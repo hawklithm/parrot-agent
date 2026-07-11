@@ -56,3 +56,5 @@ pub mod documents;
 pub use documents::document_routes;
 pub mod comments;
 pub use comments::comment_routes;
+pub mod tree_control;
+pub use tree_control::tree_control_routes;

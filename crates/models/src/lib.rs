@@ -63,3 +63,5 @@ pub mod issue;
 pub use issue::*;
 pub mod case;
 pub use case::*;
+pub mod issue_tree_control;
+pub use issue_tree_control::*;
