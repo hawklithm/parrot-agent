@@ -159,7 +159,8 @@ impl JwtService for DefaultJwtService {
         }
 
         // Decode payload to get company_id
-        let payload = base64::decode_config(parts[1], base64::URL_SAFE_NO_PAD)
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1])
             .map_err(|e| ServiceError::Unauthorized(format!("Invalid JWT payload: {}", e)))?;
 
         let payload_json: serde_json::Value = serde_json::from_slice(&payload)
@@ -241,7 +242,8 @@ impl JwtService for DefaultJwtService {
             return Err(ServiceError::Unauthorized("Invalid JWT format".to_string()));
         }
 
-        let payload = base64::decode_config(parts[1], base64::URL_SAFE_NO_PAD)
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1])
             .map_err(|e| ServiceError::Unauthorized(format!("Invalid JWT payload: {}", e)))?;
 
         let payload_json: serde_json::Value = serde_json::from_slice(&payload)

@@ -1,3 +1,4 @@
+pub mod errors;
 pub mod activity_log;
 pub mod event_bus;
 pub mod saga;

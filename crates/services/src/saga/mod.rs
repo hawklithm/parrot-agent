@@ -218,7 +218,7 @@ where
 impl<R, E> SagaOrchestratorImpl<R, E> {
     async fn execute_action(&self, action: SagaAction) -> ServiceResult<serde_json::Value> {
         match action {
-            ction::CreateAgent { agent_id } => {
+            SagaAction::CreateAgent { agent_id } => {
                 Ok(serde_json::json!({"agent_id": agent_id}))
             }
             SagaAction::CreateApproval { approval_id } => {
