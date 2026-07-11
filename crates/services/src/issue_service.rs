@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::models::{Issue, CreateIssueInput, UpdateIssueInput};
+use models::{Issue, CreateIssueInput, UpdateIssueInput};
 use crate::issue_repository::{IssueQueryFilter, Pagination};
 
 /// Issue mutation result

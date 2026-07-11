@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::models::{Case, CaseDetail, CaseEvent, CreateCaseInput, UpdateCaseInput};
+use models::{Case, CaseDetail, CaseEvent, CreateCaseInput, UpdateCaseInput};
 use crate::issue_repository::Pagination;
 
 /// Case query filter
@@ -75,7 +75,7 @@ impl MockCaseService {
     }
     
     fn create_mock_event(id: Uuid, case_id: Uuid, company_id: Uuid) -> CaseEvent {
-        use crate::models::{CaseEvent, CaseEventKind};
+        use models::{CaseEvent, CaseEventKind};
         CaseEvent {
             id,
             case_id,

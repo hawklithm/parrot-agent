@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use uuid::Uuid;
-use crate::models::{
+use models::{
     IssueTreeHold, IssueTreeHoldMember, CreateIssueTreeHoldInput,
     IssueTreeControlPreview, AffectedIssue, PreviewActiveRun,
 };

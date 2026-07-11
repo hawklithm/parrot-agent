@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 use chrono::Utc;
-use crate::models::{Issue, IssueStatus, IssuePriority, IssueWorkMode, CreateIssueInput, UpdateIssueInput};
+use models::{Issue, IssueStatus, IssuePriority, IssueWorkMode, CreateIssueInput, UpdateIssueInput};
 use crate::issue_service::{IssueService, IssueMutationResult, CheckoutInput, ReleaseInput};
 use crate::issue_repository::{IssueQueryFilter, Pagination};
 

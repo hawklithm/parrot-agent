@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use uuid::Uuid;
-use crate::models::{IssueDocument, CreateDocumentInput, LockDocumentInput};
+use models::{IssueDocument, CreateDocumentInput, LockDocumentInput};
 
 /// Document parent type
 #[derive(Debug, Clone, PartialEq, Eq)]

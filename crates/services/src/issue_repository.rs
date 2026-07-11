@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use uuid::Uuid;
-use crate::models::{Issue, IssueStatus, IssuePriority};
+use models::{Issue, IssueStatus, IssuePriority};
 
 /// Pagination parameters
 #[derive(Debug, Clone)]

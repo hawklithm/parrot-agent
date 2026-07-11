@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use uuid::Uuid;
-use crate::models::{IssueComment, AddCommentInput, CommentActorType};
+use models::{IssueComment, AddCommentInput, CommentActorType};
 
 /// Comment service trait for issue comments
 #[async_trait]
