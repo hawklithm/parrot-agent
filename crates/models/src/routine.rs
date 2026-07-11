@@ -77,6 +77,32 @@ pub enum RoutineVariableType {
     Secret,
 }
 
+/// Routine trigger configuration (stored as JSONB)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutineTriggerConfig {
+    #[serde(flatten)]
+    pub config: JsonValue,
+}
+
+/// Trigger type enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "trigger_type", rename_all = "snake_case")]
+pub enum TriggerType {
+    Schedule,
+    Webhook,
+    Manual,
+    Event,
+}
+
+/// Trigger status enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "trigger_status", rename_all = "snake_case")]
+pub enum TriggerStatus {
+    Enabled,
+    Disabled,
+    Paused,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Routine {
     pub id: Uuid,

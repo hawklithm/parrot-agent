@@ -115,3 +115,32 @@ pub struct IssueTreeControlPreview {
     pub active_runs: Vec<PreviewActiveRun>,
     pub status_changes: Vec<AffectedIssue>,
 }
+
+/// Issue tree preview issue (alias for AffectedIssue)
+pub type IssueTreePreviewIssue = AffectedIssue;
+
+/// Issue tree preview run (alias for PreviewActiveRun)
+pub type IssueTreePreviewRun = PreviewActiveRun;
+
+/// Issue tree preview warning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueTreePreviewWarning {
+    pub warning_type: String,
+    pub message: String,
+    pub issue_id: Option<Uuid>,
+}
+
+/// Hold release policy strategy (alias for backwards compatibility)
+pub type HoldReleasePolicyStrategy = IssueTreeHoldReleasePolicyStrategy;
+
+/// Active issue tree pause hold gate (for gate checking)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveIssueTreePauseHoldGate {
+    pub hold_id: Uuid,
+    pub root_issue_id: Uuid,
+    pub mode: IssueTreeControlMode,
+    pub release_policy: IssueTreeHoldReleasePolicy,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}

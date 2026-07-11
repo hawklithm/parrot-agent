@@ -84,3 +84,6 @@ pub struct AvailableSkillsResponse {
 pub struct SkillIndexResponse {
     pub skills: Vec<SkillIndexEntry>,
 }
+
+/// Alias for SkillDetails (backwards compatibility)
+pub type SkillDetail = SkillDetails;
