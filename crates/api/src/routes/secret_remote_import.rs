@@ -1,95 +1,59 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::Json,
-    routing::post,
-    Router,
+    response::{IntoResponse, Response},
+    Json,
 };
-use serde::{Deserialize, Serialize};
-use services::secret_provider_service::SecretProviderConfigService;
-use models::secret_provider::{ConflictResolution, RemoteImportPreview, RemoteImportResult};
+use models::{
+    RemoteSecretImportPreviewRequest, RemoteSecretImportPreviewResult, RemoteSecretImportRequest,
+    RemoteSecretImportResult,
+};
+use services::secret_remote_import_service::SecretRemoteImportService;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Remote import preview request
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteImportPreviewRequest {
-    pub config_id: Uuid,
-    pub filters: Option<serde_json::Value>,
-}
-
-/// Remote import execution request
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteImportExecuteRequest {
-    pub config_id: Uuid,
-    pub secret_keys: Vec<String>,
-    pub conflict_resolution: ConflictResolution,
-}
-
 /// POST /companies/:companyId/secrets/remote-import/preview
-/// Preview secrets from remote provider before importing
-pub async fn remote_import_preview(
+/// Preview secrets from external provider (scan and detect conflicts)
+pub async fn preview_remote_import(
     Path(company_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
-    Json(request): Json<RemoteImportPreviewRequest>,
-) -> Result<Json<RemoteImportPreview>, StatusCode> {
-    service
-        .remote_import_preview(company_id, request.config_id, request.filters)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            if matches!(e, services::ServiceError::NotFound(_)) {
-                StatusCode::NOT_FOUND
-            } else if matches!(e, services::ServiceError::Unauthorized(_)) {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        })
+    State(service): State<Arc<dyn SecretRemoteImportService>>,
+    Json(request): Json<RemoteSecretImportPreviewRequest>,
+) -> Response {
+    // TODO: Add permission check - assertCanManageSecrets
+
+    match service.preview(company_id, request).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// POST /companies/:companyId/secrets/remote-import
-/// Execute remote import of secrets from external provider
-pub async fn remote_import_execute(
+/// Execute batch import from external provider
+pub async fn execute_remote_import(
     Path(company_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
-    Json(request): Json<RemoteImportExecuteRequest>,
-) -> Result<Json<RemoteImportResult>, StatusCode> {
-    // TODO: Extract created_by_user_id from auth context
-    let created_by_user_id = Uuid::new_v4(); // Placeholder
+    State(service): State<Arc<dyn SecretRemoteImportService>>,
+    Json(request): Json<RemoteSecretImportRequest>,
+) -> Response {
+    // TODO: Add permission check - assertCanManageSecrets
 
-    service
-        .remote_import_execute(
-            company_id,
-            request.config_id,
-            request.secret_keys,
-            request.conflict_resolution,
-            created_by_user_id,
-        )
-        .await
-        .map(Json)
-        .map_err(|e| {
-            if matches!(e, services::ServiceError::NotFound(_)) {
-                StatusCode::NOT_FOUND
-            } else if matches!(e, services::ServiceError::Unauthorized(_)) {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        })
+    match service.execute(company_id, request).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
-/// Register secret remote import routes
-pub fn secret_remote_import_routes() -> Router<Arc<dyn SecretProviderConfigService>> {
-    Router::new()
+/// Router setup for secret remote import endpoints
+pub fn secret_remote_import_routes(
+    service: Arc<dyn SecretRemoteImportService>,
+) -> axum::Router {
+    axum::Router::new()
         .route(
-            "/companies/:company_id/secrets/remote-import/preview",
-            post(remote_import_preview),
+            "/companies/:companyId/secrets/remote-import/preview",
+            axum::routing::post(preview_remote_import),
         )
         .route(
-            "/companies/:company_id/secrets/remote-import",
-            post(remote_import_execute),
+            "/companies/:companyId/secrets/remote-import",
+            axum::routing::post(execute_remote_import),
         )
+        .with_state(service)
 }
