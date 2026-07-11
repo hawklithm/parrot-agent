@@ -21,6 +21,7 @@ pub mod websocket;
 pub mod sse;
 pub mod user_secret_definition;
 pub mod secret_provider_config;
+pub mod environment_diagnostics;
 
 pub use agent::*;
 pub use agent_api_key::*;
@@ -45,3 +46,4 @@ pub use websocket::*;
 pub use sse::*;
 pub use user_secret_definition::*;
 pub use secret_provider_config::*;
+pub use environment_diagnostics::*;
