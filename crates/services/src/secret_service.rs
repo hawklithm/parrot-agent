@@ -142,6 +142,33 @@ pub struct ResolvedAdapterConfig {
     pub manifest: Vec<RuntimeSecretManifestEntry>,
 }
 
+/// 密钥数据结构
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Secret {
+    pub id: Uuid,
+    pub company_id: Uuid,
+    pub key: String,
+    pub value: String,
+    pub description: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// 密钥创建输入
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSecretInput {
+    pub key: String,
+    pub value: String,
+    pub description: Option<String>,
+}
+
+/// 密钥更新输入
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSecretInput {
+    pub value: Option<String>,
+    pub description: Option<String>,
+}
+
 /// 密钥服务 trait
 #[async_trait]
 pub trait SecretService: Send + Sync {
@@ -199,6 +226,81 @@ pub trait SecretService: Send + Sync {
     /// # 返回
     /// - 脱敏后的配置
     fn redact_config(&self, adapter_config: JsonValue) -> JsonValue;
+
+    /// 创建新密钥
+    ///
+    /// # 参数
+    /// - company_id: 公司ID
+    /// - input: 密钥创建输入
+    ///
+    /// # 返回
+    /// - Ok(Secret): 创建的密钥
+    /// - Err: 创建失败
+    async fn create_secret(
+        &self,
+        company_id: Uuid,
+        input: CreateSecretInput,
+    ) -> Result<Secret, SecretServiceError>;
+
+    /// 获取密钥
+    ///
+    /// # 参数
+    /// - company_id: 公司ID
+    /// - secret_id: 密钥ID
+    ///
+    /// # 返回
+    /// - Ok(Secret): 密钥信息
+    /// - Err: 获取失败
+    async fn get_secret(
+        &self,
+        company_id: Uuid,
+        secret_id: Uuid,
+    ) -> Result<Secret, SecretServiceError>;
+
+    /// 更新密钥
+    ///
+    /// # 参数
+    /// - company_id: 公司ID
+    /// - secret_id: 密钥ID
+    /// - input: 密钥更新输入
+    ///
+    /// # 返回
+    /// - Ok(Secret): 更新后的密钥
+    /// - Err: 更新失败
+    async fn update_secret(
+        &self,
+        company_id: Uuid,
+        secret_id: Uuid,
+        input: UpdateSecretInput,
+    ) -> Result<Secret, SecretServiceError>;
+
+    /// 删除密钥
+    ///
+    /// # 参数
+    /// - company_id: 公司ID
+    /// - secret_id: 密钥ID
+    ///
+    /// # 返回
+    /// - Ok(()): 删除成功
+    /// - Err: 删除失败
+    async fn delete_secret(
+        &self,
+        company_id: Uuid,
+        secret_id: Uuid,
+    ) -> Result<(), SecretServiceError>;
+
+    /// 列出公司的所有密钥
+    ///
+    /// # 参数
+    /// - company_id: 公司ID
+    ///
+    /// # 返回
+    /// - Ok(Vec<Secret>): 密钥列表（value字段已脱敏）
+    /// - Err: 列出失败
+    async fn list_secrets(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<Secret>, SecretServiceError>;
 }
 
 /// 默认密钥服务实现（占位符）
@@ -400,6 +502,58 @@ impl SecretService for DefaultSecretService {
         }
 
         JsonValue::Object(config_obj)
+    }
+
+    async fn create_secret(
+        &self,
+        _company_id: Uuid,
+        _input: CreateSecretInput,
+    ) -> Result<Secret, SecretServiceError> {
+        // TODO: 实现数据库持久化
+        // 占位实现：返回错误
+        Err(SecretServiceError::ResolutionFailed(
+            "Secret creation not implemented yet".to_string(),
+        ))
+    }
+
+    async fn get_secret(
+        &self,
+        _company_id: Uuid,
+        secret_id: Uuid,
+    ) -> Result<Secret, SecretServiceError> {
+        // TODO: 实现数据库查询
+        // 占位实现：返回错误
+        Err(SecretServiceError::SecretNotFound(secret_id.to_string()))
+    }
+
+    async fn update_secret(
+        &self,
+        _company_id: Uuid,
+        secret_id: Uuid,
+        _input: UpdateSecretInput,
+    ) -> Result<Secret, SecretServiceError> {
+        // TODO: 实现数据库更新
+        // 占位实现：返回错误
+        Err(SecretServiceError::SecretNotFound(secret_id.to_string()))
+    }
+
+    async fn delete_secret(
+        &self,
+        _company_id: Uuid,
+        secret_id: Uuid,
+    ) -> Result<(), SecretServiceError> {
+        // TODO: 实现数据库删除
+        // 占位实现：返回错误
+        Err(SecretServiceError::SecretNotFound(secret_id.to_string()))
+    }
+
+    async fn list_secrets(
+        &self,
+        _company_id: Uuid,
+    ) -> Result<Vec<Secret>, SecretServiceError> {
+        // TODO: 实现数据库查询
+        // 占位实现：返回空列表
+        Ok(Vec::new())
     }
 }
 
