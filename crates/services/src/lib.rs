@@ -21,6 +21,7 @@ pub mod workspace_operation_service;
 pub mod server_adapter;
 pub mod access_service;
 pub mod built_in_agent_service;
+pub mod built_in_agent_service_impl;
 pub mod org_chart_service;
 pub mod org_chart_service_impl;
 pub mod issue_service;
@@ -74,6 +75,10 @@ pub use secret_service::{
 pub use built_in_agent_service::{
     BuiltInAgentKey, BuiltInAgentStatus, BuiltInAgentDefinition,
     BuiltInAgentMetadataRegistry, BuiltInAgentBundleDefinition,
+};
+pub use built_in_agent_service_impl::{
+    BuiltInAgentService, BuiltInAgentError, BuiltInAgentResult,
+    DefaultBuiltInAgentService, ReconcileResult,
 };
 pub use org_chart_service::{
     OrgChartService, OrgNode, OrgChartError, ROLE_LABELS, get_role_label,
