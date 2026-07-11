@@ -1,6 +1,7 @@
 pub mod errors;
 pub mod access;
 pub mod activity_log;
+pub mod adapter_config_normalizer;
 pub mod adapter_registry;
 pub mod adapters;
 pub mod event_bus;
