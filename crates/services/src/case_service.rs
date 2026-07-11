@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::models::{Case, CreateCaseInput, UpdateCaseInput};
+use crate::models::{Case, CaseDetail, CaseEvent, CreateCaseInput, UpdateCaseInput};
 use crate::issue_repository::Pagination;
 
 /// Case query filter
@@ -25,14 +25,16 @@ pub struct CaseMutationResult {
 /// Case service trait for business logic
 #[async_trait]
 pub trait CaseService: Send + Sync {
-    async fn create(&self, input: CreateCaseInput, upsert: bool) -> Result<CaseMutationResult, String>;
+    async fn create(&self, ateCaseInput, upsert: bool) -> Result<CaseMutationResult, String>;
     async fn get(&self, id: Uuid, company_id: Uuid) -> Result<Option<Case>, String>;
+    async fn get_detail(&self, id: Uuid, company_id: Uuid) -> Result<Option<CaseDetail>, String>;
     async fn list(&self, company_id: Uuid, filter: &CaseQueryFilter, pagination: &Pagination) -> Result<Vec<Case>, String>;
     async fn update(&self, id: Uuid, company_id: Uuid, input: UpdateCaseInput) -> Result<CaseMutationResult, String>;
+    async fn list_events(&self, case_id: Uuid, company_id: Uuid, pagination: &Pagination) -> Result<Vec<CaseEvent>, String>;
 }
 
 /// Mock implementation of CaseService
-pub struct MockCaseService;
+put MockCaseService;
 
 impl MockCaseService {
     pub fn new() -> Self {
@@ -60,6 +62,31 @@ impl MockCaseService {
             updated_at: chrono::Utc::now(),
         }
     }
+    
+    fn create_mock_case_detail(id: Uuid, company_id: Uuid, title: String) -> CaseDetail {
+        CaseDetail {
+            case: Self::create_mock_case(id, company_id, title),
+            labels: vec!["feature".to_string(), "priority-high".to_string()],
+            issue_links: vec![],
+            documents: vec![],
+            attachments: vec![],
+            parent_case: None,
+        }
+    }
+    
+    fn create_mock_event(id: Uuid, case_id: Uuid, company_id: Uuid) -> CaseEvent {
+        use crate::models::{CaseEvent, CaseEventKind};
+        CaseEvent {
+            id,
+            case_id,
+            company_id,
+            kind: CaseEventKind::Created,
+            metadata: Some(serde_json::json!({"action": "created"})),
+            actor_agent_id: None,
+            actor_user_id: Some(Uuid::new_v4()),
+            created_at: chrono::Utc::now(),
+        }
+    }
 }
 
 #[async_trait]
@@ -75,6 +102,10 @@ impl CaseService for MockCaseService {
     
     async fn get(&self, id: Uuid, company_id: Uuid) -> Result<Option<Case>, String> {
         Ok(Some(Self::create_mock_case(id, company_id, "Mock Case".to_string())))
+    }
+    
+    async fn get_detail(&self, id: Uuid, company_id: Uuid) -> Result<Option<CaseDetail>, String> {
+        Ok(Some(Self::create_mock_case_detail(id, company_id, "Mock Case Detail".to_string())))
     }
     
     async fn list(&self, company_id: Uuid, _filter: &CaseQueryFilter, _pagination: &Pagination) -> Result<Vec<Case>, String> {
@@ -94,5 +125,11 @@ impl CaseService for MockCaseService {
             case,
             change_kind: "updated".to_string(),
         })
+    }
+    
+    async fn list_events(&self, case_id: Uuid, company_id: Uuid, _pagination: &Pagination) -> Result<Vec<CaseEvent>, String> {
+        Ok(vec![
+            Self::create_mock_event(Uuid::new_v4(), case_id, company_id),
+        ])
     }
 }

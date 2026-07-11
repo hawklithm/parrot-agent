@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::models::{Case, CreateCaseInput, UpdateCaseInput};
+use crate::models::{Case, CaseDetail, CaseEvent, CreateCaseInput, UpdateCaseInput};
 use crate::services::{CaseQueryFilter, CaseService, Pagination};
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +85,21 @@ async fn get_case(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// GET /cases/:id/detail - Get case detail with related data
+async fn get_case_detail(
+    State(service): State<Arc<dyn CaseService>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<CaseDetail>, StatusCode> {
+    let company_id = Uuid::nil();
+    
+    service
+        .get_detail(id, company_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 /// PATCH /cases/:id - Update case
 async fn update_case(
     State(service): State<Arc<dyn CaseService>>,
@@ -100,10 +115,32 @@ async fn update_case(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// GET /cases/:id/events - List case events
+async fn list_case_events(
+    State(service): State<Arc<dyn CaseService>>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ListCasesQuery>,
+) -> Result<Json<Vec<CaseEvent>>, StatusCode> {
+    let company_id = Uuid::nil();
+    let pagination = Pagination {
+        limit: query.limit.unwrap_or(50),
+        offset: query.offset.unwrap_or(0),
+        cursor: None,
+    };
+    
+    service
+        .list_events(id, company_id, &pagination)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// Create case routes
 pub fn case_routes(service: Arc<dyn CaseService>) -> Router {
     Router::new()
         .route("/api/companies/:companyId/cases", post(create_case).get(list_cases))
         .route("/api/cases/:id", get(get_case).patch(update_case))
+        .route("/api/cases/:id/detail", get(get_case_detail))
+        .route("/api/cases/:id/events", get(list_case_events))
         .with_state(service)
 }

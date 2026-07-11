@@ -116,3 +116,42 @@ impl CaseDocument {
         }
     }
 }
+
+/// Case event kind
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseEventKind {
+    Created,
+    Updated,
+    StatusChanged,
+    DocumentRevised,
+    IssueLinked,
+    IssueUnlinked,
+}
+
+/// Case event
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseEvent {
+    pub id: Uuid,
+    pub case_id: Uuid,
+    pub company_id: Uuid,
+    pub kind: CaseEventKind,
+    pub metadata: Option<serde_json::Value>,
+    pub actor_agent_id: Option<Uuid>,
+    pub actor_user_id: Option<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Case detail with all related data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseDetail {
+    #[serde(flatten)]
+    pub case: Case,
+    pub labels: Vec<String>,
+    pub issue_links: Vec<CaseIssueLink>,
+    pub documents: Vec<CaseDocument>,
+    pub attachments: Vec<Uuid>, // Attachment IDs
+    pub parent_case: Option<Box<Case>>,
+}
