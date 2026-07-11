@@ -3,12 +3,20 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "goal_level", rename_all = "snake_case")]
+pub enum GoalLevel {
+    Company,
+    Project,
+    Task,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "goal_status", rename_all = "snake_case")]
 pub enum GoalStatus {
+    Planned,
     Active,
     Completed,
-    Abandoned,
     Archived,
 }
 
@@ -35,53 +43,63 @@ pub struct GoalMetrics {
 pub struct Goal {
     pub id: Uuid,
     pub company_id: Uuid,
-    pub parent_goal_id: Option<Uuid>,
-    pub agent_id: Option<Uuid>,
-    pub name: String,
+    pub title: String,
     pub description: Option<String>,
+    pub level: GoalLevel,
     pub status: GoalStatus,
-    pub priority: GoalPriority,
-    pub target_completion_date: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub parent_id: Option<Uuid>,
+    pub owner_agent_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub created_by_user_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateGoalInput {
+    pub company_id: Uuid,
+    pub title: String,
+    pub description: Option<String>,
+    pub level: GoalLevel,
+    pub parent_id: Option<Uuid>,
+    pub owner_agent_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateGoalInput {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<GoalStatus>,
+    pub owner_agent_id: Option<Uuid>,
 }
 
 impl Goal {
-    pub fn new(
-        company_id: Uuid,
-    name: String,
-        description: Option<String>,
-        priority: GoalPriority,
-        created_by_user_id: Uuid,
-    ) -> Self {
+    pub fn new(input: CreateGoalInput) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
-            company_id,
-            parent_goal_id: None,
-            agent_id: None,
-            name,
-            description,
-            status: GoalStatus::Active,
-            priority,
-            target_completion_date: None,
-            completed_at: None,
+            company_id: input.company_id,
+            title: input.title,
+            description: input.description,
+            level: input.level,
+            status: GoalStatus::Planned,
+            parent_id: input.parent_id,
+            owner_agent_id: input.owner_agent_id,
             created_at: now,
             updated_at: now,
-            created_by_user_id,
         }
     }
 
-    pub fn complete(&mut self) {
-        self.status = GoalStatus::Completed;
-        self.completed_at = Some(Utc::now());
+    pub fn mark_active(&mut self) {
+        self.status = GoalStatus::Active;
         self.updated_at = Utc::now();
     }
 
-    pub fn abandon(&mut self) {
-        self.status = GoalStatus::Abandoned;
+    pub fn mark_completed(&mut self) {
+        self.status = GoalStatus::Completed;
+        self.updated_at = Utc::now();
+    }
+
+    pub fn mark_archived(&mut self) {
+        self.status = GoalStatus::Archived;
         self.updated_at = Utc::now();
     }
 }

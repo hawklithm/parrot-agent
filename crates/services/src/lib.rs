@@ -34,6 +34,17 @@ pub mod sagas;
 pub mod user_secret_service;
 pub mod secret_provider_service;
 pub mod routine_service;
+pub mod routine_service_impl;
+pub mod jwt_service;
+pub mod session_service;
+pub mod event_listeners;
+pub mod goal_service;
+pub mod pipeline_service;
+pub mod approval_service;
+pub mod activity_log_service;
+pub mod environment_service;
+pub mod routine_trigger_service;
+pub mod issue_service_complete;
 
 pub use agent_service::{
     AgentService, CreateAgentInput, UpdateAgentInput, NormalizedAgentRow,
@@ -118,3 +129,11 @@ pub mod environment_driver;
 pub use environment_driver::*;
 pub mod lease_service;
 pub use lease_service::*;
+pub mod company_service;
+pub use company_service::*;
+pub mod project_service;
+pub use project_service::*;
+pub mod activity_log_service;
+pub use activity_log_service::*;
+pub mod authorization_service_complete;
+pub use authorization_service_complete::*;

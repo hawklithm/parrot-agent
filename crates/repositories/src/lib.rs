@@ -30,6 +30,8 @@ pub mod execution_workspace_repository;
 pub mod models;
 pub mod board_api_key_repository;
 pub mod auth_repositories;
+pub mod company_repository;
+pub mod project_repository;
 
 pub use agent_repository::{AgentRepository, RepositoryError, RepositoryResult};
 pub use pg_agent_repository::PgAgentRepository;
@@ -58,3 +60,5 @@ pub use secret_repository::{
 };
 pub use asset_repository::{AssetRepository, PgAssetRepository};
 pub use execution_workspace_repository::{ExecutionWorkspaceRepository, PgExecutionWorkspaceRepository};
+pub use company_repository::CompanyRepository;
+pub use project_repository::ProjectRepository;

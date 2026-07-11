@@ -1,307 +1,239 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use repositories::EnvironmentRepository;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
-use crate::models::{Environment, EnvironmentLease, ExecutionWorkspace, CreateEnvironmentInput, UpdateEnvironmentInput};
 
-/// Environment service trait
+use models::{Environment, EnvironmentStatus, EnvironmentDriver, CreateEnvironmentInput, UpdateEnvironmentInput};
+use crate::ServiceError;
+
+/// Input for leasing an environment
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseEnvironmentInput {
+    pub environment_id: Uuid,
+    pub leased_by_agent_id: Uuid,
+    pub lease_duration_seconds: i64,
+}
+
+/// Environment Service trait
 #[async_trait]
 pub trait EnvironmentService: Send + Sync {
-    /// List environments for a company
-    async fn list_environments(&self, company_id: Uuid) -> Result<Vec<Environment>, String>;
-    
+    /// Create a new environment
+    async fn create(&self, company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, ServiceError>;
+
     /// Get environment by ID
-    async fn get_environment(&self, id: Uuid, company_id: Uuid) -> Result<Option<Environment>, String>;
-    
-    /// Create environment
-    async fn create_environment(&self, company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, String>;
-    
+    async fn get(&self, id: Uuid) -> Result<Environment, ServiceError>;
+
+    /// Get environment by name
+    async fn get_by_name(&self, name: &str) -> Result<Environment, ServiceError>;
+
     /// Update environment
-    async fn update_environment(&self, id: Uuid, company_id: Uuid, input: UpdateEnvironmentInput) -> Result<Environment, String>;
-    
-    /// Delete environment
-    async fn delete_environment(&self, id: Uuid, company_id: Uuid) -> Result<bool, String>;
-    
-    /// Probe environment (test connectivity)
-    async fn probe_environment(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String>;
+    async fn update(&self, id: Uuid, input: UpdateEnvironmentInput) -> Result<Environment, ServiceError>;
+
+    /// Delete environment (soft delete - archived)
+    async fn delete(&self, id: Uuid) -> Result<(), ServiceError>;
+
+    /// List environments by status
+    async fn list_by_status(&self, status: EnvironmentStatus) -> Result<Vec<Environment>, ServiceError>;
+
+    /// List all environments
+    async fn list_all(&self) -> Result<Vec<Environment>, ServiceError>;
+
+    /// Validate environment config based on driver
+    fn validate_config(&self, driver: EnvironmentDriver, config: &serde_json::Value) -> Result<(), ServiceError>;
 }
 
-/// Environment lease service trait
-#[async_trait]
-pub trait EnvironmentLeaseService: Send + Sync {
-    /// Acquire environment lease
-    async fn acquire_lease(
-        &self,
-        environment_id: Uuid,
-        company_id: Uuid,
-        issue_id: Option<Uuid>,
-        heartbeat_run_id: Option<Uuid>,
-    ) -> Result<EnvironmentLease, String>;
-    
-    /// Release environment lease
-    async fn release_lease(&self, lease_id: Uuid, company_id: Uuid) -> Result<EnvironmentLease, String>;
-    
-    /// List active leases for a company
-    async fn list_active_leases(&self, company_id: Uuid) -> Result<Vec<EnvironmentLease>, String>;
+/// Default Environment Service Implementation
+pub struct DefaultEnvironmentService {
+    environment_repo: Arc<dyn EnvironmentRepository>,
 }
 
-/// Execution workspace service trait
-#[async_trait]
-pub trait ExecutionWorkspaceService: Send + Sync {
-    /// Create execution workspace
-    async fn create_workspace(
-        &self,
-        company_id: Uuid,
-        project_id: Option<Uuid>,
-        name: String,
-    ) -> Result<ExecutionWorkspace, String>;
-    
-    /// Get workspace by ID
-    async fn get_workspace(&self, id: Uuid, company_id: Uuid) -> Result<Option<ExecutionWorkspace>, String>;
-    
-    /// List workspaces for a company
-    async fn list_workspaces(&self, company_id: Uuid) -> Result<Vec<ExecutionWorkspace>, String>;
-    
-    /// Dispose workspace
-    async fn dispose_workspace(&self, id: Uuid, company_id: Uuid) -> Result<bool, String>;
-}
-
-/// Mock implementation of EnvironmentService
-pub struct MockEnvironmentService;
-
-impl MockEnvironmentService {
-    pub fn new() -> Self {
-        Self
+impl DefaultEnvironmentService {
+    pub fn new(environment_repo: Arc<dyn EnvironmentRepository>) -> Self {
+        Self { environment_repo }
     }
-    
-    fn create_mock_environment(id: Uuid, company_id: Uuid, name: String) -> Environment {
-        use crate::models::{EnvironmentDriver, EnvironmentStatus};
-        Environment {
-            id,
-            company_id,
-            name,
-            description: Some("Mock environment".to_string()),
-            driver: EnvironmentDriver::Local,
-            status: EnvironmentStatus::Active,
-            config: serde_json::json!({}),
-            env_vars: serde_json::json!({}),
-            metadata: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+}
+
+#[async_trait]
+impl EnvironmentService for DefaultEnvironmentService {
+    async fn create(&self, company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, ServiceError> {
+        // Validate config
+        self.validate_config(input.driver.clone(), &input.config)?;
+
+        self.environment_repo
+            .create(input)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to create environment: {}", e)))
+    }
+
+    async fn get(&self, id: Uuid) -> Result<Environment, ServiceError> {
+        self.environment_repo
+            .get_by_id(id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to get environment: {}", e)))?
+            .ok_or_else(|| ServiceError::NotFound(format!("Environment {} not found", id)))
+    }
+
+    async fn get_by_name(&self, name: &str) -> Result<Environment, ServiceError> {
+        self.environment_repo
+            .get_by_name(name)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to get environment by name: {}", e)))?
+            .ok_or_else(|| ServiceError::NotFound(format!("Environment '{}' not found", name)))
+    }
+
+    async fn update(&self, id: Uuid, input: UpdateEnvironmentInput) -> Result<Environment, ServiceError> {
+        // Validate config if provided
+        if let Some(ref config) = input.config {
+            let environment = self.get(id).await?;
+            self.validate_config(environment.driver, config)?;
+        }
+
+        self.environment_repo
+            .update(id, input)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to update environment: {}", e)))
+    }
+
+    async fn delete(&self, id: Uuid) -> Result<(), ServiceError> {
+        // Check blast radius before deleting
+        let blast_radius = self.environment_repo
+            .get_delete_blast_radius(id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to check delete blast radius: {}", e)))?;
+
+        if !blast_radius.can_delete {
+            return Err(ServiceError::Conflict(format!(
+                "Cannot delete environment: {}",
+                blast_radius.blocked_reasons.join(", ")
+            )));
+        }
+
+        self.environment_repo
+            .delete(id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to delete environment: {}", e)))
+    }
+
+    async fn list_by_status(&self, status: EnvironmentStatus) -> Result<Vec<Environment>, ServiceError> {
+        self.environment_repo
+            .list_by_status(status)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list environments by status: {}", e)))
+    }
+
+    async fn list_all(&self) -> Result<Vec<Environment>, ServiceError> {
+        self.environment_repo
+            .list_all()
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list all environments: {}", e)))
+    }
+
+    fn validate_config(&self, driver: EnvironmentDriver, config: &serde_json::Value) -> Result<(), ServiceError> {
+        match driver {
+            EnvironmentDriver::Local => {
+                // Local environments - minimal validation
+                Ok(())
+            }
+            EnvironmentDriver::Ssh => {
+                // SSH environments need host, username
+                if !config.get("host").and_then(|v| v.as_str()).is_some() {
+                    return Err(ServiceError::InvalidInput("SSH environment requires 'host' in config".to_string()));
+                }
+                if !config.get("username").and_then(|v| v.as_str()).is_some() {
+                    return Err(ServiceError::InvalidInput("SSH environment requires 'username' in config".to_string()));
+                }
+                if !config.get("remoteWorkspacePath").and_then(|v| v.as_str()).is_some() {
+                    return Err(ServiceError::InvalidInput("SSH environment requires 'remoteWorkspacePath' in config".to_string()));
+                }
+                Ok(())
+            }
+            EnvironmentDriver::Sandbox => {
+                // Sandbox environments need provider and image
+                if !config.get("provider").and_then(|v| v.as_str()).is_some() {
+                    return Err(ServiceError::InvalidInput("Sandbox environment requires 'provider' in config".to_string()));
+                }
+                if !config.get("image").and_then(|v| v.as_str()).is_some() {
+                    return Err(ServiceError::InvalidInput("Sandbox environment requires 'image' in config".to_string()));
+                }
+                Ok(())
+            }
+            EnvironmentDriver::Plugin => {
+                // Plugin environments - custom validation based on plugin type
+                // For now, just check that config is not empty
+                if config.is_null() || (config.is_object() && config.as_object().unwrap().is_empty()) {
+                    return Err(ServiceError::InvalidInput("Plugin environment requires non-empty config".to_string()));
+                }
+                Ok(())
+            }
         }
     }
 }
 
-#[async_trait]
-impl EnvironmentService for MockEnvironmentService {
-    async fn list_environments(&self, company_id: Uuid) -> Result<Vec<Environment>, String> {
-        Ok(vec![
-            Self::create_mock_environment(Uuid::new_v4(), company_id, "Local Dev".to_string()),
-            Self::create_mock_environment(Uuid::new_v4(), company_id, "SSH Remote".to_string()),
-        ])
-    }
-    
-    async fn get_environment(&self, id: Uuid, company_id: Uuid) -> Result<Option<Environment>, String> {
-        Ok(Some(Self::create_mock_environment(id, company_id, "Mock Environment".to_string())))
-    }
-    
-    async fn create_environment(&self, company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, String> {
-        let mut env = Self::create_mock_environment(Uuid::new_v4(), company_id, input.name);
-        env.driver = input.driver;
-        env.config = input.config;
-        env.env_vars = input.env_vars.unwrap_or_else(|| serde_json::json!({}));
-        Ok(env)
-    }
-    
-    async fn update_environment(&self, id: Uuid, company_id: Uuid, input: UpdateEnvironmentInput) -> Result<Environment, String> {
-        let mut env = Self::create_mock_environment(id, company_id, input.name.unwrap_or_else(|| "Updated".to_string()));
-        if let Some(status) = input.status {
-            env.status = status;
-        }
-        Ok(env)
-    }
-    
-    async fn delete_environment(&self, _id: Uuid, _company_id: Uuid) -> Result<bool, String> {
-        Ok(true)
-    }
-    
-    async fn probe_environment(&self, _id: Uuid, _company_id: Uuid) -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"ok": true, "driver": "local", "summary": "All checks passed"}))
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Mock implementation of EnvironmentLeaseService
-pub struct MockEnvironmentLeaseService;
+    #[test]
+    fn test_validate_ssh_config() {
+        let service = DefaultEnvironmentService::new(Arc::new(MockEnvironmentRepository::new()));
 
-impl MockEnvironmentLeaseService {
-    pub fn new() -> Self {
-        Self
-    }
-}
+        // Valid SSH config
+        let valid_ssh = serde_json::json!({
+            "host": "example.com",
+            "username": "agent",
+            "remoteWorkspacePath": "/home/agent/workspace",
+            "port": 22
+        });
+        assert!(service.validate_config(EnvironmentDriver::Ssh, &valid_ssh).is_ok());
 
-#[async_trait]
-impl EnvironmentLeaseService for MockEnvironmentLeaseService {
-    async fn acquire_lease(
-        &self,
-        environment_id: Uuid,
-        company_id: Uuid,
-        issue_id: Option<Uuid>,
-        heartbeat_run_id: Option<Uuid>,
-    ) -> Result<EnvironmentLease, String> {
-        use crate::models::LeaseStatus;
-        Ok(EnvironmentLease {
-            id: Uuid::new_v4(),
-            company_id,
-            environment_id,
-            execution_workspace_id: None,
-            issue_id,
-            heartbeat_run_id,
-            status: LeaseStatus::Active,
-            lease_policy: None,
-            provider: Some("local".to_string()),
-            provider_lease_id: None,
-            acquired_at: chrono::Utc::now(),
-            last_used_at: Some(chrono::Utc::now()),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            released_at: None,
-            failure_reason: None,
-            cleanup_status: None,
-        })
-    }
-    
-    async fn release_lease(&self, lease_id: Uuid, company_id: Uuid) -> Result<EnvironmentLease, String> {
-        use crate::models::LeaseStatus;
-        Ok(EnvironmentLease {
-            id: lease_id,
-            company_id,
-            environment_id: Uuid::new_v4(),
-            execution_workspace_id: None,
-            issue_id: None,
-            heartbeat_run_id: None,
-            status: LeaseStatus::Released,
-            lease_policy: None,
-            provider: Some("local".to_string()),
-            provider_lease_id: None,
-            acquired_at: chrono::Utc::now() - chrono::Duration::hours(1),
-            last_used_at: Some(chrono::Utc::now()),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            released_at: Some(chrono::Utc::now()),
-            failure_reason: None,
-            cleanup_status: Some("cleaned".to_string()),
-        })
-    }
-    
-    async fn list_active_leases(&self, company_id: Uuid) -> Result<Vec<EnvironmentLease>, String> {
-        use crate::models::LeaseStatus;
-        Ok(vec![
-            EnvironmentLease {
-                id: Uuid::new_v4(),
-                company_id,
-                environment_id: Uuid::new_v4(),
-                execution_workspace_id: None,
-                issue_id: None,
-                heartbeat_run_id: None,
-                status: LeaseStatus::Active,
-                lease_policy: None,
-                provider: Some("local".to_string()),
-                provider_lease_id: None,
-                acquired_at: chrono::Utc::now() - chrono::Duration::minutes(30),
-                last_used_at: Some(chrono::Utc::now()),
-                expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(30)),
-                released_at: None,
-                failure_reason: None,
-                cleanup_status: None,
-            },
-        ])
-    }
-}
+        // Missing host
+        let missing_host = serde_json::json!({
+            "username": "agent",
+            "remoteWorkspacePath": "/home/agent/workspace"
+        });
+        assert!(service.validate_config(EnvironmentDriver::Ssh, &missing_host).is_err());
 
-/// Mock implementation of ExecutionWorkspaceService
-pub struct MockExecutionWorkspaceService;
+        // Missing username
+        let missing_username = serde_json::json!({
+            "host": "example.com",
+            "remoteWorkspacePath": "/home/agent/workspace"
+        });
+        assert!(service.validate_config(EnvironmentDriver::Ssh, &missing_username).is_err());
+    }
 
-impl MockExecutionWorkspaceService {
-    pub fn new() -> Self {
-        Self
-    }
-}
+    #[test]
+    fn test_validate_sandbox_config() {
+        let service = DefaultEnvironmentService::new(Arc::new(MockEnvironmentRepository::new()));
 
-#[async_trait]
-impl ExecutionWorkspaceService for MockExecutionWorkspaceService {
-    async fn create_workspace(
-        &self,
-        company_id: Uuid,
-        project_id: Option<Uuid>,
-        name: String,
-    ) -> Result<ExecutionWorkspace, String> {
-        use crate::models::{ExecutionWorkspaceMode, ExecutionWorkspaceStrategyType, ExecutionWorkspaceStatus};
-        Ok(ExecutionWorkspace {
-            id: Uuid::new_v4(),
-            company_id,
-            project_id,
-            project_workspace_id: None,
-            source_issue_id: None,
-            name,
-            mode: ExecutionWorkspaceMode::Ephemeral,
-            strategy_type: ExecutionWorkspaceStrategyType::CloneAndCheckout,
-            status: ExecutionWorkspaceStatus::Provisioning,
-            cwd: Some("/tmp/workspace".to_string()),
-            provider_ref: None,
-            base_ref: Some("main".to_string()),
-            branch_name: None,
-            repo_url: None,
-            metadata: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        })
+        // Valid sandbox config
+        let valid_sandbox = serde_json::json!({
+            "provider": "e2b",
+            "image": "ubuntu:22.04",
+            "reuseLease": true
+        });
+        assert!(service.validate_config(EnvironmentDriver::Sandbox, &valid_sandbox).is_ok());
+
+        // Missing provider
+        let missing_provider = serde_json::json!({
+            "image": "ubuntu:22.04"
+        });
+        assert!(service.validate_config(EnvironmentDriver::Sandbox, &missing_provider).is_err());
+
+        // Missing image
+        let missing_image = serde_json::json!({
+            "provider": "e2b"
+        });
+        assert!(service.validate_config(EnvironmentDriver::Sandbox, &missing_image).is_err());
     }
-    
-    async fn get_workspace(&self, id: Uuid, company_id: Uuid) -> Result<Option<ExecutionWorkspace>, String> {
-        use crate::models::{ExecutionWorkspaceMode, ExecutionWorkspaceStrategyType, ExecutionWorkspaceStatus};
-        Ok(Some(ExecutionWorkspace {
-            id,
-            company_id,
-            project_id: None,
-            project_workspace_id: None,
-            source_issue_id: None,
-            name: "Mock Workspace".to_string(),
-            mode: ExecutionWorkspaceMode::Ephemeral,
-            strategy_type: ExecutionWorkspaceStrategyType::CloneAndCheckout,
-            status: ExecutionWorkspaceStatus::Ready,
-            cwd: Some("/tmp/workspace".to_string()),
-            provider_ref: None,
-            base_ref: Some("main".to_string()),
-            branch_name: None,
-            repo_url: None,
-            metadata: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }))
-    }
-    
-    async fn list_workspaces(&self, company_id: Uuid) -> Result<Vec<ExecutionWorkspace>, String> {
-        use crate::models::{ExecutionWorkspaceMode, ExecutionWorkspaceStrategyType, ExecutionWorkspaceStatus};
-        Ok(vec![
-            ExecutionWorkspace {
-                id: Uuid::new_v4(),
-                company_id,
-                project_id: None,
-                project_workspace_id: None,
-                source_issue_id: None,
-                name: "Workspace 1".to_string(),
-                mode: ExecutionWorkspaceMode::Ephemeral,
-                strategy_type: ExecutionWorkspaceStrategyType::CloneAndCheckout,
-                status: ExecutionWorkspaceStatus::Ready,
-                cwd: Some("/tmp/workspace1".to_string()),
-                provider_ref: None,
-                base_ref: Some("main".to_string()),
-                branch_name: None,
-                repo_url: None,
-                metadata: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-            },
-        ])
-    }
-    
-    async fn dispose_workspace(&self, _id: Uuid, _company_id: Uuid) -> Result<bool, String> {
-        Ok(true)
+
+    #[test]
+    fn test_validate_local_config() {
+        let service = DefaultEnvironmentService::new(Arc::new(MockEnvironmentRepository::new()));
+
+        // Local config - always valid
+        let empty_config = serde_json::json!({});
+        assert!(service.validate_config(EnvironmentDriver::Local, &empty_config).is_ok());
     }
 }

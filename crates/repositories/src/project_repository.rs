@@ -1,0 +1,356 @@
+use models::{
+    CreateProjectInput, CreateWorkspaceInput, Project, ProjectMembership, ProjectWorkspace,
+    UpdateProjectInput, AgentMembership, ResourceMemberships, ProjectMembershipWithProject,
+    AgentMembershipWithAgent, MembershipState,
+};
+use sqlx::{PgPool, Result};
+use uuid::Uuid;
+
+pub struct ProjectRepository {
+    pool: PgPool,
+}
+
+impl ProjectRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn create(&self, input: CreateProjectInput) -> Result<Project> {
+        sqlx::query_as::<_, Project>(
+            r#"
+            INSERT INTO projects (
+                company_id, goal_id, name, description, lead_agent_id,
+                target_date, color, icon, env, execution_workspace_policy
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING *
+            "#,
+        )
+        .bind(input.company_id)
+        .bind(input.goal_id)
+        .bind(&input.name)
+        .bind(&input.description)
+        .bind(input.lead_agent_id)
+        .bind(input.target_date)
+        .bind(&input.color)
+        .bind(&input.icon)
+        .bind(&input.env)
+        .bind(input.execution_workspace_policy.unwrap_or(models::ExecutionWorkspacePolicy::Shared))
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn get_by_id(&self, id: Uuid) -> Result<Option<Project>> {
+        sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    pub async fn list_by_company(&self, company_id: Uuid) -> Result<Vec<Project>> {
+        sqlx::query_as::<_, Project>(
+            "SELECT * FROM projects WHERE company_id = $1 ORDER BY created_at DESC",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn update(&self, id: Uuid, input: UpdateProjectInput) -> Result<Project> {
+        let mut query = String::from("UPDATE projects SET updated_at = NOW()");
+        let mut bind_count = 1;
+
+        if input.name.is_some() {
+            query.push_str(&format!(", name = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.description.is_some() {
+            query.push_str(&format!(", description = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.status.is_some() {
+            query.push_str(&format!(", status = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.lead_agent_id.is_some() {
+            query.push_str(&format!(", lead_agent_id = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.target_date.is_some() {
+            query.push_str(&format!(", target_date = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.color.is_some() {
+            query.push_str(&format!(", color = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.icon.is_some() {
+            query.push_str(&format!(", icon = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.env.is_some() {
+            query.push_str(&format!(", env = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.pause_reason.is_some() {
+            query.push_str(&format!(", pause_reason = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.execution_workspace_policy.is_some() {
+            query.push_str(&format!(", execution_workspace_policy = ${}", bind_count));
+            bind_count += 1;
+        }
+
+        query.push_str(&format!(" WHERE id = ${} RETURNING *", bind_count));
+
+        let mut q = sqlx::query_as::<_, Project>(&query);
+
+        if let Some(name) = input.name {
+            q = q.bind(name);
+        }
+        if let Some(description) = input.description {
+            q = q.bind(description);
+        }
+        if let Some(status) = input.status {
+            q = q.bind(status);
+        }
+        if let Some(lead_agent_id) = input.lead_agent_id {
+            q = q.bind(lead_agent_id);
+        }
+        if let Some(target_date) = input.target_date {
+            q = q.bind(target_date);
+        }
+        if let Some(color) = input.color {
+            q = q.bind(color);
+        }
+        if let Some(icon) = input.icon {
+            q = q.bind(icon);
+        }
+        if let Some(env) = input.env {
+            q = q.bind(env);
+        }
+        if let Some(pause_reason) = input.pause_reason {
+            q = q.bind(pause_reason);
+        }
+        if let Some(policy) = input.execution_workspace_policy {
+            q = q.bind(policy);
+        }
+
+        q.bind(id).fetch_one(&self.pool).await
+    }
+
+    pub async fn delete(&self, id: Uuid) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn archive(&self, id: Uuid) -> Result<Project> {
+        sqlx::query_as::<_, Project>(
+            "UPDATE projects SET archived_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    // Workspace operations
+    pub async fn create_workspace(&self, input: CreateWorkspaceInput) -> Result<ProjectWorkspace> {
+        sqlx::query_as::<_, ProjectWorkspace>(
+            r#"
+            INSERT INTO project_workspaces (project_id, name, config, is_primary)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *
+            "#,
+        )
+        .bind(input.project_id)
+        .bind(&input.name)
+        .bind(&input.config)
+        .bind(input.is_primary.unwrap_or(false))
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn list_workspaces(&self, project_id: Uuid) -> Result<Vec<ProjectWorkspace>> {
+        sqlx::query_as::<_, ProjectWorkspace>(
+            "SELECT * FROM project_workspaces WHERE project_id = $1 ORDER BY is_primary DESC, created_at ASC",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_primary_workspace(&self, project_id: Uuid) -> Result<Option<ProjectWorkspace>> {
+        sqlx::query_as::<_, ProjectWorkspace>(
+            "SELECT * FROM project_workspaces WHERE project_id = $1 AND is_primary = true",
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn delete_workspace(&self, id: Uuid) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM project_workspaces WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    // Membership operations
+    pub async fn upsert_project_membership(
+        &self,
+        company_id: Uuid,
+        project_id: Uuid,
+        user_id: Uuid,
+        state: MembershipState,
+    ) -> Result<ProjectMembership> {
+        sqlx::query_as::<_, ProjectMembership>(
+            r#"
+            INSERT INTO project_memberships (company_id, project_id, user_id, state)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (company_id, project_id, user_id)
+            DO UPDATE SET state = $4, updated_at = NOW()
+            RETURNING *
+            "#,
+        )
+        .bind(company_id)
+        .bind(project_id)
+        .bind(user_id)
+        .bind(state)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn upsert_agent_membership(
+        &self,
+        company_id: Uuid,
+        agent_id: Uuid,
+        user_id: Uuid,
+        state: MembershipState,
+    ) -> Result<AgentMembership> {
+        sqlx::query_as::<_, AgentMembership>(
+            r#"
+            INSERT INTO agent_memberships (company_id, agent_id, user_id, state)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (company_id, agent_id, user_id)
+            DO UPDATE SET state = $4, updated_at = NOW()
+            RETURNING *
+            "#,
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(user_id)
+        .bind(state)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn star_project(
+        &self,
+        company_id: Uuid,
+        project_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<ProjectMembership> {
+        sqlx::query_as::<_, ProjectMembership>(
+            r#"
+            INSERT INTO project_memberships (company_id, project_id, user_id, state, starred_at)
+            VALUES ($1, $2, $3, 'joined', NOW())
+            ON CONFLICT (company_id, project_id, user_id)
+            DO UPDATE SET starred_at = NOW(), updated_at = NOW()
+            RETURNING *
+            "#,
+        )
+        .bind(company_id)
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn unstar_project(
+        &self,
+        company_id: Uuid,
+        project_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<ProjectMembership> {
+        sqlx::query_as::<_, ProjectMembership>(
+            r#"
+            UPDATE project_memberships
+            SET starred_at = NULL, updated_at = NOW()
+            WHERE company_id = $1 AND project_id = $2 AND user_id = $3
+            RETURNING *
+            "#,
+        )
+        .bind(company_id)
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn list_memberships_for_user(
+        &self,
+        company_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<ResourceMemberships> {
+        let project_memberships = sqlx::query_as::<_, (ProjectMembership, Project)>(
+            r#"
+            SELECT pm.*, p.*
+            FROM project_memberships pm
+            INNER JOIN projects p ON pm.project_id = p.id
+            WHERE pm.company_id = $1 AND pm.user_id = $2 AND pm.state = 'joined'
+            ORDER BY pm.starred_at DESC NULLS LAST, pm.created_at DESC
+            "#,
+        )
+        .bind(company_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(membership, project)| ProjectMembershipWithProject { membership, project })
+        .collect();
+
+        let agent_memberships = sqlx::query_as::<_, (AgentMembership, String, String)>(
+            r#"
+            SELECT am.*, a.name as agent_name, a.status as agent_status
+            FROM agent_memberships am
+            INNER JOIN agents a ON am.agent_id = a.id
+            WHERE am.company_id = $1 AND am.user_id = $2 AND am.state = 'joined'
+            ORDER BY am.starred_at DESC NULLS LAST, am.created_at DESC
+            "#,
+        )
+        .bind(company_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(membership, agent_name, agent_status)| AgentMembershipWithAgent {
+            membership,
+            agent_name,
+            agent_status,
+        })
+        .collect();
+
+        let starred_project_ids: Vec<Uuid> = project_memberships
+            .iter()
+            .filter(|pm| pm.membership.starred_at.is_some())
+            .map(|pm| pm.membership.project_id)
+            .collect();
+
+        let starred_agent_ids: Vec<Uuid> = agent_memberships
+            .iter()
+            .filter(|am| am.membership.starred_at.is_some())
+            .map(|am| am.membership.agent_id)
+            .collect();
+
+        Ok(ResourceMemberships {
+            project_memberships,
+            agent_memberships,
+            starred_project_ids,
+            starred_agent_ids,
+        })
+    }
+}

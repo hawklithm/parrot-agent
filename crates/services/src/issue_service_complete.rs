@@ -1,0 +1,475 @@
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
+use std::sync::Arc;
+
+use models::Issue;
+use repositories::IssueRepository;
+use crate::ServiceError;
+
+// Import existing services
+use crate::issue_tree_control_service::IssueTreeControlService;
+use crate::issue_comment_service::IssueCommentService;
+use crate::issue_document_service::IssueDocumentService;
+use crate::work_product_service::WorkProductService;
+use crate::attachment_service::AttachmentService;
+
+/// Issue mutation result
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueMutationResult {
+    pub changed: bool,
+    pub issue: Issue,
+    pub change_kind: String, // "created" | "updated" | "deleted" | "status_changed"
+}
+
+/// Checkout input
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutInput {
+    pub agent_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+    pub expected_statuses: Vec<String>,
+    pub checkout_run_id: Uuid,
+}
+
+/// Release input
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseInput {
+    pub release_run_id: Uuid,
+    pub result: Option<String>,
+    pub target_status: Option<String>,
+}
+
+/// Create issue input
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateIssueInput {
+    pub company_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub priority: Option<i32>,
+    pub assigned_to: Option<Uuid>,
+    pub parent_id: Option<Uuid>,
+    pub goal_id: Option<Uuid>,
+}
+
+/// Update issue input
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateIssueInput {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub priority: Option<i32>,
+    pub assigned_to: Option<Uuid>,
+}
+
+/// Issue query filter
+#[derive(Debug, Clone, Default)]
+pub struct IssueQueryFilter {
+    pub status: Option<String>,
+    pub assigned_to: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    pub goal_id: Option<Uuid>,
+    pub parent_id: Option<Uuid>,
+}
+
+/// Pagination
+#[derive(Debug, Clone)]
+pub struct Pagination {
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl Default for Pagination {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            offset: 0,
+        }
+    }
+}
+
+/// Comprehensive Issue service trait with advanced features
+#[async_trait]
+pub trait IssueService: Send + Sync {
+    /// Create a new issue
+    async fn create(&self, input: CreateIssueInput) -> Result<IssueMutationResult, ServiceError>;
+
+    /// Create a child issue
+    async fn create_child(&self, parent_id: Uuid, input: CreateIssueInput) -> Result<IssueMutationResult, ServiceError>;
+
+    /// Get issue by ID
+    async fn get(&self, id: Uuid, company_id: Uuid) -> Result<Issue, ServiceError>;
+
+    /// List issues with filtering
+    async fn list(
+        &self,
+        company_id: Uuid,
+        filter: &IssueQueryFilter,
+        pagination: &Pagination,
+    ) -> Result<Vec<Issue>, ServiceError>;
+
+    /// Update issue
+    async fn update(&self, id: Uuid, company_id: Uuid, input: UpdateIssueInput) -> Result<IssueMutationResult, ServiceError>;
+
+    /// Delete issue
+    async fn delete(&self, id: Uuid, company_id: Uuid) -> Result<IssueMutationResult, ServiceError>;
+
+    /// Checkout issue for execution
+    async fn checkout(&self, id: Uuid, company_id: Uuid, input: CheckoutInput) -> Result<Issue, ServiceError>;
+
+    /// Release issue from execution
+    async fn release(&self, id: Uuid, company_id: Uuid, input: ReleaseInput) -> Result<Issue, ServiceError>;
+
+    /// Search issues
+    async fn search(
+        &self,
+        company_id: Uuid,
+        query: &str,
+        filter: &IssueQueryFilter,
+        pagination: &Pagination,
+    ) -> Result<Vec<Issue>, ServiceError>;
+
+    /// Get tree control service
+    fn tree_control(&self) -> Arc<dyn IssueTreeControlService>;
+
+    /// Get comment service
+    fn comments(&self) -> Arc<dyn IssueCommentService>;
+
+    /// Get document service
+    fn documents(&self) -> Arc<dyn IssueDocumentService>;
+
+    /// Get work product service
+    fn work_products(&self) -> Arc<dyn WorkProductService>;
+
+    /// Get attachment service
+    fn attachments(&self) -> Arc<dyn AttachmentService>;
+}
+
+/// Default Issue Service Implementation
+pub struct DefaultIssueService {
+    issue_repo: Arc<dyn IssueRepository>,
+    tree_control_service: Arc<dyn IssueTreeControlService>,
+    comment_service: Arc<dyn IssueCommentService>,
+    document_service: Arc<dyn IssueDocumentService>,
+    work_product_service: Arc<dyn WorkProductService>,
+    attachment_service: Arc<dyn AttachmentService>,
+}
+
+impl DefaultIssueService {
+    pub fn new(
+        issue_repo: Arc<dyn IssueRepository>,
+        tree_control_service: Arc<dyn IssueTreeControlService>,
+        comment_service: Arc<dyn IssueCommentService>,
+        document_service: Arc<dyn IssueDocumentService>,
+        work_product_service: Arc<dyn WorkProductService>,
+        attachment_service: Arc<dyn AttachmentService>,
+    ) -> Self {
+        Self {
+            issue_repo,
+            tree_control_service,
+            comment_service,
+            document_service,
+            work_product_service,
+            attachment_service,
+        }
+    }
+
+    /// Validate status transition
+    fn validate_status_transition(&self, from_status: &str, to_status: &str) -> Result<(), ServiceError> {
+        let valid_transitions = vec![
+            ("todo", "in_progress"),
+            ("todo", "blocked"),
+            ("in_progress", "blocked"),
+            ("in_progress", "done"),
+            ("in_progress", "cancelled"),
+            ("blocked", "in_progress"),
+            ("blocked", "cancelled"),
+        ];
+
+        let is_valid = valid_transitions.iter().any(|(from, to)| {
+            from == &from_status && to == &to_status
+        });
+
+        if !is_valid {
+            return Err(ServiceError::InvalidInput(format!(
+                "Invalid status transition from '{}' to '{}'",
+                from_status, to_status
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl IssueService for DefaultIssueService {
+    async fn create(&self, input: CreateIssueInput) -> Result<IssueMutationResult, ServiceError> {
+        // Validate parent exists if specified
+        if let Some(parent_id) = input.parent_id {
+            let parent = self.issue_repo
+                .get_by_id(parent_id)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("Failed to verify parent: {}", e)))?;
+
+            if parent.is_none() {
+                return Err(ServiceError::NotFound(format!("Parent issue {} not found", parent_id)));
+            }
+        }
+
+        let issue = Issue {
+            id: Uuid::new_v4(),
+            company_id: input.company_id,
+            project_id: input.project_id,
+            title: input.title,
+            description: input.description,
+            status: input.status,
+            priority: input.priority.unwrap_or(3),
+            assigned_to: input.assigned_to,
+            parent_id: input.parent_id,
+            goal_id: input.goal_id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let created_issue = self.issue_repo
+            .create(issue)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to create issue: {}", e)))?;
+
+        Ok(IssueMutationResult {
+            changed: true,
+            issue: created_issue,
+            change_kind: "created".to_string(),
+        })
+    }
+
+    async fn create_child(&self, parent_id: Uuid, mut input: CreateIssueInput) -> Result<IssueMutationResult, ServiceError> {
+        input.parent_id = Some(parent_id);
+        self.create(input).await
+    }
+
+    async fn get(&self, id: Uuid, company_id: Uuid) -> Result<Issue, ServiceError> {
+        let issue = self.issue_repo
+            .get_by_id(id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to get issue: {}", e)))?
+            .ok_or_else(|| ServiceError::NotFound(format!("Issue {} not found", id)))?;
+
+        // Verify company access
+        if issue.company_id != company_id {
+            return Err(ServiceError::Forbidden("Access denied to issue from different company".to_string()));
+        }
+
+        Ok(issue)
+    }
+
+    async fn list(
+        &self,
+        company_id: Uuid,
+        filter: &IssueQueryFilter,
+        pagination: &Pagination,
+    ) -> Result<Vec<Issue>, ServiceError> {
+        self.issue_repo
+            .list(company_id, filter, pagination)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list issues: {}", e)))
+    }
+
+    async fn update(&self, id: Uuid, company_id: Uuid, input: UpdateIssueInput) -> Result<IssueMutationResult, ServiceError> {
+        let mut issue = self.get(id, company_id).await?;
+
+        let mut changed = false;
+        let mut change_kind = "updated".to_string();
+
+        if let Some(title) = input.title {
+            issue.title = title;
+            changed = true;
+        }
+
+        if let Some(description) = input.description {
+            issue.description = Some(description);
+            changed = true;
+        }
+
+        if let Some(new_status) = input.status {
+            self.validate_status_transition(&issue.status, &new_status)?;
+            issue.status = new_status;
+            changed = true;
+            change_kind = "status_changed".to_string();
+        }
+
+        if let Some(priority) = input.priority {
+            issue.priority = priority;
+            changed = true;
+        }
+
+        if let Some(assigned_to) = input.assigned_to {
+            issue.assigned_to = Some(assigned_to);
+            changed = true;
+        }
+
+        if !changed {
+            return Ok(IssueMutationResult {
+                changed: false,
+                issue,
+                change_kind: "no_change".to_string(),
+            });
+        }
+
+        issue.updated_at = Utc::now();
+
+        let updated_issue = self.issue_repo
+            .update(issue)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to update issue: {}", e)))?;
+
+        Ok(IssueMutationResult {
+            changed: true,
+            issue: updated_issue,
+            change_kind,
+        })
+    }
+
+    async fn delete(&self, id: Uuid, company_id: Uuid) -> Result<IssueMutationResult, ServiceError> {
+        let issue = self.get(id, company_id).await?;
+
+        // Check for child issues
+        let children = self.issue_repo
+            .list_children(id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to check child issues: {}", e)))?;
+
+        if !children.is_empty() {
+            return Err(ServiceError::Conflict(format!(
+                "Cannot delete issue with {} child issues",
+                children.len()
+            )));
+        }
+
+        self.issue_repo
+            .delete(id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to delete issue: {}", e)))?;
+
+        Ok(IssueMutationResult {
+            changed: true,
+            issue,
+            change_kind: "deleted".to_string(),
+        })
+    }
+
+    async fn checkout(&self, id: Uuid, company_id: Uuid, input: CheckoutInput) -> Result<Issue, ServiceError> {
+        let mut issue = self.get(id, company_id).await?;
+
+        // Verify expected status
+        if !input.expected_statuses.is_empty() && !input.expected_statuses.contains(&issue.status) {
+            return Err(ServiceError::Conflict(format!(
+                "Issue status '{}' not in expected statuses: {:?}",
+                issue.status, input.expected_statuses
+            )));
+        }
+
+        // Update to in_progress and assign
+        issue.status = "in_progress".to_string();
+        issue.assigned_to = input.agent_id.or(input.user_id);
+        issue.updated_at = Utc::now();
+
+        let updated_issue = self.issue_repo
+            .update(issue)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to checkout issue: {}", e)))?;
+
+        Ok(updated_issue)
+    }
+
+    async fn release(&self, id: Uuid, company_id: Uuid, input: ReleaseInput) -> Result<Issue, ServiceError> {
+        let mut issue = self.get(id, company_id).await?;
+
+        // Update status based on result
+        if let Some(target_status) = input.target_status {
+            self.validate_status_transition(&issue.status, &target_status)?;
+            issue.status = target_status;
+        } else if let Some(result) = input.result.as_deref() {
+            issue.status = match result {
+                "success" => "done",
+                "failed" => "todo",
+                "cancelled" => "cancelled",
+                _ => "todo",
+            }.to_string();
+        }
+
+        issue.updated_at = Utc::now();
+
+        let updated_issue = self.issue_repo
+            .update(issue)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to release issue: {}", e)))?;
+
+        Ok(updated_issue)
+    }
+
+    async fn search(
+        &self,
+        company_id: Uuid,
+        query: &str,
+        filter: &IssueQueryFilter,
+        pagination: &Pagination,
+    ) -> Result<Vec<Issue>, ServiceError> {
+        self.issue_repo
+            .search(company_id, query, filter, pagination)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to search issues: {}", e)))
+    }
+
+    fn tree_control(&self) -> Arc<dyn IssueTreeControlService> {
+        self.tree_control_service.clone()
+    }
+
+    fn comments(&self) -> Arc<dyn IssueCommentService> {
+        self.comment_service.clone()
+    }
+
+    fn documents(&self) -> Arc<dyn IssueDocumentService> {
+        self.document_service.clone()
+    }
+
+    fn work_products(&self) -> Arc<dyn WorkProductService> {
+        self.work_product_service.clone()
+    }
+
+    fn attachments(&self) -> Arc<dyn AttachmentService> {
+        self.attachment_service.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_status_transition() {
+        let service = DefaultIssueService::new(
+            Arc::new(MockIssueRepository::new()),
+            Arc::new(MockIssueTreeControlService::new()),
+            Arc::new(MockIssueCommentService::new()),
+            Arc::new(MockIssueDocumentService::new()),
+            Arc::new(MockWorkProductService::new()),
+            Arc::new(MockAttachmentService::new()),
+        );
+
+        // Valid transitions
+        assert!(service.validate_status_transition("todo", "in_progress").is_ok());
+        assert!(service.validate_status_transition("in_progress", "done").is_ok());
+        assert!(service.validate_status_transition("blocked", "in_progress").is_ok());
+
+        // Invalid transitions
+        assert!(service.validate_status_transition("done", "todo").is_err());
+        assert!(service.validate_status_transition("todo", "done").is_err());
+        assert!(service.validate_status_transition("cancelled", "in_progress").is_err());
+    }
+}
