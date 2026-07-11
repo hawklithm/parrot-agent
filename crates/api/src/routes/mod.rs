@@ -46,3 +46,5 @@ pub mod invite_resources;
 pub use invite_resources::invite_resource_routes;
 pub mod routine_annotations;
 pub use routine_annotations::routine_annotation_routes;
+pub mod org_chart;
+pub use org_chart::org_chart_routes;

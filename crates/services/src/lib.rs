@@ -90,3 +90,5 @@ pub mod invite_resource_service;
 pub use invite_resource_service::*;
 pub mod routine_annotation_service;
 pub use routine_annotation_service::*;
+pub mod org_chart_service;
+pub use org_chart_service::*;

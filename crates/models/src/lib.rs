@@ -57,3 +57,5 @@ pub mod invite_resource;
 pub use invite_resource::*;
 pub mod routine_annotation;
 pub use routine_annotation::*;
+pub mod org_chart;
+pub use org_chart::*;
