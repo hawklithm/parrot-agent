@@ -143,3 +143,5 @@ pub mod event_bus_service;
 pub use event_bus_service::*;
 pub mod saga_orchestrator;
 pub use saga_orchestrator::*;
+pub mod consistency_service;
+pub use consistency_service::*;
