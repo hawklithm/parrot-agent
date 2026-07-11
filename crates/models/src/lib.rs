@@ -1,4 +1,5 @@
 pub mod activity_log;
+pub mod adapter;
 pub mod agent;
 pub mod agent_api_key;
 pub mod approval;
@@ -43,6 +44,7 @@ pub mod user_secret_definition;
 pub mod websocket;
 
 pub use activity_log::*;
+pub use adapter::*;
 pub use agent::*;
 pub use agent_api_key::*;
 pub use approval::*;

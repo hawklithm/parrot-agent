@@ -1,5 +1,7 @@
 pub mod errors;
 pub mod activity_log;
+pub mod adapter_registry;
+pub mod adapters;
 pub mod event_bus;
 pub mod saga;
 pub mod consistency;
@@ -136,3 +138,5 @@ pub mod consistency_service;
 pub use consistency_service::*;
 pub mod agent_access_service;
 pub use agent_access_service::*;
+pub use adapter_registry::*;
+pub use adapters::*;
