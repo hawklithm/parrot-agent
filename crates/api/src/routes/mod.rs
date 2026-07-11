@@ -50,3 +50,5 @@ pub mod org_chart;
 pub use org_chart::org_chart_routes;
 pub mod issues;
 pub use issues::issue_routes;
+pub mod cases;
+pub use cases::case_routes;

@@ -98,3 +98,5 @@ pub mod issue_service;
 pub use issue_service::*;
 pub mod issue_service_mock;
 pub use issue_service_mock::*;
+pub mod case_service;
+pub use case_service::*;
