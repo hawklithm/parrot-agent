@@ -112,3 +112,5 @@ pub mod work_product_service;
 pub use work_product_service::*;
 pub mod attachment_service;
 pub use attachment_service::*;
+pub mod environment_service;
+pub use environment_service::*;

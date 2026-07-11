@@ -62,3 +62,5 @@ pub mod work_products;
 pub use work_products::work_product_routes;
 pub mod attachments;
 pub use attachments::attachment_routes;
+pub mod environments;
+pub use environments::environment_routes;

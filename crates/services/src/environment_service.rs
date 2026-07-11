@@ -1,147 +1,307 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use uuid::Uuid;
+use crate::models::{Environment, EnvironmentLease, ExecutionWorkspace, CreateEnvironmentInput, UpdateEnvironmentInput};
 
-use crate::ServiceError;
-
-pub type ServiceResult<T> = Result<T, ServiceError>;
-
-/// Environment probe result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnvironmentProbeResult {
-    pub ok: bool,
-    pub driver: String,
-    pub summary: String,
-    pub details: Option<serde_json::Value>,
-}
-
-/// Lease acquisition result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LeaseAcquisitionResult {
-    pub lease_id: Uuid,
-    pub status: String,
-    pub acquired_at: chrono::DateTime<chrono::Utc>,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// Delete blast radius analysis
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteBlastRadiusResult {
-    pub environment_id: Uuid,
-    pub can_delete: bool,
-    pub dependent_workspaces: usize,
-    pub dependent_agents: Vec<Uuid>,
-    pub dependent_issues: Vec<Uuid>,
-    pub warnings: Vec<String>,
-}
-
-/// Environment service trait for diagnostic operations
+/// Environment service trait
 #[async_trait]
 pub trait EnvironmentService: Send + Sync {
-    /// Probe environment for readiness and connectivity
-    async fn probe_environment(&self, environment_id: Uuid) -> ServiceResult<EnvironmentProbeResult>;
-
-    /// Acquire a lease for the environment
-    async fn acquire_lease(&self, environment_id: Uuid) -> ServiceResult<LeaseAcquisitionResult>;
-
-    /// Analyze impact of deleting an environment
-    async fn get_delete_blast_radius(&self, environment_id: Uuid) -> ServiceResult<DeleteBlastRadiusResult>;
+    /// List environments for a company
+    async fn list_environments(&self, company_id: Uuid) -> Result<Vec<Environment>, String>;
+    
+    /// Get environment by ID
+    async fn get_environment(&self, id: Uuid, company_id: Uuid) -> Result<Option<Environment>, String>;
+    
+    /// Create environment
+    async fn create_environment(&self, company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, String>;
+    
+    /// Update environment
+    async fn update_environment(&self, id: Uuid, company_id: Uuid, input: UpdateEnvironmentInput) -> Result<Environment, String>;
+    
+    /// Delete environment
+    async fn delete_environment(&self, id: Uuid, company_id: Uuid) -> Result<bool, String>;
+    
+    /// Probe environment (test connectivity)
+    async fn probe_environment(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String>;
 }
 
-/// Default implementation of EnvironmentService
-pub struct EnvironmentServiceImpl {
-    // In production: would contain EnvironmentRepository, RuntimeLeaseRepository
+/// Environment lease service trait
+#[async_trait]
+pub trait EnvironmentLeaseService: Send + Sync {
+    /// Acquire environment lease
+    async fn acquire_lease(
+        &self,
+        environment_id: Uuid,
+        company_id: Uuid,
+        issue_id: Option<Uuid>,
+        heartbeat_run_id: Option<Uuid>,
+    ) -> Result<EnvironmentLease, String>;
+    
+    /// Release environment lease
+    async fn release_lease(&self, lease_id: Uuid, company_id: Uuid) -> Result<EnvironmentLease, String>;
+    
+    /// List active leases for a company
+    async fn list_active_leases(&self, company_id: Uuid) -> Result<Vec<EnvironmentLease>, String>;
 }
 
-impl EnvironmentServiceImpl {
+/// Execution workspace service trait
+#[async_trait]
+pub trait ExecutionWorkspaceService: Send + Sync {
+    /// Create execution workspace
+    async fn create_workspace(
+        &self,
+        company_id: Uuid,
+        project_id: Option<Uuid>,
+        name: String,
+    ) -> Result<ExecutionWorkspace, String>;
+    
+    /// Get workspace by ID
+    async fn get_workspace(&self, id: Uuid, company_id: Uuid) -> Result<Option<ExecutionWorkspace>, String>;
+    
+    /// List workspaces for a company
+    async fn list_workspaces(&self, company_id: Uuid) -> Result<Vec<ExecutionWorkspace>, String>;
+    
+    /// Dispose workspace
+    async fn dispose_workspace(&self, id: Uuid, company_id: Uuid) -> Result<bool, String>;
+}
+
+/// Mock implementation of EnvironmentService
+pub struct MockEnvironmentService;
+
+impl MockEnvironmentService {
     pub fn new() -> Self {
-        Self {}
+        Self
     }
-}
-
-impl Default for EnvironmentServiceImpl {
-    fn default() -> Self {
-        Self::new()
+    
+    fn create_mock_environment(id: Uuid, company_id: Uuid, name: String) -> Environment {
+        use crate::models::{EnvironmentDriver, EnvironmentStatus};
+        Environment {
+            id,
+            company_id,
+            name,
+            description: Some("Mock environment".to_string()),
+            driver: EnvironmentDriver::Local,
+            status: EnvironmentStatus::Active,
+            config: serde_json::json!({}),
+            env_vars: serde_json::json!({}),
+            metadata: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
     }
 }
 
 #[async_trait]
-impl EnvironmentService for EnvironmentServiceImpl {
-    async fn probe_environment(&self, environment_id: Uuid) -> ServiceResult<EnvironmentProbeResult> {
-        // Placeholder: In production, would call EnvironmentDriver::probe()
-        Ok(EnvironmentProbeResult {
-            ok: true,
-            driver: "local".to_string(),
-            summary: format!("Environment {} is ready", environment_id),
-            details: Some(serde_json::json!({
-                "status": "healthy",
-                "last_check": chrono::Utc::now(),
-            })),
-        })
+impl EnvironmentService for MockEnvironmentService {
+    async fn list_environments(&self, company_id: Uuid) -> Result<Vec<Environment>, String> {
+        Ok(vec![
+            Self::create_mock_environment(Uuid::new_v4(), company_id, "Local Dev".to_string()),
+            Self::create_mock_environment(Uuid::new_v4(), company_id, "SSH Remote".to_string()),
+        ])
     }
-
-    async fn acquire_lease(&self, environment_id: Uuid) -> ServiceResult<LeaseAcquisitionResult> {
-        // Placeholder: In production, would call LeaseService::acquire()
-        let now = chrono::Utc::now();
-        Ok(LeaseAcquisitionResult {
-            lease_id: Uuid::new_v4(),
-            status: "active".to_string(),
-            acquired_at: now,
-            expires_at: Some(now + chrono::Duration::hours(1)),
-        })
+    
+    async fn get_environment(&self, id: Uuid, company_id: Uuid) -> Result<Option<Environment>, String> {
+        Ok(Some(Self::create_mock_environment(id, company_id, "Mock Environment".to_string())))
     }
-
-    async fn get_delete_blast_radius(&self, environment_id: Uuid) -> ServiceResult<DeleteBlastRadiusResult> {
-        // Placeholder: In production, would query dependent resources
-        Ok(DeleteBlastRadiusResult {
-            environment_id,
-            can_delete: true,
-            dependent_workspaces: 0,
-            dependent_agents: vec![],
-            dependent_issues: vec![],
-            warnings: vec![],
-        })
+    
+    async fn create_environment(&self, company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, String> {
+        let mut env = Self::create_mock_environment(Uuid::new_v4(), company_id, input.name);
+        env.driver = input.driver;
+        env.config = input.config;
+        env.env_vars = input.env_vars.unwrap_or_else(|| serde_json::json!({}));
+        Ok(env)
+    }
+    
+    async fn update_environment(&self, id: Uuid, company_id: Uuid, input: UpdateEnvironmentInput) -> Result<Environment, String> {
+        let mut env = Self::create_mock_environment(id, company_id, input.name.unwrap_or_else(|| "Updated".to_string()));
+        if let Some(status) = input.status {
+            env.status = status;
+        }
+        Ok(env)
+    }
+    
+    async fn delete_environment(&self, _id: Uuid, _company_id: Uuid) -> Result<bool, String> {
+        Ok(true)
+    }
+    
+    async fn probe_environment(&self, _id: Uuid, _company_id: Uuid) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"ok": true, "driver": "local", "summary": "All checks passed"}))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Mock implementation of EnvironmentLeaseService
+pub struct MockEnvironmentLeaseService;
 
-    #[tokio::test]
-    async fn test_probe_environment() {
-        let service = EnvironmentServiceImpl::new();
-        let env_id = Uuid::new_v4();
-        let result = service.probe_environment(env_id).await;
-        assert!(result.is_ok());
-        let probe = result.unwrap();
-        assert!(probe.ok);
-        assert_eq!(probe.driver, "local");
+impl MockEnvironmentLeaseService {
+    pub fn new() -> Self {
+        Self
     }
+}
 
-    #[tokio::test]
-    async fn test_acquire_lease() {
-        let service = EnvironmentServiceImpl::new();
-        let env_id = Uuid::new_v4();
-        let result = service.acquire_lease(env_id).await;
-        assert!(result.is_ok());
-        let lease = result.unwrap();
-        assert_eq!(lease.status, "active");
-        assert!(lease.expires_at.is_some());
+#[async_trait]
+impl EnvironmentLeaseService for MockEnvironmentLeaseService {
+    async fn acquire_lease(
+        &self,
+        environment_id: Uuid,
+        company_id: Uuid,
+        issue_id: Option<Uuid>,
+        heartbeat_run_id: Option<Uuid>,
+    ) -> Result<EnvironmentLease, String> {
+        use crate::models::LeaseStatus;
+        Ok(EnvironmentLease {
+            id: Uuid::new_v4(),
+            company_id,
+            environment_id,
+            execution_workspace_id: None,
+            issue_id,
+            heartbeat_run_id,
+            status: LeaseStatus::Active,
+            lease_policy: None,
+            provider: Some("local".to_string()),
+            provider_lease_id: None,
+            acquired_at: chrono::Utc::now(),
+            last_used_at: Some(chrono::Utc::now()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            released_at: None,
+            failure_reason: None,
+            cleanup_status: None,
+        })
     }
+    
+    async fn release_lease(&self, lease_id: Uuid, company_id: Uuid) -> Result<EnvironmentLease, String> {
+        use crate::models::LeaseStatus;
+        Ok(EnvironmentLease {
+            id: lease_id,
+            company_id,
+            environment_id: Uuid::new_v4(),
+            execution_workspace_id: None,
+            issue_id: None,
+            heartbeat_run_id: None,
+            status: LeaseStatus::Released,
+            lease_policy: None,
+            provider: Some("local".to_string()),
+            provider_lease_id: None,
+            acquired_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            last_used_at: Some(chrono::Utc::now()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            released_at: Some(chrono::Utc::now()),
+            failure_reason: None,
+            cleanup_status: Some("cleaned".to_string()),
+        })
+    }
+    
+    async fn list_active_leases(&self, company_id: Uuid) -> Result<Vec<EnvironmentLease>, String> {
+        use crate::models::LeaseStatus;
+        Ok(vec![
+            EnvironmentLease {
+                id: Uuid::new_v4(),
+                company_id,
+                environment_id: Uuid::new_v4(),
+                execution_workspace_id: None,
+                issue_id: None,
+                heartbeat_run_id: None,
+                status: LeaseStatus::Active,
+                lease_policy: None,
+                provider: Some("local".to_string()),
+                provider_lease_id: None,
+                acquired_at: chrono::Utc::now() - chrono::Duration::minutes(30),
+                last_used_at: Some(chrono::Utc::now()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(30)),
+                released_at: None,
+                failure_reason: None,
+                cleanup_status: None,
+            },
+        ])
+    }
+}
 
-    #[tokio::test]
-    async fn test_get_delete_blast_radius() {
-        let service = EnvironmentServiceImpl::new();
-        let env_id = Uuid::new_v4();
-        let result = service.get_delete_blast_radius(env_id).await;
-        assert!(result.is_ok());
-        let blast_radius = result.unwrap();
-        assert_eq!(blast_radius.environment_id, env_id);
-        assert!(blast_radius.can_delete);
+/// Mock implementation of ExecutionWorkspaceService
+pub struct MockExecutionWorkspaceService;
+
+impl MockExecutionWorkspaceService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl ExecutionWorkspaceService for MockExecutionWorkspaceService {
+    async fn create_workspace(
+        &self,
+        company_id: Uuid,
+        project_id: Option<Uuid>,
+        name: String,
+    ) -> Result<ExecutionWorkspace, String> {
+        use crate::models::{ExecutionWorkspaceMode, ExecutionWorkspaceStrategyType, ExecutionWorkspaceStatus};
+        Ok(ExecutionWorkspace {
+            id: Uuid::new_v4(),
+            company_id,
+            project_id,
+            project_workspace_id: None,
+            source_issue_id: None,
+            name,
+            mode: ExecutionWorkspaceMode::Ephemeral,
+            strategy_type: ExecutionWorkspaceStrategyType::CloneAndCheckout,
+            status: ExecutionWorkspaceStatus::Provisioning,
+            cwd: Some("/tmp/workspace".to_string()),
+            provider_ref: None,
+            base_ref: Some("main".to_string()),
+            branch_name: None,
+            repo_url: None,
+            metadata: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        })
+    }
+    
+    async fn get_workspace(&self, id: Uuid, company_id: Uuid) -> Result<Option<ExecutionWorkspace>, String> {
+        use crate::models::{ExecutionWorkspaceMode, ExecutionWorkspaceStrategyType, ExecutionWorkspaceStatus};
+        Ok(Some(ExecutionWorkspace {
+            id,
+            company_id,
+            project_id: None,
+            project_workspace_id: None,
+            source_issue_id: None,
+            name: "Mock Workspace".to_string(),
+            mode: ExecutionWorkspaceMode::Ephemeral,
+            strategy_type: ExecutionWorkspaceStrategyType::CloneAndCheckout,
+            status: ExecutionWorkspaceStatus::Ready,
+            cwd: Some("/tmp/workspace".to_string()),
+            provider_ref: None,
+            base_ref: Some("main".to_string()),
+            branch_name: None,
+            repo_url: None,
+            metadata: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }))
+    }
+    
+    async fn list_workspaces(&self, company_id: Uuid) -> Result<Vec<ExecutionWorkspace>, String> {
+        use crate::models::{ExecutionWorkspaceMode, ExecutionWorkspaceStrategyType, ExecutionWorkspaceStatus};
+        Ok(vec![
+            ExecutionWorkspace {
+                id: Uuid::new_v4(),
+                company_id,
+                project_id: None,
+                project_workspace_id: None,
+                source_issue_id: None,
+                name: "Workspace 1".to_string(),
+                mode: ExecutionWorkspaceMode::Ephemeral,
+                strategy_type: ExecutionWorkspaceStrategyType::CloneAndCheckout,
+                status: ExecutionWorkspaceStatus::Ready,
+                cwd: Some("/tmp/workspace1".to_string()),
+                provider_ref: None,
+                base_ref: Some("main".to_string()),
+                branch_name: None,
+                repo_url: None,
+                metadata: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        ])
+    }
+    
+    async fn dispose_workspace(&self, _id: Uuid, _company_id: Uuid) -> Result<bool, String> {
+        Ok(true)
     }
 }
