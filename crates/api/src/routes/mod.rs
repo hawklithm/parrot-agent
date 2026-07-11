@@ -54,3 +54,5 @@ pub mod cases;
 pub use cases::case_routes;
 pub mod documents;
 pub use documents::document_routes;
+pub mod comments;
+pub use comments::comment_routes;

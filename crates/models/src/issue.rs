@@ -230,3 +230,22 @@ impl IssueDocument {
         }
     }
 }
+
+/// Add comment input
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddCommentInput {
+    pub body: String,
+    pub reopen_requested: Option<bool>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Comment actor type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CommentActorType {
+    Agent,
+    User,
+    Board,
+    System,
+}

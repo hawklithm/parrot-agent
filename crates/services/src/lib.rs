@@ -102,3 +102,7 @@ pub mod case_service;
 pub use case_service::*;
 pub mod document_service;
 pub use document_service::*;
+pub mod comment_service;
+pub use comment_service::*;
+pub mod comment_service;
+pub use comment_service::*;
