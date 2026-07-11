@@ -42,3 +42,5 @@ pub use environment_diagnostics::environment_diagnostics_routes;
 pub use secret_remote_import::secret_remote_import_routes;
 pub use custom_image_setup::custom_image_setup_routes;
 pub use skills::skill_routes;
+pub mod invite_resources;
+pub use invite_resources::invite_resource_routes;

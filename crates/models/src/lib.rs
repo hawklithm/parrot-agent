@@ -53,3 +53,5 @@ pub use environment_diagnostics::*;
 pub use secret_remote_import::*;
 pub use custom_image_setup::*;
 pub use skill::*;
+pub mod invite_resource;
+pub use invite_resource::*;

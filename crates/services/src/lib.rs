@@ -86,3 +86,5 @@ pub mod user_directory_service;
 pub mod sse_service;
 pub mod websocket_service;
 pub mod user_secret_definition_service;
+pub mod invite_resource_service;
+pub use invite_resource_service::*;
