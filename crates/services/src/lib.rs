@@ -12,6 +12,7 @@ pub mod config_revision_service;
 pub mod config_revision_service_impl;
 pub mod environment_runtime_service;
 pub mod secret_service;
+pub mod database_secret_service;
 pub mod secret_provider;
 pub mod websocket_service;
 pub mod sse_service;
