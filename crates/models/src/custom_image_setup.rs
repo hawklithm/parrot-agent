@@ -2,70 +2,124 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Custom image setup session status
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Setup session status
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SetupSessionStatus {
-    Starting,
-    WaitingForUser,
-    Capturing,
+pub enum EnvironmentCustomImageSetupSessionStatus {
+    Pending,
+    Running,
     Completed,
-    Failed,
     Cancelled,
+    TimedOut,
+    Failed,
 }
 
-/// Setup session connection type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Connection type for setup session
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ConnectionType {
+pub enum EnvironmentCustomImageSetupConnectionType {
     Ssh,
 }
 
-/// Connection payload for setup session
+/// Connection summary (redacted connection details)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConnectionPayload {
-    pub r#type: ConnectionType,
-    pub command: Option<String>,
-    pub token: Option<String>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub metadata: Option<serde_json::Value>,
+pub struct EnvironmentCustomImageSetupConnectionSummary {
+    #[serde(rename = "type")]
+    pub connection_type: EnvironmentCustomImageSetupConnectionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default = "default_true")]
+    pub host_redacted: bool,
+    #[serde(default = "default_true")]
+    pub port_redacted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
-/// Terminal session token response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalSessionToken {
-    pub id: String,
-    pub token: String,
-    pub expires_at: DateTime<Utc>,
-    pub setup_session_id: Uuid,
-    pub environment_id: Uuid,
-    pub connection_type: ConnectionType,
-    pub websocket_path: String,
+fn default_true() -> bool {
+    true
 }
 
-/// Custom image setup session
+/// Environment custom image setup session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CustomImageSetupSession {
+pub struct EnvironmentCustomImageSetupSession {
     pub id: Uuid,
     pub environment_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promoted_template_id: Option<Uuid>,
     pub provider: String,
-    pub status: SetupSessionStatus,
-    pub started_by_user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_lease_id: Option<Uuid>,
+    pub status: EnvironmentCustomImageSetupSessionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_by_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_by_agent_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_template_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
-    pub connection_summary: Option<ConnectionPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_summary: Option<EnvironmentCustomImageSetupConnectionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_secret_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// Setup session with connection payload
+/// Connection payload (full connection details including credentials)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetupSessionResult {
-    pub session: CustomImageSetupSession,
-    pub connection_payload: Option<ConnectionPayload>,
+pub struct EnvironmentCustomImageConnectionPayload {
+    #[serde(rename = "type")]
+    pub connection_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
+
+/// Setup session result (session + connection payload)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentCustomImageSetupSessionResult {
+    pub session: EnvironmentCustomImageSetupSession,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_payload: Option<EnvironmentCustomImageConnectionPayload>,
+}
+
+/// Terminal session token (WebSocket authentication)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentCustomImageTerminalSessionToken {
+    pub id: String,
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+    pub setup_session_id: String,
+    pub environment_id: String,
+    pub connection_type: String,
+    pub websocket_path: String,
+}
+
+/// Request to create terminal session token (empty body)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateEnvironmentCustomImageTerminalSessionTokenRequest {}

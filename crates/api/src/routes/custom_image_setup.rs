@@ -1,64 +1,66 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::Json,
-    routing::{get, post},
-    Router,
+    response::{IntoResponse, Response},
+    Json,
 };
-use models::custom_image_setup::{SetupSessionResult, TerminalSessionToken};
+use models::{
+    CreateEnvironmentCustomImageTerminalSessionTokenRequest,
+    EnvironmentCustomImageSetupSessionResult, EnvironmentCustomImageTerminalSessionToken,
+};
 use services::custom_image_setup_service::CustomImageSetupService;
 use std::sync::Arc;
 use uuid::Uuid;
 
 /// GET /environment-custom-image-setup-sessions/:sessionId
-/// Get setup session details
-pub async fn get_setup_session(
+/// Get setup session details (status, connection info)
+pub async fn get_session(
     Path(session_id): Path<Uuid>,
     State(service): State<Arc<dyn CustomImageSetupService>>,
-) -> Result<Json<SetupSessionResult>, StatusCode> {
-    service
-        .get_setup_session(session_id)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            if matches!(e, services::ServiceError::NotFound(_)) {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+) -> Response {
+    // TODO: Add permission check - user must have access to environment
+
+    match service.get_session(session_id).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => match e {
+            services::errors::ServiceError::NotFound(_) => {
+                (StatusCode::NOT_FOUND, e.to_string()).into_response()
             }
-        })
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+    }
 }
 
 /// POST /environment-custom-image-setup-sessions/:sessionId/terminal-session-token
-/// Generate terminal session token for WebSocket authentication
+/// Create terminal session token for WebSocket authentication
 pub async fn create_terminal_session_token(
     Path(session_id): Path<Uuid>,
     State(service): State<Arc<dyn CustomImageSetupService>>,
-) -> Result<Json<TerminalSessionToken>, StatusCode> {
-    service
-        .create_terminal_session_token(session_id)
+    Json(request): Json<CreateEnvironmentCustomImageTerminalSessionTokenRequest>,
+) -> Response {
+    // TODO: Add permission check - assertCanAccessEnvironment
+
+    match service
+        .create_terminal_session_token(session_id, request)
         .await
-        .map(Json)
-        .map_err(|e| {
-            if matches!(e, services::ServiceError::NotFound(_)) {
-                StatusCode::NOT_FOUND
-            } else if matches!(e, services::ServiceError::Unauthorized(_)) {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        })
+    {
+        Ok(token) => (StatusCode::CREATED, Json(token)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
-/// Register custom image setup session routes
-pub fn custom_image_setup_routes() -> Router<Arc<dyn CustomImageSetupService>> {
-    Router::new()
+/// Router setup for custom image setup endpoints
+pub fn custom_image_setup_routes(
+    service: Arc<dyn CustomImageSetupService>,
+) -> axum::Router {
+    axum::Router::new()
         .route(
-            "/environment-custom-image-setup-sessions/:session_id",
-            get(get_setup_session),
+            "/environment-custom-image-setup-sessions/:sessionId",
+            axum::routing::get(get_session),
         )
         .route(
-            "/environment-custom-image-setup-sessions/:session_id/terminal-session-token",
-            post(create_terminal_session_token),
+            "/environment-custom-image-setup-sessions/:sessionId/terminal-session-token",
+            axum::routing::post(create_terminal_session_token),
         )
+        .with_state(service)
 }
