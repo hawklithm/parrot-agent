@@ -176,6 +176,55 @@ where
             .await
             .map_err(|e| ConfigRevisionError::RepositoryError(e.to_string()))
     }
+
+    async fn rollback_to_revision(
+        &self,
+        agent_id: Uuid,
+        revision_id: Uuid,
+    ) -> ConfigRevisionResult<AgentConfigRevision> {
+        // 获取目标版本
+        let revision = self.get_revision(revision_id).await?;
+
+        // 验证版本属于该Agent
+        if revision.agent_id != agent_id {
+            return Err(ConfigRevisionError::RepositoryError(
+                "Revision does not belong to this agent".to_string(),
+            ));
+        }
+
+        // 获取当前Agent
+        let mut agent = self
+            .agent_repo
+            .get_by_id(agent_id)
+            .await
+            .map_err(|e| match e {
+                RepositoryError::NotFound(_) => ConfigRevisionError::AgentNotFound(agent_id),
+                _ => ConfigRevisionError::RepositoryError(e.to_string()),
+            })?;
+
+        // 反序列化快照
+        let snapshot: ConfigSnapshot = serde_json::from_value(revision.snapshot.0.clone())
+            .map_err(|e| ConfigRevisionError::SerializationError(e.to_string()))?;
+
+        // 应用配置快照到Agent
+        agent.adapter_type = snapshot.adapter_type;
+        agent.adapter_config = Json(snapshot.adapter_config);
+        agent.runtime_config = Json(snapshot.runtime_config);
+        agent.permissions = Json(
+            serde_json::from_value(snapshot.permissions)
+                .unwrap_or_else(|_| models::AgentPermissions::default()),
+        );
+        agent.budget_monthly_cents = snapshot.budget_monthly_cents;
+
+        // 保存Agent更新
+        self.agent_repo
+            .update(agent)
+            .await
+            .map_err(|e| ConfigRevisionError::RepositoryError(e.to_string()))?;
+
+        // 创建新的快照记录回滚操作
+        self.capture_snapshot(agent_id).await
+    }
 }
 
 #[cfg(test)]

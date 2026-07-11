@@ -70,6 +70,13 @@ pub trait ConfigRevisionService: Send + Sync {
 
     /// 统计Agent的版本总数
     async fn count_revisions(&self, agent_id: Uuid) -> ConfigRevisionResult<i64>;
+
+    /// 回滚Agent配置到指定版本
+    async fn rollback_to_revision(
+        &self,
+        agent_id: Uuid,
+        revision_id: Uuid,
+    ) -> ConfigRevisionResult<AgentConfigRevision>;
 }
 
 /// ConfigDiff - 配置差异结构
