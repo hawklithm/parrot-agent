@@ -16,6 +16,7 @@ pub mod routine;
 pub mod goal;
 pub mod custom_image_setup;
 pub mod openclaw;
+pub mod user_directory;
 
 pub use agent::*;
 pub use agent_api_key::*;
@@ -35,3 +36,4 @@ pub use routine::*;
 pub use goal::*;
 pub use custom_image_setup::*;
 pub use openclaw::*;
+pub use user_directory::*;
