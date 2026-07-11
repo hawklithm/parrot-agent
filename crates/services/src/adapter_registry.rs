@@ -125,6 +125,19 @@ impl Default for AdapterRegistry {
     }
 }
 
+/// 创建并注册所有内置适配器
+pub fn create_default_adapter_registry() -> AdapterRegistry {
+    let mut registry = AdapterRegistry::new();
+
+    // 注册 Process 适配器
+    registry.register(Arc::new(crate::adapters::ProcessAdapter::new()));
+
+    // 注册 Claude Local 适配器
+    registry.register(Arc::new(crate::adapters::ClaudeLocalAdapter::new()));
+
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
