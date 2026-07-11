@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn test_auth_error_forbidden_with_code() {
         let err = AuthError::forbidden_with_code("Not company member", "auth.not_company_member");
-        asserr.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
         assert_eq!(err.error_code(), "auth.not_company_member");
     }
 

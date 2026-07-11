@@ -83,7 +83,7 @@ impl ResourceMembershipService {
     ) -> AppResult<ProjectMembership> {
         // TODO: assert_mutation_allowed when AccessService is implemented
         // TODO: policy_hook evaluation
-  elf.project_repo.upsert_project_membership(company_id, project_id, user_id, state).await?)
+        Ok(self.project_repo.upsert_project_membership(company_id, project_id, user_id, state).await?)
     }
 
     pub async fn star_project(

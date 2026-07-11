@@ -101,7 +101,8 @@ pub enum ActorSource {
     AgentJwt,
     /// 云租户认证（多租户SaaS模式）
     CloudTenant,
-    /// 无认证（匿名访问 None,
+    /// 无认证（匿名访问）
+    None,
 }
 
 impl ActorSource {

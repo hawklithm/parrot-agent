@@ -118,13 +118,13 @@ impl IssueService for MockIssueService {
         let mut issue = Self::create_mock_issue(id, company_id, "Deleted Issue".to_string());
         issue.status = IssueStatus::Cancelled;
         issue.cancelled_at = Some(Utc::now());
-     MutationResult {
+        Ok(IssueMutationResult {
             changed: true,
             issue,
             change_kind: "deleted".to_string(),
         })
     }
-    
+
     async fn checkout(&self, id: Uuid, company_id: Uuid, input: CheckoutInput) -> Result<Issue, String> {
         let mut issue = Self::create_mock_issue(id, company_id, "Checked Out Issue".to_string());
         issue.checkout_run_id = Some(input.checkout_run_id);
@@ -133,7 +133,8 @@ impl IssueService for MockIssueService {
         issue.execution_locked_at = Some(Utc::now());
         Ok(issue)
     }
-  nc fn release(&self, id: Uuid, company_id: Uuid, input: ReleaseInput) -> Result<Issue, String> {
+
+    async fn release(&self, id: Uuid, company_id: Uuid, input: ReleaseInput) -> Result<Issue, String> {
         let mut issue = Self::create_mock_issue(id, company_id, "Released Issue".to_string());
         issue.execution_run_id = Some(input.release_run_id);
         issue.execution_locked_at = None;
@@ -146,9 +147,10 @@ impl IssueService for MockIssueService {
         }
         Ok(issue)
     }
-    
+
     async fn search(
-      n        company_id: Uuid,
+        &self,
+        company_id: Uuid,
         query: &str,
         _filter: &IssueQueryFilter,
         _pagination: &Pagination,

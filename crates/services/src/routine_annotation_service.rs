@@ -80,7 +80,7 @@ impl RoutineAnnotationService for MockRoutineAnnotationService {
                 quote: AnnotationTextQuoteSelector {
                     exact: "This is the selected text for annotation".to_string(),
                     prefix: "Context before...".to_string(),
-                    suffixext after".to_string(),
+                    suffix: "Context after".to_string(),
                 },
                 position: AnnotationTextPositionSelector {
                     normalized_start: 100,
@@ -98,7 +98,7 @@ impl RoutineAnnotationService for MockRoutineAnnotationService {
             updated_at: now,
         };
 
-        let comments = if innts {
+        let comments = if include_comments {
             vec![RoutineAnnotationComment {
                 id: Uuid::new_v4(),
                 company_id,
@@ -186,7 +186,7 @@ impl RoutineAnnotationService for MockRoutineAnnotationService {
         routine_id: Uuid,
         thread_id: Uuid,
         request: CreateRoutineAnnotationCommentRequest,
-   lt<RoutineAnnotationComment, String> {
+    ) -> Result<RoutineAnnotationComment, String> {
         let now = chrono::Utc::now();
 
         Ok(RoutineAnnotationComment {
@@ -235,7 +235,7 @@ impl RoutineAnnotationService for MockRoutineAnnotationService {
             original_revision_number: 1,
             current_revision_id: Some(Uuid::new_v4()),
             current_revision_number: 1,
-            selected_text: "This is the selected text for annotto_string(),
+            selected_text: "This is the selected text for annotation".to_string(),
             prefix_text: "Context before...".to_string(),
             suffix_text: "...context after".to_string(),
             normalized_start: 100,

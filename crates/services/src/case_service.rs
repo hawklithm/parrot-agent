@@ -25,7 +25,7 @@ pub struct CaseMutationResult {
 /// Case service trait for business logic
 #[async_trait]
 pub trait CaseService: Send + Sync {
-    async fn create(&self, ateCaseInput, upsert: bool) -> Result<CaseMutationResult, String>;
+    async fn create(&self, input: UpsertCaseInput, upsert: bool) -> Result<CaseMutationResult, String>;
     async fn get(&self, id: Uuid, company_id: Uuid) -> Result<Option<Case>, String>;
     async fn get_detail(&self, id: Uuid, company_id: Uuid) -> Result<Option<CaseDetail>, String>;
     async fn list(&self, company_id: Uuid, filter: &CaseQueryFilter, pagination: &Pagination) -> Result<Vec<Case>, String>;
@@ -34,7 +34,7 @@ pub trait CaseService: Send + Sync {
 }
 
 /// Mock implementation of CaseService
-put MockCaseService;
+pub struct MockCaseService;
 
 impl MockCaseService {
     pub fn new() -> Self {

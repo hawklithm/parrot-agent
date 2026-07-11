@@ -240,7 +240,7 @@ pub struct AuthorizationDecision {
 
 impl AuthorizationDecision {
     /// 创建允许决策
-    pub fn allow(action: AuthorizationAction, reason: DecisionReason, explanation: Stringf {
+    pub fn allow(action: AuthorizationAction, reason: DecisionReason, explanation: String) -> Self {
         let grant_id = match &reason {
             DecisionReason::AllowExplicitGrant { grant_id } => Some(*grant_id),
             _ => None,

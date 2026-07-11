@@ -329,7 +329,7 @@ impl InviteServiceComplete for DefaultInviteServiceComplete {
 
         // Send notification to company admins
         let notification_sent = self
-     l_service
+            .email_service
             .send_invite_acceptance_notification(invite.company_id, &acceptance_data.agent_name)
             .await
             .is_ok();
