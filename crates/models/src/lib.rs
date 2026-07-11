@@ -14,6 +14,7 @@ pub mod user_secret;
 pub mod secret_provider;
 pub mod routine;
 pub mod goal;
+pub mod custom_image_setup;
 
 pub use agent::*;
 pub use agent_api_key::*;
@@ -31,3 +32,4 @@ pub use user_secret::*;
 pub use secret_provider::*;
 pub use routine::*;
 pub use goal::*;
+pub use custom_image_setup::*;

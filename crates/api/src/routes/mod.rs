@@ -8,9 +8,17 @@ pub mod issue_comments;
 pub mod issue_documents;
 pub mod issue_tree_control;
 pub mod user_secrets;
+pub mod skills;
+pub mod environments;
+pub mod secret_remote_import;
+pub mod custom_image_setup;
 
 pub use agents::agent_routes;
 pub use adapters::adapter_routes;
 pub use config_revisions::config_revision_routes;
 pub use org::org_routes;
 pub use user_secrets::user_secret_routes;
+pub use skills::skills_routes;
+pub use environments::environment_diagnostic_routes;
+pub use secret_remote_import::secret_remote_import_routes;
+pub use custom_image_setup::custom_image_setup_routes;

@@ -59,6 +59,50 @@ pub struct SecretDiscoveryPreview {
     pub warnings: Vec<String>,
 }
 
+/// Conflict resolution strategy for remote import
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictResolution {
+    /// Skip secrets that already exist
+    Skip,
+    /// Overwrite existing secrets
+    Overwrite,
+    /// Create new version of existing secrets
+    Version,
+}
+
+/// Remote import preview result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteImportPreview {
+    pub provider: String,
+    pub total_secrets: usize,
+    pub new_secrets: usize,
+    pub conflicting_secrets: usize,
+    pub candidates: Vec<SecretDiscoveryCandidate>,
+    pub warnings: Vec<String>,
+}
+
+/// Remote import execution result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteImportResult {
+    pub imported_count: usize,
+    pub skipped_count: usize,
+ iled_count: usize,
+    pub imported_keys: Vec<String>,
+    pub skipped_keys: Vec<String>,
+    pub errors: Vec<ImportError>,
+}
+
+/// Import error detail
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportError {
+    pub secret_key: String,
+    pub error_message: String,
+}
+
 impl SecretProviderConfig {
     pub fn new(
         company_id: Uuid,
@@ -68,8 +112,7 @@ impl SecretProviderConfig {
     ) -> Self {
         let now = Utc::now();
         Self {
-            id: Uuid::new_v4(),
-            company_id,
+            id: Uuid::new_v4(),     company_id,
             provider_type,
             config: sqlx::types::Json(config),
             is_default: false,

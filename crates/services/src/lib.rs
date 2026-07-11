@@ -77,3 +77,6 @@ pub use issue_document_service::{
 pub use issue_tree_control_service::{
     IssueTreeControlService, IssueTreeControlServiceImpl, TreeControlServiceError, TreeControlServiceResult,
 };
+pub mod skills_service;
+pub mod environment_service;
+pub mod custom_image_setup_service;

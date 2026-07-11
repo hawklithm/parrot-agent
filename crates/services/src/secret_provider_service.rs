@@ -7,6 +7,7 @@ use crate::errors::{ServiceError, ServiceResult};
 use models::secret_provider::{
     SecretProviderConfig, ProviderHealthCheck, ProviderHealthStatus,
     SecretDiscoveryPreview, SecretDiscoveryCandidate,
+    RemoteImportPreview, RemoteImportResult, ConflictResolution, ImportError,
 };
 use repositories::secret_provider_config_repository::SecretProviderConfigRepository;
 
@@ -42,6 +43,24 @@ pub trait SecretProviderConfigService: Send + Sync {
     ) -> ServiceResult<SecretDiscoveryPreview>;
 
     async fn test_provider_health(&self, config_id: Uuid) -> ServiceResult<ProviderHealthCheck>;
+
+    /// Preview secrets from remote provider before importing
+    async fn remote_import_preview(
+        &self,
+        company_id: Uuid,
+        config_id: Uuid,
+        filters: Option<serde_json::Value>,
+    ) -> ServiceResult<RemoteImportPreview>;
+
+    /// Execute remote import of secrets from external provider
+    async fn remote_import_execute(
+        &self,
+        company_id: Uuid,
+        config_id: Uuid,
+        secret_keys: Vec<String>,
+        conflict_resolution: ConflictResolution,
+        created_by_user_id: Uuid,
+    ) -> ServiceResult<RemoteImportResult>;
 }
 
 pub struct SecretProviderConfigServiceImpl {
@@ -188,5 +207,80 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
             .map_err(|e| ServiceError::Database(e.to_string()))?;
 
         Ok(health_check)
+    }
+
+    async fn remote_import_preview(
+        &self,
+        company_id: Uuid,
+        config_id: Uuid,
+        filters: Option<serde_json::Value>,
+    ) -> ServiceResult<RemoteImportPreview> {
+        let config = self.repository
+            .get_config(config_id)
+            .await
+            .map_err(|e| ServiceError::Database(e.to_string()))?
+            .ok_or_else(|| ServiceError::NotFound(format!("Config {} not found", config_id)))?;
+
+        if config.company_id != company_id {
+            return Err(ServiceError::Unauthorized(
+                "Config does not belong to this company".to_string()
+            ));
+        }
+
+        // TODO: Implement actual provider-specific discovery with filters
+        // For now, return mock preview data
+        let candidates = vec![
+            SecretDiscoveryCandidate {
+                external_ref: "aws://secrets-manager/prod/db-password".to_string(),
+                suggested_name: "db_password".to_string(),
+                tags: vec![("env".to_string(), "prod".to_string())],
+                created_at: Some(chrono::Utc::now()),
+                last_modified_at: Some(chrono::Utc::now()),
+                conflict: None,
+            }
+        ];
+
+        Ok(RemoteImportPreview {
+            provider: config.provider_type.clone(),
+            total_secrets: candidates.len(),
+            new_secrets: candidates.len(),
+            conflicting_secrets: 0,
+            candidates,
+            warnings: vec![],
+        })
+    }
+
+    async fn remote_import_execute(
+        &self,
+        company_id: Uuid,
+        config_id: Uuid,
+        secret_keys: Vec<String>,
+        conflict_resolution: ConflictResolution,
+        created_by_user_id: Uuid,
+    ) -> ServiceResult<RemoteImportResult> {
+        let config = self.repository
+            .get_config(config_id)
+            .await
+            .map_err(|e| ServiceError::Database(e.to_string()))?
+            .ok_or_else(|| ServiceError::NotFound(format!("Config {} not found", config_id)))?;
+
+        if config.company_id != company_id {
+            return Err(ServiceError::Unauthorized(
+                "Config does not belong to this company".to_string()
+            ));
+        }
+
+        // TODO: Implement actual provider-specific import logic
+        // For now, simulate successful import
+        let imported_keys = secret_keys.clone();
+
+        Ok(RemoteImportResult {
+            imported_count: imported_keys.len(),
+            skipped_count: 0,
+            failed_count: 0,
+            imported_keys,
+            skipped_keys: vec![],
+            errors: vec![],
+        })
     }
 }

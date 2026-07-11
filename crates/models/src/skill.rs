@@ -71,3 +71,44 @@ pub struct AgentDesiredSkillEntry {
 pub struct AgentSkillSyncRequest {
     pub desired_skills: Vec<AgentDesiredSkillEntry>,
 }
+
+/// Available skill metadata for Skills API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableSkill {
+    pub name: String,
+    pub description: String,
+    pub is_paperclip_managed: bool,
+}
+
+/// Skill index entry with metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillIndexEntry {
+    pub name: String,
+    pub description: String,
+    pub is_paperclip_managed: bool,
+    pub version: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// Detailed skill information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDetail {
+    pub name: String,
+    pub description: String,
+is_paperclip_managed: bool,
+    pub version: Option<String>,
+    pub tags: Vec<String>,
+    pub usage_example: Option<String>,
+    pub parameters: Option<serde_json::Value>,
+    pub author: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Response wrapper for available skills
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvailableSkillsResponse {
+    pub skills: Vec<AvailableSkill>,
+}
