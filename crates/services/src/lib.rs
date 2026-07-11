@@ -1,4 +1,5 @@
 pub mod errors;
+pub mod access;
 pub mod activity_log;
 pub mod adapter_registry;
 pub mod adapters;
@@ -140,3 +141,4 @@ pub mod agent_access_service;
 pub use agent_access_service::*;
 pub use adapter_registry::*;
 pub use adapters::*;
+pub use access::*;
