@@ -1,0 +1,23 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+models = { path = "../models" }
+services = { path = "../services" }
+access = { path = "../access" }
+repositories = { path = "../repositories" }
+adapters = { path = "../adapters" }
+
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }
+garde = { version = "0.18", features = ["derive", "serde"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }

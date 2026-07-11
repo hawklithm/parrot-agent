@@ -1,0 +1,17 @@
+[package]
+name = "access"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+models = { path = "../models" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
