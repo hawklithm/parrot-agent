@@ -106,16 +106,18 @@ pub struct EnvironmentLease {
 }
 
 /// Execution workspace mode
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum ExecutionWorkspaceMode {
     Ephemeral,
     Persistent,
 }
 
 /// Execution workspace strategy type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum ExecutionWorkspaceStrategyType {
     CloneAndCheckout,
     ReuseExisting,
@@ -123,8 +125,9 @@ pub enum ExecutionWorkspaceStrategyType {
 }
 
 /// Execution workspace status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum ExecutionWorkspaceStatus {
     Provisioning,
     Ready,

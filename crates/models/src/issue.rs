@@ -204,6 +204,8 @@ pub struct LockDocumentInput {
     pub run_id: Option<Uuid>,
     pub agent_id: Option<Uuid>,
     pub user_id: Option<Uuid>,
+    pub locked_by_type: String,
+    pub locked_by_id: Uuid,
 }
 
 /// Add comment input
@@ -238,8 +240,8 @@ pub struct Pagination {
 /// Issue query filter
 #[derive(Debug, Clone, Default)]
 pub struct IssueQueryFilter {
-    pub status: Option<IssueStatus>,
-    pub priority: Option<IssuePriority>,
+    pub status: Option<Vec<IssueStatus>>,
+    pub priority: Option<Vec<IssuePriority>>,
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
     pub project_id: Option<Uuid>,

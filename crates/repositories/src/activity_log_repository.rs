@@ -7,7 +7,9 @@ use crate::agent_repository::{RepositoryError, RepositoryResult};
 use serde::{Deserialize, Serialize};
 
 /// Activity action type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ActivityAction {
     Create,
     Update,
@@ -17,7 +19,9 @@ pub enum ActivityAction {
 }
 
 /// Actor type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ActorType {
     User,
     Agent,
@@ -25,7 +29,9 @@ pub enum ActorType {
 }
 
 /// Resource type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ResourceType {
     Issue,
     Case,
@@ -35,8 +41,9 @@ pub enum ResourceType {
 }
 
 /// Activity log entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Activity {
+    pub id: Uuid,
     pub company_id: Uuid,
     pub actor_type: ActorType,
     pub actor_id: Uuid,
@@ -44,6 +51,7 @@ pub struct Activity {
     pub resource_type: ResourceType,
     pub resource_id: Uuid,
     pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// ActivityLog查询过滤器
@@ -157,7 +165,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
     async fn log_activity(&self, activity: &Activity) -> RepositoryResult<()> {
         let sanitized_metadata = Self::sanitize_metadata(
             &serde_json::to_value(&activity.metadata)
-                .map_err(|e| RepositoryError::SerializationError(e.to_string()))?,
+                .map_err(|e| RepositoryError::InvalidData(e.to_string()))?,
         );
 
         sqlx::query(
@@ -178,7 +186,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
         .bind(&activity.created_at)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        .map_err(RepositoryError::DatabaseError)?;
 
         Ok(())
     }
@@ -203,7 +211,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        .map_err(RepositoryError::DatabaseError)?;
 
         Ok(rows)
     }
@@ -227,7 +235,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
         .bind(&resource_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        .map_err(RepositoryError::DatabaseError)?;
 
         Ok(rows)
     }
@@ -254,7 +262,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        .map_err(RepositoryError::DatabaseError)?;
 
         Ok(rows)
     }
@@ -278,7 +286,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
         .bind(&end_time)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        .map_err(RepositoryError::DatabaseError)?;
 
         Ok(rows)
     }
@@ -342,7 +350,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
         let rows = q
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+            .map_err(RepositoryError::DatabaseError)?;
 
         Ok(rows)
     }
@@ -358,7 +366,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
         .bind(&before)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        .map_err(RepositoryError::DatabaseError)?;
 
         Ok(result.rows_affected())
     }

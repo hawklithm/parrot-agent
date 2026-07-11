@@ -87,7 +87,7 @@ impl AuthUser {
             password_hash: None,
             email_verified: true, // 云租户用户默认已验证
             email_verified_at: Some(now),
-           url: None,
+           avatar_url: None,
             oauth_provider: None,
             oauth_provider_id: None,
             cloud_tenant_id: Some(cloud_tenant_id),

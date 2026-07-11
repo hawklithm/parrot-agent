@@ -296,43 +296,58 @@ impl ProjectRepository {
         company_id: Uuid,
         user_id: Uuid,
     ) -> Result<ResourceMemberships> {
-        let project_memberships = sqlx::query_as::<_, (ProjectMembership, Project)>(
+        // Fetch project memberships separately
+        let memberships = sqlx::query_as::<_, ProjectMembership>(
             r#"
-            SELECT pm.*, p.*
-            FROM project_memberships pm
-            INNER JOIN projects p ON pm.project_id = p.id
-            WHERE pm.company_id = $1 AND pm.user_id = $2 AND pm.state = 'joined'
-            ORDER BY pm.starred_at DESC NULLS LAST, pm.created_at DESC
+            SELECT *
+            FROM project_memberships
+            WHERE company_id = $1 AND user_id = $2 AND state = 'joined'
+            ORDER BY starred_at DESC NULLS LAST, created_at DESC
             "#,
         )
         .bind(company_id)
         .bind(user_id)
         .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|(membership, project)| ProjectMembershipWithProject { membership, project })
-        .collect();
+        .await?;
 
-        let agent_memberships = sqlx::query_as::<_, (AgentMembership, String, String)>(
+        let mut project_memberships = Vec::new();
+        for membership in memberships {
+            if let Some(project) = self.get_by_id(membership.project_id).await? {
+                project_memberships.push(ProjectMembershipWithProject { membership, project });
+            }
+        }
+
+        // Fetch agent memberships separately
+        let agent_memberships_raw = sqlx::query_as::<_, AgentMembership>(
             r#"
-            SELECT am.*, a.name as agent_name, a.status as agent_status
-            FROM agent_memberships am
-            INNER JOIN agents a ON am.agent_id = a.id
-            WHERE am.company_id = $1 AND am.user_id = $2 AND am.state = 'joined'
-            ORDER BY am.starred_at DESC NULLS LAST, am.created_at DESC
+            SELECT *
+            FROM agent_memberships
+            WHERE company_id = $1 AND user_id = $2 AND state = 'joined'
+            ORDER BY starred_at DESC NULLS LAST, created_at DESC
             "#,
         )
         .bind(company_id)
         .bind(user_id)
         .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|(membership, agent_name, agent_status)| AgentMembershipWithAgent {
-            membership,
-            agent_name,
-            agent_status,
-        })
-        .collect();
+        .await?;
+
+        let mut agent_memberships = Vec::new();
+        for membership in agent_memberships_raw {
+            let agent_info: Option<(String, String)> = sqlx::query_as(
+                r#"SELECT name, status FROM agents WHERE id = $1"#
+            )
+            .bind(membership.agent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some((agent_name, agent_status)) = agent_info {
+                agent_memberships.push(AgentMembershipWithAgent {
+                    membership,
+                    agent_name,
+                    agent_status,
+                });
+            }
+        }
 
         let starred_project_ids: Vec<Uuid> = project_memberships
             .iter()

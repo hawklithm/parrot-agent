@@ -125,7 +125,7 @@ impl AuthUserRepository for PgAuthUserRepository {
         .bind(&user.oauth_provider).bind(&user.oauth_provider_id).bind(&user.cloud_tenant_id)
         .bind(user.is_active).bind(user.last_login_at).bind(user.created_at).bind(user.updated_at)
         .execute(&self.pool)
-     ?;
+        .await?;
         Ok(user)
     }
 

@@ -171,12 +171,13 @@ pub struct CaseDetail {
 /// Case query filter
 #[derive(Debug, Clone, Default)]
 pub struct CaseQueryFilter {
-    pub status: Option<CaseStatus>,
-    pub case_type: Option<String>,
+    pub status: Option<Vec<CaseStatus>>,
+    pub case_type: Option<Vec<String>>,
     pub project_id: Option<Uuid>,
     pub parent_case_id: Option<Uuid>,
     pub created_by_agent_id: Option<Uuid>,
     pub created_by_user_id: Option<Uuid>,
+    pub label_id: Option<Uuid>,
 }
 
 /// Upsert case input (create or update)
@@ -195,6 +196,9 @@ pub struct UpsertCaseInput {
     pub created_by_agent_id: Option<Uuid>,
     pub created_by_user_id: Option<Uuid>,
     pub created_by_run_id: Option<Uuid>,
+    pub actor_user_id: Option<Uuid>,
+    pub actor_agent_id: Option<Uuid>,
+    pub actor_run_id: Option<Uuid>,
 }
 
 impl CaseStatus {

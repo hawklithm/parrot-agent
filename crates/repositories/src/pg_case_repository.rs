@@ -260,7 +260,7 @@ impl CaseRepository for PgCaseRepository {
         updates.push("updated_at = NOW()".to_string());
 
         // Update completed_at if status is terminal
-        if let Some(status) = input.status {
+        if let Some(ref status) = input.status {
             if status.is_terminal() {
                 updates.push("completed_at = COALESCE(completed_at, NOW())".to_string());
             }

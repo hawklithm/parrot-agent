@@ -53,7 +53,7 @@ impl CompanyRepository {
         Ok(company)
     }
 
-    pub async fn get_by_id(&self, id: Uuid) -> Result<any>> {
+    pub async fn get_by_id(&self, id: Uuid) -> Result<Option<Company>> {
         sqlx::query_as::<_, Company>("SELECT * FROM companies WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)

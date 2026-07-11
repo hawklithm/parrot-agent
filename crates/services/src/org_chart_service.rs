@@ -24,7 +24,7 @@ impl MockOrgChartService {
         // CEO -> 2 directors -> agents
         vec![OrgNode {
             id: "agent-ceo".to_string(),
-            nae".to_string(),
+            name: "Alice".to_string(),
             role: "CEO".to_string(),
             status: "active".to_string(),
             reports: vec![
@@ -37,7 +37,7 @@ impl MockOrgChartService {
                         OrgNode {
                             id: "agent-backend-1".to_string(),
                             name: "Charlie".to_string(),
-                        role: "Backend Engineer".to_string(),
+                            role: "Backend Engineer".to_string(),
                             status: "active".to_string(),
                             reports: vec![],
                             collapsed_reports: None,

@@ -152,7 +152,8 @@ where
                     "succeeded".to_string(),
                     Some(sqlx::types::Json(result.clone())),
                 ).await?;
-                Ok(resul            }
+                Ok(result)
+            }
             Ok(Err(e)) => {
                 self.repository.update_step_execution(
                     execution_id,

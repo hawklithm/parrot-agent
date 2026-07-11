@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use models::{
     ExecutionEnvironment, EnvironmentStatus, CreateEnvironmentInput,
     UpdateEnvironmentInput, EnvironmentDeleteBlastRadius,
+    EnvironmentStaticReferences, EnvironmentActiveRuntimeUse,
 };
 use uuid::Uuid;
 use sqlx::PgPool;
@@ -49,7 +50,7 @@ impl PgEnvironmentRepository {
 impl EnvironmentRepository for PgEnvironmentRepository {
     async fn create(&self, input: CreateEnvironmentInput) -> Result<ExecutionEnvironment, RepositoryError> {
         let status = input.status.unwrap_or(EnvironmentStatus::Active);
-        let config = input.config.unwrap_or_else(|| serde_json::json!({}));
+        let config = input.config;
         let env_vars = input.env_vars.unwrap_or_else(|| serde_json::json!({}));
 
         let environment = sqlx::query_as::<_, ExecutionEnvironment>(
@@ -244,11 +245,27 @@ impl EnvironmentRepository for PgEnvironmentRepository {
         };
 
         Ok(EnvironmentDeleteBlastRadius {
+            environment_id: id,
             can_delete,
+            delete_blocked_reasons: Vec::new(),
             blocked_reasons,
-            affected_agents,
-            affected_issues,
-            active_leases: active_leases.0,
+            affected_agents: Vec::new(),
+            affected_issues: Vec::new(),
+            active_leases: Vec::new(),
+            static_references: EnvironmentStaticReferences {
+                is_managed_local: false,
+                is_instance_default: false,
+                agent_default_count: 0,
+                execution_workspace_selection_count: 0,
+                issue_selection_count: 0,
+                project_selection_count: 0,
+                secret_binding_count: 0,
+            },
+            active_runtime_use: EnvironmentActiveRuntimeUse {
+                active_lease_count: active_leases.0 as i32,
+                active_custom_image_setup_session_count: 0,
+                has_active_runtime_use: active_leases.0 > 0,
+            },
         })
     }
 }

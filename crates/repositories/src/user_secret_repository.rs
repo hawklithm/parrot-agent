@@ -107,7 +107,7 @@ impl UserSecretRepository for PostgresUserSecretRepository {
 
     async fn get_coverage_stats(&self, company_id: Uuid, definition_id: Uuid) -> RepositoryResult<UserSecretCoverage> {
         let definition = self.get_definition(definition_id).await?
-            .ok_or_else(|| crate::RepositoryError::NotFound("Definition not found".to_string()))?;
+            .ok_or_else(|| crate::RepositoryError::InvalidData("Definition not found".to_string()))?;
 
         let (total_users, users_with_secret): (i64, i64) = sqlx::query_as(
             r#"SELECT

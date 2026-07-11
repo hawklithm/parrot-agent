@@ -81,7 +81,7 @@ impl IssueRepository for PgIssueRepository {
             query.push_str(&format!(" AND parent_id = ${}", param_count));
         }
 
-        if let Some(work_mode) = filter.work_mode {
+        if let Some(ref work_mode) = filter.work_mode {
             param_count += 1;
             query.push_str(&format!(" AND work_mode = ${}", param_count));
         }
@@ -130,7 +130,7 @@ impl IssueRepository for PgIssueRepository {
             q = q.bind(parent_id);
         }
 
-        if let Some(work_mode) = filter.work_mode {
+        if let Some(ref work_mode) = filter.work_mode {
             let mode_str = format!("{:?}", work_mode).to_lowercase();
             q = q.bind(mode_str);
         }
@@ -372,10 +372,10 @@ impl IssueRepository for PgIssueRepository {
             q = q.bind(responsible_user_id);
         }
         if let Some(ref execution_policy) = input.execution_policy {
-            q = q.bind(execution_policy);
+            q = q.bind(serde_json::to_value(execution_policy).unwrap());
         }
         if let Some(ref execution_state) = input.execution_state {
-            q = q.bind(execution_state);
+            q = q.bind(serde_json::to_value(execution_state).unwrap());
         }
         if let Some(ref monitor_notes) = input.monitor_notes {
             q = q.bind(monitor_notes);
