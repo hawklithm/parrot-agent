@@ -55,3 +55,5 @@ pub use custom_image_setup::*;
 pub use skill::*;
 pub mod invite_resource;
 pub use invite_resource::*;
+pub mod routine_annotation;
+pub use routine_annotation::*;
