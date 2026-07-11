@@ -48,6 +48,7 @@ pub mod pipeline_service;
 pub mod approval_service;
 pub mod activity_log_service;
 pub mod environment_service;
+pub mod codex_local_isolation;
 pub mod routine_trigger_service;
 pub mod issue_service_complete;
 pub mod issue_checkout_service;
