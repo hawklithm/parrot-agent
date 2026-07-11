@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod built_in_agents;
 pub mod adapters;
 pub mod config_revisions;
 pub mod org;
@@ -24,6 +25,7 @@ pub mod custom_image_setup;
 pub mod skills;
 
 pub use agents::agent_routes;
+pub use built_in_agents::{list_built_in_agents, provision_built_in_agent, reconcile_built_in_agent};
 pub use adapters::adapter_routes;
 pub use config_revisions::config_revision_routes;
 pub use org::org_routes;

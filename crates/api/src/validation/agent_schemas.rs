@@ -223,6 +223,23 @@ pub enum InstructionsBundleMode {
     External,
 }
 
+/// 内置 Agent 配置请求验证
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisionBuiltInAgentSchema {
+    /// 适配器类型（可选）
+    #[garde(skip)]
+    pub adapter_type: Option<String>,
+
+    /// 适配器配置（可选）
+    #[garde(skip)]
+    pub adapter_config: Option<JsonValue>,
+
+    /// 月度预算（分）（可选）
+    #[garde(skip)]
+    pub budget_monthly_cents: Option<i32>,
+}
+
 // ========== 默认值函数 ==========
 
 fn default_role() -> AgentRole {
