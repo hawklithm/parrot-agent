@@ -170,7 +170,10 @@ pub struct CaseAdvanceInput {
 pub enum CaseReviewDecision {
     Approve,
     Reject,
-    RequestChanges,[derive(Debug, Clone, Serialize, Deserialize)]
+    RequestChanges,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseReviewInput {
     pub decision: CaseReviewDecision,
     pub reason: Option<String>,
@@ -209,7 +212,7 @@ impl PipelineCase {
             title: input.title,
             summary: None,
             fields: input.fields,
-            tend: None,
+            terminal_kind: None,
             version: 1,
             pending_suggestion: None,
             created_at: now,

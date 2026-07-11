@@ -104,7 +104,8 @@ impl AgentStateMachine {
             ],
             AgentStatus::Running => vec![
                 AgentStatus::Idle,
-                AgentStatus::               AgentStatus::Terminated,
+                AgentStatus::Paused,
+                AgentStatus::Terminated,
             ],
             AgentStatus::Paused => vec![
                 AgentStatus::Running,

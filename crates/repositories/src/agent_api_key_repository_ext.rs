@@ -104,7 +104,8 @@ impl AgentApiKeyRepositoryExt for PgAgentApiKeyRepositoryExt {
         .bind(key.is_revoked)
         .bind(key.revoked_at)
         .bind(key.created_at)
-        .bind(key.updated_a     .execute(&self.pool)
+        .bind(key.updated_at)
+        .execute(&self.pool)
         .await?;
 
         Ok(key)

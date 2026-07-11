@@ -70,7 +70,8 @@ pub enum RemoteSecretImportRowStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteSecretImportRowResult {
-    pub name: Str   pub external_ref: String,
+    pub name: String,
+    pub external_ref: String,
     pub status: RemoteSecretImportRowStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_id: Option<Uuid>,

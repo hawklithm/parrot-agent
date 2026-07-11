@@ -204,7 +204,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hash_api) {
+    fn test_hash_api_key() {
         let token = "test_token_123";
         let hash1 = hash_api_key(token);
         let hash2 = hash_api_key(token);
@@ -229,7 +229,7 @@ mod tests {
         assert!(!verify_api_key("wrong_token", &hash));
     }
 
-    t]
+    #[test]
     fn test_generate_api_key_token() {
         let token1 = generate_api_key_token("pk");
         let token2 = generate_api_key_token("pk");

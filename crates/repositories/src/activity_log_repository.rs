@@ -3,10 +3,48 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::error::{RepositoryError, RepositoryResult};
+use crate::agent_repository::{RepositoryError, RepositoryResult};
+use serde::{Deserialize, Serialize};
 
-/// Importar tipos desde services (shared types)
-pub use parrot_services::activity_log_service::{Activity, ActivityAction, ActorType, ResourceType};
+/// Activity action type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ActivityAction {
+    Create,
+    Update,
+    Delete,
+    View,
+    Execute,
+}
+
+/// Actor type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ActorType {
+    User,
+    Agent,
+    System,
+}
+
+/// Resource type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResourceType {
+    Issue,
+    Case,
+    Agent,
+    Project,
+    Environment,
+}
+
+/// Activity log entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Activity {
+    pub company_id: Uuid,
+    pub actor_type: ActorType,
+    pub actor_id: Uuid,
+    pub action: ActivityAction,
+    pub resource_type: ResourceType,
+    pub resource_id: Uuid,
+    pub metadata: Option<serde_json::Value>,
+}
 
 /// ActivityLog查询过滤器
 #[derive(Debug, Clone)]
@@ -347,4 +385,4 @@ mod tests {
         assert_eq!(sanitized["api_key"], "[REDACTED]");
         assert_eq!(sanitized["reason"], "test");
     }
-}}
+}

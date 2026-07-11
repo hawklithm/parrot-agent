@@ -50,13 +50,18 @@ pub struct EnvironmentDeleteBlastRadius {
     pub environment_id: Uuid,
     pub can_delete: bool,
     pub delete_blocked_reasons: Vec<EnvironmentDeleteBlockedReason>,
+    pub blocked_reasons: Vec<String>,
+    pub affected_agents: Vec<Uuid>,
+    pub affected_issues: Vec<Uuid>,
+    pub active_leases: Vec<Uuid>,
     pub static_references: EnvironmentStaticReferences,
     pub active_runtime_use: EnvironmentActiveRuntimeUse,
 }
 
 /// Environment lease status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum EnvironmentLeaseStatus {
     Acquired,
     Active,
@@ -66,10 +71,12 @@ pub enum EnvironmentLeaseStatus {
 }
 
 /// Environment lease policy
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum EnvironmentLeasePolicy {
     Reuse,
+    Reusable,
     Ephemeral,
 }
 

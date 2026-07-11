@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Environment driver type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum EnvironmentDriver {
     Local,
     Ssh,
@@ -12,13 +13,15 @@ pub enum EnvironmentDriver {
 }
 
 /// Environment status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum EnvironmentStatus {
     Active,
     InUse,
     Provisioning,
     Error,
+    Archived,
 }
 
 /// Lease status
@@ -132,7 +135,7 @@ pub enum ExecutionWorkspaceStatus {
 }
 
 /// Execution workspace
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionWorkspace {
     pub id: Uuid,
@@ -161,8 +164,10 @@ pub struct CreateEnvironmentInput {
     pub name: String,
     pub description: Option<String>,
     pub driver: EnvironmentDriver,
+    pub status: Option<EnvironmentStatus>,
     pub config: serde_json::Value,
     pub env_vars: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Update environment input
@@ -171,7 +176,9 @@ pub struct CreateEnvironmentInput {
 pub struct UpdateEnvironmentInput {
     pub name: Option<String>,
     pub description: Option<String>,
+    pub driver: Option<EnvironmentDriver>,
     pub status: Option<EnvironmentStatus>,
     pub config: Option<serde_json::Value>,
     pub env_vars: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
 }

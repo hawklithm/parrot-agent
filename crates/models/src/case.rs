@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Case status enumeration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum CaseStatus {
     Draft,
     InProgress,
@@ -14,8 +15,9 @@ pub enum CaseStatus {
 }
 
 /// Case issue link role
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum CaseIssueLinkRole {
     Origin,
     Work,
@@ -23,7 +25,7 @@ pub enum CaseIssueLinkRole {
 }
 
 /// Case core structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct Case {
     pub id: Uuid,
@@ -58,6 +60,9 @@ pub struct CreateCaseInput {
     pub status: Option<CaseStatus>,
     pub fields: Option<serde_json::Value>,
     pub parent_case_id: Option<Uuid>,
+    pub created_by_agent_id: Option<Uuid>,
+    pub created_by_user_id: Option<Uuid>,
+    pub created_by_run_id: Option<Uuid>,
 }
 
 /// Update case input
@@ -68,10 +73,12 @@ pub struct UpdateCaseInput {
     pub summary: Option<String>,
     pub status: Option<CaseStatus>,
     pub fields: Option<serde_json::Value>,
+    pub project_id: Option<Uuid>,
+    pub parent_case_id: Option<Uuid>,
 }
 
 /// Case-Issue link (many-to-many)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct CaseIssueLink {
     pub id: Uuid,
@@ -118,8 +125,9 @@ impl CaseDocument {
 }
 
 /// Case event kind
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum CaseEventKind {
     Created,
     Updated,
@@ -130,7 +138,7 @@ pub enum CaseEventKind {
 }
 
 /// Case event
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct CaseEvent {
     pub id: Uuid,
@@ -140,6 +148,10 @@ pub struct CaseEvent {
     pub metadata: Option<serde_json::Value>,
     pub actor_agent_id: Option<Uuid>,
     pub actor_user_id: Option<Uuid>,
+    pub actor_type: Option<String>,
+    pub actor_id: Option<Uuid>,
+    pub actor_run_id: Option<Uuid>,
+    pub payload: Option<serde_json::Value>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -154,4 +166,40 @@ pub struct CaseDetail {
     pub documents: Vec<CaseDocument>,
     pub attachments: Vec<Uuid>, // Attachment IDs
     pub parent_case: Option<Box<Case>>,
+}
+
+/// Case query filter
+#[derive(Debug, Clone, Default)]
+pub struct CaseQueryFilter {
+    pub status: Option<CaseStatus>,
+    pub case_type: Option<String>,
+    pub project_id: Option<Uuid>,
+    pub parent_case_id: Option<Uuid>,
+    pub created_by_agent_id: Option<Uuid>,
+    pub created_by_user_id: Option<Uuid>,
+}
+
+/// Upsert case input (create or update)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertCaseInput {
+    pub company_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub case_type: String,
+    pub key: Option<String>,
+    pub title: String,
+    pub summary: Option<String>,
+    pub status: Option<CaseStatus>,
+    pub fields: Option<serde_json::Value>,
+    pub parent_case_id: Option<Uuid>,
+    pub created_by_agent_id: Option<Uuid>,
+    pub created_by_user_id: Option<Uuid>,
+    pub created_by_run_id: Option<Uuid>,
+}
+
+impl CaseStatus {
+    /// Check if the status is terminal (no more work)
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, CaseStatus::Done | CaseStatus::Cancelled)
+    }
 }

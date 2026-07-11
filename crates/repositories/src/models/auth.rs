@@ -108,7 +108,7 @@ impl AuthUser {
     /// 更新最后登录时间
     pub fn record_login(&mut self) {
         self.last_login_at = Some(Utc::now());
-        self. Utc::now();
+        self.updated_at = Utc::now();
     }
 
     /// 停用用户

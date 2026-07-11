@@ -164,9 +164,11 @@ pub struct CliAuthChallenge {
     pub company_id: Option<Uuid>,
     pub challenge_code: String,
     pub device_name: Option<String>,
-    pub requested_access: sqlx::types::Json pub status: String,
+    pub requested_access: sqlx::types::JsonValue,
+    pub status: String,
     pub approved_at: Option<DateTime<Utc>>,
-    pub approved_by_user_id: Option<Uuid>pub api_key_id: Option<Uuid>,
+    pub approved_by_user_id: Option<Uuid>,
+    pub api_key_id: Option<Uuid>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -205,7 +207,7 @@ impl CliAuthChallenge {
         use rand::Rng;
         const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         let mut rng = rand::thread_rng();
-        .8)
+        (0..8)
             .map(|_| {
                 let idx = rng.gen_range(0..CHARSET.len());
                 CHARSET[idx] as char

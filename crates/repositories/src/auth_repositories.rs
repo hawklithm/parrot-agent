@@ -264,7 +264,7 @@ impl CompanyRepository for PgCompanyRepository {
         Ok(company)
     }
 
-    async fn update(&self, company-> RepositoryResult<Company> {
+    async fn update(&self, company: Company) -> RepositoryResult<Company> {
         sqlx::query(
             r#"UPDATE companies SET name = $2, description = $3, logo_url = $4, website = $5,
                industry = $6, size = $7, settings = $8, is_active = $9, updated_at = $10 WHERE id = $1"#

@@ -82,7 +82,7 @@ pub struct EnvironmentLease {
     pub provider: Option<String>,
     pub provider_lease_id: Option<String>,
     pub acquired_at: DateTime<Utc>,
-    pub last_used_at: Option<DateT,
+    pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub released_at: Option<DateTime<Utc>>,
     pub failure_reason: Option<String>,
@@ -112,6 +112,7 @@ pub enum WorkspaceStatus {
     InUse,
     Cleaning,
     Error,
+    Archived,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

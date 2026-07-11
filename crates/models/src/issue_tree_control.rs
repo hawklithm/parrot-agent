@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Issue tree control mode
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum IssueTreeControlMode {
     Pause,
     Resume,
@@ -29,7 +30,7 @@ pub struct IssueTreeHoldReleasePolicy {
 }
 
 /// Issue tree hold
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueTreeHold {
     pub id: Uuid,
@@ -37,7 +38,7 @@ pub struct IssueTreeHold {
     pub root_issue_id: Uuid,
     pub mode: IssueTreeControlMode,
     pub reason: Option<String>,
-    pub release_policy: IssueTreeHoldReleasePolicy,
+    pub release_policy: sqlx::types::Json<IssueTreeHoldReleasePolicy>,
     pub metadata: Option<serde_json::Value>,
     pub actor_agent_id: Option<Uuid>,
     pub actor_user_id: Option<Uuid>,
@@ -45,14 +46,36 @@ pub struct IssueTreeHold {
     pub released_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Issue tree hold status
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub enum IssueTreeHoldStatus {
+    Active,
+    Released,
+    Expired,
+}
+
 /// Issue tree hold member
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueTreeHoldMember {
     pub id: Uuid,
     pub hold_id: Uuid,
     pub issue_id: Uuid,
     pub previous_status: String,
+    pub company_id: Uuid,
+    pub parent_issue_id: Option<Uuid>,
+    pub issue_identifier: Option<String>,
+    pub issue_title: String,
+    pub issue_status: String,
+    pub assignee_agent_id: Option<Uuid>,
+    pub assignee_user_id: Option<Uuid>,
+    pub active_run_id: Option<Uuid>,
+    pub active_run_status: Option<String>,
+    pub depth: i32,
+    pub skipped: bool,
+    pub skip_reason: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

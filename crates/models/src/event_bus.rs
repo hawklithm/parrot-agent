@@ -88,7 +88,7 @@ impl IssueEvent {
     }
 
     pub fn company_id(&self) -> Uuid {
- h self {
+        match self {
             Self::Created { company_id, .. } => *company_id,
             Self::CheckedOut { company_id, .. } => *company_id,
             Self::Released { company_id, .. } => *company_id,

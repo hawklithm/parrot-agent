@@ -45,6 +45,10 @@ pub mod activity_log_service;
 pub mod environment_service;
 pub mod routine_trigger_service;
 pub mod issue_service_complete;
+pub mod issue_checkout_service;
+pub mod issue_comment_service_impl;
+pub mod work_product_service;
+pub mod attachment_service;
 
 pub use agent_service::{
     AgentService, CreateAgentInput, UpdateAgentInput, NormalizedAgentRow,

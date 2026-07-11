@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Issue status enumeration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum IssueStatus {
     Backlog,
     Todo,
@@ -15,8 +16,9 @@ pub enum IssueStatus {
 }
 
 /// Issue priority enumeration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum IssuePriority {
     Critical,
     High,
@@ -25,8 +27,9 @@ pub enum IssuePriority {
 }
 
 /// Issue work mode enumeration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum IssueWorkMode {
     Standard,
     Ask,
@@ -35,8 +38,9 @@ pub enum IssueWorkMode {
 }
 
 /// Issue monitor scheduled by
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum IssueMonitorScheduledBy {
     Assignee,
     Board,
@@ -67,7 +71,7 @@ pub struct IssueExecutionState {
 }
 
 /// Issue core structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct Issue {
     pub id: Uuid,
@@ -98,8 +102,8 @@ pub struct Issue {
     pub origin_fingerprint: Option<String>,
     pub request_depth: i32,
     pub billing_code: Option<String>,
-    pub execution_policy: Option<IssueExecutionPolicy>,
-    pub execution_state: Option<IssueExecutionState>,
+    pub execution_policy: Option<sqlx::types::Json<IssueExecutionPolicy>>,
+    pub execution_state: Option<sqlx::types::Json<IssueExecutionState>>,
     pub monitor_next_check_at: Option<chrono::DateTime<chrono::Utc>>,
     pub monitor_last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub monitor_attempt_count: Option<i32>,
@@ -112,7 +116,7 @@ pub struct Issue {
     pub cancelled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub hidden_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chronoeTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Create issue input
@@ -121,6 +125,8 @@ pub struct Issue {
 pub struct CreateIssueInput {
     pub company_id: Uuid,
     pub project_id: Option<Uuid>,
+    pub project_workspace_id: Option<Uuid>,
+    pub goal_id: Option<Uuid>,
     pub title: String,
     pub description: Option<String>,
     pub status: Option<IssueStatus>,
@@ -129,6 +135,17 @@ pub struct CreateIssueInput {
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
     pub work_mode: Option<IssueWorkMode>,
+    pub responsible_user_id: Option<Uuid>,
+    pub origin_kind: Option<String>,
+    pub origin_id: Option<String>,
+    pub origin_run_id: Option<Uuid>,
+    pub request_depth: Option<i32>,
+    pub billing_code: Option<String>,
+    pub execution_workspace_id: Option<Uuid>,
+    pub execution_workspace_preference: Option<String>,
+    pub created_by_agent_id: Option<Uuid>,
+    pub created_by_user_id: Option<Uuid>,
+    pub assignee_adapter_overrides: Option<serde_json::Value>,
 }
 
 /// Update issue input
@@ -142,38 +159,15 @@ pub struct UpdateIssueInput {
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
     pub work_mode: Option<IssueWorkMode>,
-}
-
-/// Issue comment
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IssueComment {
-    pub id: Uuid,
-    pub issue_id: Uuid,
-    pub company_id: Uuid,
-    pub body: String,
-    pub author_type: String, // "user" | "agent" | "system"
-    pub author_agent_id: Option<Uuid>,
-    pub author_user_id: Option<Uuid>,
-    pub created_by_run_id: Option<Uuid>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// Issue document
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IssueDocument {
-    pub id: Uuid,
-    pub issue_id: Uuid,
-    pub company_id: Uuid,
-    pub key: String,
-    pub content: String,
-    pub locked_by_agent_id: Option<Uuid>,
-    pub locked_by_user_id: Option<Uuid>,
-    pub locked_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub responsible_user_id: Option<Uuid>,
+    pub source_trust: Option<String>,
+    pub monitor_scheduled_by: Option<IssueMonitorScheduledBy>,
+    pub monitor_notes: Option<String>,
+    pub hidden_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub execution_workspace_preference: Option<String>,
+    pub execution_workspace_settings: Option<serde_json::Value>,
+    pub execution_policy: Option<IssueExecutionPolicy>,
+    pub execution_state: Option<IssueExecutionState>,
 }
 
 /// Create document input
@@ -212,25 +206,6 @@ pub struct LockDocumentInput {
     pub user_id: Option<Uuid>,
 }
 
-impl IssueDocument {
-    /// Check if document is currently locked
-    pub fn is_locked(&self) -> bool {
-        self.locked_at.is_some() && (self.locked_by_agent_id.is_some() || self.locked_by_user_id.is_some())
-    }
-    
-    /// Check if locked by specific actor
-    pub fn is_locked_by(&self, agent_id: Option<Uuid>, user_id: Option<Uuid>) -> bool {
-        if !self.is_locked() {
-            return false;
-        }
-        match (agent_id, user_id) {
-            (Some(aid), _) => self.locked_by_agent_id == Some(aid),
-            (_, Some(uid)) => self.locked_by_user_id == Some(uid),
-            _ => false,
-        }
-    }
-}
-
 /// Add comment input
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -241,11 +216,34 @@ pub struct AddCommentInput {
 }
 
 /// Comment actor type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum CommentActorType {
     Agent,
     User,
     Board,
     System,
+}
+
+/// Pagination parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pagination {
+    pub limit: i64,
+    pub offset: i64,
+    pub cursor: Option<String>,
+}
+
+/// Issue query filter
+#[derive(Debug, Clone, Default)]
+pub struct IssueQueryFilter {
+    pub status: Option<IssueStatus>,
+    pub priority: Option<IssuePriority>,
+    pub assignee_agent_id: Option<Uuid>,
+    pub assignee_user_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    pub goal_id: Option<Uuid>,
+    pub parent_id: Option<Uuid>,
+    pub work_mode: Option<IssueWorkMode>,
 }

@@ -8,10 +8,15 @@ models = { path = "../models" }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
+rand = { workspace = true }
+sha2 = { workspace = true }
+subtle = "2.5"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true }

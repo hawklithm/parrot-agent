@@ -73,7 +73,7 @@ pub enum AgentEvent {
 pub enum EnvironmentEvent {
     LeaseAcquired { lease_id: Uuid, environment_id: Uuid, agent_id: Uuid },
     LeaseReleased { lease_id: Uuid, environment_id: Uuid },
-    LeaseExpire_id: Uuid, environment_id: Uuid },
+    LeaseExpired { lease_id: Uuid, environment_id: Uuid },
 }
 
 /// Goal events
@@ -198,7 +198,7 @@ pub mod in_memory {
             Ok(())
         }
 
-        async fn unsubscribe(&self, event_type: &str)  Result<(), EventBusError> {
+        async fn unsubscribe(&self, event_type: &str) -> Result<(), EventBusError> {
             let mut handlers = self.handlers.write().await;
             handlers.remove(event_type);
             Ok(())

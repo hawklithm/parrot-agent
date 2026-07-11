@@ -247,7 +247,7 @@ mod tests {
         assert!(human_only.allows_human());
         assert!(!human_only.allows_agent());
 
-        let agent_only = InviteRow
+        let agent_only = InviteRow::new(
             company_id,
             "company_join".to_string(),
             None,

@@ -64,7 +64,8 @@ pub enum AuthorizationAction {
     Custom(String),
 }
 
-/// Reason for authorization decis#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Reason for authorization decision
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionReason {
     // Allow reasons
