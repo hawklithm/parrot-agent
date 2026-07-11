@@ -161,7 +161,7 @@ pub trait JoinRequestRepository: Send + Sync {
     async fn create(&self, join_request: JoinRequest) -> Result<JoinRequest, String>;
     async fn update(&self, join_request: JoinRequest) -> Result<JoinRequest, String>;
     async fn find_by_id(&self, id: Uuid) -> Result<Option<JoinRequest>, String>;
-    async fn list_by_company(&self, comp) -> Result<Vec<JoinRequest>, String>;
+    async fn list_by_company(&self, company_id: Uuid) -> Result<Vec<JoinRequest>, String>;
 }
 
 /// Invite database record
