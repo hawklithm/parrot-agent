@@ -80,3 +80,4 @@ pub use issue_tree_control_service::{
 pub mod skills_service;
 pub mod environment_service;
 pub mod custom_image_setup_service;
+pub mod invite_service;

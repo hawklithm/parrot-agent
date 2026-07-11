@@ -12,6 +12,7 @@ pub mod skills;
 pub mod environments;
 pub mod secret_remote_import;
 pub mod custom_image_setup;
+pub mod invites;
 
 pub use agents::agent_routes;
 pub use adapters::adapter_routes;
@@ -22,3 +23,4 @@ pub use skills::skills_routes;
 pub use environments::environment_diagnostic_routes;
 pub use secret_remote_import::secret_remote_import_routes;
 pub use custom_image_setup::custom_image_setup_routes;
+pub use invites::invite_subresource_routes;
