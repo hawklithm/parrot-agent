@@ -62,3 +62,6 @@ pub use asset_repository::{AssetRepository, PgAssetRepository};
 pub use execution_workspace_repository::{ExecutionWorkspaceRepository, PgExecutionWorkspaceRepository};
 pub use company_repository::CompanyRepository;
 pub use project_repository::ProjectRepository;
+pub use activity_log_repository::ActivityLogRepository;
+pub use goal_repository::GoalRepository;
+pub use routine_repository::RoutineRepository;
