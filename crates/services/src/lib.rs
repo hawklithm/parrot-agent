@@ -85,3 +85,4 @@ pub mod openclaw_service;
 pub mod user_directory_service;
 pub mod sse_service;
 pub mod websocket_service;
+pub mod user_secret_definition_service;

@@ -16,6 +16,7 @@ pub mod invites;
 pub mod openclaw;
 pub mod user_directory;
 pub mod sse;
+pub mod user_secret_definitions;
 
 pub use agents::agent_routes;
 pub use adapters::adapter_routes;
@@ -30,3 +31,4 @@ pub use invites::invite_subresource_routes;
 pub use openclaw::openclaw_routes;
 pub use user_directory::user_directory_routes;
 pub use sse::sse_routes;
+pub use user_secret_definitions::user_secret_definition_routes;

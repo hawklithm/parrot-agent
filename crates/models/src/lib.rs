@@ -19,6 +19,7 @@ pub mod openclaw;
 pub mod user_directory;
 pub mod websocket;
 pub mod sse;
+pub mod user_secret_definition;
 
 pub use agent::*;
 pub use agent_api_key::*;
@@ -41,3 +42,4 @@ pub use openclaw::*;
 pub use user_directory::*;
 pub use websocket::*;
 pub use sse::*;
+pub use user_secret_definition::*;
