@@ -100,7 +100,7 @@ impl Actor for AgentActor {
         Some(self.agent_id)
     }
 
-    fnrd_user(&self) -> bool {
+    fn is_board_user(&self) -> bool {
         false
     }
 
@@ -262,7 +262,7 @@ impl AgentAccessService for DefaultAgentAccessService {
         Ok(AccessDecision {
             allowed,
             reason: if allowed {
-                "Permission grtring()
+                "Permission granted".to_string()
             } else {
                 format!("Insufficient permissions for {}", action)
             },
