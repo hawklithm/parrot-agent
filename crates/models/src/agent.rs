@@ -85,6 +85,39 @@ pub struct AgentMetadata {
     pub built_in_key: Option<String>,
 }
 
+/// Skill source enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    Company,
+    Global,
+    Agent,
+}
+
+/// Agent skill sync mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSkillSyncMode {
+    Auto,
+    Manual,
+}
+
+/// Agent skill entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSkillEntry {
+    pub skill_id: String,
+    pub source: SkillSource,
+    pub enabled: bool,
+}
+
+/// Agent skill snapshot
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSkillSnapshot {
+    pub skills: Vec<AgentSkillEntry>,
+    pub sync_mode: AgentSkillSyncMode,
+    pub last_synced_at: Option<DateTime<Utc>>,
+}
+
 /// Agent 实体
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
