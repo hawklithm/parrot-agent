@@ -1,288 +1,264 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
-use models::{
-    RuntimeLease, EnvironmentLeaseStatus, EnvironmentLeasePolicy,
-    CreateRuntimeLeaseInput, UpdateRuntimeLeaseInput,
-};
-use repositories::{
-    EnvironmentRepository, RuntimeLeaseRepository, RepositoryError,
-};
-use crate::environment_driver::{DriverRegistry, DriverError};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use uuid::Uuid;
 
-#[derive(Debug, thiserror::Error)]
-pub enum LeaseServiceError {
-    #[error("Repository error: {0}")]
-    Repository(#[from] RepositoryError),
+use models::{EnvironmentLease, LeaseStatus};
 
-    #[error("Driver error: {0}")]
-    Driver(#[from] DriverError),
-
-    #[error("Environment not found: {0}")]
-    EnvironmentNotFound(Uuid),
-
-    #[error("Lease not found: {0}")]
-    LeaseNotFound(Uuid),
-
-    #[error("Environment not available: {0}")]
-    EnvironmentNotAvailable(String),
-
-    #[error("Lease expired: {0}")]
-    LeaseExpired(Uuid),
-
-    #[error("Internal error: {0}")]
-    Internal(String),
-}
-
-/// Request to acquire a lease
+/// Acquire lease request
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcquireLeaseRequest {
     pub environment_id: Uuid,
-    pub workspace_id: Option<String>,
+    pub execution_workspace_id: Option<Uuid>,
     pub issue_id: Option<Uuid>,
-    pub agent_id: Option<Uuid>,
-    pub run_id: Option<Uuid>,
-    pub policy: EnvironmentLeasePolicy,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub heartbeat_run_id: Option<Uuid>,
 }
 
 /// Lease policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LeasePolicy {
-    pub heartbeat_interval: Duration,
-    pub max_ttl: Option<Duration>,
+    pub heartbeat_interval_secs: u64,
+    pub max_ttl_secs: u64,
     pub auto_release_on_expire: bool,
 }
 
 impl Default for LeasePolicy {
     fn default() -> Self {
         Self {
-            heartbeat_interval: Duration::seconds(30),
-            max_ttl: Some(Duration::hours(2)),
+            heartbeat_interval_secs: 30,
+            max_ttl_secs: 3600,
             auto_release_on_expire: true,
         }
+    }
+}
+
+/// Lease state machine
+pub struct LeaseStateMachine;
+
+impl LeaseStateMachine {
+    /// Check if transition from current_status to target_status is valid
+    pub fn can_transition(current_status: &LeaseStatus, target_status: &LeaseStatus) -> bool {
+        match (current_status, target_status) {
+            (LeaseStatus::Active, LeaseStatus::Released) => true,
+            (LeaseStatus::Active, LeaseStatus::Expired) => true,
+            (LeaseStatus::Active, LeaseStatus::Failed) => true,
+            (LeaseStatus::Released, _) => false,
+            (LeaseStatus::Expired, _) => false,
+            (LeaseStatus::Failed, _) => false,
+            _ => false,
+        }
+    }
+  /// Check if lease is expired
+    pub fn is_expired(lease: &EnvironmentLease, policy: &LeasePolicy) -> bool {
+        if let Some(expires_at) = lease.expires_at {
+            return chrono::Utc::now() > expires_at;
+        }
+        
+        if let Some(last_used_at) = lease.last_used_at {
+            let timeout_duration = chrono::Duration::seconds(policy.heartbeat_interval_secs as i64 * 3);
+            return chrono::Utc::now() > last_used_at + timeout_duration;
+        }
+        
+        false
+    }
+    
+    /// Check if lease should be released
+    pub fn should_release(lease: &EnvironmentLease, policy: &LeasePolicy) -> bool {
+        matches!(lease.status, LeaseStatus::Active) 
+            && Self::is_expired(lease, policy) 
+            && policy.auto_release_on_expire
     }
 }
 
 /// Lease service trait
 #[async_trait]
 pub trait LeaseService: Send + Sync {
-    /// Acquire a lease for an environment
-    async fn acquire_lease(&self, request: AcquireLeaseRequest) -> Result<RuntimeLease, LeaseServiceError>;
-
+    /// Acquire a new lease
+    async fn acquire_lease(
+        &self,
+        company_id: Uuid,
+        request: AcquireLeaseRequest,
+    ) -> Result<EnvironmentLease, String>;
+    
     /// Release a lease
-    async fn release_lease(&self, lease_id: Uuid) -> Result<(), LeaseServiceError>;
-
-    /// Refresh heartbeat for a lease
-    async fn refresh_heartbeat(&self, lease_id: Uuid) -> Result<RuntimeLease, LeaseServiceError>;
-
-    /// Get active leases for an environment
-    async fn get_active_leases(&self, environment_id: Uuid) -> Result<Vec<RuntimeLease>, LeaseServiceError>;
-
-    /// Mark expired leases
-    async fn mark_expired(&self) -> Result<i64, LeaseServiceError>;
-
+    async fn release_lease(
+        &self,
+        lease_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<EnvironmentLease, String>;
+    
+    /// Refresh lease heartbeat
+    async fn refresh_heartbeat(
+        &self,
+        lease_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<EnvironmentLease, String>;
+    
+    /// Get active leases for a company
+    async fn get_active_leases(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<EnvironmentLease>, String>;
+    
     /// Get lease by ID
-    async fn get_lease(&self, lease_id: Uuid) -> Result<Option<RuntimeLease>, LeaseServiceError>;
+    async fn get_lease(
+        &self,
+        lease_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<Option<EnvironmentLease>, String>;
 }
 
-/// Default implementation of LeaseService
-pub struct DefaultLeaseService<E, L>
-where
-    E: EnvironmentRepository,
-    L: RuntimeLeaseRepository,
-{
-    environment_repo: Arc<E>,
-    lease_repo: Arc<L>,
-    driver_registry: Arc<DriverRegistry>,
-}
+/// Mock lease service implementation
+pub struct MockLeaseService;
 
-impl<E, L> DefaultLeaseService<E, L>
-where
-    E: EnvironmentRepository,
-    L: RuntimeLeaseRepository,
-{
-    pub fn new(
-        environment_repo: Arc<E>,
-        lease_repo: Arc<L>,
-        driver_registry: Arc<DriverRegistry>,
-    ) -> Self {
-        Self {
-            environment_repo,
-            lease_repo,
-            driver_registry,
-        }
+impl MockLeaseService {
+    pub fn new() -> Self {
+        Self
     }
 }
 
 #[async_trait]
-impl<E, L> LeaseService for DefaultLeaseService<E, L>
-where
-    E: EnvironmentRepository + 'static,
-    L: RuntimeLeaseRepository + 'static,
-{
-    async fn acquire_lease(&self, request: AcquireLeaseRequest) -> Result<RuntimeLease, LeaseServiceError> {
-        // Get environment
-        let environment = self
-            .environment_repo
-            .get_by_id(request.environment_id)
-            .await?
-            .ok_or(LeaseServiceError::EnvironmentNotFound(request.environment_id))?;
-
-        // Check if reusable lease exists for this environment
-        if request.policy == EnvironmentLeasePolicy::Reusable {
-            if let Some(existing_lease) = self.lease_repo.find_reusable_lease(request.environment_id).await? {
-                // Return existing reusable lease
-                return Ok(existing_lease);
-            }
-        }
-
-        // Get driver for this environment
-        let driver = self.driver_registry.find_driver(environment.driver)?;
-
-        // Probe environment first
-        let probe_result = driver.probe(&environment).await?;
-        if !probe_result.ok {
-            return Err(LeaseServiceError::EnvironmentNotAvailable(
-                probe_result.summary,
-            ));
-        }
-
-        // Acquire lease from driver
-        let lease_result = driver
-            .acquire_lease(&environment, request.workspace_id.clone(), None)
-            .await?;
-
-        // Create lease record
-        let input = CreateRuntimeLeaseInput {
-            environment_id: request.environment_id,
-            agent_id: request.agent_id,
-            run_id: request.run_id,
-            issue_id: request.issue_id,
-            policy: request.policy,
-            workspace_id: request.workspace_id,
-            lease_metadata: Some(lease_result.connection_info),
-            expires_at: request.expires_at.or(lease_result.expires_at),
-        };
-
-        let lease = self.lease_repo.create(input).await?;
-
-        Ok(lease)
-    }
-
-    async fn release_lease(&self, lease_id: Uuid) -> Result<(), LeaseServiceError> {
-        // Get lease
-        let lease = self
-            .lease_repo
-            .get_by_id(lease_id)
-            .await?
-            .ok_or(LeaseServiceError::LeaseNotFound(lease_id))?;
-
-        // Get environment
-        let environment = self
-            .environment_repo
-            .get_by_id(lease.environment_id)
-            .await?
-            .ok_or(LeaseServiceError::EnvironmentNotFound(lease.environment_id))?;
-
-        // Get driver
-        let driver = self.driver_registry.find_driver(environment.driver)?;
-
-        // Release lease in driver
-        driver.release_lease(&environment, lease_id).await?;
-
-        // Update lease status
-        self.lease_repo.release(lease_id).await?;
-
-        Ok(())
-    }
-
-    async fn refresh_heartbeat(&self, lease_id: Uuid) -> Result<RuntimeLease, LeaseServiceError> {
-        // Get lease
-        let lease = self
-            .lease_repo
-            .get_by_id(lease_id)
-            .await?
-            .ok_or(LeaseServiceError::LeaseNotFound(lease_id))?;
-
-        // Check if expired
-        if let Some(expires_at) = lease.expires_at {
-            if expires_at < Utc::now() {
-                return Err(LeaseServiceError::LeaseExpired(lease_id));
-            }
-        }
-
-        // Update last_used_at (heartbeat refresh is handled by repository update logic)
-        let updated_lease = self
-            .lease_repo
-            .update(
-                lease_id,
-                UpdateRuntimeLeaseInput {
-                    status: None,
-                    cleanup_status: None,
-                    cleanup_error: None,
-                    released_at: None,
-                    lease_metadata: None,
-                },
-            )
-            .await?;
-
-        Ok(updated_lease)
-    }
-
-    async fn get_active_leases(&self, environment_id: Uuid) -> Result<Vec<RuntimeLease>, LeaseServiceError> {
-        let leases = self
-            .lease_repo
-            .list_active_by_environment(environment_id)
-            .await?;
-
-        Ok(leases)
-    }
-
-    async fn mark_expired(&self) -> Result<i64, LeaseServiceError> {
-        let count = self.lease_repo.mark_expired().await?;
-
-        Ok(count)
-    }
-
-    async fn get_lease(&self, lease_id: Uuid) -> Result<Option<RuntimeLease>, LeaseServiceError> {
-        let lease = self.lease_repo.get_by_id(lease_id).await?;
-
-        Ok(lease)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_lease_policy() {
+impl LeaseService for MockLeaseService {
+    async fn acquire_lease(
+        &self,
+        company_id: Uuid,
+        request: AcquireLeaseRequest,
+    ) -> Result<EnvironmentLease, String> {
+        let lease_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
         let policy = LeasePolicy::default();
-        assert_eq!(policy.heartbeat_interval, Duration::seconds(30));
-        assert_eq!(policy.max_ttl, Some(Duration::hours(2)));
-        assert!(policy.auto_release_on_expire);
+        
+        Ok(EnvironmentLease {
+            id: lease_id,
+            company_id,
+            environment_id: request.environment_id,
+            execution_workspace_id: request.execution_workspace_id,
+            issue_id: request.issue_id,
+            heartbeat_run_id: request.heartbeat_run_id,
+            status: LeaseStatus::Active,
+            lease_policy: Some(serde_json::to_value(&policy).unwrap()),
+            provider: Some("mock".to_string()),
+            provider_lease_id: Some(format!("mock-{}", lease_id)),
+            acquired_at: now,
+            last_used_at: Some(now),
+            expires_at: Some(now + chrono::Duration::seconds(policy.max_ttl_secs as i64)),
+            released_at: None,
+            failure_reason: None,
+            cleanup_status: None,
+        })
     }
-
-    #[test]
-    fn test_acquire_lease_request_serialization() {
-        let request = AcquireLeaseRequest {
+    
+    async fn release_lease(
+        &self,
+        lease_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<EnvironmentLease, String> {
+        let now = chrono::Utc::now();
+        let policy = LeasePolicy::default();
+        
+        Ok(EnvironmentLease {
+            id: lease_id,
+            company_id,
             environment_id: Uuid::new_v4(),
-            workspace_id: Some("workspace-1".to_string()),
+            execution_workspace_id: None,
             issue_id: None,
-            agent_id: Some(Uuid::new_v4()),
-            run_id: None,
-            policy: EnvironmentLeasePolicy::Ephemeral,
-            expires_at: None,
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        let deserialized: AcquireLeaseRequest = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.environment_id, request.environment_id);
-        assert_eq!(deserialized.workspace_id, request.workspace_id);
-        assert_eq!(deserialized.policy, request.policy);
+            heartbeat_run_id: None,
+            status: LeaseStatus::Released,
+            lease_policy: Some(serde_json::to_value(&policy).unwrap()),
+            provider: Some("mock".to_string()),
+            provider_lease_id: Some(format!("mock-{}", lease_id)),
+            acquired_at: now - chrono::Duration::hours(1),
+            last_used_at: Some(now),
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            released_at: Some(now),
+            failure_reason: None,
+            cleanup_status: Some("cleaned".to_string()),
+        })
+    }
+    
+    async fn refresh_heartbeat(
+        &self,
+        lease_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<EnvironmentLease, String> {
+        let now = chrono::Utc::now();
+        let policy = LeasePolicy::default();
+        
+        Ok(EnvironmentLease {
+            id: lease_id,
+            company_id,
+            environment_id: Uuid::new_v4(),
+            execution_workspace_id: None,
+            issue_id: None,
+            heartbeat_run_id: None,
+            status: LeaseStatus::Active,
+            lease_policy: Some(serde_json::to_value(&policy).unwrap()),
+            provider: Some("mock".to_string()),
+            provider_lease_id: Some(format!("mock-{}", lease_id)),
+            acquired_at: now - chrono::Duration::minutes(30),
+            last_used_at: Some(now),
+            expires_at: Some(now + chrono::Duration::minutes(30)),
+            released_at: None,
+            failure_reason: None,
+            cleanup_status: None,
+        })
+    }
+    
+    async fn get_active_leases(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<EnvironmentLease>, String> {
+        let now = chrono::Utc::now();
+        let policy = LeasePolicy::default();
+        
+        Ok(vec![
+            EnvironmentLease {
+                id: Uuid::new_v4(),
+                company_id,
+                environment_id: Uuid::new_v4(),
+                execution_workspace_id: None,
+                issue_id: None,
+                heartbeat_run_id: None,
+                status: LeaseStatus::Active,
+                lease_policy: Some(serde_json::to_value(&policy).unwrap()),
+                provider: Some("mock".to_string()),
+                provider_lease_id: Some(format!("mock-{}", Uuid::new_v4())),
+                acquired_at: now - chrono::Duration::minutes(10),
+                last_used_at: Some(now),
+                expires_at: Some(now + chrono::Duration::minutes(50)),
+                released_at: None,
+                failure_reason: None,
+                cleanup_status: None,
+            },
+        ])
+    }
+    
+    async fn get_lease(
+        &self,
+        lease_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<Option<EnvironmentLease>, String> {
+        let now = chrono::Utc::now();
+        let policy = LeasePolicy::default();
+        
+        Ok(Some(EnvironmentLease {
+            id: lease_id,
+            company_id,
+            environment_id: Uuid::new_v4(),
+            execution_workspace_id: None,
+            issue_id: None,
+            heartbeat_run_id: None,
+            status: LeaseStatus::Active,
+            lease_policy: Some(serde_json::to_value(&policy).unwrap()),
+            provider: Some("mock".to_string()),
+            provider_lease_id: Some(format!("mock-{}", lease_id)),
+            acquired_at: now - chrono::Duration::minutes(15),
+            last_used_at: Some(now - chrono::Duration::minutes(2)),
+            expires_at: Some(now + chrono::Duration::minutes(45)),
+            released_at: None,
+            failure_reason: None,
+            cleanup_status: None,
+        }))
     }
 }

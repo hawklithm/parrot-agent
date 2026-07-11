@@ -116,3 +116,5 @@ pub mod environment_service;
 pub use environment_service::*;
 pub mod environment_driver;
 pub use environment_driver::*;
+pub mod lease_service;
+pub use lease_service::*;
