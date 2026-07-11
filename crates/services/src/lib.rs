@@ -83,3 +83,5 @@ pub mod custom_image_setup_service;
 pub mod invite_service;
 pub mod openclaw_service;
 pub mod user_directory_service;
+pub mod sse_service;
+pub mod websocket_service;

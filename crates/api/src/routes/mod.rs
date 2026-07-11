@@ -15,6 +15,7 @@ pub mod custom_image_setup;
 pub mod invites;
 pub mod openclaw;
 pub mod user_directory;
+pub mod sse;
 
 pub use agents::agent_routes;
 pub use adapters::adapter_routes;
@@ -28,3 +29,4 @@ pub use custom_image_setup::custom_image_setup_routes;
 pub use invites::invite_subresource_routes;
 pub use openclaw::openclaw_routes;
 pub use user_directory::user_directory_routes;
+pub use sse::sse_routes;
