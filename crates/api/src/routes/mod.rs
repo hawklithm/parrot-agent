@@ -21,6 +21,7 @@ pub mod secret_provider_configs;
 pub mod environment_diagnostics;
 pub mod secret_remote_import;
 pub mod custom_image_setup;
+pub mod skills;
 
 pub use agents::agent_routes;
 pub use adapters::adapter_routes;
@@ -40,3 +41,4 @@ pub use secret_provider_configs::secret_provider_config_routes;
 pub use environment_diagnostics::environment_diagnostics_routes;
 pub use secret_remote_import::secret_remote_import_routes;
 pub use custom_image_setup::custom_image_setup_routes;
+pub use skills::skill_routes;

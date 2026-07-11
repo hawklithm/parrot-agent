@@ -1,78 +1,6 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-/// Agent技能快照
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentSkillSnapshot {
-    pub adapter_type: String,
-    pub supported: bool,
-    pub mode: AgentSkillSyncMode,
-    pub desired_skills: Vec<String>,
-    pub entries: Vec<AgentSkillEntry>,
-    pub warnings: Vec<String>,
-}
-
-/// 技能同步模式
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentSkillSyncMode {
-    /// 不同步技能
-    None,
-    /// 自动同步技能
-    Auto,
-    /// 手动同步技能
-    Manual,
-}
-
-impl Default for AgentSkillSyncMode {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
-/// Agent技能条目
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentSkillEntry {
-    pub name: String,
-    pub enabled: bool,
-    pub source: SkillSource,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-/// 技能来源
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SkillSource {
-    /// 内置技能
-    Builtin,
-    /// 公司技能
-    Company,
-    /// 自定义技能
-    Custom,
-    /// 外部技能
-    External,
-}
-
-/// Agent期望技能条目（用于创建/更新）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentDesiredSkillEntry {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config: Option<serde_json::Value>,
-}
-
-/// 技能同步请求
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentSkillSyncRequest {
-    pub desired_skills: Vec<AgentDesiredSkillEntry>,
-}
-
-/// Available skill metadata for Skills API
+/// Available skill (minimal metadata for listing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailableSkill {
@@ -81,34 +9,78 @@ pub struct AvailableSkill {
     pub is_paperclip_managed: bool,
 }
 
-/// Skill index entry with metadata
+/// Skill index entry (metadata for skill registry)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillIndexEntry {
     pub name: String,
+    pub slug: String,
     pub description: String,
+    pub category: Option<String>,
     pub is_paperclip_managed: bool,
     pub version: Option<String>,
-    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
 }
 
-/// Detailed skill information
+/// Skill example (usage demonstration)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SkillDetail {
-    pub name: String,
-    pub description: String,
-is_paperclip_managed: bool,
-    pub version: Option<String>,
-    pub tags: Vec<String>,
-    pub usage_example: Option<String>,
-    pub parameters: Option<serde_json::Value>,
-    pub author: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+pub struct SkillExample {
+    pub title: String,
+    pub description: Option<String>,
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_output: Option<String>,
 }
 
-/// Response wrapper for available skills
+/// Skill parameter definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillParameter {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub param_type: String,
+    pub description: String,
+    pub required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+}
+
+/// Skill details (full documentation)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDetails {
+    pub name: String,
+    pub slug: String,
+    pub description: String,
+    pub is_paperclip_managed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Vec<SkillParameter>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub examples: Option<Vec<SkillExample>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation_url: Option<String>,
+}
+
+/// Response for available skills endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AvailableSkillsResponse {
     pub skills: Vec<AvailableSkill>,
+}
+
+/// Response for skill index endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillIndexResponse {
+    pub skills: Vec<SkillIndexEntry>,
 }

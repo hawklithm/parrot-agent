@@ -24,6 +24,7 @@ pub mod secret_provider_config;
 pub mod environment_diagnostics;
 pub mod secret_remote_import;
 pub mod custom_image_setup;
+pub mod skill;
 
 pub use agent::*;
 pub use agent_api_key::*;
@@ -51,3 +52,4 @@ pub use secret_provider_config::*;
 pub use environment_diagnostics::*;
 pub use secret_remote_import::*;
 pub use custom_image_setup::*;
+pub use skill::*;
