@@ -58,3 +58,7 @@ pub mod comments;
 pub use comments::comment_routes;
 pub mod tree_control;
 pub use tree_control::tree_control_routes;
+pub mod work_products;
+pub use work_products::work_product_routes;
+pub mod attachments;
+pub use attachments::attachment_routes;

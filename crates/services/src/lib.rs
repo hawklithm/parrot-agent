@@ -108,3 +108,7 @@ pub mod comment_service;
 pub use comment_service::*;
 pub mod tree_control_service;
 pub use tree_control_service::*;
+pub mod work_product_service;
+pub use work_product_service::*;
+pub mod attachment_service;
+pub use attachment_service::*;
