@@ -137,3 +137,5 @@ pub mod activity_log_service;
 pub use activity_log_service::*;
 pub mod authorization_service_complete;
 pub use authorization_service_complete::*;
+pub mod invite_service_complete;
+pub use invite_service_complete::*;
