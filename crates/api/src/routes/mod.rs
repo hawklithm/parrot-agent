@@ -23,6 +23,7 @@ pub mod environment_diagnostics;
 pub mod secret_remote_import;
 pub mod custom_image_setup;
 pub mod skills;
+pub mod heartbeats;
 
 pub use agents::agent_routes;
 pub use built_in_agents::{list_built_in_agents, provision_built_in_agent, reconcile_built_in_agent};
@@ -44,6 +45,7 @@ pub use environment_diagnostics::environment_diagnostics_routes;
 pub use secret_remote_import::secret_remote_import_routes;
 pub use custom_image_setup::custom_image_setup_routes;
 pub use skills::skill_routes;
+pub use heartbeats::list_scheduler_heartbeats;
 pub mod invite_resources;
 pub use invite_resources::invite_resource_routes;
 pub mod routine_annotations;
