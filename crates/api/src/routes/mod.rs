@@ -48,3 +48,5 @@ pub mod routine_annotations;
 pub use routine_annotations::routine_annotation_routes;
 pub mod org_chart;
 pub use org_chart::org_chart_routes;
+pub mod issues;
+pub use issues::issue_routes;
