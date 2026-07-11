@@ -180,6 +180,46 @@ async fn test_environment(
         .find_server_adapter(&adapter_type_str)
         .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
 
+    // 如果需要租约，先获取租约
+    let _lease_guard = if payload.with_lease {
+        if let Some(env_id) = payload.environment_id {
+            match state
+                .environment_runtime_service
+                .acquire_run_lease(
+                    env_id,
+                    None,
+                    serde_json::json!({"purpose": "adapter_test"}),
+                )
+                .await
+            {
+                Ok(lease) => {
+                    tracing::info!("Acquired lease {} for adapter test", lease.id);
+                    Some(lease)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to acquire lease: {:?}", e);
+                    return Err(AppError::BadRequest(format!(
+                        "Failed to acquire environment lease: {}",
+                        e
+                    )));
+                }
+            }
+        } else {
+            return Err(AppError::BadRequest(
+                "environment_id is required when with_lease=true".to_string(),
+            ));
+        }
+    } else {
+        None
+    };
+
+    // 如果需要工作空间实现，也需要租约
+    if payload.with_workspace && !payload.with_lease {
+        return Err(AppError::BadRequest(
+            "with_lease must be true when with_workspace=true".to_string(),
+        ));
+    }
+
     // 构建测试上下文
     let test_context = services::TestEnvironmentContext {
         adapter_config: payload.adapter_config,
@@ -193,6 +233,9 @@ async fn test_environment(
             tracing::error!("Adapter environment test failed: {:?}", e);
             AppError::Internal
         })?;
+
+    // 租约会在 _lease_guard drop 时自动释放
+    // 这确保即使测试失败，租约也会被正确释放
 
     // 转换为响应格式
     let response = TestAdapterEnvironmentResponse {
