@@ -52,3 +52,5 @@ pub mod issues;
 pub use issues::issue_routes;
 pub mod cases;
 pub use cases::case_routes;
+pub mod documents;
+pub use documents::document_routes;

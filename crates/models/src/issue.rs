@@ -175,3 +175,58 @@ pub struct IssueDocument {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// Create document input
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDocumentInput {
+    pub key: String,
+    pub content: String,
+    pub content_type: Option<String>,
+}
+
+/// Update document input
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDocumentInput {
+    pub content: String,
+    pub content_type: Option<String>,
+}
+
+/// Document lock information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentLock {
+    pub locked_by_agent_id: Option<Uuid>,
+    pub locked_by_user_id: Option<Uuid>,
+    pub locked_at: chrono::DateTime<chrono::Utc>,
+    pub run_id: Option<Uuid>,
+}
+
+/// Lock document input
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockDocumentInput {
+    pub run_id: Option<Uuid>,
+    pub agent_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+}
+
+impl IssueDocument {
+    /// Check if document is currently locked
+    pub fn is_locked(&self) -> bool {
+        self.locked_at.is_some() && (self.locked_by_agent_id.is_some() || self.locked_by_user_id.is_some())
+    }
+    
+    /// Check if locked by specific actor
+    pub fn is_locked_by(&self, agent_id: Option<Uuid>, user_id: Option<Uuid>) -> bool {
+        if !self.is_locked() {
+            return false;
+        }
+        match (agent_id, user_id) {
+            (Some(aid), _) => self.locked_by_agent_id == Some(aid),
+            (_, Some(uid)) => self.locked_by_user_id == Some(uid),
+            _ => false,
+        }
+    }
+}

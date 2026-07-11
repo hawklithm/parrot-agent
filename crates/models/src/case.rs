@@ -97,3 +97,22 @@ pub struct CaseDocument {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
+
+impl CaseDocument {
+    /// Check if document is currently locked
+    pub fn is_locked(&self) -> bool {
+        self.locked_at.is_some() && (self.locked_by_agent_id.is_some() || self.locked_by_user_id.is_some())
+    }
+    
+    /// Check if locked by specific actor
+    pub fn is_locked_by(&self, agent_id: Option<Uuid>, user_id: Option<Uuid>) -> bool {
+        if !self.is_locked() {
+            return false;
+        }
+        match (agent_id, user_id) {
+            (Some(aid), _) => self.locked_by_agent_id == Some(aid),
+            (_, Some(uid)) => self.locked_by_user_id == Some(uid),
+            _ => false,
+        }
+    }
+}
