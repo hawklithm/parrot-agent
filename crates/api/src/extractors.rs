@@ -130,7 +130,7 @@ fn decode_shortname(shortname: &str) -> Option<Uuid> {
         bytes[i] = (num >> ((15 - i) * 8)) as u8;
     }
 
-    Uuid::from_bytes(bytes).ok()
+    Some(Uuid::from_bytes(bytes))
 }
 
 /// Base62 编码

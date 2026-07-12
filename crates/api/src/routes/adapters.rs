@@ -17,12 +17,8 @@ use crate::extractors::CompanyIdOrShortname;
 use services::{AdapterRegistry, EnvironmentRuntimeService};
 use models::AdapterType;
 
-/// AppState for adapter routes
-#[derive(Clone)]
-pub struct AdapterAppState {
-    pub adapter_registry: Arc<AdapterRegistry>,
-    pub environment_runtime_service: Arc<dyn EnvironmentRuntimeService>,
-}
+/// AppState for adapter routes - 别名到统一的 `crate::app_state::AppState`
+pub use crate::app_state::AppState as AdapterAppState;
 
 /// 创建 Adapter 信息路由
 pub fn adapter_routes() -> Router<AdapterAppState> {
@@ -186,7 +182,7 @@ async fn test_environment(
             match state
                 .environment_runtime_service
                 .acquire_run_lease(
-                    env_id,
+                    &env_id.to_string(),
                     None,
                     serde_json::json!({"purpose": "adapter_test"}),
                 )
@@ -221,8 +217,17 @@ async fn test_environment(
     }
 
     // 构建测试上下文
-    let test_context = services::TestEnvironmentContext {
-        adapter_config: payload.adapter_config,
+    let adapter_config_map: std::collections::HashMap<String, serde_json::Value> = payload
+        .adapter_config
+        .as_object()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+
+    let test_context = models::TestEnvironmentContext {
+        company_id,
+        agent_id: None,
+        adapter_config: adapter_config_map,
+        runtime_config: std::collections::HashMap::new(),
     };
 
     // 执行环境测试
@@ -240,27 +245,34 @@ async fn test_environment(
     // 转换为响应格式
     let response = TestAdapterEnvironmentResponse {
         adapter_type: test_result.adapter_type,
-        status: match test_result.status {
-            models::AdapterEnvironmentTestStatus::Pass => crate::schemas::AdapterEnvironmentTestStatus::Pass,
-            models::AdapterEnvironmentTestStatus::Warning => crate::schemas::AdapterEnvironmentTestStatus::Warning,
-            models::AdapterEnvironmentTestStatus::Fail => crate::schemas::AdapterEnvironmentTestStatus::Fail,
-        },
+        status: map_adapter_test_status(test_result.status),
         tested_at: test_result.tested_at,
         checks: test_result
             .checks
             .into_iter()
             .map(|check| crate::schemas::AdapterEnvironmentCheck {
-                name: check.name,
-                status: match check.status {
-                    models::AdapterEnvironmentTestStatus::Pass => crate::schemas::AdapterEnvironmentTestStatus::Pass,
-                    models::AdapterEnvironmentTestStatus::Warning => crate::schemas::AdapterEnvironmentTestStatus::Warning,
-                    models::AdapterEnvironmentTestStatus::Fail => crate::schemas::AdapterEnvironmentTestStatus::Fail,
-                },
+                name: check.name.unwrap_or_default(),
+                status: check
+                    .status
+                    .map(map_adapter_test_status)
+                    .unwrap_or(crate::schemas::AdapterEnvironmentTestStatus::Pass),
                 message: check.message,
-                details: check.details,
+                details: check.details.map(serde_json::Value::String),
             })
             .collect(),
     };
 
     Ok(Json(response))
+}
+
+/// 将模型层的适配器环境测试状态映射到 API 响应枚举
+fn map_adapter_test_status(
+    status: models::AdapterEnvironmentTestStatus,
+) -> crate::schemas::AdapterEnvironmentTestStatus {
+    match status {
+        models::AdapterEnvironmentTestStatus::Pass => crate::schemas::AdapterEnvironmentTestStatus::Pass,
+        models::AdapterEnvironmentTestStatus::Fail => crate::schemas::AdapterEnvironmentTestStatus::Fail,
+        models::AdapterEnvironmentTestStatus::Warn
+        | models::AdapterEnvironmentTestStatus::Warning => crate::schemas::AdapterEnvironmentTestStatus::Warning,
+    }
 }

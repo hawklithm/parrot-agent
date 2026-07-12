@@ -189,7 +189,6 @@ pub struct InstructionsBundleInput {
     pub entry_file: Option<String>,
 
     /// 指令文件映射（路径 -> 内容）
-    #[garde(dive)]
     #[garde(custom(validate_files_not_empty))]
     pub files: std::collections::HashMap<String, String>,
 }

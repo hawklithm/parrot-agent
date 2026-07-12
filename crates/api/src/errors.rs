@@ -20,6 +20,12 @@ pub enum AppError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Bad request: {0}")]
     BadRequest(String),
 
@@ -45,6 +51,12 @@ impl IntoResponse for AppError {
             AppError::Service(services::ServiceError::InvalidInput(msg)) => {
                 (StatusCode::BAD_REQUEST, msg)
             }
+            AppError::Service(services::ServiceError::Unauthorized(msg)) => {
+                (StatusCode::UNAUTHORIZED, msg)
+            }
+            AppError::Service(services::ServiceError::Forbidden(msg)) => {
+                (StatusCode::FORBIDDEN, msg)
+            }
             AppError::Service(services::ServiceError::ReportingCycle) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "Reporting cycle detected".to_string())
             }
@@ -65,6 +77,12 @@ impl IntoResponse for AppError {
             }
             AppError::NotFound(msg) => {
                 (StatusCode::NOT_FOUND, msg)
+            }
+            AppError::Forbidden(msg) => {
+                (StatusCode::FORBIDDEN, msg)
+            }
+            AppError::Conflict(msg) => {
+                (StatusCode::CONFLICT, msg)
             }
             AppError::BadRequest(msg) => {
                 (StatusCode::BAD_REQUEST, msg)

@@ -36,13 +36,14 @@ impl EnvironmentDiagnosticsService for MockEnvironmentDiagnosticsService {
     async fn probe(&self, environment_id: Uuid) -> ServiceResult<EnvironmentProbeResult> {
         Ok(EnvironmentProbeResult {
             ok: true,
-            driver: "local".to_string(),
+            driver: models::EnvironmentDriver::Local,
             summary: format!("Environment {} is operational", environment_id),
             details: Some(serde_json::json!({
                 "version": "1.0.0",
                 "availableCommands": ["bash", "python", "node"],
                 "workingDirectory": "/workspace"
             })),
+            error: None,
         })
     }
 
@@ -52,7 +53,7 @@ impl EnvironmentDiagnosticsService for MockEnvironmentDiagnosticsService {
         request: AcquireEnvironmentLeaseRequest,
     ) -> ServiceResult<EnvironmentLease> {
         use chrono::Utc;
-        use models::{EnvironmentLeasePolicy, EnvironmentLeaseStatus};
+        use models::LeaseStatus;
 
         let now = Utc::now();
         Ok(EnvironmentLease {
@@ -62,22 +63,16 @@ impl EnvironmentDiagnosticsService for MockEnvironmentDiagnosticsService {
             execution_workspace_id: request.execution_workspace_id,
             issue_id: request.issue_id,
             heartbeat_run_id: request.heartbeat_run_id,
-            status: EnvironmentLeaseStatus::Acquired,
-            lease_policy: EnvironmentLeasePolicy::Reuse,
+            status: LeaseStatus::Active,
+            lease_policy: None,
             provider: Some("local".to_string()),
             provider_lease_id: Some(format!("lease-{}", Uuid::new_v4())),
             acquired_at: now,
-            last_used_at: now,
+            last_used_at: Some(now),
             expires_at: Some(now + chrono::Duration::hours(1)),
             released_at: None,
             failure_reason: None,
             cleanup_status: None,
-            metadata: Some(serde_json::json!({
-                "adapterType": request.adapter_type,
-                "workspaceMode": request.execution_workspace_mode
-            })),
-            created_at: now,
-            updated_at: now,
         })
     }
 
@@ -91,14 +86,18 @@ impl EnvironmentDiagnosticsService for MockEnvironmentDiagnosticsService {
             environment_id,
             can_delete: true,
             delete_blocked_reasons: vec![],
+            blocked_reasons: vec![],
+            affected_agents: vec![],
+            affected_issues: vec![],
+            active_leases: vec![],
             static_references: EnvironmentStaticReferences {
                 is_managed_local: false,
                 is_instance_default: false,
-                agent_default_count: 3,
-                execution_workspace_selection_count: 5,
-                issue_selection_count: 2,
-                project_selection_count: 1,
-                secret_binding_count: 4,
+                agent_default_count: 0,
+                execution_workspace_selection_count: 0,
+                issue_selection_count: 0,
+                project_selection_count: 0,
+                secret_binding_count: 0,
             },
             active_runtime_use: EnvironmentActiveRuntimeUse {
                 active_lease_count: 0,

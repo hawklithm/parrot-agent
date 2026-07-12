@@ -15,6 +15,7 @@ pub mod database_secret_service;
 pub mod secret_provider;
 pub mod websocket_service;
 pub mod sse_service;
+pub use sse_service::{InMemorySseService, SseService};
 pub mod file_resource_service;
 pub mod authorization_service;
 pub mod custom_image_service;
@@ -34,6 +35,7 @@ pub mod environment_driver;
 pub mod lease_service;
 pub mod asset_service;
 pub mod workspace_service;
+pub mod mock_environment_services;
 pub mod auth;
 pub mod user_secret_service;
 pub mod secret_provider_service;
@@ -54,6 +56,15 @@ pub mod issue_checkout_service;
 pub mod issue_comment_service_impl;
 pub mod work_product_service;
 pub mod attachment_service;
+pub mod skill_registry_service;
+pub mod secret_remote_import_service;
+pub mod secret_provider_config_service;
+pub mod environment_diagnostics_service;
+
+pub use skill_registry_service::{SkillRegistryService, MockSkillRegistryService};
+pub use secret_remote_import_service::{SecretRemoteImportService, MockSecretRemoteImportService};
+pub use secret_provider_config_service::{SecretProviderConfigService, MockSecretProviderConfigService};
+pub use environment_diagnostics_service::{EnvironmentDiagnosticsService, MockEnvironmentDiagnosticsService};
 
 pub use agent_service::{
     AgentService, CreateAgentInput, UpdateAgentInput, NormalizedAgentRow,
@@ -68,6 +79,9 @@ pub use environment_runtime_service::{
     EnvironmentRuntimeService, EnvironmentLease, WorkspaceRealizationResult,
     ExecutionTargetResult, EnvironmentRuntimeError, LeaseStatus,
     DefaultEnvironmentRuntimeService,
+};
+pub use mock_environment_services::{
+    MockEnvironmentService, MockEnvironmentLeaseService, MockExecutionWorkspaceService,
 };
 pub use secret_service::{
     SecretService, EnvBinding, SecretReference, RuntimeSecretManifestEntry,

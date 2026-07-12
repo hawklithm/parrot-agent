@@ -9,6 +9,7 @@
 /// - invite: 邀请与加入类型（InviteType, AllowedJoinTypes, JoinRequestStatus）
 
 pub mod actor;
+pub mod authorization_service;
 pub mod board_access;
 pub mod board_claim;
 pub mod cli_auth;

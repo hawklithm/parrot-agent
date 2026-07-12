@@ -117,6 +117,9 @@ impl SkillRegistryService for MockSkillRegistryService {
                 ]),
                 usage_notes: Some("This skill analyzes code for common issues including unused variables, missing error handling, security vulnerabilities, and style violations.".to_string()),
                 documentation_url: Some("https://docs.paperclip.ai/skills/code-review".to_string()),
+                usage_example: None,
+                author: Some("Paperclip".to_string()),
+                created_at: Some(chrono::Utc::now()),
             })
         } else {
             Err(crate::errors::ServiceError::NotFound(format!(

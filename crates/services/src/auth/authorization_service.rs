@@ -73,7 +73,8 @@ pub fn assert_company_access(
 /// 1. actor.type = none -> 401 Unauthenticated
 /// 2. actor.is_instance_admin = false -> 403 Forbidden
 pub fn assert_instance_admin(actor: &AuthorizationActor) -> AuthResult<()> {
-    // 检查是否已n    if actor.is_anonymous() {
+    // 检查是否已认证
+    if actor.is_anonymous() {
         return Err(AuthError::unauthenticated("Authentication required"));
     }
 

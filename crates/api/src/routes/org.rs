@@ -4,42 +4,24 @@ use axum::{
     routing::get,
     Router,
 };
-use services::{DefaultOrgChartService, OrgChartService};
-use sqlx::PgPool;
-use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::app_state::AppState;
 use crate::errors::AppError;
-
-/// 组织架构路由状态
-#[derive(Clone)]
-pub struct OrgRouteState {
-    pub org_chart_service: Arc<dyn OrgChartService>,
-}
-
-impl OrgRouteState {
-    pub fn new(pool: PgPool) -> Self {
-        Self {
-            org_chart_service: Arc::new(DefaultOrgChartService::new(pool)),
-        }
-    }
-}
+use services::OrgChartService;
 
 /// 创建组织架构路由
-pub fn org_routes(pool: PgPool) -> Router {
-    let state = OrgRouteState::new(pool);
-
+pub fn org_routes() -> Router<AppState> {
     Router::new()
         .route("/companies/:company_id/org", get(get_org_tree))
         .route("/companies/:company_id/org.svg", get(get_org_svg))
         .route("/companies/:company_id/org.png", get(get_org_png))
-        .with_state(state)
 }
 
 /// GET /companies/:company_id/org - 获取组织架构树（JSON）
 async fn get_org_tree(
     Path(company_id): Path<Uuid>,
-    State(state): State<OrgRouteState>,
+    State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tree = state
         .org_chart_service
@@ -53,7 +35,7 @@ async fn get_org_tree(
 /// GET /companies/:company_id/org.svg - 生成 SVG 组织架构图
 async fn get_org_svg(
     Path(company_id): Path<Uuid>,
-    State(state): State<OrgRouteState>,
+    State(state): State<AppState>,
 ) -> Result<Response, AppError> {
     let tree = state
         .org_chart_service
@@ -85,7 +67,7 @@ async fn get_org_svg(
 /// GET /companies/:company_id/org.png - 生成 PNG 组织架构图
 async fn get_org_png(
     Path(company_id): Path<Uuid>,
-    State(state): State<OrgRouteState>,
+    State(state): State<AppState>,
 ) -> Result<Response, AppError> {
     let _tree = state
         .org_chart_service

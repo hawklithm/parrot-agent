@@ -140,7 +140,7 @@ impl SecretProviderConfigService for MockSecretProviderConfigService {
         };
 
         Ok(SecretProviderConfigDiscoveryPreviewResult {
-            provider: request.provider,
+            provider: request.provider.clone(),
             next_token: None,
             sampled_secret_count: 15,
             skipped_foreign_paperclip_sample_count: 2,

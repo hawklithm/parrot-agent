@@ -20,7 +20,7 @@ uuid = { workspace = true }
 sqlx = { workspace = true }
 garde = { version = "0.18", features = ["derive", "serde"] }
 chrono = { workspace = true }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 thiserror = { workspace = true }
 tracing = { workspace = true }

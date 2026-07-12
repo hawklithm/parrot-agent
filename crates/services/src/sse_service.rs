@@ -1,6 +1,12 @@
+use async_trait::async_trait;
+use dashmap::DashMap;
+use models::{SseEvent, SseFrame as ModelSseFrame, SseSubscription, SseEventType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::broadcast;
+use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SseError {
@@ -258,6 +264,108 @@ impl SseStreamManager {
 impl Default for SseStreamManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Real-time server-sent-events service.
+///
+/// Implementations manage per-channel broadcast topics and allow subscribers to
+/// receive a stream of [`SseFrame`]s.
+#[async_trait]
+pub trait SseService: Send + Sync {
+    /// Subscribe to a channel, returning a receiver that yields frames.
+    async fn subscribe(
+        &self,
+        subscription: SseSubscription,
+    ) -> Result<broadcast::Receiver<ModelSseFrame>, String>;
+
+    /// Publish an event to a company/channel.
+    async fn publish(
+        &self,
+        company_id: Uuid,
+        channel: &str,
+        event: SseEvent,
+    ) -> Result<(), String>;
+
+    /// Number of active subscribers for a company/channel.
+    async fn subscriber_count(&self, company_id: Uuid, channel: &str) -> u64;
+}
+
+/// In-memory broadcast-backed implementation of [`SseService`].
+///
+/// Each channel maps to a `tokio` broadcast topic. Subscribers receive frames
+/// published after they subscribe; late frames are simply dropped.
+#[derive(Debug, Default)]
+pub struct InMemorySseService {
+    channels: DashMap<String, broadcast::Sender<ModelSseFrame>>,
+}
+
+impl InMemorySseService {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            channels: DashMap::new(),
+        })
+    }
+
+    fn channel_key(company_id: Uuid, channel: &str) -> String {
+        format!("{}:{}", company_id, channel)
+    }
+
+    fn sender_for(&self, key: &str) -> broadcast::Sender<ModelSseFrame> {
+        if let Some(existing) = self.channels.get(key) {
+            return existing.clone();
+        }
+        let (tx, _rx) = broadcast::channel(256);
+        // Only insert if another writer hasn't done so concurrently.
+        match self.channels.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(o) => o.get().clone(),
+            dashmap::mapref::entry::Entry::Vacant(v) => v.insert(tx).clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl SseService for InMemorySseService {
+    async fn subscribe(
+        &self,
+        subscription: SseSubscription,
+    ) -> Result<broadcast::Receiver<ModelSseFrame>, String> {
+        let key = Self::channel_key(subscription.company_id, &subscription.channel);
+        let sender = self.sender_for(&key);
+        Ok(sender.subscribe())
+    }
+
+    async fn publish(
+        &self,
+        company_id: Uuid,
+        channel: &str,
+        event: SseEvent,
+    ) -> Result<(), String> {
+        let key = Self::channel_key(company_id, channel);
+        let sender = self.sender_for(&key);
+
+        let event_name = match event.event_type {
+            SseEventType::Message => "message".to_string(),
+            SseEventType::Open => "open".to_string(),
+            SseEventType::Close => "close".to_string(),
+            SseEventType::Error => "error".to_string(),
+            SseEventType::Heartbeat => "heartbeat".to_string(),
+        };
+        let data = serde_json::to_string(&event.payload)
+            .unwrap_or_else(|_| "{}".to_string());
+        let frame = ModelSseFrame::with_event(event_name, data);
+
+        // Ignore send errors when there are no active subscribers.
+        let _ = sender.send(frame);
+        Ok(())
+    }
+
+    async fn subscriber_count(&self, company_id: Uuid, channel: &str) -> u64 {
+        let key = Self::channel_key(company_id, channel);
+        self.channels
+            .get(&key)
+            .map(|s| s.receiver_count() as u64)
+            .unwrap_or(0)
     }
 }
 

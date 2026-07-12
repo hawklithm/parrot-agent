@@ -300,11 +300,11 @@ where
         let api_key = self.api_key_repo
             .find_by_key_hash(&key_hash)
             .await?
-            .ok_or_else(|| ServiceError::NotFound("Invalid agent key".to_string()))?;
+            .ok_or_else(|| ServiceError::Unauthorized("Invalid agent key".to_string()))?;
 
         // Verify key is active
         if !api_key.is_active() {
-            return Err(ServiceError::InvalidInput("Agent key is revoked".to_string()));
+            return Err(ServiceError::Unauthorized("Agent key is revoked".to_string()));
         }
 
         // Update last_used_at timestamp (fire-and-forget)

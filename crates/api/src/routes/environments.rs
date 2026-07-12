@@ -11,14 +11,13 @@ use uuid::Uuid;
 
 use models::{CreateEnvironmentInput, UpdateEnvironmentInput};
 use services::{
-    EnvironmentLeaseService, EnvironmentService, ExecutionWorkspaceService,
     MockEnvironmentLeaseService, MockEnvironmentService, MockExecutionWorkspaceService,
 };
 
 pub fn environment_routes() -> Router {
-    let env_service = Arc::new(MockEnvironmentService::new());
-    let lease_service = Arc::new(MockEnvironmentLeaseService::new());
-    let workspace_service = Arc::new(MockExecutionWorkspaceService::new());
+    let env_service = MockEnvironmentService::new();
+    let lease_service = MockEnvironmentLeaseService::new();
+    let workspace_service = MockExecutionWorkspaceService::new();
 
     Router::new()
         .route(

@@ -37,6 +37,9 @@ pub enum ServiceError {
 
     #[error("Bad request: {0}")]
     BadRequest(String),
+
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 }
 
 impl From<crate::agent_service::ServiceError> for ServiceError {

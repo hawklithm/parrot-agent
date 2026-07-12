@@ -24,11 +24,9 @@ pub async fn list_scheduler_heartbeats(
             a.company_id,
             a.name as agent_name,
             a.role,
-            a.title,
             a.status,
             a.adapter_type,
             a.runtime_config,
-            a.last_heartbeat_at,
             c.name as company_name,
             c.issue_prefix as company_issue_prefix
         FROM agents a
@@ -68,13 +66,13 @@ pub async fn list_scheduler_heartbeats(
                 agent_name: row.agent_name,
                 agent_url_key,
                 role: row.role,
-                title: row.title,
+                title: None,
                 status: row.status,
                 adapter_type: row.adapter_type,
                 interval_sec: policy.interval_sec,
                 heartbeat_enabled: policy.enabled,
                 scheduler_active,
-                last_heartbeat_at: row.last_heartbeat_at,
+                last_heartbeat_at: None,
             })
         })
         .collect();

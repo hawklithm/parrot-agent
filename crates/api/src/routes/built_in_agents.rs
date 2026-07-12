@@ -1,28 +1,28 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use services::{
     BuiltInAgentService, BuiltInAgentStatus, BuiltInAgentDefinition,
-    BuiltInAgentError, ReconcileResult,
+    BuiltInAgentError, BuiltInAgentKey, ReconcileResult,
 };
 use crate::extractors::CompanyIdOrShortname;
 use crate::validation::agent_schemas::ProvisionBuiltInAgentSchema;
 use garde::Validate;
 use std::sync::Arc;
 
+/// AppState 别名，统一状态类型
+pub use crate::app_state::AppState;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuiltInAgentStateResponse {
     pub definition: BuiltInAgentDefinition,
     pub status: BuiltInAgentStatus,
-    pub agent_id: Option<uuid::Uuid>,
-    pub agent: Option<serde_json::Value>,
-    pub pause_reason: Option<String>,
-    pub resources: Vec<serde_json::Value>,
-    pub approval: Option<serde_json::Value>,
+    pub agent: Option<models::Agent>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,32 +37,45 @@ pub struct ProvisionBuiltInAgentRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ReconcileBuiltInAgentRequest {}
 
+/// 将 `BuiltInAgentError` 映射为 HTTP 状态码与消息
+fn map_built_in_error(e: BuiltInAgentError) -> (StatusCode, String) {
+    match e {
+        BuiltInAgentError::NotFound(_) => {
+            (StatusCode::NOT_FOUND, "Built-in agent not found".to_string())
+        }
+        BuiltInAgentError::RepositoryError(msg)
+        | BuiltInAgentError::InvalidConfiguration(msg)
+        | BuiltInAgentError::ProvisionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
+        BuiltInAgentError::FeatureNotEnabled(msg) => (StatusCode::FORBIDDEN, msg),
+        BuiltInAgentError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+    }
+}
+
 /// GET /companies/:companyId/built-in-agents
 /// 列出公司所有内置 Agent 的状态
 pub async fn list_built_in_agents(
-    State(service): State<Arc<dyn BuiltInAgentService>>,
+    State(state): State<AppState>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
 ) -> Result<Json<Vec<BuiltInAgentStateResponse>>, (StatusCode, String)> {
-    let states = service
-        .list_built_in_agents(company_id)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to list built-in agents: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list built-in agents: {}", e))
-        })?;
+    let service = state.built_in_agent_service.clone();
+    let definitions = service.list_definitions();
 
-    let responses: Vec<BuiltInAgentStateResponse> = states
-        .into_iter()
-        .map(|state| BuiltInAgentStateResponse {
-            definition: state.definition,
-            status: state.status,
-            agent_id: state.agent_id,
-            agent: state.agent.map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null)),
-            pause_reason: state.pause_reason,
-            resources: state.resources,
-            approval: state.approval.map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null)),
-        })
-        .collect();
+    let mut responses = Vec::with_capacity(definitions.len());
+    for def in definitions {
+        let status = service
+            .get_status(company_id, def.key)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to get built-in agent status: {:?}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get status: {}", e))
+            })?;
+
+        responses.push(BuiltInAgentStateResponse {
+            definition: def.clone(),
+            status,
+            agent: None,
+        });
+    }
 
     Ok(Json(responses))
 }
@@ -70,53 +83,42 @@ pub async fn list_built_in_agents(
 /// POST /companies/:companyId/built-in-agents/:key/provision
 /// 配置指定的内置 Agent
 pub async fn provision_built_in_agent(
-    State(service): State<Arc<dyn BuiltInAgentService>>,
+    State(state): State<AppState>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
     Path(key): Path<String>,
     Json(payload): Json<ProvisionBuiltInAgentRequest>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
-    // 构造 provision 输入
+    let service = state.built_in_agent_service.clone();
+    // 验证请求
     let schema = ProvisionBuiltInAgentSchema {
         adapter_type: payload.adapter_type.clone(),
         adapter_config: payload.adapter_config.clone(),
         budget_monthly_cents: payload.budget_monthly_cents,
     };
-
-    // 验证输入
-    schema.validate().map_err(|e| {
+    schema.validate(&()).map_err(|e| {
         tracing::warn!("Provision validation failed: {:?}", e);
         (StatusCode::BAD_REQUEST, format!("Validation error: {}", e))
     })?;
 
+    // 解析内置 Agent 键
+    let key = BuiltInAgentKey::from_str(&key)
+        .ok_or((StatusCode::NOT_FOUND, "Unknown built-in agent key".to_string()))?;
+
     // 调用服务层
-    let state = service
-        .provision_built_in_agent(
-            company_id,
-            &key,
-            payload.adapter_type,
-            payload.adapter_config,
-            payload.budget_monthly_cents,
-        )
+    let agent = service
+        .provision(company_id, key)
         .await
-        .map_err(|e| match e {
-            BuiltInAgentError::NotFound => (StatusCode::NOT_FOUND, "Built-in agent not found".to_string()),
-            BuiltInAgentError::Forbidden => (StatusCode::FORBIDDEN, "Permission denied".to_string()),
-            BuiltInAgentError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg),
-            BuiltInAgentError::AlreadyProvisioned => (StatusCode::CONFLICT, "Agent already provisioned".to_string()),
-            _ => {
-                tracing::error!("Failed to provision built-in agent: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to provision: {}", e))
-            }
-        })?;
+        .map_err(map_built_in_error)?;
+
+    let definition = service
+        .get_definition(key)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "Built-in agent definition missing".to_string()))?;
 
     let response = BuiltInAgentStateResponse {
-        definition: state.definition,
-        status: state.status,
-        agent_id: state.agent_id,
-        agent: state.agent.map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null)),
-        pause_reason: state.pause_reason,
-        resources: state.resources,
-        approval: state.approval.map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null)),
+        definition,
+        status: BuiltInAgentStatus::Ready,
+        agent: Some(agent),
     };
 
     Ok(Json(response))
@@ -125,40 +127,58 @@ pub async fn provision_built_in_agent(
 /// POST /companies/:companyId/built-in-agents/:key/reconcile
 /// 协调指定内置 Agent 的状态（重新应用默认配置）
 pub async fn reconcile_built_in_agent(
-    State(service): State<Arc<dyn BuiltInAgentService>>,
+    State(state): State<AppState>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
     Path(key): Path<String>,
     Json(_payload): Json<ReconcileBuiltInAgentRequest>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
-    let result = service
-        .reconcile_built_in_agent(company_id, &key)
-        .await
-        .map_err(|e| match e {
-            BuiltInAgentError::NotFound => (StatusCode::NOT_FOUND, "Built-in agent not found".to_string()),
-            BuiltInAgentError::Forbidden => (StatusCode::FORBIDDEN, "Permission denied".to_string()),
-            BuiltInAgentError::NotProvisioned => (
-                StatusCode::PRECONDITION_FAILED,
-                "Agent not provisioned yet".to_string(),
-            ),
-            _ => {
-                tracing::error!("Failed to reconcile built-in agent: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to reconcile: {}", e))
-            }
-        })?;
+    let service = state.built_in_agent_service.clone();
+    let key = BuiltInAgentKey::from_str(&key)
+        .ok_or((StatusCode::NOT_FOUND, "Unknown built-in agent key".to_string()))?;
 
-    let response = match result {
-        ReconcileResult::State(state) => BuiltInAgentStateResponse {
-            definition: state.definition,
-            status: state.status,
-            agent_id: state.agent_id,
-            agent: state.agent.map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null)),
-            pause_reason: state.pause_reason,
-            resources: state.resources,
-            approval: state.approval.map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null)),
-        },
+    let result = service
+        .reconcile(company_id, key)
+        .await
+        .map_err(map_built_in_error)?;
+
+    let definition = service
+        .get_definition(key)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "Built-in agent definition missing".to_string()))?;
+
+    let response = BuiltInAgentStateResponse {
+        definition,
+        status: BuiltInAgentStatus::Ready,
+        agent: None,
     };
 
+    // result.changes 可用于后续审计/日志
+    if !result.changes.is_empty() {
+        tracing::info!("Built-in agent reconcile changes: {:?}", result.changes);
+    }
+
     Ok(Json(response))
+}
+
+/// Create built-in agent routes.
+///
+/// 使用统一的 `AppState` 作为状态类型，返回 `Router<AppState>`，
+/// 由 `create_router` 统一在最后调用 `.with_state(state)` 绑定。
+pub fn built_in_agent_routes() -> Router<AppState> {
+    use axum::routing::{get, post};
+    Router::new()
+        .route(
+            "/companies/:company_id/built-in-agents",
+            get(list_built_in_agents),
+        )
+        .route(
+            "/companies/:company_id/built-in-agents/:key/provision",
+            post(provision_built_in_agent),
+        )
+        .route(
+            "/companies/:company_id/built-in-agents/:key/reconcile",
+            post(reconcile_built_in_agent),
+        )
 }
 
 #[cfg(test)]

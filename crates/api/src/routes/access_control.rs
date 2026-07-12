@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use axum::{
+    async_trait,
     extract::{Extension, FromRequestParts, Path, State},
     http::{request::Parts, StatusCode},
     response::IntoResponse,
@@ -34,12 +35,16 @@ use crate::app_state::AppState;
 pub struct CompanyId(pub Uuid);
 
 #[allow(dead_code)]
-impl FromRequestParts<AppState> for CompanyId {
+#[async_trait]
+impl<S> FromRequestParts<S> for CompanyId
+where
+    S: Send + Sync,
+{
     type Rejection = AuthError;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
         let value = parts
             .uri
@@ -58,12 +63,16 @@ impl FromRequestParts<AppState> for CompanyId {
 pub struct MemberId(pub Uuid);
 
 #[allow(dead_code)]
-impl FromRequestParts<AppState> for MemberId {
+#[async_trait]
+impl<S> FromRequestParts<S> for MemberId
+where
+    S: Send + Sync,
+{
     type Rejection = AuthError;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
         let value = parts
             .uri
@@ -82,12 +91,16 @@ impl FromRequestParts<AppState> for MemberId {
 pub struct Token(pub String);
 
 #[allow(dead_code)]
-impl FromRequestParts<AppState> for Token {
+#[async_trait]
+impl<S> FromRequestParts<S> for Token
+where
+    S: Send + Sync,
+{
     type Rejection = AuthError;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
         let value = parts
             .uri
