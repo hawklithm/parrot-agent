@@ -108,7 +108,7 @@ impl TreeControlService for MockTreeControlService {
             mode: input.mode,
             status: models::IssueTreeHoldStatus::Active,
             reason: input.reason,
-            release_policy: input.release_policy,
+            release_policy: sqlx::types::Json(input.release_policy),
             metadata: input.metadata,
             actor_agent_id: agent_id,
             actor_user_id: user_id,
@@ -129,10 +129,10 @@ impl TreeControlService for MockTreeControlService {
             mode: models::IssueTreeControlMode::Pause,
             status: models::IssueTreeHoldStatus::Active,
             reason: Some("Mock hold".to_string()),
-            release_policy: models::IssueTreeHoldReleasePolicy {
+            release_policy: sqlx::types::Json(models::IssueTreeHoldReleasePolicy {
                 strategy: models::IssueTreeHoldReleasePolicyStrategy::Manual,
                 note: None,
-            },
+            }),
             metadata: None,
             actor_agent_id: None,
             actor_user_id: None,
@@ -154,10 +154,10 @@ impl TreeControlService for MockTreeControlService {
                 mode: models::IssueTreeControlMode::Pause,
                 status: models::IssueTreeHoldStatus::Active,
                 reason: Some("Mock hold 1".to_string()),
-                release_policy: models::IssueTreeHoldReleasePolicy {
+                release_policy: sqlx::types::Json(models::IssueTreeHoldReleasePolicy {
                     strategy: models::IssueTreeHoldReleasePolicyStrategy::Manual,
                     note: None,
-                },
+                }),
                 metadata: None,
                 actor_agent_id: None,
                 actor_user_id: None,

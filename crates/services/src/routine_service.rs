@@ -3,6 +3,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::errors::{ServiceError, ServiceResult};
+use chrono::Utc;
 use models::routine::{Routine, RoutineRun, RoutineTriggerConfig, RoutineStatus};
 use models::goal::{Goal, GoalPriority, GoalStatus};
 use repositories::routine_repository::RoutineRepository;
@@ -193,6 +194,7 @@ impl GoalService for GoalServiceImpl {
         created_by_user_id: Uuid,
     ) -> ServiceResult<Goal> {
         let input = models::goal::CreateGoalInput {
+            company_id,
             title: name,
             description,
             level: models::goal::GoalLevel::Task,
@@ -242,7 +244,8 @@ impl GoalService for GoalServiceImpl {
             .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Goal {} not found", goal_id)))?;
 
-        goal.complete();
+        goal.status = models::goal::GoalStatus::Achieved;
+        goal.completed_at = Some(chrono::Utc::now());
         self.repository.update(goal).await.map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
@@ -251,7 +254,7 @@ impl GoalService for GoalServiceImpl {
             .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Goal {} not found", goal_id)))?;
 
-        goal.abandon();
+        goal.status = models::goal::GoalStatus::Abandoned;
         self.repository.update(goal).await.map_err(|e| ServiceError::Repository(e.to_string()))
     }
 

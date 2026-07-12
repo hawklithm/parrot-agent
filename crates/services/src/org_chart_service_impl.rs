@@ -70,7 +70,7 @@ impl OrgChartService for DefaultOrgChartService {
             children
                 .iter()
                 .map(|agent| OrgNode {
-                    id: agent.id,
+                    id: agent.id.to_string(),
                     name: agent.name.clone(),
                     role: get_role_label(&agent.role),
                     status: agent.status.clone(),
@@ -185,7 +185,7 @@ impl OrgChartService for DefaultOrgChartService {
             children
                 .iter()
                 .map(|agent| OrgNode {
-                    id: agent.id,
+                    id: agent.id.to_string(),
                     name: agent.name.clone(),
                     role: get_role_label(&agent.role),
                     status: agent.status.clone(),

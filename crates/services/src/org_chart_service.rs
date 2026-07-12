@@ -152,7 +152,7 @@ impl MockOrgChartService {
             // 渲染子节点（第二层）
             let children_count = root.reports.len();
             if children_count > 0 {
-                let total_width = children_count * card_width + (children_count - 1) * gap_x;
+                let total_width = (children_count as i32) * card_width + ((children_count as i32) - 1) * gap_x;
                 let start_x = 640 - total_width / 2;
                 let child_y = root_bottom + gap_y;
                 
@@ -164,7 +164,7 @@ impl MockOrgChartService {
                 ));
                 
                 for (child_idx, child) in root.reports.iter().enumerate() {
-                    let child_x = start_x + child_idx * (card_width + gap_x);
+                    let child_x = start_x + (child_idx as i32) * (card_width + gap_x);
                     let child_cx = child_x + card_width / 2;
                     
                     // 横向连接线
@@ -193,7 +193,7 @@ impl MockOrgChartService {
                         ));
                         
                         for (gc_idx, grandchild) in child.reports.iter().enumerate() {
-                            let gc_x = child_x + gc_idx * 80 - 40;
+                            let gc_x = child_x + (gc_idx as i32) * 80 - 40;
                             let gc_cx = gc_x + card_width / 2;
                             svg_content.push_str(&format!(
                                 r#"<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="{}" stroke-width="2"/>"#,

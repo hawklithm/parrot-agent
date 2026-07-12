@@ -6,7 +6,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use models::{RoutineTrigger, TriggerType, TriggerStatus};
-use crate::ServiceError;
+use crate::errors::ServiceError;
 
 /// Input for creating a routine trigger
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,7 +130,7 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
     async fn create(&self, input: CreateTriggerInput) -> Result<RoutineTrigger, ServiceError> {
         // Verify routine exists
         let routine = self.routine_repo
-            .find_by_id(input.routine_id)
+            .get(input.routine_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to verify routine: {}", e)))?
             .ok_or_else(|| ServiceError::NotFound(format!("Routine {} not found", input.routine_id)))?;
@@ -140,13 +140,31 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
 
         let trigger = RoutineTrigger {
             id: Uuid::new_v4(),
+            company_id: routine.company_id,
             routine_id: input.routine_id,
+            kind: match input.trigger_type {
+                TriggerType::Schedule => models::TriggerKind::Schedule,
+                TriggerType::Webhook => models::TriggerKind::Webhook,
+                TriggerType::Manual => models::TriggerKind::Manual,
+                TriggerType::Event => models::TriggerKind::Manual,
+            },
+            label: None,
+            enabled: input.enabled,
             trigger_type: input.trigger_type,
             config: input.config,
-            enabled: input.enabled,
-            last_triggered_at: None,
-            next_trigger_at: None,
             status: TriggerStatus::Active,
+            next_trigger_at: None,
+            last_triggered_at: None,
+            cron_expression: None,
+            timezone: None,
+            next_run_at: None,
+            last_fired_at: None,
+            public_id: None,
+            secret_id: None,
+            signing_mode: None,
+            replay_window_sec: None,
+            last_rotated_at: None,
+            last_result: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -223,8 +241,15 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
     }
 
     async fn list_by_type(&self, trigger_type: TriggerType) -> Result<Vec<RoutineTrigger>, ServiceError> {
+        let kind = match trigger_type {
+            TriggerType::Schedule => models::TriggerKind::Schedule,
+            TriggerType::Webhook => models::TriggerKind::Webhook,
+            TriggerType::Manual => models::TriggerKind::Manual,
+            TriggerType::Event => models::TriggerKind::Manual,
+            TriggerType::Cron => models::TriggerKind::Schedule,
+        };
         self.trigger_repo
-            .find_by_type(trigger_type)
+            .find_by_type(kind)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list triggers by type: {}", e)))
     }
@@ -237,7 +262,7 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
         }
 
         let routine = self.routine_repo
-            .find_by_id(trigger.routine_id)
+            .get(trigger.routine_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to get routine: {}", e)))?
             .ok_or_else(|| ServiceError::NotFound(format!("Routine {} not found", trigger.routine_id)))?;
@@ -258,6 +283,15 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
 
     fn validate_trigger_config(&self, trigger_type: TriggerType, config: &serde_json::Value) -> Result<(), ServiceError> {
         match trigger_type {
+            TriggerType::Schedule => {
+                // Schedule triggers use cron_expression
+                let cron_expr = config.get("cron_expression")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ServiceError::InvalidInput("Schedule trigger requires 'cron_expression' in config".to_string()))?;
+
+                self.validate_cron_expression(cron_expr)?;
+                Ok(())
+            }
             TriggerType::Cron => {
                 // Cron triggers need cron_expression
                 let cron_expr = config.get("cron_expression")
@@ -265,6 +299,10 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
                     .ok_or_else(|| ServiceError::InvalidInput("Cron trigger requires 'cron_expression' in config".to_string()))?;
 
                 self.validate_cron_expression(cron_expr)?;
+                Ok(())
+            }
+            TriggerType::Event => {
+                // Event triggers - minimal validation
                 Ok(())
             }
             TriggerType::Webhook => {
