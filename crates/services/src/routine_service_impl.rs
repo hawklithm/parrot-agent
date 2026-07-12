@@ -10,7 +10,7 @@ use models::{
     ConcurrencyPolicy, CatchUpPolicy, RunSource, RunStatus, TriggerKind,
     RoutineVariable, RoutineVariableType
 };
-use crate::ServiceError;
+use crate::errors::ServiceError;
 
 /// Create Routine Input
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +125,7 @@ impl DefaultRoutineService {
             company_id: routine.company_id,
             routine_id: routine.id,
             revision_number: 1,
-            title: Some(routine.title.clone()),
+            title: routine.title.clone(),
             description: routine.description.clone(),
             snapshot,
             change_summary: Some("Initial revision".to_string()),
@@ -165,10 +165,13 @@ impl DefaultRoutineService {
 
     /// Check concurrency policy before creating run
     async fn check_concurrency(&self, routine_id: Uuid, policy: ConcurrencyPolicy) -> Result<Option<Uuid>, ServiceError> {
-        let active_runs = self.routine_repo
-            .find_active_runs(routine_id)
+        let active_runs: Vec<RoutineRun> = self.routine_repo
+            .list_runs(routine_id, 10)
             .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to find active runs: {}", e)))?;
+            .map_err(|e| ServiceError::Internal(format!("Failed to find runs: {}", e)))?
+            .into_iter()
+            .filter(|r| r.status == RunStatus::Running)
+            .collect();
 
         if active_runs.is_empty() {
             return Ok(None);
@@ -204,19 +207,28 @@ impl RoutineService for DefaultRoutineService {
             project_id: input.project_id,
             goal_id: input.goal_id,
             parent_issue_id: None,
+            name: input.title.clone(),
             title: input.title,
             description: input.description,
+            agent_id: input.assignee_agent_id,
             assignee_agent_id: input.assignee_agent_id,
             priority: input.priority,
             status: input.status,
             concurrency_policy: input.concurrency_policy,
             catch_up_policy: input.catch_up_policy,
+            trigger_config: serde_json::Value::Object(serde_json::Map::new()),
             variables: serde_json::to_value(&input.variables)
                 .map_err(|e| ServiceError::Internal(format!("Failed to serialize variables: {}", e)))?,
             env: input.env,
             latest_revision_id: None,
             latest_revision_number: 0,
             responsible_user_id: input.responsible_user_id,
+            created_by_user_id: None,
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            success_count: 0,
+            failure_count: 0,
             last_triggered_at: None,
             last_enqueued_at: None,
             created_at: now,
@@ -246,7 +258,7 @@ impl RoutineService for DefaultRoutineService {
 
     async fn get_by_id(&self, id: Uuid) -> Result<Routine, ServiceError> {
         self.routine_repo
-            .find_by_id(id)
+            .get(id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find routine: {}", e)))?
             .ok_or_else(|| ServiceError::NotFound("Routine not found".to_string()))
@@ -319,7 +331,7 @@ impl RoutineService for DefaultRoutineService {
                 company_id: routine.company_id,
                 routine_id: routine.id,
                 revision_number: new_revision_number,
-                title: Some(routine.title.clone()),
+                title: routine.title.clone(),
                 description: routine.description.clone(),
                 snapshot,
                 change_summary: Some("Configuration updated".to_string()),
@@ -356,14 +368,14 @@ impl RoutineService for DefaultRoutineService {
 
     async fn list_by_company(&self, company_id: Uuid) -> Result<Vec<Routine>, ServiceError> {
         self.routine_repo
-            .find_by_company_id(company_id)
+            .list_by_company(company_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list routines: {}", e)))
     }
 
     async fn list_by_agent(&self, agent_id: Uuid) -> Result<Vec<Routine>, ServiceError> {
         self.routine_repo
-            .find_by_assignee_agent_id(agent_id)
+            .list_by_agent(agent_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list routines: {}", e)))
     }
@@ -396,7 +408,7 @@ impl RoutineService for DefaultRoutineService {
                     triggered_at: Utc::now(),
                     routine_revision_id: routine.latest_revision_id,
                     idempotency_key: None,
-                    trigger_payload: serde_json::json!({}),
+                    trigger_payload: Some(serde_json::json!({})),
                     dispatch_fingerprint: None,
                     linked_issue_id: None,
                     coalesced_into_run_id: Some(run_id),
@@ -426,7 +438,7 @@ impl RoutineService for DefaultRoutineService {
                     triggered_at: Utc::now(),
                     routine_revision_id: routine.latest_revision_id,
                     idempotency_key: None,
-                    trigger_payload: serde_json::json!({}),
+                    trigger_payload: Some(serde_json::json!({})),
                     dispatch_fingerprint: None,
                     linked_issue_id: None,
                     coalesced_into_run_id: None,
@@ -457,7 +469,7 @@ impl RoutineService for DefaultRoutineService {
             triggered_at: Utc::now(),
             routine_revision_id: routine.latest_revision_id,
             idempotency_key: None,
-            trigger_payload: serde_json::json!({}),
+            trigger_payload: Some(serde_json::json!({})),
             dispatch_fingerprint: Some(format!("{}:{}", routine_id, Uuid::new_v4())),
             linked_issue_id: None,
             coalesced_into_run_id: None,
@@ -530,7 +542,7 @@ impl RoutineService for DefaultRoutineService {
             company_id: routine.company_id,
             routine_id: routine.id,
             revision_number: new_revision_number,
-            title: Some(routine.title.clone()),
+            title: routine.title.clone(),
             description: routine.description.clone(),
             snapshot: revision.snapshot.clone(),
             change_summary: Some(format!("Restored from revision {}", revision.revision_number)),

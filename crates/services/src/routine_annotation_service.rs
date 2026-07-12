@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use models::{
     AnnotationAnchorConfidence, AnnotationAnchorSelector, AnnotationAnchorState,
-    AnnotationTextPositionSelector, AnnotationTextQuoteSelector, AnnotationThreadStatus,
+    AnnotationTextPositionSelector, AnnotationTextQuoteSelector,
     CreateRoutineAnnotationCommentRequest, CreateRoutineAnnotationThreadRequest,
     RoutineAnnotationComment, RoutineAnnotationThread, RoutineAnnotationThreadWithComments,
     UpdateRoutineAnnotationThreadRequest,
 };
+use models::routine_annotation::AnnotationThreadStatus;
 use std::sync::Arc;
 use uuid::Uuid;
 

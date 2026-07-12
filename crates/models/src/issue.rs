@@ -108,7 +108,7 @@ pub struct Issue {
     pub execution_locked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_by_agent_id: Option<Uuid>,
     pub created_by_user_id: Option<Uuid>,
-    pubesponsible_user_id: Option<Uuid>,
+    pub responsible_user_id: Option<Uuid>,
     pub issue_number: Option<i32>,
     pub identifier: Option<String>,
     pub origin_kind: Option<String>,

@@ -139,6 +139,7 @@ where
         environment_id: Uuid,
     ) -> Result<WorkspaceProvisionResult, WorkspaceServiceError> {
         // Step 1: Create workspace record with Provisioning status
+        let company_id = input.company_id; // 先取出 company_id，避免 input 被 move
         let workspace = self.workspace_repo.create(input).await?;
 
         // Step 2: Acquire environment lease
@@ -148,8 +149,6 @@ where
             issue_id: workspace.source_issue_id,
             heartbeat_run_id: None,
         };
-
-        let company_id = input.company_id;
         let lease = match self.lease_service.acquire_lease(company_id, lease_request).await {
             Ok(lease) => Some(lease),
             Err(e) => {

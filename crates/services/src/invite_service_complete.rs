@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{ServiceError, ServiceResult};
+use crate::errors::{ServiceError, ServiceResult};
 
 /// Invite service trait with complete workflow support
 #[async_trait]

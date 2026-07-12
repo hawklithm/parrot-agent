@@ -4,7 +4,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use models::{Goal, GoalLevel, GoalStatus};
-use crate::ServiceError;
+use crate::errors::ServiceError;
 
 /// Goal Service trait
 #[async_trait]
@@ -74,7 +74,7 @@ impl DefaultGoalService {
     async fn validate_hierarchy(&self, parent_id: Option<Uuid>, level: GoalLevel) -> Result<(), ServiceError> {
         if let Some(parent_id) = parent_id {
             let parent = self.goal_repo
-                .find_by_id(parent_id)
+                .get(parent_id)
                 .await
                 .map_err(|e| ServiceError::Internal(format!("Failed to find parent goal: {}", e)))?
                 .ok_or_else(|| ServiceError::NotFound("Parent goal not found".to_string()))?;
@@ -107,7 +107,7 @@ impl DefaultGoalService {
             visited.insert(current_id);
 
             let current = self.goal_repo
-                .find_by_id(current_id)
+                .get(current_id)
                 .await
                 .map_err(|e| ServiceError::Internal(format!("Failed to find goal: {}", e)))?
                 .ok_or_else(|| ServiceError::NotFound("Goal not found".to_string()))?;
@@ -187,7 +187,7 @@ impl GoalService for DefaultGoalService {
     async fn delete(&self, id: Uuid) -> Result<(), ServiceError> {
         // Check for children
         let children = self.goal_repo
-            .find_by_parent_id(id)
+                .list_children(id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find child goals: {}", e)))?;
 
@@ -221,7 +221,7 @@ impl GoalService for DefaultGoalService {
             .map_err(|e| ServiceError::Internal(format!("Failed to find issues: {}", e)))?;
 
         let child_goals = self.goal_repo
-            .find_by_parent_id(goal_id)
+                .list_children(goal_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find child goals: {}", e)))?;
 
@@ -275,7 +275,7 @@ impl GoalService for DefaultGoalService {
         };
 
         let children = self.goal_repo
-            .find_by_parent_id(goal_id)
+                .list_children(goal_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find children: {}", e)))?;
 

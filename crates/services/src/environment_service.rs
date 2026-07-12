@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use models::{Environment, EnvironmentStatus, EnvironmentDriver, CreateEnvironmentInput, UpdateEnvironmentInput};
-use crate::ServiceError;
+use models::execution_environment::{ExecutionEnvironment as Environment, EnvironmentStatus, EnvironmentDriver, CreateEnvironmentInput, UpdateEnvironmentInput};
+use crate::errors::ServiceError;
 
 /// Input for leasing an environment
 #[derive(Debug, Clone, Serialize, Deserialize)]
