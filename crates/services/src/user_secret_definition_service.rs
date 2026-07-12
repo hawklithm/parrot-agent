@@ -125,9 +125,31 @@ impl UserSecretDefinitionService for UserSecretDefinitionServiceImpl {
 
     async fn list_my_secrets(&self, company_id: Uuid, _user_id: Uuid) -> ServiceResult<Vec<MyUserSecretEntry>> {
         let defs = self.list_definitions(company_id).await?;
-        Ok(defs.into_iter().map(|definition| MyUserSecretEntry {
-            definition,
+        Ok(defs.into_iter().map(|definition| {
+            use models::user_secret_definition::UserSecretDefinition as TargetDef;
+            MyUserSecretEntry {
+            definition: TargetDef {
+                id: definition.id,
+                company_id: definition.company_id,
+                key: definition.key,
+                name: definition.name,
+                description: definition.description,
+                status: definition.status,
+                provider: definition.provider,
+                managed_mode: definition.managed_mode,
+                provider_config_id: definition.provider_config_id,
+                provider_metadata: definition.provider_metadata.and_then(|m| serde_json::from_str(&m).ok()),
+                usage_guidance: definition.usage_guidance,
+                created_by_agent_id: definition.created_by_agent_id,
+                created_by_user_id: definition.created_by_user_id,
+                updated_by_agent_id: definition.updated_by_agent_id,
+                updated_by_user_id: definition.updated_by_user_id,
+                deleted_at: definition.deleted_at,
+                created_at: definition.created_at,
+                updated_at: definition.updated_at,
+            },
             secret: None,
+        }
         }).collect())
     }
 

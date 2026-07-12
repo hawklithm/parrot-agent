@@ -182,10 +182,10 @@ impl TreeControlService for MockTreeControlService {
             mode: models::IssueTreeControlMode::Resume,
             status: models::IssueTreeHoldStatus::Released,
             reason: Some("Released".to_string()),
-            release_policy: models::IssueTreeHoldReleasePolicy {
-                strategy: models::IssueTreeHoldReleasePolicyStrategy::Manual,
-                note: None,
-            },
+                release_policy: sqlx::types::Json(models::IssueTreeHoldReleasePolicy {
+                    strategy: models::IssueTreeHoldReleasePolicyStrategy::Manual,
+                    note: None,
+                }),
             metadata: None,
             actor_agent_id: None,
             actor_user_id: None,

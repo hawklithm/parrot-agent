@@ -76,7 +76,7 @@ impl MockDocumentService {
             company_id,
             document_id: id,
             key,
-            content: "# Mock Document\n\nSample content".to_string(),
+            content: Some("# Mock Document\n\nSample content".to_string()),
             locked_by_agent_id: None,
             locked_by_user_id: None,
             locked_at: None,
@@ -119,7 +119,7 @@ impl DocumentService for MockDocumentService {
         company_id: Uuid,
     ) -> Result<IssueDocument, String> {
         let mut doc = Self::create_mock_document(Uuid::new_v4(), parent_id, company_id, key.to_string());
-        doc.content = input.content;
+        doc.content = Some(input.content);
         Ok(doc)
     }
     

@@ -248,11 +248,11 @@ impl DefaultAuthorizationService {
     }
 
     /// Check if actor has membership in company
-    fn get_membership(
+    fn get_membership<'a>(
         &self,
-        actor: &AuthorizationActor,
+        actor: &'a AuthorizationActor,
         company_id: Uuid,
-    ) -> Option<&CompanyMembership> {
+    ) -> Option<&'a CompanyMembership> {
         match actor {
             AuthorizationActor::Board { memberships, .. } => {
                 memberships

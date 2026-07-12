@@ -144,7 +144,7 @@ where
     /// Validate if a tree control mode can be applied
     fn validate_mode_transition(
         &self,
-        mode: IssueTreeControlMode,
+        mode: &IssueTreeControlMode,
         current_status: &IssueStatus,
     ) -> TreeControlServiceResult<Option<IssueStatus>> {
         match mode {
@@ -192,7 +192,7 @@ where
         let mut status_changes = Vec::new();
 
         for issue in tree_issues {
-            let transition_result = self.validate_mode_transition(mode, &issue.status);
+            let transition_result = self.validate_mode_transition(&mode, &issue.status);
 
             match transition_result {
                 Ok(target_status) => {
@@ -243,10 +243,11 @@ where
             .map_err(|e| TreeControlServiceError::Validation(format!("Invalid release policy: {}", e)))?;
 
         // Create tree hold
+        let hold_mode = input.mode.clone();
         let create_input = CreateTreeHoldInput {
             company_id,
             root_issue_id,
-            mode: input.mode,
+            mode: hold_mode,
             reason: input.reason,
             release_policy: release_policy_json,
             metadata: input.metadata,
@@ -261,7 +262,7 @@ where
         let mut members = Vec::new();
 
         for issue in tree_issues {
-            let transition_result = self.validate_mode_transition(input.mode, &issue.status);
+            let transition_result = self.validate_mode_transition(&input.mode, &issue.status);
             let (skipped, skip_reason) = match transition_result {
                 Ok(None) => (true, Some("Already in target state".to_string())),
                 Ok(Some(_)) => (false, None),

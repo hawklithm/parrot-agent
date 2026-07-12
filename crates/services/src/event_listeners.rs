@@ -180,7 +180,18 @@ impl<W: WorkspaceService, A: ActivityLogRepository> EventHandler
                 },
             );
 
-            let _ = self.activity_log_repo.log_activity(&activity).await;
+            let repo_activity = repositories::activity_log_repository::Activity {
+                id: activity.id,
+                company_id: activity.company_id,
+                actor_type: repositories::activity_log_repository::ActorType::Agent,
+                actor_id: activity.actor_id,
+                action: repositories::activity_log_repository::ActivityAction::Execute,
+                resource_type: repositories::activity_log_repository::ResourceType::Agent,
+                resource_id: activity.actor_id,
+                metadata: None,
+                created_at: chrono::Utc::now(),
+            };
+            let _ = self.activity_log_repo.log_activity(&repo_activity).await;
         }
 
         Ok(())

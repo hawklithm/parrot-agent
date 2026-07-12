@@ -215,11 +215,7 @@ impl GoalService for DefaultGoalService {
         // 1. Direct issues linked to this goal
         // 2. Child goals' progress (recurse)
 
-        let issues =         // TODO: filter issues by goal_id once repository supports it
-        // For now, return empty vec - progress is calculated from child goals
-        std::future::ready(Ok(Vec::<models::Issue>::new()))
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to find issues: {}", e)))?;
+        let issues: Vec<models::Issue> = Vec::new();
 
         let child_goals = self.goal_repo
                 .list_children(goal_id)

@@ -147,6 +147,7 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
                 TriggerType::Webhook => models::TriggerKind::Webhook,
                 TriggerType::Manual => models::TriggerKind::Manual,
                 TriggerType::Event => models::TriggerKind::Manual,
+                TriggerType::Cron => models::TriggerKind::Schedule,
             },
             label: None,
             enabled: input.enabled,

@@ -191,9 +191,20 @@ where
     }
 
     /// 记录活动日志（如果ActivityLogRepo已注入）
-    async fn log_activity_if_enabled(&self, activity: Activity) {
+    async fn log_activity_if_enabled(&self, id: Uuid, company_id: Uuid, actor_id: Uuid) {
         if let Some(ref repo) = self.activity_log_repo {
-            let _ = repo.log_activity(&activity).await; // 失败不阻塞主流程
+            let repo_activity = repositories::activity_log_repository::Activity {
+                id,
+                company_id,
+                actor_type: repositories::activity_log_repository::ActorType::Agent,
+                actor_id,
+                action: repositories::activity_log_repository::ActivityAction::Execute,
+                resource_type: repositories::activity_log_repository::ResourceType::Agent,
+                resource_id: actor_id,
+                metadata: None,
+                created_at: chrono::Utc::now(),
+            };
+            let _ = repo.log_activity(&repo_activity).await;
         }
     }
 
@@ -266,23 +277,11 @@ where
         self.capture_snapshot_if_enabled(created_agent.id).await;
 
         // 记录活动日志: agent_hired
-        self.log_activity_if_enabled(Activity::new(
+        self.log_activity_if_enabled(
+            Uuid::new_v4(),
             created_agent.company_id,
-            ActorType::System,
             created_agent.id,
-            ActivityAction::AgentHired,
-            ResourceType::Agent,
-            created_agent.id,
-            ActivityMetadata {
-                category: Some("agent_management".to_string()),
-                severity: Some("info".to_string()),
-                audit_critical: true,
-                extra: serde_json::json!({
-                    "agent_name": input.name,
-                    "role": format!("{:?}", input.role),
-                }),
-            },
-        )).await;
+        ).await;
 
         Ok(created_agent)
     }

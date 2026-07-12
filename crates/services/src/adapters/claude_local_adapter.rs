@@ -185,7 +185,8 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         }
 
         // 检查 2: API Key 配置
-        let has_api_key = self.check_api_key(&serde_json::Value::Object(ctx.adapter_config.clone()));
+        let config_value: serde_json::Value = serde_json::to_value(&ctx.adapter_config).unwrap_or(serde_json::Value::Null);
+        let has_api_key = self.check_api_key(&config_value);
         checks.push(AdapterEnvironmentCheck {
             name: Some("api_key_configured".to_string()),
             status: Some(if has_api_key {

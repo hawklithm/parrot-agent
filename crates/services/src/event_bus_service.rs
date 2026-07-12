@@ -29,20 +29,22 @@ impl InMemoryEventBus {
 
     /// Dispatch event to registered handlers
     async fn dispatch_to_handlers(&self, event: &SystemEvent) {
-        let event_type = event.event_type_str();
+        let event_type = event.event_type_str().to_string();
+        let event_clone = event.clone();
 
-        if let Some(handlers) = self.handlers.get(event_type) {
+        if let Some(handlers) = self.handlers.get(&event_type) {
             for handler in handlers.value().iter() {
                 let handler = Arc::clone(handler);
-                let event_ptr: &dyn Event = event;
+                let event = event_clone.clone();
+                let et = event_type.clone();
 
                 // Spawn handler execution in background to avoid blocking
                 tokio::spawn(async move {
-                    if let Err(e) = handler.handle(event_ptr).await {
+                    if let Err(e) = handler.handle(&event).await {
                         eprintln!(
                             "Event handler '{}' failed for event '{}': {}",
                             handler.handler_name(),
-                            event_type,
+                            et,
                             e
                         );
                     }
@@ -79,7 +81,7 @@ impl EventBus for InMemoryEventBus {
     }
 
     async fn subscribe(&self, handler: Box<dyn EventHandler>) -> Result<(), String> {
-        let handler = Arc::from(handler);
+        let handler: Arc<dyn EventHandler> = Arc::from(handler);
         let handler_name = handler.handler_name().to_string();
 
         for event_type in handler.event_types() {

@@ -221,8 +221,33 @@ impl IssueService for DefaultIssueService {
             }
         }
 
+        let models_input = models::issue::CreateIssueInput {
+            company_id: input.company_id,
+            project_id: input.project_id,
+            project_workspace_id: None,
+            goal_id: input.goal_id,
+            title: input.title,
+            description: input.description,
+            status: input.status,
+            priority: input.priority,
+            parent_id: input.parent_id,
+            assignee_agent_id: None,
+            assignee_user_id: None,
+            work_mode: None,
+            responsible_user_id: None,
+            origin_kind: None,
+            origin_id: None,
+            origin_run_id: None,
+            request_depth: None,
+            billing_code: None,
+            execution_workspace_id: None,
+            execution_workspace_preference: None,
+            assignee_adapter_overrides: None,
+            created_by_agent_id: None,
+            created_by_user_id: None,
+        };
         let created_issue = self.issue_repo
-            .create(input)
+            .create(models_input)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to create issue: {}", e)))?;
 
@@ -261,15 +286,19 @@ impl IssueService for DefaultIssueService {
     ) -> Result<Vec<Issue>, ServiceError> {
         // Convert local types to repository types
         let models_filter = models::IssueQueryFilter {
-            status: filter.status.clone(),
-            assigned_to: filter.assigned_to,
+            status: None,
+            priority: None,
+            assignee_agent_id: None,
+            assignee_user_id: None,
             project_id: filter.project_id,
             goal_id: filter.goal_id,
             parent_id: filter.parent_id,
+            work_mode: None,
         };
         let models_pagination = models::Pagination {
             limit: pagination.limit,
             offset: pagination.offset,
+            cursor: None,
         };
         self.issue_repo
             .list_by_company(company_id, &models_filter, &models_pagination)
@@ -279,6 +308,7 @@ impl IssueService for DefaultIssueService {
 
     async fn update(&self, id: Uuid, company_id: Uuid, input: UpdateIssueInput) -> Result<IssueMutationResult, ServiceError> {
         let issue = self.get(id, company_id).await?;
+        let status_changed = input.status.is_some();
 
         let update_input = models::UpdateIssueInput {
             title: input.title,
@@ -299,7 +329,7 @@ impl IssueService for DefaultIssueService {
             execution_state: None,
         };
 
-        let change_kind = if input.status.is_some() {
+        let change_kind = if status_changed {
             "status_changed".to_string()
         } else {
             "updated".to_string()
@@ -446,6 +476,7 @@ impl IssueService for DefaultIssueService {
         let models_pagination = models::Pagination {
             limit: pagination.limit,
             offset: pagination.offset,
+            cursor: None,
         };
         self.issue_repo
             .search(company_id, query, &models_pagination)
