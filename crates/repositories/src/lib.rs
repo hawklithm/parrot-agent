@@ -31,6 +31,7 @@ pub mod asset_repository;
 pub mod execution_workspace_repository;
 pub mod models;
 pub mod board_api_key_repository;
+pub mod cli_auth_challenge_repository;
 pub mod auth_repositories;
 pub mod company_repository;
 pub mod project_repository;

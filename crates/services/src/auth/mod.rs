@@ -10,6 +10,8 @@
 
 pub mod actor;
 pub mod board_access;
+pub mod board_claim;
+pub mod cli_auth;
 pub mod decision;
 pub mod error;
 pub mod invite;
@@ -22,6 +24,11 @@ pub mod permission;
 pub use actor::{ActorSource, AgentApiKeyScope, AuthorizationActor};
 pub use board_access::{
     load_responsible_user_memberships, resolve_board_access, resolve_instance_admin,
+};
+pub use board_claim::{BoardClaimService, ClaimChallenge};
+pub use cli_auth::{
+    approve_cli_auth_challenge, cancel_cli_auth_challenge, create_cli_auth_challenge,
+    get_cli_auth_challenge,
 };
 pub use decision::{AuthorizationAction, AuthorizationDecision, DecisionReason};
 pub use error::{AuthError, AuthResult};
