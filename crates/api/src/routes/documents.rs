@@ -139,7 +139,10 @@ async fn lock_case_document(
         .lock_document(DocumentParentType::Case, id, &key, input, company_id)
         .await
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERRORPOST /cases/:id/documents/:key/unlock - Unlock case document
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// POST /cases/:id/documents/:key/unlock - Unlock case document
 async fn unlock_case_document(
     State(service): State<Arc<dyn DocumentService>>,
     Path((id, key)): Path<(Uuid, String)>,

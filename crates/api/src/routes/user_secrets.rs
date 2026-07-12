@@ -74,7 +74,7 @@ pub async fn list_definitions(
     let definitions = service
         .list_definitions(company_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SE;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(definitions))
 }
 
