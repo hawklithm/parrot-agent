@@ -267,6 +267,10 @@ cargo check --workspace
   - 可配置的轮询间隔、批量大小、最大重试次数
   - `UpdateIssueInput`新增3个monitor字段
   - 单元测试: calculate_next_check backoff计算验证
+- ✅ **计划分解** - Service层实现
+  - `PlanDecompositionService` trait + `DefaultPlanDecompositionService`
+  - 创建/查询/接受/删除计划分解
+  - Issue存在性验证
 
 ### 已存在功能（之前已完成）
 - ✅ Issue/Case 数据模型（枚举、结构体、Schema迁移）
@@ -285,9 +289,7 @@ cargo check --workspace
 - [ ] 事件通知机制（watchdog评估、恢复动作协调）
 - [x] 已读标记与归档
 - [x] 恢复动作管理（reconcile算法）
-- [ ] 计划分解
-- [ ] 审批状态传播
-- [x] Monitor定时调度器
+- [x] 计划分解
 - [ ] 审批状态传播
 - [ ] 诊断端点
 - [ ] 低信任审查机制

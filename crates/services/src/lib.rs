@@ -168,6 +168,8 @@ pub mod recovery_action_service;
 pub use recovery_action_service::*;
 pub mod monitor_scheduler;
 pub use monitor_scheduler::*;
+pub mod plan_decomposition_service;
+pub use plan_decomposition_service::*;
 pub use adapter_registry::*;
 pub use adapters::*;
 pub use access::*;
