@@ -5,11 +5,11 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use crate::app_state::AppState;
 use uuid::Uuid;
 
-use models::{CreateIssueInput, Issue, UpdateIssueInput};
+use models::{CreateIssueInput, Issue, IssueStatus, UpdateIssueInput};
 use services::{
     CheckoutInput, IssueQueryFilter, IssueService, Pagination, ReleaseInput,
 };
@@ -190,7 +190,68 @@ async fn release_issue(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// Cr issue routes
+/// POST /issues/:id/admin/force-release - Force release issue (admin only)
+async fn force_release_issue(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<services::ForceReleaseInput>,
+) -> Result<Json<Issue>, StatusCode> {
+    let service = state.issue_service.clone();
+    let company_id = Uuid::nil();
+
+    // Validate force release schema
+    let schema = crate::validation::ForceReleaseSchema {
+        admin_user_id: input.admin_user_id,
+        reason: input.reason.clone(),
+        release_lease: Some(input.release_lease),
+    };
+    if let Err(e) = schema.validate() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    service
+        .force_release(id, company_id, input)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// POST /companies/:companyId/issues/batch-update - Batch update issues
+async fn batch_update_issues(
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Json(input): Json<crate::validation::BatchIssueUpdateSchema>,
+) -> Result<Json<Vec<Issue>>, StatusCode> {
+    let service = state.issue_service.clone();
+
+    // Validate batch update schema
+    if let Err(e) = input.validate() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    service
+        .batch_update(company_id, input.issue_ids, input.status, input.priority, input.assignee_agent_id, input.assignee_user_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// POST /issues/:id/heartbeat-context - Get heartbeat context for issue
+async fn get_heartbeat_context(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let service = state.issue_service.clone();
+    let company_id = Uuid::nil();
+
+    service
+        .get_heartbeat_context(id, company_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Create issue routes
 pub fn issue_routes() -> Router<AppState> {
     Router::new()
         .route("/api/issues", get(list_issues))
@@ -200,4 +261,7 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/api/companies/:companyId/issues/search", get(search_issues))
         .route("/api/issues/:id/checkout", post(checkout_issue))
         .route("/api/issues/:id/release", post(release_issue))
+        .route("/api/issues/:id/admin/force-release", post(force_release_issue))
+        .route("/api/companies/:companyId/issues/batch-update", post(batch_update_issues))
+        .route("/api/issues/:id/heartbeat-context", get(get_heartbeat_context))
 }

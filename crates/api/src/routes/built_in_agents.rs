@@ -314,11 +314,6 @@ pub fn built_in_agent_routes() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
     // 测试需要 mock BuiltInAgentService
     // 这里只提供框架，实际测试需要实现 mock
 }

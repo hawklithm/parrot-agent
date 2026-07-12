@@ -32,18 +32,27 @@ pub struct ReleaseInput {
     pub target_status: Option<String>,
 }
 
+/// Force release input (admin operation)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceReleaseInput {
+    pub admin_user_id: Uuid,
+    pub reason: String,
+    pub release_lease: bool,
+}
+
 /// Issue service trait for business logic
 #[async_trait]
 pub trait IssueService: Send + Sync {
     /// Create a new issue
     async fn create(&self, input: CreateIssueInput) -> Result<IssueMutationResult, String>;
-    
+
     /// Create a child issue
     async fn create_child(&self, parent_id: Uuid, input: CreateIssueInput) -> Result<IssueMutationResult, String>;
-    
+
     /// Get issue by ID
     async fn get(&self, id: Uuid, company_id: Uuid) -> Result<Option<Issue>, String>;
-    
+
     /// List issues with filtering
     async fn list(
         &self,
@@ -51,19 +60,22 @@ pub trait IssueService: Send + Sync {
         filter: &IssueQueryFilter,
         pagination: &Pagination,
     ) -> Result<Vec<Issue>, String>;
-    
+
     /// Update issue
     async fn update(&self, id: Uuid, company_id: Uuid, input: UpdateIssueInput) -> Result<IssueMutationResult, String>;
-    
+
     /// Delete issue
     async fn delete(&self, id: Uuid, company_id: Uuid) -> Result<IssueMutationResult, String>;
-    
+
     /// Checkout issue for execution
     async fn checkout(&self, id: Uuid, company_id: Uuid, input: CheckoutInput) -> Result<Issue, String>;
-    
+
     /// Release issue from execution
     async fn release(&self, id: Uuid, company_id: Uuid, input: ReleaseInput) -> Result<Issue, String>;
-    
+
+    /// Force release issue (admin operation)
+    async fn force_release(&self, id: Uuid, company_id: Uuid, input: ForceReleaseInput) -> Result<Issue, String>;
+
     /// Search issues
     async fn search(
         &self,
@@ -72,4 +84,18 @@ pub trait IssueService: Send + Sync {
         filter: &IssueQueryFilter,
         pagination: &Pagination,
     ) -> Result<Vec<Issue>, String>;
+
+    /// Batch update issues (status, priority, assignee)
+    async fn batch_update(
+        &self,
+        company_id: Uuid,
+        issue_ids: Vec<Uuid>,
+        status: Option<String>,
+        priority: Option<String>,
+        assignee_agent_id: Option<Uuid>,
+        assignee_user_id: Option<Uuid>,
+    ) -> Result<Vec<Issue>, String>;
+
+    /// Get heartbeat context for issue
+    async fn get_heartbeat_context(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String>;
 }

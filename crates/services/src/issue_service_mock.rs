@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 use chrono::Utc;
 use models::{Issue, IssueStatus, IssuePriority, IssueWorkMode, CreateIssueInput, UpdateIssueInput};
-use crate::issue_service::{IssueService, IssueMutationResult, CheckoutInput, ReleaseInput};
+use crate::issue_service::{IssueService, IssueMutationResult, CheckoutInput, ReleaseInput, ForceReleaseInput};
 use crate::issue_repository::{IssueQueryFilter, Pagination};
 
 /// Mock implementation of IssueService
@@ -159,5 +159,50 @@ impl IssueService for MockIssueService {
         Ok(vec![
             Self::create_mock_issue(Uuid::new_v4(), company_id, format!("Search result: {}", query)),
         ])
+    }
+
+    async fn force_release(&self, id: Uuid, company_id: Uuid, _input: ForceReleaseInput) -> Result<Issue, String> {
+        let mut issue = Self::create_mock_issue(id, company_id, "Force Released Issue".to_string());
+        issue.status = IssueStatus::Todo;
+        issue.execution_locked_at = None;
+        Ok(issue)
+    }
+
+    async fn batch_update(
+        &self,
+        company_id: Uuid,
+        issue_ids: Vec<Uuid>,
+        status: Option<String>,
+        _priority: Option<String>,
+        _assignee_agent_id: Option<Uuid>,
+        _assignee_user_id: Option<Uuid>,
+    ) -> Result<Vec<Issue>, String> {
+        let mut results = Vec::new();
+        for id in issue_ids {
+            let mut issue = Self::create_mock_issue(id, company_id, format!("Batch Issue {}", id));
+            if let Some(ref s) = status {
+                issue.status = match s.as_str() {
+                    "in_progress" => IssueStatus::InProgress,
+                    "done" => IssueStatus::Done,
+                    "cancelled" => IssueStatus::Cancelled,
+                    "todo" => IssueStatus::Todo,
+                    "in_review" => IssueStatus::InReview,
+                    "blocked" => IssueStatus::Blocked,
+                    _ => IssueStatus::Todo,
+                };
+            }
+            results.push(issue);
+        }
+        Ok(results)
+    }
+
+    async fn get_heartbeat_context(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "issueId": id.to_string(),
+            "companyId": company_id.to_string(),
+            "status": "todo",
+            "activeRuns": [],
+            "executionState": null,
+        }))
     }
 }

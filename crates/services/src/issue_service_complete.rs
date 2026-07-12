@@ -7,6 +7,7 @@ use std::sync::Arc;
 use models::{Issue, IssueStatus, IssuePriority};
 use repositories::IssueRepository;
 use crate::errors::ServiceError;
+use crate::issue_service::{ForceReleaseInput};
 
 // Import existing services
 use crate::issue_tree_control_service::IssueTreeControlService;
@@ -125,6 +126,9 @@ pub trait IssueService: Send + Sync {
     /// Release issue from execution
     async fn release(&self, id: Uuid, company_id: Uuid, input: ReleaseInput) -> Result<Issue, ServiceError>;
 
+    /// Force release issue (admin operation)
+    async fn force_release(&self, id: Uuid, company_id: Uuid, input: ForceReleaseInput) -> Result<Issue, ServiceError>;
+
     /// Search issues
     async fn search(
         &self,
@@ -133,6 +137,20 @@ pub trait IssueService: Send + Sync {
         filter: &IssueQueryFilter,
         pagination: &Pagination,
     ) -> Result<Vec<Issue>, ServiceError>;
+
+    /// Batch update issues
+    async fn batch_update(
+        &self,
+        company_id: Uuid,
+        issue_ids: Vec<Uuid>,
+        status: Option<String>,
+        priority: Option<String>,
+        assignee_agent_id: Option<Uuid>,
+        assignee_user_id: Option<Uuid>,
+    ) -> Result<Vec<Issue>, ServiceError>;
+
+    /// Get heartbeat context for issue
+    async fn get_heartbeat_context(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, ServiceError>;
 
     /// Get tree control service
     fn tree_control(&self) -> Arc<dyn IssueTreeControlService>;
@@ -466,6 +484,35 @@ impl IssueService for DefaultIssueService {
         Ok(updated_issue)
     }
 
+    async fn force_release(&self, id: Uuid, company_id: Uuid, _input: ForceReleaseInput) -> Result<Issue, ServiceError> {
+        let _issue = self.get(id, company_id).await?;
+
+        // Admin force release: reset to todo and clear execution state
+        let update_input = models::UpdateIssueInput {
+            title: None,
+            description: None,
+            status: Some(IssueStatus::Todo),
+            priority: None,
+            assignee_agent_id: None,
+            assignee_user_id: None,
+            work_mode: None,
+            responsible_user_id: None,
+            source_trust: None,
+            monitor_scheduled_by: None,
+            monitor_notes: None,
+            hidden_at: None,
+            execution_workspace_preference: None,
+            execution_workspace_settings: None,
+            execution_policy: None,
+            execution_state: None,
+        };
+
+        self.issue_repo
+            .update(id, update_input)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to force release issue: {}", e)))
+    }
+
     async fn search(
         &self,
         company_id: Uuid,
@@ -482,6 +529,80 @@ impl IssueService for DefaultIssueService {
             .search(company_id, query, &models_pagination)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to search issues: {}", e)))
+    }
+
+    async fn batch_update(
+        &self,
+        company_id: Uuid,
+        issue_ids: Vec<Uuid>,
+        status: Option<String>,
+        _priority: Option<String>,
+        _assignee_agent_id: Option<Uuid>,
+        _assignee_user_id: Option<Uuid>,
+    ) -> Result<Vec<Issue>, ServiceError> {
+        let mut results = Vec::new();
+
+        for id in &issue_ids {
+            let issue = self.get(*id, company_id).await?;
+
+            let parsed_status = status.as_ref().and_then(|s| match s.as_str() {
+                "backlog" => Some(IssueStatus::Backlog),
+                "todo" => Some(IssueStatus::Todo),
+                "in_progress" => Some(IssueStatus::InProgress),
+                "in_review" => Some(IssueStatus::InReview),
+                "blocked" => Some(IssueStatus::Blocked),
+                "done" => Some(IssueStatus::Done),
+                "cancelled" => Some(IssueStatus::Cancelled),
+                _ => None,
+            });
+
+            let update_input = models::UpdateIssueInput {
+                title: None,
+                description: None,
+                status: parsed_status,
+                priority: None,
+                assignee_agent_id: _assignee_agent_id,
+                assignee_user_id: _assignee_user_id,
+                work_mode: None,
+                responsible_user_id: None,
+                source_trust: None,
+                monitor_scheduled_by: None,
+                monitor_notes: None,
+                hidden_at: None,
+                execution_workspace_preference: None,
+                execution_workspace_settings: None,
+                execution_policy: None,
+                execution_state: None,
+            };
+
+            let updated = self.issue_repo
+                .update(*id, update_input)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("Failed to batch update issue {}: {}", id, e)))?;
+
+            results.push(updated);
+        }
+
+        Ok(results)
+    }
+
+    async fn get_heartbeat_context(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, ServiceError> {
+        let issue = self.get(id, company_id).await?;
+
+        Ok(serde_json::json!({
+            "issueId": id.to_string(),
+            "companyId": company_id.to_string(),
+            "title": issue.title,
+            "status": issue.status.to_string(),
+            "priority": issue.priority,
+            "assigneeAgentId": issue.assignee_agent_id.map(|id| id.to_string()),
+            "assigneeUserId": issue.assignee_user_id.map(|id| id.to_string()),
+            "checkoutRunId": issue.checkout_run_id.map(|id| id.to_string()),
+            "executionRunId": issue.execution_run_id.map(|id| id.to_string()),
+            "executionLockedAt": issue.execution_locked_at,
+            "activeRuns": [],
+            "executionState": issue.execution_state.map(|s| s.0),
+        }))
     }
 
     fn tree_control(&self) -> Arc<dyn IssueTreeControlService> {

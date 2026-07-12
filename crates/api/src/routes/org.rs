@@ -95,25 +95,32 @@ mod tests {
     fn test_count_nodes() {
         use services::OrgNode;
 
+        let id1 = Uuid::new_v4().to_string();
+        let id2 = Uuid::new_v4().to_string();
+        let id3 = Uuid::new_v4().to_string();
+
         let nodes = vec![
             OrgNode {
-                id: Uuid::new_v4(),
+                id: id1,
                 name: "CEO".into(),
                 role: "Chief Executive".into(),
                 status: "active".into(),
+                collapsed_reports: None,
                 reports: vec![
                     OrgNode {
-                        id: Uuid::new_v4(),
+                        id: id2,
                         name: "CTO".into(),
                         role: "Technology".into(),
                         status: "active".into(),
+                        collapsed_reports: None,
                         reports: vec![],
                     },
                     OrgNode {
-                        id: Uuid::new_v4(),
+                        id: id3,
                         name: "CFO".into(),
                         role: "Finance".into(),
                         status: "active".into(),
+                        collapsed_reports: None,
                         reports: vec![],
                     },
                 ],
