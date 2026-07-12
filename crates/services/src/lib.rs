@@ -4,7 +4,6 @@ pub mod activity_log;
 pub mod adapter_config_normalizer;
 pub mod adapter_registry;
 pub mod adapters;
-pub mod event_bus;
 pub mod saga;
 pub mod consistency;
 pub mod agent_service;
@@ -84,15 +83,19 @@ pub use built_in_agent_service_impl::{
     DefaultBuiltInAgentService, ReconcileResult,
 };
 pub use org_chart_service::{
-    OrgChartService, OrgNode, OrgChartError, ROLE_LABELS, get_role_label,
+    OrgChartService, OrgChartError, ROLE_LABELS, get_role_label,
 };
+pub use models::OrgNode;
 pub use org_chart_service_impl::DefaultOrgChartService;
 pub use issue_service::{
-    IssueService, IssueServiceImpl, IssueServiceError, IssueServiceResult,
+    IssueService,
 };
+pub use issue_service_complete::DefaultIssueService;
 pub use case_service::{
-    CaseService, CaseServiceImpl, CaseServiceError, CaseServiceResult,
+    CaseService,
 };
+pub use case_service::MockCaseService;
+pub use errors::ServiceResult;
 pub use issue_comment_service::{
     IssueCommentService, IssueCommentServiceImpl, CommentServiceError, CommentServiceResult,
 };

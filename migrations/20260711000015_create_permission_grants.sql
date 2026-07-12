@@ -1,6 +1,4 @@
 -- Create enum types
-CREATE TYPE membership_role AS ENUM ('owner', 'admin', 'operator', 'viewer');
-CREATE TYPE principal_type AS ENUM ('user', 'agent');
 CREATE TYPE membership_status AS ENUM ('active', 'archived');
 
 -- Create principal_permission_grants table

@@ -121,7 +121,7 @@ impl DefaultJwtService {
     /// Create from environment variable
     pub fn from_env() -> Result<Self, ServiceError> {
         let secret = std::env::var("JWT_SECRET")
-            .map_err(|_| ServiceError::Configuration("JWT_SECRET not set".to_string()))?;
+            .map_err(|_| ServiceError::Internal("JWT_SECRET not set".to_string()))?;
 
         Ok(Self {
             master_secret: secret.into_bytes(),

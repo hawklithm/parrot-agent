@@ -8,7 +8,7 @@ CREATE TABLE routines (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
-    goal_id UUID REFERENCES goals(id) ON DELETE SET NULL,
+    goal_id UUID,
     parent_issue_id UUID REFERENCES issues(id) ON DELETE SET NULL,
     title VARCHAR(255) NOT NULL,
     description TEXT,

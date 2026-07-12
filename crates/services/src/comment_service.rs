@@ -43,6 +43,7 @@ impl MockCommentService {
             company_id,
             body,
             author_type: "user".to_string(),
+            actor_id: None,
             author_agent_id: None,
             author_user_id: Some(Uuid::new_v4()),
             created_by_run_id: None,

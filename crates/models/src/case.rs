@@ -145,6 +145,7 @@ pub struct CaseEvent {
     pub case_id: Uuid,
     pub company_id: Uuid,
     pub kind: CaseEventKind,
+    pub event_type: String,
     pub metadata: Option<serde_json::Value>,
     pub actor_agent_id: Option<Uuid>,
     pub actor_user_id: Option<Uuid>,

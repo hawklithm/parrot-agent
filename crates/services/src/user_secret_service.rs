@@ -80,21 +80,21 @@ impl UserSecretService for UserSecretServiceImpl {
         self.repository
             .create_definition(definition)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn list_definitions(&self, company_id: Uuid) -> ServiceResult<Vec<UserSecretDefinition>> {
         self.repository
             .list_definitions(company_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn get_definition(&self, definition_id: Uuid) -> ServiceResult<Option<UserSecretDefinition>> {
         self.repository
             .get_definition(definition_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn update_definition(
@@ -108,7 +108,7 @@ impl UserSecretService for UserSecretServiceImpl {
         let mut definition = self.repository
             .get_definition(definition_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Definition {} not found", definition_id)))?;
 
         if let Some(k) = key {
@@ -127,21 +127,21 @@ impl UserSecretService for UserSecretServiceImpl {
         self.repository
             .update_definition(definition)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn delete_definition(&self, definition_id: Uuid) -> ServiceResult<()> {
         self.repository
             .delete_definition(definition_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn get_coverage_stats(&self, company_id: Uuid, definition_id: Uuid) -> ServiceResult<UserSecretCoverage> {
         self.repository
             .get_coverage_stats(company_id, definition_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn set_user_secret(
@@ -154,7 +154,7 @@ impl UserSecretService for UserSecretServiceImpl {
         let secrets = self.repository
             .list_user_secrets(user_id, Uuid::nil())
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?;
+            .map_err(|e| ServiceError::Repository(e.to_string()))?;
 
         let existing = secrets.iter().find(|s| s.definition_id == definition_id);
 
@@ -164,13 +164,13 @@ impl UserSecretService for UserSecretServiceImpl {
             self.repository
                 .update_secret(updated)
                 .await
-                .map_err(|e| ServiceError::Database(e.to_string()))
+                .map_err(|e| ServiceError::Repository(e.to_string()))
         } else {
             let secret = UserSecret::new(user_id, definition_id, encrypted_value);
             self.repository
                 .create_secret(secret)
                 .await
-                .map_err(|e| ServiceError::Database(e.to_string()))
+                .map_err(|e| ServiceError::Repository(e.to_string()))
         }
     }
 
@@ -178,14 +178,14 @@ impl UserSecretService for UserSecretServiceImpl {
         self.repository
             .list_user_secrets(user_id, company_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn get_user_secret(&self, user_id: Uuid, definition_id: Uuid) -> ServiceResult<Option<UserSecret>> {
         let secrets = self.repository
             .list_user_secrets(user_id, Uuid::nil())
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?;
+            .map_err(|e| ServiceError::Repository(e.to_string()))?;
 
         Ok(secrets.into_iter().find(|s| s.definition_id == definition_id))
     }
@@ -194,7 +194,7 @@ impl UserSecretService for UserSecretServiceImpl {
         let mut secret = self.repository
             .get_secret(secret_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Secret {} not found", secret_id)))?;
 
         secret.rotate(new_encrypted_value);
@@ -202,20 +202,20 @@ impl UserSecretService for UserSecretServiceImpl {
         self.repository
             .update_secret(secret)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn delete_user_secret(&self, secret_id: Uuid) -> ServiceResult<()> {
         self.repository
             .delete_secret(secret_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn get_secret_bindings(&self, secret_id: Uuid) -> ServiceResult<Vec<SecretBinding>> {
         self.repository
             .get_secret_bindings(secret_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 }

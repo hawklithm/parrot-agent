@@ -92,21 +92,21 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         self.repository
             .create_config(provider_config)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn list_configs(&self, company_id: Uuid) -> ServiceResult<Vec<SecretProviderConfig>> {
         self.repository
             .list_configs(company_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn get_config(&self, config_id: Uuid) -> ServiceResult<Option<SecretProviderConfig>> {
         self.repository
             .get_config(config_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn update_config(
@@ -119,7 +119,7 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         let mut provider_config = self.repository
             .get_config(config_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Config {} not found", config_id)))?;
 
         if let Some(pt) = provider_type {
@@ -135,21 +135,21 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         self.repository
             .update_config(provider_config)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn delete_config(&self, config_id: Uuid) -> ServiceResult<()> {
         self.repository
             .delete_config(config_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn set_default_provider(&self, company_id: Uuid, config_id: Uuid) -> ServiceResult<()> {
         self.repository
             .set_default(company_id, config_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))
+            .map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
     async fn discover_secrets_preview(
@@ -161,7 +161,7 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         let config = self.repository
             .get_config(config_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Config {} not found", config_id)))?;
 
         // TODO: Implement actual provider-specific discovery logic
@@ -182,7 +182,7 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         let config = self.repository
             .get_config(config_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Config {} not found", config_id)))?;
 
         // TODO: Implement actual provider-specific health check
@@ -204,7 +204,7 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         self.repository
             .record_health_check(health_check.clone())
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?;
+            .map_err(|e| ServiceError::Repository(e.to_string()))?;
 
         Ok(health_check)
     }
@@ -218,7 +218,7 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         let config = self.repository
             .get_config(config_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Config {} not found", config_id)))?;
 
         if config.company_id != company_id {
@@ -261,7 +261,7 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         let config = self.repository
             .get_config(config_id)
             .await
-            .map_err(|e| ServiceError::Database(e.to_string()))?
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Config {} not found", config_id)))?;
 
         if config.company_id != company_id {

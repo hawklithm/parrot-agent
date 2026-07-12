@@ -15,6 +15,20 @@ pub enum IssueStatus {
     Cancelled,
 }
 
+impl std::fmt::Display for IssueStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IssueStatus::Backlog => write!(f, "backlog"),
+            IssueStatus::Todo => write!(f, "todo"),
+            IssueStatus::InProgress => write!(f, "in_progress"),
+            IssueStatus::InReview => write!(f, "in_review"),
+            IssueStatus::Blocked => write!(f, "blocked"),
+            IssueStatus::Done => write!(f, "done"),
+            IssueStatus::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
 /// Issue priority enumeration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
@@ -87,6 +101,7 @@ pub struct Issue {
     pub priority: IssuePriority,
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
+    pub assigned_to: Option<Uuid>,
     pub checkout_run_id: Option<Uuid>,
     pub execution_run_id: Option<Uuid>,
     pub execution_agent_name_key: Option<String>,

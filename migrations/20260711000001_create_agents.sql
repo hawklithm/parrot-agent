@@ -43,22 +43,6 @@ CREATE TABLE agent_config_revisions (
 CREATE INDEX idx_agent_config_revisions_agent_id ON agent_config_revisions(agent_id);
 CREATE INDEX idx_agent_config_revisions_created_at ON agent_config_revisions(created_at DESC);
 
--- Create approvals table
-CREATE TABLE approvals (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-    status TEXT NOT NULL DEFAULT 'pending',
-    requested_by UUID NOT NULL,
-    approved_by UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    resolved_at TIMESTAMPTZ,
-
-    CONSTRAINT valid_approval_status CHECK (status IN ('pending', 'approved', 'rejected'))
-);
-
-CREATE INDEX idx_approvals_agent_id ON approvals(agent_id);
-CREATE INDEX idx_approvals_status ON approvals(status);
-
 -- Create cost_events table
 CREATE TABLE cost_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

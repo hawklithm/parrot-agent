@@ -54,18 +54,6 @@ CREATE INDEX issue_tree_hold_members_hold_idx ON issue_tree_hold_members(hold_id
 CREATE INDEX issue_tree_hold_members_issue_idx ON issue_tree_hold_members(issue_id);
 CREATE INDEX issue_tree_hold_members_company_idx ON issue_tree_hold_members(company_id);
 
--- Create issue_approvals table (links issues to approval entities)
-CREATE TABLE issue_approvals (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id UUID NOT NULL REFERENCES companies(id),
-    issue_id UUID NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
-    approval_id UUID NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(issue_id, approval_id)
-);
-
-CREATE INDEX issue_approvals_issue_idx ON issue_approvals(issue_id);
-CREATE INDEX issue_approvals_approval_idx ON issue_approvals(approval_id);
 
 -- Create issue watchdog status enum
 CREATE TYPE issue_watchdog_status AS ENUM ('active', 'disabled');

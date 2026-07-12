@@ -152,14 +152,18 @@ impl InviteService for InviteServiceImpl {
         Ok(vec![
             SkillIndexEntry {
                 name: "code-review".to_string(),
+                slug: "code-review".to_string(),
                 description: "Automated code review".to_string(),
+                category: None,
                 is_paperclip_managed: true,
                 version: Some("1.0.0".to_string()),
                 tags: vec!["automation".to_string()],
             },
             SkillIndexEntry {
                 name: "test-generation".to_string(),
+                slug: "test-generation".to_string(),
                 description: "Generate unit tests".to_string(),
+                category: None,
                 is_paperclip_managed: true,
                 version: Some("1.0.0".to_string()),
                 tags: vec!["testing".to_string()],
@@ -185,7 +189,7 @@ impl InviteService for InviteServiceImpl {
             usage_example: Some(format!("agent.use_skill('{}')", skill_entry.name)),
             parameters: Some(serde_json::json!({"required": [], "optional": ["config"]})),
             author: Some("Parrot Agent Team".to_string()),
-            created_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
         })
     }
 }

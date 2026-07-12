@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::fmt;
 use uuid::Uuid;
 
@@ -11,6 +12,8 @@ pub trait Event: Send + Sync + fmt::Debug {
     fn payload(&self) -> &serde_json::Value;
     fn metadata(&self) -> &EventMetadata;
     fn timestamp(&self) -> DateTime<Utc>;
+    /// 用于在 handler 中将 `&dyn Event` 向下转型为具体事件类型（如 `SystemEvent`）。
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Event metadata
@@ -311,5 +314,9 @@ impl Event for SystemEvent {
 
     fn timestamp(&self) -> DateTime<Utc> {
         self.timestamp
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

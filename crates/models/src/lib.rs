@@ -43,6 +43,41 @@ pub mod user_secret;
 pub mod user_secret_definition;
 pub mod websocket;
 
+// ===== 显式导出：消除 glob re-export 歧义 =====
+// 规则：显式导出优先于 glob 导出，放在 glob 之前即可消除歧义
+// 统一使用 execution_environment 版本（repositories 使用此版本）
+pub use execution_environment::{
+    EnvironmentDriver, EnvironmentStatus,
+    ExecutionEnvironment,
+    EnvironmentLeaseStatus, EnvironmentLeaseCleanupStatus, EnvironmentLeasePolicy,
+    RuntimeLease, CreateRuntimeLeaseInput, UpdateRuntimeLeaseInput,
+    EnvironmentProbeResult, EnvironmentCapabilities,
+    CreateEnvironmentInput, UpdateEnvironmentInput,
+    WorkspaceMode, WorkspaceStrategyType, WorkspaceStatus,
+    ExecutionWorkspace, CreateExecutionWorkspaceInput, UpdateExecutionWorkspaceInput,
+};
+pub use environment_diagnostics::EnvironmentDeleteBlastRadius;
+pub use environment::{
+    LeaseStatus,
+    LocalEnvironmentConfig, SshEnvironmentConfig, SandboxEnvironmentConfig,
+    Environment, EnvironmentLease,
+    ExecutionWorkspaceMode, ExecutionWorkspaceStrategyType, ExecutionWorkspaceStatus,
+};
+pub use approval::Approval;
+pub use state_machine::AgentStateMachine;
+pub use auth::{MembershipRole, PrincipalType};
+pub use case::{CaseEvent, CreateCaseInput};
+pub use event_bus::{
+    Event, EventHandler, EventBus,
+    IssueEvent, ApprovalEvent, RoutineEvent, AgentEvent, EnvironmentEvent, GoalEvent,
+};
+pub use secrets::{UserSecretDefinition, UserSecret, SecretBinding};
+pub use issue_document::{
+    LockDocumentInput, Attachment, CreateWorkProductInput, UpdateWorkProductInput,
+};
+pub use secret_provider::{ProviderHealthStatus, SecretProviderConfig};
+
+// ===== glob re-export（非冲突类型继续使用） =====
 pub use activity_log::*;
 pub use adapter::*;
 pub use agent::*;

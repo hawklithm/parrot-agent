@@ -189,36 +189,24 @@ where
         let tree_issues = self.collect_tree_issues(root_issue_id).await?;
 
         let mut affected_issues = Vec::new();
-        let mut warnings = Vec::new();
+        let mut status_changes = Vec::new();
 
         for issue in tree_issues {
             let transition_result = self.validate_mode_transition(mode, issue.status);
 
             match transition_result {
                 Ok(target_status) => {
-                    let skipped = target_status.is_none();
-                    let skip_reason = if skipped {
-                        Some(format!("Already in target state"))
-                    } else {
-                        None
-                    };
-
                     affected_issues.push(IssueTreePreviewIssue {
-                        id: issue.id,
-                        identifier: issue.identifier.clone(),
-                        title: issue.title.clone(),
-                        current_status: issue.status,
-                        target_status,
-                        depth: 0, // TODO: calculate actual depth
-                        skipped,
-                        skip_reason,
+                        issue_id: issue.id,
+                        current_status: issue.status.to_string(),
+                        target_status: target_status.map(|s| s.to_string()).unwrap_or_else(|| "no_change".to_string()),
                     });
                 }
                 Err(e) => {
-                    warnings.push(IssueTreePreviewWarning {
-                        kind: "invalid_transition".to_string(),
-                        message: e.to_string(),
-                        issue_id: Some(issue.id),
+                    status_changes.push(IssueTreePreviewIssue {
+                        issue_id: issue.id,
+                        current_status: issue.status.to_string(),
+                        target_status: "error".to_string(),
                     });
                 }
             }
@@ -230,7 +218,7 @@ where
         Ok(IssueTreeControlPreview {
             affected_issues,
             active_runs,
-            warnings,
+            status_changes,
         })
     }
 
@@ -249,10 +237,7 @@ where
         }
 
         // Default release policy
-        let release_policy = input.release_policy.unwrap_or(IssueTreeHoldReleasePolicy {
-            strategy: HoldReleasePolicyStrategy::Manual,
-            note: None,
-        });
+        let release_policy = input.release_policy;
 
         let release_policy_json = serde_json::to_value(&release_policy)
             .map_err(|e| TreeControlServiceError::Validation(format!("Invalid release policy: {}", e)))?;
@@ -289,6 +274,7 @@ where
                 hold_id: hold.id,
                 issue_id: issue.id,
                 parent_issue_id: issue.parent_id,
+                previous_status: format!("{:?}", issue.status),
                 depth: 0, // TODO: calculate actual depth
                 issue_identifier: issue.identifier,
                 issue_title: issue.title,
@@ -357,7 +343,8 @@ where
                 return Ok(Some(ActiveIssueTreePauseHoldGate {
                     hold_id: hold.id,
                     root_issue_id: hold.root_issue_id,
-                    reason: hold.reason,
+                    mode: hold.mode,
+                    release_policy: hold.release_policy.0,
                     created_at: hold.created_at,
                 }));
             }

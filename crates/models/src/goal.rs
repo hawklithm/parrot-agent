@@ -18,6 +18,7 @@ pub enum GoalStatus {
     Active,
     Completed,
     Archived,
+    Achieved,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
@@ -44,9 +45,11 @@ pub struct Goal {
     pub id: Uuid,
     pub company_id: Uuid,
     pub title: String,
+    pub name: String,
     pub description: Option<String>,
     pub level: GoalLevel,
     pub status: GoalStatus,
+    pub priority: GoalPriority,
     pub parent_id: Option<Uuid>,
     pub owner_agent_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
@@ -77,10 +80,12 @@ impl Goal {
         Self {
             id: Uuid::new_v4(),
             company_id: input.company_id,
-            title: input.title,
+            title: input.title.clone(),
+            name: input.title,
             description: input.description,
             level: input.level,
             status: GoalStatus::Planned,
+            priority: GoalPriority::Medium,
             parent_id: input.parent_id,
             owner_agent_id: input.owner_agent_id,
             created_at: now,

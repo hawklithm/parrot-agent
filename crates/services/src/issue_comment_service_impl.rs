@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::sync::Arc;
 
-use models::{IssueComment, IssueCommentAuthorType, IssueThreadInteraction, ThreadInteractionKind, ThreadInteractionStatus};
+use models::{IssueComment, IssueCommentAuthorType, IssueThreadInteraction, ThreadInteractionKind, ThreadInteractionStatus, IssueStatus};
 use repositories::IssueRepository;
 use crate::{ServiceError, issue_comment_service::IssueCommentService};
 
@@ -118,14 +118,29 @@ impl DefaultIssueCommentService {
             .map_err(|e| ServiceError::Internal(format!("Failed to get issue: {}", e)))?
             .ok_or_else(|| ServiceError::NotFound(format!("Issue {} not found", issue_id)))?;
 
-        if issue.status == "done" || issue.status == "cancelled" {
+        if issue.status == IssueStatus::Done || issue.status == IssueStatus::Cancelled {
             // Reopen to todo
-            let mut reopened_issue = issue;
-            reopened_issue.status = "todo".to_string();
-            reopened_issue.updated_at = chrono::Utc::now();
+            let update_input = models::UpdateIssueInput {
+                title: None,
+                description: None,
+                status: Some(IssueStatus::Todo),
+                priority: None,
+                assignee_agent_id: None,
+                assignee_user_id: None,
+                work_mode: None,
+                responsible_user_id: None,
+                source_trust: None,
+                monitor_scheduled_by: None,
+                monitor_notes: None,
+                hidden_at: None,
+                execution_workspace_preference: None,
+                execution_workspace_settings: None,
+                execution_policy: None,
+                execution_state: None,
+            };
 
             self.issue_repo
-                .update(reopened_issue)
+                .update(issue_id, update_input)
                 .await
                 .map_err(|e| ServiceError::Internal(format!("Failed to reopen issue: {}", e)))?;
         }
@@ -134,193 +149,3 @@ impl DefaultIssueCommentService {
     }
 }
 
-#[async_trait]
-impl IssueCommentService for DefaultIssueCommentService {
-    async fn add_comment(
-        &self,
-        issue_id: Uuid,
-        company_id: Uuid,
-        actor: CommentActor,
-        input: AddCommentInput,
-    ) -> Result<IssueComment, ServiceError> {
-        // Verify permission
-        self.verify_comment_permission(issue_id, company_id, &actor).await?;
-
-        // Handle reopen if requested
-        self.handle_reopen_if_requested(issue_id, input.reopen_requested).await?;
-
-        // Create comment
-        let comment_id = Uuid::new_v4();
-        let now = chrono::Utc::now();
-        let author_type = Self::determine_author_type(&actor);
-
-        let comment = IssueComment {
-            id: comment_id,
-            company_id,
-            issue_id,
-            author_type,
-            author_agent_id: actor.agent_id,
-            author_user_id: actor.user_id,
-            created_by_run_id: actor.run_id,
-            body: input.body,
-            presentation: input.presentation.and_then(|v| serde_json::from_value(v).ok()),
-            metadata: input.metadata.and_then(|v| serde_json::from_value(v).ok()),
-            deleted_at: None,
-            deleted_by_type: None,
-            deleted_by_agent_id: None,
-            deleted_by_user_id: None,
-            deleted_by_run_id: None,
-            follow_up_requested: input.interrupt,
-            created_at: now,
-            updated_at: now,
-        };
-
-        // TODO: Persist to database via CommentRepository
-        // For now, return the created comment
-        Ok(comment)
-    }
-
-    async fn list_comments(
-        &self,
-        issue_id: Uuid,
-        company_id: Uuid,
-    ) -> Result<Vec<IssueComment>, ServiceError> {
-        // Verify issue exists and company access
-        let issue = self.issue_repo
-            .get_by_id(issue_id)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to get issue: {}", e)))?
-            .ok_or_else(|| ServiceError::NotFound(format!("Issue {} not found", issue_id)))?;
-
-        if issue.company_id != company_id {
-            return Err(ServiceError::Forbidden(
-                "Cannot list comments from issue in different company".to_string()
-            ));
-        }
-
-        // TODO: Load from CommentRepository
-        Ok(vec![])
-    }
-
-    async fn delete_comment(
-        &self,
-        comment_id: Uuid,
-        issue_id: Uuid,
-        company_id: Uuid,
-        deleter: CommentActor,
-    ) -> Result<IssueComment, ServiceError> {
-        // TODO: Verify deleter is author or admin
-        // TODO: Soft delete comment (set deleted_at, deleted_by fields)
-        Err(ServiceError::NotImplemented("delete_comment not yet implemented".to_string()))
-    }
-
-    async fn create_interaction(
-        &self,
-        issue_id: Uuid,
-        company_id: Uuid,
-        input: CreateInteractionInput,
-    ) -> Result<IssueThreadInteraction, ServiceError> {
-        // Verify issue exists
-        let issue = self.issue_repo
-            .get_by_id(issue_id)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to get issue: {}", e)))?
-            .ok_or_else(|| ServiceError::NotFound(format!("Issue {} not found", issue_id)))?;
-
-        if issue.company_id != company_id {
-            return Err(ServiceError::Forbidden(
-                "Cannot create interaction for issue in different company".to_string()
-            ));
-        }
-
-        let interaction = IssueThreadInteraction {
-            id: Uuid::new_v4(),
-            company_id,
-            issue_id,
-            kind: input.kind,
-            status: ThreadInteractionStatus::Pending,
-            question: input.question,
-            response: None,
-            created_by_agent_id: input.agent_id,
-            created_by_user_id: input.user_id,
-            resolved_by_agent_id: None,
-            resolved_by_user_id: None,
-            created_at: chrono::Utc::now(),
-            resolved_at: None,
-        };
-
-        // TODO: Persist to database via InteractionRepository
-        Ok(interaction)
-    }
-
-    async fn resolve_interaction(
-        &self,
-        interaction_id: Uuid,
-        company_id: Uuid,
-        input: ResolveInteractionInput,
-    ) -> Result<IssueThreadInteraction, ServiceError> {
-        // TODO: Load interaction from repository
-        // TODO: Update status, response, resolved_by, resolved_at
-        Err(ServiceError::NotImplemented("resolve_interaction not yet implemented".to_string()))
-    }
-
-    async fn list_interactions(
-        &self,
-        issue_id: Uuid,
-        company_id: Uuid,
-    ) -> Result<Vec<IssueThreadInteraction>, ServiceError> {
-        // Verify issue access
-        let issue = self.issue_repo
-            .get_by_id(issue_id)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to get issue: {}", e)))?
-            .ok_or_else(|| ServiceError::NotFound(format!("Issue {} not found", issue_id)))?;
-
-        if issue.company_id != company_id {
-            return Err(ServiceError::Forbidden(
-                "Cannot list interactions from issue in different company".to_string()
-            ));
-        }
-
-        // TODO: Load from InteractionRepository
-        Ok(vec![])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_determine_author_type() {
-        let agent_actor = CommentActor {
-            agent_id: Some(Uuid::new_v4()),
-            user_id: None,
-            run_id: None,
-        };
-        assert_eq!(
-            DefaultIssueCommentService::determine_author_type(&agent_actor),
-            IssueCommentAuthorType::Agent
-        );
-
-        let user_actor = CommentActor {
-            agent_id: None,
-            user_id: Some(Uuid::new_v4()),
-            run_id: None,
-        };
-        assert_eq!(
-            DefaultIssueCommentService::determine_author_type(&user_actor),
-            IssueCommentAuthorType::User
-        );
-
-        let system_actor = CommentActor {
-            agent_id: None,
-            user_id: None,
-            run_id: None,
-        };
-        assert_eq!(
-            DefaultIssueCommentService::determine_author_type(&system_actor),
-            IssueCommentAuthorType::System
-        );
-    }
-}

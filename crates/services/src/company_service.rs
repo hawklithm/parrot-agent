@@ -59,16 +59,6 @@ impl CompanyService {
 
     pub async fn update_branding(&self, id: Uuid, brand_color: Option<String>, logo_asset_id: Option<Uuid>) -> AppResult<Company> {
         let input = UpdateCompanyInput {
-            ..Default::default()
-        };
-        // Note: This is simplified - in production you'd have specific fields for branding
-        Ok(self.company_repo.update(id, input).await?)
-    }
-}
-
-impl Default for UpdateCompanyInput {
-    fn default() -> Self {
-        Self {
             name: None,
             description: None,
             status: None,
@@ -77,6 +67,9 @@ impl Default for UpdateCompanyInput {
             attachment_max_bytes: None,
             default_responsible_user_id: None,
             require_board_approval_for_new_agents: None,
-        }
+        };
+        // Note: This is simplified - in production you'd have specific fields for branding
+        Ok(self.company_repo.update(id, input).await?)
     }
 }
+

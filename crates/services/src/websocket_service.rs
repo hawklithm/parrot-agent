@@ -88,7 +88,7 @@ impl WebSocketService for WebSocketServiceImpl {
             .ok_or_else(|| ServiceError::NotFound("Connection not found".to_string()))?;
         let mut subscriptions = self.subscriptions.write().await;
         for subscribers in subscriptions.values_mut() {
-            subscrsubscribers.remove(&connection_id);
+            subscribers.remove(&connection_id);
         }
         self.emit_event(ConnectionEventType::Disconnected, connection_id, context.company_id).await;
         Ok(())

@@ -131,8 +131,8 @@ impl DocumentService for MockDocumentService {
         company_id: Uuid,
     ) -> Result<IssueDocument, String> {
         let mut doc = Self::create_mock_document(Uuid::new_v4(), parent_id, company_id, key.to_string());
-        doc.locked_by_agent_id = input.agent_id;
-        doc.locked_by_user_id = input.user_id;
+        doc.locked_by_user_id = if input.locked_by_type == "user" { Some(input.locked_by_id) } else { None };
+        doc.locked_by_agent_id = if input.locked_by_type == "agent" { Some(input.locked_by_id) } else { None };
         doc.locked_at = Some(chrono::Utc::now());
         Ok(doc)
     }

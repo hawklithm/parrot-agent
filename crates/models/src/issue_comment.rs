@@ -95,6 +95,8 @@ pub struct IssueComment {
     pub issue_id: Uuid,
     pub author_type: IssueCommentAuthorType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author_agent_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author_user_id: Option<Uuid>,

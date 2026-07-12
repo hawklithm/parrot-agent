@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use std::collections::HashMap;
 use models::{AdapterType, AdapterModel, AdapterEnvironmentTestResult, AdapterEnvironmentTestStatus, AdapterEnvironmentCheck};
-use crate::adapter_registry::{ServerAdapterModule, TestEnvironmentContext};
+use crate::adapter_registry::ServerAdapterModule;
+use models::TestEnvironmentContext;
 use std::process::Command;
 
 /// Claude Local 适配器
@@ -154,19 +156,22 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         // 检查 1: Claude CLI 是否安装
         let cli_installed = self.is_claude_cli_installed();
         checks.push(AdapterEnvironmentCheck {
-            name: "claude_cli_installed".to_string(),
-            status: if cli_installed {
+            name: Some("claude_cli_installed".to_string()),
+            status: Some(if cli_installed {
                 AdapterEnvironmentTestStatus::Pass
             } else {
                 overall_status = AdapterEnvironmentTestStatus::Fail;
                 AdapterEnvironmentTestStatus::Fail
-            },
+            }),
             message: if cli_installed {
                 "Claude CLI is installed".to_string()
             } else {
                 "Claude CLI not found. Install via: npm install -g @anthropic-ai/claude-code".to_string()
             },
             details: None,
+            code: None,
+            level: None,
+            hint: None,
         });
 
         // 如果 CLI 未安装，直接返回失败
@@ -180,39 +185,48 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         }
 
         // 检查 2: API Key 配置
-        let has_api_key = self.check_api_key(&ctx.adapter_config);
+        let has_api_key = self.check_api_key(&serde_json::Value::Object(ctx.adapter_config.clone()));
         checks.push(AdapterEnvironmentCheck {
-            name: "api_key_configured".to_string(),
-            status: if has_api_key {
+            name: Some("api_key_configured".to_string()),
+            status: Some(if has_api_key {
                 AdapterEnvironmentTestStatus::Pass
             } else {
                 AdapterEnvironmentTestStatus::Warning
-            },
+            }),
             message: if has_api_key {
                 "API key is configured".to_string()
             } else {
                 "API key not found in config or ANTHROPIC_API_KEY env var".to_string()
             },
             details: None,
+            code: None,
+            level: None,
+            hint: None,
         });
 
         // 检查 3: CLI 连通性测试
         match self.test_cli_connectivity().await {
             Ok(_) => {
                 checks.push(AdapterEnvironmentCheck {
-                    name: "cli_connectivity".to_string(),
-                    status: AdapterEnvironmentTestStatus::Pass,
+                    name: Some("cli_connectivity".to_string()),
+                    status: Some(AdapterEnvironmentTestStatus::Pass),
                     message: "Claude CLI connectivity test passed".to_string(),
                     details: None,
+                    code: None,
+                    level: None,
+                    hint: None,
                 });
             }
             Err(e) => {
                 overall_status = AdapterEnvironmentTestStatus::Fail;
                 checks.push(AdapterEnvironmentCheck {
-                    name: "cli_connectivity".to_string(),
-                    status: AdapterEnvironmentTestStatus::Fail,
+                    name: Some("cli_connectivity".to_string()),
+                    status: Some(AdapterEnvironmentTestStatus::Fail),
                     message: format!("Claude CLI connectivity test failed: {}", e),
                     details: None,
+                    code: None,
+                    level: None,
+                    hint: None,
                 });
             }
         }
@@ -220,12 +234,12 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         // 检查 4: 模型可用性
         let models = self.discover_claude_models();
         checks.push(AdapterEnvironmentCheck {
-            name: "models_available".to_string(),
-            status: if models.is_empty() {
+            name: Some("models_available".to_string()),
+            status: Some(if models.is_empty() {
                 AdapterEnvironmentTestStatus::Warning
             } else {
                 AdapterEnvironmentTestStatus::Pass
-            },
+            }),
             message: if models.is_empty() {
                 "No models discovered, using defaults".to_string()
             } else {
@@ -234,7 +248,10 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
             details: Some(serde_json::json!({
                 "model_count": models.len(),
                 "models": models.iter().map(|m| &m.id).collect::<Vec<_>>(),
-            })),
+            }).to_string()),
+            code: None,
+            level: None,
+            hint: None,
         });
 
         Ok(AdapterEnvironmentTestResult {
@@ -253,12 +270,15 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         Some("instructionsFilePath")
     }
 
-    fn get_runtime_command_spec(&self, _config: &serde_json::Value) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "command": "claude",
-            "package": "@anthropic-ai/claude-code",
-            "type": "npm"
-        }))
+    fn get_runtime_command_spec(
+        &self,
+        _config: &HashMap<String, serde_json::Value>,
+    ) -> Option<models::AdapterRuntimeCommandSpec> {
+        Some(models::AdapterRuntimeCommandSpec {
+            command: "claude".to_string(),
+            detect_command: "claude --version".to_string(),
+            install_command: Some("npm install -g @anthropic-ai/claude-code".to_string()),
+        })
     }
 
     fn agent_configuration_doc(&self) -> &str {

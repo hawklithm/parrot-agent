@@ -5,7 +5,7 @@ CREATE TYPE company_status AS ENUM ('active', 'paused', 'archived');
 CREATE TYPE principal_type AS ENUM ('user', 'agent');
 
 -- Create membership role enum
-CREATE TYPE membership_role AS ENUM ('owner', 'member');
+CREATE TYPE membership_role AS ENUM ('owner', 'admin', 'operator', 'viewer');
 
 -- Create company membership status enum
 CREATE TYPE company_membership_status AS ENUM ('active', 'inactive');
@@ -39,7 +39,7 @@ CREATE TABLE companies (
 -- Create company memberships table
 CREATE TABLE company_memberships (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id UUID NOT NULL REFERENCEmpanies(id) ON DELETE CASCADE,
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     principal_type principal_type NOT NULL,
     principal_id UUID NOT NULL,
     status company_membership_status NOT NULL DEFAULT 'active',
@@ -69,5 +69,5 @@ CREATE TRIGGER update_companies_updated_at BEFORE UPDATE ON companies
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Apply updated_at trigger to company_memberships
-CREATE TRIGGER update_company_memberships_updated_at BEFORE UPDATny_memberships
+CREATE TRIGGER update_company_memberships_updated_at BEFORE UPDATE ON company_memberships
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

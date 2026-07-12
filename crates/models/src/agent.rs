@@ -153,8 +153,11 @@ pub struct Approval {
     pub agent_id: Uuid,
     pub status: String,
     pub requested_by: Uuid,
+    pub requested_by_user_id: Option<Uuid>,
+    pub requested_by_agent_id: Option<Uuid>,
     pub approved_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
 }
 

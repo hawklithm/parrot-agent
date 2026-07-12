@@ -57,6 +57,19 @@ pub trait AccessService: Send + Sync {
         &self,
         company_id: Uuid,
     ) -> Result<(), AccessError>;
+
+    /// 批量过滤Agent列表（基于权限判定）
+    async fn filter_agents_for_actor(
+        &self,
+        actor: &dyn Actor,
+        agents: Vec<models::Agent>,
+    ) -> Vec<models::Agent>;
+
+    /// 为受限视图脱敏Agent配置
+    fn redact_for_restricted_agent_view(&self, agent: &mut models::Agent);
+
+    /// 脱敏事件载荷中的敏感信息
+    fn redact_event_payload(&self, payload: &mut serde_json::Value);
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +364,72 @@ impl AccessService for DefaultAccessService {
         // 目前默认返回启用
         Ok(())
     }
+
+    async fn filter_agents_for_actor(
+        &self,
+        actor: &dyn Actor,
+        agents: Vec<models::Agent>,
+    ) -> Vec<models::Agent> {
+        let mut filtered = Vec::new();
+
+        for agent in agents {
+            let resource = ResourceContext {
+                resource_type: ResourceType::Agent,
+                resource_id: agent.id,
+                company_id: agent.company_id,
+                metadata: std::collections::HashMap::new(),
+            };
+
+            let decision = self.decide(&Action::AgentRead, actor, Some(&resource)).await;
+            if decision.allowed {
+                filtered.push(agent);
+            }
+        }
+
+        filtered
+    }
+
+    fn redact_for_restricted_agent_view(&self, agent: &mut models::Agent) {
+        // 移除敏感配置字段
+        agent.adapter_config = sqlx::types::Json(serde_json::json!({}));
+        agent.runtime_config = sqlx::types::Json(serde_json::json!({}));
+    }
+
+    fn redact_event_payload(&self, payload: &mut serde_json::Value) {
+        if let Some(obj) = payload.as_object_mut() {
+            // 脱敏常见敏感字段
+            let sensitive_keys = vec![
+                "api_key",
+                "apiKey",
+                "secret",
+                "password",
+                "token",
+                "accessToken",
+                "refresh_token",
+                "private_key",
+                "privateKey",
+                "credentials",
+                "auth",
+            ];
+
+            for key in sensitive_keys {
+                if obj.contains_key(key) {
+                    obj.insert(key.to_string(), serde_json::json!("***REDACTED***"));
+                }
+            }
+
+            // 递归处理嵌套对象
+            for value in obj.values_mut() {
+                if value.is_object() || value.is_array() {
+                    self.redact_event_payload(value);
+                }
+            }
+        } else if let Some(arr) = payload.as_array_mut() {
+            for item in arr {
+                self.redact_event_payload(item);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -416,5 +495,128 @@ mod tests {
 
         let result = service.assert_company_access(&user, different_company).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_filter_agents_for_actor() {
+        let service = DefaultAccessService::new();
+        let company_id = Uuid::new_v4();
+
+        let user = UserActor {
+            user_id: Uuid::new_v4(),
+            company_id,
+            is_board_admin: false,
+            is_instance_admin: false,
+        };
+
+        let agent1 = models::Agent {
+            id: Uuid::new_v4(),
+            company_id,
+            name: "Agent 1".to_string(),
+            role: models::AgentRole::General,
+            status: models::AgentStatus::Idle,
+            adapter_type: "process".to_string(),
+            adapter_config: sqlx::types::Json(serde_json::json!({})),
+            runtime_config: sqlx::types::Json(serde_json::json!({})),
+            permissions: sqlx::types::Json(models::AgentPermissions::default()),
+            metadata: sqlx::types::Json(models::AgentMetadata {
+                is_built_in: None,
+                built_in_key: None,
+            }),
+            budget_monthly_cents: 0,
+            reports_to: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let agent2 = models::Agent {
+            id: Uuid::new_v4(),
+            company_id: Uuid::new_v4(), // Different company
+            name: "Agent 2".to_string(),
+            role: models::AgentRole::General,
+            status: models::AgentStatus::Idle,
+            adapter_type: "process".to_string(),
+            adapter_config: sqlx::types::Json(serde_json::json!({})),
+            runtime_config: sqlx::types::Json(serde_json::json!({})),
+            permissions: sqlx::types::Json(models::AgentPermissions::default()),
+            metadata: sqlx::types::Json(models::AgentMetadata {
+                is_built_in: None,
+                built_in_key: None,
+            }),
+            budget_monthly_cents: 0,
+            reports_to: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let agents = vec![agent1.clone(), agent2];
+        let filtered = service.filter_agents_for_actor(&user, agents).await;
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, agent1.id);
+    }
+
+    #[test]
+    fn test_redact_for_restricted_agent_view() {
+        let service = DefaultAccessService::new();
+        let mut agent = models::Agent {
+            id: Uuid::new_v4(),
+            company_id: Uuid::new_v4(),
+            name: "Test Agent".to_string(),
+            role: models::AgentRole::General,
+            status: models::AgentStatus::Idle,
+            adapter_type: "claude_local".to_string(),
+            adapter_config: sqlx::types::Json(serde_json::json!({
+                "api_key": "secret-key",
+                "model": "claude-opus-4"
+            })),
+            runtime_config: sqlx::types::Json(serde_json::json!({
+                "env": {
+                    "OPENAI_API_KEY": "sk-test"
+                }
+            })),
+            permissions: sqlx::types::Json(models::AgentPermissions::default()),
+            metadata: sqlx::types::Json(models::AgentMetadata {
+                is_built_in: None,
+                built_in_key: None,
+            }),
+            budget_monthly_cents: 10000,
+            reports_to: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        service.redact_for_restricted_agent_view(&mut agent);
+
+        assert_eq!(agent.adapter_config.0, serde_json::json!({}));
+        assert_eq!(agent.runtime_config.0, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_redact_event_payload() {
+        let service = DefaultAccessService::new();
+        let mut payload = serde_json::json!({
+            "user": "john",
+            "api_key": "secret123",
+            "data": {
+                "token": "token456",
+                "value": "public"
+            },
+            "items": [
+                {
+                    "password": "pass789",
+                    "name": "item1"
+                }
+            ]
+        });
+
+        service.redact_event_payload(&mut payload);
+
+        assert_eq!(payload["api_key"], "***REDACTED***");
+        assert_eq!(payload["data"]["token"], "***REDACTED***");
+        assert_eq!(payload["items"][0]["password"], "***REDACTED***");
+        assert_eq!(payload["user"], "john");
+        assert_eq!(payload["data"]["value"], "public");
+        assert_eq!(payload["items"][0]["name"], "item1");
     }
 }

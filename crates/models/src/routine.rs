@@ -92,6 +92,7 @@ pub enum TriggerType {
     Webhook,
     Manual,
     Event,
+    Cron,
 }
 
 /// Trigger status enum
@@ -101,6 +102,9 @@ pub enum TriggerStatus {
     Enabled,
     Disabled,
     Paused,
+    Active,
+    Failed,
+    Configuration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -145,6 +149,11 @@ pub struct RoutineTrigger {
     pub kind: TriggerKind,
     pub label: Option<String>,
     pub enabled: bool,
+    pub trigger_type: TriggerType,
+    pub config: JsonValue,
+    pub status: TriggerStatus,
+    pub next_trigger_at: Option<DateTime<Utc>>,
+    pub last_triggered_at: Option<DateTime<Utc>>,
     pub cron_expression: Option<String>,
     pub timezone: Option<String>,
     pub next_run_at: Option<DateTime<Utc>>,
@@ -281,6 +290,11 @@ impl RoutineTrigger {
             kind: TriggerKind::Schedule,
             label: None,
             enabled: true,
+            trigger_type: TriggerType::Schedule,
+            config: JsonValue::Object(serde_json::Map::new()),
+            status: TriggerStatus::Active,
+            next_trigger_at: None,
+            last_triggered_at: None,
             cron_expression: Some(cron_expression),
             timezone,
             next_run_at: None,
@@ -308,6 +322,11 @@ impl RoutineTrigger {
             kind: TriggerKind::Webhook,
             label: None,
             enabled: true,
+            trigger_type: TriggerType::Webhook,
+            config: JsonValue::Object(serde_json::Map::new()),
+            status: TriggerStatus::Active,
+            next_trigger_at: None,
+            last_triggered_at: None,
             cron_expression: None,
             timezone: None,
             next_run_at: None,

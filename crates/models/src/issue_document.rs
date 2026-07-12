@@ -32,6 +32,10 @@ pub struct IssueDocument {
     pub issue_id: Uuid,
     pub document_id: Uuid,
     pub key: String,
+    pub content: Option<String>,
+    pub locked_by_user_id: Option<Uuid>,
+    pub locked_by_agent_id: Option<Uuid>,
+    pub locked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

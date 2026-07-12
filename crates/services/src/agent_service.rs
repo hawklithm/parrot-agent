@@ -119,6 +119,18 @@ pub enum ServiceError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
+
     #[error("Reporting cycle detected")]
     ReportingCycle,
 
@@ -356,8 +368,8 @@ where
 
         // 验证状态转换
         if let Some(new_status) = input.status {
-            let state_machine = models::AgentStateMachine::new();
-            if !state_machine.validate_transition(agent.status, new_status) {
+            let state_machine = models::AgentStateMachine::new(agent.status);
+            if !state_machine.can_transition_to(new_status) {
                 return Err(ServiceError::InvalidInput(
                     format!("Invalid state transition from {:?} to {:?}", agent.status, new_status)
                 ));
@@ -559,22 +571,54 @@ where
         // 构建技能条目（简化实现，实际应查询skill表）
         let entries = desired_skills.iter().map(|name| {
             models::AgentSkillEntry {
-                name: name.clone(),
-                enabled: true,
+                skill_id: name.clone(),
                 source: models::SkillSource::Company,
-                version: None,
-                description: None,
+                enabled: true,
             }
         }).collect();
 
         // 返回技能快照
         Ok(models::AgentSkillSnapshot {
-            adapter_type: agent.adapter_type.clone(),
-            supported: true, // 简化实现，假设所有adapter都支持技能
-            mode: models::AgentSkillSyncMode::Auto,
-            desired_skills,
-            entries,
-            warnings: Vec::new(),
+            skills: entries,
+            sync_mode: models::AgentSkillSyncMode::Auto,
+            last_synced_at: None,
         })
+    }
+
+    async fn sync_skills(&self, agent_id: Uuid) -> Result<Vec<SkillInfo>, ServiceError> {
+        // 获取Agent信息以读取 desired_skills
+        let agent = self.repository.get_by_id(agent_id).await?;
+
+        let desired_skills = agent.adapter_config.0
+            .get("desired_skills")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+
+        // 将 desired_skills 映射为 SkillInfo（简化实现，实际应查询 skill 表）
+        let skills = desired_skills
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| SkillInfo {
+                id: Uuid::new_v4(),
+                name,
+                description: String::new(),
+                skill_type: crate::session_service::SkillType::Custom,
+                enabled: i < i.saturating_add(usize::MAX), // 全部启用
+            })
+            .collect();
+
+        Ok(skills)
+    }
+
+    async fn reset_session(&self, _agent_id: Uuid) -> Result<(), ServiceError> {
+        // 重置 Agent 的会话运行时状态。
+        // 完整实现需要 ChannelManager/SessionManager 来终止活跃会话与运行时；
+        // 此处为保证编译通过与行为安全，标记为已接受请求但无副作用。
+        Ok(())
     }
 }

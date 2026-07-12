@@ -130,10 +130,12 @@ impl GoalService for DefaultGoalService {
         let goal = Goal {
             id: Uuid::new_v4(),
             company_id: input.company_id,
-            title: input.title,
+            title: input.title.clone(),
+            name: input.title,
             description: input.description,
             level: input.level,
             status: GoalStatus::Planned,
+            priority: models::GoalPriority::Medium,
             parent_id: input.parent_id,
             owner_agent_id: input.owner_agent_id,
             created_at: now,

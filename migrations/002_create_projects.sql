@@ -70,7 +70,7 @@ CREATE TABLE agent_memberships (
 CREATE INDEX idx_projects_company_id ON projects(company_id);
 CREATE INDEX idx_projects_status ON projects(status);
 CREATE INDEX idx_projects_goal_id ON projects(goal_id);
-CREATE INDEX idx_projects_lead_agent_id ON projects(lead_a
+CREATE INDEX idx_projects_lead_agent_id ON projects(lead_agent_id);
 CREATE INDEX idx_project_workspaces_project_id ON project_workspaces(project_id);
 CREATE INDEX idx_project_workspaces_is_primary ON project_workspaces(is_primary);
 

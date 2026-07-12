@@ -50,7 +50,8 @@ pub trait RoutineService: Send + Sync {
     /// Create a new routine with initial revision
     async fn create(&self, input: CreateRoutineInput) -> Result<Routine, ServiceError>;
 
-    /// Get routine async fn get_by_id(&self, id: Uuid) -> Result<Routine, ServiceError>;
+    /// Get routine by id
+    async fn get_by_id(&self, id: Uuid) -> Result<Routine, ServiceError>;
 
     /// Update routine and create new revision if needed
     async fn update(&self, id: Uuid, input: UpdateRoutineInput) -> Result<Routine, ServiceError>;

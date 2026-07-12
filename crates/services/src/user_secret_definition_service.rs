@@ -37,6 +37,7 @@ impl UserSecretDefinitionServiceImpl {
             key: key.to_string(),
             name: format!("{} Secret", key.to_uppercase()),
             description: Some(format!("User-level {} credential", key)),
+            required: false,
             status: "active".to_string(),
             provider: "local_encrypted".to_string(),
             managed_mode: "managed".to_string(),
@@ -70,6 +71,7 @@ impl UserSecretDefinitionService for UserSecretDefinitionServiceImpl {
             key: req.key,
             name: req.name,
             description: req.description,
+            required: false,
             status: "active".to_string(),
             provider: req.provider,
             managed_mode: req.managed_mode,
@@ -171,11 +173,13 @@ impl UserSecretDefinitionService for UserSecretDefinitionServiceImpl {
         Ok(vec![
             SecretBinding {
                 id: Uuid::new_v4(),
-                target_type: "agent".to_string(),
+                secret_id: Uuid::new_v4(),
+                target_type: models::SecretBindingTargetType::Agent,
                 target_id: Uuid::new_v4(),
-                config_path: "env.GITHUB_TOKEN".to_string(),
+                config_path: Some("env.GITHUB_TOKEN".to_string()),
                 env_key: Some("GITHUB_TOKEN".to_string()),
                 required: true,
+                created_at: chrono::Utc::now(),
             },
         ])
     }

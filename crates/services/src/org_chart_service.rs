@@ -3,6 +3,47 @@ use models::{OrgChartOptions, OrgChartStyle, OrgNode};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+/// 组织架构服务错误
+#[derive(Debug, thiserror::Error)]
+pub enum OrgChartError {
+    #[error("database error: {0}")]
+    Database(String),
+    #[error("agent not found: {0}")]
+    AgentNotFound(Uuid),
+    #[error("circular dependency detected at agent: {0}")]
+    CircularDependency(Uuid),
+}
+
+/// 角色标签映射表
+pub const ROLE_LABELS: &[(&str, &str)] = &[
+    ("ceo", "CEO"),
+    ("vp", "VP"),
+    ("manager", "Manager"),
+    ("researcher", "Researcher"),
+    ("general", "General Agent"),
+    ("engineer", "Engineer"),
+    ("director", "Director"),
+    ("product", "Product"),
+    ("pm", "Product Manager"),
+    ("admin", "Admin"),
+];
+
+/// 将内部角色标识转换为可读标签
+pub fn get_role_label(role: &str) -> String {
+    let normalized = role.to_lowercase();
+    for (key, label) in ROLE_LABELS {
+        if normalized.contains(key) {
+            return (*label).to_string();
+        }
+    }
+    // 未匹配则做简单的标题化
+    let mut chars = normalized.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + &chars.collect::<String>(),
+        None => normalized,
+    }
+}
+
 #[async_trait]
 pub trait OrgChartService: Send + Sync {
     /// GET /companies/:companyId/org - 获取组织树结构
@@ -14,6 +55,15 @@ pub trait OrgChartService: Send + Sync {
         company_id: Uuid,
         options: OrgChartOptions,
     ) -> Result<String, String>;
+
+    /// 从数据库构建组织树（含循环依赖检测）
+    async fn build_org_tree(&self, company_id: Uuid) -> Result<Vec<OrgNode>, OrgChartError>;
+
+    /// 获取 Agent 的直接下属
+    async fn get_direct_reports(&self, agent_id: Uuid) -> Result<Vec<OrgNode>, OrgChartError>;
+
+    /// 获取以指定 Agent 为根的子树
+    async fn get_subtree(&self, agent_id: Uuid) -> Result<OrgNode, OrgChartError>;
 }
 
 pub struct MockOrgChartService;
@@ -219,5 +269,40 @@ impl OrgChartService for MockOrgChartService {
     ) -> Result<String, String> {
         let tree = self.get_org_tree(company_id).await?;
         Ok(Self::render_svg(&tree, &options))
+    }
+
+    async fn build_org_tree(&self, _company_id: Uuid) -> Result<Vec<OrgNode>, OrgChartError> {
+        Ok(Self::build_org_tree_mock())
+    }
+
+    async fn get_direct_reports(&self, agent_id: Uuid) -> Result<Vec<OrgNode>, OrgChartError> {
+        let tree = Self::build_org_tree_mock();
+        if let Some(node) = Self::find_node(&tree, agent_id.to_string()) {
+            Ok(node.reports.clone())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn get_subtree(&self, agent_id: Uuid) -> Result<OrgNode, OrgChartError> {
+        let tree = Self::build_org_tree_mock();
+        Self::find_node(&tree, agent_id.to_string())
+            .cloned()
+            .ok_or(OrgChartError::AgentNotFound(agent_id))
+    }
+}
+
+impl MockOrgChartService {
+    /// 在组织中递归查找指定 id 的节点
+    fn find_node<'a>(nodes: &'a [OrgNode], id: String) -> Option<&'a OrgNode> {
+        for node in nodes {
+            if node.id == id {
+                return Some(node);
+            }
+            if let Some(found) = Self::find_node(&node.reports, id.clone()) {
+                return Some(found);
+            }
+        }
+        None
     }
 }

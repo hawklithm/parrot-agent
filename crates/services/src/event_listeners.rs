@@ -2,13 +2,12 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::event_bus::{
-    Event, EventHandler, EventHandlerError,
-    IssueEvent, IssueEventAction,
-    ApprovalEvent, ApprovalEventAction,
-    RoutineEvent, RoutineEventAction,
-    EnvironmentEvent, EnvironmentEventAction,
+use models::event_bus::{
+    Event, EventHandler, SystemEvent, SystemEventPayload,
+    IssueEvent, ApprovalEvent, RoutineEvent, EnvironmentEvent,
 };
+
+use repositories::ActivityLogRepository;
 
 // ==================== Issue完成 → Goal进度更新监听器 ====================
 
@@ -24,25 +23,27 @@ impl<G> IssueCompletedToGoalProgressListener<G> {
 
 #[async_trait]
 impl<G: GoalService> EventHandler for IssueCompletedToGoalProgressListener<G> {
-    async fn handle_event(&self, event: Arc<dyn Event>) -> Result<(), EventHandlerError> {
-        let payload = event.payload();
+    async fn handle(&self, event: &dyn Event) -> Result<(), String> {
+        let system_event = match event.as_any().downcast_ref::<SystemEvent>() {
+            Some(e) => e,
+            None => return Ok(()),
+        };
 
-        if let Ok(issue_event) = serde_json::from_value::<IssueEvent>(payload) {
-            if issue_event.action == IssueEventAction::Completed {
-                // 查询Issue关联的Goal并重新计算进度
-                if let Err(e) = self.goal_service
-                    .recalculate_progress_for_issue(issue_event.issue_id)
-                    .await
-                {
-                    return Err(EventHandlerError::ExecutionFailed(e.to_string()));
-                }
-            }
+        if let SystemEventPayload::Issue(IssueEvent::Completed { issue_id, .. }) = &system_event.payload {
+            self.goal_service
+                .recalculate_progress_for_issue(*issue_id)
+                .await
+                .map_err(|e| e.to_string())?;
         }
 
         Ok(())
     }
 
-    fn handler_id(&self) -> &str {
+    fn event_types(&self) -> Vec<String> {
+        vec!["issue.completed".to_string()]
+    }
+
+    fn handler_name(&self) -> &str {
         "issue_completed_to_goal_progress"
     }
 }
@@ -61,25 +62,27 @@ impl<I> ApprovalApprovedToIssueUnblockListener<I> {
 
 #[async_trait]
 impl<I: IssueService> EventHandler for ApprovalApprovedToIssueUnblockListener<I> {
-    async fn handle_event(&self, event: Arc<dyn Event>) -> Result<(), EventHandlerError> {
-        let payload = event.payload();
+    async fn handle(&self, event: &dyn Event) -> Result<(), String> {
+        let system_event = match event.as_any().downcast_ref::<SystemEvent>() {
+            Some(e) => e,
+            None => return Ok(()),
+        };
 
-        if let Ok(approval_event) = serde_json::from_value::<ApprovalEvent>(payload) {
-            if approval_event.action == ApprovalEventAction::Approved {
-                // 查询关联的Issue并更新状态为in_progress
-                if let Err(e) = self.issue_service
-                    .unblock_by_approval(approval_event.approval_id)
-                    .await
-                {
-                    return Err(EventHandlerError::ExecutionFailed(e.to_string()));
-                }
-            }
+        if let SystemEventPayload::Approval(ApprovalEvent::Approved { approval_id, .. }) = &system_event.payload {
+            self.issue_service
+                .unblock_by_approval(*approval_id)
+                .await
+                .map_err(|e| e.to_string())?;
         }
 
         Ok(())
     }
 
-    fn handler_id(&self) -> &str {
+    fn event_types(&self) -> Vec<String> {
+        vec!["approval.approved".to_string()]
+    }
+
+    fn handler_name(&self) -> &str {
         "approval_approved_to_issue_unblock"
     }
 }
@@ -98,25 +101,27 @@ impl<I> RoutineTriggeredToIssueCreationListener<I> {
 
 #[async_trait]
 impl<I: IssueService> EventHandler for RoutineTriggeredToIssueCreationListener<I> {
-    async fn handle_event(&self, event: Arc<dyn Event>) -> Result<(), EventHandlerError> {
-        let payload = event.payload();
+    async fn handle(&self, event: &dyn Event) -> Result<(), String> {
+        let system_event = match event.as_any().downcast_ref::<SystemEvent>() {
+            Some(e) => e,
+            None => return Ok(()),
+        };
 
-        if let Ok(routine_event) = serde_json::from_value::<RoutineEvent>(payload) {
-            if routine_event.action == RoutineEventAction::Triggered {
-                // 创建Issue并checkout
-                if let Err(e) = self.issue_service
-                    .create_and_checkout_for_routine(routine_event.routine_id)
-                    .await
-                {
-                    return Err(EventHandlerError::ExecutionFailed(e.to_string()));
-                }
-            }
+        if let SystemEventPayload::Routine(RoutineEvent::Triggered { routine_id, .. }) = &system_event.payload {
+            self.issue_service
+                .create_and_checkout_for_routine(*routine_id)
+                .await
+                .map_err(|e| e.to_string())?;
         }
 
         Ok(())
     }
 
-    fn handler_id(&self) -> &str {
+    fn event_types(&self) -> Vec<String> {
+        vec!["routine.triggered".to_string()]
+    }
+
+    fn handler_name(&self) -> &str {
         "routine_triggered_to_issue_creation"
     }
 }
@@ -138,53 +143,59 @@ impl<W, A> LeaseExpiredToWorkspaceCleanupListener<W, A> {
 }
 
 #[async_trait]
-impl<W: WorkspaceService, A: ActivityLogRepository> EventHandler for LeaseExpiredToWorkspaceCleanupListener<W, A> {
-    async fn handle_event(&self, event: Arc<dyn Event>) -> Result<(), EventHandlerError> {
-        let payload = event.payload();
+impl<W: WorkspaceService, A: ActivityLogRepository> EventHandler
+    for LeaseExpiredToWorkspaceCleanupListener<W, A>
+{
+    async fn handle(&self, event: &dyn Event) -> Result<(), String> {
+        let system_event = match event.as_any().downcast_ref::<SystemEvent>() {
+            Some(e) => e,
+            None => return Ok(()),
+        };
 
-        if let Ok(env_event) = serde_json::from_value::<EnvironmentEvent>(payload) {
-            if env_event.action == EnvironmentEventAction::LeaseExpired {
-                // 清理关联的工作空间
-                if let Err(e) = self.workspace_service
-                    .cleanup_by_environment(env_event.environment_id)
-                    .await
-                {
-                    return Err(EventHandlerError::ExecutionFailed(e.to_string()));
-                }
+        if let SystemEventPayload::Environment(EnvironmentEvent::LeaseExpired {
+            environment_id,
+            company_id,
+            ..
+        }) = &system_event.payload
+        {
+            self.workspace_service
+                .cleanup_by_environment(*environment_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
-                // 记录活动日志
-                let activity = crate::activity_log_service::Activity::new(
-                    env_event.company_id,
-                    crate::activity_log_service::ActorType::System,
-                    env_event.environment_id,
-                    crate::activity_log_service::ActivityAction::WorkspaceDeleted,
-                    crate::activity_log_service::ResourceType::Environment,
-                    env_event.environment_id,
-                    crate::activity_log_service::ActivityMetadata {
-                        category: Some("workspace_cleanup".to_string()),
-                        severity: Some("info".to_string()),
-                        audit_critical: false,
-                        extra: serde_json::json!({
-                            "reason": "lease_expired"
-                        }),
-                    },
-                );
+            let activity = crate::activity_log_service::Activity::new(
+                *company_id,
+                crate::activity_log_service::ActorType::System,
+                *environment_id,
+                crate::activity_log_service::ActivityAction::WorkspaceDeleted,
+                crate::activity_log_service::ResourceType::Environment,
+                *environment_id,
+                crate::activity_log_service::ActivityMetadata {
+                    category: Some("workspace_cleanup".to_string()),
+                    severity: Some("info".to_string()),
+                    audit_critical: false,
+                    extra: serde_json::json!({
+                        "reason": "lease_expired"
+                    }),
+                },
+            );
 
-                let _ = self.activity_log_repo.log_activity(&activity).await;
-            }
+            let _ = self.activity_log_repo.log_activity(&activity).await;
         }
 
         Ok(())
     }
 
-    fn handler_id(&self) -> &str {
+    fn event_types(&self) -> Vec<String> {
+        vec!["environment.lease_expired".to_string()]
+    }
+
+    fn handler_name(&self) -> &str {
         "lease_expired_to_workspace_cleanup"
     }
 }
 
 // ==================== Service trait placeholders ====================
-
-use repositories::ActivityLogRepository;
 
 #[async_trait]
 pub trait GoalService: Send + Sync {

@@ -1,4 +1,5 @@
-use crate::org_chart_service::{get_role_label, OrgChartError, OrgChartService, OrgNode};
+use crate::org_chart_service::{get_role_label, OrgChartError, OrgChartService};
+use models::{OrgChartOptions, OrgNode};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -74,12 +75,39 @@ impl OrgChartService for DefaultOrgChartService {
                     role: get_role_label(&agent.role),
                     status: agent.status.clone(),
                     reports: build_subtree(Some(agent.id), children_map),
+                    collapsed_reports: None,
                 })
                 .collect()
         }
 
         // 从根节点（reports_to_agent_id = NULL）开始构建
         Ok(build_subtree(None, &children_map))
+    }
+
+    async fn get_org_tree(&self, company_id: Uuid) -> Result<Vec<OrgNode>, String> {
+        self.build_org_tree(company_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn generate_org_chart_svg(
+        &self,
+        company_id: Uuid,
+        _options: OrgChartOptions,
+    ) -> Result<String, String> {
+        let tree = self.build_org_tree(company_id).await.map_err(|e| e.to_string())?;
+        // 简单的占位 SVG 渲染（与 MockOrgChartService 的 render_svg 保持一致可后续统一）
+        let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1280\" height=\"640\">");
+        svg.push_str("<rect width=\"100%\" height=\"100%\" fill=\"#f0f9ff\"/>");
+        for (i, node) in tree.iter().enumerate() {
+            let x = 40 + i * 160;
+            svg.push_str(&format!(
+                "<g><rect x=\"{}\" y=\"40\" width=\"140\" height=\"60\" rx=\"8\" fill=\"#ffffff\" stroke=\"#0ea5e9\"/><text x=\"{}\" y=\"70\" font-size=\"14\">{}</text><text x=\"{}\" y=\"88\" font-size=\"11\">{}</text></g>",
+                x, x + 70, node.name, x + 70, node.role
+            ));
+        }
+        svg.push_str("</svg>");
+        Ok(svg)
     }
 
     async fn get_direct_reports(&self, agent_id: Uuid) -> Result<Vec<OrgNode>, OrgChartError> {
@@ -104,6 +132,7 @@ impl OrgChartService for DefaultOrgChartService {
                 role: get_role_label(&agent.role),
                 status: agent.status,
                 reports: vec![],
+                collapsed_reports: None,
             })
             .collect())
     }
@@ -161,6 +190,7 @@ impl OrgChartService for DefaultOrgChartService {
                     role: get_role_label(&agent.role),
                     status: agent.status.clone(),
                     reports: build_reports(agent.id, children_map),
+                    collapsed_reports: None,
                 })
                 .collect()
         }
@@ -171,6 +201,7 @@ impl OrgChartService for DefaultOrgChartService {
             role: get_role_label(&root.role),
             status: root.status,
             reports: build_reports(root.id, &children_map),
+            collapsed_reports: None,
         })
     }
 }

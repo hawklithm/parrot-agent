@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use models::{
+use models::pipeline::{
     Pipeline, PipelineStage, PipelineCase, PipelineTransition, CaseEvent,
     PipelineStageKind, TerminalKind, PipelineStageConfig, CreatePipelineInput, CreateStageInput
 };

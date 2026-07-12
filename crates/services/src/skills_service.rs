@@ -63,7 +63,9 @@ impl SkillsServiceImpl {
             .into_iter()
             .map(|skill| SkillIndexEntry {
                 name: skill.name.clone(),
+                slug: skill.name.clone(),
                 description: skill.description.clone(),
+                category: None,
                 is_paperclip_managed: skill.is_paperclip_managed,
                 version: Some("1.0.0".to_string()),
                 tags: vec!["automation".to_string(), "development".to_string()],
@@ -98,17 +100,19 @@ impl SkillsService for SkillsServiceImpl {
 
         Ok(SkillDetail {
             name: entry.name.clone(),
+            slug: entry.slug.clone(),
             description: entry.description.clone(),
             is_paperclip_managed: entry.is_paperclip_managed,
+            category: None,
             version: entry.version.clone(),
             tags: entry.tags.clone(),
+            parameters: None,
+            examples: None,
+            usage_notes: None,
+            documentation_url: None,
             usage_example: Some(format!("agent.use_skill('{}')", entry.name)),
-            parameters: Some(serde_json::json!({
-                "required": [],
-                "optional": ["config"]
-            })),
             author: Some("Paperclip Team".to_string()),
-            created_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
         })
     }
 }

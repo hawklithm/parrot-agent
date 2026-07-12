@@ -106,6 +106,7 @@ impl TreeControlService for MockTreeControlService {
             company_id,
             root_issue_id: issue_id,
             mode: input.mode,
+            status: models::IssueTreeHoldStatus::Active,
             reason: input.reason,
             release_policy: input.release_policy,
             metadata: input.metadata,
@@ -125,10 +126,11 @@ impl TreeControlService for MockTreeControlService {
             id: Uuid::new_v4(),
             company_id,
             root_issue_id: issue_id,
-            mode: crate::models::IssueTreeControlMode::Pause,
+            mode: models::IssueTreeControlMode::Pause,
+            status: models::IssueTreeHoldStatus::Active,
             reason: Some("Mock hold".to_string()),
-            release_policy: crate::models::IssueTreeHoldReleasePolicy {
-                strategy: crate::models::IssueTreeHoldReleasePolicyStrategy::Manual,
+            release_policy: models::IssueTreeHoldReleasePolicy {
+                strategy: models::IssueTreeHoldReleasePolicyStrategy::Manual,
                 note: None,
             },
             metadata: None,
@@ -149,10 +151,11 @@ impl TreeControlService for MockTreeControlService {
                 id: Uuid::new_v4(),
                 company_id,
                 root_issue_id: issue_id,
-                mode: crate::models::IssueTreeControlMode::Pause,
+                mode: models::IssueTreeControlMode::Pause,
+                status: models::IssueTreeHoldStatus::Active,
                 reason: Some("Mock hold 1".to_string()),
-                release_policy: crate::models::IssueTreeHoldReleasePolicy {
-                    strategy: crate::models::IssueTreeHoldReleasePolicyStrategy::Manual,
+                release_policy: models::IssueTreeHoldReleasePolicy {
+                    strategy: models::IssueTreeHoldReleasePolicyStrategy::Manual,
                     note: None,
                 },
                 metadata: None,
@@ -176,10 +179,11 @@ impl TreeControlService for MockTreeControlService {
             id: hold_id,
             company_id,
             root_issue_id: issue_id,
-            mode: crate::models::IssueTreeControlMode::Resume,
+            mode: models::IssueTreeControlMode::Resume,
+            status: models::IssueTreeHoldStatus::Released,
             reason: Some("Released".to_string()),
-            release_policy: crate::models::IssueTreeHoldReleasePolicy {
-                strategy: crate::models::IssueTreeHoldReleasePolicyStrategy::Manual,
+            release_policy: models::IssueTreeHoldReleasePolicy {
+                strategy: models::IssueTreeHoldReleasePolicyStrategy::Manual,
                 note: None,
             },
             metadata: None,

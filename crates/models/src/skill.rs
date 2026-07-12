@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Available skill (minimal metadata for listing)
@@ -69,6 +70,12 @@ pub struct SkillDetails {
     pub usage_notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_example: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 /// Response for available skills endpoint

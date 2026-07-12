@@ -2,6 +2,8 @@ pub mod activity_log_repository;
 pub mod user_secret_repository;
 pub mod secret_provider_config_repository;
 pub mod routine_repository;
+pub mod routine_trigger_repository;
+pub mod routine_revision_repository;
 pub mod goal_repository;
 pub mod agent_repository;
 pub mod pg_agent_repository;
@@ -65,3 +67,17 @@ pub use project_repository::ProjectRepository;
 pub use activity_log_repository::ActivityLogRepository;
 pub use goal_repository::GoalRepository;
 pub use routine_repository::RoutineRepository;
+pub use routine_trigger_repository::{RoutineTriggerRepository, PostgresRoutineTriggerRepository};
+pub use routine_revision_repository::{RoutineRevisionRepository, PostgresRoutineRevisionRepository};
+pub mod approval_repository;
+pub use approval_repository::{ApprovalRepository, PostgresApprovalRepository};
+
+pub mod pipeline_repository;
+pub mod pipeline_stage_repository;
+pub mod pipeline_transition_repository;
+pub mod pipeline_case_repository;
+
+pub use pipeline_repository::{PipelineRepository, PostgresPipelineRepository};
+pub use pipeline_stage_repository::{PipelineStageRepository, PostgresPipelineStageRepository};
+pub use pipeline_transition_repository::{PipelineTransitionRepository, PostgresPipelineTransitionRepository};
+pub use pipeline_case_repository::{PipelineCaseRepository, PostgresPipelineCaseRepository};

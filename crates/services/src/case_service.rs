@@ -25,7 +25,7 @@ pub struct CaseMutationResult {
 /// Case service trait for business logic
 #[async_trait]
 pub trait CaseService: Send + Sync {
-    async fn create(&self, input: UpsertCaseInput, upsert: bool) -> Result<CaseMutationResult, String>;
+    async fn create(&self, input: CreateCaseInput, upsert: bool) -> Result<CaseMutationResult, String>;
     async fn get(&self, id: Uuid, company_id: Uuid) -> Result<Option<Case>, String>;
     async fn get_detail(&self, id: Uuid, company_id: Uuid) -> Result<Option<CaseDetail>, String>;
     async fn list(&self, company_id: Uuid, filter: &CaseQueryFilter, pagination: &Pagination) -> Result<Vec<Case>, String>;
@@ -52,7 +52,7 @@ impl MockCaseService {
             key: Some("MOCK-KEY".to_string()),
             title,
             summary: Some("Mock case summary".to_string()),
-            status: crate::models::CaseStatus::Draft,
+            status: models::CaseStatus::Draft,
             fields: serde_json::json!({}),
             parent_case_id: None,
             created_by_agent_id: None,
@@ -81,9 +81,14 @@ impl MockCaseService {
             case_id,
             company_id,
             kind: CaseEventKind::Created,
+            event_type: "created".to_string(),
             metadata: Some(serde_json::json!({"action": "created"})),
             actor_agent_id: None,
             actor_user_id: Some(Uuid::new_v4()),
+            actor_type: None,
+            actor_id: None,
+            actor_run_id: None,
+            payload: None,
             created_at: chrono::Utc::now(),
         }
     }

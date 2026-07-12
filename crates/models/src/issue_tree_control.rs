@@ -37,6 +37,7 @@ pub struct IssueTreeHold {
     pub company_id: Uuid,
     pub root_issue_id: Uuid,
     pub mode: IssueTreeControlMode,
+    pub status: IssueTreeHoldStatus,
     pub reason: Option<String>,
     pub release_policy: sqlx::types::Json<IssueTreeHoldReleasePolicy>,
     pub metadata: Option<serde_json::Value>,

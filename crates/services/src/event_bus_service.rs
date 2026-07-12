@@ -63,10 +63,10 @@ impl EventBus for InMemoryEventBus {
     async fn publish(&self, event: Box<dyn Event>) -> Result<(), String> {
         // Downcast to SystemEvent (assuming all events are SystemEvent)
         let system_event = Arc::new(
-            *event
-                .as_any()
-                .downcast::<SystemEvent>()
-                .map_err(|_| "Failed to downcast event to SystemEvent")?,
+            event.as_any()
+                .downcast_ref::<SystemEvent>()
+                .ok_or("Failed to downcast event to SystemEvent")?
+                .clone(),
         );
 
         // Broadcast to all subscribers

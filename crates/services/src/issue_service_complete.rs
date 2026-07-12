@@ -4,7 +4,7 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
-use models::Issue;
+use models::{Issue, IssueStatus};
 use repositories::IssueRepository;
 use crate::ServiceError;
 
@@ -180,19 +180,19 @@ impl DefaultIssueService {
     }
 
     /// Validate status transition
-    fn validate_status_transition(&self, from_status: &str, to_status: &str) -> Result<(), ServiceError> {
-        let valid_transitions = vec![
-            ("todo", "in_progress"),
-            ("todo", "blocked"),
-            ("in_progress", "blocked"),
-            ("in_progress", "done"),
-            ("in_progress", "cancelled"),
-            ("blocked", "in_progress"),
-            ("blocked", "cancelled"),
+    fn validate_status_transition(&self, from_status: &IssueStatus, to_status: &IssueStatus) -> Result<(), ServiceError> {
+        let valid_transitions: Vec<(IssueStatus, IssueStatus)> = vec![
+            (IssueStatus::Todo, IssueStatus::InProgress),
+            (IssueStatus::Todo, IssueStatus::Blocked),
+            (IssueStatus::InProgress, IssueStatus::Blocked),
+            (IssueStatus::InProgress, IssueStatus::Done),
+            (IssueStatus::InProgress, IssueStatus::Cancelled),
+            (IssueStatus::Blocked, IssueStatus::InProgress),
+            (IssueStatus::Blocked, IssueStatus::Cancelled),
         ];
 
         let is_valid = valid_transitions.iter().any(|(from, to)| {
-            from == &from_status && to == &to_status
+            from == from_status && to == to_status
         });
 
         if !is_valid {
@@ -463,13 +463,13 @@ mod tests {
         );
 
         // Valid transitions
-        assert!(service.validate_status_transition("todo", "in_progress").is_ok());
-        assert!(service.validate_status_transition("in_progress", "done").is_ok());
-        assert!(service.validate_status_transition("blocked", "in_progress").is_ok());
+        assert!(service.validate_status_transition(&IssueStatus::Todo, &IssueStatus::InProgress).is_ok());
+        assert!(service.validate_status_transition(&IssueStatus::InProgress, &IssueStatus::Done).is_ok());
+        assert!(service.validate_status_transition(&IssueStatus::Blocked, &IssueStatus::InProgress).is_ok());
 
         // Invalid transitions
-        assert!(service.validate_status_transition("done", "todo").is_err());
-        assert!(service.validate_status_transition("todo", "done").is_err());
-        assert!(service.validate_status_transition("cancelled", "in_progress").is_err());
+        assert!(service.validate_status_transition(&IssueStatus::Done, &IssueStatus::Todo).is_err());
+        assert!(service.validate_status_transition(&IssueStatus::Todo, &IssueStatus::Done).is_err());
+        assert!(service.validate_status_transition(&IssueStatus::Cancelled, &IssueStatus::InProgress).is_err());
     }
 }

@@ -1,10 +1,10 @@
 use async_trait::async_trait;
-use models::{
+use models::execution_environment::{
     ExecutionWorkspace, WorkspaceStatus, WorkspaceMode,
     CreateExecutionWorkspaceInput, UpdateExecutionWorkspaceInput,
 };
 use repositories::{ExecutionWorkspaceRepository, RepositoryError};
-use crate::lease_service::{LeaseService, AcquireLeaseRequest, LeaseServiceError};
+use crate::lease_service::{LeaseService, AcquireLeaseRequest};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -15,7 +15,7 @@ pub enum WorkspaceServiceError {
     Repository(#[from] RepositoryError),
 
     #[error("Lease service error: {0}")]
-    LeaseService(#[from] LeaseServiceError),
+    LeaseService(String),
 
     #[error("Workspace not found: {0}")]
     WorkspaceNotFound(Uuid),
@@ -144,19 +144,13 @@ where
         // Step 2: Acquire environment lease
         let lease_request = AcquireLeaseRequest {
             environment_id,
-            workspace_id: Some(workspace.id.to_string()),
+            execution_workspace_id: Some(workspace.id),
             issue_id: workspace.source_issue_id,
-            agent_id: None,
-            run_id: None,
-            policy: if workspace.mode == WorkspaceMode::Ephemeral {
-                models::EnvironmentLeasePolicy::Ephemeral
-            } else {
-                models::EnvironmentLeasePolicy::Reusable
-            },
-            expires_at: None,
+            heartbeat_run_id: None,
         };
 
-        let lease = match self.lease_service.acquire_lease(lease_request).await {
+        let company_id = input.company_id;
+        let lease = match self.lease_service.acquire_lease(company_id, lease_request).await {
             Ok(lease) => Some(lease),
             Err(e) => {
                 // Rollback: mark workspace as error
@@ -224,7 +218,7 @@ where
         // Release lease if exists
         if let Some(provider_ref) = workspace.provider_ref {
             if let Ok(lease_id) = Uuid::parse_str(&provider_ref) {
-                let _ = self.lease_service.release_lease(lease_id).await;
+                let _ = self.lease_service.release_lease(lease_id, workspace.company_id).await;
             }
         }
 

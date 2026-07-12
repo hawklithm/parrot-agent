@@ -42,10 +42,13 @@ impl ServerAdapterModule for ProcessAdapter {
             status: AdapterEnvironmentTestStatus::Pass,
             tested_at: chrono::Utc::now().to_rfc3339(),
             checks: vec![AdapterEnvironmentCheck {
-                code: "process_available".to_string(),
-                level: AdapterEnvironmentCheckLevel::Info,
+                code: Some("process_available".to_string()),
+                level: Some(AdapterEnvironmentCheckLevel::Info),
                 message: "Process adapter is always available".to_string(),
                 hint: None,
+                name: None,
+                status: None,
+                details: None,
             }],
         })
     }

@@ -90,10 +90,13 @@ pub enum AdapterEnvironmentCheckLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdapterEnvironmentCheck {
-    pub code: String,
-    pub level: AdapterEnvironmentCheckLevel,
+    pub code: Option<String>,
+    pub level: Option<AdapterEnvironmentCheckLevel>,
     pub message: String,
     pub hint: Option<String>,
+    pub name: Option<String>,
+    pub status: Option<AdapterEnvironmentTestStatus>,
+    pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +105,7 @@ pub enum AdapterEnvironmentTestStatus {
     Pass,
     Fail,
     Warn,
+    Warning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

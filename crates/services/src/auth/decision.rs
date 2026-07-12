@@ -110,7 +110,7 @@ impl AuthorizationAction {
             Self::AgentRead { .. } => "agent:read",
             Self::AgentUpdate { .. } => "agent:update",
             Self::AgentDelete { .. } => "agent:delete",
-       AgentHire { .. } => "agent:hire",
+            Self::AgentHire { .. } => "agent:hire",
             Self::CompanyRead { .. } => "company:read",
             Self::CompanyUpdate { .. } => "company:update",
             Self::CompanyDelete { .. } => "company:delete",
@@ -258,12 +258,13 @@ impl AuthorizationDecision {
 
     /// 创建拒绝决策
     pub fn deny(action: AuthorizationAction, reason: DecisionReason, explanation: String) -> Self {
+        let code = Some(Self::reason_to_code(&reason));
         Self {
             allowed: false,
             action,
             reason,
             explanation,
-            code: Some(Self::reason_to_code(&reason)),
+            code,
             grant_id: None,
         }
     }
@@ -299,6 +300,33 @@ impl AuthorizationDecision {
             200
         } else {
             self.reason.suggested_status_code()
+        }
+    }
+}
+
+impl std::fmt::Display for DecisionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecisionReason::AllowInstanceAdmin => write!(f, "allow_instance_admin"),
+            DecisionReason::AllowCompanyOwner => write!(f, "allow_company_owner"),
+            DecisionReason::AllowCompanyAdmin => write!(f, "allow_company_admin"),
+            DecisionReason::AllowCompanyOperator => write!(f, "allow_company_operator"),
+            DecisionReason::AllowExplicitGrant { .. } => write!(f, "allow_explicit_grant"),
+            DecisionReason::AllowResourceOwner => write!(f, "allow_resource_owner"),
+            DecisionReason::AllowIssueMentionGrant { .. } => write!(f, "allow_issue_mention_grant"),
+            DecisionReason::AllowLocalImplicit => write!(f, "allow_local_implicit"),
+            DecisionReason::AllowPublicResource => write!(f, "allow_public_resource"),
+            DecisionReason::DenyUnauthenticated => write!(f, "deny_unauthenticated"),
+            DecisionReason::DenyMissingPermission { .. } => write!(f, "deny_missing_permission"),
+            DecisionReason::DenyNotCompanyMember { .. } => write!(f, "deny_not_company_member"),
+            DecisionReason::DenyInsufficientRole { .. } => write!(f, "deny_insufficient_role"),
+            DecisionReason::DenyCrossCompanyAccess { .. } => write!(f, "deny_cross_company_access"),
+            DecisionReason::DenyResourceNotFound { .. } => write!(f, "deny_resource_not_found"),
+            DecisionReason::DenyApiKeyScopeRestriction { .. } => write!(f, "deny_api_key_scope_restriction"),
+            DecisionReason::DenyLowTrustBoundary { .. } => write!(f, "deny_low_trust_boundary"),
+            DecisionReason::DenyBudgetExceeded { .. } => write!(f, "deny_budget_exceeded"),
+            DecisionReason::DenyQuotaExhausted { .. } => write!(f, "deny_quota_exhausted"),
+            DecisionReason::DenyCustom { .. } => write!(f, "deny_custom"),
         }
     }
 }

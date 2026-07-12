@@ -3,6 +3,7 @@ use models::{
     CreateEnvironmentCustomImageTerminalSessionTokenRequest,
     EnvironmentCustomImageSetupSessionResult, EnvironmentCustomImageTerminalSessionToken,
 };
+use base64::Engine;
 use std::sync::Arc;
 use uuid::Uuid;
 

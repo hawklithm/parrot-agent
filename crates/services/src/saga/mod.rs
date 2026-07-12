@@ -101,11 +101,13 @@ where
         let instance = SagaInstance {
             id: saga_id,
             saga_name,
+            company_id: Uuid::nil(),
             status: SagaStatus::Pending,
-      rent_step: None,
-            context: sqlx::types::Json(context),
+            current_step: None,
+            context,
             started_at: Utc::now(),
             completed_at: None,
+            error_message: None,
         };
 
         self.repository.create_saga(instance).await?;

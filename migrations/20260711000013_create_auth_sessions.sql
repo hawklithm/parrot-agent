@@ -14,4 +14,4 @@ CREATE INDEX idx_auth_sessions_token ON auth_sessions(token);
 CREATE INDEX idx_auth_sessions_expires_at ON auth_sessions(expires_at);
 
 -- Cleanup expired sessions periodically
-CREATE INDEX idx_auth_sessions_cleanup ON auth_sessions(expires_at) WHERE expires_at < NOW();
+CREATE INDEX idx_auth_sessions_cleanup ON auth_sessions(expires_at);

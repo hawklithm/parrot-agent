@@ -109,6 +109,17 @@ pub struct UserSecretDefinition {
     pub key: String,
     pub description: Option<String>,
     pub required: bool,
+    pub status: String,
+    pub provider: String,
+    pub managed_mode: String,
+    pub provider_config_id: Option<Uuid>,
+    pub provider_metadata: Option<String>,
+    pub usage_guidance: Option<String>,
+    pub created_by_user_id: Option<Uuid>,
+    pub created_by_agent_id: Option<Uuid>,
+    pub updated_by_user_id: Option<Uuid>,
+    pub updated_by_agent_id: Option<Uuid>,
+    pub deleted_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -159,6 +170,9 @@ pub struct SecretBinding {
     pub secret_id: Uuid,
     pub target_type: SecretBindingTargetType,
     pub target_id: Uuid,
+    pub env_key: Option<String>,
+    pub config_path: Option<String>,
+    pub required: bool,
     pub created_at: DateTime<Utc>,
 }
 

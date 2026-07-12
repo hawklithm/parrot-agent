@@ -494,15 +494,15 @@ impl SecretService for DatabaseSecretService {
         let mut values: Vec<Box<dyn sqlx::Encode<'_, sqlx::Postgres> + Send + 'static>> = Vec::new();
         let mut param_index = 1;
 
-        if let Some(value) = input.value {
+        if let Some(ref value) = input.value {
             updates.push(format!("value = ${}", param_index));
-            values.push(Box::new(value));
+            values.push(Box::new(value.clone()));
             param_index += 1;
         }
 
-        if let Some(description) = input.description {
+        if let Some(ref description) = input.description {
             updates.push(format!("description = ${}", param_index));
-            values.push(Box::new(description));
+            values.push(Box::new(description.clone()));
             param_index += 1;
         }
 
