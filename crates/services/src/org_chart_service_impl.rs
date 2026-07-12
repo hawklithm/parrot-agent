@@ -127,7 +127,7 @@ impl OrgChartService for DefaultOrgChartService {
         Ok(agents
             .into_iter()
             .map(|agent| OrgNode {
-                id: agent.id,
+                id: agent.id.to_string(),
                 name: agent.name,
                 role: get_role_label(&agent.role),
                 status: agent.status,
@@ -196,7 +196,7 @@ impl OrgChartService for DefaultOrgChartService {
         }
 
         Ok(OrgNode {
-            id: root.id,
+            id: root.id.to_string(),
             name: root.name,
             role: get_role_label(&root.role),
             status: root.status,

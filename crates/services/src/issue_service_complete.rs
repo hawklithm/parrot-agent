@@ -4,9 +4,9 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
-use models::{Issue, IssueStatus};
+use models::{Issue, IssueStatus, IssuePriority};
 use repositories::IssueRepository;
-use crate::ServiceError;
+use crate::errors::ServiceError;
 
 // Import existing services
 use crate::issue_tree_control_service::IssueTreeControlService;
@@ -50,8 +50,8 @@ pub struct CreateIssueInput {
     pub project_id: Option<Uuid>,
     pub title: String,
     pub description: Option<String>,
-    pub status: String,
-    pub priority: Option<i32>,
+    pub status: Option<IssueStatus>,
+    pub priority: Option<IssuePriority>,
     pub assigned_to: Option<Uuid>,
     pub parent_id: Option<Uuid>,
     pub goal_id: Option<Uuid>,
@@ -62,8 +62,8 @@ pub struct CreateIssueInput {
 pub struct UpdateIssueInput {
     pub title: Option<String>,
     pub description: Option<String>,
-    pub status: Option<String>,
-    pub priority: Option<i32>,
+    pub status: Option<IssueStatus>,
+    pub priority: Option<IssuePriority>,
     pub assigned_to: Option<Uuid>,
 }
 
@@ -266,17 +266,17 @@ impl IssueService for DefaultIssueService {
     }
 
     async fn update(&self, id: Uuid, company_id: Uuid, input: UpdateIssueInput) -> Result<IssueMutationResult, ServiceError> {
-        let mut issue = self.get(id, company_id).await?;
+        let issue = self.get(id, company_id).await?;
 
         let update_input = models::UpdateIssueInput {
             title: input.title,
             description: input.description,
             status: input.status,
             priority: input.priority,
-            assignee_agent_id: input.assignee_agent_id,
-            assignee_user_id: input.assignee_user_id,
+            assignee_agent_id: None,
+            assignee_user_id: None,
             work_mode: None,
-            responsible_user_id: input.responsible_user_id,
+            responsible_user_id: None,
             source_trust: None,
             monitor_scheduled_by: None,
             monitor_notes: None,
@@ -294,7 +294,7 @@ impl IssueService for DefaultIssueService {
         };
 
         let updated_issue = self.issue_repo
-            .update(issue_id, update_input)
+            .update(id, update_input)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to update issue: {}", e)))?;
 
@@ -337,7 +337,8 @@ impl IssueService for DefaultIssueService {
         let mut issue = self.get(id, company_id).await?;
 
         // Verify expected status
-        if !input.expected_statuses.is_empty() && !input.expected_statuses.contains(&issue.status) {
+        let status_str = issue.status.to_string();
+        if !input.expected_statuses.is_empty() && !input.expected_statuses.contains(&status_str) {
             return Err(ServiceError::Conflict(format!(
                 "Issue status '{}' not in expected statuses: {:?}",
                 issue.status, input.expected_statuses
@@ -345,12 +346,27 @@ impl IssueService for DefaultIssueService {
         }
 
         // Update to in_progress and assign
-        issue.status = "in_progress".to_string();
-        issue.assigned_to = input.agent_id.or(input.user_id);
-        issue.updated_at = Utc::now();
+        let update_input = models::UpdateIssueInput {
+            title: None,
+            description: None,
+            status: Some(IssueStatus::InProgress),
+            priority: None,
+            assignee_agent_id: None,
+            assignee_user_id: None,
+            work_mode: None,
+            responsible_user_id: None,
+            source_trust: None,
+            monitor_scheduled_by: None,
+            monitor_notes: None,
+            hidden_at: None,
+            execution_workspace_preference: None,
+            execution_workspace_settings: None,
+            execution_policy: None,
+            execution_state: None,
+        };
 
         let updated_issue = self.issue_repo
-            .update(issue)
+            .update(id, update_input)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to checkout issue: {}", e)))?;
 
@@ -358,25 +374,50 @@ impl IssueService for DefaultIssueService {
     }
 
     async fn release(&self, id: Uuid, company_id: Uuid, input: ReleaseInput) -> Result<Issue, ServiceError> {
-        let mut issue = self.get(id, company_id).await?;
+        let issue = self.get(id, company_id).await?;
 
-        // Update status based on result
-        if let Some(target_status) = input.target_status {
-            self.validate_status_transition(&issue.status, &target_status)?;
-            issue.status = target_status;
+        // Determine new status based on result
+        let new_status = if let Some(target_status) = input.target_status {
+            Some(target_status)
         } else if let Some(result) = input.result.as_deref() {
-            issue.status = match result {
+            Some(match result {
                 "success" => "done",
                 "failed" => "todo",
                 "cancelled" => "cancelled",
                 _ => "todo",
-            }.to_string();
-        }
+            }.to_string())
+        } else {
+            None
+        };
 
-        issue.updated_at = Utc::now();
+        let update_input = models::UpdateIssueInput {
+            title: None,
+            description: None,
+            status: new_status.and_then(|s| match s.as_str() {
+                "done" => Some(IssueStatus::Done),
+                "todo" => Some(IssueStatus::Todo),
+                "cancelled" => Some(IssueStatus::Cancelled),
+                "in_progress" => Some(IssueStatus::InProgress),
+                "blocked" => Some(IssueStatus::Blocked),
+                _ => None,
+            }),
+            priority: None,
+            assignee_agent_id: None,
+            assignee_user_id: None,
+            work_mode: None,
+            responsible_user_id: None,
+            source_trust: None,
+            monitor_scheduled_by: None,
+            monitor_notes: None,
+            hidden_at: None,
+            execution_workspace_preference: None,
+            execution_workspace_settings: None,
+            execution_policy: None,
+            execution_state: None,
+        };
 
         let updated_issue = self.issue_repo
-            .update(issue)
+            .update(id, update_input)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to release issue: {}", e)))?;
 

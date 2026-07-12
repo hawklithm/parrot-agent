@@ -152,7 +152,7 @@ impl GoalService for DefaultGoalService {
 
     async fn get_by_id(&self, id: Uuid) -> Result<Goal, ServiceError> {
         self.goal_repo
-            .find_by_id(id)
+            .get(id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find goal: {}", e)))?
             .ok_or_else(|| ServiceError::NotFound("Goal not found".to_string()))

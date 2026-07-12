@@ -244,8 +244,7 @@ impl GoalService for GoalServiceImpl {
             .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Goal {} not found", goal_id)))?;
 
-        goal.status = models::goal::GoalStatus::Achieved;
-        goal.completed_at = Some(chrono::Utc::now());
+        goal.mark_completed();
         self.repository.update(goal).await.map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
@@ -254,7 +253,7 @@ impl GoalService for GoalServiceImpl {
             .map_err(|e| ServiceError::Repository(e.to_string()))?
             .ok_or_else(|| ServiceError::NotFound(format!("Goal {} not found", goal_id)))?;
 
-        goal.status = models::goal::GoalStatus::Abandoned;
+        goal.status = models::goal::GoalStatus::Archived;
         self.repository.update(goal).await.map_err(|e| ServiceError::Repository(e.to_string()))
     }
 
