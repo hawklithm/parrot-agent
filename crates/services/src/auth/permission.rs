@@ -35,6 +35,7 @@ impl PermissionKey {
     pub const ISSUES_ASSIGN: &'static str = "issues:assign";
 
     // Agent特定权限常量
+    pub const AGENTS_READ: &'static str = "agents:read";
     pub const AGENTS_CREATE: &'static str = "agents:create";
     pub const AGENTS_UPDATE: &'static str = "agents:update";
     pub const AGENTS_DELETE: &'static str = "agents:delete";

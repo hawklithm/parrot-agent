@@ -13,6 +13,7 @@ pub mod board_access;
 pub mod board_claim;
 pub mod cli_auth;
 pub mod decision;
+pub mod decision_engine;
 pub mod error;
 pub mod invite;
 pub mod jwt;
@@ -31,6 +32,11 @@ pub use cli_auth::{
     get_cli_auth_challenge,
 };
 pub use decision::{AuthorizationAction, AuthorizationDecision, DecisionReason};
+pub use decision_engine::{
+    AuthorizationService, RolePermissions, TrustPreset, TrustPresetResolver,
+    check_explicit_grants, check_issue_mention_grant, check_manager_chain, decide_access,
+    role_has_permission,
+};
 pub use error::{AuthError, AuthResult};
 pub use invite::{AllowedJoinTypes, Invite, InviteType, JoinRequest, JoinRequestStatus};
 pub use jwt::{JwtConfig, LocalAgentJwtClaims, verify_local_agent_jwt};
