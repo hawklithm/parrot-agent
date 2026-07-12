@@ -34,6 +34,9 @@ pub mod board_api_key_repository;
 pub mod auth_repositories;
 pub mod company_repository;
 pub mod project_repository;
+pub mod repository;
+
+pub use repository::{CrudOps, Repository, RepositoryExt};
 
 pub use agent_repository::{AgentRepository, RepositoryError, RepositoryResult};
 pub use pg_agent_repository::PgAgentRepository;
