@@ -77,7 +77,7 @@ pub trait SkillService: Send + Sync {
     async fn sync_agent_skills(&self, agent_id: Uuid) -> Result<Vec<SkillInfo>, SkillError>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillInfo {
     pub id: Uuid,
     pub name: String,
@@ -86,7 +86,8 @@ pub struct SkillInfo {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SkillType {
     BuiltIn,
     Custom,

@@ -34,6 +34,8 @@ pub fn agent_routes() -> Router<AppState> {
         .route("/agents/:id/configuration", get(get_agent_configuration))
         .route("/agents/:id/skills", get(get_agent_skills))
         .route("/agents/:id/config-revisions/:revision_id/rollback", post(rollback_config))
+        .route("/agents/:id/skills/sync", post(sync_agent_skills))
+        .route("/agents/:id/runtime-state/reset-session", post(reset_agent_session))
 }
 
 /// GET /companies/:company_id/agents - 列出公司的所有Agent
@@ -278,6 +280,54 @@ async fn rollback_config(
     let updated_agent = state.agent_service.rollback_config_revision(agent_id, revision_id).await?;
 
     Ok(Json(updated_agent))
+}
+
+/// POST /agents/:id/skills/sync - 同步Agent技能列表
+async fn sync_agent_skills(
+    State(state): State<AppState>,
+    Path(agent_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    // 查询现有Agent
+    let agent = state.agent_service.get_by_id(agent_id).await?;
+
+    // TODO: 从请求中提取Actor
+    let actor = UserActor {
+        user_id: Uuid::new_v4(),
+        company_id: agent.company_id,
+        is_admin: true,
+    };
+
+    // 验证更新权限
+    state.access_service.assert_can_update_agent(&actor, agent_id).await?;
+
+    // 同步技能
+    let skills = state.agent_service.sync_skills(agent_id).await?;
+
+    Ok(Json(skills))
+}
+
+/// POST /agents/:id/runtime-state/reset-session - 重置Agent会话
+async fn reset_agent_session(
+    State(state): State<AppState>,
+    Path(agent_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    // 查询现有Agent
+    let agent = state.agent_service.get_by_id(agent_id).await?;
+
+    // TODO: 从请求中提取Actor（Board管理员）
+    let actor = UserActor {
+        user_id: Uuid::new_v4(),
+        company_id: agent.company_id,
+        is_admin: true,
+    };
+
+    // 验证更新权限
+    state.access_service.assert_can_update_agent(&actor, agent_id).await?;
+
+    // 重置会话
+    state.agent_service.reset_session(agent_id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 将校验层输入的权限结构转换为领域模型权限结构

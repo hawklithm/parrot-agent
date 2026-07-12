@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use services::{
     BuiltInAgentService, BuiltInAgentStatus, BuiltInAgentDefinition,
-    BuiltInAgentError, BuiltInAgentKey, ReconcileResult,
+    BuiltInAgentError, BuiltInAgentKey, ProvisionInput, ReconcileResult,
 };
 use crate::extractors::CompanyIdOrShortname;
 use crate::validation::agent_schemas::ProvisionBuiltInAgentSchema;
@@ -105,8 +105,13 @@ pub async fn provision_built_in_agent(
         .ok_or((StatusCode::NOT_FOUND, "Unknown built-in agent key".to_string()))?;
 
     // 调用服务层
+    let provision_input = ProvisionInput {
+        adapter_type: payload.adapter_type,
+        adapter_config: payload.adapter_config,
+        budget_monthly_cents: payload.budget_monthly_cents,
+    };
     let agent = service
-        .provision(company_id, key)
+        .provision(company_id, key, Some(&provision_input))
         .await
         .map_err(map_built_in_error)?;
 
@@ -160,6 +165,112 @@ pub async fn reconcile_built_in_agent(
     Ok(Json(response))
 }
 
+/// GET /companies/:companyId/built-in-agents/:key/status
+/// 获取指定内置 Agent 的状态
+pub async fn get_built_in_agent_status(
+    State(state): State<AppState>,
+    CompanyIdOrShortname(company_id): CompanyIdOrShortname,
+    Path(key): Path<String>,
+) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
+    let service = state.built_in_agent_service.clone();
+    let key = BuiltInAgentKey::from_str(&key)
+        .ok_or((StatusCode::NOT_FOUND, "Unknown built-in agent key".to_string()))?;
+
+    let status = service
+        .get_status(company_id, key)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get built-in agent status: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get status: {}", e))
+        })?;
+
+    let definition = service
+        .get_definition(key)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "Built-in agent definition missing".to_string()))?;
+
+    Ok(Json(BuiltInAgentStateResponse {
+        definition,
+        status,
+        agent: None,
+    }))
+}
+
+/// POST /companies/:companyId/built-in-agents/:key/reset
+/// 重置指定内置 Agent（清除资源 + 恢复初始状态）
+pub async fn reset_built_in_agent(
+    State(state): State<AppState>,
+    CompanyIdOrShortname(company_id): CompanyIdOrShortname,
+    Path(key): Path<String>,
+) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
+    let service = state.built_in_agent_service.clone();
+    let key = BuiltInAgentKey::from_str(&key)
+        .ok_or((StatusCode::NOT_FOUND, "Unknown built-in agent key".to_string()))?;
+
+    service
+        .reset(company_id, key)
+        .await
+        .map_err(map_built_in_error)?;
+
+    let status = service
+        .get_status(company_id, key)
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get status: {}", e))
+        })?;
+
+    let definition = service
+        .get_definition(key)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "Built-in agent definition missing".to_string()))?;
+
+    Ok(Json(BuiltInAgentStateResponse {
+        definition,
+        status,
+        agent: None,
+    }))
+}
+
+/// POST /companies/:companyId/built-in-agents/:key/routines/:routine_key/enable
+/// 启用内置 Agent 的定时任务
+pub async fn enable_built_in_routine(
+    State(_state): State<AppState>,
+    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
+    Path((_key, _routine_key)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // TODO: 实现 Routine enable 逻辑（需要 RoutineService 集成）
+    // 1. 解析 key 和 routine_key
+    // 2. 查找对应的 Routine
+    // 3. 设置 enabled = true
+    // 4. 保存更新
+    tracing::warn!("Routine enable not yet implemented (stub)");
+    Ok(Json(serde_json::json!({"status": "not_implemented"})))
+}
+
+/// POST /companies/:companyId/built-in-agents/:key/routines/:routine_key/disable
+/// 禁用内置 Agent 的定时任务
+pub async fn disable_built_in_routine(
+    State(_state): State<AppState>,
+    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
+    Path((_key, _routine_key)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // TODO: 实现 Routine disable 逻辑
+    tracing::warn!("Routine disable not yet implemented (stub)");
+    Ok(Json(serde_json::json!({"status": "not_implemented"})))
+}
+
+/// POST /companies/:companyId/built-in-agents/:key/routines/:routine_key/run
+/// 手动触发内置 Agent 的定时任务
+pub async fn run_built_in_routine(
+    State(_state): State<AppState>,
+    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
+    Path((_key, _routine_key)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // TODO: 实现 Routine run 逻辑
+    tracing::warn!("Routine run not yet implemented (stub)");
+    Ok(Json(serde_json::json!({"status": "not_implemented"})))
+}
+
 /// Create built-in agent routes.
 ///
 /// 使用统一的 `AppState` 作为状态类型，返回 `Router<AppState>`，
@@ -172,12 +283,32 @@ pub fn built_in_agent_routes() -> Router<AppState> {
             get(list_built_in_agents),
         )
         .route(
+            "/companies/:company_id/built-in-agents/:key/status",
+            get(get_built_in_agent_status),
+        )
+        .route(
             "/companies/:company_id/built-in-agents/:key/provision",
             post(provision_built_in_agent),
         )
         .route(
             "/companies/:company_id/built-in-agents/:key/reconcile",
             post(reconcile_built_in_agent),
+        )
+        .route(
+            "/companies/:company_id/built-in-agents/:key/reset",
+            post(reset_built_in_agent),
+        )
+        .route(
+            "/companies/:company_id/built-in-agents/:key/routines/:routine_key/enable",
+            post(enable_built_in_routine),
+        )
+        .route(
+            "/companies/:company_id/built-in-agents/:key/routines/:routine_key/disable",
+            post(disable_built_in_routine),
+        )
+        .route(
+            "/companies/:company_id/built-in-agents/:key/routines/:routine_key/run",
+            post(run_built_in_routine),
         )
 }
 

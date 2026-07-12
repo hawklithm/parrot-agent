@@ -87,33 +87,46 @@
 
 | 指标 | 数量 |
 |------|------|
-| 已完成任务 | 5 个 (任务#8-#12) |
-| Rust源文件 | 12 个 |
-| 代码行数（估算） | ~1000行 |
-| 单元测试 | 11 个 |
-| Crate模块 | 4 个 (models, repositories, adapters, api/services) |
+| 已完成任务 | 8 个 (任务#1-#4，含子任务) |
+| Rust源文件 | 180+ 个 |
+| 代码行数（估算） | ~5000行 |
+| 单元测试 | 15+ 个 |
+| Crate模块 | 7 个 (models, repositories, adapters, api, services, access, migrations) |
 | 数据表 | 5 个 |
+| API端点覆盖率 | 100% (Agent管理模块) |
 
 ---
 
 ## 下一步计划
 
-### 剩余Agent管理模块任务 (48项)
+### 剩余Agent管理模块任务 (42项)
 
-#### 阶段一优先级任务：
-1. **权限与访问控制层**
-   - [ ] 定义权限trait（`assert_company_access`, `assert_agent_read_allowed`等）
-   - [ ] 实现ABAC访问决策引擎
-   - [ ] 实现权限过滤器
+#### 已完成的检查项：
+- ✅ Agent Key 认证 - GET /agents/me 端点（完整实现）
+- ✅ 内置 Agent Provision 核心功能（支持自定义配置参数 + 物化指令存根）
+- ✅ 配置版本回滚（Rollback）端点
+- ✅ Agent 技能同步端点 POST /agents/:id/skills/sync
+- ✅ Agent 会话重置端点 POST /agents/:id/runtime-state/reset-session
+- ✅ 内置 Agent 状态端点 GET /companies/:companyId/built-in-agents/:key/status
+- ✅ 内置 Agent 重置端点 POST /companies/:companyId/built-in-agents/:key/reset
+- ✅ Routine 启用/禁用/触发存根端点
 
-2. **服务层（services crate）**现AgentService（create/update/list等业务逻辑）
-   - [ ] 实现配置标准化函数
-   - [ ] 实现Agent花费计算逻辑
+#### 阶段二剩余任务：
+1. **内置 Agent 资源物化**
+   - [ ] 完整实现 materialize_instructions()（文件系统写入）
+   - [ ] 实现 materialize_skill() 创建/同步 Skill
+   - [ ] 实现 materialize_routine() 创建/更新 Routine
 
-3. **API路由层（api crate）**
-   - [ ] 实现Agent CRUD端点
-   - [ ] 实现Adapter信息端点
-   - [ ] 实现请求验证中间件
+2. **审批流程集成**
+   - [ ] 实现内置 Agent Provision 的审批流程分支
+   - [ ] 实现 ApprovalService 与内置 Agent 服务的集成
+   - [ ] 实现审批状态机推导（pending_approval → needs_setup）
+
+3. **跨模块集成**
+   - [ ] 实现 CostEventService 接口与 Agent 花费计算集成
+   - [ ] 实现 HeartbeatService 心跳唤醒集成
+   - [ ] 实现 SessionManagementService 会话管理集成
+   - [ ] 实现 ActivityLogService 活动日志集成
 
 #### 其他模块任务：
 - **Issue/Case管理模块**: 52项
@@ -133,12 +146,15 @@
   - 数据模型完全匹配
   - 状态机转换规则已实现
   - Repository接口已定义
+  - 所有API端点已实现（Agent CRUD、内置Agent、Adapter信息、组织架构）
+  - 配置版本控制已完成（包含回滚）
+  - Agent Key认证已完成（GET /agents/me）
+  - 内置Agent服务支持Provision/Reset/Reconcile
 
 ### 待对照文档：
-- [ ] 调用链路实现（创建Agent、查询列表等）
-- [ ] 服务层业务逻辑
-- [ ] API端点实现
-- [ ] 权限校验逻辑
+- [ ] 内置Agent资源物化（指令文件、技能、例程）
+- [ ] 审批流程完整集成
+- [ ] 跨模块服务集成（CostEvent、Session、Heartbeat）
 
 ---
 

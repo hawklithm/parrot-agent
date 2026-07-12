@@ -94,7 +94,7 @@ pub use built_in_agent_service::{
 };
 pub use built_in_agent_service_impl::{
     BuiltInAgentService, BuiltInAgentError, BuiltInAgentResult,
-    DefaultBuiltInAgentService, ReconcileResult,
+    DefaultBuiltInAgentService, ProvisionInput, ReconcileResult,
 };
 pub use org_chart_service::{
     OrgChartService, OrgChartError, ROLE_LABELS, get_role_label,
