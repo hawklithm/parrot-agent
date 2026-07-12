@@ -164,6 +164,8 @@ pub mod consistency_service;
 pub use consistency_service::*;
 pub mod agent_access_service;
 pub use agent_access_service::*;
+pub mod recovery_action_service;
+pub use recovery_action_service::*;
 pub use adapter_registry::*;
 pub use adapters::*;
 pub use access::*;

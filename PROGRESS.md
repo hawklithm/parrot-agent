@@ -255,6 +255,12 @@ cargo check --workspace
   - Model类型: IssueReadStatus, IssueInboxArchive, FeedbackVote, FeedbackTrace, RecoveryAction, PlanDecomposition
   - Repository traits + PostgreSQL实现
   - 支持: mark_read/unmark_read, archive/unarchive, feedback vote/trace, recovery action management, plan decomposition
+- ✅ **恢复动作管理** - 完整实现
+  - `RecoveryActionService` trait + `DefaultRecoveryActionService`
+  - Reconcile算法: 自动比较Issue当前状态与恢复目标，条件满足时自动resolve
+  - 支持5种动作类型: unblock, stale_execution, missing_assignee, general
+  - 级联协调: reconcile_for_issue_and_ancestors 递归CTE
+  - 单元测试: should_resolve_action决策逻辑验证
 
 ### 已存在功能（之前已完成）
 - ✅ Issue/Case 数据模型（枚举、结构体、Schema迁移）
@@ -272,7 +278,7 @@ cargo check --workspace
 - [ ] Monitor定时调度器（后台轮询monitor_next_check_at）
 - [ ] 事件通知机制（watchdog评估、恢复动作协调）
 - [x] 已读标记与归档
-- [ ] 恢复动作管理（reconcile算法）
+- [x] 恢复动作管理（reconcile算法）
 - [ ] 计划分解
 - [ ] 审批状态传播
 - [ ] 诊断端点
