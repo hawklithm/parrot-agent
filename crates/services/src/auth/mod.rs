@@ -9,6 +9,7 @@
 /// - invite: 邀请与加入类型（InviteType, AllowedJoinTypes, JoinRequestStatus）
 
 pub mod actor;
+pub mod audit;
 pub mod authorization_service;
 pub mod board_access;
 pub mod board_claim;
@@ -18,9 +19,11 @@ pub mod decision_engine;
 pub mod error;
 pub mod invite;
 pub mod jwt;
+pub mod key_rotation;
 pub mod membership;
 pub mod middleware;
 pub mod permission;
+pub mod rate_limiter;
 
 // 重新导出核心类型
 pub use actor::{ActorSource, AgentApiKeyScope, AuthorizationActor};

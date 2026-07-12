@@ -68,6 +68,7 @@ impl BoardApiKeyRepository for PgBoardApiKeyRepository {
                    is_revoked, revoked_at, revoked_by_user_id, created_at, updated_at
             FROM board_api_keys
             WHERE key_hash = $1 AND is_revoked = false
+              AND (expires_at IS NULL OR expires_at > NOW())
             "#,
         )
         .bind(key_hash)

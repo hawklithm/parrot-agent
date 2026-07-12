@@ -112,6 +112,23 @@ impl BearerTokenResolver {
             _ => return Ok(None),
         };
 
+        // 检查 API Key 是否过期
+        if let Some(expires_at) = key.expires_at {
+            if chrono::Utc::now() > expires_at {
+                // 记录过期拒绝审计事件
+                crate::auth::audit::audit_api_key_rejected(
+                    &self.pool,
+                    key.id,
+                    key.user_id,
+                    key.user_id,
+                    "user",
+                    "API key has expired",
+                )
+                .await;
+                return Ok(None);
+            }
+        }
+
         // 记录使用（不阻塞主流程）
         let _ = repo.record_usage(key.id).await;
 
