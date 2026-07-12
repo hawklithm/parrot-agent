@@ -181,6 +181,38 @@ impl CompanyMembership {
 
 use std::fmt;
 
+impl CompanyMembership {
+    /// 从仓储层 `CompanyMembershipRow` 转换（字符串角色/状态映射到枚举，未知值降级为 Viewer/Active）。
+    pub fn from_row(row: &repositories::models::authorization::CompanyMembershipRow) -> Self {
+        let role = match row.role.to_ascii_lowercase().as_str() {
+            "owner" => MembershipRole::Owner,
+            "admin" => MembershipRole::Admin,
+            "operator" => MembershipRole::Operator,
+            _ => MembershipRole::Viewer,
+        };
+        let status = match row.status.to_ascii_lowercase().as_str() {
+            "archived" => MembershipStatus::Archived,
+            _ => MembershipStatus::Active,
+        };
+        let principal_type = match row.principal_type.to_ascii_lowercase().as_str() {
+            "agent" => PrincipalType::Agent,
+            _ => PrincipalType::User,
+        };
+        Self {
+            id: row.id,
+            company_id: row.company_id,
+            principal_type,
+            principal_id: row.principal_id,
+            role,
+            status,
+            joined_at: row.joined_at,
+            archived_at: row.archived_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

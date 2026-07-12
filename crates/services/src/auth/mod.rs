@@ -9,16 +9,28 @@
 /// - invite: 邀请与加入类型（InviteType, AllowedJoinTypes, JoinRequestStatus）
 
 pub mod actor;
+pub mod board_access;
 pub mod decision;
 pub mod error;
-pub mod membership;
-pub mod permission;
 pub mod invite;
+pub mod jwt;
+pub mod membership;
+pub mod middleware;
+pub mod permission;
 
 // 重新导出核心类型
 pub use actor::{ActorSource, AgentApiKeyScope, AuthorizationActor};
+pub use board_access::{
+    load_responsible_user_memberships, resolve_board_access, resolve_instance_admin,
+};
 pub use decision::{AuthorizationAction, AuthorizationDecision, DecisionReason};
 pub use error::{AuthError, AuthResult};
-pub use membership::{CompanyMembership, MembershipRole, MembershipStatus, PrincipalType};
-pub use permission::{GrantScope, PermissionGrant, PermissionKey};
 pub use invite::{AllowedJoinTypes, Invite, InviteType, JoinRequest, JoinRequestStatus};
+pub use jwt::{JwtConfig, LocalAgentJwtClaims, verify_local_agent_jwt};
+pub use membership::{CompanyMembership, MembershipRole, MembershipStatus, PrincipalType};
+pub use middleware::{
+    ActorResolver, AuthMiddleware, AuthMode, BearerTokenResolver, CloudTenantHeaderResolver,
+    SessionCookieResolver, auth_middleware_fn, authenticated_middleware, extract_actor,
+    local_trusted_middleware,
+};
+pub use permission::{GrantScope, PermissionGrant, PermissionKey};

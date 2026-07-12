@@ -19,6 +19,8 @@ pub enum AuthorizationActor {
     Board {
         user_id: Uuid,
         company_id: Uuid,
+        /// 身份来源（会话/API Key/本地隐式等）
+        source: ActorSource,
         /// 该用户在当前解析上下文中的公司成员关系（用于角色级权限检查）
         memberships: Vec<CompanyMembership>,
         /// 是否为实例管理员（跨公司全局权限）
@@ -30,6 +32,8 @@ pub enum AuthorizationActor {
         company_id: Uuid,
         /// Agent所属的运行时上下文（可选）
         run_id: Option<Uuid>,
+        /// 身份来源（API Key/JWT等）
+        source: ActorSource,
     },
     /// 匿名/未认证主体
     None,
@@ -41,6 +45,7 @@ impl AuthorizationActor {
         Self::Board {
             user_id,
             company_id,
+            source: ActorSource::LocalImplicit,
             memberships: Vec::new(),
             is_instance_admin: false,
         }
@@ -56,6 +61,24 @@ impl AuthorizationActor {
         Self::Board {
             user_id,
             company_id,
+            source: ActorSource::LocalImplicit,
+            memberships,
+            is_instance_admin,
+        }
+    }
+
+    /// 创建带来源的 Board 用户主体
+    pub fn board_with_source(
+        user_id: Uuid,
+        company_id: Uuid,
+        source: ActorSource,
+        memberships: Vec<CompanyMembership>,
+        is_instance_admin: bool,
+    ) -> Self {
+        Self::Board {
+            user_id,
+            company_id,
+            source,
             memberships,
             is_instance_admin,
         }
@@ -67,6 +90,22 @@ impl AuthorizationActor {
             agent_id,
             company_id,
             run_id,
+            source: ActorSource::AgentJwt,
+        }
+    }
+
+    /// 创建带来源的 Agent 主体
+    pub fn agent_with_source(
+        agent_id: Uuid,
+        company_id: Uuid,
+        run_id: Option<Uuid>,
+        source: ActorSource,
+    ) -> Self {
+        Self::Agent {
+            agent_id,
+            company_id,
+            run_id,
+            source,
         }
     }
 
