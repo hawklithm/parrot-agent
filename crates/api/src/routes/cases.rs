@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use std::sync::Arc;
+use crate::app_state::AppState;
 use uuid::Uuid;
 
 use models::{Case, CaseDetail, CaseEvent, CreateCaseInput, UpdateCaseInput};
@@ -32,11 +32,12 @@ struct CreateCaseQuery {
 
 /// POST /companies/:companyId/cases - Create case
 async fn create_case(
-    State(service): State<Arc<dyn CaseService>>,
+    State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
     Query(query): Query<CreateCaseQuery>,
     Json(input): Json<CreateCaseInput>,
 ) -> Result<Json<Case>, StatusCode> {
+    let service = state.case_service.clone();
     service
         .create(input, query.upsert)
         .await
@@ -46,10 +47,11 @@ async fn create_case(
 
 /// GET /companies/:companyId/cases - List cases
 async fn list_cases(
-    State(service): State<Arc<dyn CaseService>>,
+    State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
     Query(query): Query<ListCasesQuery>,
 ) -> Result<Json<Vec<Case>>, StatusCode> {
+    let service = state.case_service.clone();
     let filter = CaseQueryFilter {
         status: None,
         case_type: query.case_type,
@@ -72,11 +74,12 @@ async fn list_cases(
 
 /// GET /cases/:id - Get case by ID
 async fn get_case(
-    State(service): State<Arc<dyn CaseService>>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Case>, StatusCode> {
+    let service = state.case_service.clone();
     let company_id = Uuid::nil();
-    
+
     service
         .get(id, company_id)
         .await
@@ -87,11 +90,12 @@ async fn get_case(
 
 /// GET /cases/:id/detail - Get case detail with related data
 async fn get_case_detail(
-    State(service): State<Arc<dyn CaseService>>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CaseDetail>, StatusCode> {
+    let service = state.case_service.clone();
     let company_id = Uuid::nil();
-    
+
     service
         .get_detail(id, company_id)
         .await
@@ -102,12 +106,13 @@ async fn get_case_detail(
 
 /// PATCH /cases/:id - Update case
 async fn update_case(
-    State(service): State<Arc<dyn CaseService>>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateCaseInput>,
 ) -> Result<Json<Case>, StatusCode> {
+    let service = state.case_service.clone();
     let company_id = Uuid::nil();
-    
+
     service
         .update(id, company_id, input)
         .await
@@ -117,10 +122,11 @@ async fn update_case(
 
 /// GET /cases/:id/events - List case events
 async fn list_case_events(
-    State(service): State<Arc<dyn CaseService>>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<ListCasesQuery>,
 ) -> Result<Json<Vec<CaseEvent>>, StatusCode> {
+    let service = state.case_service.clone();
     let company_id = Uuid::nil();
     let pagination = Pagination {
         limit: query.limit.unwrap_or(50),
@@ -136,11 +142,10 @@ async fn list_case_events(
 }
 
 /// Create case routes
-pub fn case_routes(service: Arc<dyn CaseService>) -> Router {
+pub fn case_routes() -> Router<AppState> {
     Router::new()
         .route("/api/companies/:companyId/cases", post(create_case).get(list_cases))
         .route("/api/cases/:id", get(get_case).patch(update_case))
         .route("/api/cases/:id/detail", get(get_case_detail))
         .route("/api/cases/:id/events", get(list_case_events))
-        .with_state(service)
 }

@@ -99,11 +99,14 @@ pub async fn upsert_document(
     };
 
     // Get issue to determine company_id
-    let issue = state.issue_service.get(issue_id).await
+    let issue = state.issue_service.get(issue_id, Uuid::nil()).await
         .map_err(|_| ApiError::NotFound(format!("Issue not found: {}", issue_id)))?;
+    let company_id = issue
+        .map(|i| i.company_id)
+        .ok_or_else(|| ApiError::NotFound(format!("Issue not found: {}", issue_id)))?;
 
     let (link, document, created) = state.issue_document_service
-        .upsert_document(issue_id, issue.company_id, input)
+        .upsert_document(issue_id, company_id, input)
         .await?;
 
     let status_code = if created {

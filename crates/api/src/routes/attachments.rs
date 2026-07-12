@@ -7,7 +7,7 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-use models::{Attachment, UploadAttachmentInput};
+use models::issue_auxiliary::{Attachment, UploadAttachmentInput};
 use services::AttachmentService;
 
 /// GET /issues/:id/attachments - List issue attachments

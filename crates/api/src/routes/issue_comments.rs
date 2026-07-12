@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use models::{IssueComment, CommentActorType, Pagination};
-use services::CommentServiceError;
-use crate::{errors::ApiError, app_state::AppState};
+use services::{CommentServiceError, IssueCommentService};
+use crate::errors::ApiError;
+use crate::app_state::AppState;
 
 /// Add comment request
 #[derive(Debug, Deserialize)]
@@ -86,7 +87,8 @@ pub async fn add_comment(
     Path(issue_id): Path<Uuid>,
     Json(req): Json<AddCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let comment = state.comment_service.add_comment(
+    let service = state.issue_comment_service.clone();
+    let comment = service.add_comment(
         issue_id,
         req.body,
         req.actor_type,
@@ -104,14 +106,15 @@ pub async fn list_comments(
     Path(issue_id): Path<Uuid>,
     Query(query): Query<CommentPaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let service = state.issue_comment_service.clone();
     let pagination = Pagination {
         limit: query.limit.unwrap_or(50).min(100),
         offset: query.offset.unwrap_or(0),
         cursor: None,
     };
 
-    let comments = state.comment_service.list_comments(issue_id, &pagination).await?;
-    let total = state.comment_service.count_comments(issue_id).await?;
+    let comments = service.list_comments(issue_id, &pagination).await?;
+    let total = service.count_comments(issue_id).await?;
 
     Ok(Json(CommentsListResponse {
         comments,
@@ -126,7 +129,8 @@ pub async fn get_comment(
     State(state): State<AppState>,
     Path(comment_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let comment = state.comment_service.get_comment(comment_id).await?;
+    let service = state.issue_comment_service.clone();
+    let comment = service.get_comment(comment_id).await?;
 
     Ok(Json(CommentResponse { comment }))
 }
@@ -137,7 +141,8 @@ pub async fn update_comment(
     Path(comment_id): Path<Uuid>,
     Json(req): Json<UpdateCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let comment = state.comment_service.update_comment(
+    let service = state.issue_comment_service.clone();
+    let comment = service.update_comment(
         comment_id,
         req.body,
         req.actor_id,
@@ -152,7 +157,8 @@ pub async fn delete_comment(
     Path(comment_id): Path<Uuid>,
     Json(req): Json<DeleteCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    state.comment_service.delete_comment(comment_id, req.actor_id).await?;
+    let service = state.issue_comment_service.clone();
+    service.delete_comment(comment_id, req.actor_id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

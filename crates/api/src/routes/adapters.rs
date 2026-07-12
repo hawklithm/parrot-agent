@@ -6,7 +6,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-use services::errors::AppError;
+use crate::errors::AppError;
 use crate::schemas::{
     AdapterInfoResponse, AdapterModelResponse, ListAdaptersResponse,
     TestAdapterEnvironmentRequest, TestAdapterEnvironmentResponse,

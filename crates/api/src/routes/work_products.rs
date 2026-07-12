@@ -7,7 +7,7 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-use models::{CreateWorkProductInput, UpdateWorkProductInput, WorkProduct};
+use models::issue_auxiliary::{CreateWorkProductInput, UpdateWorkProductInput, WorkProduct};
 use services::WorkProductService;
 
 /// GET /issues/:id/work-products - List work products

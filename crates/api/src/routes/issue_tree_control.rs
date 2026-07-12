@@ -11,7 +11,7 @@ use uuid::Uuid;
 use models::{
     IssueTreeHold, IssueTreeHoldMember, IssueTreeControlMode,
     IssueTreeControlPreview, CreateIssueTreeHoldInput,
-    IssueTreeHoldReleasePolicy, ActiveIssueTreePauseHoldGate,
+    IssueTreeHoldReleasePolicy, IssueTreeHoldReleasePolicyStrategy, ActiveIssueTreePauseHoldGate,
 };
 use services::TreeControlServiceError;
 use crate::{errors::ApiError, app_state::AppState};
@@ -111,19 +111,25 @@ pub async fn create_tree_hold(
     Json(req): Json<CreateTreeHoldRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue to determine company_id
-    let issue = state.issue_service.get(issue_id).await
+    let issue = state.issue_service.get(issue_id, Uuid::nil()).await
         .map_err(|_| ApiError::NotFound(format!("Issue not found: {}", issue_id)))?;
+    let company_id = issue
+        .map(|i| i.company_id)
+        .ok_or_else(|| ApiError::NotFound(format!("Issue not found: {}", issue_id)))?;
 
     let input = CreateIssueTreeHoldInput {
         mode: req.mode,
         reason: req.reason,
-        release_policy: req.release_policy,
+        release_policy: req.release_policy.unwrap_or_else(|| IssueTreeHoldReleasePolicy {
+            strategy: IssueTreeHoldReleasePolicyStrategy::Manual,
+            note: None,
+        }),
         metadata: req.metadata,
     };
 
     let hold = state.issue_tree_control_service
         .create_tree_hold(
-            issue.company_id,
+            company_id,
             issue_id,
             input,
             req.actor_type,

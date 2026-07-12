@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use std::sync::Arc;
+use crate::app_state::AppState;
 use uuid::Uuid;
 
 use models::{CreateIssueInput, Issue, UpdateIssueInput};
@@ -38,9 +38,10 @@ struct SearchQuery {
 
 /// GET /issues - List all issues
 async fn list_issues(
-    State(service): State<Arc<dyn IssueService>>,
+    State(state): State<AppState>,
     Query(query): Query<ListIssuesQuery>,
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
+    let service = state.issue_service.clone();
     let company_id = Uuid::nil();
     
     let filter = IssueQueryFilter {
@@ -69,11 +70,12 @@ async fn list_issues(
 
 /// GET /issues/:id - Get issue by ID
 async fn get_issue(
-    State(service): State<Arc<dyn IssueService>>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Issue>, StatusCode> {
+    let service = state.issue_service.clone();
     let company_id = Uuid::nil();
-    
+
     service
         .get(id, company_id)
         .await
@@ -84,10 +86,11 @@ async fn get_issue(
 
 /// POST /companies/:companyId/issues - Create issue
 async fn create_issue(
-    State(service): State<Arc<dyn IssueService>>,
+    State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
     Json(input): Json<CreateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
+    let service = state.issue_service.clone();
     service
         .create(input)
         .await
@@ -97,12 +100,13 @@ async fn create_issue(
 
 /// PATCH /issues/:id - Update issue
 async fn update_issue(
-    State(service): State<Arc<dyn IssueService>>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
+    let service = state.issue_service.clone();
     let company_id = Uuid::nil();
-    
+
     service
         .update(id, company_id, input)
         .await
@@ -112,11 +116,12 @@ async fn update_issue(
 
 /// DELETE /issues/:id - Delete issue
 async fn delete_issue(
-    State(service): State<Arc<dyn IssueService>>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
+    let service = state.issue_service.clone();
     let company_id = Uuid::nil();
-    
+
     service
         .delete(id, company_id)
         .await
@@ -126,7 +131,7 @@ async fn delete_issue(
 
 /// GET /companies/:companyId/issues/count - Count issues
 async fn count_issues(
-    State(_service): State<Arc<dyn IssueService>>,
+    State(_state): State<AppState>,
     Path(_company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(serde_json::json!({"count": 0})))
@@ -134,10 +139,11 @@ async fn count_issues(
 
 /// GET /companies/:companyId/issues/search - Search issues
 async fn search_issues(
-    State(service): State<Arc<dyn IssueService>>,
+    State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
+    let service = state.issue_service.clone();
     let filter = IssueQueryFilter::default();
     let pagination = Pagination {
         limit: query.limit.unwrap_or(50),
@@ -154,12 +160,13 @@ async fn search_issues(
 
 /// POST /issues/:id/checkout - Checkout issue
 async fn checkout_issue(
-    State(service): State<Arc<dyn IssueService>>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(input): Json<CheckoutInput>,
 ) -> Result<Json<Issue>, StatusCode> {
+    let service = state.issue_service.clone();
     let company_id = Uuid::nil();
-    
+
     service
         .checkout(id, company_id, input)
         .await
@@ -169,12 +176,13 @@ async fn checkout_issue(
 
 /// POST /issues/:id/release - Release issue
 async fn release_issue(
-    State(service): State<Arc<dyn IssueService>>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(input): Json<ReleaseInput>,
 ) -> Result<Json<Issue>, StatusCode> {
+    let service = state.issue_service.clone();
     let company_id = Uuid::nil();
-    
+
     service
         .release(id, company_id, input)
         .await
@@ -183,7 +191,7 @@ async fn release_issue(
 }
 
 /// Cr issue routes
-pub fn issue_routes(service: Arc<dyn IssueService>) -> Router {
+pub fn issue_routes() -> Router<AppState> {
     Router::new()
         .route("/api/issues", get(list_issues))
         .route("/api/issues/:id", get(get_issue).patch(update_issue).delete(delete_issue))
@@ -192,5 +200,4 @@ pub fn issue_routes(service: Arc<dyn IssueService>) -> Router {
         .route("/api/companies/:companyId/issues/search", get(search_issues))
         .route("/api/issues/:id/checkout", post(checkout_issue))
         .route("/api/issues/:id/release", post(release_issue))
-        .with_state(service)
 }
