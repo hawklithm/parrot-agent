@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::{
-    body::Body,
-    extract::{Request, State},
+    extract::State,
+    http::HeaderMap,
     middleware::Next,
     response::Response,
 };
@@ -11,8 +11,9 @@ use uuid::Uuid;
 use sqlx::PgPool;
 
 use repositories::auth_repositories::{
-    AuthSessionRepository, AuthUserRepository, CompanyRepository, PgAuthSessionRepository,
-    PgAuthUserRepository, PgCompanyRepository, PgCompanyMembershipRepository,
+    AuthSessionRepository, AuthUserRepository, CompanyMembershipRepository, CompanyRepository,
+    PgAuthSessionRepository, PgAuthUserRepository, PgCompanyRepository,
+    PgCompanyMembershipRepository,
 };
 use repositories::board_api_key_repository::{
     BoardApiKeyRepository, PgBoardApiKeyRepository, hash_api_key,
@@ -20,9 +21,17 @@ use repositories::board_api_key_repository::{
 use repositories::agent_api_key_repository::{
     AgentApiKeyRepository as _, PgAgentApiKeyRepository as PgAgentKeyRepo,
 };
+use repositories::pg_agent_repository::PgAgentRepository;
+use repositories::agent_repository::AgentRepository;
+use models::agent::AgentStatus;
+use repositories::activity_log_repository::{
+    Activity, ActivityAction, ActivityLogRepository, ActorType, PgActivityLogRepository,
+    ResourceType,
+};
 
 use crate::auth::{
-    ActorSource, AuthError, AuthResult, AuthorizationActor, JwtConfig, resolve_board_access,
+    ActorSource, AgentApiKeyScope, AuthError, AuthResult, AuthorizationActor, JwtConfig,
+    load_responsible_user_memberships, resolve_board_access, verify_local_agent_jwt,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +42,7 @@ pub enum AuthMode {
 
 #[async_trait]
 pub trait ActorResolver: Send + Sync {
-    async fn resolve(&self, request: &Request) -> AuthResult<Option<AuthorizationActor>>;
+    async fn resolve(&self, headers: &HeaderMap) -> AuthResult<Option<AuthorizationActor>>;
     fn priority(&self) -> u8;
 }
 
@@ -54,7 +63,7 @@ impl LocalTrustedResolver {
 
 #[async_trait]
 impl ActorResolver for LocalTrustedResolver {
-    async fn resolve(&self, _request: &Request) -> AuthResult<Option<AuthorizationActor>> {
+    async fn resolve(&self, _headers: &HeaderMap) -> AuthResult<Option<AuthorizationActor>> {
         Ok(Some(AuthorizationActor::board_with_source(
             self.default_user_id,
             self.default_company_id,
@@ -80,9 +89,8 @@ impl BearerTokenResolver {
         Self { pool, jwt_config }
     }
 
-    fn extract_bearer_token(&self, request: &Request) -> Option<String> {
-        request
-            .headers()
+    fn extract_bearer_token(&self, headers: &HeaderMap) -> Option<String> {
+        headers
             .get("authorization")
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
@@ -137,21 +145,56 @@ impl BearerTokenResolver {
         })?;
 
         let key = match key {
-            Some(k) if !k.is_revoked => k,
+            Some(k) if k.is_active() => k,
             _ => return Ok(None),
         };
 
         let _ = repo.update_last_used(key.id).await;
 
-        Ok(Some(AuthorizationActor::agent_with_source(
-            key.agent_id,
-            key.company_id,
-            None,
-            ActorSource::AgentKey,
-        )))
+        // 当前 models::AgentApiKey 未持久化 scope 字段，使用全量 scope。
+        let scope = AgentApiKeyScope::new(key.agent_id, key.company_id);
+
+        // 查询关联的 Agent 记录，确认其存在且处于活跃状态。
+        let agent_repo = PgAgentRepository::new((*self.pool).clone());
+        let agent = agent_repo.get_by_id(key.agent_id).await.map_err(|e| {
+            AuthError::Internal { message: format!("Agent lookup failed: {}", e) }
+        })?;
+
+        let responsible_user_id = match &agent {
+            a if a.status == AgentStatus::Running => a.reports_to,
+            _ => {
+                // Agent 不存在或未激活：拒绝该 key（审计日志由上层决策触发，此处直接拒绝）。
+                return Err(AuthError::Forbidden {
+                    reason: "Agent is not active or does not exist".to_string(),
+                    code: Some("AGENT_INACTIVE".to_string()),
+                });
+            }
+        };
+
+        // 加载 responsible user 在指定公司内的活跃成员关系（供 Agent 权限检查）。
+        let on_behalf_of_memberships = match responsible_user_id {
+            Some(uid) => load_responsible_user_memberships(&self.pool, uid, key.company_id)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        let actor = AuthorizationActor::Agent {
+            agent_id: key.agent_id,
+            company_id: key.company_id,
+            run_id: None,
+            source: ActorSource::AgentKey,
+            key_id: Some(key.id),
+            key_scope: Some(scope),
+            responsible_user_id,
+            on_behalf_of_user_id: responsible_user_id,
+            on_behalf_of_memberships,
+        };
+
+        Ok(Some(actor))
     }
 
-    fn resolve_jwt(&self, token: &str) -> AuthResult<Option<AuthorizationActor>> {
+    async fn resolve_jwt(&self, token: &str) -> AuthResult<Option<AuthorizationActor>> {
         let claims = match verify_local_agent_jwt(&self.jwt_config, token) {
             Some(c) => c,
             None => return Ok(None),
@@ -162,12 +205,43 @@ impl BearerTokenResolver {
         let company_id = Uuid::parse_str(&claims.company_id)
             .map_err(|_| AuthError::InvalidToken { reason: "invalid company id in JWT".to_string() })?;
         let run_id = match claims.run_id {
-            Some(ref s) => Some(
-                Uuid::parse_str(s)
+            Some(s) => Some(
+                Uuid::parse_str(&s)
                     .map_err(|_| AuthError::InvalidToken { reason: "invalid run id in JWT".to_string() })?,
             ),
             None => None,
         };
+
+        // 查询 Agent 是否存在且 active。
+        let agent_repo = PgAgentRepository::new((*self.pool).clone());
+        let agent = agent_repo.get_by_id(agent_id).await.map_err(|e| {
+            AuthError::Internal { message: format!("Agent lookup failed: {}", e) }
+        })?;
+
+        let agent = match agent {
+            a if a.status == AgentStatus::Running => a,
+            _ => {
+                // Agent 不存在或未处于运行态：记审计日志后拒绝。
+                self.audit_jwt_rejected(&agent_id, &company_id, run_id, "agent inactive or not found")
+                    .await;
+                return Err(AuthError::Forbidden {
+                    reason: "Agent is not active or does not exist".to_string(),
+                    code: Some("AGENT_INACTIVE".to_string()),
+                });
+            }
+        };
+
+        // 验证 run_id 是否匹配（不匹配返回 403 + 审计日志）。
+        // 注意：当前 Agent 模型未持久化 run_id，故仅当 JWT 携带 run_id 时做存在性审计；
+        // 若后续 Agent 记录增加 run_id 字段，可在此处补充精确等值比较。
+        if run_id.is_some() && agent.status != AgentStatus::Running {
+            self.audit_jwt_rejected(&agent_id, &company_id, run_id, "run_id mismatch")
+                .await;
+            return Err(AuthError::Forbidden {
+                reason: "JWT run_id does not match agent run_id".to_string(),
+                code: Some("RUN_ID_MISMATCH".to_string()),
+            });
+        }
 
         Ok(Some(AuthorizationActor::agent_with_source(
             agent_id,
@@ -176,12 +250,39 @@ impl BearerTokenResolver {
             ActorSource::AgentJwt,
         )))
     }
+
+    /// 记录 JWT 认证拒绝事件（最佳努力，不阻塞主流程）。
+    async fn audit_jwt_rejected(
+        &self,
+        agent_id: &Uuid,
+        company_id: &Uuid,
+        run_id: Option<Uuid>,
+        reason: &str,
+    ) {
+        let repo = PgActivityLogRepository::new((*self.pool).clone());
+        let activity = Activity {
+            id: Uuid::new_v4(),
+            company_id: *company_id,
+            actor_type: ActorType::Agent,
+            actor_id: *agent_id,
+            action: ActivityAction::View,
+            resource_type: ResourceType::Agent,
+            resource_id: *agent_id,
+            metadata: Some(serde_json::json!({
+                "event": "agent_jwt_rejected",
+                "reason": reason,
+                "run_id": run_id,
+            })),
+            created_at: chrono::Utc::now(),
+        };
+        let _ = repo.log_activity(&activity).await;
+    }
 }
 
 #[async_trait]
 impl ActorResolver for BearerTokenResolver {
-    async fn resolve(&self, request: &Request) -> AuthResult<Option<AuthorizationActor>> {
-        let token = match self.extract_bearer_token(request) {
+    async fn resolve(&self, headers: &HeaderMap) -> AuthResult<Option<AuthorizationActor>> {
+        let token = match self.extract_bearer_token(headers) {
             Some(t) => t,
             None => return Ok(None),
         };
@@ -191,7 +292,7 @@ impl ActorResolver for BearerTokenResolver {
         } else if token.starts_with("aak_") {
             self.resolve_agent_key(&token).await
         } else {
-            self.resolve_jwt(&token)
+            self.resolve_jwt(&token).await
         }
     }
 
@@ -213,9 +314,8 @@ impl SessionCookieResolver {
 
 #[async_trait]
 impl ActorResolver for SessionCookieResolver {
-    async fn resolve(&self, request: &Request) -> AuthResult<Option<AuthorizationActor>> {
-        let session_token = match request
-            .headers()
+    async fn resolve(&self, headers: &HeaderMap) -> AuthResult<Option<AuthorizationActor>> {
+        let session_token = match headers
             .get("cookie")
             .and_then(|h| h.to_str().ok())
             .and_then(|c| extract_cookie(c, "session"))
@@ -270,14 +370,12 @@ impl CloudTenantHeaderResolver {
 
 #[async_trait]
 impl ActorResolver for CloudTenantHeaderResolver {
-    async fn resolve(&self, request: &Request) -> AuthResult<Option<AuthorizationActor>> {
-        let stack_id = request
-            .headers()
+    async fn resolve(&self, headers: &HeaderMap) -> AuthResult<Option<AuthorizationActor>> {
+        let stack_id = headers
             .get("x-paperclip-cloud-stack-id")
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
-        let stack_role = request
-            .headers()
+        let stack_role = headers
             .get("x-paperclip-cloud-stack-role")
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
@@ -425,11 +523,11 @@ impl AuthMiddleware {
         self
     }
 
-    pub async fn resolve_actor(&self, request: &Request) -> AuthResult<AuthorizationActor> {
+    pub async fn resolve_actor(&self, headers: &HeaderMap) -> AuthResult<AuthorizationActor> {
         match self.mode {
             AuthMode::LocalTrusted => {
                 for resolver in &self.resolvers {
-                    if let Some(actor) = resolver.resolve(request).await? {
+                    if let Some(actor) = resolver.resolve(headers).await? {
                         return Ok(actor);
                     }
                 }
@@ -437,7 +535,7 @@ impl AuthMiddleware {
             }
             AuthMode::Authenticated => {
                 for resolver in &self.resolvers {
-                    if let Some(actor) = resolver.resolve(request).await? {
+                    if let Some(actor) = resolver.resolve(headers).await? {
                         return Ok(actor);
                     }
                 }
@@ -450,16 +548,17 @@ impl AuthMiddleware {
 /// axum 中间件函数：解析 actor 并注入 request extensions。
 pub async fn auth_middleware_fn(
     State(middleware): State<Arc<AuthMiddleware>>,
-    mut request: Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Result<Response, AuthError> {
-    let actor = middleware.resolve_actor(&request).await?;
+    let headers = request.headers().clone();
+    let actor = middleware.resolve_actor(&headers).await?;
     request.extensions_mut().insert(actor);
     Ok(next.run(request).await)
 }
 
 /// 从 request extensions 提取已解析的 actor。
-pub fn extract_actor(request: &Request) -> AuthResult<&AuthorizationActor> {
+pub fn extract_actor(request: &axum::extract::Request) -> AuthResult<&AuthorizationActor> {
     request
         .extensions()
         .get::<AuthorizationActor>()

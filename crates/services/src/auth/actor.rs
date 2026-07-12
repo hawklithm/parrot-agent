@@ -34,6 +34,16 @@ pub enum AuthorizationActor {
         run_id: Option<Uuid>,
         /// 身份来源（API Key/JWT等）
         source: ActorSource,
+        /// 关联的 API Key ID（仅 agent_key 来源）
+        key_id: Option<Uuid>,
+        /// API Key 的权限范围（仅 agent_key 来源）
+        key_scope: Option<AgentApiKeyScope>,
+        /// 负责的 Board 用户（responsible user），用于权限委托
+        responsible_user_id: Option<Uuid>,
+        /// 以 on_behalf_of 方式委托的用户 ID
+        on_behalf_of_user_id: Option<Uuid>,
+        /// on_behalf_of 用户的成员关系（用于权限检查）
+        on_behalf_of_memberships: Vec<CompanyMembership>,
     },
     /// 匿名/未认证主体
     None,
@@ -91,6 +101,11 @@ impl AuthorizationActor {
             company_id,
             run_id,
             source: ActorSource::AgentJwt,
+            key_id: None,
+            key_scope: None,
+            responsible_user_id: None,
+            on_behalf_of_user_id: None,
+            on_behalf_of_memberships: Vec::new(),
         }
     }
 
@@ -106,6 +121,32 @@ impl AuthorizationActor {
             company_id,
             run_id,
             source,
+            key_id: None,
+            key_scope: None,
+            responsible_user_id: None,
+            on_behalf_of_user_id: None,
+            on_behalf_of_memberships: Vec::new(),
+        }
+    }
+
+    /// 创建带 API Key 上下文的 Agent 主体（agent_key 来源）
+    pub fn agent_with_key(
+        agent_id: Uuid,
+        company_id: Uuid,
+        key_id: Uuid,
+        key_scope: AgentApiKeyScope,
+        responsible_user_id: Option<Uuid>,
+    ) -> Self {
+        Self::Agent {
+            agent_id,
+            company_id,
+            run_id: None,
+            source: ActorSource::AgentKey,
+            key_id: Some(key_id),
+            key_scope: Some(key_scope),
+            responsible_user_id,
+            on_behalf_of_user_id: responsible_user_id,
+            on_behalf_of_memberships: Vec::new(),
         }
     }
 

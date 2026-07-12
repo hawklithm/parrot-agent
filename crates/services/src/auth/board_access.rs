@@ -41,7 +41,7 @@ pub async fn resolve_board_access(
             message: format!("Failed to load memberships: {}", e),
         })?
         .into_iter()
-        .map(CompanyMembership::from_row)
+        .map(|row| CompanyMembership::from_row(&row))
         .collect();
 
     Ok((user, memberships, is_instance_admin))
@@ -78,7 +78,7 @@ pub async fn load_responsible_user_memberships(
             message: format!("Failed to load memberships: {}", e),
         })?
         .into_iter()
-        .map(CompanyMembership::from_row)
+        .map(|row| CompanyMembership::from_row(&row))
         .filter(|m| m.company_id == company_id && m.status.is_active())
         .collect();
 

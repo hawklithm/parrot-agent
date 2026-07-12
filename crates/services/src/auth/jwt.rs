@@ -1,8 +1,13 @@
-use chrono::{DateTime, Duration, Utc};
+use base64::Engine;
+use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
+
+/// URL-safe base64 引擎（无填充），对应 base64 0.22 API。
+const BASE64_ENGINE: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// JWT配置
 #[derive(Debug, Clone)]
@@ -177,7 +182,7 @@ pub fn create_local_agent_jwt(
 
     // 序列化Claims
     let claims_json = serde_json::to_string(&claims).ok()?;
-    let claims_b64 = base64::encode_config(claims_json.as_bytes(), base64::URL_SAFE_NO_PAD);
+    let claims_b64 = BASE64_ENGINE.encode(claims_json.as_bytes());
 
     // 创建JWT Header
     let header = serde_json::json!({
@@ -185,7 +190,7 @@ pub fn create_local_agent_jwt(
         "typ": "JWT"
     });
     let header_json = serde_json::to_string(&header).ok()?;
-    let header_b64 = base64::encode_config(header_json.as_bytes(), base64::URL_SAFE_NO_PAD);
+    let header_b64 = BASE64_ENGINE.encode(header_json.as_bytes());
 
     // 签名
     let message = format!("{}.{}", header_b64, claims_b64);
@@ -193,7 +198,7 @@ pub fn create_local_agent_jwt(
     let mut mac = HmacSha256::new_from_slice(&signing_key).ok()?;
     mac.update(message.as_bytes());
     let signature = mac.finalize().into_bytes();
-    let signature_b64 = base64::encode_config(&signature[..], base64::URL_SAFE_NO_PAD);
+    let signature_b64 = BASE64_ENGINE.encode(&signature[..]);
 
     Some(format!("{}.{}", message, signature_b64))
 }
@@ -217,7 +222,7 @@ pub fn verify_local_agent_jwt(
     let (header_b64, claims_b64, signature_b64) = (parts[0], parts[1], parts[2]);
 
     // 解析Claims
-    let claims_json = base64::decode_config(claims_b64, base64::URL_SAFE_NO_PAD).ok()?;
+    let claims_json = BASE64_ENGINE.decode(claims_b64).ok()?;
     let claims: LocalAgentJwtClaims = serde_json::from_slice(&claims_json).ok()?;
 
     // 检查过期
@@ -242,12 +247,10 @@ pub fn verify_local_agent_jwt(
     let mut mac = HmacSha256::new_from_slice(&signing_key).ok()?;
     mac.update(message.as_bytes());
 
-    let expected_signature = mac.finalize().into_bytes();
-    let provided_signature = base64::decode_config(signature_b64, base64::URL_SAFE_NO_PAD).ok()?;
+    let provided_signature = BASE64_ENGINE.decode(signature_b64).ok()?;
 
-    // Constant-time比较
-    use subtle::ConstantTimeEq;
-    if expected_signature.ct_eq(&provided_signature[..]).into() {
+    // 常量时间比较（hmac 0.12 内置 verify_slice）
+    if mac.verify_slice(&provided_signature).is_ok() {
         Some(claims)
     } else {
         None
