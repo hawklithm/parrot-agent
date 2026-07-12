@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::auth::{AuthSession, AuthUser, Company, InstanceUserRole};
-use crate::models::authorization::CompanyMembershipRow;
+use crate::models::authorization::{CompanyMembershipRow, PrincipalPermissionGrantRow};
 use crate::models::invite::{InviteRow, JoinRequestRow};
 use super::board_api_key_repository::{RepositoryError, RepositoryResult};
 
@@ -366,5 +366,115 @@ impl CompanyMembershipRepository for PgCompanyMembershipRepository {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+/// Principal Permission Grant Repository
+///
+/// 管理 `principal_permission_grants` 表中的显式权限授予记录。
+#[async_trait]
+pub trait PrincipalPermissionGrantRepository: Send + Sync {
+    /// 查询某个主体在公司内对指定权限键的**有效**授予（未过期）。
+    async fn find_valid_grant(
+        &self,
+        company_id: Uuid,
+        principal_type: &str,
+        principal_id: Uuid,
+        permission_key: &str,
+    ) -> RepositoryResult<Option<PrincipalPermissionGrantRow>>;
+
+    /// 列出某个主体在公司内的所有有效授予。
+    async fn list_valid_grants(
+        &self,
+        company_id: Uuid,
+        principal_type: &str,
+        principal_id: Uuid,
+    ) -> RepositoryResult<Vec<PrincipalPermissionGrantRow>>;
+
+    /// 创建一条权限授予记录。
+    async fn create(&self, grant: PrincipalPermissionGrantRow) -> RepositoryResult<PrincipalPermissionGrantRow>;
+}
+
+#[derive(Debug, Clone)]
+pub struct PgPrincipalPermissionGrantRepository {
+    pool: PgPool,
+}
+
+impl PgPrincipalPermissionGrantRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl PrincipalPermissionGrantRepository for PgPrincipalPermissionGrantRepository {
+    async fn find_valid_grant(
+        &self,
+        company_id: Uuid,
+        principal_type: &str,
+        principal_id: Uuid,
+        permission_key: &str,
+    ) -> RepositoryResult<Option<PrincipalPermissionGrantRow>> {
+        let grant = sqlx::query_as::<_, PrincipalPermissionGrantRow>(
+            r#"SELECT id, company_id, principal_type, principal_id, permission_key,
+                      scope, granted_by_user_id, expires_at, created_at, updated_at
+               FROM principal_permission_grants
+               WHERE company_id = $1 AND principal_type = $2 AND principal_id = $3
+                 AND permission_key = $4
+                 AND (expires_at IS NULL OR expires_at > NOW())"#,
+        )
+        .bind(company_id)
+        .bind(principal_type)
+        .bind(principal_id)
+        .bind(permission_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(grant)
+    }
+
+    async fn list_valid_grants(
+        &self,
+        company_id: Uuid,
+        principal_type: &str,
+        principal_id: Uuid,
+    ) -> RepositoryResult<Vec<PrincipalPermissionGrantRow>> {
+        let grants = sqlx::query_as::<_, PrincipalPermissionGrantRow>(
+            r#"SELECT id, company_id, principal_type, principal_id, permission_key,
+                      scope, granted_by_user_id, expires_at, created_at, updated_at
+               FROM principal_permission_grants
+               WHERE company_id = $1 AND principal_type = $2 AND principal_id = $3
+                 AND (expires_at IS NULL OR expires_at > NOW())"#,
+        )
+        .bind(company_id)
+        .bind(principal_type)
+        .bind(principal_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(grants)
+    }
+
+    async fn create(&self, grant: PrincipalPermissionGrantRow) -> RepositoryResult<PrincipalPermissionGrantRow> {
+        sqlx::query(
+            r#"INSERT INTO principal_permission_grants
+               (id, company_id, principal_type, principal_id, permission_key, scope,
+                granted_by_user_id, expires_at, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+        )
+        .bind(grant.id)
+        .bind(grant.company_id)
+        .bind(&grant.principal_type)
+        .bind(grant.principal_id)
+        .bind(&grant.permission_key)
+        .bind(&grant.scope)
+        .bind(grant.granted_by_user_id)
+        .bind(grant.expires_at)
+        .bind(grant.created_at)
+        .bind(grant.updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(grant)
     }
 }

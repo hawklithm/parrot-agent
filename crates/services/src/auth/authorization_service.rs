@@ -1,5 +1,8 @@
 use uuid::Uuid;
 
+use repositories::auth_repositories::PrincipalPermissionGrantRepository;
+use sqlx::PgPool;
+
 use super::{AuthError, AuthResult, AuthorizationActor, MembershipRole};
 
 /// 授权决策引擎 - 核心守卫函数
@@ -41,11 +44,23 @@ pub fn assert_company_access(
 
     // 如果是写操作，检查角色权限
     if is_write_op {
-        // Agent默认允许写操作（由其他权限检查控制）
+        // Agent 默认允许写操作（由其他权限检查控制）
         if let AuthorizationActor::Board { .. } = actor {
-            // Board用户需要检查成员资格和角色
-            // TODO: 从memberships中获取角色并验证
-            // 当前简化实现：假设已在中间件中加载了memberships
+            match actor.role_in(company_id) {
+                Some(role) if role.can_update_resources() => {}
+                Some(_) => {
+                    return Err(AuthError::forbidden_with_code(
+                        "Role does not permit write operations in this company",
+                        "auth.role_no_write",
+                    ));
+                }
+                None => {
+                    return Err(AuthError::forbidden_with_code(
+                        "No active membership in this company",
+                        "auth.no_membership",
+                    ));
+                }
+            }
         }
     }
 
@@ -70,9 +85,13 @@ pub fn assert_instance_admin(actor: &AuthorizationActor) -> AuthResult<()> {
         ));
     }
 
-    // TODO: 检查is_instance_admin标志
-    // 当前简化实现：需要从actor中获取is_instance_admin字段
-    // 这需要扩展AuthorizationActor结构体
+    // 检查实例管理员标志
+    if !actor.is_instance_admin() {
+        return Err(AuthError::forbidden_with_code(
+            "Actor is not an instance administrator",
+            "auth.not_instance_admin",
+        ));
+    }
 
     Ok(())
 }
@@ -90,10 +109,19 @@ pub fn assert_role(
     // 先检查公司访问权限
     assert_company_access(actor, company_id, false)?;
 
-    // TODO: 从actor的memberships中查找对应公司的角色
-    // 当前简化实现：需要在ActorResolver中加载memberships
+    let role = actor.role_in(company_id).ok_or_else(|| {
+        AuthError::forbidden_with_code("No active membership in this company", "auth.no_membership")
+    })?;
 
-    // TODO: 使用MembershipRole::has_privilege()检查权限级别
+    if !role.has_privilege(&required_role) {
+        return Err(AuthError::forbidden_with_code(
+            format!(
+                "Role {:?} does not meet required role {:?}",
+                role, required_role
+            ),
+            "auth.role_insufficient",
+        ));
+    }
 
     Ok(())
 }
@@ -109,8 +137,7 @@ pub fn assert_can_write(
 ) -> AuthResult<()> {
     assert_company_access(actor, company_id, true)?;
 
-    // TODO: 检查角
-    // 使用 role.can_update_resources() 或 role.can_create_resources()
+    // assert_company_access 内部已校验 Board 用户的写角色权限
 
     Ok(())
 }
@@ -126,8 +153,16 @@ pub fn assert_can_manage_members(
 ) -> AuthResult<()> {
     assert_company_access(actor, company_id, false)?;
 
-    // TODO: 检查角色是否允许管理成员
-    // 使用 role.can_manage_members()
+    let role = actor.role_in(company_id).ok_or_else(|| {
+        AuthError::forbidden_with_code("No active membership in this company", "auth.no_membership")
+    })?;
+
+    if !role.can_manage_members() {
+        return Err(AuthError::forbidden_with_code(
+            format!("Role {:?} cannot manage members", role),
+            "auth.role_no_manage",
+        ));
+    }
 
     Ok(())
 }
@@ -143,15 +178,70 @@ pub fn assert_can_delete(
 ) -> AuthResult<()> {
     assert_company_access(actor, company_id, true)?;
 
-    // TODO: 检查角色是否允许删除资源
-    // 使用 role.can_delete_resources()
+    let role = actor.role_in(company_id).ok_or_else(|| {
+        AuthError::forbidden_with_code("No active membership in this company", "auth.no_membership")
+    })?;
+
+    if !role.can_delete_resources() {
+        return Err(AuthError::forbidden_with_code(
+            format!("Role {:?} cannot delete resources", role),
+            "auth.role_no_delete",
+        ));
+    }
 
     Ok(())
+}
+
+/// 断言 Actor 在公司内拥有指定权限键的显式授予。
+///
+/// 检查规则：
+/// 1. 先调用 `assert_company_access` 校验公司边界
+/// 2. 根据 actor 类型推导 principal_type / principal_id
+///    （Board -> user / Agent -> agent）
+/// 3. 查询 `principal_permission_grants` 是否存在**有效**（未过期）授予
+/// 4. 无有效授予时返回 403 Forbidden
+pub async fn assert_company_permission(
+    pool: &PgPool,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    permission_key: &str,
+) -> AuthResult<()> {
+    // 公司边界校验
+    assert_company_access(actor, company_id, false)?;
+
+    // 推导主体类型与 ID
+    let (principal_type, principal_id) = match actor {
+        AuthorizationActor::Board { user_id, .. } => ("user", *user_id),
+        AuthorizationActor::Agent { agent_id, .. } => ("agent", *agent_id),
+        AuthorizationActor::None => {
+            return Err(AuthError::unauthenticated("Authentication required"));
+        }
+    };
+
+    let repo = repositories::auth_repositories::PgPrincipalPermissionGrantRepository::new(pool.clone());
+    let grant = repo
+        .find_valid_grant(company_id, principal_type, principal_id, permission_key)
+        .await
+        .map_err(|e| AuthError::Internal {
+            message: format!("Failed to query permission grant: {}", e),
+        })?;
+
+    match grant {
+        Some(_) => Ok(()),
+        None => Err(AuthError::forbidden_with_code(
+            format!(
+                "Missing permission grant '{}' for principal {} in company {}",
+                permission_key, principal_id, company_id
+            ),
+            "auth.no_permission_grant",
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::membership::{CompanyMembership, PrincipalType};
 
     #[test]
     fn test_assert_company_access_anonymous() {
@@ -211,29 +301,122 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_can_write() {
+    fn test_assert_can_write_viewer_denied() {
         let company_id = Uuid::new_v4();
-        let actor = AuthorizationActor::board(Uuid::new_v4(), company_id);
+        let membership = CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            Uuid::new_v4(),
+            MembershipRole::Viewer,
+        );
+        let actor = AuthorizationActor::board_with_memberships(
+            Uuid::new_v4(),
+            company_id,
+            vec![membership],
+            false,
+        );
 
         let result = assert_can_write(&actor, company_id);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), AuthError::Forbidden { .. }));
     }
 
     #[test]
-    fn test_assert_can_manage_members() {
+    fn test_assert_can_write_operator_ok() {
         let company_id = Uuid::new_v4();
-        let actor = AuthorizationActor::board(Uuid::new_v4(), company_id);
+        let membership = CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            Uuid::new_v4(),
+            MembershipRole::Operator,
+        );
+        let actor = AuthorizationActor::board_with_memberships(
+            Uuid::new_v4(),
+            company_id,
+            vec![membership],
+            false,
+        );
 
-        let result = assert_can_manage_members(&actor, company_id);
-        assert!(result.is_ok());
+        assert!(assert_can_write(&actor, company_id).is_ok());
     }
 
     #[test]
-    fn test_assert_can_delete() {
+    fn test_assert_can_manage_members_owner() {
         let company_id = Uuid::new_v4();
-        let actor = AuthorizationActor::board(Uuid::new_v4(), company_id);
+        let membership = CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            Uuid::new_v4(),
+            MembershipRole::Owner,
+        );
+        let actor = AuthorizationActor::board_with_memberships(
+            Uuid::new_v4(),
+            company_id,
+            vec![membership],
+            false,
+        );
 
-        let result = assert_can_delete(&actor, company_id);
-        assert!(result.is_ok());
+        assert!(assert_can_manage_members(&actor, company_id).is_ok());
+        assert!(assert_can_delete(&actor, company_id).is_ok());
+    }
+
+    #[test]
+    fn test_assert_can_manage_members_operator_denied() {
+        let company_id = Uuid::new_v4();
+        let membership = CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            Uuid::new_v4(),
+            MembershipRole::Operator,
+        );
+        let actor = AuthorizationActor::board_with_memberships(
+            Uuid::new_v4(),
+            company_id,
+            vec![membership],
+            false,
+        );
+
+        assert!(assert_can_manage_members(&actor, company_id).is_err());
+        assert!(assert_can_delete(&actor, company_id).is_err());
+    }
+
+    #[test]
+    fn test_assert_instance_admin_flag() {
+        let company_id = Uuid::new_v4();
+        let actor = AuthorizationActor::board_with_memberships(
+            Uuid::new_v4(),
+            company_id,
+            vec![],
+            true,
+        );
+        assert!(assert_instance_admin(&actor).is_ok());
+
+        let non_admin = AuthorizationActor::board_with_memberships(
+            Uuid::new_v4(),
+            company_id,
+            vec![],
+            false,
+        );
+        assert!(assert_instance_admin(&non_admin).is_err());
+    }
+
+    #[test]
+    fn test_assert_role_insufficient() {
+        let company_id = Uuid::new_v4();
+        let membership = CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            Uuid::new_v4(),
+            MembershipRole::Viewer,
+        );
+        let actor = AuthorizationActor::board_with_memberships(
+            Uuid::new_v4(),
+            company_id,
+            vec![membership],
+            false,
+        );
+
+        assert!(assert_role(&actor, company_id, MembershipRole::Admin).is_err());
+        assert!(assert_role(&actor, company_id, MembershipRole::Viewer).is_ok());
     }
 }

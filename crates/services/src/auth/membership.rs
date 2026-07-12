@@ -111,7 +111,7 @@ impl MembershipStatus {
 }
 
 /// 公司成员关系
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompanyMembership {
     pub id: Uuid,
     pub company_id: Uuid,

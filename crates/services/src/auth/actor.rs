@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::membership::{CompanyMembership, MembershipRole};
+
 /// Actor 类型系统 - 授权主体抽象
 ///
 /// 核心概念：
@@ -17,6 +19,10 @@ pub enum AuthorizationActor {
     Board {
         user_id: Uuid,
         company_id: Uuid,
+        /// 该用户在当前解析上下文中的公司成员关系（用于角色级权限检查）
+        memberships: Vec<CompanyMembership>,
+        /// 是否为实例管理员（跨公司全局权限）
+        is_instance_admin: bool,
     },
     /// Agent 主体
     Agent {
@@ -30,11 +36,28 @@ pub enum AuthorizationActor {
 }
 
 impl AuthorizationActor {
-    /// 创建 Board 用户主体
+    /// 创建 Board 用户主体（无成员关系/非实例管理员）
     pub fn board(user_id: Uuid, company_id: Uuid) -> Self {
         Self::Board {
             user_id,
             company_id,
+            memberships: Vec::new(),
+            is_instance_admin: false,
+        }
+    }
+
+    /// 创建带成员关系与实例管理员标记的 Board 主体
+    pub fn board_with_memberships(
+        user_id: Uuid,
+        company_id: Uuid,
+        memberships: Vec<CompanyMembership>,
+        is_instance_admin: bool,
+    ) -> Self {
+        Self::Board {
+            user_id,
+            company_id,
+            memberships,
+            is_instance_admin,
         }
     }
 
@@ -57,6 +80,22 @@ impl AuthorizationActor {
         match self {
             Self::Board { company_id, .. } | Self::Agent { company_id, .. } => Some(*company_id),
             Self::None => None,
+        }
+    }
+
+    /// 是否为实例管理员（仅 Board 用户可持有）
+    pub fn is_instance_admin(&self) -> bool {
+        matches!(self, Self::Board { is_instance_admin, .. } if *is_instance_admin)
+    }
+
+    /// 查找该 Actor 在指定公司的活跃成员角色
+    pub fn role_in(&self, company_id: Uuid) -> Option<MembershipRole> {
+        match self {
+            Self::Board { memberships, .. } => memberships
+                .iter()
+                .find(|m| m.company_id == company_id && m.status.is_active())
+                .map(|m| m.role),
+            _ => None,
         }
     }
 
