@@ -1,3 +1,4 @@
+pub mod access_control;
 pub mod agents;
 pub mod auth;
 pub mod built_in_agents;
@@ -31,6 +32,7 @@ pub mod tree_control;
 pub mod work_products;
 pub mod attachments;
 
+pub use access_control::{access_control_routes, CompanyId, MemberId, Token};
 pub use agents::agent_routes;
 pub use auth::auth_routes;
 pub use built_in_agents::{

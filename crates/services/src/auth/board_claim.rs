@@ -246,6 +246,52 @@ impl BoardClaimService {
         Ok(())
     }
 
+    /// 首次管理员认领：将指定用户提升为实例管理员。
+    ///
+    /// 前置条件：实例当前不存在任何 `instance_admin` 角色（即首次运行）。
+    /// 若已存在实例管理员，则返回 `BadRequest`。
+    pub async fn claim_first_instance_admin(&self, user_id: Uuid) -> AuthResult<()> {
+        // 前置条件：当前无任何实例管理员。
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM instance_user_roles WHERE role = 'instance_admin' LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AuthError::Internal {
+            message: format!("Failed to check existing instance admin: {}", e),
+        })?;
+
+        if existing.is_some() {
+            return Err(AuthError::BadRequest {
+                message: "Instance already has an administrator".to_string(),
+            });
+        }
+
+        let admin_role = repositories::models::auth::InstanceUserRole::new(
+            user_id,
+            "instance_admin".to_string(),
+            None,
+        );
+        sqlx::query(
+            "INSERT INTO instance_user_roles (id, user_id, role, granted_by_user_id, granted_at, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (user_id, role) DO NOTHING",
+        )
+        .bind(admin_role.id)
+        .bind(admin_role.user_id)
+        .bind(&admin_role.role)
+        .bind(admin_role.granted_by_user_id)
+        .bind(admin_role.granted_at)
+        .bind(admin_role.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthError::Internal {
+            message: format!("Failed to grant first instance admin: {}", e),
+        })?;
+
+        Ok(())
+    }
+
     /// 定位当前 local-board 管理员：即持有 instance_admin 角色的用户。
     async fn resolve_local_board_admin(&self) -> AuthResult<Uuid> {
         let user_id: Option<Uuid> = sqlx::query_scalar(
