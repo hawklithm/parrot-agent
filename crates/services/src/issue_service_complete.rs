@@ -221,23 +221,8 @@ impl IssueService for DefaultIssueService {
             }
         }
 
-        let issue = Issue {
-            id: Uuid::new_v4(),
-            company_id: input.company_id,
-            project_id: input.project_id,
-            title: input.title,
-            description: input.description,
-            status: input.status,
-            priority: input.priority.unwrap_or(3),
-            assigned_to: input.assigned_to,
-            parent_id: input.parent_id,
-            goal_id: input.goal_id,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-
         let created_issue = self.issue_repo
-            .create(issue)
+            .create(input)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to create issue: {}", e)))?;
 
@@ -275,7 +260,7 @@ impl IssueService for DefaultIssueService {
         pagination: &Pagination,
     ) -> Result<Vec<Issue>, ServiceError> {
         self.issue_repo
-            .list(company_id, filter, pagination)
+            .list_by_company(company_id, filter, pagination)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list issues: {}", e)))
     }
@@ -283,48 +268,33 @@ impl IssueService for DefaultIssueService {
     async fn update(&self, id: Uuid, company_id: Uuid, input: UpdateIssueInput) -> Result<IssueMutationResult, ServiceError> {
         let mut issue = self.get(id, company_id).await?;
 
-        let mut changed = false;
-        let mut change_kind = "updated".to_string();
+        let update_input = models::UpdateIssueInput {
+            title: input.title,
+            description: input.description,
+            status: input.status,
+            priority: input.priority,
+            assignee_agent_id: input.assignee_agent_id,
+            assignee_user_id: input.assignee_user_id,
+            work_mode: None,
+            responsible_user_id: input.responsible_user_id,
+            source_trust: None,
+            monitor_scheduled_by: None,
+            monitor_notes: None,
+            hidden_at: None,
+            execution_workspace_preference: None,
+            execution_workspace_settings: None,
+            execution_policy: None,
+            execution_state: None,
+        };
 
-        if let Some(title) = input.title {
-            issue.title = title;
-            changed = true;
-        }
-
-        if let Some(description) = input.description {
-            issue.description = Some(description);
-            changed = true;
-        }
-
-        if let Some(new_status) = input.status {
-            self.validate_status_transition(&issue.status, &new_status)?;
-            issue.status = new_status;
-            changed = true;
-            change_kind = "status_changed".to_string();
-        }
-
-        if let Some(priority) = input.priority {
-            issue.priority = priority;
-            changed = true;
-        }
-
-        if let Some(assigned_to) = input.assigned_to {
-            issue.assigned_to = Some(assigned_to);
-            changed = true;
-        }
-
-        if !changed {
-            return Ok(IssueMutationResult {
-                changed: false,
-                issue,
-                change_kind: "no_change".to_string(),
-            });
-        }
-
-        issue.updated_at = Utc::now();
+        let change_kind = if input.status.is_some() {
+            "status_changed".to_string()
+        } else {
+            "updated".to_string()
+        };
 
         let updated_issue = self.issue_repo
-            .update(issue)
+            .update(issue_id, update_input)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to update issue: {}", e)))?;
 

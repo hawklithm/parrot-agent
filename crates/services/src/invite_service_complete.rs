@@ -359,7 +359,7 @@ impl InviteServiceComplete for DefaultInviteServiceComplete {
             id: Uuid::new_v4(),
             agent_id,
             company_id,
-            message,
+            message: message.clone(),
             status: JoinRequestStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),

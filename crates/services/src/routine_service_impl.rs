@@ -170,7 +170,7 @@ impl DefaultRoutineService {
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find runs: {}", e)))?
             .into_iter()
-            .filter(|r| r.status == RunStatus::Running)
+            .filter(|r| r.status == RunStatus::Dispatched)
             .collect();
 
         if active_runs.is_empty() {
@@ -395,7 +395,7 @@ impl RoutineService for DefaultRoutineService {
         let routine = self.get_by_id(routine_id).await?;
 
         // Check concurrency policy
-        let coalesced_into = match self.check_concurrency(routine_id, routine.concurrency_policy).await {
+        let coalesced_into: Option<Uuid> = match self.check_concurrency(routine_id, routine.concurrency_policy).await {
             Ok(Some(run_id)) => {
                 // Coalesce into existing run
                 let mut run = RoutineRun {
@@ -591,7 +591,7 @@ impl RoutineService for DefaultRoutineService {
                     RoutineVariableType::Select => {
                         if let Some(ref options) = var.options {
                             default_value.is_string() && options.iter().any(|opt| {
-                                opt.as_str() == default_value.as_str()
+                                Some(opt.as_str()) == default_value.as_str()
                             })
                         } else {
                             false

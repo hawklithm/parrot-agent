@@ -89,7 +89,7 @@ pub struct RemoteImportPreview {
 pub struct RemoteImportResult {
     pub imported_count: usize,
     pub skipped_count: usize,
- iled_count: usize,
+    pub failed_count: usize,
     pub imported_keys: Vec<String>,
     pub skipped_keys: Vec<String>,
     pub errors: Vec<ImportError>,
