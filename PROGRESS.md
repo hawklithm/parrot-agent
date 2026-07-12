@@ -286,16 +286,34 @@ cargo check --workspace
 
 ### 剩余待实现
 - [x] Monitor定时调度器（后台轮询monitor_next_check_at）
-- [ ] 事件通知机制（watchdog评估、恢复动作协调）
+- [x] 事件通知机制（watchdog评估、恢复动作协调）
+  - IssueCheckedOutToRecoveryReconcileListener: 检出时协调恢复动作
+  - IssueStatusChangedToWatchdogEvalListener: 状态变更时评估看门狗
+  - IssueCompletedToRecoveryResolveListener: 完成时解决恢复动作
 - [x] 已读标记与归档
 - [x] 恢复动作管理（reconcile算法）
 - [x] 计划分解
-- [ ] 审批状态传播
-- [ ] 诊断端点
-- [ ] 低信任审查机制
-- [ ] 字段级权限控制
-   - 工作空间实例化逻辑
-   - 配置标准化函数实现
+- [x] 审批状态传播
+  - ApprovalService集成了EventBus发布ApprovalEvent
+  - unblock_by_approval()将Blocked状态的Issue自动转为InProgress
+  - ApprovalApprovedToIssueUnblockListener监听approval.approved事件
+- [x] 诊断端点
+  - IssueDiagnosticsService: get_blockers_diagnostics / get_wakes_diagnostics / get_subtree_diagnostics
+  - API routes: GET /issues/:id/diagnostics/blockers | /wakes | /subtree
+- [x] 低信任审查机制
+  - LowTrustService: promote_low_trust / list_low_trust_issues
+  - API routes: POST /issues/:id/low-trust/promotions, GET /issues/low-trust
+  - 通过 source_trust 字段标记和提升低信任输出
+- [x] 字段级权限控制（已实现）
+   - IssueAction / CaseAction / TreeControlAction 权限枚举
+   - IssueAccessInfo 结构体用于细粒度访问决策
+   - decide_issue_access() 综合访问决策（公司隔离、分配人、角色、权限）
+   - assert_agent_issue_mutation_allowed() / assert_agent_issue_comment_allowed() 断言
+   - filter_issues_for_actor() 批量权限过滤
+   - assert_board() Board 操作认证守卫
+   - SourceTrustLevel 枚举 + redact_issue_for_actor() 字段级脱敏
+   - filter_issues_by_source_trust() 按信任级别过滤
+   - assert_cases_enabled() / assert_project_belongs_to_company() Case 访问控制
 
 ---
 

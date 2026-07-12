@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
 use models::{Issue, IssueStatus, IssuePriority};
-use repositories::IssueRepository;
+use repositories::{IssueRepository, ApprovalRepository};
 use crate::errors::ServiceError;
 use crate::issue_service::{ForceReleaseInput};
 
@@ -166,11 +166,18 @@ pub trait IssueService: Send + Sync {
 
     /// Get attachment service
     fn attachments(&self) -> Arc<dyn AttachmentService>;
+
+    /// Unblock issue by approval (called when approval is approved)
+    async fn unblock_by_approval(&self, approval_id: Uuid) -> Result<(), ServiceError>;
+
+    /// Create and checkout an issue for a routine
+    async fn create_and_checkout_for_routine(&self, routine_id: Uuid) -> Result<(), ServiceError>;
 }
 
 /// Default Issue Service Implementation
 pub struct DefaultIssueService {
     issue_repo: Arc<dyn IssueRepository>,
+    approval_repo: Arc<dyn ApprovalRepository>,
     tree_control_service: Arc<dyn IssueTreeControlService>,
     comment_service: Arc<dyn IssueCommentService>,
     document_service: Arc<dyn IssueDocumentService>,
@@ -181,6 +188,7 @@ pub struct DefaultIssueService {
 impl DefaultIssueService {
     pub fn new(
         issue_repo: Arc<dyn IssueRepository>,
+        approval_repo: Arc<dyn ApprovalRepository>,
         tree_control_service: Arc<dyn IssueTreeControlService>,
         comment_service: Arc<dyn IssueCommentService>,
         document_service: Arc<dyn IssueDocumentService>,
@@ -189,6 +197,7 @@ impl DefaultIssueService {
     ) -> Self {
         Self {
             issue_repo,
+            approval_repo,
             tree_control_service,
             comment_service,
             document_service,
@@ -624,21 +633,160 @@ impl IssueService for DefaultIssueService {
     fn attachments(&self) -> Arc<dyn AttachmentService> {
         self.attachment_service.clone()
     }
+
+    async fn unblock_by_approval(&self, approval_id: Uuid) -> Result<(), ServiceError> {
+        // Find linked issues for this approval via the approval repository
+        let linked_issue_ids = self.approval_repo
+            .find_linked_issues(approval_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to find linked issues: {}", e)))?;
+
+        for issue_id in linked_issue_ids {
+            let issue = self.issue_repo
+                .get_by_id(issue_id)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("Failed to get issue: {}", e)))?;
+
+            if let Some(issue) = issue {
+                if issue.status == IssueStatus::Blocked {
+                    let update = models::UpdateIssueInput {
+                        status: Some(IssueStatus::InProgress),
+                        ..Default::default()
+                    };
+                    self.issue_repo
+                        .update(issue.id, update)
+                        .await
+                        .map_err(|e| ServiceError::Internal(format!("Failed to unblock issue: {}", e)))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn create_and_checkout_for_routine(&self, routine_id: Uuid) -> Result<(), ServiceError> {
+        // In production: look up routine definition and create an issue based on it
+        // For now, this is a placeholder that logs the action
+        tracing::info!("create_and_checkout_for_routine called for routine_id={}", routine_id);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use repositories::RepositoryResult;
+    use models::ApprovalStatus;
+
+    struct MockIssueRepo;
+    impl MockIssueRepo {
+        fn new() -> Self { Self }
+    }
+
+    #[async_trait]
+    impl IssueRepository for MockIssueRepo {
+        async fn get_by_id(&self, _id: Uuid) -> Result<Option<Issue>, String> { Ok(None) }
+        async fn list_by_company(&self, _company_id: Uuid, _filter: &crate::issue_repository::IssueQueryFilter, _pagination: &crate::issue_repository::Pagination) -> Result<Vec<Issue>, String> { Ok(vec![]) }
+        async fn count_by_company(&self, _company_id: Uuid, _filter: &crate::issue_repository::IssueQueryFilter) -> Result<i64, String> { Ok(0) }
+        async fn create(&self, _input: models::CreateIssueInput) -> Result<Issue, String> { unimplemented!() }
+        async fn update(&self, _id: Uuid, _input: models::UpdateIssueInput) -> Result<Issue, String> { unimplemented!() }
+        async fn delete(&self, _id: Uuid) -> Result<(), String> { Ok(()) }
+        async fn search(&self, _company_id: Uuid, _query: &str, _pagination: &crate::issue_repository::Pagination) -> Result<Vec<Issue>, String> { Ok(vec![]) }
+        async fn list_children(&self, _parent_id: Uuid) -> Result<Vec<Issue>, String> { Ok(vec![]) }
+        async fn get_by_identifier(&self, _identifier: &str) -> Result<Option<Issue>, String> { Ok(None) }
+        async fn list_by_parent(&self, _parent_id: Uuid, _pagination: &crate::issue_repository::Pagination) -> Result<Vec<Issue>, String> { Ok(vec![]) }
+        async fn get_by_ids(&self, _ids: Vec<Uuid>) -> Result<Vec<Issue>, String> { Ok(vec![]) }
+    }
+
+    struct MockApprovalRepo;
+    impl MockApprovalRepo {
+        fn new() -> Self { Self }
+    }
+
+    #[async_trait]
+    impl ApprovalRepository for MockApprovalRepo {
+        async fn create(&self, _approval: models::Approval) -> RepositoryResult<models::Approval> { unimplemented!() }
+        async fn find_by_id(&self, _id: Uuid) -> RepositoryResult<Option<models::Approval>> { Ok(None) }
+        async fn find_by_company_id(&self, _company_id: Uuid, _status: Option<ApprovalStatus>) -> RepositoryResult<Vec<models::Approval>> { Ok(vec![]) }
+        async fn find_pending_for_reviewer(&self, _user_id: Uuid) -> RepositoryResult<Vec<models::Approval>> { Ok(vec![]) }
+        async fn update(&self, _approval: models::Approval) -> RepositoryResult<models::Approval> { unimplemented!() }
+        async fn find_linked_issues(&self, _approval_id: Uuid) -> RepositoryResult<Vec<Uuid>> { Ok(vec![]) }
+        async fn link_to_issue(&self, _approval_id: Uuid, _issue_id: Uuid) -> RepositoryResult<()> { Ok(()) }
+        async fn find_by_issue_id(&self, _issue_id: Uuid) -> RepositoryResult<Vec<models::Approval>> { Ok(vec![]) }
+    }
+
+    struct MockTreeControlService;
+    impl MockTreeControlService {
+        fn new() -> Self { Self }
+    }
+    #[async_trait]
+    impl IssueTreeControlService for MockTreeControlService {
+        async fn preview(&self, _root_issue_id: Uuid, _mode: &str) -> Result<crate::issue_tree_control_service::IssueTreeControlPreview, String> { unimplemented!() }
+        async fn create_hold(&self, _company_id: Uuid, _root_issue_id: Uuid, _input: crate::issue_tree_control_service::CreateIssueTreeHoldInput) -> Result<crate::issue_tree_control_service::IssueTreeHold, String> { unimplemented!() }
+        async fn release_hold(&self, _hold_id: Uuid) -> Result<(), String> { unimplemented!() }
+        async fn get_hold_by_id(&self, _hold_id: Uuid) -> Result<Option<crate::issue_tree_control_service::IssueTreeHold>, String> { Ok(None) }
+        async fn list_holds(&self, _issue_id: Uuid) -> Result<Vec<crate::issue_tree_control_service::IssueTreeHold>, String> { Ok(vec![]) }
+        async fn get_active_pause_hold_gate(&self, _issue_id: Uuid) -> Result<Option<crate::issue_tree_control_service::IssueTreeHold>, String> { Ok(None) }
+    }
+
+    struct MockCommentService;
+    impl MockCommentService {
+        fn new() -> Self { Self }
+    }
+    #[async_trait]
+    impl IssueCommentService for MockCommentService {
+        async fn add_comment(&self, _issue_id: Uuid, _body: &str, _actor_type: &str, _actor_id: Uuid) -> Result<models::IssueComment, String> { unimplemented!() }
+        async fn list_comments(&self, _issue_id: Uuid) -> Result<Vec<models::IssueComment>, String> { Ok(vec![]) }
+        async fn delete_comment(&self, _comment_id: Uuid) -> Result<(), String> { unimplemented!() }
+    }
+
+    struct MockDocumentService;
+    impl MockDocumentService {
+        fn new() -> Self { Self }
+    }
+    #[async_trait]
+    impl IssueDocumentService for MockDocumentService {
+        async fn list_documents(&self, _issue_id: Uuid) -> Result<Vec<models::IssueDocument>, String> { Ok(vec![]) }
+        async fn get_document(&self, _issue_id: Uuid, _key: &str) -> Result<Option<models::IssueDocument>, String> { Ok(None) }
+        async fn upsert_document(&self, _issue_id: Uuid, _key: &str, _content: &str) -> Result<models::IssueDocument, String> { unimplemented!() }
+        async fn lock_document(&self, _issue_id: Uuid, _key: &str, _run_id: Uuid) -> Result<models::IssueDocument, String> { unimplemented!() }
+        async fn unlock_document(&self, _issue_id: Uuid, _key: &str) -> Result<models::IssueDocument, String> { unimplemented!() }
+    }
+
+    struct MockWorkProduct;
+    impl MockWorkProduct {
+        fn new() -> Self { Self }
+    }
+    #[async_trait]
+    impl WorkProductService for MockWorkProduct {
+        async fn list_work_products(&self, _issue_id: Uuid) -> Result<Vec<models::WorkProduct>, String> { Ok(vec![]) }
+        async fn create_work_product(&self, _issue_id: Uuid, _name: &str, _description: Option<&str>, _artifact: Option<serde_json::Value>) -> Result<models::WorkProduct, String> { unimplemented!() }
+        async fn update_work_product(&self, _id: Uuid, _name: Option<String>, _description: Option<String>) -> Result<models::WorkProduct, String> { unimplemented!() }
+        async fn delete_work_product(&self, _id: Uuid) -> Result<(), String> { unimplemented!() }
+    }
+
+    struct MockAttachment;
+    impl MockAttachment {
+        fn new() -> Self { Self }
+    }
+    #[async_trait]
+    impl AttachmentService for MockAttachment {
+        async fn list_attachments(&self, _parent_type: &str, _parent_id: Uuid) -> Result<Vec<models::Attachment>, String> { Ok(vec![]) }
+        async fn upload_attachment(&self, _parent_type: &str, _parent_id: Uuid, _filename: &str, _content_type: &str, _data: Vec<u8>) -> Result<models::Attachment, String> { unimplemented!() }
+        async fn delete_attachment(&self, _id: Uuid) -> Result<(), String> { unimplemented!() }
+        async fn get_attachment_content(&self, _id: Uuid) -> Result<Vec<u8>, String> { unimplemented!() }
+    }
 
     #[test]
     fn test_validate_status_transition() {
         let service = DefaultIssueService::new(
-            Arc::new(MockIssueRepository::new()),
-            Arc::new(MockIssueTreeControlService::new()),
-            Arc::new(MockIssueCommentService::new()),
-            Arc::new(MockIssueDocumentService::new()),
-            Arc::new(MockWorkProductService::new()),
-            Arc::new(MockAttachmentService::new()),
+            Arc::new(MockIssueRepo::new()),
+            Arc::new(MockApprovalRepo::new()),
+            Arc::new(MockTreeControlService::new()),
+            Arc::new(MockCommentService::new()),
+            Arc::new(MockDocumentService::new()),
+            Arc::new(MockWorkProduct::new()),
+            Arc::new(MockAttachment::new()),
         );
 
         // Valid transitions

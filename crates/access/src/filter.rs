@@ -1,7 +1,7 @@
 use models::Agent;
 use uuid::Uuid;
 
-use super::models::{AccessDecision, Action, Actor};
+use super::models::{Action, Actor};
 use super::service::{AccessService, Resource, ResourceType};
 
 /// 为访问主体过滤 Agent 列表
@@ -17,6 +17,7 @@ pub async fn filter_agents_for_actor<S: AccessService>(
             resource_type: ResourceType::Agent,
             resource_id: agent.id,
             company_id: agent.company_id,
+            issue_context: None,
         };
 
         let decision = service.decide(Action::AgentRead, actor, Some(&resource)).await;

@@ -64,3 +64,7 @@ pub use comments::comment_routes;
 pub use tree_control::tree_control_routes;
 pub use work_products::work_product_routes;
 pub use attachments::attachment_routes;
+pub mod issue_diagnostics;
+pub use issue_diagnostics::issue_diagnostics_routes;
+pub mod low_trust;
+pub use low_trust::low_trust_routes;

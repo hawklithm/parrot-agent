@@ -7,7 +7,7 @@ pub use services::{
     AgentService, ConfigRevisionService, IssueService, CaseService,
     IssueCommentService, IssueDocumentService, IssueTreeControlService,
     BuiltInAgentService, AdapterRegistry, EnvironmentRuntimeService,
-    OrgChartService,
+    OrgChartService, LowTrustService,
 };
 
 pub use access::AccessService;
@@ -35,6 +35,12 @@ pub struct AppState {
     // Org chart
     pub org_chart_service: Arc<dyn OrgChartService>,
 
+    // Issue diagnostics
+    pub issue_diagnostics_service: Arc<dyn services::issue_diagnostics_service::IssueDiagnosticsService>,
+
+    // Low trust review
+    pub low_trust_service: Arc<dyn LowTrustService>,
+
     // Shared DB pool
     pub pool: PgPool,
 }
@@ -53,6 +59,8 @@ impl AppState {
         issue_document_service: Arc<dyn IssueDocumentService>,
         issue_tree_control_service: Arc<dyn IssueTreeControlService>,
         org_chart_service: Arc<dyn OrgChartService>,
+        issue_diagnostics_service: Arc<dyn services::issue_diagnostics_service::IssueDiagnosticsService>,
+        low_trust_service: Arc<dyn LowTrustService>,
         pool: PgPool,
     ) -> Self {
         Self {
@@ -68,6 +76,8 @@ impl AppState {
             issue_document_service,
             issue_tree_control_service,
             org_chart_service,
+            issue_diagnostics_service,
+            low_trust_service,
             pool,
         }
     }
@@ -98,6 +108,8 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::issue_comments::issue_comment_routes())
         .merge(crate::routes::issue_documents::issue_document_routes())
         .merge(crate::routes::issue_tree_control::issue_tree_control_routes())
+        .merge(crate::routes::issue_diagnostics::issue_diagnostics_routes())
+        .merge(crate::routes::low_trust::low_trust_routes())
 
         // Apply state
         .with_state(state)

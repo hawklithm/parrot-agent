@@ -23,6 +23,31 @@ pub enum Action {
     // Company 相关
     CompanyRead,
     CompanyUpdate,
+
+    // Issue/Case 相关
+    IssueCreate,
+    IssueRead,
+    IssueUpdate,
+    IssueDelete,
+    IssueCheckout,
+    IssueRelease,
+    IssueComment,
+    IssueMutate,
+    CaseCreate,
+    CaseRead,
+    CaseUpdate,
+    CaseLinkIssue,
+    CaseDelete,
+
+    // Tree Control 相关
+    TreeControlPreview,
+    TreeControlCreateHold,
+    TreeControlReleaseHold,
+    TreeControlViewState,
+
+    // Board 管理操作
+    BoardForceRelease,
+    BoardLowTrustPromote,
 }
 
 impl std::fmt::Display for Action {
@@ -39,6 +64,25 @@ impl std::fmt::Display for Action {
             Action::BuiltInRoutineControl => write!(f, "built_in_routine:control"),
             Action::CompanyRead => write!(f, "company:read"),
             Action::CompanyUpdate => write!(f, "company:update"),
+            Action::IssueCreate => write!(f, "issue:create"),
+            Action::IssueRead => write!(f, "issue:read"),
+            Action::IssueUpdate => write!(f, "issue:update"),
+            Action::IssueDelete => write!(f, "issue:delete"),
+            Action::IssueCheckout => write!(f, "issue:checkout"),
+            Action::IssueRelease => write!(f, "issue:release"),
+            Action::IssueComment => write!(f, "issue:comment"),
+            Action::IssueMutate => write!(f, "issue:mutate"),
+            Action::CaseCreate => write!(f, "case:create"),
+            Action::CaseRead => write!(f, "case:read"),
+            Action::CaseUpdate => write!(f, "case:update"),
+            Action::CaseLinkIssue => write!(f, "case:link_issue"),
+            Action::CaseDelete => write!(f, "case:delete"),
+            Action::TreeControlPreview => write!(f, "tree_control:preview"),
+            Action::TreeControlCreateHold => write!(f, "tree_control:create_hold"),
+            Action::TreeControlReleaseHold => write!(f, "tree_control:release_hold"),
+            Action::TreeControlViewState => write!(f, "tree_control:view_state"),
+            Action::BoardForceRelease => write!(f, "board:force_release"),
+            Action::BoardLowTrustPromote => write!(f, "board:low_trust_promote"),
         }
     }
 }
@@ -92,7 +136,31 @@ pub trait Actor: Send + Sync {
                     .get("can_assign_tasks")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
-                _ => false,
+                Action::IssueCreate => perms
+                    .get("can_create_issues")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                Action::IssueRead => perms
+                    .get("can_read_issues")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true), // Default to true for agents
+                Action::IssueComment => perms
+                    .get("can_comment_issues")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                Action::IssueMutate => perms
+                    .get("can_mutate_issues")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                Action::BoardForceRelease => perms
+                    .get("can_force_release")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                Action::BoardLowTrustPromote => perms
+                    .get("can_promote_low_trust")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                _ => false, // Unknown actions default to denied
             }
         } else {
             false

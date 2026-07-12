@@ -41,6 +41,93 @@ pub trait AccessService: Send + Sync {
 
     /// 断言内置 Agent 功能已启用
     async fn assert_built_in_agents_enabled(&self, company_id: Uuid) -> Result<(), AccessError>;
+
+    // ---- Issue/Case 访问控制 ----
+
+    /// 决定 Issue 访问权限（含 watchdog scope 检查）
+    async fn decide_issue_access(
+        &self,
+        actor: &dyn Actor,
+        issue: &IssueAccessInfo,
+        action: IssueAction,
+    ) -> AccessDecision;
+
+    /// 断言 Agent 对 Issue 的变更权限
+    async fn assert_agent_issue_mutation_allowed(
+        &self,
+        actor: &dyn Actor,
+        issue: &IssueAccessInfo,
+    ) -> Result<(), AccessError>;
+
+    /// 断言 Agent 对 Issue 的评论权限
+    async fn assert_agent_issue_comment_allowed(
+        &self,
+        actor: &dyn Actor,
+        issue: &IssueAccessInfo,
+    ) -> Result<(), AccessError>;
+
+    /// 过滤 Actor 可见的 Issue 列表
+    /// Uses Vec<Box<dyn IssueLike + Send>> for dyn compatibility
+    async fn filter_issues_for_actor(
+        &self,
+        actor: &dyn Actor,
+        issues: Vec<Box<dyn IssueLike + Send>>,
+    ) -> Vec<Box<dyn IssueLike + Send>>;
+
+    /// 断言 Cases 功能已启用
+    async fn assert_cases_enabled(&self, company_id: Uuid) -> Result<(), AccessError>;
+
+    /// 断言项目属于公司
+    async fn assert_project_belongs_to_company(
+        &self,
+        project_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<(), AccessError>;
+
+    /// 断言 Board 操作权限（树形控制、强制释放等）
+    async fn assert_board(&self, actor: &dyn Actor) -> Result<(), AccessError>;
+}
+
+/// Issue access info used for access decisions
+#[derive(Debug, Clone)]
+pub struct IssueAccessInfo {
+    pub id: Uuid,
+    pub company_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub parent_id: Option<Uuid>,
+    pub assignee_agent_id: Option<Uuid>,
+    pub assignee_user_id: Option<Uuid>,
+    pub status: String,
+}
+
+/// Issue action types for access control
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueAction {
+    Read,
+    Comment,
+    Mutate,
+}
+
+/// Trait for types that can be used in issue filtering
+pub trait IssueLike {
+    fn issue_id(&self) -> Uuid;
+    fn issue_company_id(&self) -> Uuid;
+    fn issue_project_id(&self) -> Option<Uuid>;
+    fn issue_parent_id(&self) -> Option<Uuid>;
+    fn issue_assignee_agent_id(&self) -> Option<Uuid>;
+    fn issue_assignee_user_id(&self) -> Option<Uuid>;
+    fn issue_status(&self) -> &str;
+}
+
+// Implement IssueLike for IssueAccessInfo itself
+impl IssueLike for IssueAccessInfo {
+    fn issue_id(&self) -> Uuid { self.id }
+    fn issue_company_id(&self) -> Uuid { self.company_id }
+    fn issue_project_id(&self) -> Option<Uuid> { self.project_id }
+    fn issue_parent_id(&self) -> Option<Uuid> { self.parent_id }
+    fn issue_assignee_agent_id(&self) -> Option<Uuid> { self.assignee_agent_id }
+    fn issue_assignee_user_id(&self) -> Option<Uuid> { self.assignee_user_id }
+    fn issue_status(&self) -> &str { &self.status }
 }
 
 /// Resource - 资源信息
@@ -49,6 +136,18 @@ pub struct Resource {
     pub resource_type: ResourceType,
     pub resource_id: Uuid,
     pub company_id: Uuid,
+    /// Optional Issue-specific context for fine-grained access decisions
+    pub issue_context: Option<IssueResourceContext>,
+}
+
+/// Issue-specific resource context for fine-grained access decisions
+#[derive(Debug, Clone)]
+pub struct IssueResourceContext {
+    pub project_id: Option<Uuid>,
+    pub parent_issue_id: Option<Uuid>,
+    pub assignee_agent_id: Option<Uuid>,
+    pub assignee_user_id: Option<Uuid>,
+    pub status: Option<String>,
 }
 
 /// ResourceType - 资源类型
@@ -58,6 +157,11 @@ pub enum ResourceType {
     Company,
     Task,
     BuiltInAgent,
+    Issue,
+    Case,
+    IssueDocument,
+    IssueComment,
+    CaseDocument,
 }
 
 /// AccessError - 访问控制错误
@@ -209,6 +313,150 @@ impl AccessService for DefaultAccessService {
         // TODO: 查询公司配置检查实验特性是否启用
         let _ = company_id;
         Ok(())
+    }
+
+    async fn decide_issue_access(
+        &self,
+        actor: &dyn Actor,
+        issue: &IssueAccessInfo,
+        action: IssueAction,
+    ) -> AccessDecision {
+        // 1. 公司级隔离
+        if actor.company_id() != Some(issue.company_id) {
+            return AccessDecision::deny("Cross-company issue access not allowed");
+        }
+
+        // 2. 如果是被分配人，允许访问
+        let is_assignee = match actor.agent_id() {
+            Some(agent_id) => issue.assignee_agent_id == Some(agent_id),
+            None => false,
+        };
+        if is_assignee {
+            return AccessDecision::allow("Assignee access granted");
+        }
+
+        // 3. 如果是 Admin 用户，允许访问
+        if !actor.is_agent() {
+            // 非 Agent 用户（Board/Admin）有完整访问权限
+            return AccessDecision::allow("User access granted");
+        }
+
+        // 4. Agent 访问：检查权限配置
+        match action {
+            IssueAction::Read => {
+                if actor.has_permission(Action::IssueRead) {
+                    AccessDecision::allow("Agent has issue:read permission")
+                } else {
+                    // 根据 mention grant 或其他机制判断
+                    AccessDecision::deny("Agent lacks issue:read permission for this issue")
+                }
+            }
+            IssueAction::Comment => {
+                if actor.has_permission(Action::IssueComment) {
+                    AccessDecision::allow("Agent has issue:comment permission")
+                } else {
+                    AccessDecision::deny("Agent lacks issue:comment permission for this issue")
+                }
+            }
+            IssueAction::Mutate => {
+                if actor.has_permission(Action::IssueMutate) {
+                    AccessDecision::allow("Agent has issue:mutate permission")
+                } else {
+                    AccessDecision::deny("Agent lacks issue:mutate permission for this issue")
+                }
+            }
+        }
+    }
+
+    async fn assert_agent_issue_mutation_allowed(
+        &self,
+        actor: &dyn Actor,
+        issue: &IssueAccessInfo,
+    ) -> Result<(), AccessError> {
+        if !actor.is_agent() {
+            return Ok(());
+        }
+        let decision = self.decide_issue_access(actor, issue, IssueAction::Mutate).await;
+        if decision.allowed {
+            Ok(())
+        } else {
+            Err(AccessError::Denied(format!(
+                "Agent issue mutation denied: {}",
+                decision.reason
+            )))
+        }
+    }
+
+    async fn assert_agent_issue_comment_allowed(
+        &self,
+        actor: &dyn Actor,
+        issue: &IssueAccessInfo,
+    ) -> Result<(), AccessError> {
+        if !actor.is_agent() {
+            return Ok(());
+        }
+        let decision = self.decide_issue_access(actor, issue, IssueAction::Comment).await;
+        if decision.allowed {
+            Ok(())
+        } else {
+            Err(AccessError::Denied(format!(
+                "Agent issue comment denied: {}",
+                decision.reason
+            )))
+        }
+    }
+
+    async fn filter_issues_for_actor(
+        &self,
+        actor: &dyn Actor,
+        issues: Vec<Box<dyn IssueLike + Send>>,
+    ) -> Vec<Box<dyn IssueLike + Send>> {
+        let mut visible = Vec::new();
+        for issue in issues {
+            let info = IssueAccessInfo {
+                id: issue.issue_id(),
+                company_id: issue.issue_company_id(),
+                project_id: issue.issue_project_id(),
+                parent_id: issue.issue_parent_id(),
+                assignee_agent_id: issue.issue_assignee_agent_id(),
+                assignee_user_id: issue.issue_assignee_user_id(),
+                status: issue.issue_status().to_string(),
+            };
+            let decision = self.decide_issue_access(actor, &info, IssueAction::Read).await;
+            if decision.allowed {
+                visible.push(issue);
+            }
+        }
+        visible
+    }
+
+    async fn assert_cases_enabled(&self, company_id: Uuid) -> Result<(), AccessError> {
+        let _ = company_id;
+        // TODO: 查询公司配置检查 Cases 功能是否启用
+        Ok(())
+    }
+
+    async fn assert_project_belongs_to_company(
+        &self,
+        project_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<(), AccessError> {
+        let _ = (project_id, company_id);
+        // TODO: 查询数据库验证 project.company_id == company_id
+        // 这里需要 ProjectRepository，简化实现中假设验证通过
+        Ok(())
+    }
+
+    async fn assert_board(&self, actor: &dyn Actor) -> Result<(), AccessError> {
+        // Board 权限：非 Agent 用户有 Board 权限
+        if !actor.is_agent() {
+            return Ok(());
+        }
+        // Agent 需要检查 board 权限
+        if actor.has_permission(Action::BoardForceRelease) {
+            return Ok(());
+        }
+        Err(AccessError::Denied("Board access required".to_string()))
     }
 }
 

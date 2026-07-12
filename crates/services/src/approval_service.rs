@@ -6,6 +6,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use models::{Approval, ApprovalType, ApprovalStatus};
+use models::event_bus::{EventBus, SystemEvent, SystemEventPayload, ApprovalEvent, EventMetadata};
 use crate::ServiceError;
 
 /// Create Approval Input
@@ -76,6 +77,7 @@ pub trait ApprovalService: Send + Sync {
 pub struct DefaultApprovalService {
     approval_repo: Arc<dyn ApprovalRepository>,
     issue_repo: Arc<dyn IssueRepository>,
+    event_bus: Option<Arc<dyn EventBus>>,
 }
 
 impl DefaultApprovalService {
@@ -86,7 +88,13 @@ impl DefaultApprovalService {
         Self {
             approval_repo,
             issue_repo,
+            event_bus: None,
         }
+    }
+
+    pub fn with_event_bus(mut self, event_bus: Arc<dyn EventBus>) -> Self {
+        self.event_bus = Some(event_bus);
+        self
     }
 
     /// Validate approval payload based on type
@@ -132,10 +140,6 @@ impl DefaultApprovalService {
 
     /// Send notification about approval status change
     async fn notify_approval_change(&self, approval: &Approval, decision: Option<ApprovalDecision>) -> Result<(), ServiceError> {
-        // TODO: Implement notification system
-        // This would send emails, webhooks, or push notifications
-        // For now, just log the event
-
         let event_type = match decision {
             Some(ApprovalDecision::Approve) => "approval.approved",
             Some(ApprovalDecision::Reject) => "approval.rejected",
@@ -143,8 +147,56 @@ impl DefaultApprovalService {
             None => "approval.created",
         };
 
-        // Would publish event to EventBus here
-        println!("Approval event: {} for approval {}", event_type, approval.id);
+        // Publish event to EventBus if available
+        if let Some(ref event_bus) = self.event_bus {
+            let linked_issue_ids = self.approval_repo
+                .find_linked_issues(approval.id)
+                .await
+                .unwrap_or_default();
+
+            let issue_id = linked_issue_ids.first().copied();
+
+            let approval_event = match decision {
+                Some(ApprovalDecision::Approve) => ApprovalEvent::Approved {
+                    approval_id: approval.id,
+                    company_id: approval.company_id,
+                    approver_id: approval.decided_by_user_id.unwrap_or(Uuid::nil()),
+                    issue_id,
+                },
+                Some(ApprovalDecision::Reject) => ApprovalEvent::Rejected {
+                    approval_id: approval.id,
+                    company_id: approval.company_id,
+                    approver_id: approval.decided_by_user_id.unwrap_or(Uuid::nil()),
+                    reason: approval.decision_note.clone().unwrap_or_default(),
+                },
+                Some(ApprovalDecision::RequestRevision) => ApprovalEvent::RevisionRequested {
+                    approval_id: approval.id,
+                    company_id: approval.company_id,
+                    approver_id: approval.decided_by_user_id.unwrap_or(Uuid::nil()),
+                    feedback: approval.decision_note.clone().unwrap_or_default(),
+                },
+                None => ApprovalEvent::Requested {
+                    approval_id: approval.id,
+                    company_id: approval.company_id,
+                    requester_id: approval.requested_by_user_id.unwrap_or(Uuid::nil()),
+                    issue_id,
+                },
+            };
+
+            let system_event = SystemEvent::new(
+                EventMetadata {
+                    event_id: Uuid::new_v4(),
+                    correlation_id: None,
+                    causation_id: None,
+                    actor_type: "user".to_string(),
+                    actor_id: approval.decided_by_user_id.unwrap_or(Uuid::nil()),
+                    company_id: approval.company_id,
+                },
+                SystemEventPayload::Approval(approval_event),
+            );
+
+            let _ = event_bus.publish(Box::new(system_event)).await;
+        }
 
         Ok(())
     }
