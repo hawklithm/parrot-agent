@@ -7,6 +7,7 @@ use models::{Issue, IssueStatus, EnvironmentLease, UpdateIssueInput};
 use repositories::IssueRepository;
 use crate::errors::ServiceError;
 use crate::lease_service::{LeaseService, AcquireLeaseRequest};
+use crate::heartbeat_service::{HeartbeatService, HeartbeatError};
 
 /// Checkout input with environment acquisition
 #[derive(Debug, Clone, Deserialize)]
@@ -99,16 +100,19 @@ pub trait IssueCheckoutService: Send + Sync {
 pub struct DefaultIssueCheckoutService {
     issue_repo: Arc<dyn IssueRepository>,
     lease_service: Arc<dyn LeaseService>,
+    heartbeat_service: Arc<dyn HeartbeatService>,
 }
 
 impl DefaultIssueCheckoutService {
     pub fn new(
         issue_repo: Arc<dyn IssueRepository>,
         lease_service: Arc<dyn LeaseService>,
+        heartbeat_service: Arc<dyn HeartbeatService>,
     ) -> Self {
         Self {
             issue_repo,
             lease_service,
+            heartbeat_service,
         }
     }
 
@@ -242,6 +246,8 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
             monitor_scheduled_by: None, monitor_notes: None, monitor_next_check_at: None, monitor_last_triggered_at: None, monitor_attempt_count: None, hidden_at: None,
             execution_workspace_preference: None, execution_workspace_settings: None,
             execution_policy: None, execution_state: None,
+            execution_locked_at: None,
+            execution_run_id: None,
         };
 
         match self.issue_repo.update(issue_id, update_input).await {
@@ -259,6 +265,21 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
                     checkout_agent_id: input.agent_id.unwrap_or_else(Uuid::nil),
                     checkout_run_id: Some(input.checkout_run_id),
                 });
+
+                // Heartbeat integration: wake up the assignee if needed
+                if should_wake {
+                    if let Some(assignee_agent_id) = updated_issue.assignee_agent_id {
+                        let heartbeat = self.heartbeat_service.clone();
+                        let issue_id = updated_issue.id;
+                        let company_id = updated_issue.company_id;
+                        // Fire-and-forget wakeup — don't block the checkout response
+                        tokio::spawn(async move {
+                            if let Err(e) = heartbeat.wakeup(assignee_agent_id, issue_id, company_id).await {
+                                tracing::warn!("Heartbeat wakeup failed for agent={}, issue={}: {}", assignee_agent_id, issue_id, e);
+                            }
+                        });
+                    }
+                }
 
                 Ok(CheckoutResult {
                     issue: updated_issue,
@@ -301,6 +322,8 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
             monitor_scheduled_by: None, monitor_notes: None, monitor_next_check_at: None, monitor_last_triggered_at: None, monitor_attempt_count: None, hidden_at: None,
             execution_workspace_preference: None, execution_workspace_settings: None,
             execution_policy: None, execution_state: None,
+            execution_locked_at: None,
+            execution_run_id: None,
         };
 
         let updated_issue = self.issue_repo
@@ -342,12 +365,28 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
             monitor_scheduled_by: None, monitor_notes: None, monitor_next_check_at: None, monitor_last_triggered_at: None, monitor_attempt_count: None, hidden_at: None,
             execution_workspace_preference: None, execution_workspace_settings: None,
             execution_policy: None, execution_state: None,
+            execution_locked_at: None,
+            execution_run_id: None,
         };
 
         let updated_issue = self.issue_repo
             .update(issue_id, update_input)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to force release issue: {}", e)))?;
+
+        // Heartbeat integration: cancel active run for the assignee
+        if let Some(assignee_agent_id) = updated_issue.assignee_agent_id {
+            let heartbeat = self.heartbeat_service.clone();
+            let issue_id = updated_issue.id;
+            let company_id = updated_issue.company_id;
+            let reason = format!("force_release by admin={}", input.admin_user_id);
+            // Fire-and-forget cancel — don't block the force_release response
+            tokio::spawn(async move {
+                if let Err(e) = heartbeat.cancel_run(assignee_agent_id, issue_id, company_id, &reason).await {
+                    tracing::warn!("Heartbeat cancel_run failed for agent={}, issue={}: {}", assignee_agent_id, issue_id, e);
+                }
+            });
+        }
 
         // Always release lease on force release
         if input.release_lease {
@@ -395,9 +434,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_wake_assignee_on_checkout() {
+        let heartbeat = Arc::new(crate::heartbeat_service::mock::MockHeartbeatService::new());
         let service = DefaultIssueCheckoutService::new(
             Arc::new(crate::MockIssueRepository::new()),
             Arc::new(MockLeaseService::new()),
+            heartbeat,
         );
 
         let agent_id = Uuid::new_v4();
@@ -454,9 +495,11 @@ mod tests {
 
     #[test]
     fn test_determine_checkout_status() {
+        let heartbeat = Arc::new(crate::heartbeat_service::mock::MockHeartbeatService::new());
         let service = DefaultIssueCheckoutService::new(
             Arc::new(crate::MockIssueRepository::new()),
             Arc::new(MockLeaseService::new()),
+            heartbeat,
         );
 
         assert_eq!(service.determine_checkout_status("todo"), "in_progress");
@@ -468,9 +511,11 @@ mod tests {
 
     #[test]
     fn test_determine_release_status() {
+        let heartbeat = Arc::new(crate::heartbeat_service::mock::MockHeartbeatService::new());
         let service = DefaultIssueCheckoutService::new(
             Arc::new(crate::MockIssueRepository::new()),
             Arc::new(MockLeaseService::new()),
+            heartbeat,
         );
 
         // Explicit target

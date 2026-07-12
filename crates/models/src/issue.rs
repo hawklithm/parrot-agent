@@ -361,6 +361,8 @@ pub struct UpdateIssueInput {
     pub execution_workspace_settings: Option<serde_json::Value>,
     pub execution_policy: Option<IssueExecutionPolicy>,
     pub execution_state: Option<IssueExecutionState>,
+    pub execution_locked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub execution_run_id: Option<Uuid>,
 }
 
 /// Create document input

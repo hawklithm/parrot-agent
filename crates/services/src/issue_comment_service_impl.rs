@@ -137,6 +137,8 @@ impl DefaultIssueCommentService {
                 execution_workspace_settings: None,
                 execution_policy: None,
                 execution_state: None,
+            execution_locked_at: None,
+            execution_run_id: None,
             };
 
             self.issue_repo
