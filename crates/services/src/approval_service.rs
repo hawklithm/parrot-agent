@@ -164,7 +164,7 @@ impl ApprovalService for DefaultApprovalService {
         // Validate linked issues exist
         for issue_id in &input.linked_issue_ids {
             let issue = self.issue_repo
-                .find_by_id(*issue_id)
+                .get_by_id(*issue_id)
                 .await
                 .map_err(|e| ServiceError::Internal(format!("Failed to find issue: {}", e)))?;
 
@@ -368,7 +368,7 @@ impl ApprovalService for DefaultApprovalService {
 
         for issue_id in linked_issue_ids {
             let issue = self.issue_repo
-                .find_by_id(issue_id)
+                .get_by_id(issue_id)
                 .await
                 .map_err(|e| ServiceError::Internal(format!("Failed to find issue: {}", e)))?
                 .ok_or_else(|| ServiceError::NotFound(format!("Issue {} not found", issue_id)))?;

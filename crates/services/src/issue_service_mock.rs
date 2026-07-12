@@ -28,6 +28,7 @@ impl MockIssueService {
             priority: IssuePriority::Medium,
             assignee_agent_id: None,
             assignee_user_id: None,
+            assigned_to: None,
             checkout_run_id: None,
             execution_run_id: None,
             execution_agent_name_key: None,

@@ -259,8 +259,20 @@ impl IssueService for DefaultIssueService {
         filter: &IssueQueryFilter,
         pagination: &Pagination,
     ) -> Result<Vec<Issue>, ServiceError> {
+        // Convert local types to repository types
+        let models_filter = models::IssueQueryFilter {
+            status: filter.status.clone(),
+            assigned_to: filter.assigned_to,
+            project_id: filter.project_id,
+            goal_id: filter.goal_id,
+            parent_id: filter.parent_id,
+        };
+        let models_pagination = models::Pagination {
+            limit: pagination.limit,
+            offset: pagination.offset,
+        };
         self.issue_repo
-            .list_by_company(company_id, filter, pagination)
+            .list_by_company(company_id, &models_filter, &models_pagination)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list issues: {}", e)))
     }
@@ -431,8 +443,12 @@ impl IssueService for DefaultIssueService {
         filter: &IssueQueryFilter,
         pagination: &Pagination,
     ) -> Result<Vec<Issue>, ServiceError> {
+        let models_pagination = models::Pagination {
+            limit: pagination.limit,
+            offset: pagination.offset,
+        };
         self.issue_repo
-            .search(company_id, query, filter, pagination)
+            .search(company_id, query, &models_pagination)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to search issues: {}", e)))
     }

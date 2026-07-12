@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::sync::Arc;
 
-use models::{Issue, EnvironmentLease};
+use models::{Issue, IssueStatus, EnvironmentLease, UpdateIssueInput};
 use repositories::IssueRepository;
-use crate::{ServiceError, lease_service::{LeaseService, AcquireLeaseRequest}};
+use crate::errors::ServiceError;
+use crate::lease_service::{LeaseService, AcquireLeaseRequest};
 
 /// Checkout input with environment acquisition
 #[derive(Debug, Clone, Deserialize)]
@@ -114,17 +115,18 @@ impl DefaultIssueCheckoutService {
     /// Validate status is in expected list
     fn validate_expected_status(
         &self,
-        current_status: &str,
+        current_status: &IssueStatus,
         expected_statuses: &[String],
     ) -> Result<(), ServiceError> {
         if expected_statuses.is_empty() {
             return Ok(());
         }
 
-        if !expected_statuses.contains(&current_status.to_string()) {
+        let status_str = current_status.to_string();
+        if !expected_statuses.contains(&status_str) {
             return Err(ServiceError::Conflict(format!(
                 "Issue status '{}' not in expected statuses: {:?}",
-                current_status, expected_statuses
+                status_str, expected_statuses
             )));
         }
 
@@ -132,35 +134,42 @@ impl DefaultIssueCheckoutService {
     }
 
     /// Determine target status after checkout
-    fn determine_checkout_status(&self, current_status: &str) -> String {
+    fn determine_checkout_status(&self, current_status: &IssueStatus) -> IssueStatus {
         match current_status {
-            "todo" | "backlog" | "blocked" | "in_review" => "in_progress".to_string(),
-            _ => current_status.to_string(),
+            IssueStatus::Todo | IssueStatus::Backlog | IssueStatus::Blocked | IssueStatus::InReview => IssueStatus::InProgress,
+            _ => current_status.clone(),
         }
     }
 
     /// Determine target status after release
     fn determine_release_status(
         &self,
-        current_status: &str,
+        current_status: &IssueStatus,
         result: Option<&str>,
         explicit_target: Option<&str>,
-    ) -> String {
+    ) -> IssueStatus {
         if let Some(target) = explicit_target {
-            return target.to_string();
+            return match target {
+                "done" => IssueStatus::Done,
+                "todo" => IssueStatus::Todo,
+                "cancelled" => IssueStatus::Cancelled,
+                "in_progress" => IssueStatus::InProgress,
+                "in_review" => IssueStatus::InReview,
+                _ => current_status.clone(),
+            };
         }
 
         match result {
-            Some("success") => "done".to_string(),
-            Some("failed") => "todo".to_string(),
-            Some("cancelled") => "cancelled".to_string(),
-            Some("needs_review") => "in_review".to_string(),
+            Some("success") => IssueStatus::Done,
+            Some("failed") => IssueStatus::Todo,
+            Some("cancelled") => IssueStatus::Cancelled,
+            Some("needs_review") => IssueStatus::InReview,
             _ => {
                 // Default: in_progress -> in_review (paperclip pattern)
-                if current_status == "in_progress" {
-                    "in_review".to_string()
+                if *current_status == IssueStatus::InProgress {
+                    IssueStatus::InReview
                 } else {
-                    current_status.to_string()
+                    current_status.clone()
                 }
             }
         }
@@ -225,12 +234,17 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
         };
 
         // Step 3: Update issue (only if lease acquired successfully or no lease needed)
-        let original_status = issue.status.clone();
-        issue.status = self.determine_checkout_status(&original_status);
-        issue.assigned_to = input.agent_id.or(input.user_id);
-        issue.updated_at = chrono::Utc::now();
+        let new_status = self.determine_checkout_status(&issue.status);
+        let update_input = models::UpdateIssueInput {
+            title: None, description: None, status: Some(new_status),
+            priority: None, assignee_agent_id: None, assignee_user_id: None,
+            work_mode: None, responsible_user_id: None, source_trust: None,
+            monitor_scheduled_by: None, monitor_notes: None, hidden_at: None,
+            execution_workspace_preference: None, execution_workspace_settings: None,
+            execution_policy: None, execution_state: None,
+        };
 
-        match self.issue_repo.update(issue.clone()).await {
+        match self.issue_repo.update(issue_id, update_input).await {
             Ok(updated_issue) => {
                 // Determine wakeup decision
                 let should_wake = self.should_wake_assignee_on_checkout(&CheckoutWakeInput {
@@ -272,19 +286,25 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
         company_id: Uuid,
         input: ReleaseIssueInput,
     ) -> Result<Issue, ServiceError> {
-        let mut issue = self.get_issue_verified(issue_id, company_id).await?;
+        let issue = self.get_issue_verified(issue_id, company_id).await?;
 
         // Update status
-        let original_status = issue.status.clone();
-        issue.status = self.determine_release_status(
-            &original_status,
+        let new_status = self.determine_release_status(
+            &issue.status,
             input.result.as_deref(),
             input.target_status.as_deref(),
         );
-        issue.updated_at = chrono::Utc::now();
+        let update_input = models::UpdateIssueInput {
+            title: None, description: None, status: Some(new_status),
+            priority: None, assignee_agent_id: None, assignee_user_id: None,
+            work_mode: None, responsible_user_id: None, source_trust: None,
+            monitor_scheduled_by: None, monitor_notes: None, hidden_at: None,
+            execution_workspace_preference: None, execution_workspace_settings: None,
+            execution_policy: None, execution_state: None,
+        };
 
         let updated_issue = self.issue_repo
-            .update(issue)
+            .update(issue_id, update_input)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to release issue: {}", e)))?;
 
@@ -312,15 +332,20 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
         company_id: Uuid,
         input: ForceReleaseInput,
     ) -> Result<Issue, ServiceError> {
-        let mut issue = self.get_issue_verified(issue_id, company_id).await?;
+        let issue = self.get_issue_verified(issue_id, company_id).await?;
 
         // Admin can force release from any status
-        issue.status = "todo".to_string();
-        issue.assigned_to = None;
-        issue.updated_at = chrono::Utc::now();
+        let update_input = models::UpdateIssueInput {
+            title: None, description: None, status: Some(IssueStatus::Todo),
+            priority: None, assignee_agent_id: None, assignee_user_id: None,
+            work_mode: None, responsible_user_id: None, source_trust: None,
+            monitor_scheduled_by: None, monitor_notes: None, hidden_at: None,
+            execution_workspace_preference: None, execution_workspace_settings: None,
+            execution_policy: None, execution_state: None,
+        };
 
         let updated_issue = self.issue_repo
-            .update(issue)
+            .update(issue_id, update_input)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to force release issue: {}", e)))?;
 

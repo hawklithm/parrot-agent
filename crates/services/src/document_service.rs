@@ -74,6 +74,7 @@ impl MockDocumentService {
             id,
             issue_id: parent_id,
             company_id,
+            document_id: id,
             key,
             content: "# Mock Document\n\nSample content".to_string(),
             locked_by_agent_id: None,
