@@ -1,6 +1,6 @@
 # Parrot Agent 实现进度报告
 
-生成时间: 2026-07-11
+生成时间: 2026-07-12
 
 ## 当前进度总览
 
@@ -81,6 +81,64 @@
 
 **验证**: `cargo check --package adapters` ✅ 通过
 
+#### 6. 认证授权模块 ✅ (2026/07/12)
+**文件**: `crates/services/src/auth/` 完整模块
+
+- ✅ Core Types：Actor类型系统、授权决策类型、统一错误类型
+- ✅ JWT Module：签发、验证、公司级密钥派生、配置加载
+- ✅ Auth Middleware：Bearer Token分派、Session Cookie、Cloud Tenant、路由集成
+- ✅ Board Auth Service：BoardApiKey Repository、CLI挑战、Board认领
+- ✅ Agent Auth Service：AgentApiKey Repository、JWT认证、Responsible User加载
+- ✅ Authorization Service：assertCompanyAccess、assertInstanceAdmin、decide()引擎
+- ✅ Security Hardening：审计日志、速率限制、API Key过期轮换、错误响应标准化
+- ✅ Integration Tests：20个测试用例（认证流程、授权决策、安全场景）
+
+**验证**: `cargo test --package services --test auth_integration_tests` ✅ 20/20通过
+**验证**: `cargo check --package services` ✅ 通过
+**验证**: `cargo check --package api` ✅ 通过
+- ✅ 5个索引（company_id, status, reports_to, created_at等）
+
+#### 4. Repository层 (repositories) ✅
+**文件**: 
+- `crates/repositories/src/agent_repository.rs` - trait定义
+- `crates/repositories/src/pg_agent_repository.rs` - PostgreSQL实现
+
+- ✅ `AgentRepository` trait（6个方法）
+- ✅ `PgAgentRepository` 实现
+  - ✅ create() - 创建Agent
+  - ✅ get_by_id() - 按ID查询
+  - ✅ list_by_company() - 按公司列表查询
+  - ✅ update() - 更新Agent
+  - ✅ delete() - 软删除（设置terminated状态）
+  - ✅ list_by_status() - 按状态查询
+- ✅ `RepositoryError` 错误类型定义
+- ✅ 单元测试框架
+
+**验证**: `cargo check --package repositories` ✅ 通过
+
+#### 5. 适配器模式层 (adapters) ✅
+**文件**:
+- `crates/adapters/src/adapter_trait.rs` - trait定义
+- `crates/adapters/src/registry.rs` - 注册表
+- `crates/adapters/src/process_adapter.rs` - Process适配器
+- `crates/adapters/src/claude_local_adapter.rs` - Claude Local适配器
+
+- ✅ `AdapterType` 枚举（5种：process/claude_local/cursor/opencode/codex_local）
+- ✅ `ServerAdapterModule` trait（6个方法）
+- ✅ `AdapterRegistry` 注册表实现
+- ✅ `ProcessAdapter` 实现
+  - ✅ list_models() - 返回空列表
+  - ✅ test_environment() - 基础连通性测试
+- ✅ `ClaudeLocalAdapter` 实现
+  - ✅ list_models() - 返回3个Claude模型
+  - ✅ test_environment() - API key验证
+  - ✅ detect_model() - 模型检测
+  - ✅ supports_instructions_bundle() - 支持指令集
+- ✅ `create_default_registry()` 工厂函数
+- ✅ 单元测试（7个测试用例）
+
+**验证**: `cargo check --package adapters` ✅ 通过
+
 ---
 
 ## 统计数据
@@ -99,43 +157,22 @@
 
 ## 下一步计划
 
-### 剩余Agent管理模块任务 (42项)
+### 剩余模块任务：
 
-#### 已完成的检查项：
-- ✅ Agent Key 认证 - GET /agents/me 端点（完整实现）
-- ✅ 内置 Agent Provision 核心功能（支持自定义配置参数 + 物化指令存根）
-- ✅ 配置版本回滚（Rollback）端点
-- ✅ Agent 技能同步端点 POST /agents/:id/skills/sync
-- ✅ Agent 会话重置端点 POST /agents/:id/runtime-state/reset-session
-- ✅ 内置 Agent 状态端点 GET /companies/:companyId/built-in-agents/:key/status
-- ✅ 内置 Agent 重置端点 POST /companies/:companyId/built-in-agents/:key/reset
-- ✅ Routine 启用/禁用/触发存根端点
+- **Issue/Case管理模块**: 61项
+- **实时环境模块**: 98项
+- **认证授权模块**: 0项 ✅ 已全部完成
+- **Routine/Goal模块**: 100项
+- **Company/Org模块**: 71项
+- **Pipeline/Adapter模块**: 80项
+- **跨模块集成**: 39项
 
-#### 阶段二剩余任务：
-1. **内置 Agent 资源物化**
-   - [ ] 完整实现 materialize_instructions()（文件系统写入）
-   - [ ] 实现 materialize_skill() 创建/同步 Skill
-   - [ ] 实现 materialize_routine() 创建/更新 Routine
+### 下次执行建议
 
-2. **审批流程集成**
-   - [ ] 实现内置 Agent Provision 的审批流程分支
-   - [ ] 实现 ApprovalService 与内置 Agent 服务的集成
-   - [ ] 实现审批状态机推导（pending_approval → needs_setup）
-
-3. **跨模块集成**
-   - [ ] 实现 CostEventService 接口与 Agent 花费计算集成
-   - [ ] 实现 HeartbeatService 心跳唤醒集成
-   - [ ] 实现 SessionManagementService 会话管理集成
-   - [ ] 实现 ActivityLogService 活动日志集成
-
-#### 其他模块任务：
-- **Issue/Case管理模块**: 52项
-- **实时环境模块**: 91项
-- **认证授权模块**: 59项
-- **Routine/Goal模块**: 81项
-- **Company/Org模块**: 53项
-- **Pipeline/Adapter模块**: 40项
-- **跨模块集成**: 90项
+1. **优先级P0**: 继续完成跨模块集成（事件总线监听器、Saga编排器）
+2. **优先级P1**: Issue/Case管理模块剩余任务
+3. **优先级P2**: 补充其他模块任务
+4. **优先级P3**: 编写更多集成测试
 
 ---
 
