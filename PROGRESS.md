@@ -248,6 +248,14 @@ cargo check --workspace
 - ✅ **Heartbeat Context** - GET /api/issues/:id/heartbeat-context
 - ✅ **IssueService 扩展** - force_release/batch_update/get_heartbeat_context方法
 
+### 本次完成 (2026/07/13)
+- ✅ **已读标记与归档** - 完整实现
+  - 新增Migration: `20260712000001_create_issue_read_status_and_archive.sql`
+  - 包含6张新表: issue_read_status, issue_inbox_archives, feedback_votes, feedback_traces, recovery_actions, plan_decompositions
+  - Model类型: IssueReadStatus, IssueInboxArchive, FeedbackVote, FeedbackTrace, RecoveryAction, PlanDecomposition
+  - Repository traits + PostgreSQL实现
+  - 支持: mark_read/unmark_read, archive/unarchive, feedback vote/trace, recovery action management, plan decomposition
+
 ### 已存在功能（之前已完成）
 - ✅ Issue/Case 数据模型（枚举、结构体、Schema迁移）
 - ✅ IssueRepository trait + PgIssueRepository实现
@@ -263,7 +271,7 @@ cargo check --workspace
 ### 剩余待实现
 - [ ] Monitor定时调度器（后台轮询monitor_next_check_at）
 - [ ] 事件通知机制（watchdog评估、恢复动作协调）
-- [ ] 已读标记与归档
+- [x] 已读标记与归档
 - [ ] 恢复动作管理（reconcile算法）
 - [ ] 计划分解
 - [ ] 审批状态传播

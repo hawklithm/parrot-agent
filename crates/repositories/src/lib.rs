@@ -73,6 +73,18 @@ pub use goal_repository::GoalRepository;
 pub use routine_repository::RoutineRepository;
 pub use routine_trigger_repository::{RoutineTriggerRepository, PostgresRoutineTriggerRepository};
 pub use routine_revision_repository::{RoutineRevisionRepository, PostgresRoutineRevisionRepository};
+pub mod issue_auxiliary_repository;
+pub use issue_auxiliary_repository::{
+    IssueReadStatusRepository, IssueInboxArchiveRepository,
+    FeedbackVoteRepository, FeedbackTraceRepository,
+    RecoveryActionRepository, PlanDecompositionRepository,
+};
+pub mod pg_issue_auxiliary_repository;
+pub use pg_issue_auxiliary_repository::{
+    PgIssueReadStatusRepository, PgIssueInboxArchiveRepository,
+    PgFeedbackVoteRepository, PgFeedbackTraceRepository,
+    PgRecoveryActionRepository, PgPlanDecompositionRepository,
+};
 pub mod approval_repository;
 pub use approval_repository::{ApprovalRepository, PostgresApprovalRepository};
 
