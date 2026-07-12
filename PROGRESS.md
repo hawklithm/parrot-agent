@@ -204,13 +204,15 @@ cargo check --workspace
 ✅ 所有crate编译通过
 
 ### 测试覆盖
-- ✅ models: 状态机测试
+- ✅ models: 状态机测试（Agent + Issue）
+- ✅ models: IssueStateMachine 10个测试
 - ✅ repositories: Repository单元测试框架
 - ✅ adapters: 适配器功能测试
+- ✅ api: 验证Schema测试（20个测试）
 
 ### 待补充测试
 - [ ] 集成测试（使用testcontainers）
-- [ ] API端点测试
+- [ ] API端点测试（Issue/Case CRUD端到端）
 - [ ] 权限验证测试
 
 ---
@@ -227,6 +229,47 @@ cargo check --workspace
 
 3. **未完成功能**:
    - 环境租约管理服务接口（EnvironmentRuntimeService）
+   - 工作空间实例化逻辑
+   - 配置标准化函数实现
+   - Issue/Case 事件通知机制
+   - Monitor定时调度器
+   - 恢复动作管理
+   - 已读标记与归档功能
+
+---
+
+## Issue/Case 管理模块进度 (2026/07/12)
+
+### 本次完成 (2026/07/12)
+- ✅ **IssueStateMachine** - 完整状态机（19个转换规则，10个测试）
+- ✅ **Validation Schemas** - Checkout/Release/ForceRelease/BatchUpdate验证
+- ✅ **Admin Force-Release** - POST /api/issues/:id/admin/force-release
+- ✅ **Batch Update** - POST /api/companies/:companyId/issues/batch-update
+- ✅ **Heartbeat Context** - GET /api/issues/:id/heartbeat-context
+- ✅ **IssueService 扩展** - force_release/batch_update/get_heartbeat_context方法
+
+### 已存在功能（之前已完成）
+- ✅ Issue/Case 数据模型（枚举、结构体、Schema迁移）
+- ✅ IssueRepository trait + PgIssueRepository实现
+- ✅ IssueService trait + DefaultIssueService
+- ✅ IssueCheckoutService（含环境租约集成）
+- ✅ CaseService trait + 路由
+- ✅ 评论 CRUD 路由和服务
+- ✅ 文档 CRUD + 锁定/解锁
+- ✅ 树形控制服务
+- ✅ WorkProduct 服务
+- ✅ 附件服务
+
+### 剩余待实现
+- [ ] Monitor定时调度器（后台轮询monitor_next_check_at）
+- [ ] 事件通知机制（watchdog评估、恢复动作协调）
+- [ ] 已读标记与归档
+- [ ] 恢复动作管理（reconcile算法）
+- [ ] 计划分解
+- [ ] 审批状态传播
+- [ ] 诊断端点
+- [ ] 低信任审查机制
+- [ ] 字段级权限控制
    - 工作空间实例化逻辑
    - 配置标准化函数实现
 
