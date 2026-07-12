@@ -33,6 +33,9 @@ pub enum AppError {
     NotImplemented(String),
 }
 
+/// ApiError type alias for backwards compatibility
+pub type ApiError = AppError;
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {

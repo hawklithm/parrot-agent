@@ -7,8 +7,8 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::models::{Attachment, UploadAttachmentInput};
-use crate::services::AttachmentService;
+use models::{Attachment, UploadAttachmentInput};
+use services::AttachmentService;
 
 /// GET /issues/:id/attachments - List issue attachments
 async fn list_issue_attachments(

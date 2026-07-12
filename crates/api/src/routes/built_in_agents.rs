@@ -99,7 +99,7 @@ pub async fn provision_built_in_agent(
         )
         .await
         .map_err(|e| match e {
-            BuiltInAgentError::NotFound => (StatusCode::NOT_FOUND, "Built-in agent not found".to_string()),
+            BuiltInAgentError::NotFound(_) => (StatusCode::NOT_FOUND, "Built-in agent not found".to_string()),
             BuiltInAgentError::Forbidden => (StatusCode::FORBIDDEN, "Permission denied".to_string()),
             BuiltInAgentError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg),
             BuiltInAgentError::AlreadyProvisioned => (StatusCode::CONFLICT, "Agent already provisioned".to_string()),
@@ -134,7 +134,7 @@ pub async fn reconcile_built_in_agent(
         .reconcile_built_in_agent(company_id, &key)
         .await
         .map_err(|e| match e {
-            BuiltInAgentError::NotFound => (StatusCode::NOT_FOUND, "Built-in agent not found".to_string()),
+            BuiltInAgentError::NotFound(_) => (StatusCode::NOT_FOUND, "Built-in agent not found".to_string()),
             BuiltInAgentError::Forbidden => (StatusCode::FORBIDDEN, "Permission denied".to_string()),
             BuiltInAgentError::NotProvisioned => (
                 StatusCode::PRECONDITION_FAILED,

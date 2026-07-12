@@ -7,8 +7,8 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::models::{CreateIssueTreeHoldInput, IssueTreeHold, IssueTreeControlPreview};
-use crate::services::TreeControlService;
+use models::{CreateIssueTreeHoldInput, IssueTreeHold, IssueTreeControlPreview};
+use services::TreeControlService;
 
 /// POST /issues/:id/tree-control/preview - Preview tree control impact
 async fn preview_tree_control(

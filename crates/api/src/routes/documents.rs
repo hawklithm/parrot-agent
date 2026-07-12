@@ -7,8 +7,8 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::models::{CreateDocumentInput, IssueDocument, LockDocumentInput};
-use crate::services::{DocumentParentType, DocumentService};
+use models::{CreateDocumentInput, IssueDocument, LockDocumentInput};
+use services::{DocumentParentType, DocumentService};
 
 /// GET /issues/:id/documents - List issue documents
 async fn list_issue_documents(

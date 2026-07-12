@@ -8,8 +8,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::models::{Case, CaseDetail, CaseEvent, CreateCaseInput, UpdateCaseInput};
-use crate::services::{CaseQueryFilter, CaseService, Pagination};
+use models::{Case, CaseDetail, CaseEvent, CreateCaseInput, UpdateCaseInput};
+use services::{CaseQueryFilter, CaseService, Pagination};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

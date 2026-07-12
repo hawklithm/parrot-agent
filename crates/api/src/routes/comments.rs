@@ -7,8 +7,8 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::models::{AddCommentInput, IssueComment};
-use crate::services::CommentService;
+use models::{AddCommentInput, IssueComment};
+use services::CommentService;
 
 /// GET /issues/:id/comments - List issue comments
 async fn list_comments(

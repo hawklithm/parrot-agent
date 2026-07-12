@@ -9,8 +9,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::models::{CreateIssueInput, Issue, UpdateIssueInput};
-use crate::services::{
+use models::{CreateIssueInput, Issue, UpdateIssueInput};
+use services::{
     CheckoutInput, IssueQueryFilter, IssueService, Pagination, ReleaseInput,
 };
 

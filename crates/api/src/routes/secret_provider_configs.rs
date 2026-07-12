@@ -66,7 +66,7 @@ pub async fn get_config(
     match service.get_config(config_id).await {
         Ok(config) => (StatusCode::OK, Json(config)).into_response(),
         Err(e) => match e {
-            services::errors::ServiceError::NotFound(_) => {
+            crate::errors::ServiceError::NotFound(_) => {
                 (StatusCode::NOT_FOUND, e.to_string()).into_response()
             }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -86,7 +86,7 @@ pub async fn update_config(
     match service.update_config(config_id, request).await {
         Ok(config) => (StatusCode::OK, Json(config)).into_response(),
         Err(e) => match e {
-            services::errors::ServiceError::NotFound(_) => {
+            crate::errors::ServiceError::NotFound(_) => {
                 (StatusCode::NOT_FOUND, e.to_string()).into_response()
             }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -105,7 +105,7 @@ pub async fn delete_config(
     match service.delete_config(config_id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => match e {
-            services::errors::ServiceError::NotFound(_) => {
+            crate::errors::ServiceError::NotFound(_) => {
                 (StatusCode::NOT_FOUND, e.to_string()).into_response()
             }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

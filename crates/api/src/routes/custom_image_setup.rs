@@ -23,7 +23,7 @@ pub async fn get_session(
     match service.get_session(session_id).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => match e {
-            services::errors::ServiceError::NotFound(_) => {
+            crate::errors::ServiceError::NotFound(_) => {
                 (StatusCode::NOT_FOUND, e.to_string()).into_response()
             }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

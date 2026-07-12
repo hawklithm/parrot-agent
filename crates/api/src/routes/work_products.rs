@@ -7,8 +7,8 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::models::{CreateWorkProductInput, UpdateWorkProductInput, WorkProduct};
-use crate::services::WorkProductService;
+use models::{CreateWorkProductInput, UpdateWorkProductInput, WorkProduct};
+use services::WorkProductService;
 
 /// GET /issues/:id/work-products - List work products
 async fn list_work_products(

@@ -43,7 +43,7 @@ pub async fn get_skill_details(
     match service.get_skill_details(&skill_name).await {
         Ok(details) => (StatusCode::OK, Json(details)).into_response(),
         Err(e) => match e {
-            services::errors::ServiceError::NotFound(_) => {
+            crate::errors::ServiceError::NotFound(_) => {
                 (StatusCode::NOT_FOUND, e.to_string()).into_response()
             }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
