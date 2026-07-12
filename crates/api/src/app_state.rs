@@ -85,6 +85,7 @@ pub fn create_router(state: AppState) -> Router {
 
         // Phase 1: Agent Management routes
         .merge(crate::routes::agents::agent_routes())
+        .merge(crate::routes::auth::auth_routes(state.clone()))
         .merge(crate::routes::adapters::adapter_routes())
         .merge(crate::routes::config_revisions::config_revision_routes())
         .merge(crate::routes::built_in_agents::built_in_agent_routes())
