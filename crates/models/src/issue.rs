@@ -339,7 +339,7 @@ pub struct CreateIssueInput {
 }
 
 /// Update issue input
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateIssueInput {
     pub title: Option<String>,
@@ -353,6 +353,9 @@ pub struct UpdateIssueInput {
     pub source_trust: Option<String>,
     pub monitor_scheduled_by: Option<IssueMonitorScheduledBy>,
     pub monitor_notes: Option<String>,
+    pub monitor_next_check_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub monitor_last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub monitor_attempt_count: Option<i32>,
     pub hidden_at: Option<chrono::DateTime<chrono::Utc>>,
     pub execution_workspace_preference: Option<String>,
     pub execution_workspace_settings: Option<serde_json::Value>,

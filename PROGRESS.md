@@ -261,6 +261,12 @@ cargo check --workspace
   - 支持5种动作类型: unblock, stale_execution, missing_assignee, general
   - 级联协调: reconcile_for_issue_and_ancestors 递归CTE
   - 单元测试: should_resolve_action决策逻辑验证
+- ✅ **Monitor定时调度器** - 后台轮询服务
+  - `MonitorSchedulerService` trait + `DefaultMonitorScheduler`
+  - Exponential backoff with jitter算法（base 5min, max 120min）
+  - 可配置的轮询间隔、批量大小、最大重试次数
+  - `UpdateIssueInput`新增3个monitor字段
+  - 单元测试: calculate_next_check backoff计算验证
 
 ### 已存在功能（之前已完成）
 - ✅ Issue/Case 数据模型（枚举、结构体、Schema迁移）
@@ -275,11 +281,13 @@ cargo check --workspace
 - ✅ 附件服务
 
 ### 剩余待实现
-- [ ] Monitor定时调度器（后台轮询monitor_next_check_at）
+- [x] Monitor定时调度器（后台轮询monitor_next_check_at）
 - [ ] 事件通知机制（watchdog评估、恢复动作协调）
 - [x] 已读标记与归档
 - [x] 恢复动作管理（reconcile算法）
 - [ ] 计划分解
+- [ ] 审批状态传播
+- [x] Monitor定时调度器
 - [ ] 审批状态传播
 - [ ] 诊断端点
 - [ ] 低信任审查机制

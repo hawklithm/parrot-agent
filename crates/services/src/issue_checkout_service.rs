@@ -239,7 +239,7 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
             title: None, description: None, status: Some(new_status),
             priority: None, assignee_agent_id: None, assignee_user_id: None,
             work_mode: None, responsible_user_id: None, source_trust: None,
-            monitor_scheduled_by: None, monitor_notes: None, hidden_at: None,
+            monitor_scheduled_by: None, monitor_notes: None, monitor_next_check_at: None, monitor_last_triggered_at: None, monitor_attempt_count: None, hidden_at: None,
             execution_workspace_preference: None, execution_workspace_settings: None,
             execution_policy: None, execution_state: None,
         };
@@ -298,7 +298,7 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
             title: None, description: None, status: Some(new_status),
             priority: None, assignee_agent_id: None, assignee_user_id: None,
             work_mode: None, responsible_user_id: None, source_trust: None,
-            monitor_scheduled_by: None, monitor_notes: None, hidden_at: None,
+            monitor_scheduled_by: None, monitor_notes: None, monitor_next_check_at: None, monitor_last_triggered_at: None, monitor_attempt_count: None, hidden_at: None,
             execution_workspace_preference: None, execution_workspace_settings: None,
             execution_policy: None, execution_state: None,
         };
@@ -339,7 +339,7 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
             title: None, description: None, status: Some(IssueStatus::Todo),
             priority: None, assignee_agent_id: None, assignee_user_id: None,
             work_mode: None, responsible_user_id: None, source_trust: None,
-            monitor_scheduled_by: None, monitor_notes: None, hidden_at: None,
+            monitor_scheduled_by: None, monitor_notes: None, monitor_next_check_at: None, monitor_last_triggered_at: None, monitor_attempt_count: None, hidden_at: None,
             execution_workspace_preference: None, execution_workspace_settings: None,
             execution_policy: None, execution_state: None,
         };

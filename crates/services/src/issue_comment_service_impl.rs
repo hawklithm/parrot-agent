@@ -131,7 +131,7 @@ impl DefaultIssueCommentService {
                 responsible_user_id: None,
                 source_trust: None,
                 monitor_scheduled_by: None,
-                monitor_notes: None,
+                monitor_notes: None, monitor_next_check_at: None, monitor_last_triggered_at: None, monitor_attempt_count: None,
                 hidden_at: None,
                 execution_workspace_preference: None,
                 execution_workspace_settings: None,
