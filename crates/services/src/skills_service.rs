@@ -68,7 +68,7 @@ impl SkillsServiceImpl {
                 category: None,
                 is_paperclip_managed: skill.is_paperclip_managed,
                 version: Some("1.0.0".to_string()),
-                tags: vec!["automation".to_string(), "development".to_string()],
+                tags: Some(vec!["automation".to_string(), "development".to_string()]),
             })
             .collect()
     }

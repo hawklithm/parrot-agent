@@ -43,8 +43,14 @@ impl CompanyService {
 
     pub async fn archive(&self, id: Uuid) -> AppResult<Company> {
         let input = UpdateCompanyInput {
+            name: None,
+            description: None,
             status: Some(models::CompanyStatus::Archived),
-            ..Default::default()
+            pause_reason: None,
+            budget_monthly_cents: None,
+            attachment_max_bytes: None,
+            default_responsible_user_id: None,
+            require_board_approval_for_new_agents: None,
         };
         Ok(self.company_repo.update(id, input).await?)
     }

@@ -145,8 +145,8 @@ impl AuthError {
     /// 获取错误代码（用于客户端国际化）
     pub fn error_code(&self) -> String {
         match self {
-            Self::Unauthenticated=> "auth.unauthenticated",
-            Self::Forbidden { code: Some(code), .. } => code.clone(),
+            Self::Unauthenticated { .. } => "auth.unauthenticated",
+            Self::Forbidden { code: Some(code), .. } => return code.clone(),
             Self::Forbidden { .. } => "auth.forbidden",
             Self::BadRequest { .. } => "auth.bad_request",
             Self::Internal { .. } => "auth.internal_error",
@@ -161,16 +161,15 @@ impl AuthError {
     /// 获取用户可见的错误消息（隐藏内部实现细节）
     pub fn user_message(&self) -> String {
         match self {
-            Self::Unauthenticated { .. } => "Authentication required",
+            Self::Unauthenticated { .. } => "Authentication required".to_string(),
             Self::Forbidden { reason, .. } => reason.clone(),
             Self::BadRequest { message } => message.clone(),
-            Self::Internal { .. } => "Internal server error",
-            Self::InvalidToken { .. } => "Invalid authentication token",
-            Self::TokenExpired => "Authentication token has expired",
-            Self::InvalidSession { .. } => "Invalid or expired session",
-            Self::InvalidApiKey { .. } => "Invalid API key",
+            Self::Internal { .. } => "Internal server error".to_string(),
+            Self::InvalidToken { .. } => "Invalid authentication token".to_string(),
+            Self::TokenExpired => "Authentication token has expired".to_string(),
+            Self::InvalidSession { .. } => "Invalid or expired session".to_string(),
+            Self::InvalidApiKey { .. } => "Invalid API key".to_string(),
         }
-        .to_string()
     }
 }
 

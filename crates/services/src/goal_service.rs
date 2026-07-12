@@ -205,7 +205,7 @@ impl GoalService for DefaultGoalService {
 
     async fn list_by_company(&self, company_id: Uuid, level: Option<GoalLevel>) -> Result<Vec<Goal>, ServiceError> {
         self.goal_repo
-            .find_by_company_id(company_id, level)
+            .list_by_company(company_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list goals: {}", e)))
     }
@@ -215,8 +215,8 @@ impl GoalService for DefaultGoalService {
         // 1. Direct issues linked to this goal
         // 2. Child goals' progress (recurse)
 
-        let issues = self.issue_repo
-            .find_by_goal_id(goal_id)
+        let issues =         self.issue_repo
+            .get_by_goal_id(goal_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find issues: {}", e)))?;
 

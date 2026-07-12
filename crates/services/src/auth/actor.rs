@@ -130,7 +130,7 @@ pub struct AgentApiKeyScope {
     /// 密钥所属Agent ID
     pub agent_id: Uuid,
     /// 密钥所属公司ID
-    pubid: Uuid,
+    pub company_id: Uuid,
     /// 允许的Issue范围（None表示允许所有Issue）
     pub allowed_issue_ids: Option<Vec<Uuid>>,
     /// 允许的操作列表（None表示允许所有操作）

@@ -59,7 +59,7 @@ impl DefaultEnvironmentService {
 impl EnvironmentService for DefaultEnvironmentService {
     async fn create(&self, company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, ServiceError> {
         // Validate config
-        self.validate_config(input.driver.clone(), &input.config)?;
+        self.validate_config(input.driver.clone(), input.config.as_ref().unwrap_or(&serde_json::Value::Null))?;
 
         self.environment_repo
             .create(input)
