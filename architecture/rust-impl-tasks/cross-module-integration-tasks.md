@@ -447,25 +447,25 @@
 - [x] **将 custom_image_setup 路由合并到主路由器**
   - 调用 .merge(crate::routes::custom_image_setup::custom_image_setup_routes(...))
 
-- [ ] **将 secret_remote_import / secret_provider_configs 路由合并到主路由器**
+- [x] **将 secret_remote_import / secret_provider_configs 路由合并到主路由器**
   - 调用 .merge(crate::routes::secret_remote_import::secret_remote_import_routes(...))
   - 调用 .merge(crate::routes::secret_provider_configs::secret_provider_config_routes(...))
 
-- [ ] **将 environment_diagnostics / heartbeats 路由合并到主路由器**
+- [x] **将 environment_diagnostics / heartbeats 路由合并到主路由器**
   - 调用 .merge(crate::routes::environment_diagnostics::environment_diagnostics_routes(...))
   - 调用 .merge(crate::routes::heartbeats::heartbeats_routes(...))
 
-- [ ] **将 invite_resources / routine_annotations 路由合并到主路由器**
+- [x] **将 invite_resources / routine_annotations 路由合并到主路由器**
   - 调用 .merge(crate::routes::invite_resources::invite_resource_routes(...))
   - 调用 .merge(crate::routes::routine_annotations::routine_annotation_routes(...))
 
-- [ ] **将 org_chart / documents / comments / tree_control 路由合并到主路由器**
+- [x] **将 org_chart / documents / comments / tree_control 路由合并到主路由器**
   - 调用 .merge(crate::routes::org_chart::org_chart_routes(...))
   - 调用 .merge(crate::routes::documents::document_routes())
   - 调用 .merge(crate::routes::comments::comment_routes())
   - 调用 .merge(crate::routes::tree_control::tree_control_routes())
 
-- [ ] **将 work_products / attachments / user_secret_definitions 路由合并到主路由器**
+- [x] **将 work_products / attachments / user_secret_definitions 路由合并到主路由器**
   - 调用 .merge(crate::routes::work_products::work_product_routes(...))
   - 调用 .merge(crate::routes::attachments::attachment_routes(...))
   - 调用 .merge(crate::routes::user_secret_definitions::user_secret_definition_routes(...))

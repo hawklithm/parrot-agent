@@ -370,29 +370,29 @@
 
 ### 阶段一：基础架构
 
-- [ ] **定义 Config 核心枚举**
+- [x] **定义 Config 核心枚举**
   - 定义 `DeploymentMode` 枚举（local_trusted / authenticated）
   - 定义 `DeploymentExposure` 枚举（private / public）
   - 定义 `BindMode` 枚举（loopback / lan / tailnet / custom）
 
-- [ ] **定义 Config 数据库与存储枚举**
+- [x] **定义 Config 数据库与存储枚举**
   - 定义 `DatabaseMode` 枚举（embedded_postgres / postgres）
   - 定义 `StorageProvider` 枚举（local_disk / s3）
   - 定义 `SecretProvider` 枚举（local_encrypted / aws_secrets_manager / gcp_secret_manager / vault）
 
-- [ ] **定义 Config 结构体**
+- [x] **定义 Config 结构体**
   - 定义 `Config` 结构体，包含所有配置字段（deployment, auth, database, storage, secrets, ui, heartbeat 等）
   - 定义 `ConfigBuilder` 使用 builder 模式逐步构建
   - 定义 `ConfigError` 枚举（MissingRequired, InvalidValue, ParseError）
 
 ### 阶段二：核心功能
 
-- [ ] **实现配置加载优先级**
+- [x] **实现配置加载优先级**
   - 实现环境变量加载（PAPERCLIP_* 前缀，支持嵌套 key 如 PAPERCLIP_DATABASE_URL）
   - 实现配置文件加载（config.yaml / config.toml，使用 serde 反序列化）
   - 实现优先级合并逻辑：环境变量 > 配置文件 > 默认值
 
-- [ ] **实现配置校验与默认值**
+- [x] **实现配置校验与默认值**
   - 实现 `Config::validate()` 方法（校验端口范围、URL 格式、路径存在性等）
   - 实现 `Default for Config` trait（合理默认值）
   - 实现 `Config::load()` 入口方法（加载 + 校验 + 返回）
@@ -449,7 +449,7 @@
 
 ### 阶段三：高级特性
 
-- [ ] **实现审批流程权限控制**
+- [x] **实现审批流程权限控制**
   - 实现 `StageApprover` 匹配逻辑（any_human / user / agent 三种审批者类型）
   - 实现 `require_approval` 配置下的操作拦截与审批请求生成
   - 实现审批请求的创建与追踪（issue_service 集成点）
