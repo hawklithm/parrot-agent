@@ -175,12 +175,12 @@
 
 ### 阶段一：基础架构
 
-- [ ] **定义 Adapter 插件加载接口**
+- [x] **定义 Adapter 插件加载接口**
   - 定义 `AdapterPluginLoader` trait（load_from_path(), load_from_npm()）
   - 定义 `AdapterPluginRecord` 结构体（type, package_name, version, is_local_path, local_path, installed_at）
   - 定义 `AdapterInstallRequest` 结构体（package_name, is_local_path, version）
 
-- [ ] **定义技能与模型 Profile 接口**
+- [x] **定义技能与模型 Profile 接口**
   - 定义 `AdapterSkillEntry` 结构体（skill_id, name, description, content）
   - 定义 `AdapterModelProfileDefinition` 结构体（key, label, config_overrides）
   - 定义 `ModelProfileKey` 枚举（default, fast, balanced, deep）
@@ -192,17 +192,17 @@
 
 ### 阶段二：核心功能
 
-- [ ] **实现本地路径 Adapter 加载**
+- [x] **实现本地路径 Adapter 加载**
   - 实现 `normalize_local_path()` 函数（路径安全校验与规范化）
   - 实现 `load_external_adapter_package()` 从本地路径加载 adapter 动态库（使用 libloading 或 WASM）
   - 实现加载后的 `register_server_adapter()` 集成
 
-- [ ] **实现 NPM 包 Adapter 安装**
+- [x] **实现 NPM 包 Adapter 安装**
   - 实现 `get_adapter_plugins_dir()` 函数（获取插件目录路径）
   - 实现 `npm_install_adapter()` 函数（执行 npm install --no-save，带 120s 超时）
   - 实现 `read_installed_package_version()` 从 package.json 读取版本信息
 
-- [ ] **实现 Adapter 插件持久化**
+- [x] **实现 Adapter 插件持久化**
   - 实现 `AdapterPluginStore` 结构体（管理 AdapterPluginRecord 列表）
   - 实现 `add_adapter_plugin()` / `remove_adapter_plugin()` 方法
   - 实现插件记录的文件持久化（JSON 文件存储）
@@ -225,24 +225,24 @@
 
 ### 阶段一：基础架构
 
-- [ ] **定义执行引擎核心接口**
+- [x] **定义执行引擎核心接口**
   - 定义 `AdapterExecutor` trait（execute(ctx) -> AdapterExecutionResult）
   - 定义 `AdapterRuntime` 结构体（runtime_command_spec, environment, working_dir）
   - 定义 `AdapterRuntimeCommandSpec` 结构体（command, args, env）
 
-- [ ] **定义执行回调接口**
+- [x] **定义执行回调接口**
   - 定义 `LogSink` trait（on_log(stream: StdioKind, chunk: &str)）
   - 定义 `RuntimeStatusSink` trait（on_runtime_progress(status: &RuntimeStatus)）
   - 定义 `SpawnNotifier` trait（on_spawn(pid, process_group_id, started_at)）
 
-- [ ] **定义本地与远程执行类型**
+- [x] **定义本地与远程执行类型**
   - 定义 `LocalExecutor` 结构体（持有 tokio::process::Command）
   - 定义 `RemoteExecutor` 结构体（持有远程连接配置）
   - 定义 `ExecutionTargetConfig` 结构体（target_type, connection_info, asset_sync_config）
 
 ### 阶段二：核心功能
 
-- [ ] **实现本地 Adapter 执行**
+- [x] **实现本地 Adapter 执行**
   - 实现 `LocalExecutor::execute()`：准备运行时配置 -> 构建环境变量 -> spawn 子进程
   - 实现 stdout/stderr 流式输出回调（tokio 异步管道读取 -> on_log）
   - 实现进程生命周期管理（启动、超时 kill、退出码收集）
