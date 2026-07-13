@@ -484,3 +484,31 @@
 - [x] **AppState 完整集成（新增14个服务到AppState）**
   - 将所有缺失的服务添加到 AppState（SseService, InviteService, OpenClawService, UserDirectoryService, CustomImageSetupService, SecretProviderConfigService, SecretRemoteImportService, EnvironmentDiagnosticsService, InviteResourceService, RoutineAnnotationService, WorkProductService, AttachmentService, UserSecretDefinitionService, UserSecretService）
   - 确保所有路由都能正确访问其依赖的服务
+
+
+## 8. 全局错误恢复策略 实现任务
+
+### 阶段一：基础架构
+
+- [x] **定义统一错误类型体系**（已在 retry.rs 中实现 RetryPolicy, CircuitBreaker, Fallback）
+- [x] **定义重试策略配置**（RetryPolicy + BackoffStrategy）
+- [x] **实现重试装饰器**（with_retry() 高阶函数，exponential backoff）
+
+### 阶段二：核心功能
+
+- [x] **实现关键操作的重试策略**（DB: max=3, exponential; API: max=5, exponential; Env: max=3, fixed）
+- [x] **实现熔断器**（CircuitBreaker: closed/open/half_open 状态机）
+- [x] **实现降级策略**（Fallback trait）
+
+## 9. 后台调度器统一管理 实现任务
+
+### 阶段一：基础架构
+
+- [x] **定义 ScheduledJob 核心类型**（ScheduledJob trait, JobSchedule, JobStatus, JobExecutionRecord）
+- [x] **实现 JobRegistry 注册表**（register/unregister/list_jobs）
+- [x] **实现 JobScheduler 调度器**（start/stop/pause/resume/trigger）
+
+### 阶段二：核心功能
+
+- [x] **注册所有后台任务到统一调度器**（MonitorCheck, LeaseExpiry, HealthProbe, CronTrigger, ConsistencyCheck）
+- [x] **实现任务执行日志与监控**（JobExecutionRecord 记录）
