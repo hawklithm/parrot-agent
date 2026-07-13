@@ -1,4 +1,6 @@
-use axum::{
+use crate::app_state::AppState;
+use crate::errors::AppError;
+use axum::{Router, 
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -9,7 +11,6 @@ use models::{
     UpdateRoutineAnnotationThreadRequest,
 };
 use services::RoutineAnnotationService;
-use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize)]
@@ -23,11 +24,11 @@ struct ListAnnotationsQuery {
 pub async fn list_annotations(
     Path(routine_id): Path<Uuid>,
     Query(query): Query<ListAnnotationsQuery>,
-    State(service): State<Arc<dyn RoutineAnnotationService>>,
+    State(state): State<AppState>,
 ) -> Response {
     // TODO: Add permission check - assertCanReadRoutine(routine_id, auth)
 
-    match service
+    match state.routine_annotation_service
         .list_annotations(routine_id, query.include_comments)
         .await
     {
@@ -43,12 +44,12 @@ pub async fn list_annotations(
 /// POST /routines/:id/description/annotations - 创建新annotation thread
 pub async fn create_annotation_thread(
     Path(routine_id): Path<Uuid>,
-    State(service): State<Arc<dyn RoutineAnnotationService>>,
+    State(state): State<AppState>,
     Json(request): Json<CreateRoutineAnnotationThreadRequest>,
 ) -> Response {
     // TODO: Add permission check - assertCanWriteRoutine(routine_id, auth)
 
-    match service.create_annotation_thread(routine_id, request).await {
+    match state.routine_annotation_service.create_annotation_thread(routine_id, request).await {
         Ok(thread) => (StatusCode::CREATED, Json(thread)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -61,12 +62,12 @@ pub async fn create_annotation_thread(
 /// POST /routines/:id/description/annotations/:threadId/comments - 添加评论到thread
 pub async fn add_annotation_comment(
     Path((routine_id, thread_id)): Path<(Uuid, Uuid)>,
-    State(service): State<Arc<dyn RoutineAnnotationService>>,
+    State(state): State<AppState>,
     Json(request): Json<CreateRoutineAnnotationCommentRequest>,
 ) -> Response {
     // TODO: Add permission check - assertCanWriteRoutine(routine_id, auth)
 
-    match service.add_comment(routine_id, thread_id, request).await {
+    match state.routine_annotation_service.add_comment(routine_id, thread_id, request).await {
         Ok(comment) => (StatusCode::CREATED, Json(comment)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -79,12 +80,12 @@ pub async fn add_annotation_comment(
 /// PATCH /routines/:id/description/annotations/:threadId - 更新thread状态
 pub async fn update_annotation_thread(
     Path((routine_id, thread_id)): Path<(Uuid, Uuid)>,
-    State(service): State<Arc<dyn RoutineAnnotationService>>,
+    State(state): State<AppState>,
     Json(request): Json<UpdateRoutineAnnotationThreadRequest>,
 ) -> Response {
     // TODO: Add permission check - assertCanWriteRoutine(routine_id, auth)
 
-    match service.update_thread(routine_id, thread_id, request).await {
+    match state.routine_annotation_service.update_thread(routine_id, thread_id, request).await {
         Ok(thread) => (StatusCode::OK, Json(thread)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -95,7 +96,7 @@ pub async fn update_annotation_thread(
 }
 
 /// 创建Routine Annotation路由器
-pub fn routine_annotation_routes(service: Arc<dyn RoutineAnnotationService>) -> axum::Router {
+pub fn routine_annotation_routes() -> Router<AppState> {
     axum::Router::new()
         .route(
             "/routines/:id/description/annotations",
@@ -109,5 +110,4 @@ pub fn routine_annotation_routes(service: Arc<dyn RoutineAnnotationService>) -> 
             "/routines/:id/description/annotations/:threadId",
             axum::routing::patch(update_annotation_thread),
         )
-        .with_state(service)
 }

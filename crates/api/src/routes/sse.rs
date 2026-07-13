@@ -1,4 +1,6 @@
-use axum::{
+use crate::app_state::AppState;
+use crate::errors::AppError;
+use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
     response::{
@@ -10,7 +12,6 @@ use futures::stream::{Stream, StreamExt};
 use models::{SseEvent, SseEventType, SseFrame, SseSubscription};
 use services::sse_service::SseService;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
@@ -19,7 +20,7 @@ use uuid::Uuid;
 /// SSE endpoint for real-time event streaming
 pub async fn sse_stream(
     Path((company_id, channel)): Path<(Uuid, String)>,
-    State(service): State<Arc<dyn SseService>>,
+    State(state): State<AppState>,
 ) -> Response {
     // TODO: Extract actor_id from auth context
     let actor_id = Uuid::new_v4(); // Mock for now
@@ -31,7 +32,7 @@ pub async fn sse_stream(
         last_event_id: None,
     };
 
-    match service.subscribe(subscription).await {
+    match state.sse_service.subscribe(subscription).await {
         Ok(receiver) => {
             let stream = BroadcastStream::new(receiver)
                 .filter_map(|result| async move {
@@ -58,7 +59,7 @@ pub async fn sse_stream(
 /// Publish event to SSE channel (for testing/admin)
 pub async fn publish_event(
     Path((company_id, channel)): Path<(Uuid, String)>,
-    State(service): State<Arc<dyn SseService>>,
+    State(state): State<AppState>,
     axum::Json(payload): axum::Json<serde_json::Value>,
 ) -> Response {
     let event = SseEvent {
@@ -68,7 +69,7 @@ pub async fn publish_event(
         timestamp: chrono::Utc::now(),
     };
 
-    match service.publish(company_id, &channel, event).await {
+    match state.sse_service.publish(company_id, &channel, event).await {
         Ok(_) => StatusCode::ACCEPTED.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -78,9 +79,9 @@ pub async fn publish_event(
 /// Get channel statistics
 pub async fn channel_stats(
     Path((company_id, channel)): Path<(Uuid, String)>,
-    State(service): State<Arc<dyn SseService>>,
+    State(state): State<AppState>,
 ) -> Response {
-    let count = service.subscriber_count(company_id, &channel).await;
+    let count = state.sse_service.subscriber_count(company_id, &channel).await;
 
     let stats = serde_json::json!({
         "channel": channel,
@@ -91,7 +92,7 @@ pub async fn channel_stats(
 }
 
 /// Router setup for SSE endpoints
-pub fn sse_routes(service: Arc<dyn SseService>) -> axum::Router {
+pub fn sse_routes() -> Router<AppState> {
     axum::Router::new()
         .route(
             "/companies/:companyId/events/:channel",
@@ -101,5 +102,4 @@ pub fn sse_routes(service: Arc<dyn SseService>) -> axum::Router {
             "/companies/:companyId/events/:channel/stats",
             axum::routing::get(channel_stats),
         )
-        .with_state(service)
 }

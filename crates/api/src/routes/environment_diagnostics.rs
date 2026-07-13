@@ -1,4 +1,6 @@
-use axum::{
+use crate::app_state::AppState;
+use crate::errors::AppError;
+use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -9,18 +11,17 @@ use models::{
     EnvironmentProbeResult,
 };
 use services::environment_diagnostics_service::EnvironmentDiagnosticsService;
-use std::sync::Arc;
 use uuid::Uuid;
 
 /// POST /environments/:id/probe
 /// Probe environment connectivity and health
 pub async fn probe(
     Path(environment_id): Path<Uuid>,
-    State(service): State<Arc<dyn EnvironmentDiagnosticsService>>,
+    State(state): State<AppState>,
 ) -> Response {
     // TODO: Add permission check - user must have access to environment
 
-    match service.probe(environment_id).await {
+    match state.environment_diagnostics_service.probe(environment_id).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -30,12 +31,12 @@ pub async fn probe(
 /// Acquire exclusive lease for environment access
 pub async fn acquire_lease(
     Path(environment_id): Path<Uuid>,
-    State(service): State<Arc<dyn EnvironmentDiagnosticsService>>,
+    State(state): State<AppState>,
     Json(request): Json<AcquireEnvironmentLeaseRequest>,
 ) -> Response {
     // TODO: Add permission check - assertCanAccessEnvironment
 
-    match service.acquire_lease(environment_id, request).await {
+    match state.environment_diagnostics_service.acquire_lease(environment_id, request).await {
         Ok(lease) => (StatusCode::CREATED, Json(lease)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -45,20 +46,18 @@ pub async fn acquire_lease(
 /// Analyze impact of deleting an environment
 pub async fn delete_blast_radius(
     Path(environment_id): Path<Uuid>,
-    State(service): State<Arc<dyn EnvironmentDiagnosticsService>>,
+    State(state): State<AppState>,
 ) -> Response {
     // TODO: Add permission check - assertCanManageEnvironments
 
-    match service.delete_blast_radius(environment_id).await {
+    match state.environment_diagnostics_service.delete_blast_radius(environment_id).await {
         Ok(analysis) => (StatusCode::OK, Json(analysis)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 /// Router setup for environment diagnostic endpoints
-pub fn environment_diagnostics_routes(
-    service: Arc<dyn EnvironmentDiagnosticsService>,
-) -> axum::Router {
+pub fn environment_diagnostics_routes() -> Router<AppState> {
     axum::Router::new()
         .route("/environments/:id/probe", axum::routing::post(probe))
         .route("/environments/:id/acquire", axum::routing::post(acquire_lease))
@@ -66,5 +65,4 @@ pub fn environment_diagnostics_routes(
             "/environments/:id/delete-blast-radius",
             axum::routing::get(delete_blast_radius),
         )
-        .with_state(service)
 }

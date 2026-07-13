@@ -18,6 +18,14 @@ pub use services::{
 
 pub use access::AccessService;
 
+/// Helper: wrap a service-backed router into an AppState-compatible router
+fn wrap_routes<S>(routes: Router<S>, state: S) -> Router
+where
+    S: Clone + Send + Sync + 'static,
+{
+    routes.with_state(state)
+}
+
 /// Global application state containing all services
 #[derive(Clone)]
 pub struct AppState {
@@ -202,7 +210,22 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::routines::routine_routes())
         .merge(crate::routes::goals::goal_routes())
 
-        // Phase 4: Additional service routes (using layer to wrap into AppState)
+        // Phase 4: Additional service routes (now all AppState compatible)
+        .merge(crate::routes::attachments::attachment_routes())
+        .merge(crate::routes::work_products::work_product_routes())
+        .merge(crate::routes::custom_image_setup::custom_image_setup_routes())
+        .merge(crate::routes::environment_diagnostics::environment_diagnostics_routes())
+        .merge(crate::routes::invite_resources::invite_resource_routes())
+        .merge(crate::routes::openclaw::openclaw_routes())
+        .merge(crate::routes::org_chart::org_chart_routes())
+        .merge(crate::routes::routine_annotations::routine_annotation_routes())
+        .merge(crate::routes::secret_provider_configs::secret_provider_config_routes())
+        .merge(crate::routes::secret_remote_import::secret_remote_import_routes())
+        .merge(crate::routes::skills::skill_routes())
+        .merge(crate::routes::sse::sse_routes())
+        .merge(crate::routes::user_directory::user_directory_routes())
+        .merge(crate::routes::user_secret_definitions::user_secret_definition_routes())
+        // Routes with Arc<dyn X> state type (need wrapping)
         .merge(crate::routes::user_secrets::user_secret_routes().with_state(state.user_secret_service.clone()))
         .merge(crate::routes::invites::invite_subresource_routes().with_state(state.invite_service.clone()))
 

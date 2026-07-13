@@ -1,4 +1,6 @@
-use axum::{
+use crate::app_state::AppState;
+use crate::errors::AppError;
+use axum::{Router, 
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -6,7 +8,6 @@ use axum::{
 };
 use models::{OrgChartOptions, OrgChartStyle};
 use services::OrgChartService;
-use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize)]
@@ -19,9 +20,9 @@ struct OrgChartQuery {
 /// GET /companies/:companyId/org - 获取组织树JSON
 pub async fn get_org_tree(
     Path(company_id): Path<Uuid>,
-    State(service): State<Arc<dyn OrgChartService>>,
+    State(state): State<AppState>,
 ) -> Response {
-    match service.get_org_tree(company_id).await {
+    match state.org_chart_service.get_org_tree(company_id).await {
         Ok(tree) => (StatusCode::OK, Json(tree)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -35,7 +36,7 @@ pub async fn get_org_tree(
 pub async fn generate_org_chart_svg(
     Path(company_id): Path<Uuid>,
     Query(query): Query<OrgChartQuery>,
-    State(service): State<Arc<dyn OrgChartService>>,
+    State(state): State<AppState>,
 ) -> Response {
     let style = match query.style.as_deref() {
         Some("professional") => OrgChartStyle::Professional,
@@ -50,7 +51,7 @@ pub async fn generate_org_chart_svg(
         stats: Some("Agents: 6".to_string()),
     };
 
-    match service.generate_org_chart_svg(company_id, options).await {
+    match state.org_chart_service.generate_org_chart_svg(company_id, options).await {
         Ok(svg) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "image/svg+xml")],
@@ -66,7 +67,7 @@ pub async fn generate_org_chart_svg(
 }
 
 /// 创建组织架构图路由器
-pub fn org_chart_routes(service: Arc<dyn OrgChartService>) -> axum::Router {
+pub fn org_chart_routes() -> Router<AppState> {
     axum::Router::new()
         .route(
             "/companies/:companyId/org",
@@ -76,5 +77,4 @@ pub fn org_chart_routes(service: Arc<dyn OrgChartService>) -> axum::Router {
             "/companies/:companyId/org-chart.svg",
             axum::routing::get(generate_org_chart_svg),
         )
-        .with_state(service)
 }

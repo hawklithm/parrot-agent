@@ -1,4 +1,6 @@
-use axum::{
+use crate::app_state::AppState;
+use crate::errors::AppError;
+use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -17,11 +19,11 @@ use uuid::Uuid;
 /// List all provider configurations for a company
 pub async fn list_configs(
     Path(company_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
+    State(state): State<AppState>,
 ) -> Response {
     // TODO: Add permission check - user must be company member
 
-    match service.list_configs(company_id).await {
+    match state.secret_provider_config_service.list_configs(company_id).await {
         Ok(configs) => (StatusCode::OK, Json(configs)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -31,12 +33,12 @@ pub async fn list_configs(
 /// Preview secret discovery from external provider
 pub async fn discovery_preview(
     Path(company_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
+    State(state): State<AppState>,
     Json(request): Json<SecretProviderConfigDiscoveryPreviewRequest>,
 ) -> Response {
     // TODO: Add permission check - assertCanManageSecrets
 
-    match service.discovery_preview(company_id, request).await {
+    match state.secret_provider_config_service.discovery_preview(company_id, request).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -46,12 +48,12 @@ pub async fn discovery_preview(
 /// Create a new provider configuration
 pub async fn create_config(
     Path(company_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
+    State(state): State<AppState>,
     Json(request): Json<CreateSecretProviderConfigRequest>,
 ) -> Response {
     // TODO: Add permission check - assertCanManageSecrets
 
-    match service.create_config(company_id, request).await {
+    match state.secret_provider_config_service.create_config(company_id, request).await {
         Ok(config) => (StatusCode::CREATED, Json(config)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -61,9 +63,9 @@ pub async fn create_config(
 /// Get a single provider configuration
 pub async fn get_config(
     Path(config_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
+    State(state): State<AppState>,
 ) -> Response {
-    match service.get_config(config_id).await {
+    match state.secret_provider_config_service.get_config(config_id).await {
         Ok(config) => (StatusCode::OK, Json(config)).into_response(),
         Err(e) => match e {
             services::errors::ServiceError::NotFound(_) => {
@@ -78,12 +80,12 @@ pub async fn get_config(
 /// Update an existing provider configuration
 pub async fn update_config(
     Path(config_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
+    State(state): State<AppState>,
     Json(request): Json<UpdateSecretProviderConfigRequest>,
 ) -> Response {
     // TODO: Add permission check - assertCanManageSecrets
 
-    match service.update_config(config_id, request).await {
+    match state.secret_provider_config_service.update_config(config_id, request).await {
         Ok(config) => (StatusCode::OK, Json(config)).into_response(),
         Err(e) => match e {
             services::errors::ServiceError::NotFound(_) => {
@@ -98,11 +100,11 @@ pub async fn update_config(
 /// Delete a provider configuration
 pub async fn delete_config(
     Path(config_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
+    State(state): State<AppState>,
 ) -> Response {
     // TODO: Add permission check - assertCanManageSecrets
 
-    match service.delete_config(config_id).await {
+    match state.secret_provider_config_service.delete_config(config_id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => match e {
             services::errors::ServiceError::NotFound(_) => {
@@ -117,11 +119,11 @@ pub async fn delete_config(
 /// Set a provider configuration as default
 pub async fn set_default(
     Path(config_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
+    State(state): State<AppState>,
 ) -> Response {
     // TODO: Add permission check - assertCanManageSecrets
 
-    match service.set_default(config_id).await {
+    match state.secret_provider_config_service.set_default(config_id).await {
         Ok(config) => (StatusCode::OK, Json(config)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -131,9 +133,9 @@ pub async fn set_default(
 /// Perform health check on a specific configuration
 pub async fn health_check(
     Path(config_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
+    State(state): State<AppState>,
 ) -> Response {
-    match service.health_check(config_id).await {
+    match state.secret_provider_config_service.health_check(config_id).await {
         Ok(health) => (StatusCode::OK, Json(health)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -143,18 +145,16 @@ pub async fn health_check(
 /// Get aggregated health status for all providers in a company
 pub async fn company_health(
     Path(company_id): Path<Uuid>,
-    State(service): State<Arc<dyn SecretProviderConfigService>>,
+    State(state): State<AppState>,
 ) -> Response {
-    match service.company_health(company_id).await {
+    match state.secret_provider_config_service.company_health(company_id).await {
         Ok(health_list) => (StatusCode::OK, Json(health_list)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 /// Router setup for secret provider configuration endpoints
-pub fn secret_provider_config_routes(
-    service: Arc<dyn SecretProviderConfigService>,
-) -> axum::Router {
+pub fn secret_provider_config_routes() -> Router<AppState> {
     axum::Router::new()
         // Company-scoped endpoints
         .route(
@@ -184,5 +184,4 @@ pub fn secret_provider_config_routes(
             "/secret-provider-configs/:id/health",
             axum::routing::post(health_check),
         )
-        .with_state(service)
 }

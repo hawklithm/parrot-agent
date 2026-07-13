@@ -417,11 +417,11 @@
 
 ### 阶段一：基础架构
 
-- [ ] **将 environments 路由合并到主路由器**
+- [x] **将 environments 路由合并到主路由器**
   - 在 create_router() 中调用 .merge(crate::routes::environments::environment_routes())
   - 确保 AppState 包含 EnvironmentService
 
-- [ ] **将 skills 路由合并到主路由器**
+- [x] **将 skills 路由合并到主路由器**
   - 调用 .merge(crate::routes::skills::skill_routes(state.skill_registry_service.clone()))
   - 确保 SkillRegistryService 已注册
 
@@ -429,7 +429,7 @@
   - 调用 .merge(crate::routes::user_secrets::user_secret_routes())
   - 确保 UserSecretService 已注册
 
-- [ ] **将 sse 路由合并到主路由器**
+- [x] **将 sse 路由合并到主路由器**
   - 调用 .merge(crate::routes::sse::sse_routes(state.sse_service.clone()))
   - 确保 SseService 已注册到 AppState
 
@@ -437,14 +437,14 @@
   - 调用 .merge(crate::routes::invites::invite_subresource_routes())
   - 确保 InviteService 已注册
 
-- [ ] **将 openclaw 路由合并到主路由器**
+- [x] **将 openclaw 路由合并到主路由器**
   - 调用 .merge(crate::routes::openclaw::openclaw_routes(state.openclaw_service.clone()))
   - 确保 OpenClawService 已注册
 
-- [ ] **将 user_directory 路由合并到主路由器**
+- [x] **将 user_directory 路由合并到主路由器**
   - 调用 .merge(crate::routes::user_directory::user_directory_routes(state.user_directory_service.clone()))
 
-- [ ] **将 custom_image_setup 路由合并到主路由器**
+- [x] **将 custom_image_setup 路由合并到主路由器**
   - 调用 .merge(crate::routes::custom_image_setup::custom_image_setup_routes(...))
 
 - [ ] **将 secret_remote_import / secret_provider_configs 路由合并到主路由器**
