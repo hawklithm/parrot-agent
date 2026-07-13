@@ -92,24 +92,24 @@
   - 实现 `list_pipelines_by_company()`（含分页支持）
   - 实现 `update_pipeline()` / `delete_pipeline()`（含权限检查集成点）
 
-- [ ] **实现案例推进核心逻辑**
+- [x] **实现案例推进核心逻辑**
   - 实现 `advance_case()`：验证转换规则合法（from_stage -> to_stage 存在于 transitions）、更新 stage_id、评估自动推进
   - 实现 `evaluate_auto_advance()`：检查 `auto_advance_on_children_terminal` 配置，递归推进子案例
   - 实现 `review_case()`：根据 `CaseReviewDecision` 执行审批/拒绝/请求修改，更新 terminal_kind
 
-- [ ] **实现案例分解逻辑**
+- [x] **实现案例分解逻辑**
   - 实现 `breakdown_case()`：按 `PipelineStageConfig.breakdown` 配置创建子案例
   - 实现 `target_pipeline_id` / `target_stage_key` 解析（跨 Pipeline 分解支持）
   - 实现父案例与子案例的关联维护（parent_case_id 字段）
 
-- [ ] **实现健康警告与关注列表**
+- [x] **实现健康警告与关注列表**
   - 实现 `get_health_warnings()`：检查停滞案例、阻塞案例、审批超时
   - 实现 `get_pipelines_attention()`：按公司维度聚合需要关注的 Pipeline
   - 定义 `HealthWarning` 结构体（warning_type, pipeline_id, case_id, message, severity）
 
 ### 阶段三：高级特性
 
-- [ ] **实现批量审核**
+- [x] **实现批量审核**
   - 实现 `bulk_review_cases()`：批量执行审批/拒绝操作（事务性保证）
   - 实现批量操作的结果聚合（部分成功/部分失败处理）
   - 定义 `BulkReviewResult` 结构体（succeeded: Vec<CaseId>, failed: Vec<(CaseId, Error)>）

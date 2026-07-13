@@ -148,6 +148,11 @@ pub fn create_router(state: AppState) -> Router {
         // Phase 3: Company/Org routes
         .merge(crate::routes::companies::company_routes())
         .merge(crate::routes::projects::project_routes())
+        // Pipeline routes
+        .merge(crate::routes::pipelines::pipeline_routes())
+        // Routine/Goal routes
+        .merge(crate::routes::routines::routine_routes())
+        .merge(crate::routes::goals::goal_routes())
 
         // Apply state
         .with_state(state)

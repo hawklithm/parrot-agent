@@ -33,6 +33,9 @@ pub mod work_products;
 pub mod attachments;
 pub mod companies;
 pub mod projects;
+pub mod pipelines;
+pub mod routines;
+pub mod goals;
 
 pub use access_control::{access_control_routes, CompanyId, MemberId, Token};
 pub use agents::agent_routes;
@@ -72,3 +75,6 @@ pub mod low_trust;
 pub use low_trust::low_trust_routes;
 pub use companies::company_routes;
 pub use projects::project_routes;
+pub use pipelines::pipeline_routes;
+pub use routines::routine_routes;
+pub use goals::goal_routes;

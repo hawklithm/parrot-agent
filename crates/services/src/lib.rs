@@ -48,7 +48,7 @@ pub mod event_listeners;
 pub mod goal_service;
 pub use goal_service::{GoalService, DefaultGoalService, CreateGoalInput, UpdateGoalInput, GoalHierarchy};
 pub mod pipeline_service;
-pub use pipeline_service::{PipelineService, DefaultPipelineService, AdvanceCaseInput, CreateCaseInput};
+pub use pipeline_service::{PipelineService, DefaultPipelineService, AdvanceCaseInput, CreateCaseInput, HealthWarning, BulkReviewResult, CaseReviewInput, CaseReviewDecision};
 
 pub mod approval_service;
 pub use approval_service::{ApprovalService, DefaultApprovalService};

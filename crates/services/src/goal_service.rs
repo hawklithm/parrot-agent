@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use repositories::{GoalRepository, IssueRepository};
+use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -52,7 +53,7 @@ pub struct UpdateGoalInput {
     pub owner_agent_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct GoalHierarchy {
     pub goal: Goal,
     pub parent: Option<Box<Goal>>,
