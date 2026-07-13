@@ -275,12 +275,12 @@
 
 ### 阶段一：基础架构
 
-- [ ] **定义 Pipeline 路由框架**
+- [x] **定义 Pipeline 路由框架**
   - 使用 axum/actix-web 定义 `/api/companies/:company_id/pipelines` 路由组
   - 定义 `PipelineRouter` 结构体，注入 `Arc<dyn PipelineService>` 和 `Arc<dyn AccessService>`
   - 实现路由中间件：认证 + 公司访问权限校验（assert_pipeline_company_access）
 
-- [ ] **定义 Case 路由框架**
+- [x] **定义 Case 路由框架**
   - 定义 `/api/pipelines/:pipeline_id/cases` 路由组
   - 定义 `CaseRouter` 结构体，注入 `Arc<dyn CaseService>` 和 `Arc<dyn AccessService>`
   - 实现路由中间件：案例访问权限校验（assert_pipeline_case_access）
@@ -292,12 +292,12 @@
 
 ### 阶段二：核心功能
 
-- [ ] **实现 Pipeline CRUD 路由端点**
+- [x] **实现 Pipeline CRUD 路由端点**
   - 实现 `POST /companies/:company_id/pipelines`（create_pipeline + 权限检查 pipelines:write）
   - 实现 `GET /companies/:company_id/pipelines`（list_pipelines_by_company）
   - 实现 `GET /pipelines/:pipeline_id` / `PATCH` / `DELETE`（详情/更新/删除）
 
-- [ ] **实现 Case 操作路由端点**
+- [x] **实现 Case 操作路由端点**
   - 实现 `POST /pipelines/:pipeline_id/cases`（create_case）
   - 实现 `PATCH /pipelines/:pipeline_id/cases/:case_id/advance`（advance_case + 转换验证）
   - 实现 `POST /cases/:case_id/approve` / `reject` / `request-changes` / `breakdown`（案例生命周期操作）
@@ -309,12 +309,12 @@
 
 ### 阶段三：高级特性
 
-- [ ] **实现审核与关注路由端点**
+- [x] **实现审核与关注路由端点**
   - 实现 `GET /companies/:company_id/pipelines-attention`（获取需要关注的 Pipeline）
   - 实现 `GET /companies/:company_id/review-cases`（列出待审核案例）
   - 实现 `POST /companies/:company_id/review-cases/bulk`（批量审核）
 
-- [ ] **实现健康警告与事件路由**
+- [x] **实现健康警告与事件路由**
   - 实现 `GET /pipelines/:pipeline_id/health-warnings`（获取健康警告）
   - 实现 `GET /companies/:company_id/case-events`（列出公司案例事件）
   - 定义分页、过滤、排序查询参数结构体

@@ -9,7 +9,11 @@ pub use services::{
     BuiltInAgentService, AdapterRegistry, EnvironmentRuntimeService,
     OrgChartService, LowTrustService, CompanyService, ProjectService,
     RoutineService, GoalService, EnvironmentService, PipelineService,
-    SkillRegistryService,
+    SkillRegistryService, SseService, InviteService, OpenClawService,
+    UserDirectoryService, CustomImageSetupService, SecretProviderConfigService,
+    SecretRemoteImportService, EnvironmentDiagnosticsService,
+    InviteResourceService, RoutineAnnotationService, WorkProductService,
+    AttachmentService, UserSecretDefinitionService, UserSecretService,
 };
 
 pub use access::AccessService;
@@ -60,6 +64,22 @@ pub struct AppState {
     // Skills
     pub skill_registry_service: Arc<dyn SkillRegistryService>,
 
+    // Additional services for unmerged routes
+    pub sse_service: Arc<dyn SseService>,
+    pub invite_service: Arc<dyn InviteService>,
+    pub openclaw_service: Arc<dyn OpenClawService>,
+    pub user_directory_service: Arc<dyn UserDirectoryService>,
+    pub custom_image_setup_service: Arc<dyn CustomImageSetupService>,
+    pub secret_provider_config_service: Arc<dyn SecretProviderConfigService>,
+    pub secret_remote_import_service: Arc<dyn SecretRemoteImportService>,
+    pub environment_diagnostics_service: Arc<dyn EnvironmentDiagnosticsService>,
+    pub invite_resource_service: Arc<dyn InviteResourceService>,
+    pub routine_annotation_service: Arc<dyn RoutineAnnotationService>,
+    pub work_product_service: Arc<dyn WorkProductService>,
+    pub attachment_service: Arc<dyn AttachmentService>,
+    pub user_secret_definition_service: Arc<dyn UserSecretDefinitionService>,
+    pub user_secret_service: Arc<dyn UserSecretService>,
+
     // Shared DB pool
     pub pool: PgPool,
 }
@@ -88,6 +108,20 @@ impl AppState {
         environment_service: Arc<dyn EnvironmentService>,
         pipeline_service: Arc<dyn PipelineService>,
         skill_registry_service: Arc<dyn SkillRegistryService>,
+        sse_service: Arc<dyn SseService>,
+        invite_service: Arc<dyn InviteService>,
+        openclaw_service: Arc<dyn OpenClawService>,
+        user_directory_service: Arc<dyn UserDirectoryService>,
+        custom_image_setup_service: Arc<dyn CustomImageSetupService>,
+        secret_provider_config_service: Arc<dyn SecretProviderConfigService>,
+        secret_remote_import_service: Arc<dyn SecretRemoteImportService>,
+        environment_diagnostics_service: Arc<dyn EnvironmentDiagnosticsService>,
+        invite_resource_service: Arc<dyn InviteResourceService>,
+        routine_annotation_service: Arc<dyn RoutineAnnotationService>,
+        work_product_service: Arc<dyn WorkProductService>,
+        attachment_service: Arc<dyn AttachmentService>,
+        user_secret_definition_service: Arc<dyn UserSecretDefinitionService>,
+        user_secret_service: Arc<dyn UserSecretService>,
         pool: PgPool,
     ) -> Self {
         Self {
@@ -112,6 +146,20 @@ impl AppState {
             environment_service,
             pipeline_service,
             skill_registry_service,
+            sse_service,
+            invite_service,
+            openclaw_service,
+            user_directory_service,
+            custom_image_setup_service,
+            secret_provider_config_service,
+            secret_remote_import_service,
+            environment_diagnostics_service,
+            invite_resource_service,
+            routine_annotation_service,
+            work_product_service,
+            attachment_service,
+            user_secret_definition_service,
+            user_secret_service,
             pool,
         }
     }
@@ -153,6 +201,8 @@ pub fn create_router(state: AppState) -> Router {
         // Routine/Goal routes
         .merge(crate::routes::routines::routine_routes())
         .merge(crate::routes::goals::goal_routes())
+
+        // Phase 4: Additional service routes will be integrated in future rounds
 
         // Apply state
         .with_state(state)

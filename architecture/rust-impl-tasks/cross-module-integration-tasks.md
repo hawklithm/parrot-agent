@@ -472,15 +472,15 @@
 
 ### 阶段二：核心功能
 
-- [ ] **实现 Routine/Goal 路由文件**
+- [x] **实现 Routine/Goal 路由文件**
   - 创建 crates/api/src/routes/routines.rs：Routine CRUD + 触发 + 运行查询路由
   - 创建 crates/api/src/routes/goals.rs：Goal CRUD + 进度计算 + 层级查询路由
   - 在 AppState 中添加 RoutineService 和 GoalService
 
-- [ ] **实现 Pipeline HTTP 路由文件**
+- [x] **实现 Pipeline HTTP 路由文件**
   - 创建 crates/api/src/routes/pipelines.rs：Pipeline CRUD + Case操作 + Stage/Transition CRUD + 审核关注
   - 集成到主路由器
 
-- [ ] **AppState 完整集成**
+- [x] **AppState 完整集成（新增14个服务到AppState）**
   - 将所有缺失的服务添加到 AppState（SseService, InviteService, OpenClawService, UserDirectoryService, CustomImageSetupService, SecretProviderConfigService, SecretRemoteImportService, EnvironmentDiagnosticsService, InviteResourceService, RoutineAnnotationService, WorkProductService, AttachmentService, UserSecretDefinitionService, UserSecretService）
   - 确保所有路由都能正确访问其依赖的服务
