@@ -40,13 +40,18 @@ pub mod auth;
 pub mod user_secret_service;
 pub mod secret_provider_service;
 pub mod routine_service;
+pub use routine_service::{RoutineService, RoutineServiceImpl};
 pub mod routine_service_impl;
 pub mod jwt_service;
 pub mod session_service;
 pub mod event_listeners;
 pub mod goal_service;
+pub use goal_service::{GoalService, DefaultGoalService, CreateGoalInput, UpdateGoalInput, GoalHierarchy};
 pub mod pipeline_service;
+pub use pipeline_service::{PipelineService, DefaultPipelineService, AdvanceCaseInput, CreateCaseInput};
+
 pub mod approval_service;
+pub use approval_service::{ApprovalService, DefaultApprovalService};
 pub mod activity_log_service;
 pub mod environment_service;
 pub mod codex_local_isolation;

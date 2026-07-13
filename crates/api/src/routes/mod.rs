@@ -31,6 +31,8 @@ pub mod comments;
 pub mod tree_control;
 pub mod work_products;
 pub mod attachments;
+pub mod companies;
+pub mod projects;
 
 pub use access_control::{access_control_routes, CompanyId, MemberId, Token};
 pub use agents::agent_routes;
@@ -68,3 +70,5 @@ pub mod issue_diagnostics;
 pub use issue_diagnostics::issue_diagnostics_routes;
 pub mod low_trust;
 pub use low_trust::low_trust_routes;
+pub use companies::company_routes;
+pub use projects::project_routes;

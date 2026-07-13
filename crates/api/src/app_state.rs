@@ -7,7 +7,9 @@ pub use services::{
     AgentService, ConfigRevisionService, IssueService, CaseService,
     IssueCommentService, IssueDocumentService, IssueTreeControlService,
     BuiltInAgentService, AdapterRegistry, EnvironmentRuntimeService,
-    OrgChartService, LowTrustService,
+    OrgChartService, LowTrustService, CompanyService, ProjectService,
+    RoutineService, GoalService, EnvironmentService, PipelineService,
+    SkillRegistryService,
 };
 
 pub use access::AccessService;
@@ -41,11 +43,29 @@ pub struct AppState {
     // Low trust review
     pub low_trust_service: Arc<dyn LowTrustService>,
 
+    // Phase 3: Company/Org
+    pub company_service: Arc<CompanyService>,
+    pub project_service: Arc<ProjectService>,
+
+    // Phase 4: Routine/Goal
+    pub routine_service: Arc<dyn RoutineService>,
+    pub goal_service: Arc<dyn GoalService>,
+
+    // Environment
+    pub environment_service: Arc<dyn EnvironmentService>,
+
+    // Pipeline
+    pub pipeline_service: Arc<dyn PipelineService>,
+
+    // Skills
+    pub skill_registry_service: Arc<dyn SkillRegistryService>,
+
     // Shared DB pool
     pub pool: PgPool,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_service: Arc<dyn AgentService>,
         access_service: Arc<dyn AccessService>,
@@ -61,6 +81,13 @@ impl AppState {
         org_chart_service: Arc<dyn OrgChartService>,
         issue_diagnostics_service: Arc<dyn services::issue_diagnostics_service::IssueDiagnosticsService>,
         low_trust_service: Arc<dyn LowTrustService>,
+        company_service: Arc<CompanyService>,
+        project_service: Arc<ProjectService>,
+        routine_service: Arc<dyn RoutineService>,
+        goal_service: Arc<dyn GoalService>,
+        environment_service: Arc<dyn EnvironmentService>,
+        pipeline_service: Arc<dyn PipelineService>,
+        skill_registry_service: Arc<dyn SkillRegistryService>,
         pool: PgPool,
     ) -> Self {
         Self {
@@ -78,6 +105,13 @@ impl AppState {
             org_chart_service,
             issue_diagnostics_service,
             low_trust_service,
+            company_service,
+            project_service,
+            routine_service,
+            goal_service,
+            environment_service,
+            pipeline_service,
+            skill_registry_service,
             pool,
         }
     }
@@ -110,6 +144,10 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::issue_tree_control::issue_tree_control_routes())
         .merge(crate::routes::issue_diagnostics::issue_diagnostics_routes())
         .merge(crate::routes::low_trust::low_trust_routes())
+
+        // Phase 3: Company/Org routes
+        .merge(crate::routes::companies::company_routes())
+        .merge(crate::routes::projects::project_routes())
 
         // Apply state
         .with_state(state)

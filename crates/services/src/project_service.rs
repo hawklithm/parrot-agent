@@ -59,18 +59,9 @@ impl ProjectService {
     pub async fn delete_workspace(&self, id: Uuid) -> AppResult<bool> {
         Ok(self.project_repo.delete_workspace(id).await?)
     }
-}
 
-pub struct ResourceMembershipService {
-    project_repo: ProjectRepository,
-}
-
-impl ResourceMembershipService {
-    pub fn new(project_repo: ProjectRepository) -> Self {
-        Self { project_repo }
-    }
-
-    pub async fn list_for_user(&self, company_id: Uuid, user_id: Uuid) -> AppResult<ResourceMemberships> {
+    // Resource membership operations
+    pub async fn list_memberships_for_user(&self, company_id: Uuid, user_id: Uuid) -> AppResult<ResourceMemberships> {
         Ok(self.project_repo.list_memberships_for_user(company_id, user_id).await?)
     }
 
@@ -81,8 +72,7 @@ impl ResourceMembershipService {
         user_id: Uuid,
         state: MembershipState,
     ) -> AppResult<ProjectMembership> {
-        // TODO: assert_mutation_allowed when AccessService is implemented
-        // TODO: policy_hook evaluation
+        // TODO: assert_mutation_allowed when AccessService is integrated
         Ok(self.project_repo.upsert_project_membership(company_id, project_id, user_id, state).await?)
     }
 
