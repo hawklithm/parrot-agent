@@ -92,8 +92,15 @@ pub mod pipeline_repository;
 pub mod pipeline_stage_repository;
 pub mod pipeline_transition_repository;
 pub mod pipeline_case_repository;
+pub mod task_watchdog_repository;
 
 pub use pipeline_repository::{PipelineRepository, PostgresPipelineRepository};
 pub use pipeline_stage_repository::{PipelineStageRepository, PostgresPipelineStageRepository};
 pub use pipeline_transition_repository::{PipelineTransitionRepository, PostgresPipelineTransitionRepository};
 pub use pipeline_case_repository::{PipelineCaseRepository, PostgresPipelineCaseRepository};
+pub use task_watchdog_repository::{
+    HeartbeatRunRepository, PostgresHeartbeatRunRepository, IssueWatchdogRepository,
+    PostgresIssueWatchdogRepository, AgentWakeupRequestRepository,
+    PostgresAgentWakeupRequestRepository, IssueThreadInteractionRepository,
+    PostgresIssueThreadInteractionRepository,
+};

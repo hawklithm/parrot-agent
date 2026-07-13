@@ -258,18 +258,21 @@ impl<W> IssueStatusChangedToWatchdogEvalListener<W> {
 }
 
 #[async_trait]
-impl<W: TaskWatchdogService> EventHandler for IssueStatusChangedToWatchdogEvalListener<W> {
+impl<W: WatchdogService + Send + Sync> EventHandler for IssueStatusChangedToWatchdogEvalListener<W> {
     async fn handle(&self, event: &dyn Event) -> Result<(), String> {
         let system_event = match event.as_any().downcast_ref::<SystemEvent>() {
             Some(e) => e,
             None => return Ok(()),
         };
 
-        if let SystemEventPayload::Issue(IssueEvent::StatusChanged { issue_id, company_id, new_status, .. }) = &system_event.payload {
-            // When issue status changes, reconcile watchdogs for this issue and ancestors
-            self.watchdog_service
-                .reconcile_for_issue_and_ancestors(*company_id, *issue_id, new_status)
-                .await?;
+        if let SystemEventPayload::Issue(IssueEvent::StatusChanged { issue_id, company_id, .. }) = &system_event.payload {
+            // When issue status changes, find the watchdog for this issue and evaluate it
+            // Also evaluate watchdogs for ancestor issues (via the company-wide evaluation)
+            let watchdogs = self.watchdog_service
+                .evaluate_for_issue(*company_id, *issue_id)
+                .await
+                .map_err(|e| format!("Watchdog evaluation failed: {}", e))?;
+            let _ = watchdogs;
         }
 
         Ok(())
@@ -332,13 +335,11 @@ pub trait RecoveryActionService: Send + Sync {
     async fn resolve_active_for_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, String>;
 }
 
-#[async_trait]
-pub trait TaskWatchdogService: Send + Sync {
-    async fn reconcile_for_issue_and_ancestors(&self, company_id: Uuid, issue_id: Uuid, new_status: &str) -> Result<(), String>;
-}
-
 // Re-export RecoveryAction for use in trait
 use models::RecoveryAction;
+
+// WatchdogService trait — re-exported from task_watchdog module
+pub use crate::task_watchdog::WatchdogService;
 
 // Original service traits (existing)
 #[async_trait]

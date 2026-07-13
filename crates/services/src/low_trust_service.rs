@@ -140,6 +140,7 @@ mod tests {
         async fn get_by_identifier(&self, _identifier: &str) -> Result<Option<Issue>, RepositoryError> { Ok(None) }
         async fn list_by_parent(&self, _parent_id: Uuid, _pagination: &models::Pagination) -> Result<Vec<Issue>, RepositoryError> { Ok(vec![]) }
         async fn get_by_ids(&self, _ids: Vec<Uuid>) -> Result<Vec<Issue>, RepositoryError> { Ok(vec![]) }
+        async fn list_ancestors(&self, _issue_id: Uuid) -> Result<Vec<Issue>, RepositoryError> { Ok(vec![]) }
     }
 
     #[tokio::test]

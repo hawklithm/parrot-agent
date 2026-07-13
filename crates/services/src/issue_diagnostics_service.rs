@@ -243,6 +243,9 @@ mod tests {
         async fn get_by_ids(&self, _ids: Vec<Uuid>) -> Result<Vec<Issue>, RepositoryError> {
             Ok(vec![])
         }
+        async fn list_ancestors(&self, _issue_id: Uuid) -> Result<Vec<Issue>, RepositoryError> {
+            Ok(vec![])
+        }
     }
 
     #[tokio::test]

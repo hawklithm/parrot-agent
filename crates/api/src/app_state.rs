@@ -14,9 +14,12 @@ pub use services::{
     SecretRemoteImportService, EnvironmentDiagnosticsService,
     InviteResourceService, RoutineAnnotationService, WorkProductService,
     AttachmentService, UserSecretDefinitionService, UserSecretService,
+    WatchdogService,
 };
 
 pub use access::AccessService;
+
+pub use models::event_bus::EventBus;
 
 /// Helper: wrap a service-backed router into an AppState-compatible router
 fn wrap_routes<S>(routes: Router<S>, state: S) -> Router
@@ -88,6 +91,12 @@ pub struct AppState {
     pub user_secret_definition_service: Arc<dyn UserSecretDefinitionService>,
     pub user_secret_service: Arc<dyn UserSecretService>,
 
+    // Task watchdog subsystem
+    pub watchdog_service: Arc<dyn WatchdogService>,
+
+    // Event bus
+    pub event_bus: Arc<dyn EventBus>,
+
     // Shared DB pool
     pub pool: PgPool,
 }
@@ -130,6 +139,8 @@ impl AppState {
         attachment_service: Arc<dyn AttachmentService>,
         user_secret_definition_service: Arc<dyn UserSecretDefinitionService>,
         user_secret_service: Arc<dyn UserSecretService>,
+        watchdog_service: Arc<dyn WatchdogService>,
+        event_bus: Arc<dyn EventBus>,
         pool: PgPool,
     ) -> Self {
         Self {
@@ -168,6 +179,8 @@ impl AppState {
             attachment_service,
             user_secret_definition_service,
             user_secret_service,
+            watchdog_service,
+            event_bus,
             pool,
         }
     }
@@ -228,6 +241,9 @@ pub fn create_router(state: AppState) -> Router {
         // Routes with Arc<dyn X> state type (need wrapping)
         .merge(crate::routes::user_secrets::user_secret_routes().with_state(state.user_secret_service.clone()))
         .merge(crate::routes::invites::invite_subresource_routes().with_state(state.invite_service.clone()))
+
+        // Task watchdog routes (Arc<dyn WatchdogService> state)
+        .merge(crate::routes::watchdogs::watchdog_routes().with_state(state.watchdog_service.clone()))
 
         // Apply state
         .with_state(state)

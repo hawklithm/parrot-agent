@@ -503,4 +503,41 @@ impl IssueRepository for PgIssueRepository {
 
         Ok(issues)
     }
+
+    async fn list_ancestors(&self, issue_id: Uuid) -> Result<Vec<Issue>, RepositoryError> {
+        let issues = sqlx::query_as::<_, Issue>(
+            r#"WITH RECURSIVE ancestors AS (
+                 SELECT id, company_id, project_id, project_workspace_id, goal_id, parent_id,
+                        title, name, description, status, priority, work_mode,
+                        assignee_agent_id, assignee_user_id, responsible_user_id, source_trust,
+                        created_by_agent_id, created_by_user_id, origin_kind, origin_id,
+                        origin_run_id, origin_fingerprint, execution_workspace_id,
+                        execution_workspace_preference, execution_policy, execution_state,
+                        execution_locked_at, execution_run_id, monitor_scheduled_by,
+                        monitor_notes, monitor_next_check_at, monitor_last_triggered_at,
+                        monitor_attempt_count, hidden_at, created_at, updated_at, identifier
+                   FROM issues WHERE id = $1
+                  UNION ALL
+                 SELECT p.id, p.company_id, p.project_id, p.project_workspace_id, p.goal_id, p.parent_id,
+                        p.title, p.name, p.description, p.status, p.priority, p.work_mode,
+                        p.assignee_agent_id, p.assignee_user_id, p.responsible_user_id, p.source_trust,
+                        p.created_by_agent_id, p.created_by_user_id, p.origin_kind, p.origin_id,
+                        p.origin_run_id, p.origin_fingerprint, p.execution_workspace_id,
+                        p.execution_workspace_preference, p.execution_policy, p.execution_state,
+                        p.execution_locked_at, p.execution_run_id, p.monitor_scheduled_by,
+                        p.monitor_notes, p.monitor_next_check_at, p.monitor_last_triggered_at,
+                        p.monitor_attempt_count, p.hidden_at, p.created_at, p.updated_at, p.identifier
+                   FROM issues p
+                   JOIN ancestors a ON p.id = a.parent_id
+               )
+               SELECT * FROM ancestors WHERE id != $1
+               ORDER BY parent_id NULLS LAST"#,
+        )
+        .bind(issue_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        Ok(issues)
+    }
 }

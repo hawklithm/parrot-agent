@@ -310,7 +310,7 @@ pub struct Issue {
 }
 
 /// Create issue input
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateIssueInput {
     pub company_id: Uuid,

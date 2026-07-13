@@ -706,6 +706,7 @@ mod tests {
         async fn get_by_identifier(&self, _identifier: &str) -> Result<Option<Issue>, String> { Ok(None) }
         async fn list_by_parent(&self, _parent_id: Uuid, _pagination: &crate::issue_repository::Pagination) -> Result<Vec<Issue>, String> { Ok(vec![]) }
         async fn get_by_ids(&self, _ids: Vec<Uuid>) -> Result<Vec<Issue>, String> { Ok(vec![]) }
+        async fn list_ancestors(&self, _issue_id: Uuid) -> Result<Vec<Issue>, String> { Ok(vec![]) }
     }
 
     struct MockApprovalRepo;

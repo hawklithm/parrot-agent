@@ -42,6 +42,7 @@ pub mod user_directory;
 pub mod user_secret;
 pub mod user_secret_definition;
 pub mod websocket;
+pub mod task_watchdog;
 
 // ===== 显式导出：消除 glob re-export 歧义 =====
 // 规则：显式导出优先于 glob 导出，放在 glob 之前即可消除歧义
@@ -74,6 +75,7 @@ pub use event_bus::{
 pub use secrets::{UserSecretDefinition, UserSecret, SecretBinding};
 pub use issue_document::{
     LockDocumentInput, Attachment, CreateWorkProductInput, UpdateWorkProductInput,
+    AnnotationThreadStatus,
 };
 pub use secret_provider::{ProviderHealthStatus, SecretProviderConfig};
 
@@ -89,12 +91,10 @@ pub use case::*;
 pub use company::*;
 pub use cost_event::*;
 pub use custom_image_setup::*;
-pub use environment::*;
 pub use environment_diagnostics::*;
 pub use error::*;
 pub use event_bus::*;
 pub use events::*;
-pub use execution_environment::*;
 pub use goal::*;
 pub use invite::*;
 pub use invite_resource::*;

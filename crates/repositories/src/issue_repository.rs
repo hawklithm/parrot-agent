@@ -60,4 +60,8 @@ pub trait IssueRepository: Send + Sync {
 
     /// Get issues by multiple IDs
     async fn get_by_ids(&self, ids: Vec<Uuid>) -> Result<Vec<Issue>, RepositoryError>;
+
+    /// Walk up the parent chain from an issue and return all ancestors.
+    /// Returns them in order from immediate parent to root.
+    async fn list_ancestors(&self, issue_id: Uuid) -> Result<Vec<Issue>, RepositoryError>;
 }

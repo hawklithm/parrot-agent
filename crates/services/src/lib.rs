@@ -188,6 +188,8 @@ pub use issue_diagnostics_service::*;
 pub mod low_trust_service;
 pub mod heartbeat_service;
 pub use heartbeat_service::*;
+pub mod task_watchdog;
+pub use task_watchdog::{WatchdogService, DefaultWatchdogService, classify_subtree, ClassifierState, ClassifierInput, StoppedLeaf};
 pub mod retry;
 pub use retry::*;
 pub mod job_scheduler;
@@ -195,7 +197,14 @@ pub use job_scheduler::*;
 pub mod config;
 pub use config::*;
 pub mod adapter_plugin;
-pub use adapter_plugin::*;
+pub use adapter_plugin::{
+    AdapterPluginLoader, DefaultAdapterPluginLoader, AdapterPluginStore,
+    AdapterPluginRecord, AdapterPluginError, AdapterPluginResult,
+    AdapterInstallRequest, AdapterSkillEntry,
+    ModelProfileKey, AdapterModelProfileDefinition, ModelProfileApplication,
+    ModelProfileRequestSource, AppliedModelProfileConfigSource,
+    resolve_model_profile_application,
+};
 pub mod adapter_executor;
 pub use adapter_executor::*;
 pub use job_scheduler::*;

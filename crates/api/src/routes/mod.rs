@@ -73,6 +73,8 @@ pub mod issue_diagnostics;
 pub use issue_diagnostics::issue_diagnostics_routes;
 pub mod low_trust;
 pub use low_trust::low_trust_routes;
+pub mod watchdogs;
+pub use watchdogs::watchdog_routes;
 pub use companies::company_routes;
 pub use projects::project_routes;
 pub use pipelines::pipeline_routes;

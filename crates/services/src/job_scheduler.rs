@@ -9,6 +9,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration, Instant};
 use uuid::Uuid;
+use crate::WatchdogService;
+use repositories::CompanyRepository;
 
 /// 任务执行记录
 #[derive(Debug, Clone)]
@@ -297,5 +299,63 @@ impl ScheduledJob for ConsistencyCheckJob {
     async fn execute(&self) -> Result<String, String> {
         // TODO: Run consistency checks
         Ok("Consistency check completed".to_string())
+    }
+}
+
+// ============================================================================
+// Task Watchdog 定时评估器
+// ============================================================================
+
+/// Watchdog 定时评估任务（每5分钟）
+///
+/// Periodically evaluates all active watchdogs across companies.
+/// Requires a CompanyRepository to discover which companies have active watchdogs.
+pub struct WatchdogEvaluationJob {
+    watchdog_service: Arc<dyn WatchdogService>,
+    company_repo: Arc<CompanyRepository>,
+}
+
+impl WatchdogEvaluationJob {
+    pub fn new(
+        watchdog_service: Arc<dyn WatchdogService>,
+        company_repo: Arc<CompanyRepository>,
+    ) -> Self {
+        Self {
+            watchdog_service,
+            company_repo,
+        }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for WatchdogEvaluationJob {
+    fn job_name(&self) -> &str {
+        "watchdog_evaluation"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(300) // 每5分钟
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        // Load all companies and evaluate watchdogs for each
+        let companies = self.company_repo.list(1000, 0).await
+            .map_err(|e| format!("Failed to list companies: {}", e))?;
+
+        let mut total_evaluated = 0usize;
+        let mut errors = Vec::new();
+
+        for company in &companies {
+            match self.watchdog_service.evaluate_all(company.id).await {
+                Ok(count) => total_evaluated += count,
+                Err(e) => errors.push(format!("Company {}: {}", company.id, e)),
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(format!("Watchdog evaluation completed: {} watchdogs evaluated across {} companies", total_evaluated, companies.len()))
+        } else {
+            Err(format!("Watchdog evaluation completed with errors: {} evaluated, {} companies, errors: {}", total_evaluated, companies.len(), errors.join("; ")))
+        }
     }
 }
