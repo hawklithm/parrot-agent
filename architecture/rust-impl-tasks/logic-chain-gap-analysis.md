@@ -76,13 +76,13 @@
 **解决方案**：
 ```rust
 // 需添加到 agent-management-tasks.md 或 realtime-environment-tasks.md
-- [ ] 定义 Agent 任务轮询机制
+- [x] 定义 Agent 任务轮询机制
   - 实现 GET /agents/me/pending-issues 轮询端点
   - 或实现 WebSocket 推送任务分配事件
   - 实现 Agent 收到 wakeup() 后的执行入口点
   - (注: 当前代码中 `agent_service.get_me()` 已支持 Agent Key 认证，但待处理任务推送机制尚未实现)
 
-- [ ] 实现 Agent 执行生命周期管理
+- [x] 实现 Agent 执行生命周期管理
   - Agent 收到任务 -> 获取环境 -> 执行 -> 释放环境 -> 更新 Issue 状态
   - 实现执行失败时的重试与回滚策略
   - (注: `reset_session()` 已实现存根，完整生命周期管理需 Saga 编排器集成)

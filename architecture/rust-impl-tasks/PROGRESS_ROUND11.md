@@ -165,15 +165,15 @@ $ cargo check --workspace
 根据依赖顺序，下一轮（第12轮）应实现：
 
 ### 优先级1: Agent CRUD 服务层阶段二（循环检测集成）
-- [ ] 在 `AgentService::update_agent()` 中集成 `OrgChartService`
-- [ ] 更新 `reports_to_agent_id` 时调用 `detect_circular_dependencies()`
-- [ ] 返回 `ServiceError::ReportingCycle` 错误
+- [x] 在 `AgentService::update_agent()` 中集成 `OrgChartService`
+- [x] 更新 `reports_to_agent_id` 时调用 `detect_circular_dependencies()`
+- [x] 返回 `ServiceError::ReportingCycle` 错误
 
 ### 优先级2: 内置 Agent 服务层阶段二（核心功能）
-- [ ] 实现 `BuiltInAgentService::provision()` 方法
-- [ ] 实现 `materialize_instructions()` 方法
-- [ ] 实现 `get_status()` 状态机逻辑
-- [ ] 集成 Agent 创建和 Secrets 服务
+- [x] 实现 `BuiltInAgentService::provision()` 方法
+- [x] 实现 `materialize_instructions()` 方法
+- [x] 实现 `get_status()` 状态机逻辑
+- [x] 集成 Agent 创建和 Secrets 服务
 
 ---
 
