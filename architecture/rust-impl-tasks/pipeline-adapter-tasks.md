@@ -92,24 +92,24 @@
   - 实现 `list_pipelines_by_company()`（含分页支持）
   - 实现 `update_pipeline()` / `delete_pipeline()`（含权限检查集成点）
 
-- [x] **实现案例推进核心逻辑**
+- [ ] **实现案例推进核心逻辑**
   - 实现 `advance_case()`：验证转换规则合法（from_stage -> to_stage 存在于 transitions）、更新 stage_id、评估自动推进
   - 实现 `evaluate_auto_advance()`：检查 `auto_advance_on_children_terminal` 配置，递归推进子案例
   - 实现 `review_case()`：根据 `CaseReviewDecision` 执行审批/拒绝/请求修改，更新 terminal_kind
 
-- [x] **实现案例分解逻辑**
+- [ ] **实现案例分解逻辑**
   - 实现 `breakdown_case()`：按 `PipelineStageConfig.breakdown` 配置创建子案例
   - 实现 `target_pipeline_id` / `target_stage_key` 解析（跨 Pipeline 分解支持）
   - 实现父案例与子案例的关联维护（parent_case_id 字段）
 
-- [x] **实现健康警告与关注列表**
+- [ ] **实现健康警告与关注列表**
   - 实现 `get_health_warnings()`：检查停滞案例、阻塞案例、审批超时
   - 实现 `get_pipelines_attention()`：按公司维度聚合需要关注的 Pipeline
   - 定义 `HealthWarning` 结构体（warning_type, pipeline_id, case_id, message, severity）
 
 ### 阶段三：高级特性
 
-- [x] **实现批量审核**
+- [ ] **实现批量审核**
   - 实现 `bulk_review_cases()`：批量执行审批/拒绝操作（事务性保证）
   - 实现批量操作的结果聚合（部分成功/部分失败处理）
   - 定义 `BulkReviewResult` 结构体（succeeded: Vec<CaseId>, failed: Vec<(CaseId, Error)>）
@@ -175,12 +175,12 @@
 
 ### 阶段一：基础架构
 
-- [x] **定义 Adapter 插件加载接口**
+- [ ] **定义 Adapter 插件加载接口**
   - 定义 `AdapterPluginLoader` trait（load_from_path(), load_from_npm()）
   - 定义 `AdapterPluginRecord` 结构体（type, package_name, version, is_local_path, local_path, installed_at）
   - 定义 `AdapterInstallRequest` 结构体（package_name, is_local_path, version）
 
-- [x] **定义技能与模型 Profile 接口**
+- [ ] **定义技能与模型 Profile 接口**
   - 定义 `AdapterSkillEntry` 结构体（skill_id, name, description, content）
   - 定义 `AdapterModelProfileDefinition` 结构体（key, label, config_overrides）
   - 定义 `ModelProfileKey` 枚举（default, fast, balanced, deep）
@@ -192,17 +192,17 @@
 
 ### 阶段二：核心功能
 
-- [x] **实现本地路径 Adapter 加载**
+- [ ] **实现本地路径 Adapter 加载**
   - 实现 `normalize_local_path()` 函数（路径安全校验与规范化）
   - 实现 `load_external_adapter_package()` 从本地路径加载 adapter 动态库（使用 libloading 或 WASM）
   - 实现加载后的 `register_server_adapter()` 集成
 
-- [x] **实现 NPM 包 Adapter 安装**
+- [ ] **实现 NPM 包 Adapter 安装**
   - 实现 `get_adapter_plugins_dir()` 函数（获取插件目录路径）
   - 实现 `npm_install_adapter()` 函数（执行 npm install --no-save，带 120s 超时）
   - 实现 `read_installed_package_version()` 从 package.json 读取版本信息
 
-- [x] **实现 Adapter 插件持久化**
+- [ ] **实现 Adapter 插件持久化**
   - 实现 `AdapterPluginStore` 结构体（管理 AdapterPluginRecord 列表）
   - 实现 `add_adapter_plugin()` / `remove_adapter_plugin()` 方法
   - 实现插件记录的文件持久化（JSON 文件存储）
@@ -225,24 +225,24 @@
 
 ### 阶段一：基础架构
 
-- [x] **定义执行引擎核心接口**
+- [ ] **定义执行引擎核心接口**
   - 定义 `AdapterExecutor` trait（execute(ctx) -> AdapterExecutionResult）
   - 定义 `AdapterRuntime` 结构体（runtime_command_spec, environment, working_dir）
   - 定义 `AdapterRuntimeCommandSpec` 结构体（command, args, env）
 
-- [x] **定义执行回调接口**
+- [ ] **定义执行回调接口**
   - 定义 `LogSink` trait（on_log(stream: StdioKind, chunk: &str)）
   - 定义 `RuntimeStatusSink` trait（on_runtime_progress(status: &RuntimeStatus)）
   - 定义 `SpawnNotifier` trait（on_spawn(pid, process_group_id, started_at)）
 
-- [x] **定义本地与远程执行类型**
+- [ ] **定义本地与远程执行类型**
   - 定义 `LocalExecutor` 结构体（持有 tokio::process::Command）
   - 定义 `RemoteExecutor` 结构体（持有远程连接配置）
   - 定义 `ExecutionTargetConfig` 结构体（target_type, connection_info, asset_sync_config）
 
 ### 阶段二：核心功能
 
-- [x] **实现本地 Adapter 执行**
+- [ ] **实现本地 Adapter 执行**
   - 实现 `LocalExecutor::execute()`：准备运行时配置 -> 构建环境变量 -> spawn 子进程
   - 实现 stdout/stderr 流式输出回调（tokio 异步管道读取 -> on_log）
   - 实现进程生命周期管理（启动、超时 kill、退出码收集）
@@ -275,12 +275,12 @@
 
 ### 阶段一：基础架构
 
-- [x] **定义 Pipeline 路由框架**
+- [ ] **定义 Pipeline 路由框架**
   - 使用 axum/actix-web 定义 `/api/companies/:company_id/pipelines` 路由组
   - 定义 `PipelineRouter` 结构体，注入 `Arc<dyn PipelineService>` 和 `Arc<dyn AccessService>`
   - 实现路由中间件：认证 + 公司访问权限校验（assert_pipeline_company_access）
 
-- [x] **定义 Case 路由框架**
+- [ ] **定义 Case 路由框架**
   - 定义 `/api/pipelines/:pipeline_id/cases` 路由组
   - 定义 `CaseRouter` 结构体，注入 `Arc<dyn CaseService>` 和 `Arc<dyn AccessService>`
   - 实现路由中间件：案例访问权限校验（assert_pipeline_case_access）
@@ -292,12 +292,12 @@
 
 ### 阶段二：核心功能
 
-- [x] **实现 Pipeline CRUD 路由端点**
+- [ ] **实现 Pipeline CRUD 路由端点**
   - 实现 `POST /companies/:company_id/pipelines`（create_pipeline + 权限检查 pipelines:write）
   - 实现 `GET /companies/:company_id/pipelines`（list_pipelines_by_company）
   - 实现 `GET /pipelines/:pipeline_id` / `PATCH` / `DELETE`（详情/更新/删除）
 
-- [x] **实现 Case 操作路由端点**
+- [ ] **实现 Case 操作路由端点**
   - 实现 `POST /pipelines/:pipeline_id/cases`（create_case）
   - 实现 `PATCH /pipelines/:pipeline_id/cases/:case_id/advance`（advance_case + 转换验证）
   - 实现 `POST /cases/:case_id/approve` / `reject` / `request-changes` / `breakdown`（案例生命周期操作）
@@ -309,12 +309,12 @@
 
 ### 阶段三：高级特性
 
-- [x] **实现审核与关注路由端点**
+- [ ] **实现审核与关注路由端点**
   - 实现 `GET /companies/:company_id/pipelines-attention`（获取需要关注的 Pipeline）
   - 实现 `GET /companies/:company_id/review-cases`（列出待审核案例）
   - 实现 `POST /companies/:company_id/review-cases/bulk`（批量审核）
 
-- [x] **实现健康警告与事件路由**
+- [ ] **实现健康警告与事件路由**
   - 实现 `GET /pipelines/:pipeline_id/health-warnings`（获取健康警告）
   - 实现 `GET /companies/:company_id/case-events`（列出公司案例事件）
   - 定义分页、过滤、排序查询参数结构体
@@ -370,29 +370,29 @@
 
 ### 阶段一：基础架构
 
-- [x] **定义 Config 核心枚举**
+- [ ] **定义 Config 核心枚举**
   - 定义 `DeploymentMode` 枚举（local_trusted / authenticated）
   - 定义 `DeploymentExposure` 枚举（private / public）
   - 定义 `BindMode` 枚举（loopback / lan / tailnet / custom）
 
-- [x] **定义 Config 数据库与存储枚举**
+- [ ] **定义 Config 数据库与存储枚举**
   - 定义 `DatabaseMode` 枚举（embedded_postgres / postgres）
   - 定义 `StorageProvider` 枚举（local_disk / s3）
   - 定义 `SecretProvider` 枚举（local_encrypted / aws_secrets_manager / gcp_secret_manager / vault）
 
-- [x] **定义 Config 结构体**
+- [ ] **定义 Config 结构体**
   - 定义 `Config` 结构体，包含所有配置字段（deployment, auth, database, storage, secrets, ui, heartbeat 等）
   - 定义 `ConfigBuilder` 使用 builder 模式逐步构建
   - 定义 `ConfigError` 枚举（MissingRequired, InvalidValue, ParseError）
 
 ### 阶段二：核心功能
 
-- [x] **实现配置加载优先级**
+- [ ] **实现配置加载优先级**
   - 实现环境变量加载（PAPERCLIP_* 前缀，支持嵌套 key 如 PAPERCLIP_DATABASE_URL）
   - 实现配置文件加载（config.yaml / config.toml，使用 serde 反序列化）
   - 实现优先级合并逻辑：环境变量 > 配置文件 > 默认值
 
-- [x] **实现配置校验与默认值**
+- [ ] **实现配置校验与默认值**
   - 实现 `Config::validate()` 方法（校验端口范围、URL 格式、路径存在性等）
   - 实现 `Default for Config` trait（合理默认值）
   - 实现 `Config::load()` 入口方法（加载 + 校验 + 返回）
@@ -449,7 +449,7 @@
 
 ### 阶段三：高级特性
 
-- [x] **实现审批流程权限控制**
+- [ ] **实现审批流程权限控制**
   - 实现 `StageApprover` 匹配逻辑（any_human / user / agent 三种审批者类型）
   - 实现 `require_approval` 配置下的操作拦截与审批请求生成
   - 实现审批请求的创建与追踪（issue_service 集成点）

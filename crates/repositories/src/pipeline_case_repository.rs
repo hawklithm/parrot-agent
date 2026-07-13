@@ -13,6 +13,7 @@ pub trait PipelineCaseRepository: Send + Sync {
     async fn update(&self, case: PipelineCase) -> RepositoryResult<PipelineCase>;
     async fn find_by_stage_id(&self, stage_id: Uuid) -> RepositoryResult<Vec<PipelineCase>>;
     async fn find_by_pipeline_id(&self, pipeline_id: Uuid) -> RepositoryResult<Vec<PipelineCase>>;
+    async fn find_by_parent_case_id(&self, parent_case_id: Uuid) -> RepositoryResult<Vec<PipelineCase>>;
     async fn find_events_by_case_id(&self, case_id: Uuid) -> RepositoryResult<Vec<CaseEvent>>;
     async fn create_event(&self, event: CaseEvent) -> RepositoryResult<CaseEvent>;
 }
@@ -104,6 +105,18 @@ impl PipelineCaseRepository for PostgresPipelineCaseRepository {
             &format!("SELECT {} FROM pipeline_cases WHERE pipeline_id = $1 ORDER BY created_at DESC", CASE_COLS)
         )
         .bind(pipeline_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(cases)
+    }
+
+    async fn find_by_parent_case_id(&self, parent_case_id: Uuid) -> RepositoryResult<Vec<PipelineCase>> {
+        // Use fields JSONB to store parent_case_id relationship
+        // Query: pipeline_cases WHERE fields->>'parent_case_id' = $1
+        let cases = sqlx::query_as::<_, PipelineCase>(
+            &format!("SELECT {} FROM pipeline_cases WHERE fields->>'parent_case_id' = $1 ORDER BY created_at ASC", CASE_COLS)
+        )
+        .bind(parent_case_id.to_string())
         .fetch_all(&self.pool)
         .await?;
         Ok(cases)

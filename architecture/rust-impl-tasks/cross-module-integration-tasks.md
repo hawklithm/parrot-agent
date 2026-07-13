@@ -410,3 +410,77 @@
 **总任务数**: ~90 个  
 **覆盖模块**: 跨模块协调 + 系统基础设施  
 **优先级**: P1 - 所有模块依赖的基础设施
+
+---
+
+## 7. 路由集成与系统组装 实现任务
+
+### 阶段一：基础架构
+
+- [ ] **将 environments 路由合并到主路由器**
+  - 在 create_router() 中调用 .merge(crate::routes::environments::environment_routes())
+  - 确保 AppState 包含 EnvironmentService
+
+- [ ] **将 skills 路由合并到主路由器**
+  - 调用 .merge(crate::routes::skills::skill_routes(state.skill_registry_service.clone()))
+  - 确保 SkillRegistryService 已注册
+
+- [ ] **将 user_secrets 路由合并到主路由器**
+  - 调用 .merge(crate::routes::user_secrets::user_secret_routes())
+  - 确保 UserSecretService 已注册
+
+- [ ] **将 sse 路由合并到主路由器**
+  - 调用 .merge(crate::routes::sse::sse_routes(state.sse_service.clone()))
+  - 确保 SseService 已注册到 AppState
+
+- [ ] **将 invites 路由合并到主路由器**
+  - 调用 .merge(crate::routes::invites::invite_subresource_routes())
+  - 确保 InviteService 已注册
+
+- [ ] **将 openclaw 路由合并到主路由器**
+  - 调用 .merge(crate::routes::openclaw::openclaw_routes(state.openclaw_service.clone()))
+  - 确保 OpenClawService 已注册
+
+- [ ] **将 user_directory 路由合并到主路由器**
+  - 调用 .merge(crate::routes::user_directory::user_directory_routes(state.user_directory_service.clone()))
+
+- [ ] **将 custom_image_setup 路由合并到主路由器**
+  - 调用 .merge(crate::routes::custom_image_setup::custom_image_setup_routes(...))
+
+- [ ] **将 secret_remote_import / secret_provider_configs 路由合并到主路由器**
+  - 调用 .merge(crate::routes::secret_remote_import::secret_remote_import_routes(...))
+  - 调用 .merge(crate::routes::secret_provider_configs::secret_provider_config_routes(...))
+
+- [ ] **将 environment_diagnostics / heartbeats 路由合并到主路由器**
+  - 调用 .merge(crate::routes::environment_diagnostics::environment_diagnostics_routes(...))
+  - 调用 .merge(crate::routes::heartbeats::heartbeats_routes(...))
+
+- [ ] **将 invite_resources / routine_annotations 路由合并到主路由器**
+  - 调用 .merge(crate::routes::invite_resources::invite_resource_routes(...))
+  - 调用 .merge(crate::routes::routine_annotations::routine_annotation_routes(...))
+
+- [ ] **将 org_chart / documents / comments / tree_control 路由合并到主路由器**
+  - 调用 .merge(crate::routes::org_chart::org_chart_routes(...))
+  - 调用 .merge(crate::routes::documents::document_routes())
+  - 调用 .merge(crate::routes::comments::comment_routes())
+  - 调用 .merge(crate::routes::tree_control::tree_control_routes())
+
+- [ ] **将 work_products / attachments / user_secret_definitions 路由合并到主路由器**
+  - 调用 .merge(crate::routes::work_products::work_product_routes(...))
+  - 调用 .merge(crate::routes::attachments::attachment_routes(...))
+  - 调用 .merge(crate::routes::user_secret_definitions::user_secret_definition_routes(...))
+
+### 阶段二：核心功能
+
+- [ ] **实现 Routine/Goal 路由文件**
+  - 创建 crates/api/src/routes/routines.rs：Routine CRUD + 触发 + 运行查询路由
+  - 创建 crates/api/src/routes/goals.rs：Goal CRUD + 进度计算 + 层级查询路由
+  - 在 AppState 中添加 RoutineService 和 GoalService
+
+- [ ] **实现 Pipeline HTTP 路由文件**
+  - 创建 crates/api/src/routes/pipelines.rs：Pipeline CRUD + Case操作 + Stage/Transition CRUD + 审核关注
+  - 集成到主路由器
+
+- [ ] **AppState 完整集成**
+  - 将所有缺失的服务添加到 AppState（SseService, InviteService, OpenClawService, UserDirectoryService, CustomImageSetupService, SecretProviderConfigService, SecretRemoteImportService, EnvironmentDiagnosticsService, InviteResourceService, RoutineAnnotationService, WorkProductService, AttachmentService, UserSecretDefinitionService, UserSecretService）
+  - 确保所有路由都能正确访问其依赖的服务

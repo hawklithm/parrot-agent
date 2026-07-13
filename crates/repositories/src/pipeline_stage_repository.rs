@@ -10,6 +10,8 @@ use models::pipeline::PipelineStage;
 pub trait PipelineStageRepository: Send + Sync {
     async fn create(&self, stage: PipelineStage) -> RepositoryResult<PipelineStage>;
     async fn find_by_id(&self, id: Uuid) -> RepositoryResult<Option<PipelineStage>>;
+    async fn find_by_key(&self, pipeline_id: Uuid, key: &str) -> RepositoryResult<Option<PipelineStage>>;
+    async fn find_by_pipeline_id(&self, pipeline_id: Uuid) -> RepositoryResult<Vec<PipelineStage>>;
 }
 
 pub struct PostgresPipelineStageRepository {
@@ -54,5 +56,26 @@ impl PipelineStageRepository for PostgresPipelineStageRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(stage)
+    }
+
+    async fn find_by_key(&self, pipeline_id: Uuid, key: &str) -> RepositoryResult<Option<PipelineStage>> {
+        let stage = sqlx::query_as::<_, PipelineStage>(
+            &format!("SELECT {} FROM pipeline_stages WHERE pipeline_id = $1 AND key = $2", STAGE_COLS)
+        )
+        .bind(pipeline_id)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(stage)
+    }
+
+    async fn find_by_pipeline_id(&self, pipeline_id: Uuid) -> RepositoryResult<Vec<PipelineStage>> {
+        let stages = sqlx::query_as::<_, PipelineStage>(
+            &format!("SELECT {} FROM pipeline_stages WHERE pipeline_id = $1 ORDER BY position ASC", STAGE_COLS)
+        )
+        .bind(pipeline_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(stages)
     }
 }

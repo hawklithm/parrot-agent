@@ -10,6 +10,7 @@ use models::pipeline::Pipeline;
 pub trait PipelineRepository: Send + Sync {
     async fn create(&self, pipeline: Pipeline) -> RepositoryResult<Pipeline>;
     async fn find_by_id(&self, id: Uuid) -> RepositoryResult<Option<Pipeline>>;
+    async fn list_by_company(&self, company_id: Uuid) -> RepositoryResult<Vec<Pipeline>>;
 }
 
 pub struct PostgresPipelineRepository {
@@ -54,5 +55,15 @@ impl PipelineRepository for PostgresPipelineRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(pipeline)
+    }
+
+    async fn list_by_company(&self, company_id: Uuid) -> RepositoryResult<Vec<Pipeline>> {
+        let pipelines = sqlx::query_as::<_, Pipeline>(
+            &format!("SELECT {} FROM pipelines WHERE company_id = $1 ORDER BY created_at DESC", PIPELINE_COLS)
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(pipelines)
     }
 }

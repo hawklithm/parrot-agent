@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use repositories::{PipelineRepository, PipelineCaseRepository, PipelineStageRepository, PipelineTransitionRepository};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -30,6 +31,41 @@ pub struct CreateCaseInput {
     pub title: String,
     pub summary: Option<String>,
     pub fields: serde_json::Value,
+}
+
+/// Case review decision
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CaseReviewDecision {
+    Approve,
+    Reject,
+    RequestChanges,
+}
+
+/// Case review input
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseReviewInput {
+    pub case_id: Uuid,
+    pub decision: CaseReviewDecision,
+    pub reason: Option<String>,
+    pub actor_type: Option<String>,
+    pub actor_id: Option<Uuid>,
+}
+
+/// Bulk review result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkReviewResult {
+    pub succeeded: Vec<Uuid>,
+    pub failed: Vec<(Uuid, String)>,
+}
+
+/// Health warning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthWarning {
+    pub warning_type: String,
+    pub pipeline_id: Uuid,
+    pub case_id: Uuid,
+    pub message: String,
+    pub severity: String,
 }
 
 /// Pipeline Service trait
@@ -61,6 +97,24 @@ pub trait PipelineService: Send + Sync {
 
     /// Get case history (events)
     async fn get_case_events(&self, case_id: Uuid) -> Result<Vec<CaseEvent>, ServiceError>;
+
+    /// Evaluate auto-advance for case children
+    async fn evaluate_auto_advance(&self, case_id: Uuid) -> Result<(), ServiceError>;
+
+    /// Review a case (approve/reject/request changes)
+    async fn review_case(&self, input: CaseReviewInput) -> Result<PipelineCase, ServiceError>;
+
+    /// Breakdown a case into sub-cases
+    async fn breakdown_case(&self, case_id: Uuid, sub_cases: Vec<CreateCaseInput>) -> Result<Vec<PipelineCase>, ServiceError>;
+
+    /// Bulk review cases
+    async fn bulk_review_cases(&self, reviews: Vec<CaseReviewInput>) -> Result<BulkReviewResult, ServiceError>;
+
+    /// Get health warnings for a pipeline
+    async fn get_health_warnings(&self, pipeline_id: Uuid) -> Result<Vec<HealthWarning>, ServiceError>;
+
+    /// Get pipelines needing attention for a company
+    async fn get_pipelines_attention(&self, company_id: Uuid) -> Result<Vec<HealthWarning>, ServiceError>;
 }
 
 /// Default Pipeline Service Implementation
@@ -417,6 +471,241 @@ impl PipelineService for DefaultPipelineService {
             .find_events_by_case_id(case_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to get case events: {}", e)))
+    }
+
+    async fn evaluate_auto_advance(&self, case_id: Uuid) -> Result<(), ServiceError> {
+        let case = self.get_case(case_id).await?;
+
+        // Get current stage config
+        let stage = self.stage_repo
+            .find_by_id(case.stage_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to find stage: {}", e)))?
+            .ok_or_else(|| ServiceError::NotFound("Stage not found".to_string()))?;
+
+        let config: PipelineStageConfig = serde_json::from_value(stage.config.clone())
+            .map_err(|e| ServiceError::Internal(format!("Failed to parse stage config: {}", e)))?;
+        let auto_advance = config.auto_advance_on_children_terminal.unwrap_or(false);
+        if !auto_advance {
+            return Ok(());
+        }
+
+        // Check if all children are terminal
+        let children = self.case_repo
+            .find_by_parent_case_id(case_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to find child cases: {}", e)))?;
+
+        if children.is_empty() {
+            return Ok(());
+        }
+
+        let all_terminal = children.iter().all(|c| c.terminal_kind.is_some());
+        if !all_terminal {
+            return Ok(());
+        }
+
+        // Determine next stage from config - use approve_to_stage_key or find next by position
+        let next_stage_key = config.approve_to_stage_key.clone()
+            .unwrap_or_default();
+
+        let next_stage = if !next_stage_key.is_empty() {
+            // Find by configured key
+            self.stage_repo
+                .find_by_key(case.pipeline_id, next_stage_key.as_str())
+                .await
+                .map_err(|e| ServiceError::Internal(format!("Failed to find next stage: {}", e)))?
+        } else {
+            // Find next stage by position
+            let stages = self.stage_repo
+                .find_by_pipeline_id(case.pipeline_id)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("Failed to list stages: {}", e)))?;
+            stages.into_iter()
+                .find(|s| s.position > stage.position)
+        };
+
+        if let Some(target_stage) = next_stage {
+            // Auto-advance the case
+            let advance_input = AdvanceCaseInput {
+                case_id,
+                to_stage_id: target_stage.id,
+                actor_type: None,
+                actor_id: None,
+                note: Some("Auto-advanced (all children terminal)".to_string()),
+            };
+            self.advance_case(advance_input).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn review_case(&self, input: CaseReviewInput) -> Result<PipelineCase, ServiceError> {
+        let case = self.get_case(input.case_id).await?;
+
+        if case.terminal_kind.is_some() {
+            return Err(ServiceError::InvalidInput("Cannot review terminal case".to_string()));
+        }
+
+        // Get current stage to find target stage based on decision
+        let stage = self.stage_repo
+            .find_by_id(case.stage_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to find stage: {}", e)))?
+            .ok_or_else(|| ServiceError::NotFound("Stage not found".to_string()))?;
+
+        let config: PipelineStageConfig = serde_json::from_value(stage.config.clone())
+            .map_err(|e| ServiceError::Internal(format!("Failed to parse stage config: {}", e)))?;
+        let target_stage_key = match input.decision {
+            CaseReviewDecision::Approve => config.approve_to_stage_key.clone(),
+            CaseReviewDecision::Reject => config.reject_to_stage_key.clone(),
+            CaseReviewDecision::RequestChanges => config.request_changes_to_stage_key.clone(),
+        };
+
+        // Clone values before using them to avoid move issues
+        let actor_type = input.actor_type.clone();
+        let actor_id = input.actor_id;
+
+        // Record review event
+        self.record_event(
+            input.case_id,
+            format!("case.review.{}", match input.decision {
+                CaseReviewDecision::Approve => "approved",
+                CaseReviewDecision::Reject => "rejected",
+                CaseReviewDecision::RequestChanges => "changes_requested",
+            }),
+            serde_json::json!({
+                "decision": input.decision,
+                "reason": input.reason,
+                "from_stage_key": stage.key,
+                "to_stage_key": target_stage_key,
+            }),
+            actor_type.clone(),
+            actor_id,
+        ).await?;
+
+        if let Some(to_stage_key) = target_stage_key {
+            let target_stage = self.stage_repo
+                .find_by_key(case.pipeline_id, to_stage_key.as_str())
+                .await
+                .map_err(|e| ServiceError::Internal(format!("Failed to find target stage: {}", e)))?;
+
+            if let Some(target_stage) = target_stage {
+                let advance_input = AdvanceCaseInput {
+                    case_id: input.case_id,
+                    to_stage_id: target_stage.id,
+                    actor_type,
+                    actor_id,
+                    note: input.reason,
+                };
+                return self.advance_case(advance_input).await;
+            }
+        }
+
+        // If no target stage configured, just return the case as-is
+        self.get_case(input.case_id).await
+    }
+
+    async fn breakdown_case(&self, case_id: Uuid, sub_cases: Vec<CreateCaseInput>) -> Result<Vec<PipelineCase>, ServiceError> {
+        let parent = self.get_case(case_id).await?;
+
+        if parent.terminal_kind.is_some() {
+            return Err(ServiceError::InvalidInput("Cannot breakdown terminal case".to_string()));
+        }
+
+        let mut created_cases = Vec::new();
+
+        for sub_input in sub_cases {
+            let mut input = sub_input;
+            input.pipeline_id = parent.pipeline_id;
+            let child = self.create_case(input).await?;
+            created_cases.push(child);
+        }
+
+        // Record breakdown event
+        self.record_event(
+            case_id,
+            "case.breakdown".to_string(),
+            serde_json::json!({
+                "child_case_ids": created_cases.iter().map(|c| c.id).collect::<Vec<_>>(),
+                "count": created_cases.len(),
+            }),
+            None,
+            None,
+        ).await?;
+
+        Ok(created_cases)
+    }
+
+    async fn bulk_review_cases(&self, reviews: Vec<CaseReviewInput>) -> Result<BulkReviewResult, ServiceError> {
+        let mut succeeded = Vec::new();
+        let mut failed = Vec::new();
+
+        for review in reviews {
+            let case_id = review.case_id;
+            match self.review_case(review).await {
+                Ok(_) => succeeded.push(case_id),
+                Err(e) => failed.push((case_id, e.to_string())),
+            }
+        }
+
+        Ok(BulkReviewResult { succeeded, failed })
+    }
+
+    async fn get_health_warnings(&self, pipeline_id: Uuid) -> Result<Vec<HealthWarning>, ServiceError> {
+        let mut warnings = Vec::new();
+
+        // Get all cases in pipeline
+        let cases = self.case_repo
+            .find_by_pipeline_id(pipeline_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list cases: {}", e)))?;
+
+        let now = Utc::now();
+
+        for case in &cases {
+            // Check for stalled cases (non-terminal, no update for > 7 days)
+            let age = now.signed_duration_since(case.updated_at);
+            if case.terminal_kind.is_none() && age.num_days() > 7 {
+                warnings.push(HealthWarning {
+                    warning_type: "stalled_case".to_string(),
+                    pipeline_id,
+                    case_id: case.id,
+                    message: format!("Case '{}' has been in stage for {} days without progress", case.title, age.num_days()),
+                    severity: "warning".to_string(),
+                });
+            }
+
+            // Check for blocked cases
+            if case.terminal_kind.is_none() && age.num_days() > 14 {
+                warnings.push(HealthWarning {
+                    warning_type: "blocked_case".to_string(),
+                    pipeline_id,
+                    case_id: case.id,
+                    message: format!("Case '{}' has been blocked for {} days", case.title, age.num_days()),
+                    severity: "critical".to_string(),
+                });
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    async fn get_pipelines_attention(&self, company_id: Uuid) -> Result<Vec<HealthWarning>, ServiceError> {
+        let mut all_warnings = Vec::new();
+
+        // Get all pipelines for company
+        let pipelines = self.pipeline_repo
+            .list_by_company(company_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list pipelines: {}", e)))?;
+
+        for pipeline in pipelines {
+            let warnings = self.get_health_warnings(pipeline.id).await?;
+            all_warnings.extend(warnings);
+        }
+
+        Ok(all_warnings)
     }
 }
 
