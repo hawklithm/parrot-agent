@@ -425,7 +425,7 @@
   - 调用 .merge(crate::routes::skills::skill_routes(state.skill_registry_service.clone()))
   - 确保 SkillRegistryService 已注册
 
-- [ ] **将 user_secrets 路由合并到主路由器**
+- [x] **将 user_secrets 路由合并到主路由器**
   - 调用 .merge(crate::routes::user_secrets::user_secret_routes())
   - 确保 UserSecretService 已注册
 
@@ -433,7 +433,7 @@
   - 调用 .merge(crate::routes::sse::sse_routes(state.sse_service.clone()))
   - 确保 SseService 已注册到 AppState
 
-- [ ] **将 invites 路由合并到主路由器**
+- [x] **将 invites 路由合并到主路由器**
   - 调用 .merge(crate::routes::invites::invite_subresource_routes())
   - 确保 InviteService 已注册
 

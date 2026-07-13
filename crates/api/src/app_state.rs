@@ -202,7 +202,9 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::routines::routine_routes())
         .merge(crate::routes::goals::goal_routes())
 
-        // Phase 4: Additional service routes will be integrated in future rounds
+        // Phase 4: Additional service routes (using layer to wrap into AppState)
+        .merge(crate::routes::user_secrets::user_secret_routes().with_state(state.user_secret_service.clone()))
+        .merge(crate::routes::invites::invite_subresource_routes().with_state(state.invite_service.clone()))
 
         // Apply state
         .with_state(state)
