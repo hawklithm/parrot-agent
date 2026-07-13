@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use repositories::{GoalRepository, IssueRepository};
+use repositories::GoalRepository;
 use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -64,12 +64,11 @@ pub struct GoalHierarchy {
 /// Default Goal Service Implementation
 pub struct DefaultGoalService {
     goal_repo: Arc<dyn GoalRepository>,
-    issue_repo: Arc<dyn IssueRepository>,
 }
 
 impl DefaultGoalService {
-    pub fn new(goal_repo: Arc<dyn GoalRepository>, issue_repo: Arc<dyn IssueRepository>) -> Self {
-        Self { goal_repo, issue_repo }
+    pub fn new(goal_repo: Arc<dyn GoalRepository>) -> Self {
+        Self { goal_repo }
     }
 
     async fn validate_hierarchy(&self, parent_id: Option<Uuid>, level: GoalLevel) -> Result<(), ServiceError> {
@@ -127,9 +126,10 @@ impl GoalService for DefaultGoalService {
         // Validate hierarchy
         self.validate_hierarchy(input.parent_id, input.level).await?;
 
+        let goal_id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let goal = Goal {
-            id: Uuid::new_v4(),
+            id: goal_id,
             company_id: input.company_id,
             title: input.title.clone(),
             name: input.title,
@@ -142,6 +142,16 @@ impl GoalService for DefaultGoalService {
             created_at: now,
             updated_at: now,
         };
+
+        // Prevent cycles: a goal must not be attached under its own descendant.
+        // (Relevant for reparenting/move scenarios and guards against malformed input.)
+        if let Some(parent_id) = input.parent_id {
+            if self.detect_cycle(goal_id, parent_id).await? {
+                return Err(ServiceError::InvalidInput(
+                    "Cannot create goal: would form a cycle in the goal hierarchy".to_string(),
+                ));
+            }
+        }
 
         self.goal_repo
             .create(goal.clone())
