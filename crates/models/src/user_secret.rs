@@ -3,18 +3,27 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-/// 用户密钥定义 - 定义公司级别的用户密钥模板
+/// 用户密钥定义 - 定义公司级别的用户密钥模板（paperclip-aligned: user_secret_definitions）
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct UserSecretDefinition {
     pub id: Uuid,
     pub company_id: Uuid,
     pub key: String,
+    pub name: Option<String>,
     pub description: Option<String>,
+    pub status: String,
+    pub provider: String,
+    pub managed_mode: String,
+    pub provider_config_id: Option<Uuid>,
+    pub provider_metadata: Option<serde_json::Value>,
+    pub usage_guidance: Option<String>,
     pub required: bool,
     pub scope: sqlx::types::Json<UserSecretScope>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub created_by_user_id: Uuid,
+    pub created_by_user_id: Option<Uuid>,
+    pub updated_by_user_id: Option<Uuid>,
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 /// 用户密钥作用域
@@ -25,16 +34,24 @@ pub struct UserSecretScope {
     pub applies_to_all: bool,
 }
 
-/// 用户密钥实例 - 具体用户的密钥值
+/// 用户密钥实例 - 具体用户为某定义提交的值（paperclip-aligned: user_secret_declarations）
+///
+/// 每个 (user_id, definition_id) 对应一行声明；加密后的值存于 `value_material`
+/// （parrot 扩展列，paperclip 本身不存值，值由用户在 UI 提供并走 provider）。
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct UserSecret {
     pub id: Uuid,
+    pub company_id: Uuid,
+    pub user_secret_definition_id: Uuid,
     pub user_id: Uuid,
-    pub definition_id: Uuid,
-    pub encrypted_value: String,
+    pub env_key: String,
+    pub value_material: Option<String>,
+    pub value_sha256: Option<String>,
+    pub version_selector: String,
+    pub required: bool,
+    pub allow_missing_override: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub last_rotated_at: Option<DateTime<Utc>>,
 }
 
 /// 用户密钥覆盖率统计
@@ -70,34 +87,47 @@ impl UserSecretDefinition {
         Self {
             id: Uuid::new_v4(),
             company_id,
-            key,
+            key: key.clone(),
+            name: Some(key),
             description,
+            status: "active".to_string(),
+            provider: "local_encrypted".to_string(),
+            managed_mode: "paperclip_managed".to_string(),
+            provider_config_id: None,
+            provider_metadata: None,
+            usage_guidance: None,
             required,
             scope: sqlx::types::Json(scope),
             created_at: now,
             updated_at: now,
-            created_by_user_id,
+            created_by_user_id: Some(created_by_user_id),
+            updated_by_user_id: Some(created_by_user_id),
+            deleted_at: None,
         }
     }
 }
 
 impl UserSecret {
-    pub fn new(user_id: Uuid, definition_id: Uuid, encrypted_value: String) -> Self {
+    pub fn new(
+        company_id: Uuid,
+        user_id: Uuid,
+        definition_id: Uuid,
+        env_key: String,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
+            company_id,
+            user_secret_definition_id: definition_id,
             user_id,
-            definition_id,
-            encrypted_value,
+            env_key,
+            value_material: None,
+            value_sha256: None,
+            version_selector: "latest".to_string(),
+            required: true,
+            allow_missing_override: false,
             created_at: now,
             updated_at: now,
-            last_rotated_at: None,
         }
-    }
-
-    pub fn rotate(&mut self, new_encrypted_value: String) {
-        self.encrypted_value = new_encrypted_value;
-        self.last_rotated_at = Some(Utc::now());
-        self.updated_at = Utc::now();
     }
 }

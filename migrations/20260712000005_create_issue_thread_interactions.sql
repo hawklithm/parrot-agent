@@ -2,7 +2,13 @@
 -- Mirrors paperclip issue_thread_interactions: pending interactions/approvals
 -- that keep a stopped watchdog issue in the in_review review path.
 
-CREATE TYPE issue_thread_interaction_status AS ENUM ('pending', 'resolved', 'cancelled');
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'issue_thread_interaction_status') THEN
+        CREATE TYPE issue_thread_interaction_status AS ENUM ('pending', 'resolved', 'cancelled');
+    END IF;
+END
+$$;
 
 CREATE TABLE issue_thread_interactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

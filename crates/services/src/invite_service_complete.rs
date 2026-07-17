@@ -328,7 +328,7 @@ impl InviteServiceComplete for DefaultInviteServiceComplete {
         let onboarding_url = self.generate_onboarding_url(invite.company_id, agent_id);
 
         // Send notification to company admins
-        let notification_sent = self
+        let _notification_sent = self
             .email_service
             .send_invite_acceptance_notification(invite.company_id, &acceptance_data.agent_name)
             .await

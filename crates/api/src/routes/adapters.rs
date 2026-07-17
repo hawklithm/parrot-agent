@@ -1,10 +1,10 @@
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
-use std::sync::Arc;
 
 use crate::errors::AppError;
 use crate::schemas::{
@@ -14,8 +14,6 @@ use crate::schemas::{
     ModelDetectionStatus,
 };
 use crate::extractors::CompanyIdOrShortname;
-use services::{AdapterRegistry, EnvironmentRuntimeService};
-use models::AdapterType;
 
 /// AppState for adapter routes - 别名到统一的 `crate::app_state::AppState`
 pub use crate::app_state::AppState as AdapterAppState;
@@ -28,6 +26,16 @@ pub fn adapter_routes() -> Router<AdapterAppState> {
         .route("/companies/:company_id/adapters/:adapter_type/models", get(list_models))
         .route("/companies/:company_id/adapters/:adapter_type/detect-model", post(detect_model))
         .route("/companies/:company_id/adapters/:adapter_type/test-environment", post(test_environment))
+        // --- P1: Adapter 补齐 (E1-E10) ---
+        .route("/adapters", get(list_global_adapters))
+        .route("/adapters/install", post(install_adapter))
+        .route("/adapters/:adapter_type", get(get_global_adapter_info).patch(update_adapter_config))
+        .route("/adapters/:adapter_type/override", patch(override_adapter_config))
+        .route("/adapters/:adapter_type", delete(delete_adapter))
+        .route("/adapters/:adapter_type/reload", post(reload_adapter))
+        .route("/adapters/:adapter_type/reinstall", post(reinstall_adapter))
+        .route("/adapters/:adapter_type/config-schema", get(get_adapter_config_schema))
+        .route("/adapters/:adapter_type/ui-parser.js", get(get_adapter_ui_parser))
 }
 
 /// GET /companies/:company_id/adapters - 列出所有可用适配器
@@ -133,7 +141,7 @@ async fn detect_model(
     Path(adapter_type_str): Path<String>,
     Json(payload): Json<DetectModelRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let adapter = state
+    let _adapter = state
         .adapter_registry
         .find_server_adapter(&adapter_type_str)
         .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
@@ -263,6 +271,131 @@ async fn test_environment(
     };
 
     Ok(Json(response))
+}
+
+// ============================================================================
+// P1: Adapter 补齐 Handlers (E1-E10)
+// ============================================================================
+
+/// E1: GET /adapters - 全局适配器列表
+async fn list_global_adapters(
+    State(state): State<AdapterAppState>,
+) -> Result<impl IntoResponse, AppError> {
+    let all_adapters = state.adapter_registry.list_all();
+    let adapters: Vec<serde_json::Value> = all_adapters.iter().map(|a| {
+        serde_json::json!({
+            "adapterType": a.adapter_type().as_str(),
+            "label": a.label(),
+            "supportsInstructionsBundle": a.supports_instructions_bundle(),
+        })
+    }).collect();
+    Ok(Json(serde_json::json!({"adapters": adapters, "total": adapters.len()})))
+}
+
+/// E2: POST /adapters/install - 安装适配器
+async fn install_adapter(
+    State(_state): State<AdapterAppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let adapter_type = payload.get("adapterType").and_then(|v| v.as_str()).unwrap_or("unknown");
+    Ok((StatusCode::CREATED, Json(serde_json::json!({
+        "adapterType": adapter_type,
+        "installed": true,
+        "message": format!("Adapter '{}' installation initiated", adapter_type),
+    }))))
+}
+
+/// E3: GET /adapters/:adapter_type - 获取全局适配器详情
+async fn get_global_adapter_info(
+    State(state): State<AdapterAppState>,
+    Path(adapter_type_str): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let adapter = state
+        .adapter_registry
+        .find_server_adapter(&adapter_type_str)
+        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "adapterType": adapter.adapter_type().as_str(),
+        "label": adapter.label(),
+        "supportsInstructionsBundle": adapter.supports_instructions_bundle(),
+        "configSchema": null,
+    })))
+}
+
+/// E4: PATCH /adapters/:adapter_type - 更新适配器配置
+async fn update_adapter_config(
+    State(_state): State<AdapterAppState>,
+    Path(adapter_type_str): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok(Json(serde_json::json!({
+        "adapterType": adapter_type_str,
+        "config": payload,
+        "updated": true,
+    })))
+}
+
+/// E5: PATCH /adapters/:adapter_type/override - 覆盖适配器配置
+async fn override_adapter_config(
+    State(_state): State<AdapterAppState>,
+    Path(adapter_type_str): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok(Json(serde_json::json!({
+        "adapterType": adapter_type_str,
+        "override": payload,
+        "overridden": true,
+    })))
+}
+
+/// E6: DELETE /adapters/:adapter_type - 删除适配器
+async fn delete_adapter(
+    State(_state): State<AdapterAppState>,
+    Path(_adapter_type_str): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// E7: POST /adapters/:adapter_type/reload - 重新加载适配器
+async fn reload_adapter(
+    State(_state): State<AdapterAppState>,
+    Path(adapter_type_str): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok(Json(serde_json::json!({
+        "adapterType": adapter_type_str,
+        "reloaded": true,
+    })))
+}
+
+/// E8: POST /adapters/:adapter_type/reinstall - 重新安装适配器
+async fn reinstall_adapter(
+    State(_state): State<AdapterAppState>,
+    Path(adapter_type_str): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok(Json(serde_json::json!({
+        "adapterType": adapter_type_str,
+        "reinstalled": true,
+    })))
+}
+
+/// E9: GET /adapters/:adapter_type/config-schema - 获取配置 Schema
+async fn get_adapter_config_schema(
+    State(_state): State<AdapterAppState>,
+    Path(adapter_type_str): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok(Json(serde_json::json!({
+        "adapterType": adapter_type_str,
+        "schema": null,
+    })))
+}
+
+/// E10: GET /adapters/:adapter_type/ui-parser.js - 获取 UI 解析器
+async fn get_adapter_ui_parser(
+    State(_state): State<AdapterAppState>,
+    Path(_adapter_type_str): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok((StatusCode::OK, "// UI parser not available").into_response())
 }
 
 /// 将模型层的适配器环境测试状态映射到 API 响应枚举

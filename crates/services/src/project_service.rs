@@ -1,5 +1,5 @@
 use models::{
-    AppResult, CreateProjectInput, CreateWorkspaceInput, Project, ProjectMembership,
+    AgentMembership, AppResult, CreateProjectInput, CreateWorkspaceInput, Project, ProjectMembership,
     ProjectWorkspace, ResourceMemberships, UpdateProjectInput, MembershipState,
 };
 use repositories::ProjectRepository;
@@ -92,5 +92,24 @@ impl ProjectService {
         user_id: Uuid,
     ) -> AppResult<ProjectMembership> {
         Ok(self.project_repo.unstar_project(company_id, project_id, user_id).await?)
+    }
+
+    /// Upsert an agent membership (joined/left + optional starred).
+    ///
+    /// Mirrors Paperclip `resourceMembershipService.updateAgent`. `starred`
+    /// overrides `starred_at`: `true` sets NOW() (if not already starred),
+    /// `false` clears it; `None` leaves it untouched on state-only updates.
+    pub async fn update_agent_membership(
+        &self,
+        company_id: Uuid,
+        agent_id: Uuid,
+        user_id: Uuid,
+        state: MembershipState,
+        starred: Option<bool>,
+    ) -> AppResult<AgentMembership> {
+        Ok(self
+            .project_repo
+            .upsert_agent_membership(company_id, agent_id, user_id, state, starred)
+            .await?)
     }
 }

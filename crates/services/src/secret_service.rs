@@ -143,13 +143,21 @@ pub struct ResolvedAdapterConfig {
 }
 
 /// 密钥数据结构
+///
+/// `value` 是**运行时明文**（按 latest_version 解密 `company_secret_versions.material` 得到）。
+/// 列表中为 `None`（不返回实际值）。数据库层无扁平 `value` 列（paperclip 版本化模型）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Secret {
     pub id: Uuid,
     pub company_id: Uuid,
     pub key: String,
-    pub value: String,
+    pub name: String,
+    pub provider: String,
+    pub status: String,
+    pub scope: String,
     pub description: Option<String>,
+    pub latest_version: i32,
+    pub value: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }

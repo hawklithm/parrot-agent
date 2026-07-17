@@ -50,7 +50,7 @@ impl DefaultLowTrustService {
 #[async_trait]
 impl LowTrustService for DefaultLowTrustService {
     async fn promote_low_trust(&self, _company_id: Uuid, issue_id: Uuid, input: PromoteLowTrustInput) -> Result<PromoteLowTrustResult, String> {
-        let issue = self.issue_repo
+        let _issue = self.issue_repo
             .get_by_id(issue_id)
             .await
             .map_err(|e| format!("Failed to get issue: {}", e))?

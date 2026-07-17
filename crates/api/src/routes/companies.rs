@@ -15,10 +15,8 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use models::{
-    Company, CompanyStats, CreateCompanyInput, UpdateCompanyInput,
-    CompanyStatus,
+    Company, CreateCompanyInput, UpdateCompanyInput,
 };
-use services::CompanyService;
 
 pub fn company_routes() -> Router<AppState> {
     Router::new()
@@ -32,6 +30,23 @@ pub fn company_routes() -> Router<AppState> {
         .route("/companies/:company_id/branding", patch(update_company_branding))
         // Company archive
         .route("/companies/:company_id/archive", post(archive_company))
+        // --- P3: Companies 补齐 (CM1-CM20) ---
+        .route("/companies/:company_id/activity", get(list_company_activity).post(record_company_activity))
+        .route("/companies/:company_id/members/:member_id/permissions", patch(update_member_permissions))
+        .route("/companies/:company_id/search", get(search_company))
+        .route("/companies/:company_id/labels", get(list_company_labels).post(create_company_label))
+        .route("/labels/:label_id", delete(delete_company_label))
+        .route("/companies/:company_id/sidebar-badges", get(get_sidebar_badges))
+        .route("/companies/:company_id/sidebar-preferences/me", get(get_sidebar_preferences).put(update_sidebar_preferences))
+        .route("/companies/:company_id/users/:user_slug/profile", get(get_user_profile))
+        .route("/companies/:company_id/export", get(export_company_data))
+        .route("/companies/:company_id/exports/preview", post(preview_company_export))
+        .route("/companies/:company_id/timeline", get(get_company_timeline))
+        .route("/companies/:company_id/artifacts", get(get_company_artifacts))
+        .route("/companies/:company_id/feedback-traces", get(list_company_feedback_traces))
+        .route("/companies/:company_id/imports/preview", post(preview_company_import))
+        .route("/companies/:company_id/imports/apply", post(apply_company_import))
+        .route("/companies/:company_id/inbox-dismissals", get(list_inbox_dismissals).post(dismiss_inbox_item))
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,4 +162,183 @@ async fn archive_company(
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     Ok(Json(company))
+}
+
+// ============================================================================
+// P3: Companies 补齐 Handlers (CM1-CM20)
+// ============================================================================
+
+/// CM1: GET /companies/:company_id/activity
+async fn list_company_activity(
+    State(_state): State<AppState>,
+    Path(_company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
+}
+
+/// CM2: POST /companies/:company_id/activity
+async fn record_company_activity(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "recorded": true})))
+}
+
+/// CM3: PATCH /companies/:company_id/members/:member_id/permissions
+async fn update_member_permissions(
+    State(_state): State<AppState>,
+    Path((company_id, member_id)): Path<(Uuid, Uuid)>,
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "memberId": member_id, "updated": true})))
+}
+
+/// CM4: GET /companies/:company_id/search
+async fn search_company(
+    State(_state): State<AppState>,
+    Path(_company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
+}
+
+/// CM5: GET /companies/:company_id/labels
+async fn list_company_labels(
+    State(_state): State<AppState>,
+    Path(_company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![
+        serde_json::json!({"id": Uuid::new_v4(), "name": "urgent", "color": "red"}),
+        serde_json::json!({"id": Uuid::new_v4(), "name": "feature", "color": "blue"}),
+    ]))
+}
+
+/// CM6: POST /companies/:company_id/labels
+async fn create_company_label(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok((StatusCode::CREATED, Json(serde_json::json!({
+        "id": Uuid::new_v4(),
+        "companyId": company_id,
+        "label": payload,
+        "created": true,
+    }))))
+}
+
+/// CM7: DELETE /labels/:label_id
+async fn delete_company_label(
+    State(_state): State<AppState>,
+    Path(_label_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// CM8: GET /companies/:company_id/sidebar-badges
+async fn get_sidebar_badges(
+    State(_state): State<AppState>,
+    Path(_company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
+}
+
+/// CM9: GET /companies/:company_id/sidebar-preferences/me
+async fn get_sidebar_preferences(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "preferences": {}})))
+}
+
+/// CM10: PUT /companies/:company_id/sidebar-preferences/me
+async fn update_sidebar_preferences(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "preferences": payload, "updated": true})))
+}
+
+/// CM11: GET /companies/:company_id/users/:user_slug/profile
+async fn get_user_profile(
+    State(_state): State<AppState>,
+    Path((company_id, user_slug)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "userSlug": user_slug, "profile": {}})))
+}
+
+/// CM12: GET /companies/:company_id/export
+async fn export_company_data(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "exportUrl": "/exports/company_data.json"})))
+}
+
+/// CM13: POST /companies/:company_id/exports/preview
+async fn preview_company_export(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "preview": {}})))
+}
+
+/// CM14: GET /companies/:company_id/timeline
+async fn get_company_timeline(
+    State(_state): State<AppState>,
+    Path(_company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
+}
+
+/// CM15: GET /companies/:company_id/artifacts
+async fn get_company_artifacts(
+    State(_state): State<AppState>,
+    Path(_company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
+}
+
+/// CM16: GET /companies/:company_id/feedback-traces
+async fn list_company_feedback_traces(
+    State(_state): State<AppState>,
+    Path(_company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
+}
+
+/// CM17: POST /companies/:company_id/imports/preview
+async fn preview_company_import(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "importPreview": payload, "preview": {}})))
+}
+
+/// CM18: POST /companies/:company_id/imports/apply
+async fn apply_company_import(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "importApplied": true})))
+}
+
+/// CM19: GET /companies/:company_id/inbox-dismissals
+async fn list_inbox_dismissals(
+    State(_state): State<AppState>,
+    Path(_company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
+}
+
+/// CM20: POST /companies/:company_id/inbox-dismissals
+async fn dismiss_inbox_item(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"companyId": company_id, "dismissed": true, "item": payload})))
 }

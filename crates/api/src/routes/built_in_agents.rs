@@ -1,18 +1,16 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use services::{
-    BuiltInAgentService, BuiltInAgentStatus, BuiltInAgentDefinition,
-    BuiltInAgentError, BuiltInAgentKey, ProvisionInput, ReconcileResult,
+    BuiltInAgentStatus, BuiltInAgentDefinition,
+    BuiltInAgentError, BuiltInAgentKey, ProvisionInput,
 };
 use crate::extractors::CompanyIdOrShortname;
 use crate::validation::agent_schemas::ProvisionBuiltInAgentSchema;
 use garde::Validate;
-use std::sync::Arc;
 
 /// AppState 别名，统一状态类型
 pub use crate::app_state::AppState;

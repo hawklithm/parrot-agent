@@ -140,7 +140,7 @@ impl DefaultApprovalService {
 
     /// Send notification about approval status change
     async fn notify_approval_change(&self, approval: &Approval, decision: Option<ApprovalDecision>) -> Result<(), ServiceError> {
-        let event_type = match decision {
+        let _event_type = match decision {
             Some(ApprovalDecision::Approve) => "approval.approved",
             Some(ApprovalDecision::Reject) => "approval.rejected",
             Some(ApprovalDecision::RequestRevision) => "approval.revision_requested",

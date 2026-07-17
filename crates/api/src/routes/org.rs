@@ -8,7 +8,6 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
-use services::OrgChartService;
 
 /// 创建组织架构路由
 pub fn org_routes() -> Router<AppState> {

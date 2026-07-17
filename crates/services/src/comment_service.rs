@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use uuid::Uuid;
-use models::{IssueComment, AddCommentInput, CommentActorType};
+use models::{IssueComment, AddCommentInput};
 
 /// Comment service trait for issue comments
 #[async_trait]
@@ -78,7 +78,7 @@ impl CommentService for MockCommentService {
         _agent_id: Option<Uuid>,
         _user_id: Option<Uuid>,
     ) -> Result<IssueComment, String> {
-        let mut comment = Self::create_mock_comment(Uuid::new_v4(), issue_id, company_id, input.body);
+        let comment = Self::create_mock_comment(Uuid::new_v4(), issue_id, company_id, input.body);
         if input.reopen_requested == Some(true) {
             // TODO: Trigger issue reopen logic
         }

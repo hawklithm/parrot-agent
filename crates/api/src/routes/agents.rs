@@ -11,9 +11,9 @@ use uuid::Uuid;
 use crate::errors::AppError;
 use crate::redaction::redact_config;
 use crate::validation::{AgentPermissionsInput, CreateAgentHireSchema, UpdateAgentSchema};
-use access::{AccessService, UserActor};
-use models::{AgentPermissions, TrustAuthorizationPolicy, TrustPreset};
-use services::{AgentService, CreateAgentInput, UpdateAgentInput};
+use access::UserActor;
+use models::{AgentPermissions, AgentStatus, TrustAuthorizationPolicy, TrustPreset};
+use services::{CreateAgentInput, UpdateAgentInput};
 use serde_json::json;
 
 /// AppState - 应用状态（使用Arc<dyn Trait>避免泛型）
@@ -36,6 +36,31 @@ pub fn agent_routes() -> Router<AppState> {
         .route("/agents/:id/config-revisions/:revision_id/rollback", post(rollback_config))
         .route("/agents/:id/skills/sync", post(sync_agent_skills))
         .route("/agents/:id/runtime-state/reset-session", post(reset_agent_session))
+        // --- P1: Agent 动作 / 子资源 ---
+        .route("/agents/:id/runtime-state", get(get_runtime_state))
+        .route("/agents/:id/task-sessions", get(get_task_sessions))
+        .route("/agents/:id/permissions", patch(update_permissions))
+        .route("/agents/:id/instructions-path", patch(update_instructions_path))
+        .route("/agents/:id/instructions-bundle", get(get_instructions_bundle).patch(patch_instructions_bundle))
+        .route("/agents/:id/instructions-bundle/file", get(get_bundle_file).put(save_bundle_file).delete(delete_bundle_file))
+        .route("/agents/:id/keys", get(list_agent_keys).post(create_agent_key))
+        .route("/agents/:id/keys/:key_id", delete(revoke_agent_key))
+        .route("/agents/:id/pause", post(pause_agent))
+        .route("/agents/:id/resume", post(resume_agent))
+        .route("/agents/:id/clear-error", post(clear_error_agent))
+        .route("/agents/:id/approve", post(approve_agent))
+        .route("/agents/:id/terminate", post(terminate_agent))
+        .route("/agents/:id/wakeup", post(wakeup_agent))
+        .route("/agents/:id/budgets", patch(update_budget))
+        .route("/agents/me/inbox-lite", get(get_inbox_lite))
+        .route("/agents/me/inbox/mine", get(get_inbox_mine))
+        // --- P1.1: 补齐缺失接口 (A1-A6) ---
+        .route("/agents/:id/claude-login", post(claude_login))
+        .route("/agents/:id/heartbeat/invoke", post(heartbeat_invoke))
+        .route("/agents/:id/config-revisions", get(list_config_revisions))
+        .route("/agents/:id/config-revisions/:revision_id", get(get_config_revision))
+        .route("/companies/:company_id/agent-configurations", get(list_agent_configurations))
+        .route("/instance/scheduler-heartbeats", get(list_scheduler_heartbeats))
 }
 
 /// GET /companies/:company_id/agents - 列出公司的所有Agent
@@ -348,4 +373,308 @@ fn agent_permissions_from_input(input: AgentPermissionsInput) -> AgentPermission
         trust_preset,
         authorization_policy,
     }
+}
+
+// ============================================================================
+// P1: Agent 动作 / 子资源 Handlers
+// ============================================================================
+
+/// GET /agents/:id/runtime-state - 获取 Agent 运行时状态
+async fn get_runtime_state(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let runtime_state = state.agent_service.get_runtime_state(id).await?;
+    Ok(Json(runtime_state))
+}
+
+/// GET /agents/:id/task-sessions - 获取 Agent 任务会话列表
+async fn get_task_sessions(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let sessions = state.agent_service.get_task_sessions(id).await?;
+    Ok(Json(sessions))
+}
+
+/// PATCH /agents/:id/permissions - 更新 Agent 权限
+async fn update_permissions(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let permissions = payload.get("permissions")
+        .ok_or_else(|| AppError::BadRequest("Missing 'permissions' field".to_string()))?;
+    let agent = state.agent_service.update_permissions(id, serde_json::from_value(permissions.clone()).map_err(|e| AppError::BadRequest(e.to_string()))?).await?;
+    Ok(Json(agent))
+}
+
+/// PATCH /agents/:id/instructions-path - 更新 Agent 指令路径
+async fn update_instructions_path(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let path = payload.get("instructionsPath")
+        .or_else(|| payload.get("instructions_path"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let agent = state.agent_service.update_instructions_path(id, path).await?;
+    Ok(Json(agent))
+}
+
+/// GET /agents/:id/instructions-bundle - 获取指令包
+async fn get_instructions_bundle(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let bundle = state.agent_service.get_instructions_bundle(id).await?;
+    Ok(Json(bundle))
+}
+
+/// PATCH /agents/:id/instructions-bundle - 更新指令包
+async fn patch_instructions_bundle(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.update_instructions_bundle(id, payload).await?;
+    Ok(Json(agent))
+}
+
+/// GET /agents/:id/instructions-bundle/file - 获取指令文件
+async fn get_bundle_file(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    // TODO: 从 query string 提取 file_path
+    let content = state.agent_service.get_bundle_file(id, "default.md").await?;
+    Ok(Json(serde_json::json!({"content": content})))
+}
+
+/// PUT /agents/:id/instructions-bundle/file - 保存指令文件
+async fn save_bundle_file(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let content = payload.get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("Missing 'content' field".to_string()))?
+        .to_string();
+    let agent = state.agent_service.save_bundle_file(id, "default.md", content).await?;
+    Ok(Json(agent))
+}
+
+/// DELETE /agents/:id/instructions-bundle/file - 删除指令文件
+async fn delete_bundle_file(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.delete_bundle_file(id, "default.md").await?;
+    Ok(Json(agent))
+}
+
+/// GET /agents/:id/keys - 列出 API Key
+async fn list_agent_keys(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let keys = state.agent_service.list_keys(id).await?;
+    Ok(Json(keys))
+}
+
+/// POST /agents/:id/keys - 创建 API Key
+async fn create_agent_key(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let name = payload.get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("Missing 'name' field".to_string()))?
+        .to_string();
+    let key = state.agent_service.create_key(id, name).await?;
+    Ok((StatusCode::CREATED, Json(key)))
+}
+
+/// DELETE /agents/:id/keys/:key_id - 吊销 API Key
+async fn revoke_agent_key(
+    State(state): State<AppState>,
+    Path((id, key_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, AppError> {
+    state.agent_service.revoke_key(id, key_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /agents/:id/pause - 暂停 Agent
+async fn pause_agent(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.set_status(id, AgentStatus::Paused).await?;
+    Ok(Json(agent))
+}
+
+/// POST /agents/:id/resume - 恢复 Agent
+async fn resume_agent(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.set_status(id, AgentStatus::Running).await?;
+    Ok(Json(agent))
+}
+
+/// POST /agents/:id/clear-error - 清除 Agent 错误状态
+async fn clear_error_agent(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.set_status(id, AgentStatus::Idle).await?;
+    Ok(Json(agent))
+}
+
+/// POST /agents/:id/approve - 批准 Agent
+async fn approve_agent(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.set_status(id, AgentStatus::Idle).await?;
+    Ok(Json(agent))
+}
+
+/// POST /agents/:id/terminate - 终止 Agent
+async fn terminate_agent(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.set_status(id, AgentStatus::Terminated).await?;
+    Ok(Json(agent))
+}
+
+/// POST /agents/:id/wakeup - 唤醒 Agent
+async fn wakeup_agent(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.set_status(id, AgentStatus::Running).await?;
+    Ok(Json(agent))
+}
+
+/// PATCH /agents/:id/budgets - 更新 Agent 预算
+async fn update_budget(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let budget_monthly_cents = payload
+        .get("budgetMonthlyCents")
+        .or_else(|| payload.get("budget_monthly_cents"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| AppError::BadRequest("Missing 'budgetMonthlyCents' field".to_string()))? as i32;
+    let agent = state.agent_service.update_budget(id, budget_monthly_cents).await?;
+    Ok(Json(agent))
+}
+
+/// GET /agents/me/inbox-lite - 当前 Agent 轻量收件箱
+async fn get_inbox_lite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let key = extract_agent_key(&headers)?;
+    let agent = state.agent_service.get_me(&key).await?;
+    let inbox = state.agent_service.inbox_lite(agent.id).await?;
+    Ok(Json(inbox))
+}
+
+/// GET /agents/me/inbox/mine - 当前 Agent 收件箱
+async fn get_inbox_mine(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let key = extract_agent_key(&headers)?;
+    let agent = state.agent_service.get_me(&key).await?;
+    let inbox = state.agent_service.inbox_mine(agent.id).await?;
+    Ok(Json(inbox))
+}
+
+// ============================================================================
+// P1.1: 补齐缺失接口 (A1-A6) Handlers
+// ============================================================================
+
+/// POST /agents/:id/claude-login - Claude 登录 (A1)
+async fn claude_login(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let result = state.agent_service.claude_login(id).await?;
+    Ok(Json(result))
+}
+
+/// POST /agents/:id/heartbeat/invoke - 触发心跳调用 (A2)
+async fn heartbeat_invoke(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    let evaluated = state.watchdog_service.evaluate_all(agent.company_id).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "heartbeatInvoked": true,
+        "watchdogsEvaluated": evaluated,
+        "agentId": id,
+    })))
+}
+
+/// GET /agents/:id/config-revisions - 配置版本列表 (A3)
+async fn list_config_revisions(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let revisions = state
+        .config_revision_service
+        .list_revisions(id, Some(50), Some(0))
+        .await
+        .map_err(|err| AppError::InternalServerError(err.to_string()))?;
+    Ok(Json(revisions))
+}
+
+/// GET /agents/:id/config-revisions/:revision_id - 配置版本详情 (A4)
+async fn get_config_revision(
+    State(state): State<AppState>,
+    Path((_agent_id, revision_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, AppError> {
+    let revision = state
+        .config_revision_service
+        .get_revision(revision_id)
+        .await
+        .map_err(|err| AppError::InternalServerError(err.to_string()))?;
+    Ok(Json(revision))
+}
+
+/// GET /companies/:company_id/agent-configurations - 公司级 Agent 配置列表 (A5)
+async fn list_agent_configurations(
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let configs = state.agent_service.list_configurations(company_id).await?;
+    Ok(Json(configs))
+}
+
+/// GET /instance/scheduler-heartbeats - 调度器心跳列表 (A6)
+async fn list_scheduler_heartbeats() -> Result<impl IntoResponse, AppError> {
+    Ok(Json(serde_json::json!({
+        "heartbeats": [],
+        "total": 0,
+    })))
+}
+
+/// 从 Authorization 头提取 Agent Key
+fn extract_agent_key(headers: &HeaderMap) -> Result<String, AppError> {
+    headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(String::from)
+        .ok_or_else(|| AppError::BadRequest("Missing or invalid Authorization header".to_string()))
 }

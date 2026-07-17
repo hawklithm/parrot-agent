@@ -6,8 +6,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use models::{
-    Routine, RoutineRun, RoutineTrigger, RoutineRevision, RoutineStatus,
-    ConcurrencyPolicy, CatchUpPolicy, RunSource, RunStatus, TriggerKind,
+    Routine, RoutineRun, RoutineRevision, RoutineStatus,
+    ConcurrencyPolicy, CatchUpPolicy, RunSource, RunStatus,
     RoutineVariable, RoutineVariableType
 };
 use crate::errors::ServiceError;
@@ -84,6 +84,7 @@ pub trait RoutineService: Send + Sync {
 /// Default Routine Service Implementation
 pub struct DefaultRoutineService {
     routine_repo: Arc<dyn RoutineRepository>,
+    #[allow(dead_code)]
     trigger_repo: Arc<dyn RoutineTriggerRepository>,
     revision_repo: Arc<dyn RoutineRevisionRepository>,
 }
@@ -380,7 +381,7 @@ impl RoutineService for DefaultRoutineService {
             .map_err(|e| ServiceError::Internal(format!("Failed to list routines: {}", e)))
     }
 
-    async fn trigger_manual(&self, routine_id: Uuid, triggered_by: Uuid) -> Result<RoutineRun, ServiceError> {
+    async fn trigger_manual(&self, routine_id: Uuid, _triggered_by: Uuid) -> Result<RoutineRun, ServiceError> {
         let routine = self.get_by_id(routine_id).await?;
 
         // Check if routine is active
@@ -395,10 +396,10 @@ impl RoutineService for DefaultRoutineService {
         let routine = self.get_by_id(routine_id).await?;
 
         // Check concurrency policy
-        let coalesced_into: Option<Uuid> = match self.check_concurrency(routine_id, routine.concurrency_policy).await {
+        let _coalesced_into: Option<Uuid> = match self.check_concurrency(routine_id, routine.concurrency_policy).await {
             Ok(Some(run_id)) => {
                 // Coalesce into existing run
-                let mut run = RoutineRun {
+                let run = RoutineRun {
                     id: Uuid::new_v4(),
                     company_id: routine.company_id,
                     routine_id,
@@ -428,7 +429,7 @@ impl RoutineService for DefaultRoutineService {
             Ok(None) => None,
             Err(e) if e.to_string().contains("skipping") => {
                 // Create skipped run
-                let mut run = RoutineRun {
+                let run = RoutineRun {
                     id: Uuid::new_v4(),
                     company_id: routine.company_id,
                     routine_id,

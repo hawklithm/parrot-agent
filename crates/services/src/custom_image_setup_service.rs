@@ -4,7 +4,6 @@ use models::{
     EnvironmentCustomImageSetupSessionResult, EnvironmentCustomImageTerminalSessionToken,
 };
 use base64::Engine;
-use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::errors::ServiceResult;

@@ -82,7 +82,7 @@ impl EventBus for InMemoryEventBus {
 
     async fn subscribe(&self, handler: Box<dyn EventHandler>) -> Result<(), String> {
         let handler: Arc<dyn EventHandler> = Arc::from(handler);
-        let handler_name = handler.handler_name().to_string();
+        let _handler_name = handler.handler_name().to_string();
 
         for event_type in handler.event_types() {
             self.handlers

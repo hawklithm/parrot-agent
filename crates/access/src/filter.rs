@@ -1,5 +1,4 @@
 use models::Agent;
-use uuid::Uuid;
 
 use super::models::{Action, Actor};
 use super::service::{AccessService, Resource, ResourceType};
@@ -109,7 +108,7 @@ mod tests {
             adapter_config: Json(serde_json::json!({"api_key": "secret-key"})),
             runtime_config: Json(serde_json::json!({"env": "production"})),
             permissions: Json(AgentPermissions::default()),
-            metadata: Json(AgentMetadata { is_built_in: None, built_in_key: None }),
+            metadata: Json(AgentMetadata { is_built_in: None, built_in_key: None, instructions_path: None, instructions_bundle: None }),
             budget_monthly_cents: 0,
             reports_to: None,
             created_at: Utc::now(),

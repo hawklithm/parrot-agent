@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use models::{Issue, CreateIssueInput, UpdateIssueInput};
-use crate::issue_repository::{IssueQueryFilter, Pagination};
+pub use crate::issue_repository::{IssueQueryFilter, Pagination};
 
 /// Issue mutation result
 #[derive(Debug, Clone, Serialize)]
@@ -98,4 +98,63 @@ pub trait IssueService: Send + Sync {
 
     /// Get heartbeat context for issue
     async fn get_heartbeat_context(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String>;
+
+    // --- P1: Issue 子资源补齐 (I1-I44) ---
+
+    /// I1: Get issue activity
+    async fn get_activity(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String>;
+
+    /// I2: Get related cases
+    async fn get_cases(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String>;
+
+    /// I3: Get active run
+    async fn get_active_run(&self, id: Uuid, company_id: Uuid) -> Result<Option<serde_json::Value>, String>;
+
+    /// I4: Get live runs
+    async fn get_live_runs(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String>;
+
+    /// I5: Get run history
+    async fn get_runs(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String>;
+
+    /// I6: Get accepted plan decompositions
+    async fn get_accepted_plan_decompositions(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String>;
+
+    /// I7: Submit plan decomposition
+    async fn submit_plan_decomposition(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String>;
+
+    /// I8: Get approvals
+    async fn get_approvals(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String>;
+
+    /// I9: Create approval
+    async fn create_approval(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String>;
+
+    /// I10: Delete approval
+    async fn delete_approval(&self, id: Uuid, approval_id: Uuid, company_id: Uuid) -> Result<(), String>;
+
+    /// I12: Mark issue as read
+    async fn mark_read(&self, id: Uuid, company_id: Uuid) -> Result<(), String>;
+
+    /// I13: Unmark issue as read
+    async fn unmark_read(&self, id: Uuid, company_id: Uuid) -> Result<(), String>;
+
+    /// I14: Archive to inbox
+    async fn archive_inbox(&self, id: Uuid, company_id: Uuid) -> Result<(), String>;
+
+    /// I15: Unarchive from inbox
+    async fn unarchive_inbox(&self, id: Uuid, company_id: Uuid) -> Result<(), String>;
+
+    /// I27: Get recovery actions
+    async fn get_recovery_actions(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String>;
+
+    /// I28: Resolve recovery action
+    async fn resolve_recovery_action(&self, id: Uuid, company_id: Uuid, action_id: Uuid) -> Result<(), String>;
+
+    /// I39: Create work product
+    async fn create_work_product(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String>;
+
+    /// I42: Get single comment
+    async fn get_comment(&self, comment_id: Uuid, company_id: Uuid) -> Result<Option<serde_json::Value>, String>;
+
+    /// I43: Get cost summary
+    async fn get_cost_summary(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String>;
 }

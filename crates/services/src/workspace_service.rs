@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use models::execution_environment::{
-    ExecutionWorkspace, WorkspaceStatus, WorkspaceMode,
+    ExecutionWorkspace, WorkspaceStatus,
     CreateExecutionWorkspaceInput, UpdateExecutionWorkspaceInput,
 };
 use repositories::{ExecutionWorkspaceRepository, RepositoryError};

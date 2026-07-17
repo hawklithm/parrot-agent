@@ -3,6 +3,32 @@ use models::SecretProviderType;
 use serde_json::Value as JsonValue;
 use sha2::{Sha256, Digest};
 use hex;
+use std::env;
+
+/// Load the AES-256 encryption key used by the local encrypted secret provider.
+///
+/// Expects `PARROT_SECRET_ENCRYPTION_KEY` to be a 64-char hex string (32 bytes).
+/// Falls back to an all-zero key when unset (dev/test only — never use in prod).
+pub fn load_secret_encryption_key() -> Vec<u8> {
+    match env::var("PARROT_SECRET_ENCRYPTION_KEY") {
+        Ok(s) if s.len() == 64 => {
+            match hex::decode(&s) {
+                Ok(bytes) if bytes.len() == 32 => return bytes,
+                _ => tracing::warn!("PARROT_SECRET_ENCRYPTION_KEY is not valid 32-byte hex; using zero key"),
+            }
+        }
+        Ok(_) => tracing::warn!("PARROT_SECRET_ENCRYPTION_KEY must be 64 hex chars; using zero key"),
+        Err(_) => tracing::warn!("PARROT_SECRET_ENCRYPTION_KEY not set; using zero key (dev only)"),
+    }
+    vec![0u8; 32]
+}
+
+/// SHA-256 hex of a secret plaintext value (mirrors paperclip value_sha256).
+pub fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -53,7 +79,7 @@ impl LocalEncryptedProvider {
         Ok(Self { encryption_key })
     }
 
-    fn encrypt(&self, plaintext: &str) -> Result<String, ProviderError> {
+    pub fn encrypt(&self, plaintext: &str) -> Result<String, ProviderError> {
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use aes_gcm::aead::Aead;
 
@@ -73,7 +99,7 @@ impl LocalEncryptedProvider {
         Ok(hex::encode(result))
     }
 
-    fn decrypt(&self, encrypted_hex: &str) -> Result<String, ProviderError> {
+    pub fn decrypt(&self, encrypted_hex: &str) -> Result<String, ProviderError> {
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use aes_gcm::aead::Aead;
 

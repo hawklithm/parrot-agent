@@ -3,7 +3,6 @@ use models::{
     AcquireEnvironmentLeaseRequest, EnvironmentDeleteBlastRadius, EnvironmentLease,
     EnvironmentProbeResult,
 };
-use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::errors::ServiceResult;

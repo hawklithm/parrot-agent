@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use models::{
-    IssueTreeHold, IssueTreeHoldMember, IssueTreeControlMode,
-    IssueTreeControlPreview, CreateIssueTreeHoldInput,
+    IssueTreeHold, IssueTreeHoldMember, IssueTreeControlMode, CreateIssueTreeHoldInput,
     IssueTreeHoldReleasePolicy, IssueTreeHoldReleasePolicyStrategy, ActiveIssueTreePauseHoldGate,
 };
 use services::TreeControlServiceError;

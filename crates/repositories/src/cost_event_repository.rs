@@ -1,5 +1,5 @@
 use models::{CostEvent, CostSummary};
-use sqlx::{PgPool, FromRow};
+use sqlx::PgPool;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use crate::RepositoryError as RepoError;

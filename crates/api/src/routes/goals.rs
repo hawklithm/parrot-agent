@@ -3,16 +3,14 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
-    routing::{delete, get, patch, post},
+    routing::{get, post},
     Json, Router,
 };
 use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
-use models::goal::{Goal, GoalLevel, GoalPriority};
-use services::GoalService;
+use models::goal::{Goal, GoalLevel};
 
 pub fn goal_routes() -> Router<AppState> {
     Router::new()

@@ -4,7 +4,6 @@
 //! 对应 cross-module-integration-tasks.md §5 全局错误恢复策略
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;

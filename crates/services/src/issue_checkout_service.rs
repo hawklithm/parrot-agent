@@ -3,11 +3,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::sync::Arc;
 
-use models::{Issue, IssueStatus, EnvironmentLease, UpdateIssueInput};
+use models::{Issue, IssueStatus, EnvironmentLease};
 use repositories::IssueRepository;
 use crate::errors::ServiceError;
 use crate::lease_service::{LeaseService, AcquireLeaseRequest};
-use crate::heartbeat_service::{HeartbeatService, HeartbeatError};
+use crate::heartbeat_service::HeartbeatService;
 
 /// Checkout input with environment acquisition
 #[derive(Debug, Clone, Deserialize)]
@@ -209,7 +209,7 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
         company_id: Uuid,
         input: CheckoutIssueInput,
     ) -> Result<CheckoutResult, ServiceError> {
-        let mut issue = self.get_issue_verified(issue_id, company_id).await?;
+        let issue = self.get_issue_verified(issue_id, company_id).await?;
 
         // Step 1: Validate expected s
         self.validate_expected_status(&issue.status, &input.expected_statuses)?;
@@ -355,7 +355,7 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
         company_id: Uuid,
         input: ForceReleaseInput,
     ) -> Result<Issue, ServiceError> {
-        let issue = self.get_issue_verified(issue_id, company_id).await?;
+        let _issue = self.get_issue_verified(issue_id, company_id).await?;
 
         // Admin can force release from any status
         let update_input = models::UpdateIssueInput {

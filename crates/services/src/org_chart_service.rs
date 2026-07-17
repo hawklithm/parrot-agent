@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use models::{OrgChartOptions, OrgChartStyle, OrgNode};
-use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// 组织架构服务错误
@@ -142,7 +141,7 @@ impl MockOrgChartService {
         let mut y_offset = 40;
 
         // 遍历根节点
-        for (idx, root) in tree.iter().enumerate() {
+        for (_idx, root) in tree.iter().enumerate() {
             let root_x = 640 - card_width / 2; // 居中
             svg_content.push_str(&Self::render_card(root, root_x as f32, y_offset as f32, card_width, card_height, card_bg, card_border, text_color));
             

@@ -1,4 +1,4 @@
-use crate::errors::{ServiceError, ServiceResult};
+use crate::errors::ServiceResult;
 use async_trait::async_trait;
 use models::{
     AdminUserDirectoryEntry, AdminUserDirectoryResponse, CompanyUserDirectoryEntry,

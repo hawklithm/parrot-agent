@@ -205,4 +205,108 @@ impl IssueService for MockIssueService {
             "executionState": null,
         }))
     }
+
+    // --- P1: Issue 子资源 Mock 实现 (I1-I44) ---
+
+    async fn get_activity(&self, id: Uuid, _company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
+        Ok(vec![
+            serde_json::json!({"id": Uuid::new_v4(), "issueId": id, "action": "created", "timestamp": Utc::now()}),
+            serde_json::json!({"id": Uuid::new_v4(), "issueId": id, "action": "status_changed", "from": "todo", "to": "in_progress", "timestamp": Utc::now()}),
+        ])
+    }
+
+    async fn get_cases(&self, _id: Uuid, _company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
+        Ok(vec![
+            serde_json::json!({"caseId": Uuid::new_v4(), "title": "Related Case 1"}),
+            serde_json::json!({"caseId": Uuid::new_v4(), "title": "Related Case 2"}),
+        ])
+    }
+
+    async fn get_active_run(&self, _id: Uuid, _company_id: Uuid) -> Result<Option<serde_json::Value>, String> {
+        Ok(Some(serde_json::json!({
+            "runId": Uuid::new_v4(),
+            "status": "running",
+            "startedAt": Utc::now(),
+        })))
+    }
+
+    async fn get_live_runs(&self, _id: Uuid, _company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
+        Ok(vec![
+            serde_json::json!({"runId": Uuid::new_v4(), "status": "running", "startedAt": Utc::now()}),
+        ])
+    }
+
+    async fn get_runs(&self, _id: Uuid, _company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
+        Ok(vec![
+            serde_json::json!({"runId": Uuid::new_v4(), "status": "completed", "startedAt": Utc::now(), "completedAt": Utc::now()}),
+            serde_json::json!({"runId": Uuid::new_v4(), "status": "failed", "startedAt": Utc::now(), "completedAt": Utc::now()}),
+        ])
+    }
+
+    async fn get_accepted_plan_decompositions(&self, _id: Uuid, _company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
+        Ok(vec![
+            serde_json::json!({"id": Uuid::new_v4(), "description": "Phase 1", "status": "accepted"}),
+        ])
+    }
+
+    async fn submit_plan_decomposition(&self, _id: Uuid, _company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"id": Uuid::new_v4(), "issueId": _id, "decomposition": input, "status": "submitted"}))
+    }
+
+    async fn get_approvals(&self, _id: Uuid, _company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
+        Ok(vec![
+            serde_json::json!({"id": Uuid::new_v4(), "status": "pending", "title": "Approval needed"}),
+        ])
+    }
+
+    async fn create_approval(&self, _id: Uuid, _company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"id": Uuid::new_v4(), "issueId": _id, "approval": input, "status": "pending"}))
+    }
+
+    async fn delete_approval(&self, _id: Uuid, _approval_id: Uuid, _company_id: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn mark_read(&self, _id: Uuid, _company_id: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn unmark_read(&self, _id: Uuid, _company_id: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn archive_inbox(&self, _id: Uuid, _company_id: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn unarchive_inbox(&self, _id: Uuid, _company_id: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn get_recovery_actions(&self, _id: Uuid, _company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
+        Ok(vec![
+            serde_json::json!({"id": Uuid::new_v4(), "action": "retry", "status": "pending"}),
+        ])
+    }
+
+    async fn resolve_recovery_action(&self, _id: Uuid, _company_id: Uuid, _action_id: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn create_work_product(&self, _id: Uuid, _company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"id": Uuid::new_v4(), "issueId": _id, "workProduct": input, "created": true}))
+    }
+
+    async fn get_comment(&self, comment_id: Uuid, _company_id: Uuid) -> Result<Option<serde_json::Value>, String> {
+        Ok(Some(serde_json::json!({"id": comment_id, "body": "Mock comment", "createdAt": Utc::now()})))
+    }
+
+    async fn get_cost_summary(&self, _id: Uuid, _company_id: Uuid) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "issueId": _id,
+            "totalCostCents": 1500,
+            "byModel": {"claude-3-opus": 1000, "claude-3-sonnet": 500},
+            "byProvider": {"anthropic": 1500},
+        }))
+    }
 }

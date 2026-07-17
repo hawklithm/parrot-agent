@@ -228,7 +228,7 @@ impl AgentAccessService for DefaultAgentAccessService {
                     true
                 } else if actor.is_agent() {
                     // Agents with can_create_agents permission can create
-                    if let Some(agent_id) = actor.agent_id() {
+                    if let Some(_agent_id) = actor.agent_id() {
                         // In production: fetch agent permissions from database
                         // For now: check via AgentActor struct
                         false // Placeholder

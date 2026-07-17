@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use repositories::EnvironmentRepository;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -42,6 +41,17 @@ pub trait EnvironmentService: Send + Sync {
 
     /// Validate environment config based on driver
     fn validate_config(&self, driver: EnvironmentDriver, config: &serde_json::Value) -> Result<(), ServiceError>;
+
+    // --- P1: Environment 补齐 (E11-E16) ---
+
+    /// E11: Get environment capabilities
+    async fn get_capabilities(&self, company_id: Uuid) -> Result<serde_json::Value, ServiceError>;
+
+    /// E12: Probe environment configuration
+    async fn probe_config(&self, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, ServiceError>;
+
+    /// E16: Get delete blast radius
+    async fn get_delete_blast_radius(&self, id: Uuid) -> Result<serde_json::Value, ServiceError>;
 }
 
 /// Default Environment Service Implementation
@@ -57,7 +67,7 @@ impl DefaultEnvironmentService {
 
 #[async_trait]
 impl EnvironmentService for DefaultEnvironmentService {
-    async fn create(&self, company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, ServiceError> {
+    async fn create(&self, _company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, ServiceError> {
         // Validate config
         self.validate_config(input.driver.clone(), input.config.as_ref().unwrap_or(&serde_json::Value::Null))?;
 
@@ -168,6 +178,42 @@ impl EnvironmentService for DefaultEnvironmentService {
                 Ok(())
             }
         }
+    }
+
+    // --- P1: Environment 补齐 Mock 实现 ---
+
+    async fn get_capabilities(&self, company_id: Uuid) -> Result<serde_json::Value, ServiceError> {
+        Ok(serde_json::json!({
+            "companyId": company_id,
+            "environments": [],
+            "totalEnvironments": 0,
+            "supportedDrivers": ["local", "ssh", "sandbox", "plugin"],
+        }))
+    }
+
+    async fn probe_config(&self, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, ServiceError> {
+        Ok(serde_json::json!({
+            "companyId": company_id,
+            "probeConfig": input,
+            "status": "ok",
+            "compatible": true,
+        }))
+    }
+
+    async fn get_delete_blast_radius(&self, id: Uuid) -> Result<serde_json::Value, ServiceError> {
+        // Check repo for actual blast radius
+        let blast_radius = self.environment_repo
+            .get_delete_blast_radius(id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to check delete blast radius: {}", e)))?;
+
+        Ok(serde_json::json!({
+            "environmentId": id,
+            "canDelete": blast_radius.can_delete,
+            "blockedReasons": blast_radius.blocked_reasons,
+            "activeLeases": blast_radius.active_leases,
+            "linkedAgents": blast_radius.affected_agents,
+        }))
     }
 }
 

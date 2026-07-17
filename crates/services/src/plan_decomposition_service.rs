@@ -5,7 +5,7 @@ use std::sync::Arc;
 use models::{
     PlanDecomposition, CreatePlanDecompositionInput, AcceptPlanDecompositionInput,
 };
-use repositories::{PlanDecompositionRepository, IssueRepository, RepositoryError};
+use repositories::{PlanDecompositionRepository, IssueRepository};
 
 /// Plan decomposition service for managing issue plan decompositions
 #[async_trait]

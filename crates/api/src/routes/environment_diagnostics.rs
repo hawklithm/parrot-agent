@@ -1,16 +1,11 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use models::{
-    AcquireEnvironmentLeaseRequest, EnvironmentDeleteBlastRadius, EnvironmentLease,
-    EnvironmentProbeResult,
-};
-use services::environment_diagnostics_service::EnvironmentDiagnosticsService;
+use models::AcquireEnvironmentLeaseRequest;
 use uuid::Uuid;
 
 /// POST /environments/:id/probe

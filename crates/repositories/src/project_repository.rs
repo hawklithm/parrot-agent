@@ -230,13 +230,28 @@ impl ProjectRepository {
         agent_id: Uuid,
         user_id: Uuid,
         state: MembershipState,
+        starred: Option<bool>,
     ) -> Result<AgentMembership> {
+        // `starred` semantics mirror Paperclip updateAgent:
+        //  - Some(true)  -> starred_at = COALESCE(starred_at, NOW())
+        //  - Some(false) -> starred_at = NULL
+        //  - None        -> leave starred_at untouched
         sqlx::query_as::<_, AgentMembership>(
             r#"
-            INSERT INTO agent_memberships (company_id, agent_id, user_id, state)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO agent_memberships (company_id, agent_id, user_id, state, starred_at)
+            VALUES ($1, $2, $3, $4,
+                    CASE WHEN $5 = TRUE THEN NOW()
+                         WHEN $5 = FALSE THEN NULL
+                         ELSE NULL
+                    END)
             ON CONFLICT (company_id, agent_id, user_id)
-            DO UPDATE SET state = $4, updated_at = NOW()
+            DO UPDATE SET state = EXCLUDED.state,
+                          starred_at = CASE
+                            WHEN $5 = TRUE THEN COALESCE(agent_memberships.starred_at, NOW())
+                            WHEN $5 = FALSE THEN NULL
+                            ELSE agent_memberships.starred_at
+                          END,
+                          updated_at = NOW()
             RETURNING *
             "#,
         )
@@ -244,6 +259,7 @@ impl ProjectRepository {
         .bind(agent_id)
         .bind(user_id)
         .bind(state)
+        .bind(starred)
         .fetch_one(&self.pool)
         .await
     }

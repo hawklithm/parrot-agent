@@ -1,7 +1,6 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
     routing::get,
     Json, Router,
 };
@@ -9,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use services::IssueService;
-use models::Issue;
 
 /// Blocker diagnostics response
 #[derive(Debug, Clone, Serialize, Deserialize)]

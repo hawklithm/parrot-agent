@@ -1,5 +1,4 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
@@ -7,12 +6,9 @@ use axum::{Router,
     Json,
 };
 use models::{
-    CompanySecretProviderConfig, CreateSecretProviderConfigRequest,
-    SecretProviderConfigDiscoveryPreviewRequest, SecretProviderConfigDiscoveryPreviewResult,
-    SecretProviderConfigHealthResponse, UpdateSecretProviderConfigRequest,
+    CreateSecretProviderConfigRequest,
+    SecretProviderConfigDiscoveryPreviewRequest, UpdateSecretProviderConfigRequest,
 };
-use services::secret_provider_config_service::SecretProviderConfigService;
-use std::sync::Arc;
 use uuid::Uuid;
 
 /// GET /companies/:companyId/secret-provider-configs

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use serde_json::{Value as JsonValue, json};
 use models::AdapterType;
 

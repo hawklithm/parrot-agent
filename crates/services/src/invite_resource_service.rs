@@ -1,9 +1,7 @@
 use async_trait::async_trait;
 use models::{
-    CompanyLogo, InviteOnboardingManifest, InviteSkillDetails, InviteSkillIndex, InviteToken,
+    CompanyLogo, InviteOnboardingManifest, InviteSkillDetails, InviteSkillIndex,
 };
-use std::sync::Arc;
-use uuid::Uuid;
 
 #[async_trait]
 pub trait InviteResourceService: Send + Sync {

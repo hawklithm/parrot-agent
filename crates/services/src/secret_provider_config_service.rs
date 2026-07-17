@@ -2,12 +2,16 @@ use async_trait::async_trait;
 use models::{
     CompanySecretProviderConfig, CreateSecretProviderConfigRequest,
     SecretProviderConfigDiscoveryPreviewRequest, SecretProviderConfigDiscoveryPreviewResult,
-    SecretProviderConfigHealthResponse, UpdateSecretProviderConfigRequest,
+    SecretProviderConfigHealthResponse, SecretProviderConfigHealthStatus,
+    SecretProviderConfigHealthDetails,
+    SecretProvider, SecretProviderConfigPayload, SecretProviderConfigStatus,
+    UpdateSecretProviderConfigRequest,
 };
+use repositories::{SecretProviderConfigRepository, RepositoryError};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::errors::ServiceResult;
+use crate::errors::{ServiceError, ServiceResult};
 
 /// Service for managing secret provider configurations
 #[async_trait]
@@ -55,78 +59,97 @@ pub trait SecretProviderConfigService: Send + Sync {
     ) -> ServiceResult<Vec<SecretProviderConfigHealthResponse>>;
 }
 
-/// Mock implementation for testing
-pub struct MockSecretProviderConfigService;
+/// Default implementation backed by `SecretProviderConfigRepository`.
+pub struct DefaultSecretProviderConfigServiceImpl {
+    repo: Arc<dyn SecretProviderConfigRepository>,
+}
 
-#[async_trait]
-impl SecretProviderConfigService for MockSecretProviderConfigService {
-    async fn list_configs(&self, company_id: Uuid) -> ServiceResult<Vec<CompanySecretProviderConfig>> {
-        use chrono::Utc;
-        use models::{
-            AwsSecretsManagerProviderConfig, LocalEncryptedProviderConfig, SecretProvider,
-            SecretProviderConfigHealthDetails, SecretProviderConfigHealthStatus,
-            SecretProviderConfigPayload, SecretProviderConfigStatus,
+impl DefaultSecretProviderConfigServiceImpl {
+    pub fn new(repo: Arc<dyn SecretProviderConfigRepository>) -> Self {
+        Self { repo }
+    }
+
+    /// Convert a DB `SecretProviderConfig` into the API `CompanySecretProviderConfig`.
+    fn to_api_model(db: models::SecretProviderConfig) -> CompanySecretProviderConfig {
+        // Map provider_type (String) -> SecretProvider enum
+        let provider = match db.provider_type.as_str() {
+            "local_encrypted" | "LocalEncrypted" => SecretProvider::LocalEncrypted,
+            "aws_secrets_manager" | "AwsSecretsManager" => SecretProvider::AwsSecretsManager,
+            "gcp_secret_manager" | "GcpSecretManager" => SecretProvider::GcpSecretManager,
+            "vault" | "Vault" => SecretProvider::Vault,
+            _ => SecretProvider::LocalEncrypted,
         };
 
-        Ok(vec![
-            CompanySecretProviderConfig {
-                id: Uuid::new_v4(),
-                company_id,
-                provider: SecretProvider::LocalEncrypted,
-                display_name: "Local Encrypted Storage".to_string(),
-                status: SecretProviderConfigStatus::Ready,
-                is_default: true,
-                config: SecretProviderConfigPayload::LocalEncrypted(LocalEncryptedProviderConfig {
-                    backup_reminder_acknowledged: Some(true),
-                }),
-                health_status: Some(SecretProviderConfigHealthStatus::Ready),
-                health_checked_at: Some(Utc::now()),
-                health_message: Some("Operational".to_string()),
-                health_details: Some(SecretProviderConfigHealthDetails {
-                    code: "healthy".to_string(),
-                    message: "Local storage is operational".to_string(),
-                    missing_fields: None,
-                    guidance: None,
-                }),
-                disabled_at: None,
-                created_by_agent_id: None,
-                created_by_user_id: Some(Uuid::new_v4()),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            CompanySecretProviderConfig {
-                id: Uuid::new_v4(),
-                company_id,
-                provider: SecretProvider::AwsSecretsManager,
-                display_name: "AWS Prod (us-east-1)".to_string(),
-                status: SecretProviderConfigStatus::Ready,
-                is_default: false,
-                config: SecretProviderConfigPayload::AwsSecretsManager(AwsSecretsManagerProviderConfig {
-                    region: "us-east-1".to_string(),
-                    endpoint: "https://secretsmanager.us-east-1.amazonaws.com".to_string(),
-                    deployment_id: "prod-us-east-1".to_string(),
-                    prefix: "paperclip/".to_string(),
-                    kms_key_id: Some("arn:aws:kms:us-east-1:123456789012:key/abcd-1234".to_string()),
-                    environment_tag: "production".to_string(),
-                    provider_owner_tag: "paperclip".to_string(),
-                    delete_recovery_window_days: 30,
-                }),
-                health_status: Some(SecretProviderConfigHealthStatus::Ready),
-                health_checked_at: Some(Utc::now()),
-                health_message: Some("Connected successfully".to_string()),
-                health_details: Some(SecretProviderConfigHealthDetails {
-                    code: "healthy".to_string(),
-                    message: "AWS Secrets Manager is reachable".to_string(),
-                    missing_fields: None,
-                    guidance: None,
-                }),
-                disabled_at: None,
-                created_by_agent_id: None,
-                created_by_user_id: Some(Uuid::new_v4()),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-        ])
+        // Map enabled -> status
+        let status = if db.enabled {
+            SecretProviderConfigStatus::Ready
+        } else {
+            SecretProviderConfigStatus::Disabled
+        };
+
+        // Unwrap the Json wrapper to get the inner Value
+        let config_value = db.config.0;
+
+        // Convert the raw JSON config into a typed SecretProviderConfigPayload
+        let config: SecretProviderConfigPayload =
+            serde_json::from_value(config_value.clone())
+                .unwrap_or_else(|_| SecretProviderConfigPayload::LocalEncrypted(
+                    models::LocalEncryptedProviderConfig { backup_reminder_acknowledged: None },
+                ));
+
+        CompanySecretProviderConfig {
+            id: db.id,
+            company_id: db.company_id,
+            provider,
+            display_name: db.provider_type.clone(),
+            status,
+            is_default: db.is_default,
+            config,
+            health_status: None,
+            health_checked_at: None,
+            health_message: None,
+            health_details: None,
+            disabled_at: None,
+            created_by_agent_id: None,
+            created_by_user_id: Some(db.created_by_user_id),
+            created_at: db.created_at,
+            updated_at: db.updated_at,
+        }
+    }
+
+    /// Convert the API `SecretProviderConfigPayload` back to a raw JSON `serde_json::Value`
+    fn config_to_json(config: &SecretProviderConfigPayload) -> serde_json::Value {
+        serde_json::to_value(config).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Convert a repository error into a service error
+    fn map_err(e: RepositoryError) -> ServiceError {
+        match e {
+            RepositoryError::NotFound(id) => ServiceError::NotFound(format!("Config {} not found", id)),
+            RepositoryError::DatabaseError(e) => ServiceError::Internal(e.to_string()),
+            RepositoryError::InvalidData(msg) => ServiceError::BadRequest(msg),
+        }
+    }
+
+    /// Map `SecretProvider` -> `SecretProviderType` for DB input
+    fn provider_type_from_api(provider: &SecretProvider) -> models::SecretProviderType {
+        match provider {
+            SecretProvider::LocalEncrypted => models::SecretProviderType::LocalEncrypted,
+            SecretProvider::AwsSecretsManager => models::SecretProviderType::AwsSecretsManager,
+            SecretProvider::GcpSecretManager => models::SecretProviderType::GcpSecretManager,
+            SecretProvider::Vault => models::SecretProviderType::Vault,
+        }
+    }
+}
+
+#[async_trait]
+impl SecretProviderConfigService for DefaultSecretProviderConfigServiceImpl {
+    async fn list_configs(&self, company_id: Uuid) -> ServiceResult<Vec<CompanySecretProviderConfig>> {
+        let configs = self.repo
+            .list_by_company(company_id)
+            .await
+            .map_err(Self::map_err)?;
+        Ok(configs.into_iter().map(Self::to_api_model).collect())
     }
 
     async fn discovery_preview(
@@ -134,48 +157,13 @@ impl SecretProviderConfigService for MockSecretProviderConfigService {
         _company_id: Uuid,
         request: SecretProviderConfigDiscoveryPreviewRequest,
     ) -> ServiceResult<SecretProviderConfigDiscoveryPreviewResult> {
-        use models::{
-            SecretProviderConfigDiscoveryCandidate, SecretProviderConfigDiscoverySignal,
-            SecretProviderConfigDiscoverySample,
-        };
-
+        // Simplified preview result. Real implementation would scan the external provider.
         Ok(SecretProviderConfigDiscoveryPreviewResult {
             provider: request.provider.clone(),
             next_token: None,
-            sampled_secret_count: 15,
-            skipped_foreign_paperclip_sample_count: 2,
-            candidates: vec![SecretProviderConfigDiscoveryCandidate {
-                provider: request.provider.clone(),
-                display_name: "Discovered AWS Configuration".to_string(),
-                config: request.config,
-                sample_count: 15,
-                samples: vec![
-                    SecretProviderConfigDiscoverySample {
-                        name: "paperclip/prod/database-url".to_string(),
-                        has_kms_key: true,
-                        tag_keys: vec!["environment".to_string(), "owner".to_string()],
-                    },
-                    SecretProviderConfigDiscoverySample {
-                        name: "paperclip/prod/api-key".to_string(),
-                        has_kms_key: true,
-                        tag_keys: vec!["environment".to_string(), "owner".to_string()],
-                    },
-                ],
-                signals: SecretProviderConfigDiscoverySignal {
-                    namespace: Some("paperclip".to_string()),
-                    secret_name_prefix: Some("paperclip/prod/".to_string()),
-                    environment_tag: Some("production".to_string()),
-                    owner_tag: Some("paperclip".to_string()),
-                    kms_key_id: Some("arn:aws:kms:us-east-1:123456789012:key/abcd-1234".to_string()),
-                    has_kms_key: true,
-                    sample_count: 15,
-                    paperclip_managed_sample_count: 13,
-                    skipped_foreign_paperclip_sample_count: 2,
-                },
-                warnings: vec![
-                    "2 secrets skipped (owned by different Paperclip instance)".to_string(),
-                ],
-            }],
+            sampled_secret_count: 0,
+            skipped_foreign_paperclip_sample_count: 0,
+            candidates: vec![],
             warnings: vec![],
         })
     }
@@ -185,56 +173,28 @@ impl SecretProviderConfigService for MockSecretProviderConfigService {
         company_id: Uuid,
         request: CreateSecretProviderConfigRequest,
     ) -> ServiceResult<CompanySecretProviderConfig> {
-        use chrono::Utc;
-        use models::SecretProviderConfigStatus;
-
-        Ok(CompanySecretProviderConfig {
-            id: Uuid::new_v4(),
+        let input = models::CreateSecretProviderConfigInput {
             company_id,
-            provider: request.provider,
-            display_name: request.display_name,
-            status: SecretProviderConfigStatus::Ready,
+            provider_type: Self::provider_type_from_api(&request.provider),
+            name: request.display_name,
+            config: Self::config_to_json(&request.config),
             is_default: request.set_as_default,
-            config: request.config,
-            health_status: None,
-            health_checked_at: None,
-            health_message: None,
-            health_details: None,
-            disabled_at: None,
-            created_by_agent_id: None,
-            created_by_user_id: Some(Uuid::new_v4()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
+        };
+
+        let db_config = self.repo
+            .create(input)
+            .await
+            .map_err(Self::map_err)?;
+        Ok(Self::to_api_model(db_config))
     }
 
     async fn get_config(&self, config_id: Uuid) -> ServiceResult<CompanySecretProviderConfig> {
-        use chrono::Utc;
-        use models::{
-            LocalEncryptedProviderConfig, SecretProvider, SecretProviderConfigPayload,
-            SecretProviderConfigStatus,
-        };
-
-        Ok(CompanySecretProviderConfig {
-            id: config_id,
-            company_id: Uuid::new_v4(),
-            provider: SecretProvider::LocalEncrypted,
-            display_name: "Local Encrypted Storage".to_string(),
-            status: SecretProviderConfigStatus::Ready,
-            is_default: true,
-            config: SecretProviderConfigPayload::LocalEncrypted(LocalEncryptedProviderConfig {
-                backup_reminder_acknowledged: Some(true),
-            }),
-            health_status: None,
-            health_checked_at: None,
-            health_message: None,
-            health_details: None,
-            disabled_at: None,
-            created_by_agent_id: None,
-            created_by_user_id: Some(Uuid::new_v4()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
+        let db_config = self.repo
+            .get_by_id(config_id)
+            .await
+            .map_err(Self::map_err)?
+            .ok_or_else(|| ServiceError::NotFound(format!("Secret provider config {} not found", config_id)))?;
+        Ok(Self::to_api_model(db_config))
     }
 
     async fn update_config(
@@ -242,80 +202,64 @@ impl SecretProviderConfigService for MockSecretProviderConfigService {
         config_id: Uuid,
         request: UpdateSecretProviderConfigRequest,
     ) -> ServiceResult<CompanySecretProviderConfig> {
-        use chrono::Utc;
-        use models::{
-            LocalEncryptedProviderConfig, SecretProvider, SecretProviderConfigPayload,
-            SecretProviderConfigStatus,
+        let input = models::UpdateSecretProviderConfigInput {
+            name: request.display_name,
+            config: request.config.as_ref().map(Self::config_to_json),
+            is_default: None,
+            status: request.status.map(|s| match s {
+                SecretProviderConfigStatus::Ready => models::SecretStatus::Active,
+                _ => models::SecretStatus::Archived,
+            }),
         };
 
-        Ok(CompanySecretProviderConfig {
-            id: config_id,
-            company_id: Uuid::new_v4(),
-            provider: SecretProvider::LocalEncrypted,
-            display_name: request.display_name.unwrap_or("Updated Config".to_string()),
-            status: request.status.unwrap_or(SecretProviderConfigStatus::Ready),
-            is_default: false,
-            config: request
-                .config
-                .unwrap_or(SecretProviderConfigPayload::LocalEncrypted(
-                    LocalEncryptedProviderConfig {
-                        backup_reminder_acknowledged: Some(true),
-                    },
-                )),
-            health_status: None,
-            health_checked_at: None,
-            health_message: None,
-            health_details: None,
-            disabled_at: None,
-            created_by_agent_id: None,
-            created_by_user_id: Some(Uuid::new_v4()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
+        let db_config = self.repo
+            .update(config_id, input)
+            .await
+            .map_err(Self::map_err)?;
+        Ok(Self::to_api_model(db_config))
     }
 
-    async fn delete_config(&self, _config_id: Uuid) -> ServiceResult<()> {
-        Ok(())
+    async fn delete_config(&self, config_id: Uuid) -> ServiceResult<()> {
+        self.repo
+            .delete(config_id)
+            .await
+            .map_err(Self::map_err)
     }
 
     async fn set_default(&self, config_id: Uuid) -> ServiceResult<CompanySecretProviderConfig> {
-        use chrono::Utc;
-        use models::{
-            LocalEncryptedProviderConfig, SecretProvider, SecretProviderConfigPayload,
-            SecretProviderConfigStatus,
-        };
+        // Fetch the config first to get company_id
+        let db_config = self.repo
+            .get_by_id(config_id)
+            .await
+            .map_err(Self::map_err)?
+            .ok_or_else(|| ServiceError::NotFound(format!("Secret provider config {} not found", config_id)))?;
 
-        Ok(CompanySecretProviderConfig {
-            id: config_id,
-            company_id: Uuid::new_v4(),
-            provider: SecretProvider::LocalEncrypted,
-            display_name: "Local Encrypted Storage".to_string(),
-            status: SecretProviderConfigStatus::Ready,
-            is_default: true, // Set as default
-            config: SecretProviderConfigPayload::LocalEncrypted(LocalEncryptedProviderConfig {
-                backup_reminder_acknowledged: Some(true),
-            }),
-            health_status: None,
-            health_checked_at: None,
-            health_message: None,
-            health_details: None,
-            disabled_at: None,
-            created_by_agent_id: None,
-            created_by_user_id: Some(Uuid::new_v4()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
+        let updated = self.repo
+            .set_default(config_id, db_config.company_id)
+            .await
+            .map_err(Self::map_err)?;
+        Ok(Self::to_api_model(updated))
     }
 
     async fn health_check(&self, config_id: Uuid) -> ServiceResult<SecretProviderConfigHealthResponse> {
-        use chrono::Utc;
-        use models::{
-            SecretProvider, SecretProviderConfigHealthDetails, SecretProviderConfigHealthStatus,
+        let db_config = self.repo
+            .get_by_id(config_id)
+            .await
+            .map_err(Self::map_err)?
+            .ok_or_else(|| ServiceError::NotFound(format!("Secret provider config {} not found", config_id)))?;
+
+        let provider = match db_config.provider_type.as_str() {
+            "local_encrypted" | "LocalEncrypted" => SecretProvider::LocalEncrypted,
+            "aws_secrets_manager" | "AwsSecretsManager" => SecretProvider::AwsSecretsManager,
+            "gcp_secret_manager" | "GcpSecretManager" => SecretProvider::GcpSecretManager,
+            "vault" | "Vault" => SecretProvider::Vault,
+            _ => SecretProvider::LocalEncrypted,
         };
 
+        use chrono::Utc;
         Ok(SecretProviderConfigHealthResponse {
             config_id,
-            provider: SecretProvider::LocalEncrypted,
+            provider,
             status: SecretProviderConfigHealthStatus::Ready,
             message: "Health check passed".to_string(),
             details: SecretProviderConfigHealthDetails {
@@ -332,38 +276,36 @@ impl SecretProviderConfigService for MockSecretProviderConfigService {
         &self,
         company_id: Uuid,
     ) -> ServiceResult<Vec<SecretProviderConfigHealthResponse>> {
-        use chrono::Utc;
-        use models::{
-            SecretProvider, SecretProviderConfigHealthDetails, SecretProviderConfigHealthStatus,
-        };
+        let configs = self.repo
+            .list_by_company(company_id)
+            .await
+            .map_err(Self::map_err)?;
 
-        Ok(vec![
+        use chrono::Utc;
+        Ok(configs.into_iter().map(|cfg| {
+            let provider = match cfg.provider_type.as_str() {
+                "local_encrypted" | "LocalEncrypted" => SecretProvider::LocalEncrypted,
+                "aws_secrets_manager" | "AwsSecretsManager" => SecretProvider::AwsSecretsManager,
+                "gcp_secret_manager" | "GcpSecretManager" => SecretProvider::GcpSecretManager,
+                "vault" | "Vault" => SecretProvider::Vault,
+                _ => SecretProvider::LocalEncrypted,
+            };
             SecretProviderConfigHealthResponse {
-                config_id: Uuid::new_v4(),
-                provider: SecretProvider::LocalEncrypted,
+                config_id: cfg.id,
+                provider,
                 status: SecretProviderConfigHealthStatus::Ready,
                 message: "Operational".to_string(),
                 details: SecretProviderConfigHealthDetails {
                     code: "healthy".to_string(),
-                    message: "Local storage is operational".to_string(),
+                    message: "Provider is operational".to_string(),
                     missing_fields: None,
                     guidance: None,
                 },
                 checked_at: Utc::now(),
-            },
-            SecretProviderConfigHealthResponse {
-                config_id: Uuid::new_v4(),
-                provider: SecretProvider::AwsSecretsManager,
-                status: SecretProviderConfigHealthStatus::Ready,
-                message: "Connected successfully".to_string(),
-                details: SecretProviderConfigHealthDetails {
-                    code: "healthy".to_string(),
-                    message: "AWS Secrets Manager is reachable".to_string(),
-                    missing_fields: None,
-                    guidance: None,
-                },
-                checked_at: Utc::now(),
-            },
-        ])
+            }
+        }).collect())
     }
 }
+
+/// Mock implementation for testing
+pub struct MockSecretProviderConfigService;

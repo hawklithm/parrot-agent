@@ -1,5 +1,4 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
@@ -8,9 +7,8 @@ use axum::{Router,
         IntoResponse, Response, Sse,
     },
 };
-use futures::stream::{Stream, StreamExt};
-use models::{SseEvent, SseEventType, SseFrame, SseSubscription};
-use services::sse_service::SseService;
+use futures::stream::StreamExt;
+use models::{SseEvent, SseEventType, SseSubscription};
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;

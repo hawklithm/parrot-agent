@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{self, Duration, Instant};
+use tokio::time::{self, Duration};
 use uuid::Uuid;
 use crate::WatchdogService;
 use repositories::CompanyRepository;

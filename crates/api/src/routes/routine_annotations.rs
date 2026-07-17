@@ -1,5 +1,4 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, Query, State},
     http::StatusCode,
@@ -10,12 +9,11 @@ use models::{
     CreateRoutineAnnotationCommentRequest, CreateRoutineAnnotationThreadRequest,
     UpdateRoutineAnnotationThreadRequest,
 };
-use services::RoutineAnnotationService;
 use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ListAnnotationsQuery {
+pub struct ListAnnotationsQuery {
     #[serde(default)]
     include_comments: bool,
 }

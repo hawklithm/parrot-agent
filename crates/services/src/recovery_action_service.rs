@@ -212,12 +212,16 @@ mod tests {
 }
 
 // Mock implementations for testing
+#[allow(dead_code)]
 struct MockRecoveryRepo;
+#[allow(dead_code)]
 impl MockRecoveryRepo {
     fn new() -> Self { Self }
 }
 
+#[allow(dead_code)]
 struct MockIssueRepo;
+#[allow(dead_code)]
 impl MockIssueRepo {
     fn new() -> Self { Self }
 }

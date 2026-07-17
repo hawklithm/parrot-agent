@@ -63,7 +63,7 @@ impl CompanyService {
         Ok(self.company_repo.increment_issue_counter(company_id).await?)
     }
 
-    pub async fn update_branding(&self, id: Uuid, brand_color: Option<String>, logo_asset_id: Option<Uuid>) -> AppResult<Company> {
+    pub async fn update_branding(&self, id: Uuid, _brand_color: Option<String>, _logo_asset_id: Option<Uuid>) -> AppResult<Company> {
         let input = UpdateCompanyInput {
             name: None,
             description: None,

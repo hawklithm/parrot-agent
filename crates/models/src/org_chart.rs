@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Organization node (recursive tree structure)
 #[derive(Debug, Clone, Serialize, Deserialize)]

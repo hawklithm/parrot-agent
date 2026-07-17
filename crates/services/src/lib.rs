@@ -62,13 +62,15 @@ pub mod issue_comment_service_impl;
 pub mod work_product_service;
 pub mod attachment_service;
 pub mod skill_registry_service;
+pub mod skill_registry_service_impl;
 pub mod secret_remote_import_service;
 pub mod secret_provider_config_service;
 pub mod environment_diagnostics_service;
 
 pub use skill_registry_service::{SkillRegistryService, MockSkillRegistryService};
+pub use skill_registry_service_impl::DefaultSkillRegistryServiceImpl;
 pub use secret_remote_import_service::{SecretRemoteImportService, MockSecretRemoteImportService};
-pub use secret_provider_config_service::{SecretProviderConfigService, MockSecretProviderConfigService};
+pub use secret_provider_config_service::{SecretProviderConfigService, MockSecretProviderConfigService, DefaultSecretProviderConfigServiceImpl};
 pub use environment_diagnostics_service::{EnvironmentDiagnosticsService, MockEnvironmentDiagnosticsService};
 
 pub use agent_service::{
@@ -109,7 +111,7 @@ pub use org_chart_service_impl::DefaultOrgChartService;
 pub use issue_service::{
     IssueService,
 };
-pub use issue_service_complete::DefaultIssueService;
+pub use issue_service_complete::{DefaultIssueService, LegacyIssueService};
 pub use case_service::{
     CaseService,
 };
@@ -166,7 +168,6 @@ pub mod project_service;
 pub use project_service::*;
 pub use activity_log_service::*;
 pub mod authorization_service_complete;
-pub use authorization_service_complete::*;
 pub mod invite_service_complete;
 pub use invite_service_complete::*;
 pub mod event_bus_service;
@@ -176,7 +177,6 @@ pub use saga_orchestrator::*;
 pub mod consistency_service;
 pub use consistency_service::*;
 pub mod agent_access_service;
-pub use agent_access_service::*;
 pub mod recovery_action_service;
 pub use recovery_action_service::*;
 pub mod monitor_scheduler;
@@ -207,7 +207,6 @@ pub use adapter_plugin::{
 };
 pub mod adapter_executor;
 pub use adapter_executor::*;
-pub use job_scheduler::*;
 pub mod issue_execution_lock_service;
 pub use issue_execution_lock_service::*;
 pub use low_trust_service::*;

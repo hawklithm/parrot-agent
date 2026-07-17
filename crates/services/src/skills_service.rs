@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use models::{AvailableSkill, AvailableSkillsResponse, SkillDetail, SkillIndexEntry};
-use std::sync::Arc;
 
 use crate::ServiceError;
 

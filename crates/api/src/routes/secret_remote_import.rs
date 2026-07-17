@@ -1,5 +1,4 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
@@ -7,10 +6,8 @@ use axum::{Router,
     Json,
 };
 use models::{
-    RemoteSecretImportPreviewRequest, RemoteSecretImportPreviewResult, RemoteSecretImportRequest,
-    RemoteSecretImportResult,
+    RemoteSecretImportPreviewRequest, RemoteSecretImportRequest,
 };
-use services::secret_remote_import_service::SecretRemoteImportService;
 use uuid::Uuid;
 
 /// POST /companies/:companyId/secrets/remote-import/preview

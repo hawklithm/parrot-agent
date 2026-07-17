@@ -230,11 +230,11 @@ impl EnvironmentRepository for PgEnvironmentRepository {
 
         // Check for agents using this environment
         // TODO: This requires agents table to have environment_id field
-        let affected_agents: i64 = 0;
+        let _affected_agents: i64 = 0;
 
         // Check for issues using this environment
         // TODO: This requires issues table to have environment_id or execution_workspace_id field
-        let affected_issues: i64 = 0;
+        let _affected_issues: i64 = 0;
 
         let mut blocked_reasons = Vec::new();
         let can_delete = if active_leases.0 > 0 {

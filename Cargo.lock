@@ -1314,6 +1314,22 @@ name = "parrot-agent"
 version = "0.1.0"
 
 [[package]]
+name = "parrot-server"
+version = "0.1.0"
+dependencies = [
+ "access",
+ "api",
+ "axum",
+ "models",
+ "repositories",
+ "services",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,5 +1,4 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
@@ -7,12 +6,9 @@ use axum::{Router,
     Json,
 };
 use models::{
-    CreateUserSecretDefinitionRequest, MyUserSecretEntry, SecretBinding,
-    UpdateUserSecretDefinitionRequest, UpsertUserSecretRequest, UserSecretCoverageSummary,
-    UserSecretDefinition, UserSecretValue,
+    CreateUserSecretDefinitionRequest,
+    UpdateUserSecretDefinitionRequest, UpsertUserSecretRequest,
 };
-use services::user_secret_definition_service::UserSecretDefinitionService;
-use std::sync::Arc;
 use uuid::Uuid;
 
 /// GET /companies/:companyId/user-secret-definitions

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use models::{
     IssueTreeHold, IssueTreeHoldMember, IssueTreeControlMode,
-    IssueTreeHoldStatus, CreateIssueTreeHoldInput,
+
 };
 use uuid::Uuid;
 use crate::RepositoryError;

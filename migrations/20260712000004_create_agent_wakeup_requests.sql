@@ -2,7 +2,13 @@
 -- Mirrors paperclip agent_wakeup_requests: a queued/active wake that keeps an
 -- issue subtree "live" until the agent run starts.
 
-CREATE TYPE agent_wakeup_request_status AS ENUM ('queued', 'dispatched', 'running', 'completed', 'failed', 'cancelled');
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'agent_wakeup_request_status') THEN
+        CREATE TYPE agent_wakeup_request_status AS ENUM ('queued', 'dispatched', 'running', 'completed', 'failed', 'cancelled');
+    END IF;
+END
+$$;
 
 CREATE TABLE agent_wakeup_requests (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -77,12 +77,18 @@ impl Default for AgentPermissions {
 }
 
 /// Agent 元数据
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_built_in: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub built_in_key: Option<String>,
+    /// 指令包在适配器运行时中的路径（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions_path: Option<String>,
+    /// 指令包内容（文件树），存储于 agent 元数据内
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions_bundle: Option<serde_json::Value>,
 }
 
 /// Skill source enum
@@ -119,7 +125,7 @@ pub struct AgentSkillSnapshot {
 }
 
 /// Agent 实体
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Agent {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -144,6 +150,27 @@ pub struct AgentConfigRevision {
     pub agent_id: Uuid,
     pub snapshot: Json<serde_json::Value>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Agent 运行时状态
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRuntimeState {
+    pub agent_id: Uuid,
+    pub status: AgentStatus,
+    pub is_healthy: bool,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub current_task_id: Option<Uuid>,
+}
+
+/// Agent 任务会话
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTaskSession {
+    pub id: Uuid,
+    pub agent_id: Uuid,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// 审批记录

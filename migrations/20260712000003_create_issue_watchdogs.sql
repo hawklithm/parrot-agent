@@ -2,7 +2,13 @@
 -- Mirrors paperclip issue_watchdogs: one row per (company, watched issue)
 -- tracking the subtree evaluation fingerprint and review state.
 
-CREATE TYPE issue_watchdog_status AS ENUM ('active', 'paused', 'resolved', 'archived');
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'issue_watchdog_status') THEN
+        CREATE TYPE issue_watchdog_status AS ENUM ('active', 'paused', 'resolved', 'archived');
+    END IF;
+END
+$$;
 
 CREATE TABLE issue_watchdogs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

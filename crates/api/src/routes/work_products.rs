@@ -3,7 +3,7 @@ use crate::errors::AppError;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get, patch, post},
+    routing::{get, patch},
     Json, Router,
 };
 use uuid::Uuid;

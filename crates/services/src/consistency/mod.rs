@@ -35,8 +35,8 @@ pub struct IssueStateChecker;
 
 #[async_trait]
 impl ConsistencyChecker for IssueStateChecker {
-    async fn check(&self, company_id: Uuid) -> ServiceResult<Vec<InconsistencyReport>> {
-        let mut reports = vec![];
+    async fn check(&self, _company_id: Uuid) -> ServiceResult<Vec<InconsistencyReport>> {
+        let reports = vec![];
 
         // Check 1: Issue.status = in_progress but no active RoutineRun or HeartbeatRun
         // Check 2: Issue.checked_out_by = agent_id but agent is terminated
@@ -64,8 +64,8 @@ pub struct EnvironmentLeaseChecker;
 
 #[async_trait]
 impl ConsistencyChecker for EnvironmentLeaseChecker {
-    async fn check(&self, company_id: Uuid) -> ServiceResult<Vec<InconsistencyReport>> {
-        let mut reports = vec![];
+    async fn check(&self, _company_id: Uuid) -> ServiceResult<Vec<InconsistencyReport>> {
+        let reports = vec![];
 
         // Check 1: Lease expired but not released
         // Check 2: Lease held by terminated agent
@@ -93,8 +93,8 @@ pub struct AgentStateChecker;
 
 #[async_trait]
 impl ConsistencyChecker for AgentStateChecker {
-    async fn check(&self, company_id: Uuid) -> ServiceResult<Vec<InconsistencyReport>> {
-        let mut reports = vec![];
+    async fn check(&self, _company_id: Uuid) -> ServiceResult<Vec<InconsistencyReport>> {
+        let reports = vec![];
 
         // Check 1: Agent.status = employed but no active issue
         // Check 2: Agent has checked_out_issue but issue.checked_out_by != agent_id

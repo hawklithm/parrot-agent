@@ -1,7 +1,6 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -12,6 +11,7 @@ use models::user_secret::{UserSecretDefinition, UserSecret, UserSecretScope, Use
 use services::user_secret_service::UserSecretService;
 
 pub struct UserSecretRoutes {
+    #[allow(dead_code)]
     service: Arc<dyn UserSecretService>,
 }
 
@@ -46,22 +46,32 @@ pub struct SetUserSecretRequest {
 #[derive(Debug, Serialize)]
 pub struct UserSecretResponse {
     pub id: Uuid,
+    pub company_id: Uuid,
+    pub user_secret_definition_id: Uuid,
     pub user_id: Uuid,
-    pub definition_id: Uuid,
+    pub env_key: String,
+    pub value_sha256: Option<String>,
+    pub version_selector: String,
+    pub required: bool,
+    pub allow_missing_override: bool,
     pub created_at: String,
     pub updated_at: String,
-    pub last_rotated_at: Option<String>,
 }
 
 impl From<UserSecret> for UserSecretResponse {
     fn from(secret: UserSecret) -> Self {
         Self {
             id: secret.id,
+            company_id: secret.company_id,
+            user_secret_definition_id: secret.user_secret_definition_id,
             user_id: secret.user_id,
-            definition_id: secret.definition_id,
+            env_key: secret.env_key,
+            value_sha256: secret.value_sha256,
+            version_selector: secret.version_selector,
+            required: secret.required,
+            allow_missing_override: secret.allow_missing_override,
             created_at: secret.created_at.to_rfc3339(),
             updated_at: secret.updated_at.to_rfc3339(),
-            last_rotated_at: secret.last_rotated_at.map(|dt| dt.to_rfc3339()),
         }
     }
 }
@@ -96,7 +106,7 @@ pub async fn create_definition(
 
 // GET /companies/:companyId/user-secret-definitions/:definitionId
 pub async fn get_definition(
-    Path((company_id, definition_id)): Path<(Uuid, Uuid)>,
+    Path((_company_id, definition_id)): Path<(Uuid, Uuid)>,
     State(service): State<Arc<dyn UserSecretService>>,
 ) -> Result<Json<UserSecretDefinition>, StatusCode> {
     let definition = service
@@ -109,7 +119,7 @@ pub async fn get_definition(
 
 // PATCH /companies/:companyId/user-secret-definitions/:definitionId
 pub async fn update_definition(
-    Path((company_id, definition_id)): Path<(Uuid, Uuid)>,
+    Path((_company_id, definition_id)): Path<(Uuid, Uuid)>,
     State(service): State<Arc<dyn UserSecretService>>,
     Json(req): Json<UpdateDefinitionRequest>,
 ) -> Result<Json<UserSecretDefinition>, StatusCode> {
@@ -122,7 +132,7 @@ pub async fn update_definition(
 
 // DELETE /companies/:companyId/user-secret-definitions/:definitionId
 pub async fn delete_definition(
-    Path((company_id, definition_id)): Path<(Uuid, Uuid)>,
+    Path((_company_id, definition_id)): Path<(Uuid, Uuid)>,
     State(service): State<Arc<dyn UserSecretService>>,
 ) -> Result<StatusCode, StatusCode> {
     service
@@ -163,7 +173,7 @@ pub async fn list_user_secrets(
 
 // POST /companies/:companyId/me/user-secrets
 pub async fn set_user_secret(
-    Path(company_id): Path<Uuid>,
+    Path(_company_id): Path<Uuid>,
     State(service): State<Arc<dyn UserSecretService>>,
     Json(req): Json<SetUserSecretRequest>,
 ) -> Result<Json<UserSecretResponse>, StatusCode> {
@@ -180,7 +190,7 @@ pub async fn set_user_secret(
 
 // GET /companies/:companyId/me/user-secrets/:definitionId
 pub async fn get_user_secret(
-    Path((company_id, definition_id)): Path<(Uuid, Uuid)>,
+    Path((_company_id, definition_id)): Path<(Uuid, Uuid)>,
     State(service): State<Arc<dyn UserSecretService>>,
 ) -> Result<Json<UserSecretResponse>, StatusCode> {
     // TODO: Extract user_id from auth context
@@ -197,7 +207,7 @@ pub async fn get_user_secret(
 
 // POST /companies/:companyId/me/user-secrets/:secretId/rotate
 pub async fn rotate_user_secret(
-    Path((company_id, secret_id)): Path<(Uuid, Uuid)>,
+    Path((_company_id, secret_id)): Path<(Uuid, Uuid)>,
     State(service): State<Arc<dyn UserSecretService>>,
     Json(new_value): Json<String>,
 ) -> Result<Json<UserSecretResponse>, StatusCode> {
@@ -211,7 +221,7 @@ pub async fn rotate_user_secret(
 
 // DELETE /companies/:companyId/me/user-secrets/:secretId
 pub async fn delete_user_secret(
-    Path((company_id, secret_id)): Path<(Uuid, Uuid)>,
+    Path((_company_id, secret_id)): Path<(Uuid, Uuid)>,
     State(service): State<Arc<dyn UserSecretService>>,
 ) -> Result<StatusCode, StatusCode> {
     service
@@ -223,7 +233,7 @@ pub async fn delete_user_secret(
 
 // GET /companies/:companyId/me/user-secrets/:secretId/bindings
 pub async fn get_secret_bindings(
-    Path((company_id, secret_id)): Path<(Uuid, Uuid)>,
+    Path((_company_id, secret_id)): Path<(Uuid, Uuid)>,
     State(service): State<Arc<dyn UserSecretService>>,
 ) -> Result<Json<Vec<SecretBinding>>, StatusCode> {
     let bindings = service
@@ -234,7 +244,7 @@ pub async fn get_secret_bindings(
 }
 
 pub fn user_secret_routes() -> axum::Router<Arc<dyn UserSecretService>> {
-    use axum::routing::{delete, get, patch, post};
+    use axum::routing::{delete, get, post};
 
     axum::Router::new()
         .route("/companies/:company_id/user-secret-definitions", get(list_definitions).post(create_definition))

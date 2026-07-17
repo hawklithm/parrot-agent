@@ -16,7 +16,7 @@ use repositories::auth_repositories::{
 
 use super::actor::{ActorSource, AuthorizationActor};
 use super::decision::{AuthorizationAction, AuthorizationDecision, DecisionReason};
-use super::membership::{CompanyMembership, MembershipRole, PrincipalType};
+use super::membership::{CompanyMembership, MembershipRole};
 use super::permission::PermissionKey;
 
 /// 核心信任预设（对应 §7 阶段二 TrustPresetResolver）。

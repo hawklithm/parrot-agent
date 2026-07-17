@@ -339,14 +339,14 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
         Ok(ready_triggers)
     }
 
-    async fn record_execution(&self, trigger_id: Uuid, success: bool, run_id: Option<Uuid>, error_message: Option<String>) -> Result<(), ServiceError> {
+    async fn record_execution(&self, trigger_id: Uuid, success: bool, _run_id: Option<Uuid>, _error_message: Option<String>) -> Result<(), ServiceError> {
         let mut trigger = self.get(trigger_id).await?;
 
         trigger.last_triggered_at = Some(Utc::now());
 
         // Calculate next_trigger_at for cron triggers
         if trigger.trigger_type == TriggerType::Cron {
-            if let Some(cron_expr) = trigger.config.get("cron_expression").and_then(|v| v.as_str()) {
+            if let Some(_cron_expr) = trigger.config.get("cron_expression").and_then(|v| v.as_str()) {
                 // TODO: Use cron parser to calculate next execution time
                 // For now, set it to 1 hour from now as a placeholder
                 trigger.next_trigger_at = Some(Utc::now() + chrono::Duration::hours(1));

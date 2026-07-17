@@ -960,6 +960,7 @@ async fn update_member_role_and_grants(
 #[serde(rename_all = "camelCase")]
 struct UpdateRoleAndGrantsPayload {
     role: String,
+    #[allow(dead_code)]
     grants: Option<Vec<String>>,
 }
 

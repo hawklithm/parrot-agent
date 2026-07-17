@@ -1,0 +1,21 @@
+[package]
+name = "parrot-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "parrot-server"
+path = "src/main.rs"
+
+[dependencies]
+api = { path = "../api" }
+models = { path = "../models" }
+services = { path = "../services" }
+repositories = { path = "../repositories" }
+access = { path = "../access" }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

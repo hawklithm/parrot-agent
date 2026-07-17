@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::Utc;
-use models::event_bus::{EventBus, SystemEvent};
+use models::event_bus::EventBus;
 use models::saga::{
     RetryPolicy, SagaContext, SagaInstance, SagaOrchestrator, SagaRepository, SagaStatus,
     SagaStep, SagaStepExecution, StepExecutionStatus,
@@ -11,6 +11,7 @@ use uuid::Uuid;
 /// Default saga orchestrator implementation
 pub struct DefaultSagaOrchestrator {
     saga_repo: Arc<dyn SagaRepository>,
+    #[allow(dead_code)]
     event_bus: Arc<dyn EventBus>,
 }
 

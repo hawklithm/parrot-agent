@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use models::{
-    ExecutionWorkspace, WorkspaceStatus, WorkspaceMode, WorkspaceStrategyType,
+    ExecutionWorkspace, WorkspaceStatus,
     CreateExecutionWorkspaceInput, UpdateExecutionWorkspaceInput,
 };
 use uuid::Uuid;

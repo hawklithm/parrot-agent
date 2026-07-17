@@ -4,8 +4,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 use tokio::sync::Mutex;
 
-use models::{Issue, IssueStatus, UpdateIssueInput};
-use repositories::{IssueRepository, RepositoryError};
+use models::{Issue, UpdateIssueInput};
+use repositories::IssueRepository;
 
 /// Configuration for the monitor scheduler
 #[derive(Debug, Clone)]
@@ -106,6 +106,7 @@ impl DefaultMonitorScheduler {
     }
 
     /// Main background loop
+    #[allow(dead_code)]
     async fn run_loop(&self) {
         let config = self.config.clone();
         let interval = tokio::time::Duration::from_secs(config.poll_interval_seconds);
@@ -140,7 +141,7 @@ impl MonitorSchedulerService for DefaultMonitorScheduler {
         drop(running);
 
         // Spawn the background loop
-        let this_ref = Arc::new(()); // We need to capture self
+        let _this_ref = Arc::new(()); // We need to capture self
         // Since we can't easily clone Arc<Self>, use a simpler approach
         tokio::spawn(async move {
             // In production: self.run_loop().await;

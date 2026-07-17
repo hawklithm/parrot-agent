@@ -1,4 +1,4 @@
-use crate::errors::{ServiceError, ServiceResult};
+use crate::errors::ServiceResult;
 use async_trait::async_trait;
 use models::{
     CreateUserSecretDefinitionRequest, MyUserSecretEntry, SecretBinding,
@@ -191,7 +191,7 @@ impl UserSecretDefinitionService for UserSecretDefinitionServiceImpl {
         Ok(secret)
     }
 
-    async fn get_secret_bindings(&self, secret_id: Uuid) -> ServiceResult<Vec<SecretBinding>> {
+    async fn get_secret_bindings(&self, _secret_id: Uuid) -> ServiceResult<Vec<SecretBinding>> {
         Ok(vec![
             SecretBinding {
                 id: Uuid::new_v4(),

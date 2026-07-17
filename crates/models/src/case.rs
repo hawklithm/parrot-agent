@@ -14,6 +14,33 @@ pub enum CaseStatus {
     Cancelled,
 }
 
+/// Case 状态机：校验 Case 状态转换合法性
+pub struct CaseStateMachine;
+
+impl CaseStateMachine {
+    /// 判断从 `from` 到 `to` 是否允许
+    pub fn can_transition(from: CaseStatus, to: &CaseStatus) -> bool {
+        use CaseStatus::*;
+        match (&from, to) {
+            // 同状态始终允许
+            (a, b) if a == b => true,
+            // Draft -> InProgress / Cancelled
+            (Draft, InProgress) | (Draft, Cancelled) => true,
+            // InProgress -> InReview / Done / Cancelled
+            (InProgress, InReview) | (InProgress, Done) | (InProgress, Cancelled) => true,
+            // InReview -> Approved / InProgress / Cancelled
+            (InReview, Approved) | (InReview, InProgress) | (InReview, Cancelled) => true,
+            // Approved -> Done / Cancelled
+            (Approved, Done) | (Approved, Cancelled) => true,
+            // Done -> InProgress (reopen)
+            (Done, InProgress) => true,
+            // Cancelled -> Draft (reopen)
+            (Cancelled, Draft) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Case issue link role
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]

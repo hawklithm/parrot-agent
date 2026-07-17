@@ -1,13 +1,11 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use models::{OpenClawInvitePromptRequest, OpenClawInvitePromptResponse};
-use services::openclaw_service::OpenClawService;
+use models::OpenClawInvitePromptRequest;
 use uuid::Uuid;
 
 /// POST /companies/:companyId/openclaw/invite-prompt

@@ -17,7 +17,6 @@ use axum::{
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use crate::auth::AuthError;
 
 /// 速率限制配置
 #[derive(Debug, Clone)]

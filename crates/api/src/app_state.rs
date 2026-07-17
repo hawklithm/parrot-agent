@@ -14,7 +14,7 @@ pub use services::{
     SecretRemoteImportService, EnvironmentDiagnosticsService,
     InviteResourceService, RoutineAnnotationService, WorkProductService,
     AttachmentService, UserSecretDefinitionService, UserSecretService,
-    WatchdogService,
+    WatchdogService, ApprovalService,
 };
 
 pub use access::AccessService;
@@ -22,6 +22,7 @@ pub use access::AccessService;
 pub use models::event_bus::EventBus;
 
 /// Helper: wrap a service-backed router into an AppState-compatible router
+#[allow(dead_code)]
 fn wrap_routes<S>(routes: Router<S>, state: S) -> Router
 where
     S: Clone + Send + Sync + 'static,
@@ -91,6 +92,9 @@ pub struct AppState {
     pub user_secret_definition_service: Arc<dyn UserSecretDefinitionService>,
     pub user_secret_service: Arc<dyn UserSecretService>,
 
+    // P2: Approval subsystem
+    pub approval_service: Arc<dyn ApprovalService>,
+
     // Task watchdog subsystem
     pub watchdog_service: Arc<dyn WatchdogService>,
 
@@ -139,6 +143,7 @@ impl AppState {
         attachment_service: Arc<dyn AttachmentService>,
         user_secret_definition_service: Arc<dyn UserSecretDefinitionService>,
         user_secret_service: Arc<dyn UserSecretService>,
+        approval_service: Arc<dyn ApprovalService>,
         watchdog_service: Arc<dyn WatchdogService>,
         event_bus: Arc<dyn EventBus>,
         pool: PgPool,
@@ -179,6 +184,7 @@ impl AppState {
             attachment_service,
             user_secret_definition_service,
             user_secret_service,
+            approval_service,
             watchdog_service,
             event_bus,
             pool,
@@ -192,10 +198,7 @@ impl AppState {
 /// 返回 `Router<AppState>`，或返回已绑定状态的无状态 `Router`，方可被
 /// `merge` 合并。
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
-        // Health check
-        .route("/health", axum::routing::get(health_check))
-
+    let api_routes = Router::new()
         // Phase 1: Agent Management routes
         .merge(crate::routes::agents::agent_routes())
         .merge(crate::routes::auth::auth_routes(state.clone()))
@@ -217,6 +220,8 @@ pub fn create_router(state: AppState) -> Router {
         // Phase 3: Company/Org routes
         .merge(crate::routes::companies::company_routes())
         .merge(crate::routes::projects::project_routes())
+        // Company secrets + secret providers (SE5, SE14-SE20)
+        .merge(crate::routes::secrets::secret_routes())
         // Pipeline routes
         .merge(crate::routes::pipelines::pipeline_routes())
         // Routine/Goal routes
@@ -245,8 +250,25 @@ pub fn create_router(state: AppState) -> Router {
         // Task watchdog routes (Arc<dyn WatchdogService> state)
         .merge(crate::routes::watchdogs::watchdog_routes().with_state(state.watchdog_service.clone()))
 
-        // Apply state
-        .with_state(state)
+        // P2: New domain routes
+        .merge(crate::routes::approvals::approval_routes())
+        .merge(crate::routes::costs::cost_routes())
+        .merge(crate::routes::plugins::plugin_routes())
+        .merge(crate::routes::activity::activity_routes())
+        .merge(crate::routes::assets::asset_routes())
+        .merge(crate::routes::board_chat::board_chat_routes())
+        .merge(crate::routes::cloud_upstreams::cloud_upstream_routes())
+        .merge(crate::routes::instance_settings::instance_settings_routes())
+        .merge(crate::routes::labels::label_routes())
+        .merge(crate::routes::llms::llm_routes())
+        // P2: Execution workspace + heartbeat-run routes (X1-X18)
+        .merge(crate::routes::execution_workspaces::execution_workspace_routes())
+        .merge(crate::routes::heartbeat_runs::heartbeat_run_routes())
+        .with_state(state);
+
+    Router::new()
+        // The Paperclip HTTP contract exposes all service routes below `/api`.
+        .nest("/api", api_routes)
 
         // Middleware layers
         .layer(axum::middleware::from_fn(
@@ -257,6 +279,7 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 /// Health check endpoint
+#[allow(dead_code)]
 async fn health_check() -> &'static str {
     "OK"
 }

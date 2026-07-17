@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use models::{IssueComment, CommentActorType, Pagination};
-use services::{CommentServiceError, IssueCommentService};
+use services::CommentServiceError;
 use crate::errors::ApiError;
 use crate::app_state::AppState;
 

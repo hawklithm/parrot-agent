@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::built_in_agent_service::{
     BuiltInAgentDefinition, BuiltInAgentKey, BuiltInAgentMetadataRegistry, BuiltInAgentStatus,
 };
+use repositories;
 
 #[derive(Debug, Error)]
 pub enum BuiltInAgentError {
@@ -134,7 +135,7 @@ where
     async fn find_single_root_agent(&self, company_id: Uuid) -> BuiltInAgentResult<Option<Uuid>> {
         let agents = self
             .agent_repo
-            .list_by_company(company_id)
+            .list_by_company(company_id, repositories::ListAgentsOptions::default())
             .await
             .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
 
@@ -210,6 +211,8 @@ where
             metadata: sqlx::types::Json(models::AgentMetadata {
                 is_built_in: Some(true),
                 built_in_key: Some(definition.key.as_str().to_string()),
+                instructions_path: None,
+                instructions_bundle: None,
             }),
             budget_monthly_cents: budget,
             reports_to,
@@ -231,7 +234,11 @@ where
     ) -> BuiltInAgentResult<Option<models::Agent>> {
         let agents = self
             .agent_repo
-            .list_by_company(company_id)
+            .list_by_company(company_id, repositories::ListAgentsOptions {
+                include_terminated: true,
+                limit: None,
+                offset: None,
+            })
             .await
             .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
 

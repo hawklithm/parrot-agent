@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use uuid::Uuid;
 use super::secret_service::{
     Secret, CreateSecretInput, UpdateSecretInput, SecretService, SecretServiceError,
     EnvBinding, ResolvedAdapterConfig, RuntimeSecretManifestEntry, SecretResolutionOutcome,
 };
-use serde_json::Value as JsonValue;
+use crate::secret_provider::{LocalEncryptedProvider, load_secret_encryption_key, sha256_hex};
 
 /// 数据库支持的密钥服务实现
 pub struct DatabaseSecretService {
@@ -16,6 +16,59 @@ pub struct DatabaseSecretService {
 impl DatabaseSecretService {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Encrypt a plaintext value into a stored material jsonb (mirrors paperclip
+    /// local-encrypted provider). Returns (material_json, value_sha256).
+    fn encrypt_value(&self, plaintext: &str) -> Result<(serde_json::Value, String), SecretServiceError> {
+        let key = load_secret_encryption_key();
+        let provider = LocalEncryptedProvider::new(key)
+            .map_err(|e| SecretServiceError::ResolutionFailed(e.to_string()))?;
+        let ciphertext = provider
+            .encrypt(plaintext)
+            .map_err(|e| SecretServiceError::ResolutionFailed(e.to_string()))?;
+        let material = serde_json::json!({ "ciphertext": ciphertext });
+        let sha = sha256_hex(plaintext);
+        Ok((material, sha))
+    }
+
+    /// Decrypt the latest version material of a secret into plaintext.
+    async fn decrypt_latest(
+        &self,
+        secret_id: Uuid,
+    ) -> Result<Option<String>, SecretServiceError> {
+        let row = sqlx::query!(
+            r#"
+            SELECT material
+            FROM company_secret_versions
+            WHERE secret_id = $1
+            ORDER BY version DESC
+            LIMIT 1
+            "#,
+            secret_id,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let ciphertext = r
+                    .material
+                    .get("ciphertext")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        SecretServiceError::ResolutionFailed("missing ciphertext in material".to_string())
+                    })?;
+                let key = load_secret_encryption_key();
+                let provider = LocalEncryptedProvider::new(key)
+                    .map_err(|e| SecretServiceError::ResolutionFailed(e.to_string()))?;
+                let plaintext = provider
+                    .decrypt(ciphertext)
+                    .map_err(|e| SecretServiceError::ResolutionFailed(e.to_string()))?;
+                Ok(Some(plaintext))
+            }
+        }
     }
 
     /// 检查是否为敏感字段名
@@ -172,7 +225,10 @@ impl DatabaseSecretService {
                     // 从数据库获取密钥值
                     match self.get_secret(company_id, secret_id).await {
                         Ok(secret) => {
-                            resolved_env.insert(key.clone(), JsonValue::String(secret.value.clone()));
+                            resolved_env.insert(
+                                key.clone(),
+                                JsonValue::String(secret.value.clone().unwrap_or_default()),
+                            );
 
                             manifest.push(RuntimeSecretManifestEntry {
                                 config_path: format!("env.{}", key),
@@ -310,7 +366,10 @@ impl SecretService for DatabaseSecretService {
                 if let EnvBinding::SecretRef { secret_id, version } = binding {
                     match self.get_secret(company_id, secret_id).await {
                         Ok(secret) => {
-                            resolved.insert(key.clone(), JsonValue::String(secret.value.clone()));
+                            resolved.insert(
+                                key.clone(),
+                                JsonValue::String(secret.value.clone().unwrap_or_default()),
+                            );
                             secret_keys.push(key.clone());
 
                             manifest.push(RuntimeSecretManifestEntry {
@@ -424,18 +483,37 @@ impl SecretService for DatabaseSecretService {
     ) -> Result<Secret, SecretServiceError> {
         let secret_id = Uuid::new_v4();
         let now = chrono::Utc::now();
+        let (material, sha) = self.encrypt_value(&input.value)?;
 
+        // Metadata row (no value column).
         sqlx::query!(
             r#"
-            INSERT INTO company_secrets (id, company_id, key, value, description, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO company_secrets
+                (id, company_id, key, name, provider, status, scope, description, latest_version, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, 'local_encrypted', 'active', 'company', $5, 1, $6, $7)
             "#,
             secret_id,
             company_id,
             input.key,
-            input.value,
+            input.key,
             input.description,
             now,
+            now,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // First version holds the encrypted material.
+        sqlx::query!(
+            r#"
+            INSERT INTO company_secret_versions
+                (id, secret_id, version, material, value_sha256, fingerprint_sha256, status, created_at)
+            VALUES ($1, $2, 1, $3, $4, $4, 'current', $5)
+            "#,
+            Uuid::new_v4(),
+            secret_id,
+            material,
+            sha,
             now,
         )
         .execute(&self.pool)
@@ -444,9 +522,14 @@ impl SecretService for DatabaseSecretService {
         Ok(Secret {
             id: secret_id,
             company_id,
-            key: input.key,
-            value: input.value,
+            key: input.key.clone(),
+            name: input.key,
+            provider: "local_encrypted".to_string(),
+            status: "active".to_string(),
+            scope: "company".to_string(),
             description: input.description,
+            latest_version: 1,
+            value: Some(input.value),
             created_at: now,
             updated_at: now,
         })
@@ -459,7 +542,8 @@ impl SecretService for DatabaseSecretService {
     ) -> Result<Secret, SecretServiceError> {
         let row = sqlx::query!(
             r#"
-            SELECT id, company_id, key, value, description, created_at, updated_at
+            SELECT id, company_id, key, name, provider, status, scope, description,
+                   latest_version, created_at, updated_at
             FROM company_secrets
             WHERE id = $1 AND company_id = $2
             "#,
@@ -470,12 +554,19 @@ impl SecretService for DatabaseSecretService {
         .await?
         .ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
 
+        let value = self.decrypt_latest(secret_id).await?;
+
         Ok(Secret {
             id: row.id,
             company_id: row.company_id,
             key: row.key,
-            value: row.value,
+            name: row.name,
+            provider: row.provider,
+            status: row.status,
+            scope: row.scope,
             description: row.description,
+            latest_version: row.latest_version,
+            value,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -489,51 +580,12 @@ impl SecretService for DatabaseSecretService {
     ) -> Result<Secret, SecretServiceError> {
         let now = chrono::Utc::now();
 
-        // 构建动态更新 SQL
-        let mut updates = Vec::new();
-        let mut values: Vec<Box<dyn sqlx::Encode<'_, sqlx::Postgres> + Send + 'static>> = Vec::new();
-        let mut param_index = 1;
-
-        if let Some(ref value) = input.value {
-            updates.push(format!("value = ${}", param_index));
-            values.push(Box::new(value.clone()));
-            param_index += 1;
-        }
-
-        if let Some(ref description) = input.description {
-            updates.push(format!("description = ${}", param_index));
-            values.push(Box::new(description.clone()));
-            param_index += 1;
-        }
-
-        updates.push(format!("updated_at = ${}", param_index));
-
-        if updates.is_empty() {
-            // 没有更新，直接返回当前密钥
-            return self.get_secret(company_id, secret_id).await;
-        }
-
-        let query_str = format!(
-            "UPDATE company_secrets SET {} WHERE id = ${} AND company_id = ${} RETURNING id, company_id, key, value, description, created_at, updated_at",
-            updates.join(", "),
-            param_index + 1,
-            param_index + 2,
-        );
-
-        // 由于参数绑定的限制，这里使用简化版本
-        // 实际生产环境可以使用 sqlx::query_builder 或其他方法
-        let row = sqlx::query!(
+        // Fetch current latest_version (for bumping when a new value is provided).
+        let current = sqlx::query!(
             r#"
-            UPDATE company_secrets
-            SET value = COALESCE($1, value),
-                description = COALESCE($2, description),
-                updated_at = $3
-            WHERE id = $4 AND company_id = $5
-            RETURNING id, company_id, key, value, description, created_at, updated_at
+            SELECT latest_version FROM company_secrets
+            WHERE id = $1 AND company_id = $2
             "#,
-            input.value,
-            input.description,
-            now,
             secret_id,
             company_id,
         )
@@ -541,15 +593,60 @@ impl SecretService for DatabaseSecretService {
         .await?
         .ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
 
-        Ok(Secret {
-            id: row.id,
-            company_id: row.company_id,
-            key: row.key,
-            value: row.value,
-            description: row.description,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        })
+        if let Some(ref value) = input.value {
+            let next_version = current.latest_version + 1;
+            let (material, sha) = self.encrypt_value(value)?;
+
+            sqlx::query!(
+                r#"
+                INSERT INTO company_secret_versions
+                    (id, secret_id, version, material, value_sha256, fingerprint_sha256, status, created_at)
+                VALUES ($1, $2, $3, $4, $5, $5, 'current', $6)
+                "#,
+                Uuid::new_v4(),
+                secret_id,
+                next_version,
+                material,
+                sha,
+                now,
+            )
+            .execute(&self.pool)
+            .await?;
+
+            sqlx::query!(
+                r#"
+                UPDATE company_secrets
+                SET description = COALESCE($1, description),
+                    latest_version = $2,
+                    updated_at = $3
+                WHERE id = $4 AND company_id = $5
+                "#,
+                input.description,
+                next_version,
+                now,
+                secret_id,
+                company_id,
+            )
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query!(
+                r#"
+                UPDATE company_secrets
+                SET description = COALESCE($1, description),
+                    updated_at = $2
+                WHERE id = $3 AND company_id = $4
+                "#,
+                input.description,
+                now,
+                secret_id,
+                company_id,
+            )
+            .execute(&self.pool)
+            .await?;
+        }
+
+        self.get_secret(company_id, secret_id).await
     }
 
     async fn delete_secret(
@@ -581,9 +678,10 @@ impl SecretService for DatabaseSecretService {
     ) -> Result<Vec<Secret>, SecretServiceError> {
         let rows = sqlx::query!(
             r#"
-            SELECT id, company_id, key, description, created_at, updated_at
+            SELECT id, company_id, key, name, provider, status, scope, description,
+                   latest_version, created_at, updated_at
             FROM company_secrets
-            WHERE company_id = $1
+            WHERE company_id = $1 AND deleted_at IS NULL
             ORDER BY created_at DESC
             "#,
             company_id,
@@ -597,8 +695,13 @@ impl SecretService for DatabaseSecretService {
                 id: row.id,
                 company_id: row.company_id,
                 key: row.key,
-                value: "***REDACTED***".to_string(), // 列表中不返回实际值
+                name: row.name,
+                provider: row.provider,
+                status: row.status,
+                scope: row.scope,
                 description: row.description,
+                latest_version: row.latest_version,
+                value: None, // 列表中不返回实际值
                 created_at: row.created_at,
                 updated_at: row.updated_at,
             })

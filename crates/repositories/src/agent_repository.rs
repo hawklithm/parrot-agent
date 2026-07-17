@@ -16,6 +16,17 @@ pub enum RepositoryError {
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;
 
+/// Options for listing agents in a company
+#[derive(Debug, Clone, Default)]
+pub struct ListAgentsOptions {
+    /// Whether to include terminated agents. Default: false.
+    pub include_terminated: bool,
+    /// Maximum number of agents to return. None = no limit.
+    pub limit: Option<i64>,
+    /// Number of agents to skip. None = no offset.
+    pub offset: Option<i64>,
+}
+
 /// Agent Repository trait
 #[async_trait]
 pub trait AgentRepository: Send + Sync {
@@ -25,8 +36,9 @@ pub trait AgentRepository: Send + Sync {
     /// Get agent by ID
     async fn get_by_id(&self, id: Uuid) -> RepositoryResult<Agent>;
 
-    /// List all agents for a company
-    async fn list_by_company(&self, company_id: Uuid) -> RepositoryResult<Vec<Agent>>;
+    /// List all agents for a company.
+    /// By default excludes terminated agents and applies no pagination.
+    async fn list_by_company(&self, company_id: Uuid, options: ListAgentsOptions) -> RepositoryResult<Vec<Agent>>;
 
     /// Update an existing agent
     async fn update(&self, agent: Agent) -> RepositoryResult<Agent>;

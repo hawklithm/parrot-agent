@@ -81,6 +81,7 @@ pub trait SagaOrchestrator: Send + Sync {
 
 pub struct SagaOrchestratorImpl<R, E> {
     repository: Arc<R>,
+    #[allow(dead_code)]
     event_bus: Arc<E>,
 }
 

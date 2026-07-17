@@ -1,9 +1,8 @@
 use async_trait::async_trait;
 use models::{Asset, CreateAssetInput, AssetContent, StoragePutResult, MAX_ATTACHMENT_BYTES};
 use repositories::{AssetRepository, RepositoryError};
-use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -114,7 +113,7 @@ impl StorageService for LocalStorageProvider {
         &self,
         content: &[u8],
         content_type: &str,
-        filename: Option<&str>,
+        _filename: Option<&str>,
     ) -> Result<StoragePutResult, AssetServiceError> {
         self.ensure_directory()?;
 

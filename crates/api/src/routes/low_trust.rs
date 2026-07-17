@@ -1,14 +1,13 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use services::low_trust_service::{LowTrustService, PromoteLowTrustInput, PromoteLowTrustResult};
+use services::low_trust_service::{PromoteLowTrustInput, PromoteLowTrustResult};
 use models::Issue;
 
 /// POST /issues/:id/low-trust/promotions - Promote a low-trust issue

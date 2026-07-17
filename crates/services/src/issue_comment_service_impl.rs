@@ -1,11 +1,10 @@
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 use std::sync::Arc;
 
-use models::{IssueComment, IssueCommentAuthorType, IssueThreadInteraction, ThreadInteractionKind, ThreadInteractionStatus, IssueStatus};
+use models::{IssueCommentAuthorType, ThreadInteractionKind, ThreadInteractionStatus, IssueStatus};
 use repositories::IssueRepository;
-use crate::{ServiceError, issue_comment_service::IssueCommentService};
+use crate::ServiceError;
 
 /// Add comment input
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +51,7 @@ pub struct ResolveInteractionInput {
 
 /// Default Issue Comment Service Implementation
 pub struct DefaultIssueCommentService {
+    #[allow(dead_code)]
     issue_repo: Arc<dyn IssueRepository>,
 }
 
@@ -61,6 +61,7 @@ impl DefaultIssueCommentService {
     }
 
     /// Verify actor is allowed to comment on issue
+    #[allow(dead_code)]
     async fn verify_comment_permission(
         &self,
         issue_id: Uuid,
@@ -91,6 +92,7 @@ impl DefaultIssueCommentService {
     }
 
     /// Determine author type from actor
+    #[allow(dead_code)]
     fn determine_author_type(actor: &CommentActor) -> IssueCommentAuthorType {
         if actor.agent_id.is_some() {
             IssueCommentAuthorType::Agent
@@ -102,6 +104,7 @@ impl DefaultIssueCommentService {
     }
 
     /// Handle reopen requested logic
+    #[allow(dead_code)]
     async fn handle_reopen_if_requested(
         &self,
         issue_id: Uuid,

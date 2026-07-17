@@ -3,9 +3,15 @@
 -- task-watchdog live-path detection reads (id, company, agent, status,
 -- context_snapshot carrying issueId/taskId).
 
-CREATE TYPE heartbeat_run_status AS ENUM (
-    'queued', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out'
-);
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'heartbeat_run_status') THEN
+        CREATE TYPE heartbeat_run_status AS ENUM (
+            'queued', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out'
+        );
+    END IF;
+END
+$$;
 
 CREATE TABLE heartbeat_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

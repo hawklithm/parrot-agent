@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 use models::{
     IssueTreeHold, IssueTreeHoldMember, IssueTreeControlMode, IssueTreeHoldStatus,
-    IssueTreeControlPreview, IssueTreePreviewIssue, IssueTreePreviewRun, IssueTreePreviewWarning,
-    CreateIssueTreeHoldInput, IssueTreeHoldReleasePolicy, HoldReleasePolicyStrategy,
+    IssueTreeControlPreview, IssueTreePreviewIssue,
+    CreateIssueTreeHoldInput,
     ActiveIssueTreePauseHoldGate, Issue, IssueStatus,
 };
 use uuid::Uuid;
 use std::sync::Arc;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use repositories::{
     IssueTreeHoldRepository, IssueRepository, CreateTreeHoldInput,
     RepositoryError,
@@ -202,7 +202,7 @@ where
                         target_status: target_status.map(|s| s.to_string()).unwrap_or_else(|| "no_change".to_string()),
                     });
                 }
-                Err(e) => {
+                Err(_e) => {
                     status_changes.push(IssueTreePreviewIssue {
                         issue_id: issue.id,
                         current_status: issue.status.to_string(),

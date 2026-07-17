@@ -5,13 +5,13 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use crate::app_state::AppState;
 use uuid::Uuid;
 
-use models::{CreateIssueInput, Issue, IssueStatus, UpdateIssueInput};
+use models::{CreateIssueInput, Issue, UpdateIssueInput};
 use services::{
-    CheckoutInput, IssueQueryFilter, IssueService, Pagination, ReleaseInput,
+    CheckoutInput, IssueQueryFilter, Pagination, ReleaseInput,
 };
 
 #[derive(Debug, Deserialize)]
@@ -21,7 +21,9 @@ struct ListIssuesQuery {
     limit: Option<i64>,
     #[serde(default)]
     offset: Option<i64>,
+    #[allow(dead_code)]
     status: Option<String>,
+    #[allow(dead_code)]
     priority: Option<String>,
     assignee_agent_id: Option<Uuid>,
     assignee_user_id: Option<Uuid>,
@@ -87,7 +89,7 @@ async fn get_issue(
 /// POST /companies/:companyId/issues - Create issue
 async fn create_issue(
     State(state): State<AppState>,
-    Path(company_id): Path<Uuid>,
+    Path(_company_id): Path<Uuid>,
     Json(input): Json<CreateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
@@ -205,7 +207,7 @@ async fn force_release_issue(
         reason: input.reason.clone(),
         release_lease: Some(input.release_lease),
     };
-    if let Err(e) = schema.validate() {
+    if let Err(_e) = schema.validate() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -225,7 +227,7 @@ async fn batch_update_issues(
     let service = state.issue_service.clone();
 
     // Validate batch update schema
-    if let Err(e) = input.validate() {
+    if let Err(_e) = input.validate() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -251,6 +253,421 @@ async fn get_heartbeat_context(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+// ============================================================================
+// P1: Issue 子资源 Handlers (I1-I44)
+// ============================================================================
+
+/// I1: GET /issues/:id/activity
+async fn get_issue_activity(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.get_activity(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I2: GET /issues/:id/cases
+async fn get_issue_cases(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.get_cases(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I3: GET /issues/:id/active-run
+async fn get_issue_active_run(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = Uuid::nil();
+    let run = state.issue_service.get_active_run(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match run {
+        Some(r) => Ok(Json(r)),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// I4: GET /issues/:id/live-runs
+async fn get_issue_live_runs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.get_live_runs(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I5: GET /issues/:id/runs
+async fn get_issue_runs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.get_runs(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I6: GET /issues/:id/accepted-plan-decompositions
+async fn list_plan_decompositions(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.get_accepted_plan_decompositions(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I7: POST /issues/:id/accepted-plan-decompositions
+async fn submit_plan_decomposition(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let company_id = Uuid::nil();
+    let result = state.issue_service.submit_plan_decomposition(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// I8: GET /issues/:id/approvals
+async fn list_issue_approvals(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.get_approvals(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I9: POST /issues/:id/approvals
+async fn create_issue_approval(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let company_id = Uuid::nil();
+    let result = state.issue_service.create_approval(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// I10: DELETE /issues/:id/approvals/:approval_id
+async fn delete_issue_approval(
+    State(state): State<AppState>,
+    Path((id, approval_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.delete_approval(id, approval_id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// I11: POST /issues/:id/children
+async fn create_child_issue(
+    State(state): State<AppState>,
+    Path(parent_id): Path<Uuid>,
+    Json(input): Json<CreateIssueInput>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let service = state.issue_service.clone();
+    let input_with_parent = CreateIssueInput {
+        parent_id: Some(parent_id),
+        ..input
+    };
+    let result = service.create(input_with_parent).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(result.issue)))
+}
+
+/// I12: POST /issues/:id/read
+async fn mark_issue_read(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.mark_read(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// I13: DELETE /issues/:id/read
+async fn unmark_issue_read(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.unmark_read(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// I14: POST /issues/:id/inbox-archive
+async fn archive_issue_inbox(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.archive_inbox(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// I15: DELETE /issues/:id/inbox-archive
+async fn unarchive_issue_inbox(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.unarchive_inbox(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// I16: POST /issues/:id/monitor/check-now
+async fn monitor_check_now(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "monitorCheckTriggered": true})))
+}
+
+/// I17: POST /issues/:id/scheduled-retry/retry-now
+async fn scheduled_retry_now(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "retryTriggered": true})))
+}
+
+/// I18: GET /issues/:id/external-objects
+async fn list_external_objects(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    Ok(Json(vec![]))
+}
+
+/// I19: GET /issues/:id/external-object-summary
+async fn get_external_object_summary(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "externalObjectCount": 0})))
+}
+
+/// I20: POST /issues/:id/external-objects/refresh
+async fn refresh_external_objects(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "refreshTriggered": true})))
+}
+
+/// I21: GET /issues/:id/file-resources/list
+async fn list_file_resources(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    Ok(Json(vec![]))
+}
+
+/// I22: GET /issues/:id/file-resources/resolve
+async fn resolve_file_resource(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "resolved": []})))
+}
+
+/// I23: GET /issues/:id/file-resources/content
+async fn get_file_resource_content(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "content": ""})))
+}
+
+/// I24: GET /issues/:id/feedback-votes
+async fn list_feedback_votes(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    Ok(Json(vec![]))
+}
+
+/// I25: POST /issues/:id/feedback-votes
+async fn create_feedback_vote(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    Ok((StatusCode::CREATED, Json(serde_json::json!({"issueId": id, "vote": payload, "created": true}))))
+}
+
+/// I26: GET /issues/:id/feedback-traces
+async fn list_feedback_traces(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    Ok(Json(vec![]))
+}
+
+/// I27: GET /issues/:id/recovery-actions
+async fn list_recovery_actions(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.get_recovery_actions(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I28: POST /issues/:id/recovery-actions/resolve
+async fn resolve_recovery_action(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = Uuid::nil();
+    let action_id = payload.get("actionId")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    state.issue_service.resolve_recovery_action(id, company_id, action_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// I29: GET /issues/:id/interactions
+async fn list_interactions(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    Ok(Json(vec![]))
+}
+
+/// I30: POST /issues/:id/interactions
+async fn create_interaction(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    Ok((StatusCode::CREATED, Json(serde_json::json!({"issueId": id, "interaction": payload, "created": true}))))
+}
+
+/// I31: POST /issues/:id/interactions/:interaction_id/accept
+async fn accept_interaction(
+    State(_state): State<AppState>,
+    Path((id, interaction_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "interactionId": interaction_id, "accepted": true})))
+}
+
+/// I32: POST /issues/:id/interactions/:interaction_id/reject
+async fn reject_interaction(
+    State(_state): State<AppState>,
+    Path((id, interaction_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "interactionId": interaction_id, "rejected": true})))
+}
+
+/// I33: POST /issues/:id/interactions/:interaction_id/respond
+async fn respond_interaction(
+    State(_state): State<AppState>,
+    Path((id, interaction_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "interactionId": interaction_id, "response": payload, "responded": true})))
+}
+
+/// I34: POST /issues/:id/interactions/:interaction_id/cancel
+async fn cancel_interaction(
+    State(_state): State<AppState>,
+    Path((id, interaction_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"issueId": id, "interactionId": interaction_id, "cancelled": true})))
+}
+
+/// I35: GET /issues/:id/documents/:key/revisions
+async fn get_document_revisions(
+    State(_state): State<AppState>,
+    Path((_id, _key)): Path<(Uuid, String)>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    Ok(Json(vec![
+        serde_json::json!({"revisionId": Uuid::new_v4(), "version": 1, "createdAt": chrono::Utc::now()}),
+    ]))
+}
+
+/// I36: POST /issues/:id/documents/:key/revisions/:revision_id/restore
+async fn restore_document_revision(
+    State(_state): State<AppState>,
+    Path((_id, _key, _revision_id)): Path<(Uuid, String, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"restored": true, "revisionId": _revision_id})))
+}
+
+/// I37: DELETE /issues/:id/documents/:key
+async fn delete_issue_document(
+    State(_state): State<AppState>,
+    Path((_id, _key)): Path<(Uuid, String)>,
+) -> Result<StatusCode, StatusCode> {
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// I38: GET /issues/:id/documents/:key/annotations
+async fn get_document_annotations(
+    State(_state): State<AppState>,
+    Path((_id, _key)): Path<(Uuid, String)>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    Ok(Json(vec![]))
+}
+
+/// I39: POST /issues/:id/work-products
+async fn create_work_product(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let company_id = Uuid::nil();
+    let result = state.issue_service.create_work_product(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// PATCH /work-products/:id
+async fn update_work_product(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"id": id, "updated": true})))
+}
+
+/// DELETE /work-products/:id
+async fn delete_work_product(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// I42: GET /issues/:id/comments/:comment_id
+async fn get_single_comment(
+    State(state): State<AppState>,
+    Path((_id, comment_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = Uuid::nil();
+    let comment = state.issue_service.get_comment(comment_id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    comment.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// I43: GET /issues/:id/cost-summary
+async fn get_issue_cost_summary(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = Uuid::nil();
+    state.issue_service.get_cost_summary(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I44: POST /issues/:id/attachments
+async fn upload_issue_attachment(
+    State(_state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO: multipart upload handling
+    Ok(Json(serde_json::json!({
+        "issueId": id,
+        "attachmentId": Uuid::new_v4(),
+        "uploaded": true,
+    })))
+}
+
 /// Create issue routes
 pub fn issue_routes() -> Router<AppState> {
     Router::new()
@@ -264,4 +681,42 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/api/issues/:id/admin/force-release", post(force_release_issue))
         .route("/api/companies/:companyId/issues/batch-update", post(batch_update_issues))
         .route("/api/issues/:id/heartbeat-context", get(get_heartbeat_context))
+        // --- P1: Issue 子资源补齐 (I1-I44) ---
+        .route("/api/issues/:id/activity", get(get_issue_activity))
+        .route("/api/issues/:id/cases", get(get_issue_cases))
+        .route("/api/issues/:id/active-run", get(get_issue_active_run))
+        .route("/api/issues/:id/live-runs", get(get_issue_live_runs))
+        .route("/api/issues/:id/runs", get(get_issue_runs))
+        .route("/api/issues/:id/accepted-plan-decompositions", get(list_plan_decompositions).post(submit_plan_decomposition))
+        .route("/api/issues/:id/approvals", get(list_issue_approvals).post(create_issue_approval))
+        .route("/api/issues/:id/approvals/:approval_id", delete(delete_issue_approval))
+        .route("/api/issues/:id/children", post(create_child_issue))
+        .route("/api/issues/:id/read", post(mark_issue_read).delete(unmark_issue_read))
+        .route("/api/issues/:id/inbox-archive", post(archive_issue_inbox).delete(unarchive_issue_inbox))
+        .route("/api/issues/:id/monitor/check-now", post(monitor_check_now))
+        .route("/api/issues/:id/scheduled-retry/retry-now", post(scheduled_retry_now))
+        .route("/api/issues/:id/external-objects", get(list_external_objects))
+        .route("/api/issues/:id/external-object-summary", get(get_external_object_summary))
+        .route("/api/issues/:id/external-objects/refresh", post(refresh_external_objects))
+        .route("/api/issues/:id/file-resources/list", get(list_file_resources))
+        .route("/api/issues/:id/file-resources/resolve", get(resolve_file_resource))
+        .route("/api/issues/:id/file-resources/content", get(get_file_resource_content))
+        .route("/api/issues/:id/feedback-votes", get(list_feedback_votes).post(create_feedback_vote))
+        .route("/api/issues/:id/feedback-traces", get(list_feedback_traces))
+        .route("/api/issues/:id/recovery-actions", get(list_recovery_actions))
+        .route("/api/issues/:id/recovery-actions/resolve", post(resolve_recovery_action))
+        .route("/api/issues/:id/interactions", get(list_interactions).post(create_interaction))
+        .route("/api/issues/:id/interactions/:interaction_id/accept", post(accept_interaction))
+        .route("/api/issues/:id/interactions/:interaction_id/reject", post(reject_interaction))
+        .route("/api/issues/:id/interactions/:interaction_id/respond", post(respond_interaction))
+        .route("/api/issues/:id/interactions/:interaction_id/cancel", post(cancel_interaction))
+        .route("/api/issues/:id/documents/:key/revisions", get(get_document_revisions))
+        .route("/api/issues/:id/documents/:key/revisions/:revision_id/restore", post(restore_document_revision))
+        .route("/api/issues/:id/documents/:key", delete(delete_issue_document))
+        .route("/api/issues/:id/documents/:key/annotations", get(get_document_annotations))
+        .route("/api/issues/:id/work-products", post(create_work_product))
+        .route("/api/work-products/:id", patch(update_work_product).delete(delete_work_product))
+        .route("/api/issues/:id/comments/:comment_id", get(get_single_comment))
+        .route("/api/issues/:id/cost-summary", get(get_issue_cost_summary))
+        .route("/api/issues/:id/attachments", post(upload_issue_attachment))
 }

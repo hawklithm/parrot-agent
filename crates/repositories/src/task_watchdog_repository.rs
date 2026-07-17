@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::RepositoryResult;
 use models::task_watchdog::{
-    AgentWakeupRequest, AgentWakeupRequestStatus, HeartbeatRun, HeartbeatRunStatus,
-    IssueThreadInteraction, IssueThreadInteractionStatus, IssueWatchdog, IssueWatchdogStatus,
+    AgentWakeupRequest, HeartbeatRun,
+    IssueThreadInteraction, IssueWatchdog, IssueWatchdogStatus,
     TaskWatchdogClassifierIssue,
 };
 

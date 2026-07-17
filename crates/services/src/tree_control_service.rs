@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 use models::{
-    IssueTreeHold, IssueTreeHoldMember, CreateIssueTreeHoldInput,
+    IssueTreeHold, CreateIssueTreeHoldInput,
     IssueTreeControlPreview, AffectedIssue, PreviewActiveRun,
 };
 

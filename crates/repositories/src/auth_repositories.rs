@@ -1,12 +1,11 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::auth::{AuthSession, AuthUser, Company, InstanceUserRole};
 use crate::models::authorization::{CompanyMembershipRow, PrincipalPermissionGrantRow};
 use crate::models::invite::{InviteRow, JoinRequestRow};
-use super::board_api_key_repository::{RepositoryError, RepositoryResult};
+use super::board_api_key_repository::RepositoryResult;
 
 /// AuthUser Repository
 #[async_trait]

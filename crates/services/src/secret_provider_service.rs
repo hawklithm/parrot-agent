@@ -7,7 +7,7 @@ use crate::errors::{ServiceError, ServiceResult};
 use models::secret_provider::{
     SecretProviderConfig, ProviderHealthCheck, ProviderHealthStatus,
     SecretDiscoveryPreview, SecretDiscoveryCandidate,
-    RemoteImportPreview, RemoteImportResult, ConflictResolution, ImportError,
+    RemoteImportPreview, RemoteImportResult, ConflictResolution,
 };
 use repositories::secret_provider_config_repository::SecretProviderConfigRepository;
 
@@ -155,8 +155,8 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
     async fn discover_secrets_preview(
         &self,
         config_id: Uuid,
-        max_results: Option<usize>,
-        next_token: Option<String>,
+        _max_results: Option<usize>,
+        _next_token: Option<String>,
     ) -> ServiceResult<SecretDiscoveryPreview> {
         let config = self.repository
             .get_config(config_id)
@@ -213,7 +213,7 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         &self,
         company_id: Uuid,
         config_id: Uuid,
-        filters: Option<serde_json::Value>,
+        _filters: Option<serde_json::Value>,
     ) -> ServiceResult<RemoteImportPreview> {
         let config = self.repository
             .get_config(config_id)
@@ -255,8 +255,8 @@ impl SecretProviderConfigService for SecretProviderConfigServiceImpl {
         company_id: Uuid,
         config_id: Uuid,
         secret_keys: Vec<String>,
-        conflict_resolution: ConflictResolution,
-        created_by_user_id: Uuid,
+        _conflict_resolution: ConflictResolution,
+        _created_by_user_id: Uuid,
     ) -> ServiceResult<RemoteImportResult> {
         let config = self.repository
             .get_config(config_id)

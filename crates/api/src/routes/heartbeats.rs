@@ -4,8 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use sqlx::PgPool;
-use uuid::Uuid;
+use sqlx::{PgPool, Row};
 
 use crate::schemas::{
     derive_agent_url_key, parse_scheduler_heartbeat_policy, InstanceSchedulerHeartbeatAgent,
@@ -17,14 +16,14 @@ pub async fn list_scheduler_heartbeats(
     State(pool): State<PgPool>,
 ) -> Result<Json<Vec<InstanceSchedulerHeartbeatAgent>>, HeartbeatError> {
     // 查询所有活跃的 Agent 及其公司信息
-    let rows = sqlx::query!(
+    let rows = sqlx::query(
         r#"
         SELECT
             a.id,
             a.company_id,
             a.name as agent_name,
-            a.role,
-            a.status,
+            a.role::text as role,
+            a.status::text as status,
             a.adapter_type,
             a.runtime_config,
             c.name as company_name,
@@ -42,33 +41,42 @@ pub async fn list_scheduler_heartbeats(
     let agents: Vec<InstanceSchedulerHeartbeatAgent> = rows
         .into_iter()
         .filter_map(|row| {
+            let id = row.try_get("id").ok()?;
+            let company_id = row.try_get("company_id").ok()?;
+            let agent_name: String = row.try_get("agent_name").ok()?;
+            let role: String = row.try_get("role").ok()?;
+            let status: String = row.try_get("status").ok()?;
+            let adapter_type: String = row.try_get("adapter_type").ok()?;
+            let runtime_config = row.try_get("runtime_config").ok()?;
+            let company_name: String = row.try_get("company_name").ok()?;
+            let company_issue_prefix: String = row.try_get("company_issue_prefix").ok()?;
+
             // 解析心跳策略
-            let policy = parse_scheduler_heartbeat_policy(&row.runtime_config);
+            let policy = parse_scheduler_heartbeat_policy(&runtime_config);
 
             // 状态检查
-            let status = row.status.as_str();
             let status_eligible = status != "paused"
                 && status != "terminated"
                 && status != "pending_approval";
 
             // 生成 Agent URL key
-            let agent_url_key = derive_agent_url_key(&row.agent_name, row.id);
+            let agent_url_key = derive_agent_url_key(&agent_name, id);
 
             // 判断调度器是否活跃
             let scheduler_active =
                 status_eligible && policy.enabled && policy.interval_sec > 0;
 
             Some(InstanceSchedulerHeartbeatAgent {
-                id: row.id,
-                company_id: row.company_id,
-                company_name: row.company_name,
-                company_issue_prefix: row.company_issue_prefix,
-                agent_name: row.agent_name,
+                id,
+                company_id,
+                company_name,
+                company_issue_prefix,
+                agent_name,
                 agent_url_key,
-                role: row.role,
+                role,
                 title: None,
-                status: row.status,
-                adapter_type: row.adapter_type,
+                status,
+                adapter_type,
                 interval_sec: policy.interval_sec,
                 heartbeat_enabled: policy.enabled,
                 scheduler_active,

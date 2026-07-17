@@ -522,6 +522,8 @@ mod tests {
             metadata: sqlx::types::Json(models::AgentMetadata {
                 is_built_in: None,
                 built_in_key: None,
+                instructions_path: None,
+                instructions_bundle: None,
             }),
             budget_monthly_cents: 0,
             reports_to: None,
@@ -542,6 +544,8 @@ mod tests {
             metadata: sqlx::types::Json(models::AgentMetadata {
                 is_built_in: None,
                 built_in_key: None,
+                instructions_path: None,
+                instructions_bundle: None,
             }),
             budget_monthly_cents: 0,
             reports_to: None,
@@ -579,6 +583,8 @@ mod tests {
             metadata: sqlx::types::Json(models::AgentMetadata {
                 is_built_in: None,
                 built_in_key: None,
+                instructions_path: None,
+                instructions_bundle: None,
             }),
             budget_monthly_cents: 10000,
             reports_to: None,

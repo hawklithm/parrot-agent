@@ -23,6 +23,7 @@ pub trait AgentApiKeyRepository: Send + Sync {
 }
 
 /// PostgreSQL 实现
+#[derive(Clone)]
 pub struct PgAgentApiKeyRepository {
     pool: PgPool,
 }

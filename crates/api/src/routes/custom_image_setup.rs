@@ -1,16 +1,11 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use models::{
-    CreateEnvironmentCustomImageTerminalSessionTokenRequest,
-    EnvironmentCustomImageSetupSessionResult, EnvironmentCustomImageTerminalSessionToken,
-};
-use services::custom_image_setup_service::CustomImageSetupService;
+use models::CreateEnvironmentCustomImageTerminalSessionTokenRequest;
 use uuid::Uuid;
 
 /// GET /environment-custom-image-setup-sessions/:sessionId

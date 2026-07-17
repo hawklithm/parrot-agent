@@ -2,13 +2,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use repositories::{PipelineRepository, PipelineCaseRepository, PipelineStageRepository, PipelineTransitionRepository};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use models::pipeline::{
     Pipeline, PipelineStage, PipelineCase, PipelineTransition, CaseEvent,
-    PipelineStageKind, TerminalKind, PipelineStageConfig, CreatePipelineInput, CreateStageInput
+    PipelineStageKind, TerminalKind, PipelineStageConfig, CreatePipelineInput
 };
 use crate::ServiceError;
 
@@ -173,7 +172,7 @@ impl DefaultPipelineService {
     }
 
     /// Evaluate transition conditions
-    async fn evaluate_conditions(&self, case: &PipelineCase, conditions: &serde_json::Value) -> Result<bool, ServiceError> {
+    async fn evaluate_conditions(&self, _case: &PipelineCase, conditions: &serde_json::Value) -> Result<bool, ServiceError> {
         // Simplified condition evaluation
         // Full implementation would parse conditions and evaluate against case state
 

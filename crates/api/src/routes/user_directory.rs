@@ -1,13 +1,11 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use models::{AdminUserDirectoryResponse, CompanyUserDirectoryResponse, UserDirectoryQuery};
-use services::user_directory_service::UserDirectoryService;
+use models::UserDirectoryQuery;
 use uuid::Uuid;
 
 /// GET /companies/:companyId/user-directory

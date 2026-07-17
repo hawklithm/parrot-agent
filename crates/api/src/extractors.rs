@@ -1,7 +1,7 @@
 use axum::{
     async_trait,
     extract::{FromRequestParts, Path},
-    http::{request::Parts, StatusCode},
+    http::request::Parts,
 };
 use uuid::Uuid;
 use crate::errors::AppError;

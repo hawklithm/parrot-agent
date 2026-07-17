@@ -445,8 +445,8 @@ impl AuthorizationService for DefaultAuthorizationService {
     async fn authorize_resource_action(
         &self,
         actor: &AuthorizationActor,
-        resource_type: &str,
-        resource_id: Uuid,
+        _resource_type: &str,
+        _resource_id: Uuid,
         action: AuthorizationAction,
     ) -> Result<AuthorizationDecision, ServiceError> {
         // For now, delegate to company-level authorization

@@ -93,6 +93,7 @@ pub struct CreateWorkspaceInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "membership_state", rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum MembershipState {
     Joined,
     Left,

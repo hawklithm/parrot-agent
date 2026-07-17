@@ -1,12 +1,10 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use services::InviteResourceService;
 
 /// GET /api/invites/:token/logo - 返回公司Logo
 pub async fn get_company_logo(

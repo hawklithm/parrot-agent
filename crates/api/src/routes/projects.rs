@@ -5,8 +5,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
-    routing::{delete, get, patch, post, put},
+    routing::{get, patch, put},
     Json, Router,
 };
 use uuid::Uuid;
@@ -18,7 +17,6 @@ use models::{
     CreateProjectInput, UpdateProjectInput, CreateWorkspaceInput,
     MembershipState,
 };
-use services::ProjectService;
 
 pub fn project_routes() -> Router<AppState> {
     Router::new()
@@ -34,6 +32,7 @@ pub fn project_routes() -> Router<AppState> {
         // Resource memberships
         .route("/companies/:company_id/resource-memberships/me", get(list_my_memberships))
         .route("/companies/:company_id/resource-memberships/me/projects/:project_id", put(update_project_membership))
+        .route("/companies/:company_id/resource-memberships/me/agents/:agent_id", put(update_agent_membership))
 }
 
 // ===== Project endpoints =====
@@ -125,7 +124,7 @@ async fn list_workspaces(
 /// POST /projects/:project_id/workspaces
 async fn create_workspace(
     State(state): State<AppState>,
-    Path(project_id): Path<Uuid>,
+    Path(_project_id): Path<Uuid>,
     Json(input): Json<CreateWorkspaceInput>,
 ) -> Result<(StatusCode, Json<ProjectWorkspace>), AppError> {
     let workspace = state
@@ -138,8 +137,8 @@ async fn create_workspace(
 
 /// PATCH /projects/:project_id/workspaces/:workspace_id
 async fn update_workspace(
-    State(state): State<AppState>,
-    Path((project_id, workspace_id)): Path<(Uuid, Uuid)>,
+    State(_state): State<AppState>,
+    Path((_project_id, _workspace_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ProjectWorkspace>, AppError> {
     // TODO: Implement workspace update
     Err(AppError::NotImplemented("Workspace update not yet implemented".to_string()))
@@ -148,7 +147,7 @@ async fn update_workspace(
 /// DELETE /projects/:project_id/workspaces/:workspace_id
 async fn delete_workspace(
     State(state): State<AppState>,
-    Path((project_id, workspace_id)): Path<(Uuid, Uuid)>,
+    Path((_project_id, workspace_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
     state
         .project_service
@@ -211,4 +210,39 @@ async fn update_project_membership(
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     Ok(Json(membership))
+}
+
+/// PUT /companies/:company_id/resource-memberships/me/agents/:agent_id
+///
+/// Mirrors Paperclip `resourceMembershipRoutes` -> `svc.updateAgent`. The
+/// response shape drops the internal `changed/changeKind/policySource` fields
+/// and returns `{ resourceType, resourceId, state, starredAt, updatedAt }`.
+async fn update_agent_membership(
+    State(state): State<AppState>,
+    Path((company_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // TODO: Extract user_id from auth context
+    let user_id = Uuid::nil();
+    let state_val = body.get("state").and_then(|v| v.as_str()).unwrap_or("joined");
+    let membership_state = match state_val {
+        "left" => MembershipState::Left,
+        _ => MembershipState::Joined,
+    };
+    let starred = body.get("starred").and_then(|v| v.as_bool());
+
+    let membership = state
+        .project_service
+        .update_agent_membership(company_id, agent_id, user_id, membership_state, starred)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    // Project to the Paperclip response shape (camelCase, stripped internals).
+    Ok(Json(serde_json::json!({
+        "resourceType": "agent",
+        "resourceId": membership.agent_id,
+        "state": membership.state,
+        "starredAt": membership.starred_at,
+        "updatedAt": membership.updated_at,
+    })))
 }

@@ -1,5 +1,4 @@
 use crate::app_state::AppState;
-use crate::errors::AppError;
 use axum::{Router, 
     extract::{Path, Query, State},
     http::{header, StatusCode},
@@ -7,12 +6,11 @@ use axum::{Router,
     Json,
 };
 use models::{OrgChartOptions, OrgChartStyle};
-use services::OrgChartService;
 use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct OrgChartQuery {
+pub struct OrgChartQuery {
     #[serde(default)]
     style: Option<String>,
 }

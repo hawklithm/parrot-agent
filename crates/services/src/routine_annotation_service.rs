@@ -7,7 +7,6 @@ use models::{
     UpdateRoutineAnnotationThreadRequest,
 };
 use models::routine_annotation::AnnotationThreadStatus;
-use std::sync::Arc;
 use uuid::Uuid;
 
 #[async_trait]

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::errors::{ServiceError, ServiceResult};
-use chrono::Utc;
 use models::routine::{Routine, RoutineRun, RoutineTriggerConfig, RoutineStatus};
 use repositories::routine_repository::RoutineRepository;
 
@@ -51,7 +50,7 @@ impl RoutineService for RoutineServiceImpl {
         agent_id: Uuid,
         name: String,
         description: Option<String>,
-        trigger_config: RoutineTriggerConfig,
+        _trigger_config: RoutineTriggerConfig,
         created_by_user_id: Uuid,
     ) -> ServiceResult<Routine> {
         let input = models::routine::CreateRoutineInput {

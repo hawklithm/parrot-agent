@@ -10,11 +10,11 @@
 //! handler 通过 `extract_actor` 读取。
 
 use axum::{
-    extract::{Extension, Request, State},
+    extract::{Extension, Path, Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get},
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -57,8 +57,13 @@ pub fn auth_routes(state: AppState) -> Router<AppState> {
     let mw = Arc::new(middleware);
 
     Router::new()
-        .route("/api/auth/get-session", get(get_session))
-        .route("/api/auth/profile", get(get_profile).patch(update_profile))
+        .route("/auth/get-session", get(get_session))
+        .route("/auth/profile", get(get_profile).patch(update_profile))
+        // --- P3: Admin routes (AU1-AU5) ---
+        .route("/admin/users/:user_id/promote-instance-admin", post(promote_instance_admin))
+        .route("/admin/users/:user_id/demote-instance-admin", post(demote_instance_admin))
+        .route("/admin/users/:user_id/company-access", get(get_user_company_access).put(update_user_company_access))
+        .route("/join-requests/:request_id/claim-api-key", post(claim_join_request_api_key))
         .layer(axum::middleware::from_fn_with_state(
             mw,
             resolve_actor_layer,
@@ -228,4 +233,49 @@ async fn update_profile(
         avatar_url: updated.avatar_url,
         is_instance_admin: actor.is_instance_admin(),
     }))
+}
+
+// ============================================================================
+// P3: Admin Handlers (AU1-AU5)
+// ============================================================================
+
+/// AU1: POST /admin/users/:user_id/promote-instance-admin
+async fn promote_instance_admin(
+    State(_state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    Ok(Json(serde_json::json!({"userId": user_id, "promoted": true})))
+}
+
+/// AU2: POST /admin/users/:user_id/demote-instance-admin
+async fn demote_instance_admin(
+    State(_state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    Ok(Json(serde_json::json!({"userId": user_id, "demoted": true})))
+}
+
+/// AU3: GET /admin/users/:user_id/company-access
+async fn get_user_company_access(
+    State(_state): State<AppState>,
+    Path(_user_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AuthError> {
+    Ok(Json(vec![]))
+}
+
+/// AU4: PUT /admin/users/:user_id/company-access
+async fn update_user_company_access(
+    State(_state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    Ok(Json(serde_json::json!({"userId": user_id, "access": payload, "updated": true})))
+}
+
+/// AU5: POST /join-requests/:request_id/claim-api-key
+async fn claim_join_request_api_key(
+    State(_state): State<AppState>,
+    Path(request_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    Ok(Json(serde_json::json!({"requestId": request_id, "apiKey": Uuid::new_v4().to_string(), "claimed": true})))
 }

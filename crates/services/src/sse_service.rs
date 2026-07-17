@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use models::{SseEvent, SseFrame as ModelSseFrame, SseSubscription, SseEventType};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::broadcast;

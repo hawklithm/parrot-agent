@@ -1,10 +1,10 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::RepositoryResult;
-use models::routine::{Routine, RoutineRun, RoutineTrigger, RoutineRevision, RunStatus};
+use models::routine::{Routine, RoutineRun};
 
 #[async_trait]
 pub trait RoutineRepository: Send + Sync {
