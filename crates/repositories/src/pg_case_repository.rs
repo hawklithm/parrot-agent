@@ -17,6 +17,11 @@ impl PgCaseRepository {
     }
 }
 
+/// Convert a CaseStatus to its database text representation (snake_case per sqlx rename_all).
+fn case_status_to_db(s: &CaseStatus) -> String {
+    crate::debug_to_snake_case(&format!("{:?}", s))
+}
+
 #[async_trait]
 impl CaseRepository for PgCaseRepository {
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Case>, RepositoryError> {
@@ -71,17 +76,17 @@ impl CaseRepository for PgCaseRepository {
             }
         }
 
-        if let Some(project_id) = filter.project_id {
+        if let Some(_project_id) = filter.project_id {
             param_count += 1;
             query.push_str(&format!(" AND project_id = ${}", param_count));
         }
 
-        if let Some(parent_case_id) = filter.parent_case_id {
+        if let Some(_parent_case_id) = filter.parent_case_id {
             param_count += 1;
             query.push_str(&format!(" AND parent_case_id = ${}", param_count));
         }
 
-        if let Some(label_id) = filter.label_id {
+        if let Some(_label_id) = filter.label_id {
             param_count += 1;
             query.push_str(&format!(
                 " AND EXISTS (SELECT 1 FROM case_labels WHERE case_id = cases.id AND label_id = ${})",
@@ -101,7 +106,7 @@ impl CaseRepository for PgCaseRepository {
 
         if let Some(statuses) = &filter.status {
             if !statuses.is_empty() {
-                let status_strs: Vec<String> = statuses.iter().map(|s| format!("{:?}", s).to_lowercase()).collect();
+                let status_strs: Vec<String> = statuses.iter().map(|s| case_status_to_db(s)).collect();
                 q = q.bind(status_strs);
             }
         }
@@ -156,16 +161,29 @@ impl CaseRepository for PgCaseRepository {
             }
         }
 
-        if let Some(project_id) = filter.project_id {
+        if let Some(_project_id) = filter.project_id {
             param_count += 1;
             query.push_str(&format!(" AND project_id = ${}", param_count));
+        }
+
+        if let Some(_parent_case_id) = filter.parent_case_id {
+            param_count += 1;
+            query.push_str(&format!(" AND parent_case_id = ${}", param_count));
+        }
+
+        if let Some(_label_id) = filter.label_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM case_labels WHERE case_id = cases.id AND label_id = ${})",
+                param_count
+            ));
         }
 
         let mut q = sqlx::query_scalar::<_, i64>(&query).bind(company_id);
 
         if let Some(statuses) = &filter.status {
             if !statuses.is_empty() {
-                let status_strs: Vec<String> = statuses.iter().map(|s| format!("{:?}", s).to_lowercase()).collect();
+                let status_strs: Vec<String> = statuses.iter().map(|s| case_status_to_db(s)).collect();
                 q = q.bind(status_strs);
             }
         }
@@ -180,6 +198,14 @@ impl CaseRepository for PgCaseRepository {
             q = q.bind(project_id);
         }
 
+        if let Some(parent_case_id) = filter.parent_case_id {
+            q = q.bind(parent_case_id);
+        }
+
+        if let Some(label_id) = filter.label_id {
+            q = q.bind(label_id);
+        }
+
         let count = q.fetch_one(&self.pool)
             .await
             .map_err(RepositoryError::DatabaseError)?;
@@ -188,7 +214,6 @@ impl CaseRepository for PgCaseRepository {
     }
 
     async fn create(&self, input: CreateCaseInput) -> Result<Case, RepositoryError> {
-        // Generate case identity first
         let (case_number, identifier) = self.next_case_identity(input.company_id).await?;
 
         let case = sqlx::query_as::<_, Case>(

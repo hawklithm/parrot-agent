@@ -39,7 +39,7 @@ pub mod repository;
 
 pub use repository::{CrudOps, Repository, RepositoryExt};
 
-pub use agent_repository::{AgentRepository, RepositoryError, RepositoryResult};
+pub use agent_repository::{AgentRepository, ListAgentsOptions, RepositoryError, RepositoryResult};
 pub use pg_agent_repository::PgAgentRepository;
 pub use agent_api_key_repository::{AgentApiKeyRepository, PgAgentApiKeyRepository};
 pub use cost_event_repository::{CostEventRepository, PgCostEventRepository};
@@ -60,7 +60,6 @@ pub use pg_issue_tree_control_repository::PgIssueTreeHoldRepository;
 pub use environment_repository::{EnvironmentRepository, PgEnvironmentRepository};
 pub use runtime_lease_repository::{RuntimeLeaseRepository, PgRuntimeLeaseRepository};
 pub use secret_repository::{
-    SecretRepository, PgSecretRepository,
     SecretProviderConfigRepository, PgSecretProviderConfigRepository,
     UserSecretDefinitionRepository, PgUserSecretDefinitionRepository,
 };
@@ -93,6 +92,8 @@ pub mod pipeline_stage_repository;
 pub mod pipeline_transition_repository;
 pub mod pipeline_case_repository;
 pub mod task_watchdog_repository;
+pub mod skill_repository;
+pub mod pg_skill_repository;
 
 pub use pipeline_repository::{PipelineRepository, PostgresPipelineRepository};
 pub use pipeline_stage_repository::{PipelineStageRepository, PostgresPipelineStageRepository};
@@ -104,3 +105,21 @@ pub use task_watchdog_repository::{
     PostgresAgentWakeupRequestRepository, IssueThreadInteractionRepository,
     PostgresIssueThreadInteractionRepository,
 };
+pub use skill_repository::*;
+pub use pg_skill_repository::*;
+
+/// Convert a PascalCase enum variant name (from Debug) to snake_case for DB queries.
+/// E.g., "InProgress" → "in_progress", "InReview" → "in_review", "SkillTest" → "skill_test".
+///
+/// Used by repository implementations to convert enum variants to their database
+/// text representation when the enum uses `#[sqlx(rename_all = "snake_case")]`.
+pub fn debug_to_snake_case(debug_str: &str) -> String {
+    let mut result = String::new();
+    for (i, ch) in debug_str.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            result.push('_');
+        }
+        result.push(ch.to_ascii_lowercase());
+    }
+    result
+}

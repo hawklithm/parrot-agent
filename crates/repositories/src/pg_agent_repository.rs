@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use chrono::Utc;
-use models::{Agent, AgentStatus, AgentRole, AgentPermissions, AgentMetadata};
-use sqlx::{PgPool, Row, types::Json};
+use models::{Agent, AgentStatus};
+use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::agent_repository::{AgentRepository, RepositoryError, RepositoryResult};
+use super::agent_repository::{AgentRepository, ListAgentsOptions, RepositoryError, RepositoryResult};
 
 /// PostgreSQL implementation of AgentRepository
+#[derive(Clone)]
 pub struct PgAgentRepository {
     pool: PgPool,
 }
@@ -14,6 +15,30 @@ pub struct PgAgentRepository {
 impl PgAgentRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+}
+
+/// Helper: map a PgRow to Agent via explicit column access.
+/// Uses sqlx::Row::get instead of query_as because sqlx::FromRow cannot
+/// directly handle the Json<serde_json::Value> wrapper types' column
+/// mapping when column names match struct fields exactly.
+fn map_agent_row(row: sqlx::postgres::PgRow) -> Agent {
+    use sqlx::Row;
+    Agent {
+        id: row.get("id"),
+        company_id: row.get("company_id"),
+        name: row.get("name"),
+        role: row.get("role"),
+        status: row.get("status"),
+        adapter_type: row.get("adapter_type"),
+        adapter_config: row.get("adapter_config"),
+        runtime_config: row.get("runtime_config"),
+        permissions: row.get("permissions"),
+        metadata: row.get("metadata"),
+        budget_monthly_cents: row.get("budget_monthly_cents"),
+        reports_to: row.get("reports_to"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
     }
 }
 
@@ -48,22 +73,7 @@ impl AgentRepository for PgAgentRepository {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(Agent {
-            id: row.get("id"),
-            company_id: row.get("company_id"),
-            name: row.get("name"),
-            role: row.get("role"),
-            status: row.get("status"),
-            adapter_type: row.get("adapter_type"),
-            adapter_config: row.get("adapter_config"),
-            runtime_config: row.get("runtime_config"),
-            permissions: row.get("permissions"),
-            metadata: row.get("metadata"),
-            budget_monthly_cents: row.get("budget_monthly_cents"),
-            reports_to: row.get("reports_to"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-        })
+        Ok(map_agent_row(row))
     }
 
     async fn get_by_id(&self, id: Uuid) -> RepositoryResult<Agent> {
@@ -73,52 +83,48 @@ impl AgentRepository for PgAgentRepository {
             .await?;
 
         match row {
-            Some(row) => Ok(Agent {
-                id: row.get("id"),
-                company_id: row.get("company_id"),
-                name: row.get("name"),
-                role: row.get("role"),
-                status: row.get("status"),
-                adapter_type: row.get("adapter_type"),
-                adapter_config: row.get("adapter_config"),
-                runtime_config: row.get("runtime_config"),
-                permissions: row.get("permissions"),
-                metadata: row.get("metadata"),
-                budget_monthly_cents: row.get("budget_monthly_cents"),
-                reports_to: row.get("reports_to"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-            }),
+            Some(row) => Ok(map_agent_row(row)),
             None => Err(RepositoryError::NotFound(id)),
         }
     }
 
-    async fn list_by_company(&self, company_id: Uuid) -> RepositoryResult<Vec<Agent>> {
-        let rows = sqlx::query("SELECT * FROM agents WHERE company_id = $1 ORDER BY created_at DESC")
-            .bind(&company_id)
-            .fetch_all(&self.pool)
-            .await?;
+    async fn list_by_company(
+        &self,
+        company_id: Uuid,
+        options: ListAgentsOptions,
+    ) -> RepositoryResult<Vec<Agent>> {
+        let mut query = String::from("SELECT * FROM agents WHERE company_id = $1");
+        let mut param_count = 1;
 
-        let agents = rows
-            .into_iter()
-            .map(|row| Agent {
-                id: row.get("id"),
-                company_id: row.get("company_id"),
-                name: row.get("name"),
-                role: row.get("role"),
-                status: row.get("status"),
-                adapter_type: row.get("adapter_type"),
-                adapter_config: row.get("adapter_config"),
-                runtime_config: row.get("runtime_config"),
-                permissions: row.get("permissions"),
-                metadata: row.get("metadata"),
-                budget_monthly_cents: row.get("budget_monthly_cents"),
-                reports_to: row.get("reports_to"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-            })
-            .collect();
+        // Default: exclude terminated agents (mirrors Paperclip behavior)
+        if !options.include_terminated {
+            query.push_str(" AND status != 'terminated'");
+        }
 
+        query.push_str(" ORDER BY created_at DESC");
+
+        // Add pagination using parameterized bindings (not string interpolation)
+        if options.limit.is_some() {
+            param_count += 1;
+            query.push_str(&format!(" LIMIT ${}", param_count));
+        }
+        if options.offset.is_some() {
+            param_count += 1;
+            query.push_str(&format!(" OFFSET ${}", param_count));
+        }
+
+        let mut q = sqlx::query(&query).bind(&company_id);
+
+        if let Some(limit) = options.limit {
+            q = q.bind(limit);
+        }
+        if let Some(offset) = options.offset {
+            q = q.bind(offset);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+
+        let agents = rows.into_iter().map(map_agent_row).collect();
         Ok(agents)
     }
 
@@ -152,22 +158,7 @@ impl AgentRepository for PgAgentRepository {
         .await?;
 
         match row {
-            Some(row) => Ok(Agent {
-                id: row.get("id"),
-                company_id: row.get("company_id"),
-                name: row.get("name"),
-                role: row.get("role"),
-                status: row.get("status"),
-                adapter_type: row.get("adapter_type"),
-                adapter_config: row.get("adapter_config"),
-                runtime_config: row.get("runtime_config"),
-                permissions: row.get("permissions"),
-                metadata: row.get("metadata"),
-                budget_monthly_cents: row.get("budget_monthly_cents"),
-                reports_to: row.get("reports_to"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-            }),
+            Some(row) => Ok(map_agent_row(row)),
             None => Err(RepositoryError::NotFound(agent.id)),
         }
     }
@@ -179,7 +170,7 @@ impl AgentRepository for PgAgentRepository {
             .execute(&self.pool)
             .await?;
 
- if result.rows_affected() == 0 {
+        if result.rows_affected() == 0 {
             Err(RepositoryError::NotFound(id))
         } else {
             Ok(())
@@ -195,26 +186,7 @@ impl AgentRepository for PgAgentRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        let agents = rows
-            .into_iter()
-            .map(|row| Agent {
-                id: row.get("id"),
-                company_id: row.get("company_id"),
-                name: row.get("name"),
-                role: row.get("role"),
-                status: row.get("status"),
-                adapter_type: row.get("adapter_type"),
-                adapter_config: row.get("adapter_config"),
-                runtime_config: row.get("runtime_config"),
-                permissions: row.get("permissions"),
-                metadata: row.get("metadata"),
-                budget_monthly_cents: row.get("budget_monthly_cents"),
-                reports_to: row.get("reports_to"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-            })
-            .collect();
-
+        let agents = rows.into_iter().map(map_agent_row).collect();
         Ok(agents)
     }
 }
@@ -222,7 +194,9 @@ impl AgentRepository for PgAgentRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use models::AgentRole;
     use sqlx::postgres::PgPoolOptions;
+    use sqlx::types::Json;
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -252,7 +226,7 @@ mod tests {
             adapter_config: Json(serde_json::json!({})),
             runtime_config: Json(serde_json::json!({})),
             permissions: Json(AgentPermissions::default()),
-            metadata: Json(AgentMetadata { is_built_in: None, built_in_key: None }),
+            metadata: Json(AgentMetadata { is_built_in: None, built_in_key: None, instructions_path: None, instructions_bundle: None }),
             budget_monthly_cents: 0,
             reports_to: None,
             created_at: Utc::now(),

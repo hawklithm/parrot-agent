@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::RepositoryResult;
-use models::goal::{Goal, GoalStatus, GoalLevel};
+use models::goal::Goal;
 
 #[async_trait]
 pub trait GoalRepository: Send + Sync {
@@ -15,6 +15,9 @@ pub trait GoalRepository: Send + Sync {
     async fn list_children(&self, parent_goal_id: Uuid) -> RepositoryResult<Vec<Goal>>;
     async fn update(&self, goal: Goal) -> RepositoryResult<Goal>;
     async fn delete(&self, goal_id: Uuid) -> RepositoryResult<()>;
+    /// Check whether attaching `goal_id` under `parent_id` would form a cycle.
+    /// Returns true if a cycle would be created.
+    async fn detect_cycle(&self, goal_id: Uuid, parent_id: Uuid) -> RepositoryResult<bool>;
 }
 
 pub struct PostgresGoalRepository {
@@ -124,5 +127,41 @@ impl GoalRepository for PostgresGoalRepository {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn detect_cycle(&self, goal_id: Uuid, parent_id: Uuid) -> RepositoryResult<bool> {
+        // Use advisory lock to prevent TOCTOU race (mirrors case upsert pattern)
+        let lock_key = format!("goal-cycle:{}:{}", goal_id, parent_id);
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&lock_key)
+            .execute(&self.pool)
+            .await?;
+
+        let mut current_id = parent_id;
+        let mut visited = std::collections::HashSet::new();
+
+        loop {
+            if current_id == goal_id {
+                return Ok(true);
+            }
+            if visited.contains(&current_id) {
+                return Ok(false);
+            }
+            visited.insert(current_id);
+
+            let current: Option<Goal> = sqlx::query_as::<_, Goal>(
+                "SELECT id, company_id, title, description, level, status, parent_id,
+                        owner_agent_id, created_at, updated_at
+                 FROM goals WHERE id = $1"
+            )
+            .bind(current_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            match current.and_then(|g| g.parent_id) {
+                Some(pid) => current_id = pid,
+                None => return Ok(false),
+            }
+        }
     }
 }

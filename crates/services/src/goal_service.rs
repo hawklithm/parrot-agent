@@ -90,34 +90,6 @@ impl DefaultGoalService {
             Ok(())
         }
     }
-
-    async fn detect_cycle(&self, goal_id: Uuid, parent_id: Uuid) -> Result<bool, ServiceError> {
-        let mut current_id = parent_id;
-        let mut visited = std::collections::HashSet::new();
-
-        loop {
-            if current_id == goal_id {
-                return Ok(true); // Cycle detected
-            }
-
-            if visited.contains(&current_id) {
-                return Ok(false); // Already visited, no cycle to goal_id
-            }
-
-            visited.insert(current_id);
-
-            let current = self.goal_repo
-                .get(current_id)
-                .await
-                .map_err(|e| ServiceError::Internal(format!("Failed to find goal: {}", e)))?
-                .ok_or_else(|| ServiceError::NotFound("Goal not found".to_string()))?;
-
-            match current.parent_id {
-                Some(pid) => current_id = pid,
-                None => return Ok(false), // Reached root, no cycle
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -144,9 +116,14 @@ impl GoalService for DefaultGoalService {
         };
 
         // Prevent cycles: a goal must not be attached under its own descendant.
-        // (Relevant for reparenting/move scenarios and guards against malformed input.)
+        // Uses repository-level advisory lock to prevent TOCTOU races
+        // (mirrors case upsert pattern).
         if let Some(parent_id) = input.parent_id {
-            if self.detect_cycle(goal_id, parent_id).await? {
+            if self.goal_repo
+                .detect_cycle(goal_id, parent_id)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("Failed to check for cycles: {}", e)))?
+            {
                 return Err(ServiceError::InvalidInput(
                     "Cannot create goal: would form a cycle in the goal hierarchy".to_string(),
                 ));
@@ -215,10 +192,18 @@ impl GoalService for DefaultGoalService {
     }
 
     async fn list_by_company(&self, company_id: Uuid, level: Option<GoalLevel>) -> Result<Vec<Goal>, ServiceError> {
-        self.goal_repo
+        let goals = self.goal_repo
             .list_by_company(company_id)
             .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to list goals: {}", e)))
+            .map_err(|e| ServiceError::Internal(format!("Failed to list goals: {}", e)))?;
+
+        // Apply level filter in-memory (mirrors Paperclip: repository returns all,
+        // service applies optional filters)
+        if let Some(lvl) = level {
+            Ok(goals.into_iter().filter(|g| g.level == lvl).collect())
+        } else {
+            Ok(goals)
+        }
     }
 
     async fn calculate_progress(&self, goal_id: Uuid) -> Result<f64, ServiceError> {

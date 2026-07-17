@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
 use models::{
-    Issue, IssueQueryFilter, Pagination, CreateIssueInput, UpdateIssueInput, IssueStatus,
+    Issue, IssueQueryFilter, Pagination, CreateIssueInput, UpdateIssueInput,
+    IssueStatus, IssueWorkMode,
 };
 use uuid::Uuid;
 use crate::{issue_repository::IssueRepository, RepositoryError};
@@ -14,6 +15,17 @@ impl PgIssueRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
+
+/// Convert an IssueStatus to its database text representation.
+/// Uses the Display impl which returns correct snake_case per the sqlx rename_all.
+fn issue_status_to_db(s: &IssueStatus) -> String {
+    s.to_string()
+}
+
+/// Convert an IssueWorkMode to its database text representation (snake_case).
+fn issue_work_mode_to_db(wm: &IssueWorkMode) -> String {
+    crate::debug_to_snake_case(&format!("{:?}", wm))
 }
 
 #[async_trait]
@@ -56,32 +68,32 @@ impl IssueRepository for PgIssueRepository {
             }
         }
 
-        if let Some(assignee_agent_id) = filter.assignee_agent_id {
+        if let Some(_assignee_agent_id) = filter.assignee_agent_id {
             param_count += 1;
             query.push_str(&format!(" AND assignee_agent_id = ${}", param_count));
         }
 
-        if let Some(assignee_user_id) = filter.assignee_user_id {
+        if let Some(_assignee_user_id) = filter.assignee_user_id {
             param_count += 1;
             query.push_str(&format!(" AND assignee_user_id = ${}", param_count));
         }
 
-        if let Some(project_id) = filter.project_id {
+        if let Some(_project_id) = filter.project_id {
             param_count += 1;
             query.push_str(&format!(" AND project_id = ${}", param_count));
         }
 
-        if let Some(goal_id) = filter.goal_id {
+        if let Some(_goal_id) = filter.goal_id {
             param_count += 1;
             query.push_str(&format!(" AND goal_id = ${}", param_count));
         }
 
-        if let Some(parent_id) = filter.parent_id {
+        if let Some(_parent_id) = filter.parent_id {
             param_count += 1;
             query.push_str(&format!(" AND parent_id = ${}", param_count));
         }
 
-        if let Some(ref work_mode) = filter.work_mode {
+        if let Some(ref _work_mode) = filter.work_mode {
             param_count += 1;
             query.push_str(&format!(" AND work_mode = ${}", param_count));
         }
@@ -98,13 +110,14 @@ impl IssueRepository for PgIssueRepository {
 
         if let Some(statuses) = &filter.status {
             if !statuses.is_empty() {
-                let status_strs: Vec<String> = statuses.iter().map(|s| format!("{:?}", s).to_lowercase()).collect();
+                let status_strs: Vec<String> = statuses.iter().map(|s| issue_status_to_db(s)).collect();
                 q = q.bind(status_strs);
             }
         }
 
         if let Some(priorities) = &filter.priority {
             if !priorities.is_empty() {
+                // IssuePriority uses rename_all = "lowercase", so Debug → lowercase is correct
                 let priority_strs: Vec<String> = priorities.iter().map(|p| format!("{:?}", p).to_lowercase()).collect();
                 q = q.bind(priority_strs);
             }
@@ -131,7 +144,7 @@ impl IssueRepository for PgIssueRepository {
         }
 
         if let Some(ref work_mode) = filter.work_mode {
-            let mode_str = format!("{:?}", work_mode).to_lowercase();
+            let mode_str = issue_work_mode_to_db(work_mode);
             q = q.bind(mode_str);
         }
 
@@ -167,21 +180,41 @@ impl IssueRepository for PgIssueRepository {
             }
         }
 
-        if let Some(assignee_agent_id) = filter.assignee_agent_id {
+        if let Some(_assignee_agent_id) = filter.assignee_agent_id {
             param_count += 1;
             query.push_str(&format!(" AND assignee_agent_id = ${}", param_count));
         }
 
-        if let Some(project_id) = filter.project_id {
+        if let Some(_assignee_user_id) = filter.assignee_user_id {
+            param_count += 1;
+            query.push_str(&format!(" AND assignee_user_id = ${}", param_count));
+        }
+
+        if let Some(_project_id) = filter.project_id {
             param_count += 1;
             query.push_str(&format!(" AND project_id = ${}", param_count));
+        }
+
+        if let Some(_goal_id) = filter.goal_id {
+            param_count += 1;
+            query.push_str(&format!(" AND goal_id = ${}", param_count));
+        }
+
+        if let Some(_parent_id) = filter.parent_id {
+            param_count += 1;
+            query.push_str(&format!(" AND parent_id = ${}", param_count));
+        }
+
+        if let Some(ref _work_mode) = filter.work_mode {
+            param_count += 1;
+            query.push_str(&format!(" AND work_mode = ${}", param_count));
         }
 
         let mut q = sqlx::query_scalar::<_, i64>(&query).bind(company_id);
 
         if let Some(statuses) = &filter.status {
             if !statuses.is_empty() {
-                let status_strs: Vec<String> = statuses.iter().map(|s| format!("{:?}", s).to_lowercase()).collect();
+                let status_strs: Vec<String> = statuses.iter().map(|s| issue_status_to_db(s)).collect();
                 q = q.bind(status_strs);
             }
         }
@@ -197,8 +230,25 @@ impl IssueRepository for PgIssueRepository {
             q = q.bind(assignee_agent_id);
         }
 
+        if let Some(assignee_user_id) = filter.assignee_user_id {
+            q = q.bind(assignee_user_id);
+        }
+
         if let Some(project_id) = filter.project_id {
             q = q.bind(project_id);
+        }
+
+        if let Some(goal_id) = filter.goal_id {
+            q = q.bind(goal_id);
+        }
+
+        if let Some(parent_id) = filter.parent_id {
+            q = q.bind(parent_id);
+        }
+
+        if let Some(ref work_mode) = filter.work_mode {
+            let mode_str = issue_work_mode_to_db(work_mode);
+            q = q.bind(mode_str);
         }
 
         let count = q.fetch_one(&self.pool)
