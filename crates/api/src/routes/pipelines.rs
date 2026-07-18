@@ -29,10 +29,10 @@ pub fn pipeline_routes() -> Router<AppState> {
         // Cases
         .route("/pipelines/:pipeline_id/cases", post(create_case))
         .route("/pipelines/:pipeline_id/cases", get(list_cases))
-        .route("/cases/:case_id", get(get_case))
-        .route("/cases/:case_id/advance", patch(advance_case))
-        .route("/cases/:case_id/terminal", post(mark_terminal))
-        .route("/cases/:case_id/events", get(get_case_events))
+        .route("/cases/:id", get(get_case))
+        .route("/cases/:id/advance", patch(advance_case))
+        .route("/cases/:id/terminal", post(mark_terminal))
+        .route("/cases/:id/events", get(get_case_events))
         // Health & attention
         .route("/pipelines/:pipeline_id/health-warnings", get(get_health_warnings))
         .route("/companies/:company_id/pipelines-attention", get(get_pipelines_attention))
