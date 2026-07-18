@@ -29,9 +29,10 @@ pub fn pipeline_routes() -> Router<AppState> {
         // Cases
         .route("/pipelines/:pipeline_id/cases", post(create_case))
         .route("/pipelines/:pipeline_id/cases", get(list_cases))
-        .route("/cases/:id", get(get_case))
-        .route("/cases/:id/advance", patch(advance_case))
-        .route("/cases/:id/terminal", post(mark_terminal))
+        // Pipeline-specific case operations (under pipeline sub-path to avoid
+        // conflict with cases.rs which owns /cases/:id)
+        .route("/cases/:id/pipeline/advance", patch(advance_case))
+        .route("/cases/:id/pipeline/terminal", post(mark_terminal))
         // Note: GET /cases/:id/events is registered in cases.rs via case_service
         // Health & attention
         .route("/pipelines/:pipeline_id/health-warnings", get(get_health_warnings))
@@ -139,20 +140,7 @@ async fn list_cases(
     Ok(Json(cases))
 }
 
-/// GET /cases/:case_id
-async fn get_case(
-    State(state): State<AppState>,
-    Path(case_id): Path<Uuid>,
-) -> Result<Json<PipelineCase>, AppError> {
-    let case = state
-        .pipeline_service
-        .get_case(case_id)
-        .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(case))
-}
-
-/// PATCH /cases/:case_id/advance
+/// PATCH /cases/:id/pipeline/advance
 async fn advance_case(
     State(state): State<AppState>,
     Path(case_id): Path<Uuid>,
@@ -179,7 +167,7 @@ async fn advance_case(
     Ok(Json(case))
 }
 
-/// POST /cases/:case_id/terminal
+/// POST /cases/:id/pipeline/terminal
 async fn mark_terminal(
     State(state): State<AppState>,
     Path(case_id): Path<Uuid>,
