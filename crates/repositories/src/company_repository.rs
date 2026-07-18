@@ -27,7 +27,7 @@ impl CompanyRepository {
         )
         .bind(&input.name)
         .bind(&input.description)
-        .bind(&input.issue_prefix)
+        .bind(input.issue_prefix.as_deref().unwrap_or(&input.name.to_uppercase()))
         .bind(input.budget_monthly_cents)
         .bind(input.attachment_max_bytes.unwrap_or(10485760))
         .bind(input.default_responsible_user_id)

@@ -42,7 +42,7 @@ pub struct Company {
 pub struct CreateCompanyInput {
     pub name: String,
     pub description: Option<String>,
-    pub issue_prefix: String,
+    pub issue_prefix: Option<String>,
     pub budget_monthly_cents: Option<i64>,
     pub attachment_max_bytes: Option<i64>,
     pub default_responsible_user_id: Option<Uuid>,
