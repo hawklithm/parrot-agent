@@ -100,10 +100,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app: Router = create_router(state);
 
+    let config = services::config::Config::load(None).unwrap_or_default();
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
+        .unwrap_or(config.server.port);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("listening on http://{}", addr);
 

@@ -12,6 +12,7 @@ pub enum CompanyStatus {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Company {
     pub id: Uuid,
     pub name: String,
@@ -37,6 +38,7 @@ pub struct Company {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateCompanyInput {
     pub name: String,
     pub description: Option<String>,
@@ -48,6 +50,7 @@ pub struct CreateCompanyInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateCompanyInput {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -64,6 +67,7 @@ pub struct UpdateCompanyInput {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompanyStats {
     pub company_id: Uuid,
     pub total_projects: i64,
@@ -94,6 +98,7 @@ pub enum CompanyMembershipStatus {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompanyMembership {
     pub id: Uuid,
     pub company_id: Uuid,

@@ -25,6 +25,7 @@ pub struct CompareDiffQuery {
 
 /// 配置版本响应
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RevisionResponse {
     pub id: Uuid,
     pub agent_id: Uuid,
@@ -34,6 +35,7 @@ pub struct RevisionResponse {
 
 /// 配置版本列表响应
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RevisionListResponse {
     pub revisions: Vec<RevisionResponse>,
     pub total: i64,

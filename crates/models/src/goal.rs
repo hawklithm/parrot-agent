@@ -31,6 +31,7 @@ pub enum GoalPriority {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoalMetrics {
     pub target_completion_date: Option<DateTime<Utc>>,
     pub progress_percentage: Option<f64>,
@@ -41,6 +42,7 @@ pub struct GoalMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Goal {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -57,6 +59,7 @@ pub struct Goal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateGoalInput {
     pub company_id: Uuid,
     pub title: String,
@@ -67,6 +70,7 @@ pub struct CreateGoalInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateGoalInput {
     pub title: Option<String>,
     pub description: Option<String>,

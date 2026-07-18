@@ -85,7 +85,7 @@ impl Default for ServerConfig {
             exposure: DeploymentExposure::Private,
             bind_mode: BindMode::Loopback,
             host: "127.0.0.1".to_string(),
-            port: 8080,
+            port: 3100,
             external_url: None,
         }
     }

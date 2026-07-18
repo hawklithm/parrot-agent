@@ -24,6 +24,7 @@ pub enum ExecutionWorkspacePolicy {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Project {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -45,6 +46,7 @@ pub struct Project {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateProjectInput {
     pub company_id: Uuid,
     pub goal_id: Option<Uuid>,
@@ -59,6 +61,7 @@ pub struct CreateProjectInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateProjectInput {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -73,6 +76,7 @@ pub struct UpdateProjectInput {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectWorkspace {
     pub id: Uuid,
     pub project_id: Uuid,
@@ -84,6 +88,7 @@ pub struct ProjectWorkspace {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateWorkspaceInput {
     pub project_id: Uuid,
     pub name: String,
@@ -100,6 +105,7 @@ pub enum MembershipState {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectMembership {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -112,6 +118,7 @@ pub struct ProjectMembership {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentMembership {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -124,6 +131,7 @@ pub struct AgentMembership {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResourceMemberships {
     pub project_memberships: Vec<ProjectMembershipWithProject>,
     pub agent_memberships: Vec<AgentMembershipWithAgent>,
@@ -132,12 +140,14 @@ pub struct ResourceMemberships {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectMembershipWithProject {
     pub membership: ProjectMembership,
     pub project: Project,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentMembershipWithAgent {
     pub membership: AgentMembership,
     pub agent_name: String,

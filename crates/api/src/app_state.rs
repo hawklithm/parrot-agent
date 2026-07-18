@@ -269,6 +269,7 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         // The Paperclip HTTP contract exposes all service routes below `/api`.
+        .route("/api/health", axum::routing::get(health_check))
         .nest("/api", api_routes)
 
         // Middleware layers
@@ -280,7 +281,14 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 /// Health check endpoint
+///
+/// Paperclip 前端期望返回 JSON 格式的健康状态，
+/// 而非纯文本 `"OK"`，否则前端 JSON 解析会报错：
+/// `Unexpected token 'O', "OK" is not valid JSON`
 #[allow(dead_code)]
-async fn health_check() -> &'static str {
-    "OK"
+async fn health_check() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "message": "Service is healthy"
+    }))
 }

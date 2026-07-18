@@ -25,6 +25,7 @@ pub enum TerminalKind {
 
 /// Stage approver configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StageApprover {
     pub kind: ApproverKind,
     pub id: Option<String>,
@@ -40,6 +41,7 @@ pub enum ApproverKind {
 
 /// Pipeline stage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PipelineStageConfig {
     pub autonomy: Option<String>,
     pub auto_advance_on_children_terminal: Option<bool>,
@@ -61,6 +63,7 @@ pub struct PipelineStageConfig {
 
 /// Pipeline model
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Pipeline {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -75,6 +78,7 @@ pub struct Pipeline {
 
 /// Pipeline stage model
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct PipelineStage {
     pub id: Uuid,
     pub pipeline_id: Uuid,
@@ -89,6 +93,7 @@ pub struct PipelineStage {
 
 /// Pipeline case model
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct PipelineCase {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -107,6 +112,7 @@ pub struct PipelineCase {
 
 /// Pipeline transition model
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct PipelineTransition {
     pub id: Uuid,
     pub pipeline_id: Uuid,
@@ -118,6 +124,7 @@ pub struct PipelineTransition {
 
 /// Case event model for event sourcing
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct CaseEvent {
     pub id: Uuid,
     pub case_id: Uuid,
@@ -130,6 +137,7 @@ pub struct CaseEvent {
 
 /// Input structures
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreatePipelineInput {
     pub company_id: Uuid,
     pub key: String,
@@ -141,6 +149,7 @@ pub struct CreatePipelineInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateStageInput {
     pub key: String,
     pub name: String,
@@ -150,6 +159,7 @@ pub struct CreateStageInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateCaseInput {
     pub pipeline_id: Uuid,
     pub title: String,
@@ -157,6 +167,7 @@ pub struct CreateCaseInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CaseAdvanceInput {
     pub company_id: Uuid,
     pub case_id: Uuid,
@@ -174,6 +185,7 @@ pub enum CaseReviewDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CaseReviewInput {
     pub decision: CaseReviewDecision,
     pub reason: Option<String>,

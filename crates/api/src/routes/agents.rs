@@ -16,6 +16,8 @@ use models::{AgentPermissions, AgentStatus, TrustAuthorizationPolicy, TrustPrese
 use services::{CreateAgentInput, UpdateAgentInput};
 use serde_json::json;
 
+use crate::routes::heartbeats::list_scheduler_heartbeats;
+
 /// AppState - 应用状态（使用Arc<dyn Trait>避免泛型）
 ///
 /// 与 `crate::app_state::AppState` 为同一类型（统一状态），
@@ -631,14 +633,6 @@ async fn list_agent_configurations(
 ) -> Result<impl IntoResponse, AppError> {
     let configs = state.agent_service.list_configurations(company_id).await?;
     Ok(Json(configs))
-}
-
-/// GET /instance/scheduler-heartbeats - 调度器心跳列表 (A6)
-async fn list_scheduler_heartbeats() -> Result<impl IntoResponse, AppError> {
-    Ok(Json(serde_json::json!({
-        "heartbeats": [],
-        "total": 0,
-    })))
 }
 
 /// 从 Authorization 头提取 Agent Key

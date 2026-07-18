@@ -23,6 +23,7 @@ pub enum ApprovalStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Approval {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -39,6 +40,7 @@ pub struct Approval {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct IssueApproval {
     pub id: Uuid,
     pub approval_id: Uuid,
@@ -46,6 +48,7 @@ pub struct IssueApproval {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateApprovalInput {
     pub company_id: Uuid,
     pub approval_type: ApprovalType,
@@ -55,6 +58,7 @@ pub struct CreateApprovalInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DecisionInput {
     pub status: ApprovalStatus,
     pub decision_note: Option<String>,

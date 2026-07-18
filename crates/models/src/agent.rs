@@ -58,6 +58,7 @@ pub enum TrustAuthorizationPolicy {
 
 /// Agent 权限结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentPermissions {
     pub can_create_agents: bool,
     pub can_create_skills: bool,
@@ -78,6 +79,7 @@ impl Default for AgentPermissions {
 
 /// Agent 元数据
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_built_in: Option<bool>,
@@ -110,6 +112,7 @@ pub enum AgentSkillSyncMode {
 
 /// Agent skill entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSkillEntry {
     pub skill_id: String,
     pub source: SkillSource,
@@ -118,6 +121,7 @@ pub struct AgentSkillEntry {
 
 /// Agent skill snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSkillSnapshot {
     pub skills: Vec<AgentSkillEntry>,
     pub sync_mode: AgentSkillSyncMode,
@@ -126,6 +130,7 @@ pub struct AgentSkillSnapshot {
 
 /// Agent 实体
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Agent {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -145,6 +150,7 @@ pub struct Agent {
 
 /// Agent 配置版本
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentConfigRevision {
     pub id: Uuid,
     pub agent_id: Uuid,
@@ -154,6 +160,7 @@ pub struct AgentConfigRevision {
 
 /// Agent 运行时状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentRuntimeState {
     pub agent_id: Uuid,
     pub status: AgentStatus,
@@ -164,6 +171,7 @@ pub struct AgentRuntimeState {
 
 /// Agent 任务会话
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentTaskSession {
     pub id: Uuid,
     pub agent_id: Uuid,
@@ -175,6 +183,7 @@ pub struct AgentTaskSession {
 
 /// 审批记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Approval {
     pub id: Uuid,
     pub agent_id: Uuid,

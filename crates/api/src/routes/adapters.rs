@@ -278,6 +278,9 @@ async fn test_environment(
 // ============================================================================
 
 /// E1: GET /adapters - 全局适配器列表
+///
+/// Paperclip 前端期望返回一个**裸数组**（而非包裹在对象中），
+/// 因为 AdapterStore 会直接在响应上调用 `.map()`。
 async fn list_global_adapters(
     State(state): State<AdapterAppState>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -289,7 +292,7 @@ async fn list_global_adapters(
             "supportsInstructionsBundle": a.supports_instructions_bundle(),
         })
     }).collect();
-    Ok(Json(serde_json::json!({"adapters": adapters, "total": adapters.len()})))
+    Ok(Json(adapters))
 }
 
 /// E2: POST /adapters/install - 安装适配器

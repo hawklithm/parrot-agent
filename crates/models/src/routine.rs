@@ -57,6 +57,7 @@ pub enum RunStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutineVariable {
     pub name: String,
     pub label: String,
@@ -79,6 +80,7 @@ pub enum RoutineVariableType {
 
 /// Routine trigger configuration (stored as JSONB)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutineTriggerConfig {
     #[serde(flatten)]
     pub config: JsonValue,
@@ -108,6 +110,7 @@ pub enum TriggerStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Routine {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -142,6 +145,7 @@ pub struct Routine {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutineTrigger {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -169,6 +173,7 @@ pub struct RoutineTrigger {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutineRevision {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -185,6 +190,7 @@ pub struct RoutineRevision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutineRevisionSnapshotV1 {
     pub version: i32,
     pub routine_snapshot: JsonValue,
@@ -192,6 +198,7 @@ pub struct RoutineRevisionSnapshotV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutineRun {
     pub id: Uuid,
     pub company_id: Uuid,
@@ -213,6 +220,7 @@ pub struct RoutineRun {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateRoutineInput {
     pub company_id: Uuid,
     pub title: String,
@@ -230,6 +238,7 @@ pub struct CreateRoutineInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateRoutineInput {
     pub title: Option<String>,
     pub description: Option<String>,

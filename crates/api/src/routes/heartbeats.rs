@@ -4,8 +4,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 
+use crate::app_state::AppState;
 use crate::schemas::{
     derive_agent_url_key, parse_scheduler_heartbeat_policy, InstanceSchedulerHeartbeatAgent,
 };
@@ -13,8 +14,9 @@ use crate::schemas::{
 /// GET /instance/scheduler-heartbeats
 /// 获取所有配置了调度心跳的 Agent 列表（需要 Instance Admin 权限）
 pub async fn list_scheduler_heartbeats(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
 ) -> Result<Json<Vec<InstanceSchedulerHeartbeatAgent>>, HeartbeatError> {
+    let pool = &state.pool;
     // 查询所有活跃的 Agent 及其公司信息
     let rows = sqlx::query(
         r#"
@@ -34,7 +36,7 @@ pub async fn list_scheduler_heartbeats(
         ORDER BY c.name, a.name
         "#
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| HeartbeatError::DatabaseError(e.to_string()))?;
 
