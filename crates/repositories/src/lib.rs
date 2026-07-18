@@ -20,8 +20,6 @@ pub mod case_issue_link_repository;
 pub mod pg_case_issue_link_repository;
 pub mod issue_comment_repository;
 pub mod pg_issue_comment_repository;
-pub mod issue_document_repository;
-pub mod pg_issue_document_repository;
 pub mod issue_tree_control_repository;
 pub mod pg_issue_tree_control_repository;
 pub mod environment_repository;
@@ -53,8 +51,6 @@ pub use case_issue_link_repository::{CaseIssueLinkRepository, CreateCaseIssueLin
 pub use pg_case_issue_link_repository::PgCaseIssueLinkRepository;
 pub use issue_comment_repository::{IssueCommentRepository, CreateIssueCommentInput, UpdateIssueCommentInput};
 pub use pg_issue_comment_repository::PgIssueCommentRepository;
-pub use issue_document_repository::IssueDocumentRepository;
-pub use pg_issue_document_repository::PgIssueDocumentRepository;
 pub use issue_tree_control_repository::{IssueTreeHoldRepository, CreateTreeHoldInput};
 pub use pg_issue_tree_control_repository::PgIssueTreeHoldRepository;
 pub use environment_repository::{EnvironmentRepository, PgEnvironmentRepository};

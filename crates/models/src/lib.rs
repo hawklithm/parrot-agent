@@ -21,7 +21,6 @@ pub mod invite_resource;
 pub mod issue;
 pub mod issue_auxiliary;
 pub mod issue_comment;
-pub mod issue_document;
 pub mod issue_tree_control;
 pub mod openclaw;
 pub mod org_chart;
@@ -73,10 +72,6 @@ pub use event_bus::{
     IssueEvent, ApprovalEvent, RoutineEvent, AgentEvent, EnvironmentEvent, GoalEvent,
 };
 pub use secrets::{UserSecretDefinition, UserSecret, SecretBinding};
-pub use issue_document::{
-    LockDocumentInput, Attachment, CreateWorkProductInput, UpdateWorkProductInput,
-    AnnotationThreadStatus,
-};
 pub use secret_provider::{ProviderHealthStatus, SecretProviderConfig};
 
 // ===== glob re-export（非冲突类型继续使用） =====
@@ -101,7 +96,6 @@ pub use invite_resource::*;
 pub use issue::*;
 pub use issue_auxiliary::*;
 pub use issue_comment::*;
-pub use issue_document::*;
 pub use issue_tree_control::*;
 pub use openclaw::*;
 pub use org_chart::*;

@@ -11,7 +11,6 @@ use crate::issue_service::{self, ForceReleaseInput};
 // Import existing services
 use crate::issue_tree_control_service::IssueTreeControlService;
 use crate::issue_comment_service::IssueCommentService;
-use crate::issue_document_service::IssueDocumentService;
 use crate::work_product_service::WorkProductService;
 use crate::attachment_service::AttachmentService;
 
@@ -157,9 +156,6 @@ pub trait IssueService: Send + Sync {
     /// Get comment service
     fn comments(&self) -> Arc<dyn IssueCommentService>;
 
-    /// Get document service
-    fn documents(&self) -> Arc<dyn IssueDocumentService>;
-
     /// Get work product service
     fn work_products(&self) -> Arc<dyn WorkProductService>;
 
@@ -179,7 +175,6 @@ pub struct DefaultIssueService {
     approval_repo: Arc<dyn ApprovalRepository>,
     tree_control_service: Arc<dyn IssueTreeControlService>,
     comment_service: Arc<dyn IssueCommentService>,
-    document_service: Arc<dyn IssueDocumentService>,
     work_product_service: Arc<dyn WorkProductService>,
     attachment_service: Arc<dyn AttachmentService>,
 }
@@ -190,7 +185,6 @@ impl DefaultIssueService {
         approval_repo: Arc<dyn ApprovalRepository>,
         tree_control_service: Arc<dyn IssueTreeControlService>,
         comment_service: Arc<dyn IssueCommentService>,
-        document_service: Arc<dyn IssueDocumentService>,
         work_product_service: Arc<dyn WorkProductService>,
         attachment_service: Arc<dyn AttachmentService>,
     ) -> Self {
@@ -199,7 +193,6 @@ impl DefaultIssueService {
             approval_repo,
             tree_control_service,
             comment_service,
-            document_service,
             work_product_service,
             attachment_service,
         }
@@ -632,10 +625,6 @@ impl IssueService for DefaultIssueService {
         self.comment_service.clone()
     }
 
-    fn documents(&self) -> Arc<dyn IssueDocumentService> {
-        self.document_service.clone()
-    }
-
     fn work_products(&self) -> Arc<dyn WorkProductService> {
         self.work_product_service.clone()
     }
@@ -693,8 +682,6 @@ pub struct LegacyIssueService {
     #[allow(dead_code)]
     comment_service: Arc<dyn IssueCommentService>,
     #[allow(dead_code)]
-    document_service: Arc<dyn IssueDocumentService>,
-    #[allow(dead_code)]
     work_product_service: Arc<dyn WorkProductService>,
     #[allow(dead_code)]
     attachment_service: Arc<dyn AttachmentService>,
@@ -706,7 +693,6 @@ impl LegacyIssueService {
         approval_repo: Arc<dyn ApprovalRepository>,
         tree_control_service: Arc<dyn IssueTreeControlService>,
         comment_service: Arc<dyn IssueCommentService>,
-        document_service: Arc<dyn IssueDocumentService>,
         work_product_service: Arc<dyn WorkProductService>,
         attachment_service: Arc<dyn AttachmentService>,
     ) -> Self {
@@ -716,13 +702,11 @@ impl LegacyIssueService {
                 approval_repo,
                 tree_control_service,
                 comment_service.clone(),
-                document_service.clone(),
                 work_product_service.clone(),
                 attachment_service.clone(),
             ),
             issue_repo,
             comment_service,
-            document_service,
             work_product_service,
             attachment_service,
         }
@@ -1008,19 +992,6 @@ mod tests {
         async fn add_comment(&self, _issue_id: Uuid, _body: &str, _actor_type: &str, _actor_id: Uuid) -> Result<models::IssueComment, String> { unimplemented!() }
         async fn list_comments(&self, _issue_id: Uuid) -> Result<Vec<models::IssueComment>, String> { Ok(vec![]) }
         async fn delete_comment(&self, _comment_id: Uuid) -> Result<(), String> { unimplemented!() }
-    }
-
-    struct MockDocumentService;
-    impl MockDocumentService {
-        fn new() -> Self { Self }
-    }
-    #[async_trait]
-    impl IssueDocumentService for MockDocumentService {
-        async fn list_documents(&self, _issue_id: Uuid) -> Result<Vec<models::IssueDocument>, String> { Ok(vec![]) }
-        async fn get_document(&self, _issue_id: Uuid, _key: &str) -> Result<Option<models::IssueDocument>, String> { Ok(None) }
-        async fn upsert_document(&self, _issue_id: Uuid, _key: &str, _content: &str) -> Result<models::IssueDocument, String> { unimplemented!() }
-        async fn lock_document(&self, _issue_id: Uuid, _key: &str, _run_id: Uuid) -> Result<models::IssueDocument, String> { unimplemented!() }
-        async fn unlock_document(&self, _issue_id: Uuid, _key: &str) -> Result<models::IssueDocument, String> { unimplemented!() }
     }
 
     struct MockWorkProduct;
