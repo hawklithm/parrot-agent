@@ -3,7 +3,6 @@ use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
     response::Response,
-    routing::get,
     Router,
 };
 use axum::response::Json;
@@ -124,8 +123,8 @@ pub async fn get_invite_skill_detail(
         })
 }
 
-/// Register invite sub-resource routes
+/// All invite sub-resource routes have been migrated to `invite_resources::invite_resource_routes()`.
+/// This module is kept only to avoid breaking the `with_state` call in `app_state.rs`.
 pub fn invite_subresource_routes() -> Router<Arc<dyn InviteService>> {
     Router::new()
-        .route("/invites/:token/skills/:skill_name", get(get_invite_skill_detail))
 }

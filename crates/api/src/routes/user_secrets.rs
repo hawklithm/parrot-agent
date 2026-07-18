@@ -243,17 +243,9 @@ pub async fn get_secret_bindings(
     Ok(Json(bindings))
 }
 
+/// All user-secret routes have been migrated to `user_secret_definitions::user_secret_definition_routes()`.
+/// This module is kept only to avoid breaking the `with_state` call in `app_state.rs`.
+/// All handler functions remain here for reference but are no longer registered as routes.
 pub fn user_secret_routes() -> axum::Router<Arc<dyn UserSecretService>> {
-    use axum::routing::{delete, get, post};
-
     axum::Router::new()
-        .route("/companies/:company_id/user-secret-definitions", get(list_definitions).post(create_definition))
-        .route("/companies/:company_id/user-secret-definitions/:definition_id",
-            get(get_definition).patch(update_definition).delete(delete_definition))
-        .route("/companies/:company_id/user-secret-definitions/:definition_id/coverage", get(get_coverage_stats))
-        .route("/companies/:company_id/me/user-secrets", get(list_user_secrets).post(set_user_secret))
-        .route("/companies/:company_id/me/user-secrets/:definition_id", get(get_user_secret))
-        .route("/companies/:company_id/me/user-secrets/:secret_id/rotate", post(rotate_user_secret))
-        .route("/companies/:company_id/me/user-secrets/:secret_id", delete(delete_user_secret))
-        .route("/companies/:company_id/me/user-secrets/:secret_id/bindings", get(get_secret_bindings))
 }

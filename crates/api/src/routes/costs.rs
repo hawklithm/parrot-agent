@@ -35,7 +35,6 @@ pub fn cost_routes() -> Router<AppState> {
         .route("/companies/:company_id/budgets/overview", get(get_budget_overview))
         .route("/companies/:company_id/budgets/policies", post(create_budget_policy))
         .route("/companies/:company_id/budgets", patch(update_budget))
-        .route("/agents/:agent_id/budgets", patch(update_agent_budget))
         .route("/companies/:company_id/budget-incidents/:incident_id/resolve", post(resolve_budget_incident))
 }
 
@@ -199,15 +198,6 @@ async fn update_budget(
     Json(_body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(serde_json::json!({"companyId": company_id, "updated": true})))
-}
-
-/// CO19: PATCH /agents/:agent_id/budgets
-async fn update_agent_budget(
-    State(_state): State<AppState>,
-    Path(agent_id): Path<Uuid>,
-    Json(_body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"agentId": agent_id, "updated": true})))
 }
 
 /// CO20: POST /companies/:company_id/budget-incidents/:incident_id/resolve
