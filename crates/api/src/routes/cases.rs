@@ -2,15 +2,16 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use serde::Deserialize;
 use crate::app_state::AppState;
+use crate::errors::AppError;
 use uuid::Uuid;
 
-use models::{Case, CaseDetail, CaseEvent, CreateCaseInput, UpdateCaseInput};
-use services::{CaseQueryFilter, Pagination};
+use models::{Case, CaseDetail, CaseEvent, CreateCaseInput, PipelineCase, UpdateCaseInput};
+use services::{AdvanceCaseInput, CaseQueryFilter, Pagination};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -523,6 +524,53 @@ async fn automation_retry_single(
     state.case_service.automation_retry_single(id, company_id, automation_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// PATCH /cases/:id/advance — Advance pipeline case to next stage
+async fn advance_case(
+    State(state): State<AppState>,
+    Path(case_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<PipelineCase>, AppError> {
+    let to_stage_id: Uuid = body.get("to_stage_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| AppError::BadRequest("Missing to_stage_id".to_string()))?;
+
+    let input = AdvanceCaseInput {
+        case_id,
+        to_stage_id,
+        actor_type: body.get("actor_type").and_then(|v| v.as_str().map(String::from)),
+        actor_id: body.get("actor_id").and_then(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok())),
+        note: body.get("note").and_then(|v| v.as_str().map(String::from)),
+    };
+
+    let case = state
+        .pipeline_service
+        .advance_case(input)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok(Json(case))
+}
+
+/// POST /cases/:id/terminal — Mark pipeline case as terminal (done/cancelled)
+async fn mark_terminal(
+    State(state): State<AppState>,
+    Path(case_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<PipelineCase>, AppError> {
+    let kind_str = body.get("kind").and_then(|v| v.as_str()).unwrap_or("done");
+    let kind = match kind_str {
+        "cancelled" => models::pipeline::TerminalKind::Cancelled,
+        _ => models::pipeline::TerminalKind::Done,
+    };
+
+    let case = state
+        .pipeline_service
+        .mark_terminal(case_id, kind)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok(Json(case))
+}
+
 /// Create case routes
 pub fn case_routes() -> Router<AppState> {
     Router::new()
@@ -547,6 +595,9 @@ pub fn case_routes() -> Router<AppState> {
         .route("/cases/:id/open-conversation", post(open_conversation))
         .route("/cases/:id/breakdown", post(breakdown_case))
         .route("/cases/:id/attachments", post(upload_case_attachment))
+        // Pipeline case operations (advance, terminal) — owned by cases module
+        .route("/cases/:id/advance", patch(advance_case))
+        .route("/cases/:id/terminal", post(mark_terminal))
         // Case documents CRUD (C16-C20)
         .route("/cases/:id/documents/:key", get(get_case_document).post(create_case_document).put(update_case_document).delete(delete_case_document))
         .route("/cases/:id/documents/:key/lock", post(lock_case_document))

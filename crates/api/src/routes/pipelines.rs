@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use models::pipeline::{Pipeline, PipelineStage, PipelineCase, PipelineTransition};
-use services::{AdvanceCaseInput, CreateCaseInput};
+use services::CreateCaseInput;
 
 pub fn pipeline_routes() -> Router<AppState> {
     Router::new()
@@ -29,10 +29,9 @@ pub fn pipeline_routes() -> Router<AppState> {
         // Cases
         .route("/pipelines/:pipeline_id/cases", post(create_case))
         .route("/pipelines/:pipeline_id/cases", get(list_cases))
-        // Pipeline-specific case operations (under pipeline sub-path to avoid
-        // conflict with cases.rs which owns /cases/:id)
-        .route("/cases/:id/pipeline/advance", patch(advance_case))
-        .route("/cases/:id/pipeline/terminal", post(mark_terminal))
+        // Note: Pipeline-specific case operations (advance, terminal) are
+        // registered in cases::case_routes() under /cases/:id/ to match
+        // Paperclip's route ownership model.
         // Note: GET /cases/:id/events is registered in cases.rs via case_service
         // Health & attention
         .route("/pipelines/:pipeline_id/health-warnings", get(get_health_warnings))
@@ -138,53 +137,6 @@ async fn list_cases(
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     Ok(Json(cases))
-}
-
-/// PATCH /cases/:id/pipeline/advance
-async fn advance_case(
-    State(state): State<AppState>,
-    Path(case_id): Path<Uuid>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<PipelineCase>, AppError> {
-    let to_stage_id: Uuid = body.get("to_stage_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or_else(|| AppError::BadRequest("Missing to_stage_id".to_string()))?;
-
-    let input = AdvanceCaseInput {
-        case_id,
-        to_stage_id,
-        actor_type: body.get("actor_type").and_then(|v| v.as_str().map(String::from)),
-        actor_id: body.get("actor_id").and_then(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok())),
-        note: body.get("note").and_then(|v| v.as_str().map(String::from)),
-    };
-
-    let case = state
-        .pipeline_service
-        .advance_case(input)
-        .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(case))
-}
-
-/// POST /cases/:id/pipeline/terminal
-async fn mark_terminal(
-    State(state): State<AppState>,
-    Path(case_id): Path<Uuid>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<PipelineCase>, AppError> {
-    let kind_str = body.get("kind").and_then(|v| v.as_str()).unwrap_or("done");
-    let kind = match kind_str {
-        "cancelled" => models::pipeline::TerminalKind::Cancelled,
-        _ => models::pipeline::TerminalKind::Done,
-    };
-
-    let case = state
-        .pipeline_service
-        .mark_terminal(case_id, kind)
-        .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(case))
 }
 
 // ===== Health & Attention endpoints =====
