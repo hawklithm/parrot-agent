@@ -57,6 +57,10 @@ pub struct UpdateCompanyInput {
     pub attachment_max_bytes: Option<i64>,
     pub default_responsible_user_id: Option<Uuid>,
     pub require_board_approval_for_new_agents: Option<bool>,
+    pub feedback_data_sharing_enabled: Option<bool>,
+    pub feedback_data_sharing_consent_at: Option<DateTime<Utc>>,
+    pub feedback_data_sharing_consent_by_user_id: Option<Uuid>,
+    pub feedback_data_sharing_terms_version: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

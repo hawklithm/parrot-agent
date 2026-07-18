@@ -122,6 +122,22 @@ impl CompanyRepository {
             query.push_str(&format!(", require_board_approval_for_new_agents = ${}", bind_count));
             bind_count += 1;
         }
+        if input.feedback_data_sharing_enabled.is_some() {
+            query.push_str(&format!(", feedback_data_sharing_enabled = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.feedback_data_sharing_consent_at.is_some() {
+            query.push_str(&format!(", feedback_data_sharing_consent_at = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.feedback_data_sharing_consent_by_user_id.is_some() {
+            query.push_str(&format!(", feedback_data_sharing_consent_by_user_id = ${}", bind_count));
+            bind_count += 1;
+        }
+        if input.feedback_data_sharing_terms_version.is_some() {
+            query.push_str(&format!(", feedback_data_sharing_terms_version = ${}", bind_count));
+            bind_count += 1;
+        }
 
         query.push_str(&format!(" WHERE id = ${} RETURNING *", bind_count));
 
@@ -150,6 +166,18 @@ impl CompanyRepository {
         }
         if let Some(require_approval) = input.require_board_approval_for_new_agents {
             q = q.bind(require_approval);
+        }
+        if let Some(enabled) = input.feedback_data_sharing_enabled {
+            q = q.bind(enabled);
+        }
+        if let Some(consent_at) = input.feedback_data_sharing_consent_at {
+            q = q.bind(consent_at);
+        }
+        if let Some(consent_by) = input.feedback_data_sharing_consent_by_user_id {
+            q = q.bind(consent_by);
+        }
+        if let Some(terms_version) = input.feedback_data_sharing_terms_version {
+            q = q.bind(terms_version);
         }
 
         q.bind(id).fetch_one(&self.pool).await

@@ -159,7 +159,6 @@ pub enum ResourceType {
     BuiltInAgent,
     Issue,
     Case,
-    IssueDocument,
     IssueComment,
     CaseDocument,
 }
