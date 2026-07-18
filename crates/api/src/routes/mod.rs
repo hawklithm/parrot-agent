@@ -4,7 +4,6 @@ pub mod auth;
 pub mod built_in_agents;
 pub mod adapters;
 pub mod config_revisions;
-pub mod org;
 pub mod issues;
 pub mod cases;
 pub mod issue_comments;
@@ -57,7 +56,6 @@ pub use built_in_agents::{
 };
 pub use adapters::adapter_routes;
 pub use config_revisions::config_revision_routes;
-pub use org::org_routes;
 pub use user_secrets::user_secret_routes;
 pub use skills::skill_routes;
 pub use environments::environment_routes;

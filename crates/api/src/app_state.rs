@@ -208,7 +208,8 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::adapters::adapter_routes())
         .merge(crate::routes::config_revisions::config_revision_routes())
         .merge(crate::routes::built_in_agents::built_in_agent_routes())
-        .merge(crate::routes::org::org_routes())
+        // Org chart routes (includes /companies/:companyId/org, /org-chart.svg, /org.png)
+        .merge(crate::routes::org_chart::org_chart_routes())
 
         // Phase 2: Issue/Case Management routes
         .merge(crate::routes::issues::issue_routes())
@@ -236,7 +237,6 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::environment_diagnostics::environment_diagnostics_routes())
         .merge(crate::routes::invite_resources::invite_resource_routes())
         .merge(crate::routes::openclaw::openclaw_routes())
-        .merge(crate::routes::org_chart::org_chart_routes())
         .merge(crate::routes::routine_annotations::routine_annotation_routes())
         .merge(crate::routes::secret_provider_configs::secret_provider_config_routes())
         .merge(crate::routes::secret_remote_import::secret_remote_import_routes())

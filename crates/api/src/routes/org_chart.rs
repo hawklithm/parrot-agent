@@ -1,5 +1,6 @@
 use crate::app_state::AppState;
-use axum::{Router, 
+use crate::errors::AppError;
+use axum::{Router,
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -75,4 +76,77 @@ pub fn org_chart_routes() -> Router<AppState> {
             "/companies/:companyId/org-chart.svg",
             axum::routing::get(generate_org_chart_svg),
         )
+        .route(
+            "/companies/:companyId/org.png",
+            axum::routing::get(generate_org_png),
+        )
+}
+
+/// GET /companies/:companyId/org.png - 生成 PNG 组织架构图（占位）
+async fn generate_org_png(
+    Path(company_id): Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Response, AppError> {
+    let _tree = state
+        .org_chart_service
+        .build_org_tree(company_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    // TODO: 实现 PNG 渲染逻辑（需要 resvg 或 image 库）
+    // 当前返回 501 Not Implemented
+    Err(AppError::NotImplemented(
+        "PNG rendering not yet implemented".to_string(),
+    ))
+}
+
+#[cfg(test)]
+/// 辅助函数：递归统计组织架构树中的节点总数
+fn count_nodes(nodes: &[services::OrgNode]) -> usize {
+    nodes.iter().map(|node| 1 + count_nodes(&node.reports)).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_count_nodes() {
+        use services::OrgNode;
+
+        let id1 = Uuid::new_v4().to_string();
+        let id2 = Uuid::new_v4().to_string();
+        let id3 = Uuid::new_v4().to_string();
+
+        let nodes = vec![
+            OrgNode {
+                id: id1,
+                name: "CEO".into(),
+                role: "Chief Executive".into(),
+                status: "active".into(),
+                collapsed_reports: None,
+                reports: vec![
+                    OrgNode {
+                        id: id2,
+                        name: "CTO".into(),
+                        role: "Technology".into(),
+                        status: "active".into(),
+                        collapsed_reports: None,
+                        reports: vec![],
+                    },
+                    OrgNode {
+                        id: id3,
+                        name: "CFO".into(),
+                        role: "Finance".into(),
+                        status: "active".into(),
+                        collapsed_reports: None,
+                        reports: vec![],
+                    },
+                ],
+            },
+        ];
+
+        assert_eq!(count_nodes(&nodes), 3);
+    }
 }
