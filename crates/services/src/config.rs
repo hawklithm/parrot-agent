@@ -259,9 +259,7 @@ impl Config {
 
     /// 校验配置
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.server.port > 65535 {
-            return Err(ConfigError::InvalidValue("server.port must be between 1 and 65535".to_string()));
-        }
+        // port is u16, always within 1-65535 range
         if self.database.url.is_empty() {
             return Err(ConfigError::MissingRequired("database.url".to_string()));
         }

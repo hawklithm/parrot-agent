@@ -29,7 +29,6 @@ pub mod org_chart_service_impl;
 pub mod issue_service;
 pub mod case_service;
 pub mod issue_comment_service;
-pub mod issue_document_service;
 pub mod issue_tree_control_service;
 pub mod environment_driver;
 pub mod lease_service;
@@ -120,9 +119,6 @@ pub use errors::ServiceResult;
 pub use issue_comment_service::{
     IssueCommentService, IssueCommentServiceImpl, CommentServiceError, CommentServiceResult,
 };
-pub use issue_document_service::{
-    IssueDocumentService, IssueDocumentServiceImpl, DocumentServiceError, DocumentServiceResult,
-};
 pub use issue_tree_control_service::{
     IssueTreeControlService, IssueTreeControlServiceImpl, TreeControlServiceError, TreeControlServiceResult,
 };
@@ -148,8 +144,6 @@ pub use issue_service::*;
 pub mod issue_service_mock;
 pub use issue_service_mock::*;
 pub use case_service::*;
-pub mod document_service;
-pub use document_service::*;
 pub mod comment_service;
 pub use comment_service::*;
 pub mod tree_control_service;
@@ -190,6 +184,8 @@ pub mod heartbeat_service;
 pub use heartbeat_service::*;
 pub mod task_watchdog;
 pub use task_watchdog::{WatchdogService, DefaultWatchdogService, classify_subtree, ClassifierState, ClassifierInput, StoppedLeaf};
+pub mod term_service;
+pub use term_service::*;
 pub mod retry;
 pub use retry::*;
 pub mod job_scheduler;
@@ -212,4 +208,13 @@ pub use issue_execution_lock_service::*;
 pub use low_trust_service::*;
 pub use adapter_registry::*;
 pub use adapters::*;
-pub use access::*;
+// 注意: activity_log_service 和 access 都定义了 ResourceType，
+// 使用通配符导入会导致 ambiguous_glob_reexports 警告。
+// 改为精确导入以消除歧义。
+pub use access::abac::{
+    AccessDecision, Action, Actor, AgentActor, AgentPermissions, AuthorizationPolicy, TrustPreset,
+    UserActor,
+};
+pub use access::access_service::{
+    AccessError, AccessService, DefaultAccessService, ResourceContext, ResourceType,
+};
