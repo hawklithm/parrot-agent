@@ -32,7 +32,7 @@ pub fn pipeline_routes() -> Router<AppState> {
         .route("/cases/:id", get(get_case))
         .route("/cases/:id/advance", patch(advance_case))
         .route("/cases/:id/terminal", post(mark_terminal))
-        .route("/cases/:id/events", get(get_case_events))
+        // Note: GET /cases/:id/events is registered in cases.rs via case_service
         // Health & attention
         .route("/pipelines/:pipeline_id/health-warnings", get(get_health_warnings))
         .route("/companies/:company_id/pipelines-attention", get(get_pipelines_attention))
@@ -197,19 +197,6 @@ async fn mark_terminal(
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     Ok(Json(case))
-}
-
-/// GET /cases/:case_id/events
-async fn get_case_events(
-    State(state): State<AppState>,
-    Path(case_id): Path<Uuid>,
-) -> Result<Json<Vec<models::pipeline::CaseEvent>>, AppError> {
-    let events = state
-        .pipeline_service
-        .get_case_events(case_id)
-        .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(events))
 }
 
 // ===== Health & Attention endpoints =====
