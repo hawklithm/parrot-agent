@@ -28,7 +28,6 @@ use repositories::{
     pg_case_repository::PgCaseRepository,
     pg_config_revision_repository::PgConfigRevisionRepository,
     pg_issue_comment_repository::PgIssueCommentRepository,
-    pg_issue_document_repository::PgIssueDocumentRepository,
     pg_issue_repository::PgIssueRepository,
     pg_issue_tree_control_repository::PgIssueTreeHoldRepository,
     pipeline_case_repository::PipelineCaseRepository,
@@ -56,7 +55,7 @@ use services::{
     AdapterRegistry, AgentService, ApprovalService, AttachmentService, BuiltInAgentService, CaseService,
     CompanyService, ConfigRevisionService, CustomImageSetupService, EnvironmentDiagnosticsService,
     EnvironmentRuntimeService, EnvironmentService, GoalService, InviteResourceService, InviteService,
-    IssueCommentService, IssueDiagnosticsService, IssueDocumentService, IssueService,
+    IssueCommentService, IssueDiagnosticsService, IssueService,
     IssueTreeControlService, LowTrustService, OpenClawService, OrgChartService, PipelineService,
     ProjectService, RoutineAnnotationService, RoutineService, SecretProviderConfigService,
     SecretRemoteImportService, SseService, UserDirectoryService, UserSecretDefinitionService,
@@ -70,7 +69,6 @@ use services::{
     issue_tree_control_service::IssueTreeControlServiceImpl,
     user_secret_definition_service::UserSecretDefinitionServiceImpl,
     issue_comment_service::IssueCommentServiceImpl,
-    issue_document_service::IssueDocumentServiceImpl,
     InMemoryEventBus, InMemorySseService, DefaultWatchdogService,
     // Mock impls for not-yet-implemented domains
     MockCaseService,
@@ -79,6 +77,9 @@ use services::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 加载 .env 文件（优先级：环境变量 > .env）
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
@@ -130,8 +131,6 @@ fn build_app_state(pool: PgPool) -> AppState {
     let issue_repo: Arc<PgIssueRepository> = Arc::new(PgIssueRepository::new(pool.clone()));
     let issue_comment_repo: Arc<PgIssueCommentRepository> =
         Arc::new(PgIssueCommentRepository::new(pool.clone()));
-    let issue_document_repo: Arc<PgIssueDocumentRepository> =
-        Arc::new(PgIssueDocumentRepository::new(pool.clone()));
     let tree_hold_repo: Arc<PgIssueTreeHoldRepository> =
         Arc::new(PgIssueTreeHoldRepository::new(pool.clone()));
     let approval_repo: Arc<PostgresApprovalRepository> =
@@ -211,8 +210,6 @@ fn build_app_state(pool: PgPool) -> AppState {
         Arc::new(DefaultEnvironmentRuntimeService::new());
     let issue_comment_service: Arc<dyn IssueCommentService> =
         Arc::new(IssueCommentServiceImpl::new(issue_comment_repo.clone(), issue_repo.clone()));
-    let issue_document_service: Arc<dyn IssueDocumentService> =
-        Arc::new(IssueDocumentServiceImpl::new(issue_document_repo.clone(), issue_repo.clone()));
     let issue_tree_control_service: Arc<dyn IssueTreeControlService> = Arc::new(
         IssueTreeControlServiceImpl::new(tree_hold_repo.clone(), issue_repo.clone()),
     );
@@ -295,7 +292,6 @@ fn build_app_state(pool: PgPool) -> AppState {
         approval_repo.clone(),
         issue_tree_control_service.clone(),
         issue_comment_service.clone(),
-        issue_document_service.clone(),
         work_product_service.clone(),
         attachment_service.clone(),
     ));
@@ -310,7 +306,6 @@ fn build_app_state(pool: PgPool) -> AppState {
         issue_service,
         case_service,
         issue_comment_service,
-        issue_document_service,
         issue_tree_control_service,
         org_chart_service,
         issue_diagnostics_service,
@@ -338,6 +333,7 @@ fn build_app_state(pool: PgPool) -> AppState {
         user_secret_service,
         approval_service,
         watchdog_service,
+        Arc::new(services::DefaultTermService::new()),
         event_bus,
         pool,
     )

@@ -1,12 +1,9 @@
-[package]
-name = "parrot-agent"
-version = "0.1.0"
-edition = "2021"
-
 [workspace]
+resolver = "2"
 members = [
     "crates/*"
 ]
+default-members = ["crates/server"]
 
 [workspace.dependencies]
 # Web framework
@@ -51,5 +48,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Testing
 mockall = "0.12"
-
-[dependencies]
