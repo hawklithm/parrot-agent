@@ -365,9 +365,9 @@ async fn delete_company_skill(
 /// Router setup for skills endpoints
 pub fn skill_routes() -> Router<AppState> {
     axum::Router::new()
-        .route("/api/skills/available", axum::routing::get(list_available_skills))
-        .route("/api/skills/index", axum::routing::get(get_skill_index))
-        .route("/api/skills/:skillName", axum::routing::get(get_skill_details))
+        .route("/skills/available", axum::routing::get(list_available_skills))
+        .route("/skills/index", axum::routing::get(get_skill_index))
+        .route("/skills/:skillName", axum::routing::get(get_skill_details))
         // --- P2: SK routes ---
         .route("/skills/catalog", get(get_skill_catalog))
         .route("/skills/catalog/:catalog_id", get(get_skill_catalog_detail))

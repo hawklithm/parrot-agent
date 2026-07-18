@@ -324,7 +324,74 @@ async fn upload_case_attachment(
     })))
 }
 
-/// C16: GET /cases/:id/documents/:key/revisions
+/// C16: GET /cases/:id/documents/:key — Get case document content
+async fn get_case_document(
+    State(_state): State<AppState>,
+    Path((_id, _key)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO: Use case document service
+    Ok(Json(serde_json::json!({"id": _id, "key": _key, "content": "", "contentType": "text/markdown"})))
+}
+
+/// C17: POST /cases/:id/documents/:key — Create case document
+async fn create_case_document(
+    State(_state): State<AppState>,
+    Path((_id, _key)): Path<(Uuid, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    // TODO: Use case document service
+    Ok((StatusCode::CREATED, Json(serde_json::json!({
+        "caseId": _id,
+        "key": _key,
+        "document": payload,
+        "created": true,
+    }))))
+}
+
+/// C18: PUT /cases/:id/documents/:key — Update case document
+async fn update_case_document(
+    State(_state): State<AppState>,
+    Path((_id, _key)): Path<(Uuid, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO: Use case document service
+    Ok(Json(serde_json::json!({
+        "caseId": _id,
+        "key": _key,
+        "document": payload,
+        "updated": true,
+    })))
+}
+
+/// C19: POST /cases/:id/documents/:key/lock — Lock case document
+async fn lock_case_document(
+    State(_state): State<AppState>,
+    Path((_id, _key)): Path<(Uuid, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO: Use case document service
+    Ok(Json(serde_json::json!({
+        "caseId": _id,
+        "key": _key,
+        "locked": true,
+        "lockedBy": payload,
+    })))
+}
+
+/// C20: POST /cases/:id/documents/:key/unlock — Unlock case document
+async fn unlock_case_document(
+    State(_state): State<AppState>,
+    Path((_id, _key)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO: Use case document service
+    Ok(Json(serde_json::json!({
+        "caseId": _id,
+        "key": _key,
+        "unlocked": true,
+    })))
+}
+
+/// C21: GET /cases/:id/documents/:key/revisions
 async fn get_document_revisions(
     State(_state): State<AppState>,
     Path((_id, _key)): Path<(Uuid, String)>,
@@ -336,7 +403,7 @@ async fn get_document_revisions(
     ]))
 }
 
-/// C17: POST /cases/:id/documents/:key/revisions/:revision_id/restore
+/// C22: POST /cases/:id/documents/:key/revisions/:revision_id/restore
 async fn restore_document_revision(
     State(_state): State<AppState>,
     Path((_id, _key, _revision_id)): Path<(Uuid, String, Uuid)>,
@@ -344,7 +411,7 @@ async fn restore_document_revision(
     Ok(Json(serde_json::json!({"restored": true, "revisionId": _revision_id})))
 }
 
-/// C18: DELETE /cases/:id/documents/:key
+/// C23: DELETE /cases/:id/documents/:key
 async fn delete_case_document(
     State(_state): State<AppState>,
     Path((_id, _key)): Path<(Uuid, String)>,
@@ -352,7 +419,7 @@ async fn delete_case_document(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// C19: GET /cases/:id/documents/:key/annotations
+/// C24: GET /cases/:id/documents/:key/annotations
 async fn get_document_annotations(
     State(_state): State<AppState>,
     Path((_id, _key)): Path<(Uuid, String)>,
@@ -360,7 +427,65 @@ async fn get_document_annotations(
     Ok(Json(vec![]))
 }
 
-/// C20: POST /cases/:id/automation/retry
+/// C25: GET /cases/:id/documents/:key/annotations/:thread_id
+async fn get_document_annotation_thread(
+    State(_state): State<AppState>,
+    Path((_id, _key, _thread_id)): Path<(Uuid, String, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({
+        "threadId": _thread_id,
+        "caseId": _id,
+        "documentKey": _key,
+        "annotations": [],
+    })))
+}
+
+/// C26: POST /cases/:id/documents/:key/annotations — Create document annotation
+async fn create_document_annotation(
+    State(_state): State<AppState>,
+    Path((_id, _key)): Path<(Uuid, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    Ok((StatusCode::CREATED, Json(serde_json::json!({
+        "threadId": Uuid::new_v4(),
+        "caseId": _id,
+        "documentKey": _key,
+        "annotation": payload,
+        "created": true,
+    }))))
+}
+
+/// C27: POST /cases/:id/documents/:key/annotations/:thread_id/reply — Reply to annotation thread
+async fn reply_document_annotation(
+    State(_state): State<AppState>,
+    Path((_id, _key, _thread_id)): Path<(Uuid, String, Uuid)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    Ok((StatusCode::CREATED, Json(serde_json::json!({
+        "threadId": _thread_id,
+        "caseId": _id,
+        "documentKey": _key,
+        "reply": payload,
+        "created": true,
+    }))))
+}
+
+/// C28: PATCH /cases/:id/documents/:key/annotations/:thread_id — Update annotation thread
+async fn update_document_annotation(
+    State(_state): State<AppState>,
+    Path((_id, _key, _thread_id)): Path<(Uuid, String, Uuid)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({
+        "threadId": _thread_id,
+        "caseId": _id,
+        "documentKey": _key,
+        "annotation": payload,
+        "updated": true,
+    })))
+}
+
+/// C29: POST /cases/:id/automation/retry
 async fn automation_retry(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -370,7 +495,7 @@ async fn automation_retry(
     state.case_service.automation_retry(id, company_id, payload).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// C21: POST /cases/:id/automation/retry-plan
+/// C30: POST /cases/:id/automation/retry-plan
 async fn automation_retry_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -380,7 +505,7 @@ async fn automation_retry_plan(
     state.case_service.automation_retry_plan(id, company_id, payload).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// C22: POST /cases/:id/automation/current-stage/rerun
+/// C31: POST /cases/:id/automation/current-stage/rerun
 async fn automation_rerun_stage(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -389,7 +514,7 @@ async fn automation_rerun_stage(
     state.case_service.automation_rerun_stage(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// C23: POST /cases/:id/automations/:automation_id/retry
+/// C32: POST /cases/:id/automations/:automation_id/retry
 async fn automation_retry_single(
     State(state): State<AppState>,
     Path((id, automation_id)): Path<(Uuid, Uuid)>,
@@ -401,33 +526,41 @@ async fn automation_retry_single(
 /// Create case routes
 pub fn case_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/companies/:companyId/cases", post(create_case).get(list_cases))
-        .route("/api/cases/:id", get(get_case).patch(update_case))
-        .route("/api/cases/:id/detail", get(get_case_detail))
-        .route("/api/cases/:id/events", get(list_case_events))
-        // --- P1: Case 子资源/状态机动作 (C1-C23) ---
-        .route("/api/cases/:id/children", get(get_case_children))
-        .route("/api/cases/:id/children/tree", get(get_case_children_tree))
-        .route("/api/cases/:id/rollup", get(get_case_rollup))
-        .route("/api/cases/:id/context-pack", get(get_case_context_pack))
-        .route("/api/cases/:id/outputs", get(get_case_outputs))
-        .route("/api/cases/:id/issue-links", get(list_issue_links).post(create_issue_link))
-        .route("/api/cases/:id/issue-links/:link_id", delete(delete_issue_link))
-        .route("/api/cases/:id/links", post(create_link))
-        .route("/api/cases/:id/blockers", put(update_blockers))
-        .route("/api/cases/:id/suggest-transition", post(suggest_transition))
-        .route("/api/cases/:id/resolve-suggestion", post(resolve_suggestion))
-        .route("/api/cases/:id/review", post(review_case))
-        .route("/api/cases/:id/acknowledge-drift", post(acknowledge_drift))
-        .route("/api/cases/:id/open-conversation", post(open_conversation))
-        .route("/api/cases/:id/breakdown", post(breakdown_case))
-        .route("/api/cases/:id/attachments", post(upload_case_attachment))
-        .route("/api/cases/:id/documents/:key/revisions", get(get_document_revisions))
-        .route("/api/cases/:id/documents/:key/revisions/:revision_id/restore", post(restore_document_revision))
-        .route("/api/cases/:id/documents/:key", delete(delete_case_document))
-        .route("/api/cases/:id/documents/:key/annotations", get(get_document_annotations))
-        .route("/api/cases/:id/automation/retry", post(automation_retry))
-        .route("/api/cases/:id/automation/retry-plan", post(automation_retry_plan))
-        .route("/api/cases/:id/automation/current-stage/rerun", post(automation_rerun_stage))
-        .route("/api/cases/:id/automations/:automation_id/retry", post(automation_retry_single))
+        .route("/companies/:companyId/cases", post(create_case).get(list_cases))
+        .route("/cases/:id", get(get_case).patch(update_case))
+        .route("/cases/:id/detail", get(get_case_detail))
+        .route("/cases/:id/events", get(list_case_events))
+        // --- P1: Case 子资源/状态机动作 (C1-C32) ---
+        .route("/cases/:id/children", get(get_case_children))
+        .route("/cases/:id/children/tree", get(get_case_children_tree))
+        .route("/cases/:id/rollup", get(get_case_rollup))
+        .route("/cases/:id/context-pack", get(get_case_context_pack))
+        .route("/cases/:id/outputs", get(get_case_outputs))
+        .route("/cases/:id/issue-links", get(list_issue_links).post(create_issue_link))
+        .route("/cases/:id/issue-links/:link_id", delete(delete_issue_link))
+        .route("/cases/:id/links", post(create_link))
+        .route("/cases/:id/blockers", put(update_blockers))
+        .route("/cases/:id/suggest-transition", post(suggest_transition))
+        .route("/cases/:id/resolve-suggestion", post(resolve_suggestion))
+        .route("/cases/:id/review", post(review_case))
+        .route("/cases/:id/acknowledge-drift", post(acknowledge_drift))
+        .route("/cases/:id/open-conversation", post(open_conversation))
+        .route("/cases/:id/breakdown", post(breakdown_case))
+        .route("/cases/:id/attachments", post(upload_case_attachment))
+        // Case documents CRUD (C16-C20)
+        .route("/cases/:id/documents/:key", get(get_case_document).post(create_case_document).put(update_case_document).delete(delete_case_document))
+        .route("/cases/:id/documents/:key/lock", post(lock_case_document))
+        .route("/cases/:id/documents/:key/unlock", post(unlock_case_document))
+        // Case document revisions (C21-C23)
+        .route("/cases/:id/documents/:key/revisions", get(get_document_revisions))
+        .route("/cases/:id/documents/:key/revisions/:revision_id/restore", post(restore_document_revision))
+        // Case document annotations (C24-C28)
+        .route("/cases/:id/documents/:key/annotations", get(get_document_annotations).post(create_document_annotation))
+        .route("/cases/:id/documents/:key/annotations/:thread_id", get(get_document_annotation_thread).patch(update_document_annotation))
+        .route("/cases/:id/documents/:key/annotations/:thread_id/reply", post(reply_document_annotation))
+        // Case automation (C29-C32)
+        .route("/cases/:id/automation/retry", post(automation_retry))
+        .route("/cases/:id/automation/retry-plan", post(automation_retry_plan))
+        .route("/cases/:id/automation/current-stage/rerun", post(automation_rerun_stage))
+        .route("/cases/:id/automations/:automation_id/retry", post(automation_retry_single))
 }

@@ -57,8 +57,6 @@ pub fn agent_routes() -> Router<AppState> {
         // --- P1.1: 补齐缺失接口 (A1-A6) ---
         .route("/agents/:id/claude-login", post(claude_login))
         .route("/agents/:id/heartbeat/invoke", post(heartbeat_invoke))
-        .route("/agents/:id/config-revisions", get(list_config_revisions))
-        .route("/agents/:id/config-revisions/:revision_id", get(get_config_revision))
         .route("/companies/:company_id/agent-configurations", get(list_agent_configurations))
         .route("/instance/scheduler-heartbeats", get(list_scheduler_heartbeats))
 }
@@ -624,32 +622,6 @@ async fn heartbeat_invoke(
         "watchdogsEvaluated": evaluated,
         "agentId": id,
     })))
-}
-
-/// GET /agents/:id/config-revisions - 配置版本列表 (A3)
-async fn list_config_revisions(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse, AppError> {
-    let revisions = state
-        .config_revision_service
-        .list_revisions(id, Some(50), Some(0))
-        .await
-        .map_err(|err| AppError::InternalServerError(err.to_string()))?;
-    Ok(Json(revisions))
-}
-
-/// GET /agents/:id/config-revisions/:revision_id - 配置版本详情 (A4)
-async fn get_config_revision(
-    State(state): State<AppState>,
-    Path((_agent_id, revision_id)): Path<(Uuid, Uuid)>,
-) -> Result<impl IntoResponse, AppError> {
-    let revision = state
-        .config_revision_service
-        .get_revision(revision_id)
-        .await
-        .map_err(|err| AppError::InternalServerError(err.to_string()))?;
-    Ok(Json(revision))
 }
 
 /// GET /companies/:company_id/agent-configurations - 公司级 Agent 配置列表 (A5)

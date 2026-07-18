@@ -72,6 +72,6 @@ async fn delete_work_product(
 pub fn work_product_routes() -> Router<AppState> {
 
     Router::new()
-        .route("/api/issues/:id/work-products", get(list_work_products).post(create_work_product))
-        .route("/api/work-products/:id", patch(update_work_product).delete(delete_work_product))
+        .route("/issues/:id/work-products", get(list_work_products).post(create_work_product))
+        .route("/work-products/:id", patch(update_work_product).delete(delete_work_product))
 }

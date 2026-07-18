@@ -182,7 +182,8 @@ mod tests {
         assert_eq!(encode_base62(0), "0");
         assert_eq!(encode_base62(61), "z");
         assert_eq!(encode_base62(62), "10");
-        assert_eq!(encode_base62(100), "1C");
+        // 100 = 1×62 + 38, charset[1]='1', charset[38]='c'
+        assert_eq!(encode_base62(100), "1c");
     }
 
     #[test]
@@ -190,7 +191,8 @@ mod tests {
         assert_eq!(decode_base62("0"), Some(0));
         assert_eq!(decode_base62("z"), Some(61));
         assert_eq!(decode_base62("10"), Some(62));
-        assert_eq!(decode_base62("1C"), Some(100));
+        // "1c" = 1×62 + 38 = 100
+        assert_eq!(decode_base62("1c"), Some(100));
     }
 
     #[test]

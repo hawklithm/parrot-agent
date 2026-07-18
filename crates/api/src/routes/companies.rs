@@ -5,8 +5,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
-    routing::{delete, get, patch, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -34,8 +33,6 @@ pub fn company_routes() -> Router<AppState> {
         .route("/companies/:company_id/activity", get(list_company_activity).post(record_company_activity))
         .route("/companies/:company_id/members/:member_id/permissions", patch(update_member_permissions))
         .route("/companies/:company_id/search", get(search_company))
-        .route("/companies/:company_id/labels", get(list_company_labels).post(create_company_label))
-        .route("/labels/:label_id", delete(delete_company_label))
         .route("/companies/:company_id/sidebar-badges", get(get_sidebar_badges))
         .route("/companies/:company_id/sidebar-preferences/me", get(get_sidebar_preferences).put(update_sidebar_preferences))
         .route("/companies/:company_id/users/:user_slug/profile", get(get_user_profile))
@@ -47,6 +44,7 @@ pub fn company_routes() -> Router<AppState> {
         .route("/companies/:company_id/imports/preview", post(preview_company_import))
         .route("/companies/:company_id/imports/apply", post(apply_company_import))
         .route("/companies/:company_id/inbox-dismissals", get(list_inbox_dismissals).post(dismiss_inbox_item))
+        .route("/companies/:company_id/teams-catalog", get(get_teams_catalog))
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,11 +107,37 @@ async fn get_company(
 }
 
 /// PATCH /companies/:company_id
+///
+/// Mirrors Paperclip's company update handler.  When `feedbackDataSharingEnabled`
+/// transitions from `false` → `true`, consent fields are auto-populated using
+/// the [`TermService`].
 async fn update_company(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
-    Json(input): Json<UpdateCompanyInput>,
+    Json(mut input): Json<UpdateCompanyInput>,
 ) -> Result<Json<Company>, AppError> {
+    // Mirror Paperclip: when enabling feedback data sharing for the first time,
+    // auto-set consent timestamp, user, and terms version.
+    if input.feedback_data_sharing_enabled == Some(true) {
+        let existing = state
+            .company_service
+            .get_by_id(company_id)
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound(format!("Company {} not found", company_id)))?;
+
+        if !existing.feedback_data_sharing_enabled {
+            // TODO: Extract user_id from auth context
+            let user_id = Uuid::nil();
+            input.feedback_data_sharing_consent_at = Some(chrono::Utc::now());
+            input.feedback_data_sharing_consent_by_user_id = Some(user_id);
+            input.feedback_data_sharing_terms_version = input
+                .feedback_data_sharing_terms_version
+                .filter(|v| !v.is_empty())
+                .or_else(|| Some(state.term_service.default_terms_version().to_string()));
+        }
+    }
+
     let company = state
         .company_service
         .update(company_id, input)
@@ -200,39 +224,6 @@ async fn search_company(
     Path(_company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     Ok(Json(vec![]))
-}
-
-/// CM5: GET /companies/:company_id/labels
-async fn list_company_labels(
-    State(_state): State<AppState>,
-    Path(_company_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    Ok(Json(vec![
-        serde_json::json!({"id": Uuid::new_v4(), "name": "urgent", "color": "red"}),
-        serde_json::json!({"id": Uuid::new_v4(), "name": "feature", "color": "blue"}),
-    ]))
-}
-
-/// CM6: POST /companies/:company_id/labels
-async fn create_company_label(
-    State(_state): State<AppState>,
-    Path(company_id): Path<Uuid>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<impl IntoResponse, AppError> {
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "id": Uuid::new_v4(),
-        "companyId": company_id,
-        "label": payload,
-        "created": true,
-    }))))
-}
-
-/// CM7: DELETE /labels/:label_id
-async fn delete_company_label(
-    State(_state): State<AppState>,
-    Path(_label_id): Path<Uuid>,
-) -> Result<StatusCode, AppError> {
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// CM8: GET /companies/:company_id/sidebar-badges
@@ -341,4 +332,15 @@ async fn dismiss_inbox_item(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     Ok(Json(serde_json::json!({"companyId": company_id, "dismissed": true, "item": payload})))
+}
+
+/// CM21: GET /companies/:company_id/teams-catalog
+async fn get_teams_catalog(
+    State(_state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![
+        serde_json::json!({"id": Uuid::new_v4(), "name": "Engineering", "companyId": company_id}),
+        serde_json::json!({"id": Uuid::new_v4(), "name": "Design", "companyId": company_id}),
+    ]))
 }

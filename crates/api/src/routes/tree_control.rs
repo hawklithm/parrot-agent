@@ -85,9 +85,9 @@ async fn release_tree_hold(
 /// Create tree control routes
 pub fn tree_control_routes(service: Arc<dyn TreeControlService>) -> Router {
     Router::new()
-        .route("/api/issues/:id/tree-control/preview", post(preview_tree_control))
-        .route("/api/issues/:id/tree-holds", post(create_tree_hold).get(list_tree_holds))
-        .route("/api/issues/:id/tree-control/state", get(get_tree_hold_state))
-        .route("/api/issues/:id/tree-holds/:holdId/release", post(release_tree_hold))
+        .route("/issues/:id/tree-control/preview", post(preview_tree_control))
+        .route("/issues/:id/tree-holds", post(create_tree_hold).get(list_tree_holds))
+        .route("/issues/:id/tree-control/state", get(get_tree_hold_state))
+        .route("/issues/:id/tree-holds/:holdId/release", post(release_tree_hold))
         .with_state(service)
 }

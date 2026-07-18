@@ -43,6 +43,6 @@ async fn list_low_trust_issues(
 /// Create low trust routes
 pub fn low_trust_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/issues/:id/low-trust/promotions", post(promote_low_trust))
-        .route("/api/issues/low-trust", get(list_low_trust_issues))
+        .route("/issues/:id/low-trust/promotions", post(promote_low_trust))
+        .route("/issues/low-trust", get(list_low_trust_issues))
 }

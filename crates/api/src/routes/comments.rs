@@ -56,7 +56,7 @@ async fn delete_comment(
 /// Create comment routes
 pub fn comment_routes(service: Arc<dyn CommentService>) -> Router {
     Router::new()
-        .route("/api/issues/:id/comments", get(list_comments).post(add_comment))
-        .route("/api/issues/:id/comments/:commentId", delete(delete_comment))
+        .route("/issues/:id/comments", get(list_comments).post(add_comment))
+        .route("/issues/:id/comments/:commentId", delete(delete_comment))
         .with_state(service)
 }

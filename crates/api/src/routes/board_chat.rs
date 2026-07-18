@@ -12,7 +12,7 @@ use crate::app_state::AppState;
 
 pub fn board_chat_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/board/chat/stream", post(stream_board_chat))
+        .route("/board/chat/stream", post(stream_board_chat))
 }
 
 async fn stream_board_chat(

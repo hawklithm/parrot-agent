@@ -13,9 +13,9 @@ use crate::app_state::AppState;
 
 pub fn asset_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/companies/:company_id/assets/images", post(upload_asset_image))
-        .route("/api/companies/:company_id/logo", post(upload_company_logo))
-        .route("/api/assets/:asset_id/content", get(get_asset_content))
+        .route("/companies/:company_id/assets/images", post(upload_asset_image))
+        .route("/companies/:company_id/logo", post(upload_company_logo))
+        .route("/assets/:asset_id/content", get(get_asset_content))
 }
 
 async fn upload_asset_image(

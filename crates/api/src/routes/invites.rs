@@ -127,9 +127,5 @@ pub async fn get_invite_skill_detail(
 /// Register invite sub-resource routes
 pub fn invite_subresource_routes() -> Router<Arc<dyn InviteService>> {
     Router::new()
-        .route("/invites/:token/logo", get(get_invite_logo))
-        .route("/invites/:token/onboarding", get(get_invite_onboarding))
-        .route("/invites/:token/onboarding.txt", get(get_invite_onboarding_text))
-        .route("/invites/:token/skills/index", get(get_invite_skills_index))
         .route("/invites/:token/skills/:skill_name", get(get_invite_skill_detail))
 }

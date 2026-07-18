@@ -13,8 +13,8 @@ use crate::app_state::AppState;
 
 pub fn label_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/companies/:company_id/labels", get(list_labels).post(create_label))
-        .route("/api/labels/:label_id", delete(delete_label))
+        .route("/companies/:company_id/labels", get(list_labels).post(create_label))
+        .route("/labels/:label_id", delete(delete_label))
 }
 
 async fn list_labels(

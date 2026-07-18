@@ -13,20 +13,20 @@ use models::{CreateEnvironmentInput, UpdateEnvironmentInput};
 
 pub fn environment_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/companies/:company_id/environments", get(list_environments_v2).post(create_environment_v2))
-        .route("/api/environments/:id", get(get_environment_v2).patch(update_environment_v2).delete(delete_environment_v2))
-        .route("/api/environments/:id/probe", post(probe_environment_v2))
+        .route("/companies/:company_id/environments", get(list_environments_v2).post(create_environment_v2))
+        .route("/environments/:id", get(get_environment_v2).patch(update_environment_v2).delete(delete_environment_v2))
+        .route("/environments/:id/probe", post(probe_environment_v2))
         // --- P1: Environment 补齐 (E11-E24) ---
-        .route("/api/companies/:company_id/environments/capabilities", get(get_environment_capabilities))
-        .route("/api/companies/:company_id/environments/probe-config", post(probe_environment_config))
-        .route("/api/environments/:id/delete-blast-radius", get(get_delete_blast_radius))
-        .route("/api/environments/:environment_id/custom-image-template", get(get_custom_image_template).delete(delete_custom_image_template))
-        .route("/api/environments/:environment_id/custom-image-template/rollback", post(rollback_custom_image_template))
-        .route("/api/environments/:environment_id/custom-image-setup-sessions", post(create_custom_image_setup_session))
-        .route("/api/environment-custom-image-setup-sessions/:id/finish", get(finish_custom_image_setup_session))
-        .route("/api/environment-custom-image-setup-sessions/:id/cancel", post(cancel_custom_image_setup_session))
-        .route("/api/environment-leases/:lease_id", get(get_environment_lease))
-        .route("/api/companies/:company_id/adapters/:adapter_type/model-profiles", get(list_model_profiles))
+        .route("/companies/:company_id/environments/capabilities", get(get_environment_capabilities))
+        .route("/companies/:company_id/environments/probe-config", post(probe_environment_config))
+        .route("/environments/:id/delete-blast-radius", get(get_delete_blast_radius))
+        .route("/environments/:environment_id/custom-image-template", get(get_custom_image_template).delete(delete_custom_image_template))
+        .route("/environments/:environment_id/custom-image-template/rollback", post(rollback_custom_image_template))
+        .route("/environments/:environment_id/custom-image-setup-sessions", post(create_custom_image_setup_session))
+        .route("/environment-custom-image-setup-sessions/:id/finish", get(finish_custom_image_setup_session))
+        .route("/environment-custom-image-setup-sessions/:id/cancel", post(cancel_custom_image_setup_session))
+        .route("/environment-leases/:lease_id", get(get_environment_lease))
+        .route("/companies/:company_id/adapters/:adapter_type/model-profiles", get(list_model_profiles))
 }
 
 // ===== V2 Handlers (AppState-based) =====

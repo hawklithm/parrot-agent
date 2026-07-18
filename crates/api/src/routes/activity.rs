@@ -12,20 +12,12 @@ use crate::app_state::AppState;
 
 pub fn activity_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/issues/:id/activity", get(get_issue_activity))
-        .route("/api/issues/:id/runs", get(get_issue_runs))
-        .route("/api/heartbeat-runs/:run_id/issues", get(get_run_issues))
-        .route("/api/companies/:company_id/dashboard", get(get_company_dashboard))
+        .route("/issues/:id/activity", get(get_issue_activity))
+        .route("/heartbeat-runs/:run_id/issues", get(get_run_issues))
+        .route("/companies/:company_id/dashboard", get(get_company_dashboard))
 }
 
 async fn get_issue_activity(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
-}
-
-async fn get_issue_runs(
     State(_state): State<AppState>,
     Path(_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {

@@ -12,14 +12,14 @@ use crate::app_state::AppState;
 
 pub fn cloud_upstream_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/cloud-upstreams", get(list_cloud_upstreams))
-        .route("/api/cloud-upstreams/connect/start", post(start_cloud_connect))
-        .route("/api/cloud-upstreams/connect/finish", post(finish_cloud_connect))
-        .route("/api/cloud-upstreams/:connection_id/push-runs/preview", post(preview_push_run))
-        .route("/api/cloud-upstreams/:connection_id/push-runs", post(execute_push_run))
-        .route("/api/cloud-upstreams/:connection_id/push-runs/:run_id", get(get_push_run))
-        .route("/api/cloud-upstreams/:connection_id/push-runs/:run_id/cancel", post(cancel_push_run))
-        .route("/api/cloud-upstreams/:connection_id/push-runs/:run_id/activation", post(activate_push_run))
+        .route("/cloud-upstreams", get(list_cloud_upstreams))
+        .route("/cloud-upstreams/connect/start", post(start_cloud_connect))
+        .route("/cloud-upstreams/connect/finish", post(finish_cloud_connect))
+        .route("/cloud-upstreams/:connection_id/push-runs/preview", post(preview_push_run))
+        .route("/cloud-upstreams/:connection_id/push-runs", post(execute_push_run))
+        .route("/cloud-upstreams/:connection_id/push-runs/:run_id", get(get_push_run))
+        .route("/cloud-upstreams/:connection_id/push-runs/:run_id/cancel", post(cancel_push_run))
+        .route("/cloud-upstreams/:connection_id/push-runs/:run_id/activation", post(activate_push_run))
 }
 
 async fn list_cloud_upstreams(

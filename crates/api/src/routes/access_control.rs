@@ -150,9 +150,9 @@ pub fn access_control_routes(state: AppState) -> Router<AppState> {
             "/api/board-claim/:token",
             get(inspect_board_claim).post(claim_board),
         )
-        .route("/api/bootstrap/claim", post(bootstrap_claim))
+        .route("/bootstrap/claim", post(bootstrap_claim))
         // 阶段二：CLI 认证
-        .route("/api/cli-auth/challenges", post(create_cli_challenge_handler))
+        .route("/cli-auth/challenges", post(create_cli_challenge_handler))
         .route(
             "/api/cli-auth/challenges/:id",
             get(get_cli_challenge_handler),
@@ -165,17 +165,17 @@ pub fn access_control_routes(state: AppState) -> Router<AppState> {
             "/api/cli-auth/challenges/:id/cancel",
             post(cancel_cli_challenge_handler),
         )
-        .route("/api/cli-auth/me", get(get_cli_auth_me))
-        .route("/api/cli-auth/revoke-current", post(revoke_current_cli_key))
+        .route("/cli-auth/me", get(get_cli_auth_me))
+        .route("/cli-auth/revoke-current", post(revoke_current_cli_key))
         // 阶段二：Board API Key 管理
-        .route("/api/board-api-keys", get(list_board_api_keys).post(create_board_api_key))
-        .route("/api/board-api-keys/:key_id", delete(revoke_board_api_key))
+        .route("/board-api-keys", get(list_board_api_keys).post(create_board_api_key))
+        .route("/board-api-keys/:key_id", delete(revoke_board_api_key))
         // 阶段二：邀请管理
-        .route("/api/companies/:company_id/invites", post(create_invite))
-        .route("/api/invites/:token", get(get_invite))
-        .route("/api/invites/:token/accept", post(accept_invite))
+        .route("/companies/:company_id/invites", post(create_invite))
+        .route("/invites/:token", get(get_invite))
+        .route("/invites/:token/accept", post(accept_invite))
         // 阶段二：加入请求
-        .route("/api/companies/:company_id/join-requests", get(list_join_requests))
+        .route("/companies/:company_id/join-requests", get(list_join_requests))
         .route(
             "/api/companies/:company_id/join-requests/:request_id/approve",
             post(approve_join_request),
@@ -185,7 +185,7 @@ pub fn access_control_routes(state: AppState) -> Router<AppState> {
             post(reject_join_request),
         )
         // 阶段二：成员管理
-        .route("/api/companies/:company_id/members", get(list_members))
+        .route("/companies/:company_id/members", get(list_members))
         .route(
             "/api/companies/:company_id/members/:member_id",
             patch(update_member),
@@ -199,7 +199,7 @@ pub fn access_control_routes(state: AppState) -> Router<AppState> {
             post(archive_member),
         )
         // 阶段三：实例管理员
-        .route("/api/admin/users", get(list_admin_users))
+        .route("/admin/users", get(list_admin_users))
         .route(
             "/api/admin/users/:user_id/promote-instance-admin",
             post(promote_instance_admin),

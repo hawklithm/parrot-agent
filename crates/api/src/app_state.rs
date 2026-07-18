@@ -5,7 +5,7 @@ use sqlx::PgPool;
 // Re-export services
 pub use services::{
     AgentService, ConfigRevisionService, IssueService, CaseService,
-    IssueCommentService, IssueDocumentService, IssueTreeControlService,
+    IssueCommentService, IssueTreeControlService,
     BuiltInAgentService, AdapterRegistry, EnvironmentRuntimeService,
     OrgChartService, LowTrustService, CompanyService, ProjectService,
     RoutineService, GoalService, EnvironmentService, PipelineService,
@@ -14,7 +14,7 @@ pub use services::{
     SecretRemoteImportService, EnvironmentDiagnosticsService,
     InviteResourceService, RoutineAnnotationService, WorkProductService,
     AttachmentService, UserSecretDefinitionService, UserSecretService,
-    WatchdogService, ApprovalService,
+    WatchdogService, ApprovalService, TermService,
 };
 
 pub use access::AccessService;
@@ -47,7 +47,6 @@ pub struct AppState {
     pub issue_service: Arc<dyn IssueService>,
     pub case_service: Arc<dyn CaseService>,
     pub issue_comment_service: Arc<dyn IssueCommentService>,
-    pub issue_document_service: Arc<dyn IssueDocumentService>,
     pub issue_tree_control_service: Arc<dyn IssueTreeControlService>,
 
     // Org chart
@@ -98,6 +97,9 @@ pub struct AppState {
     // Task watchdog subsystem
     pub watchdog_service: Arc<dyn WatchdogService>,
 
+    // Terms service
+    pub term_service: Arc<dyn TermService>,
+
     // Event bus
     pub event_bus: Arc<dyn EventBus>,
 
@@ -117,7 +119,6 @@ impl AppState {
         issue_service: Arc<dyn IssueService>,
         case_service: Arc<dyn CaseService>,
         issue_comment_service: Arc<dyn IssueCommentService>,
-        issue_document_service: Arc<dyn IssueDocumentService>,
         issue_tree_control_service: Arc<dyn IssueTreeControlService>,
         org_chart_service: Arc<dyn OrgChartService>,
         issue_diagnostics_service: Arc<dyn services::issue_diagnostics_service::IssueDiagnosticsService>,
@@ -145,6 +146,7 @@ impl AppState {
         user_secret_service: Arc<dyn UserSecretService>,
         approval_service: Arc<dyn ApprovalService>,
         watchdog_service: Arc<dyn WatchdogService>,
+        term_service: Arc<dyn TermService>,
         event_bus: Arc<dyn EventBus>,
         pool: PgPool,
     ) -> Self {
@@ -158,7 +160,6 @@ impl AppState {
             issue_service,
             case_service,
             issue_comment_service,
-            issue_document_service,
             issue_tree_control_service,
             org_chart_service,
             issue_diagnostics_service,
@@ -186,6 +187,7 @@ impl AppState {
             user_secret_service,
             approval_service,
             watchdog_service,
+            term_service,
             event_bus,
             pool,
         }
@@ -212,7 +214,6 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::issues::issue_routes())
         .merge(crate::routes::cases::case_routes())
         .merge(crate::routes::issue_comments::issue_comment_routes())
-        .merge(crate::routes::issue_documents::issue_document_routes())
         .merge(crate::routes::issue_tree_control::issue_tree_control_routes())
         .merge(crate::routes::issue_diagnostics::issue_diagnostics_routes())
         .merge(crate::routes::low_trust::low_trust_routes())

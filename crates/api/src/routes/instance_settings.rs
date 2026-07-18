@@ -12,12 +12,12 @@ use crate::app_state::AppState;
 
 pub fn instance_settings_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/instance/settings", get(get_instance_settings).patch(update_instance_settings))
-        .route("/api/instance/settings/general", get(get_general_settings).patch(update_general_settings))
-        .route("/api/instance/settings/experimental", get(get_experimental_settings).patch(update_experimental_settings))
-        .route("/api/instance/settings/experimental/issue-graph-liveness-auto-recovery/preview", post(preview_auto_recovery))
-        .route("/api/instance/settings/experimental/issue-graph-liveness-auto-recovery/run", post(run_auto_recovery))
-        .route("/api/instance/database-backups", post(create_database_backup))
+        .route("/instance/settings", get(get_instance_settings).patch(update_instance_settings))
+        .route("/instance/settings/general", get(get_general_settings).patch(update_general_settings))
+        .route("/instance/settings/experimental", get(get_experimental_settings).patch(update_experimental_settings))
+        .route("/instance/settings/experimental/issue-graph-liveness-auto-recovery/preview", post(preview_auto_recovery))
+        .route("/instance/settings/experimental/issue-graph-liveness-auto-recovery/run", post(run_auto_recovery))
+        .route("/instance/database-backups", post(create_database_backup))
 }
 
 async fn get_instance_settings(

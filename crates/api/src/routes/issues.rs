@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -257,15 +257,6 @@ async fn get_heartbeat_context(
 // P1: Issue 子资源 Handlers (I1-I44)
 // ============================================================================
 
-/// I1: GET /issues/:id/activity
-async fn get_issue_activity(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = Uuid::nil();
-    state.issue_service.get_activity(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
 /// I2: GET /issues/:id/cases
 async fn get_issue_cases(
     State(state): State<AppState>,
@@ -295,15 +286,6 @@ async fn get_issue_live_runs(
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = Uuid::nil();
     state.issue_service.get_live_runs(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-/// I5: GET /issues/:id/runs
-async fn get_issue_runs(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = Uuid::nil();
-    state.issue_service.get_runs(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// I6: GET /issues/:id/accepted-plan-decompositions
@@ -574,68 +556,6 @@ async fn cancel_interaction(
     Ok(Json(serde_json::json!({"issueId": id, "interactionId": interaction_id, "cancelled": true})))
 }
 
-/// I35: GET /issues/:id/documents/:key/revisions
-async fn get_document_revisions(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![
-        serde_json::json!({"revisionId": Uuid::new_v4(), "version": 1, "createdAt": chrono::Utc::now()}),
-    ]))
-}
-
-/// I36: POST /issues/:id/documents/:key/revisions/:revision_id/restore
-async fn restore_document_revision(
-    State(_state): State<AppState>,
-    Path((_id, _key, _revision_id)): Path<(Uuid, String, Uuid)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"restored": true, "revisionId": _revision_id})))
-}
-
-/// I37: DELETE /issues/:id/documents/:key
-async fn delete_issue_document(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
-) -> Result<StatusCode, StatusCode> {
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// I38: GET /issues/:id/documents/:key/annotations
-async fn get_document_annotations(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
-}
-
-/// I39: POST /issues/:id/work-products
-async fn create_work_product(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let company_id = Uuid::nil();
-    let result = state.issue_service.create_work_product(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok((StatusCode::CREATED, Json(result)))
-}
-
-/// PATCH /work-products/:id
-async fn update_work_product(
-    State(_state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(_payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"id": id, "updated": true})))
-}
-
-/// DELETE /work-products/:id
-async fn delete_work_product(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
-    Ok(StatusCode::NO_CONTENT)
-}
-
 /// I42: GET /issues/:id/comments/:comment_id
 async fn get_single_comment(
     State(state): State<AppState>,
@@ -646,77 +566,45 @@ async fn get_single_comment(
     comment.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
-/// I43: GET /issues/:id/cost-summary
-async fn get_issue_cost_summary(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
-    state.issue_service.get_cost_summary(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-/// I44: POST /issues/:id/attachments
-async fn upload_issue_attachment(
-    State(_state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: multipart upload handling
-    Ok(Json(serde_json::json!({
-        "issueId": id,
-        "attachmentId": Uuid::new_v4(),
-        "uploaded": true,
-    })))
-}
-
 /// Create issue routes
 pub fn issue_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/issues", get(list_issues))
-        .route("/api/issues/:id", get(get_issue).patch(update_issue).delete(delete_issue))
-        .route("/api/companies/:companyId/issues", post(create_issue))
-        .route("/api/companies/:companyId/issues/count", get(count_issues))
-        .route("/api/companies/:companyId/issues/search", get(search_issues))
-        .route("/api/issues/:id/checkout", post(checkout_issue))
-        .route("/api/issues/:id/release", post(release_issue))
-        .route("/api/issues/:id/admin/force-release", post(force_release_issue))
-        .route("/api/companies/:companyId/issues/batch-update", post(batch_update_issues))
-        .route("/api/issues/:id/heartbeat-context", get(get_heartbeat_context))
+        .route("/issues", get(list_issues))
+        .route("/issues/:id", get(get_issue).patch(update_issue).delete(delete_issue))
+        .route("/companies/:companyId/issues", post(create_issue))
+        .route("/companies/:companyId/issues/count", get(count_issues))
+        .route("/companies/:companyId/issues/search", get(search_issues))
+        .route("/issues/:id/checkout", post(checkout_issue))
+        .route("/issues/:id/release", post(release_issue))
+        .route("/issues/:id/admin/force-release", post(force_release_issue))
+        .route("/companies/:companyId/issues/batch-update", post(batch_update_issues))
+        .route("/issues/:id/heartbeat-context", get(get_heartbeat_context))
         // --- P1: Issue 子资源补齐 (I1-I44) ---
-        .route("/api/issues/:id/activity", get(get_issue_activity))
-        .route("/api/issues/:id/cases", get(get_issue_cases))
-        .route("/api/issues/:id/active-run", get(get_issue_active_run))
-        .route("/api/issues/:id/live-runs", get(get_issue_live_runs))
-        .route("/api/issues/:id/runs", get(get_issue_runs))
-        .route("/api/issues/:id/accepted-plan-decompositions", get(list_plan_decompositions).post(submit_plan_decomposition))
-        .route("/api/issues/:id/approvals", get(list_issue_approvals).post(create_issue_approval))
-        .route("/api/issues/:id/approvals/:approval_id", delete(delete_issue_approval))
-        .route("/api/issues/:id/children", post(create_child_issue))
-        .route("/api/issues/:id/read", post(mark_issue_read).delete(unmark_issue_read))
-        .route("/api/issues/:id/inbox-archive", post(archive_issue_inbox).delete(unarchive_issue_inbox))
-        .route("/api/issues/:id/monitor/check-now", post(monitor_check_now))
-        .route("/api/issues/:id/scheduled-retry/retry-now", post(scheduled_retry_now))
-        .route("/api/issues/:id/external-objects", get(list_external_objects))
-        .route("/api/issues/:id/external-object-summary", get(get_external_object_summary))
-        .route("/api/issues/:id/external-objects/refresh", post(refresh_external_objects))
-        .route("/api/issues/:id/file-resources/list", get(list_file_resources))
-        .route("/api/issues/:id/file-resources/resolve", get(resolve_file_resource))
-        .route("/api/issues/:id/file-resources/content", get(get_file_resource_content))
-        .route("/api/issues/:id/feedback-votes", get(list_feedback_votes).post(create_feedback_vote))
-        .route("/api/issues/:id/feedback-traces", get(list_feedback_traces))
-        .route("/api/issues/:id/recovery-actions", get(list_recovery_actions))
-        .route("/api/issues/:id/recovery-actions/resolve", post(resolve_recovery_action))
-        .route("/api/issues/:id/interactions", get(list_interactions).post(create_interaction))
-        .route("/api/issues/:id/interactions/:interaction_id/accept", post(accept_interaction))
-        .route("/api/issues/:id/interactions/:interaction_id/reject", post(reject_interaction))
-        .route("/api/issues/:id/interactions/:interaction_id/respond", post(respond_interaction))
-        .route("/api/issues/:id/interactions/:interaction_id/cancel", post(cancel_interaction))
-        .route("/api/issues/:id/documents/:key/revisions", get(get_document_revisions))
-        .route("/api/issues/:id/documents/:key/revisions/:revision_id/restore", post(restore_document_revision))
-        .route("/api/issues/:id/documents/:key", delete(delete_issue_document))
-        .route("/api/issues/:id/documents/:key/annotations", get(get_document_annotations))
-        .route("/api/issues/:id/work-products", post(create_work_product))
-        .route("/api/work-products/:id", patch(update_work_product).delete(delete_work_product))
-        .route("/api/issues/:id/comments/:comment_id", get(get_single_comment))
-        .route("/api/issues/:id/cost-summary", get(get_issue_cost_summary))
-        .route("/api/issues/:id/attachments", post(upload_issue_attachment))
+        .route("/issues/:id/cases", get(get_issue_cases))
+        .route("/issues/:id/active-run", get(get_issue_active_run))
+        .route("/issues/:id/live-runs", get(get_issue_live_runs))
+        .route("/issues/:id/accepted-plan-decompositions", get(list_plan_decompositions).post(submit_plan_decomposition))
+        .route("/issues/:id/approvals", get(list_issue_approvals).post(create_issue_approval))
+        .route("/issues/:id/approvals/:approval_id", delete(delete_issue_approval))
+        .route("/issues/:id/children", post(create_child_issue))
+        .route("/issues/:id/read", post(mark_issue_read).delete(unmark_issue_read))
+        .route("/issues/:id/inbox-archive", post(archive_issue_inbox).delete(unarchive_issue_inbox))
+        .route("/issues/:id/monitor/check-now", post(monitor_check_now))
+        .route("/issues/:id/scheduled-retry/retry-now", post(scheduled_retry_now))
+        .route("/issues/:id/external-objects", get(list_external_objects))
+        .route("/issues/:id/external-object-summary", get(get_external_object_summary))
+        .route("/issues/:id/external-objects/refresh", post(refresh_external_objects))
+        .route("/issues/:id/file-resources/list", get(list_file_resources))
+        .route("/issues/:id/file-resources/resolve", get(resolve_file_resource))
+        .route("/issues/:id/file-resources/content", get(get_file_resource_content))
+        .route("/issues/:id/feedback-votes", get(list_feedback_votes).post(create_feedback_vote))
+        .route("/issues/:id/feedback-traces", get(list_feedback_traces))
+        .route("/issues/:id/recovery-actions", get(list_recovery_actions))
+        .route("/issues/:id/recovery-actions/resolve", post(resolve_recovery_action))
+        .route("/issues/:id/interactions", get(list_interactions).post(create_interaction))
+        .route("/issues/:id/interactions/:interaction_id/accept", post(accept_interaction))
+        .route("/issues/:id/interactions/:interaction_id/reject", post(reject_interaction))
+        .route("/issues/:id/interactions/:interaction_id/respond", post(respond_interaction))
+        .route("/issues/:id/interactions/:interaction_id/cancel", post(cancel_interaction))
+        .route("/issues/:id/comments/:comment_id", get(get_single_comment))
 }

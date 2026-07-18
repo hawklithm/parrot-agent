@@ -11,11 +11,11 @@ use crate::app_state::AppState;
 
 pub fn llm_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/llms/agent-configuration.txt", get(get_agent_config_txt))
-        .route("/api/llms/agent-icons.txt", get(get_agent_icons_txt))
-        .route("/api/llms/agent-configuration/:adapter_type.txt", get(get_adapter_config_txt))
-        .route("/api/openapi.json", get(get_openapi_spec))
-        .route("/api/stats", get(get_stats))
+        .route("/llms/agent-configuration.txt", get(get_agent_config_txt))
+        .route("/llms/agent-icons.txt", get(get_agent_icons_txt))
+        .route("/llms/agent-configuration/:adapter_type.txt", get(get_adapter_config_txt))
+        .route("/openapi.json", get(get_openapi_spec))
+        .route("/stats", get(get_stats))
 }
 
 async fn get_agent_config_txt(

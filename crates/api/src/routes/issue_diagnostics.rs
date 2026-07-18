@@ -163,7 +163,7 @@ async fn get_subtree_diagnostics(
 /// Create issue diagnostics routes
 pub fn issue_diagnostics_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/issues/:id/diagnostics/blockers", get(get_blockers_diagnostics))
-        .route("/api/issues/:id/diagnostics/wakes", get(get_wakes_diagnostics))
-        .route("/api/issues/:id/diagnostics/subtree", get(get_subtree_diagnostics))
+        .route("/issues/:id/diagnostics/blockers", get(get_blockers_diagnostics))
+        .route("/issues/:id/diagnostics/wakes", get(get_wakes_diagnostics))
+        .route("/issues/:id/diagnostics/subtree", get(get_subtree_diagnostics))
 }

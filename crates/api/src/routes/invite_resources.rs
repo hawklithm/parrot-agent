@@ -74,9 +74,9 @@ pub async fn get_skill_details(
 /// 创建Invite资源路由器
 pub fn invite_resource_routes() -> Router<AppState> {
     axum::Router::new()
-        .route("/api/invites/:token/logo", axum::routing::get(get_company_logo))
-        .route("/api/invites/:token/onboarding", axum::routing::get(get_onboarding))
-        .route("/api/invites/:token/onboarding.txt", axum::routing::get(get_onboarding_text))
-        .route("/api/invites/:token/skills/index", axum::routing::get(get_skills_index))
-        .route("/api/invites/:token/skills/:skillName", axum::routing::get(get_skill_details))
+        .route("/invites/:token/logo", axum::routing::get(get_company_logo))
+        .route("/invites/:token/onboarding", axum::routing::get(get_onboarding))
+        .route("/invites/:token/onboarding.txt", axum::routing::get(get_onboarding_text))
+        .route("/invites/:token/skills/index", axum::routing::get(get_skills_index))
+        .route("/invites/:token/skills/:skillName", axum::routing::get(get_skill_details))
 }

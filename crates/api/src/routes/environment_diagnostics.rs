@@ -54,7 +54,6 @@ pub async fn delete_blast_radius(
 /// Router setup for environment diagnostic endpoints
 pub fn environment_diagnostics_routes() -> Router<AppState> {
     axum::Router::new()
-        .route("/environments/:id/probe", axum::routing::post(probe))
         .route("/environments/:id/acquire", axum::routing::post(acquire_lease))
         .route(
             "/environments/:id/delete-blast-radius",
