@@ -85,5 +85,17 @@ impl CompanyService {
         // Note: This is simplified - in production you'd have specific fields for branding
         Ok(self.company_repo.update(id, input).await?)
     }
+
+    pub async fn search(&self, query: &str) -> AppResult<Vec<Company>> {
+        Ok(self.company_repo.search(query).await?)
+    }
+
+    pub async fn count_all(&self) -> AppResult<i64> {
+        Ok(self.company_repo.count_all().await?)
+    }
+
+    pub async fn count_active(&self) -> AppResult<i64> {
+        Ok(self.company_repo.count_active().await?)
+    }
 }
 

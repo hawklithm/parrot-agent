@@ -231,4 +231,25 @@ impl CompanyRepository {
         .fetch_optional(&self.pool)
         .await
     }
+
+    pub async fn search(&self, query: &str) -> Result<Vec<Company>> {
+        sqlx::query_as::<_, Company>(
+            "SELECT * FROM companies WHERE name ILIKE $1 OR issue_prefix ILIKE $1 ORDER BY name LIMIT 50",
+        )
+        .bind(format!("%{}%", query))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn count_all(&self) -> Result<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM companies")
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn count_active(&self) -> Result<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM companies WHERE status = 'active'")
+            .fetch_one(&self.pool)
+            .await
+    }
 }

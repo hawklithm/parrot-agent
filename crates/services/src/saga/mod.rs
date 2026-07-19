@@ -44,6 +44,8 @@ pub enum SagaAction {
 pub struct SagaInstance {
     pub id: Uuid,
     pub saga_name: String,
+    pub company_id: Uuid,
+    pub initiator_id: Option<Uuid>,
     pub status: SagaStatus,
     pub current_step: Option<String>,
     pub context: sqlx::types::Json<serde_json::Value>,
@@ -102,6 +104,8 @@ where
         let instance = SagaInstance {
             id: saga_id,
             saga_name,
+            company_id: Uuid::nil(),
+            initiator_id: None,
             status: SagaStatus::Pending,
             current_step: None,
             context: sqlx::types::Json(context),

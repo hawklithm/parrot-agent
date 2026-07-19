@@ -318,23 +318,20 @@ impl BearerTokenResolver {
                 message: format!("Agent lookup failed: {}", e),
             })?;
 
-        let agent = match agent {
-            a if a.status == AgentStatus::Running => a,
-            _ => {
-                // Agent 不存在或未处于运行态：记审计日志后拒绝。
-                self.audit_jwt_rejected(
-                    &agent_id,
-                    &company_id,
-                    run_id,
-                    "agent inactive or not found",
-                )
-                .await;
-                return Err(AuthError::Forbidden {
-                    reason: "Agent is not active or does not exist".to_string(),
-                    code: Some("AGENT_INACTIVE".to_string()),
-                });
-            }
-        };
+        if agent.status != AgentStatus::Running {
+            // Agent 不存在或未处于运行态：记审计日志后拒绝。
+            self.audit_jwt_rejected(
+                &agent_id,
+                &company_id,
+                run_id,
+                "agent inactive or not found",
+            )
+            .await;
+            return Err(AuthError::Forbidden {
+                reason: "Agent is not active or does not exist".to_string(),
+                code: Some("AGENT_INACTIVE".to_string()),
+            });
+        }
 
         if let Some(claim_run_id) = run_id {
             if let Some(header_run_id) = headers

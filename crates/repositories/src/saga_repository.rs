@@ -87,14 +87,15 @@ impl SagaRepository for PgSagaRepository {
         let row = sqlx::query_as::<_, SagaInstance>(
             r#"
             INSERT INTO saga_instances
-            (id, saga_name, company_id, status, current_step, context, started_at, completed_at, error_message)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (id, saga_name, company_id, initiator_id, status, current_step, context, started_at, completed_at, error_message)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING *
             "#,
         )
         .bind(&instance.id)
         .bind(&instance.saga_name)
         .bind(&instance.company_id)
+        .bind(&instance.initiator_id)
         .bind(&instance.status)
         .bind(instance.current_step as i32)
         .bind(&instance.context)
@@ -175,7 +176,7 @@ impl SagaRepository for PgSagaRepository {
     async fn get_by_id(&self, id: Uuid) -> RepositoryResult<Option<SagaInstance>> {
         let row = sqlx::query_as::<_, SagaInstance>(
             r#"
-            SELECT id, saga_name, company_id, status, current_step, context, started_at, completed_at, error_message
+            SELECT id, saga_name, company_id, initiator_id, status, current_step, context, started_at, completed_at, error_message
             FROM saga_instances
             WHERE id = $1
             "#,
@@ -191,7 +192,7 @@ impl SagaRepository for PgSagaRepository {
     async fn list_by_status(&self, company_id: Uuid, status: SagaStatus) -> RepositoryResult<Vec<SagaInstance>> {
         let rows = sqlx::query_as::<_, SagaInstance>(
             r#"
-            SELECT id, saga_name, company_id, status, current_step, context, started_at, completed_at, error_message
+            SELECT id, saga_name, company_id, initiator_id, status, current_step, context, started_at, completed_at, error_message
             FROM saga_instances
             WHERE company_id = $1 AND status = $2
             ORDER BY started_at DESC

@@ -734,7 +734,6 @@ pub struct DefaultBudgetService {
     cost_repo: Arc<dyn CostEventRepository>,
     policy_repo: Arc<dyn BudgetPolicyRepository>,
     incident_repo: Arc<dyn BudgetIncidentRepository>,
-    agent_repo: Arc<dyn AgentRepository>,
     company_repo: Arc<CompanyRepository>,
 }
 
@@ -743,10 +742,9 @@ impl DefaultBudgetService {
         cost_repo: Arc<dyn CostEventRepository>,
         policy_repo: Arc<dyn BudgetPolicyRepository>,
         incident_repo: Arc<dyn BudgetIncidentRepository>,
-        agent_repo: Arc<dyn AgentRepository>,
         company_repo: Arc<CompanyRepository>,
     ) -> Self {
-        Self { cost_repo, policy_repo, incident_repo, agent_repo, company_repo }
+        Self { cost_repo, policy_repo, incident_repo, company_repo }
     }
 
     async fn log_budget_activity(&self, company_id: Uuid, event_type: &str, resource_id: Uuid, actor_id: Option<Uuid>, metadata: serde_json::Value) {
@@ -1146,7 +1144,7 @@ impl BudgetService for DefaultBudgetService {
         };
 
         // Verify scope belongs to company
-        let (scope_name, _, _) = self.check_scope_paused(&scope_type, input.scope_id).await?;
+        self.check_scope_paused(&scope_type, input.scope_id).await?;
 
         let metric = BudgetMetric::BilledCents;
         let window_kind = match input.window_kind.as_deref() {

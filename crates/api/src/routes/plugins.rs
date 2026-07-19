@@ -120,19 +120,13 @@ async fn execute_plugin_tool(
     State(s): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    let tool = body.get("tool").and_then(Value::as_str).unwrap_or_default();
+    let tool = body.get("tool").and_then(Value::as_str).ok_or_else(|| AppError::BadRequest("tool is required".into()))?;
     let id = body
         .get("pluginId")
         .and_then(Value::as_str)
         .and_then(|v| Uuid::parse_str(v).ok())
         .ok_or_else(|| AppError::BadRequest("pluginId is required".into()))?;
-    let p = s.plugin_service.get(id).await.map_err(err)?;
-    if p.status != "ready" {
-        return Err(AppError::BadRequest("plugin is not ready".into()));
-    }
-    Ok(Json(
-        json!({"tool":tool,"result":body.get("parameters").cloned().unwrap_or(Value::Null)}),
-    ))
+    Ok(Json(s.plugin_service.dispatch_tool(id, tool, body.get("parameters").cloned().unwrap_or(Value::Null)).await.map_err(err)?))
 }
 async fn install_plugin(
     State(s): State<AppState>,
@@ -257,10 +251,9 @@ async fn bridge_plugin_action(
     Path(id): Path<Uuid>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    s.plugin_service.get(id).await.map_err(err)?;
-    Ok(Json(
-        json!({"pluginId":id,"action":body.get("action"),"accepted":true}),
-    ))
+    let action = body.get("action").and_then(Value::as_str).ok_or_else(|| AppError::BadRequest("action is required".into()))?.to_owned();
+    let payload = body.get("payload").cloned().unwrap_or_else(|| body.clone());
+    Ok(Json(s.plugin_service.dispatch_action(id, &action, payload).await.map_err(err)?))
 }
 async fn store_plugin_data(
     State(s): State<AppState>,
@@ -279,10 +272,7 @@ async fn trigger_plugin_action(
     Path((id, key)): Path<(Uuid, String)>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    s.plugin_service.get(id).await.map_err(err)?;
-    Ok(Json(
-        json!({"pluginId":id,"action":key,"payload":body,"accepted":true}),
-    ))
+    Ok(Json(s.plugin_service.dispatch_action(id, &key, body).await.map_err(err)?))
 }
 async fn list_plugin_jobs(
     State(s): State<AppState>,

@@ -272,6 +272,7 @@ fn build_app_state(pool: PgPool) -> AppState {
         DefaultBuiltInAgentService::new(Arc::new(agent_repo.clone())),
     );
     let adapter_registry: Arc<AdapterRegistry> = Arc::new(AdapterRegistry::new());
+    let server_adapter_registry = Arc::new(services::server_adapter::AdapterRegistry::new());
     let environment_runtime_service: Arc<dyn EnvironmentRuntimeService> =
         Arc::new(DefaultEnvironmentRuntimeService::new());
     let issue_comment_service: Arc<dyn IssueCommentService> = Arc::new(
@@ -431,13 +432,12 @@ fn build_app_state(pool: PgPool) -> AppState {
                 Arc::new(agent_repo.clone()) as Arc<dyn repositories::AgentRepository>,
                 Arc::new(company_repo_for_services.clone()),
             )
-            .with_adapter_registry(adapter_registry.clone()),
+            .with_adapter_registry(server_adapter_registry),
         ),
         Arc::new(services::DefaultBudgetService::new(
             cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
             budget_policy_repo.clone() as Arc<dyn repositories::BudgetPolicyRepository>,
             budget_incident_repo.clone() as Arc<dyn repositories::BudgetIncidentRepository>,
-            Arc::new(agent_repo.clone()) as Arc<dyn repositories::AgentRepository>,
             Arc::new(company_repo_for_services.clone()),
         )),
         Arc::new(services::DefaultFinanceService::new(
@@ -448,6 +448,8 @@ fn build_app_state(pool: PgPool) -> AppState {
         company_portability_service.clone(),
         company_portability_service.clone(),
         company_portability_service,
+        Arc::new(services::cloud_upstream_service::DefaultCloudUpstreamService::new(pool.clone())),
+        Arc::new(services::work_timeline_service::DefaultWorkTimelineService { pool: pool.clone() }),
         event_bus,
         pool,
     )

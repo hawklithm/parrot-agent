@@ -47,7 +47,6 @@ pub fn cost_routes() -> Router<AppState> {
         .route("/companies/:company_id/costs/finance-events", get(list_finance_events))
         .route("/issues/:id/cost-summary", get(get_issue_cost_summary))
         .route("/issues/:id/cost-tree-summary", get(get_issue_tree_cost_summary))
-        .route("/agents/:agent_id/budgets", patch(update_agent_budget))
         // Budgets
         .route("/companies/:company_id/budgets/overview", get(get_budget_overview))
         .route("/companies/:company_id/budgets/policies", get(list_budget_policies))
@@ -346,23 +345,6 @@ async fn update_budget(
     let _ = state.budget_service.upsert_policy_full(company_id, body, None).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({"companyId": company_id, "updated": true})))
-}
-
-/// PATCH /agents/:agent_id/budgets — agent scoped policy update.
-async fn update_agent_budget(
-    State(state): State<AppState>,
-    Path(agent_id): Path<Uuid>,
-    Json(mut body): Json<UpsertPolicyInput>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM agents WHERE id = $1")
-        .bind(agent_id).fetch_optional(&state.pool).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let company_id = company_id.ok_or(StatusCode::NOT_FOUND)?;
-    body.scope_type = "agent".to_string();
-    body.scope_id = agent_id;
-    let policy = state.budget_service.upsert_policy_full(company_id, body, None).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"agentId": agent_id, "policy": policy})))
 }
 
 /// CO20: POST /companies/:company_id/budget-incidents/:incident_id/resolve

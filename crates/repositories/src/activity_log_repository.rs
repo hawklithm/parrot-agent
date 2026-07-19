@@ -171,7 +171,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
         sqlx::query(
             r#"
             INSERT INTO activity_logs
-            (id, company_id, actor_type, actor_id, action, resource_type, resource_id, metadata, created_at)
+            (id, company_id, actor_type, actor_id, event_type, resource_type, resource_id, metadata, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             "#,
         )
@@ -199,7 +199,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
     ) -> RepositoryResult<Vec<Activity>> {
         let rows = sqlx::query_as::<_, Activity>(
             r#"
-            SELECT id, company_id, actor_type, actor_id, action, resource_type, resource_id, metadata, created_at
+            SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
             FROM activity_logs
             WHERE company_id = $1
             ORDER BY created_at DESC
@@ -224,7 +224,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
     ) -> RepositoryResult<Vec<Activity>> {
         let rows = sqlx::query_as::<_, Activity>(
             r#"
-            SELECT id, company_id, actor_type, actor_id, action, resource_type, resource_id, metadata, created_at
+            SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
             FROM activity_logs
             WHERE company_id = $1 AND resource_type = $2 AND resource_id = $3
             ORDER BY created_at DESC
@@ -249,7 +249,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
     ) -> RepositoryResult<Vec<Activity>> {
         let rows = sqlx::query_as::<_, Activity>(
             r#"
-            SELECT id, company_id, actor_type, actor_id, action, resource_type, resource_id, metadata, created_at
+            SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
             FROM activity_logs
             WHERE company_id = $1 AND actor_id = $2
             ORDER BY created_at DESC
@@ -275,7 +275,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
     ) -> RepositoryResult<Vec<Activity>> {
         let rows = sqlx::query_as::<_, Activity>(
             r#"
-            SELECT id, company_id, actor_type, actor_id, action, resource_type, resource_id, metadata, created_at
+            SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
             FROM activity_logs
             WHERE company_id = $1 AND created_at >= $2 AND created_at <= $3
             ORDER BY created_at DESC
@@ -293,7 +293,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
 
     async fn list_with_filter(&self, filter: ActivityLogFilter) -> RepositoryResult<Vec<Activity>> {
         let mut query = String::from(
-            "SELECT id, company_id, actor_type, actor_id, action, resource_type, resource_id, metadata, created_at FROM activity_logs WHERE company_id = $1"
+            "SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at FROM activity_logs WHERE company_id = $1"
         );
         let mut bind_index = 2;
 
@@ -310,7 +310,7 @@ impl ActivityLogRepository for PgActivityLogRepository {
             bind_index += 1;
         }
         if filter.action.is_some() {
-            query.push_str(&format!(" AND action = ${}", bind_index));
+            query.push_str(&format!(" AND event_type = ${}", bind_index));
             bind_index += 1;
         }
         if filter.start_time.is_some() {

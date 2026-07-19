@@ -15,6 +15,7 @@ pub struct Plugin {
     pub status: String,
     pub package_name: Option<String>,
     pub install_path: Option<String>,
+    #[serde(rename = "manifestJson")]
     pub manifest: serde_json::Value,
     pub config: serde_json::Value,
     pub last_error: Option<String>,

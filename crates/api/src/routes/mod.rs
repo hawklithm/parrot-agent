@@ -63,6 +63,22 @@ pub async fn require_authenticated(
     }
 }
 
+pub async fn require_cloud_company_access(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use services::auth::AuthorizationActor;
+    let Some(actor) = request.extensions().get::<AuthorizationActor>() else { return axum::http::StatusCode::UNAUTHORIZED.into_response(); };
+    if actor.is_anonymous() { return axum::http::StatusCode::UNAUTHORIZED.into_response(); }
+    if let Some(raw) = request.uri().query().and_then(|query| query.split('&').find_map(|part| part.strip_prefix("companyId=").or_else(|| part.strip_prefix("company_id=")))) {
+        if let Ok(company_id) = uuid::Uuid::parse_str(raw) {
+            if assert_company_access(actor, company_id, request.method() == axum::http::Method::GET).is_err() { return axum::http::StatusCode::FORBIDDEN.into_response(); }
+        }
+    }
+    next.run(request).await
+}
+
 pub async fn require_plugin_access(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -83,13 +99,13 @@ pub async fn require_plugin_access(
     let agent_allowed = path == "/plugins/tools/execute"
         || path.contains("/bridge/")
         || path.contains("/actions/");
-    if mutation_admin && !(actor.is_instance_admin() || actor.is_board() && actor.company_id() == Some(uuid::Uuid::nil())) {
+    if mutation_admin && assert_instance_admin(actor).is_err() {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    if !mutation_admin && !agent_allowed && !actor.is_board() {
+    if !mutation_admin && !agent_allowed && assert_board(actor).is_err() {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    if agent_allowed && !actor.is_board() && !actor.is_agent() {
+    if agent_allowed && assert_board_or_agent(actor).is_err() {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
     next.run(request).await
@@ -105,12 +121,44 @@ pub async fn require_company_access(
     if actor.is_anonymous() { return axum::http::StatusCode::UNAUTHORIZED.into_response(); }
     let company_id = request.uri().path().split('/').find_map(|part| uuid::Uuid::parse_str(part).ok());
     if let Some(company_id) = company_id {
-        if actor.company_id() != Some(company_id) { return axum::http::StatusCode::FORBIDDEN.into_response(); }
-        if request.method() != axum::http::Method::GET && actor.role_in(company_id).is_some_and(|role| role.is_read_only()) {
+        if assert_company_access(actor, company_id, request.method() == axum::http::Method::GET).is_err() {
             return axum::http::StatusCode::FORBIDDEN.into_response();
         }
     }
     next.run(request).await
+}
+
+pub fn assert_company_access(
+    actor: &services::auth::AuthorizationActor,
+    company_id: uuid::Uuid,
+    read_only: bool,
+) -> Result<(), axum::http::StatusCode> {
+    let has_company_access = actor.company_id() == Some(company_id)
+        || actor.role_in(company_id).is_some()
+        || matches!(
+            actor,
+            services::auth::AuthorizationActor::Board {
+                source: services::auth::ActorSource::LocalImplicit,
+                ..
+            }
+        );
+    if actor.is_anonymous() || !has_company_access {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    if !read_only && actor.role_in(company_id).is_some_and(|role| role.is_read_only()) { return Err(axum::http::StatusCode::FORBIDDEN); }
+    Ok(())
+}
+
+pub fn assert_board(actor: &services::auth::AuthorizationActor) -> Result<(), axum::http::StatusCode> {
+    actor.is_board().then_some(()).ok_or(axum::http::StatusCode::FORBIDDEN)
+}
+
+pub fn assert_instance_admin(actor: &services::auth::AuthorizationActor) -> Result<(), axum::http::StatusCode> {
+    (actor.is_instance_admin() || actor.is_board() && actor.company_id() == Some(uuid::Uuid::nil())).then_some(()).ok_or(axum::http::StatusCode::FORBIDDEN)
+}
+
+pub fn assert_board_or_agent(actor: &services::auth::AuthorizationActor) -> Result<(), axum::http::StatusCode> {
+    (actor.is_board() || actor.is_agent()).then_some(()).ok_or(axum::http::StatusCode::FORBIDDEN)
 }
 
 pub use access_control::{access_control_routes, CompanyId, MemberId, Token};
@@ -159,3 +207,23 @@ pub use watchdogs::watchdog_routes;
 pub use approvals::approval_routes;
 pub use costs::cost_routes;
 pub use plugins::plugin_routes;
+
+#[cfg(test)]
+mod tests {
+    use super::assert_company_access;
+    use services::auth::{ActorSource, AuthorizationActor};
+    use uuid::Uuid;
+
+    #[test]
+    fn local_trusted_actor_can_access_development_company_routes() {
+        let actor = AuthorizationActor::board_with_source(
+            Uuid::new_v4(),
+            Uuid::nil(),
+            ActorSource::LocalImplicit,
+            vec![],
+            false,
+        );
+
+        assert!(assert_company_access(&actor, Uuid::new_v4(), true).is_ok());
+    }
+}

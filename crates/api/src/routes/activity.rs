@@ -20,8 +20,11 @@ use crate::errors::AppError;
 /// 活动查询参数
 #[derive(Debug, Deserialize)]
 pub struct ActivityQueryParams {
+    #[allow(dead_code)]
     actor_id: Option<Uuid>,
+    #[allow(dead_code)]
     entity_type: Option<String>,
+    #[allow(dead_code)]
     entity_id: Option<Uuid>,
     limit: Option<i64>,
 }
@@ -34,6 +37,7 @@ pub struct CreateActivityRequest {
     action: String,
     entity_type: String,
     entity_id: Uuid,
+    #[allow(dead_code)]
     agent_id: Option<Uuid>,
     details: Option<serde_json::Value>,
 }
@@ -56,8 +60,6 @@ pub fn activity_routes() -> Router<AppState> {
     Router::new()
         .route("/companies/:company_id/activity", get(list_company_activity).post(create_activity))
         .route("/issues/:id/activity", get(get_issue_activity))
-        .route("/issues/:id/runs", get(get_issue_runs))
-        .route("/heartbeat-runs/:run_id/issues", get(get_heartbeat_run_issues))
 }
 
 /// GET /companies/:company_id/activity
@@ -72,7 +74,7 @@ async fn list_company_activity(
 
     let rows = sqlx::query_as::<_, ActivityRow>(
         r#"
-        SELECT id, company_id, actor_type, actor_id, action, resource_type, resource_id, metadata, created_at
+SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
         FROM activity_logs
         WHERE company_id = $1
         ORDER BY created_at DESC
@@ -118,7 +120,7 @@ async fn create_activity(
 
     sqlx::query(
         r#"
-        INSERT INTO activity_logs (id, company_id, actor_type, actor_id, action, resource_type, resource_id, metadata, created_at)
+INSERT INTO activity_logs (id, company_id, actor_type, actor_id, event_type, resource_type, resource_id, metadata, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         "#,
     )
@@ -151,7 +153,7 @@ async fn get_issue_activity(
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let rows = sqlx::query_as::<_, ActivityRow>(
         r#"
-        SELECT id, company_id, actor_type, actor_id, action, resource_type, resource_id, metadata, created_at
+SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
         FROM activity_logs
         WHERE resource_type = 'issue' AND resource_id = $1
         ORDER BY created_at DESC
@@ -176,78 +178,6 @@ async fn get_issue_activity(
                 "resourceId": r.resource_id,
                 "metadata": r.metadata,
                 "createdAt": r.created_at,
-            })
-        })
-        .collect();
-
-    Ok(Json(result))
-}
-
-/// GET /issues/:id/runs
-/// 获取议题的运行记录。
-/// 对应 Paperclip: activityRoutes -> GET /issues/:id/runs
-async fn get_issue_runs(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    // Query heartbeat_runs associated with this issue
-    let rows = sqlx::query_as::<_, (Uuid, Option<serde_json::Value>, DateTime<Utc>)>(
-        r#"
-        SELECT hr.id, hr.metadata, hr.created_at
-        FROM heartbeat_runs hr
-        JOIN issue_thread_interactions iti ON iti.heartbeat_run_id = hr.id
-        WHERE iti.issue_id = $1
-        ORDER BY hr.created_at DESC
-        LIMIT 50
-        "#,
-    )
-    .bind(id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Failed to query issue runs: {}", e)))?;
-
-    let result: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|(run_id, metadata, created_at)| {
-            serde_json::json!({
-                "id": run_id,
-                "metadata": metadata,
-                "createdAt": created_at,
-            })
-        })
-        .collect();
-
-    Ok(Json(result))
-}
-
-/// GET /heartbeat-runs/:run_id/issues
-/// 获取心跳运行的议题列表。
-/// 对应 Paperclip: activityRoutes -> GET /heartbeat-runs/:runId/issues
-async fn get_heartbeat_run_issues(
-    State(state): State<AppState>,
-    Path(run_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, Option<serde_json::Value>, DateTime<Utc>)>(
-        r#"
-        SELECT iti.issue_id, iti.agent_id, iti.metadata, iti.created_at
-        FROM issue_thread_interactions iti
-        WHERE iti.heartbeat_run_id = $1
-        ORDER BY iti.created_at DESC
-        "#,
-    )
-    .bind(run_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Failed to query run issues: {}", e)))?;
-
-    let result: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|(issue_id, agent_id, metadata, created_at)| {
-            serde_json::json!({
-                "issueId": issue_id,
-                "agentId": agent_id,
-                "metadata": metadata,
-                "createdAt": created_at,
             })
         })
         .collect();

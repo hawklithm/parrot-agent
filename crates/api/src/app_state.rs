@@ -5,15 +5,16 @@ use std::sync::Arc;
 // Re-export services
 pub use services::{
     AdapterRegistry, AgentService, ApprovalService, AttachmentService, BudgetService,
-    BuiltInAgentService, CaseService, CompanyService, ConfigRevisionService, CostService,
-    CustomImageSetupService, EnvironmentDiagnosticsService, EnvironmentRuntimeService,
-    EnvironmentService, ExportService, FinanceService, GoalService, ImportService, InboxService,
-    InstanceSettingsService, InviteResourceService, InviteService, IssueCommentService,
-    IssueService, IssueTreeControlService, LabelService, LowTrustService, OpenClawService,
-    OrgChartService, PipelineService, PluginService, ProjectService, RoutineAnnotationService,
-    RoutineService, SecretProviderConfigService, SecretRemoteImportService, SkillRegistryService,
-    SseService, TermService, UserDirectoryService, UserSecretDefinitionService, UserSecretService,
-    WatchdogService, WorkProductService,
+    BuiltInAgentService, CaseService, CloudUpstreamService, CompanyService, ConfigRevisionService,
+    CostService, CustomImageSetupService, EnvironmentDiagnosticsService,
+    EnvironmentRuntimeService, EnvironmentService, ExportService, FinanceService, GoalService,
+    ImportService, InboxService, InstanceSettingsService, InviteResourceService, InviteService,
+    IssueCommentService, IssueService, IssueTreeControlService, LabelService, LowTrustService,
+    OpenClawService, OrgChartService, PipelineService, PluginService, ProjectService,
+    RoutineAnnotationService, RoutineService, SecretProviderConfigService,
+    SecretRemoteImportService, SkillRegistryService, SseService, TermService,
+    UserDirectoryService, UserSecretDefinitionService, UserSecretService, WatchdogService,
+    WorkProductService, WorkTimelineService,
 };
 
 pub use access::AccessService;
@@ -114,6 +115,8 @@ pub struct AppState {
     pub export_service: Arc<dyn ExportService>,
     pub import_service: Arc<dyn ImportService>,
     pub inbox_service: Arc<dyn InboxService>,
+    pub cloud_upstream_service: Arc<dyn CloudUpstreamService>,
+    pub work_timeline_service: Arc<dyn WorkTimelineService>,
 
     // Event bus
     pub event_bus: Arc<dyn EventBus>,
@@ -173,6 +176,8 @@ impl AppState {
         export_service: Arc<dyn ExportService>,
         import_service: Arc<dyn ImportService>,
         inbox_service: Arc<dyn InboxService>,
+        cloud_upstream_service: Arc<dyn CloudUpstreamService>,
+        work_timeline_service: Arc<dyn WorkTimelineService>,
         event_bus: Arc<dyn EventBus>,
         pool: PgPool,
     ) -> Self {
@@ -223,6 +228,8 @@ impl AppState {
             export_service,
             import_service,
             inbox_service,
+            cloud_upstream_service,
+            work_timeline_service,
             event_bus,
             pool,
         }
@@ -324,6 +331,20 @@ pub fn create_router(state: AppState) -> Router {
         ))
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+#[cfg(test)]
+mod route_conflict_tests {
+    use super::AppState;
+    use axum::Router;
+
+    #[test]
+    fn activity_and_heartbeat_routes_merge_without_conflicts() {
+        let _router = Router::<AppState>::new()
+            .merge(crate::routes::companies::company_routes())
+            .merge(crate::routes::activity::activity_routes())
+            .merge(crate::routes::heartbeat_runs::heartbeat_run_routes());
+    }
 }
 
 /// Health check endpoint

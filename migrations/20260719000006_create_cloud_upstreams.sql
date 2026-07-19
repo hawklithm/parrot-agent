@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS cloud_upstream_connections (
     target_stack_slug TEXT,
     target_company_id TEXT,
     target_origin TEXT,
+    target_schema_major INTEGER,
     pending_state TEXT,
     pending_code_verifier TEXT,
     pending_redirect_uri TEXT,
@@ -51,3 +52,4 @@ CREATE TABLE IF NOT EXISTS cloud_upstream_runs (
 
 CREATE INDEX IF NOT EXISTS cloud_upstream_connections_company_idx ON cloud_upstream_connections(company_id);
 CREATE INDEX IF NOT EXISTS cloud_upstream_runs_connection_idx ON cloud_upstream_runs(connection_id);
+ALTER TABLE cloud_upstream_connections ADD COLUMN IF NOT EXISTS target_schema_major INTEGER;

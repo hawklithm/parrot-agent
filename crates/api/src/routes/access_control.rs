@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::{
     async_trait,
-    extract::{Extension, FromRequestParts, Path, State},
+    extract::{Extension, FromRequestParts, Path, Query, State},
     http::{request::Parts, StatusCode},
     response::IntoResponse,
     routing::{get, post, delete, patch},
@@ -25,8 +25,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use services::auth::{
-    AuthError, AuthMiddleware, AuthorizationActor, BoardClaimService, ClaimChallenge, JwtConfig,
-    auth_middleware_fn, authenticated_middleware, AuthorizationAction, PermissionKey,
+    auth_middleware_fn, middleware_from_env, AuthError, AuthorizationAction, AuthorizationActor,
+    BoardClaimService, ClaimChallenge, PermissionKey,
 };
 use services::auth::authorization_service::assert_instance_admin;
 use services::auth::cli_auth::{
@@ -124,25 +124,7 @@ where
 
 /// 构建访问控制路由组，并挂载认证中间件层。
 pub fn access_control_routes(state: AppState) -> Router<AppState> {
-    let pool = Arc::new(state.pool.clone());
-    let jwt_config = JwtConfig::from_env().map(Arc::new);
-    let middleware = match &jwt_config {
-        Some(cfg) => authenticated_middleware(pool.clone(), cfg.clone()),
-        None => AuthMiddleware::new(services::auth::AuthMode::Authenticated)
-            .with_resolver(Arc::new(services::auth::BearerTokenResolver::new(
-                pool.clone(),
-                Arc::new(JwtConfig::new(
-                    String::new(),
-                    3600,
-                    "parrot-agent".to_string(),
-                    "agent-runtime".to_string(),
-                    "local".to_string(),
-                )),
-            )))
-            .with_resolver(Arc::new(services::auth::SessionCookieResolver::new(pool.clone())))
-            .with_resolver(Arc::new(services::auth::CloudTenantHeaderResolver::new(pool.clone()))),
-    };
-    let mw = Arc::new(middleware);
+    let mw = Arc::new(middleware_from_env(Arc::new(state.pool.clone())));
 
     Router::new()
         // 阶段一：Board 认领
@@ -531,9 +513,9 @@ async fn create_invite(
     // Store invite in database using raw SQL
     let invite_id = Uuid::new_v4();
     sqlx::query(
-        r#"INSERT INTO invites (id, company_id, invite_type, invited_by_user_id, email, token,
-           allowed_join_types, expires_at, used_at, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9)"#
+        r#"INSERT INTO invites (id, company_id, invite_type, invited_by_user_id, invited_email, token,
+           allowed_join_types, expires_at, accepted, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9)"#
     )
     .bind(invite_id)
     .bind(company_id)
@@ -563,8 +545,8 @@ async fn get_invite(
     State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
-    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>)>(
-        r#"SELECT id, company_id, invite_type, allowed_join_types, used_at, expires_at
+    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, bool, chrono::DateTime<Utc>)>(
+        r#"SELECT id, company_id, invite_type, allowed_join_types, accepted, expires_at
            FROM invites WHERE token = $1"#
     )
     .bind(&token)
@@ -573,12 +555,12 @@ async fn get_invite(
     .map_err(|e| AuthError::internal(format!("Failed to find invite: {}", e)))?
     .ok_or_else(|| AuthError::bad_request("Invite not found"))?;
 
-    let (invite_id, company_id, invite_type, allowed_join_types, used_at, expires_at) = row;
+    let (invite_id, company_id, invite_type, allowed_join_types, accepted, expires_at) = row;
 
     if Utc::now() > expires_at {
         return Err(AuthError::bad_request("Invite has expired"));
     }
-    if used_at.is_some() {
+    if accepted {
         return Err(AuthError::bad_request("Invite has already been used"));
     }
 
@@ -612,8 +594,8 @@ async fn accept_invite(
     let user_id = actor_user_id(&actor)?;
 
     // Find invite
-    let invite: Option<(Uuid, Uuid, String, String, Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>)> = sqlx::query_as(
-        r#"SELECT id, company_id, invite_type, allowed_join_types, used_at, expires_at
+    let invite: Option<(Uuid, Uuid, String, String, bool, chrono::DateTime<Utc>)> = sqlx::query_as(
+        r#"SELECT id, company_id, invite_type, allowed_join_types, accepted, expires_at
            FROM invites WHERE token = $1"#
     )
     .bind(&token)
@@ -621,13 +603,13 @@ async fn accept_invite(
     .await
     .map_err(|e| AuthError::internal(format!("Failed to find invite: {}", e)))?;
 
-    let (invite_id, company_id, _invite_type, _allowed_join_types, used_at, expires_at) =
+    let (invite_id, company_id, _invite_type, _allowed_join_types, accepted, expires_at) =
         invite.ok_or_else(|| AuthError::bad_request("Invite not found"))?;
 
     if Utc::now() > expires_at {
         return Err(AuthError::bad_request("Invite has expired"));
     }
-    if used_at.is_some() {
+    if accepted {
         return Err(AuthError::bad_request("Invite has already been used"));
     }
 
@@ -635,9 +617,9 @@ async fn accept_invite(
     let jr_id = Uuid::new_v4();
     let now = Utc::now();
     sqlx::query(
-        r#"INSERT INTO join_requests (id, company_id, principal_type, principal_id, status,
-           requested_role, message, reviewed_by_user_id, reviewed_at, rejection_reason, created_at, updated_at)
-           VALUES ($1, $2, 'user', $3, 'pending_approval', 'operator', $4, NULL, NULL, NULL, $5, $5)"#
+        r#"INSERT INTO join_requests (id, company_id, requester_user_id, status,
+           message, reviewed_by_user_id, reviewed_at, rejection_reason, created_at, updated_at)
+           VALUES ($1, $2, $3, 'pending_approval', $4, NULL, NULL, NULL, $5, $5)"#
     )
     .bind(jr_id)
     .bind(company_id)
@@ -648,8 +630,9 @@ async fn accept_invite(
     .await
     .map_err(|e| AuthError::internal(format!("Failed to create join request: {}", e)))?;
 
-    // Mark invite as used
-    sqlx::query("UPDATE invites SET used_at = $1 WHERE id = $2")
+    // Mark invite as accepted
+    sqlx::query("UPDATE invites SET accepted = true, accepted_by_user_id = $1, accepted_at = $2 WHERE id = $3")
+        .bind(user_id)
         .bind(now)
         .bind(invite_id)
         .execute(&state.pool)
@@ -672,6 +655,7 @@ async fn list_join_requests(
     Extension(actor): Extension<AuthorizationActor>,
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
+    Query(params): Query<JoinRequestsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, AuthError> {
     actor_user_id(&actor)?;
 
@@ -697,10 +681,14 @@ async fn list_join_requests(
     }
 
     let requests: Vec<JrRow> = sqlx::query_as::<_, JrRow>(
-        r#"SELECT id, principal_type, principal_id, status, requested_role, message, created_at
-           FROM join_requests WHERE company_id = $1 ORDER BY created_at DESC"#
+        r#"SELECT id, 'user'::text AS principal_type, requester_user_id AS principal_id,
+                  status::text AS status, 'operator'::text AS requested_role, message, created_at
+           FROM join_requests
+           WHERE company_id = $1 AND ($2::text IS NULL OR status::text = $2)
+           ORDER BY created_at DESC"#
     )
     .bind(company_id)
+    .bind(params.status.as_deref())
     .fetch_all(&state.pool)
     .await
     .map_err(|e| AuthError::internal(format!("Failed to list join requests: {}", e)))?;
@@ -714,6 +702,11 @@ async fn list_join_requests(
         "message": jr.message,
         "createdAt": jr.created_at,
     })).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinRequestsQuery {
+    status: Option<String>,
 }
 
 /// POST /api/companies/:company_id/join-requests/:request_id/approve
@@ -736,8 +729,8 @@ async fn approve_join_request(
     }
 
     // Check join request exists and is pending
-    let jr: Option<(Uuid, String, Uuid, String)> = sqlx::query_as(
-        r#"SELECT id, principal_type, principal_id, status
+    let jr: Option<(Uuid, Uuid, String)> = sqlx::query_as(
+        r#"SELECT id, requester_user_id, status::text
            FROM join_requests WHERE id = $1 AND company_id = $2"#
     )
     .bind(request_id)
@@ -746,7 +739,7 @@ async fn approve_join_request(
     .await
     .map_err(|e| AuthError::internal(format!("Failed to find join request: {}", e)))?;
 
-    let (_jr_id, principal_type, principal_id, status) =
+    let (_jr_id, principal_id, status) =
         jr.ok_or_else(|| AuthError::bad_request("Join request not found"))?;
 
     if status != "pending_approval" {
@@ -769,14 +762,13 @@ async fn approve_join_request(
     // Create membership
     let membership_id = Uuid::new_v4();
     sqlx::query(
-        r#"INSERT INTO company_memberships (id, company_id, principal_type, principal_id, role, status,
-           joined_at, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, 'operator', 'active', $5, $5, $5)
+        r#"INSERT INTO company_memberships (id, company_id, principal_type, principal_id,
+           membership_role, status, created_at, updated_at)
+           VALUES ($1, $2, 'user', $3, 'operator', 'active', $4, $4)
            ON CONFLICT DO NOTHING"#
     )
     .bind(membership_id)
     .bind(company_id)
-    .bind(&principal_type)
     .bind(principal_id)
     .bind(now)
     .execute(&state.pool)
@@ -1075,4 +1067,3 @@ async fn demote_instance_admin(
 
     Ok(Json(json!({ "status": "demoted" })))
 }
-

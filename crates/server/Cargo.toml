@@ -17,6 +17,7 @@ access = { path = "../access" }
 axum = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }
+	uuid = { workspace = true }
 dotenvy = "0.15"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -100,6 +100,36 @@ async fn create_issue(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// GET /companies/:companyId/issues - List issues for a company
+async fn list_company_issues(
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Query(query): Query<ListIssuesQuery>,
+) -> Result<Json<Vec<Issue>>, StatusCode> {
+    let filter = IssueQueryFilter {
+        status: None,
+        priority: None,
+        assignee_agent_id: query.assignee_agent_id,
+        assignee_user_id: query.assignee_user_id,
+        project_id: query.project_id,
+        parent_id: None,
+        goal_id: None,
+        search_query: None,
+    };
+    let pagination = Pagination {
+        limit: query.limit.unwrap_or(50).clamp(1, 500),
+        offset: query.offset.unwrap_or(0).max(0),
+        cursor: None,
+    };
+
+    state
+        .issue_service
+        .list(company_id, &filter, &pagination)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// PATCH /issues/:id - Update issue
 async fn update_issue(
     State(state): State<AppState>,
@@ -578,7 +608,10 @@ pub fn issue_routes() -> Router<AppState> {
     Router::new()
         .route("/issues", get(list_issues))
         .route("/issues/:id", get(get_issue).patch(update_issue).delete(delete_issue))
-        .route("/companies/:companyId/issues", post(create_issue))
+        .route(
+            "/companies/:companyId/issues",
+            get(list_company_issues).post(create_issue),
+        )
         .route("/companies/:companyId/issues/count", get(count_issues))
         .route("/companies/:companyId/issues/search", get(search_issues))
         .route("/issues/:id/checkout", post(checkout_issue))

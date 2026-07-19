@@ -189,6 +189,7 @@ impl SagaOrchestrator for DefaultSagaOrchestrator {
             id: Uuid::new_v4(),
             saga_name: saga_name.clone(),
             company_id,
+            initiator_id: Some(initiator_id),
             status: SagaStatus::Pending,
             current_step: None,
             context: persisted_context.clone(),
@@ -285,13 +286,12 @@ impl SagaOrchestrator for DefaultSagaOrchestrator {
             .filter(|e| e.status == StepExecutionStatus::Succeeded)
             .collect();
 
-        let initiator_id = instance
-            .context
-            .get("__saga_meta")
-            .and_then(|meta| meta.get("initiator_id"))
-            .and_then(|value| value.as_str())
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .ok_or_else(|| format!("Saga {} is missing its initiator id", saga_id))?;
+        let initiator_id = if let Some(initiator_id) = instance.initiator_id {
+            initiator_id
+        } else {
+            tracing::warn!(%saga_id, "falling back to legacy saga initiator metadata");
+            instance.context.get("__saga_meta").and_then(|meta| meta.get("initiator_id")).and_then(|value| value.as_str()).and_then(|value| Uuid::parse_str(value).ok()).ok_or_else(|| format!("Saga {} is missing its initiator id", saga_id))?
+        };
         let context = SagaContext {
             saga_id: instance.id,
             company_id: instance.company_id,
@@ -390,6 +390,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 saga_name: "test_saga".to_string(),
                 company_id: Uuid::new_v4(),
+                initiator_id: None,
                 status: SagaStatus::Succeeded,
                 current_step: None,
                 context: serde_json::json!({}),

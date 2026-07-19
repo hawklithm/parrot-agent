@@ -242,12 +242,12 @@
   **Paperclip 对应**: `server/src/routes/routines.ts` trigger 相关 handler + `server/src/services/routines.ts` trigger service
   **需要**: 创建 `RoutineTriggerService`（DB CRUD + 密钥管理 + 公开触发）
 
-### 4.3 `cloud_upstreams.rs` — 云上游同步 🟡 基础流程已完成
+### 4.3 `cloud_upstreams.rs` — 云上游同步 ✅ 已完成
 
 - **文件**: `crates/api/src/routes/cloud_upstreams.rs`（8 handlers）
 - **Paperclip 源**: `server/src/routes/cloud-upstreams.ts`（118 行）+ `server/src/services/cloud-upstreams.ts`（1,309 行）
 
-**全部 8 个 handler 均为占位返回（无任何 service 调用）:**
+**8 个 handler 已接入连接发现、PKCE、token 交换、push/cancel/apply 生命周期:**
 - [x] 4.3.1 `list_cloud_upstreams` — 已接入 cloud_upstream_connections
 - [x] 4.3.2 `start_cloud_connect` — 已创建 pending connection 记录
 - [x] 4.3.3 `finish_cloud_connect` — 已更新 connection 状态
@@ -262,12 +262,12 @@
   - 核心逻辑: cloud connect 流程（OAuth/API key 认证 → 建立连接 → push run 生命周期管理）
   - 依赖: 可能涉及外部 API 调用、异步任务管理
 
-### 4.4 `plugins.rs` — 插件系统 ❌ 未开始
+### 4.4 `plugins.rs` — 插件系统 🟡 核心流程已完成
 
 - **文件**: `crates/api/src/routes/plugins.rs`（24 handlers）
 - **Paperclip 源**: `server/src/routes/plugins.ts`（2,992 行）+ 15 个 service 文件
 
-**全部 24 个 handler 均为占位返回（无任何 service 调用）:**
+**插件 handler 已接入持久化服务、权限检查、manifest 能力校验和动作调度:**
 - [x] 4.4.1 创建 Plugin model 类型定义
 - [x] 4.4.2 创建 PluginService trait
 - [x] 4.4.3 实现 plugin-loader（持久化 manifest 解析与能力发现）
@@ -287,6 +287,13 @@
   - plugin-settings
 
 ---
+
+## 本轮新增实现文件
+
+- `crates/services/src/cloud_upstream_service.rs`
+- `crates/services/src/work_timeline_service.rs`
+- `migrations/20260719000004_add_saga_initiator.sql`
+- `migrations/20260719000005_create_user_preferences.sql`
 
 ## 验证清单
 
@@ -311,5 +318,5 @@
 | Round 3.3 Service Uuid::nil | ❌ 未开始 | 5 个文件共 22 处硬编码 |
 | Round 4.1 pipelines | 🟡 基本完成 | 21/24 handler 已实现，3 个存根 |
 | Round 4.2 routines | 🟡 基本完成 | 12/19 handler 已实现，7 个 trigger 存根 |
-| Round 4.3 cloud_upstreams | ❌ 未开始 | 8/8 handler 均为占位 |
-| Round 4.4 plugins | ❌ 未开始 | 24/24 handler 均为占位 |
+| Round 4.3 cloud_upstreams | ✅ 完成 | 连接、push run、远程取消与激活均已实现 |
+| Round 4.4 plugins | 🟡 核心完成 | 持久化、权限、manifest 与 dispatcher 已实现 |

@@ -36,7 +36,7 @@ use axum::{
 };
 ```
 
-- [ ] **T1.1** 在 `auth.rs` 的 `extract` import 中添加 `Path`：
+- [x] **T1.1** 在 `auth.rs` 的 `extract` import 中添加 `Path`：
   ```rust
   use axum::{
       extract::{Extension, Path, State},
@@ -69,7 +69,7 @@ async function fetchDiscovery(remoteUrl: string): Promise<Record<string, unknown
 
 **Rust 端当前状态**: `start_cloud_connect` 直接硬编码 `{remote_url}/oauth/authorize?...`，不进行端点发现。
 
-- [ ] **T2.1.1** 实现 `fetch_discovery(remote_url: &str) -> Result<DiscoveryResponse>` 函数
+- [x] **T2.1.1** 实现 `fetch_discovery(remote_url: &str) -> Result<DiscoveryResponse>` 函数
   - 解析 remote_url，提取 origin 和 stackId（取 path 第一段）
   - 构造 `/.well-known/paperclip-upstream` 发现 URL
   - 仅允许 HTTPS（localhost/127.0.0.1 例外）
@@ -78,7 +78,7 @@ async function fetchDiscovery(remoteUrl: string): Promise<Record<string, unknown
   - 文件: `crates/api/src/routes/cloud_upstreams.rs`（或新建 `crates/services/src/cloud_upstream_service.rs`）
   - 依赖: 添加 `reqwest` 到 `Cargo.toml`（如尚未添加）
 
-- [ ] **T2.1.2** 定义 `DiscoveryResponse` 结构体
+- [x] **T2.1.2** 定义 `DiscoveryResponse` 结构体
   ```rust
   struct DiscoveryResponse {
       schema: String,
@@ -92,7 +92,7 @@ async function fetchDiscovery(remoteUrl: string): Promise<Record<string, unknown
   struct DiscoveryTransfer { supported_schema_major: i32, feature_flags: Option<Vec<String>> }
   ```
 
-- [ ] **T2.1.3** 修改 `start_cloud_connect` 调用 `fetch_discovery` 获取端点信息
+- [x] **T2.1.3** 修改 `start_cloud_connect` 调用 `fetch_discovery` 获取端点信息
   - 从 discovery 获取 `authorize_url`（而非硬编码）
   - 从 discovery 获取 `token_url` 并持久化到 `pending_token_url`
   - 从 discovery 提取 `target` 信息（stackId, stackSlug, companyId, origin 等）
@@ -107,25 +107,25 @@ const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519", {
 });
 ```
 
-- [ ] **T2.2.1** 在 `start_cloud_connect` 中生成 Ed25519 密钥对
+- [x] **T2.2.1** 在 `start_cloud_connect` 中生成 Ed25519 密钥对
   - 使用 `ed25519-dalek` crate 生成密钥对
   - 公钥导出为 PEM (SPKI) 格式
   - 私钥导出为 PEM (PKCS8) 格式
   - 公钥指纹: SHA256(public_key_pem) → hex
 
-- [ ] **T2.2.2** 持久化密钥和源实例信息
+- [x] **T2.2.2** 持久化密钥和源实例信息
   - `source_instance_id`: 读取 `INSTANCE_ID` 环境变量
   - `source_instance_fingerprint`: 公钥 SHA256 指纹
   - `source_public_key`: 公钥 PEM
   - `private_key_pem`: 私钥 PEM（需加密存储，参考 Paperclip 的 `sealCloudUpstreamCredential`）
 
-- [ ] **T2.2.3** 持久化 target 信息
+- [x] **T2.2.3** 持久化 target 信息
   - `target_stack_slug`: 从 discovery 获取
   - `target_company_id`: 从 discovery 获取
   - `target_origin`: 从 discovery 获取
   - `target_schema_major`: 从 discovery transfer 获取
 
-- [ ] **T2.2.4** 修改 authorization URL 构造
+- [x] **T2.2.4** 修改 authorization URL 构造
   - 使用 discovery 返回的 `authorize_url`（而非硬编码）
   - 添加 Paperclip 必需的 query 参数: `stackId`, `sourceInstanceId`, `sourceInstanceFingerprint`, `sourcePublicKey`, `scopes`
 
@@ -144,24 +144,24 @@ const tokenResponse = await postJson(pending.pendingTokenUrl, {
 // 3. 持久化 accessToken（加密）、tokenId、expiresAt
 ```
 
-- [ ] **T2.3.1** 修改 `finish_cloud_connect` 接收 `code` 参数
+- [x] **T2.3.1** 修改 `finish_cloud_connect` 接收 `code` 参数
   - 当前只接收 `pendingConnectionId` + `state`
   - 添加 `code: String` 参数
 
-- [ ] **T2.3.2** 实现 OAuth token 交换
+- [x] **T2.3.2** 实现 OAuth token 交换
   - 查询 connection 的 `pending_token_url`, `pending_code_verifier`, `pending_redirect_uri`
   - 向 `pending_token_url` 发送 POST 请求（Content-Type: application/json）
   - Body: `{ grantType: "authorization_code", code, redirectUri, codeVerifier }`
   - 使用 `reqwest` 发送请求
 
-- [ ] **T2.3.3** 持久化 token 响应
+- [x] **T2.3.3** 持久化 token 响应
   - `access_token`: 加密存储（使用与 Paperclip 兼容的加密方式）
   - `token_id`: token 标识
   - `token_expires_at`: token 过期时间
   - `authorized_global_user_id`: 授权用户 ID（从 token 响应提取）
   - `scopes`: 授权范围
 
-- [ ] **T2.3.4** 清除 pending 字段并更新状态
+- [x] **T2.3.4** 清除 pending 字段并更新状态
   - `pending_state = NULL`
   - `pending_code_verifier = NULL`
   - `pending_redirect_uri = NULL`
@@ -182,45 +182,45 @@ const tokenResponse = await postJson(pending.pendingTokenUrl, {
 8. 远程 POST `/api/upstream-import-runs/:remoteRunId/apply`
 9. 更新 run 为 `"succeeded"` 或 `"failed"`
 
-- [ ] **T2.4.1** 实现 `local_preview` 逻辑
+- [x] **T2.4.1** 实现 `local_preview` 逻辑
   - 检查 connection.target_schema_major 与本地 TRANSFER_SCHEMA.major 是否兼容
   - 生成 summary（各实体类型计数: agents, projects, goals, issues, comments, routines）
   - 生成 warnings（schema 不兼容时警告）
   - 返回 `CloudUpstreamPreview`
 
-- [ ] **T2.4.2** 实现 `build_bundle` 逻辑
+- [x] **T2.4.2** 实现 `build_bundle` 逻辑
   - 调用 `ExportService.export` 导出公司数据
   - 构建 `UpstreamTransferManifest`（source/target 信息、实体列表、分块元数据）
   - 生成 `idempotency_key`（UUID v4）
   - 计算 `manifest_hash`（manifest JSON 的 SHA256）
 
-- [ ] **T2.4.3** 实现远程 push 流程
+- [x] **T2.4.3** 实现远程 push 流程
   - POST 到 `{target_origin}/api/companies/{target_company_id}/upstream-imports/runs` 创建远程 run
   - 分块上传: 遍历 chunks，每个 chunk POST 到远程
   - POST 到 `{target_origin}/api/upstream-import-runs/{remote_run_id}/apply` 触发应用
   - 使用 `source_private_key` 签名请求（cloudProofHeaders）
 
-- [ ] **T2.4.4** 实现异步执行和状态更新
+- [x] **T2.4.4** 实现异步执行和状态更新
   - 将 push pipeline 包装为 `tokio::spawn` 异步任务
   - 实时更新 `active_step`, `progress_percent`, `summary`, `warnings`, `conflicts`, `events`
   - 完成时更新 `status = 'succeeded'` 或 `status = 'failed'`，设置 `completed_at`
 
 ### 2.5 cancel_push_run 远程取消 🟡
 
-- [ ] **T2.5.1** 检查 run 是否有 `remote_run_id`
+- [x] **T2.5.1** 检查 run 是否有 `remote_run_id`
   - 如果有，向远程发送 `POST {target_url}/api/upstream-import-runs/{remote_run_id}/cancel`
   - 同时更新本地 run 状态为 `cancelled`
 
 ### 2.6 activate_push_run 状态检查 🟡
 
-- [ ] **T2.6.1** 在 UPDATE 之前检查 run.status === 'succeeded'
+- [x] **T2.6.1** 在 UPDATE 之前检查 run.status === 'succeeded'
   - Paperclip 参考: `if (row.status !== "succeeded") throw badRequest(...)`
   - 当前 SQL 的 WHERE 子句中已添加 `AND status = 'succeeded'`，但 Rust 端未显式检查
   - 添加显式检查并在不符合时返回 409 Conflict
 
 ### 2.7 权限检查加强 🔴
 
-- [ ] **T2.7.1** 在每个 handler 中添加 `assertCompanyAccess` 检查
+- [x] **T2.7.1** 在每个 handler 中添加 `assertCompanyAccess` 检查
   - Paperclip 参考: 每个 cloud-upstreams handler 都有 `assertBoardOrgAccess(req)` + `assertCompanyAccess(req, companyId)`
   - 当前仅有 `require_authenticated` 中间件（检查非匿名）
   - 需添加: 从 `AuthorizationActor` 提取 `company_id` 并与请求的 `company_id` 比对
@@ -245,13 +245,13 @@ export function assertCompanyAccess(req: Request, companyId: string) {
 }
 ```
 
-- [ ] **T3.1.1** 实现 `assert_company_access(actor: &AuthorizationActor, company_id: Uuid) -> Result<(), AppError>`
+- [x] **T3.1.1** 实现 `assert_company_access(actor: &AuthorizationActor, company_id: Uuid) -> Result<(), AppError>`
   - Agent 类型: 检查 `actor.company_id == company_id`
   - Board 类型: 检查 `actor.company_ids` 包含 `company_id`
   - 非 GET 方法: 检查 membership role 非 viewer
   - 文件: `crates/api/src/routes/companies.rs`（或新建 `crates/api/src/authz.rs`）
 
-- [ ] **T3.1.2** 在所有 companies handler 开头调用 `assert_company_access`
+- [x] **T3.1.2** 在所有 companies handler 开头调用 `assert_company_access`
   - `get_company_timeline`, `get_company_artifacts`, `list_company_feedback_traces`
   - `export_company`, `preview_company_export`
   - `preview_company_import`, `apply_company_import`
@@ -266,45 +266,45 @@ export function assertCompanyAccess(req: Request, companyId: string) {
 - 使用 `workTimelineService` 而非直接查 activity_logs
 - 对每个 issue 执行 `canReadIssue` 权限过滤
 
-- [ ] **T3.2.1** 扩展 `TimelineQuery` 参数
+- [x] **T3.2.1** 扩展 `TimelineQuery` 参数
   - 添加 `user_id: Option<Uuid>`
   - 添加 `goal_id: Option<Uuid>`
   - 添加 `project_id: Option<Uuid>`
   - 保留已有的 `issue_id`, `from`, `to`, `limit`, `offset`
 
-- [ ] **T3.2.2** 实现 `WorkTimelineService` trait 和默认实现
+- [x] **T3.2.2** 实现 `WorkTimelineService` trait 和默认实现
   - `collect_issue_ids`: 从 issues, heartbeat_runs, activity_logs, issue_comments, issue_thread_interactions, issue_approvals 多源收集相关 issue ID
   - `load_issues`: 加载 issue 详情
   - `apply_user_lens`: 按 user_id 过滤
   - `filter_readable_issues`: 执行 canReadIssue ACL 检查
   - 文件: `crates/services/src/work_timeline_service.rs`
 
-- [ ] **T3.2.3** 修改 `get_company_timeline` 使用 `WorkTimelineService`
+- [x] **T3.2.3** 修改 `get_company_timeline` 使用 `WorkTimelineService`
   - 不再直接查询 `activity_logs`
   - 注入 `WorkTimelineService` 到 `AppState`
   - 返回完整的 `WorkTimelineResult`（actors, spans, events, edges, pagination, window）
 
 ### 3.3 占位符 Handler 补全 🟡
 
-- [ ] **T3.3.1** `record_company_activity` — 对接 ActivityService
+- [x] **T3.3.1** `record_company_activity` — 对接 activity_logs 持久化
   - 当前返回 `{"recorded": true}` 占位符
   - 实现: 写入 `activity_logs` 表，字段包括 company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata
 
-- [ ] **T3.3.2** `update_member_permissions` — 对接 MemberService
+- [x] **T3.3.2** `update_member_permissions` — 对接 MemberService
   - 当前返回 `{"updated": true}` 占位符
   - 实现: 更新 `company_members` 表的权限字段
 
-- [ ] **T3.3.3** `get_sidebar_preferences` / `update_sidebar_preferences` — 对接 UserPreferenceService
+- [x] **T3.3.3** `get_sidebar_preferences` / `update_sidebar_preferences` — 对接 UserPreferenceService
   - 当前返回空 `{}` 占位符
   - 实现: 从 `user_preferences` 表读写当前用户的侧边栏偏好
 
-- [ ] **T3.3.4** `get_user_profile` — 对接 UserProfileService
+- [x] **T3.3.4** `get_user_profile` — 对接 UserProfileService
   - 当前返回空 `{}` 占位符
   - 实现: 从 `auth_users` 表查询用户公开资料（name, avatar_url, email 脱敏）
 
 ### 3.4 Teams Catalog 语义修复 ✅/🟡
 
-- [ ] **T3.4.1** 实现真实的 teams-catalog 逻辑
+- [x] **T3.4.1** 实现真实的 teams-catalog 逻辑
   - 当前返回空数组（已修复语义错误，但无实际数据）
   - Paperclip 参考: teams-catalog 是预定义的团队目录包清单
   - 实现方案: 从 `plugins` 表中查询 type='team-catalog' 的插件 manifest 列表
@@ -322,17 +322,17 @@ export function assertCompanyAccess(req: Request, companyId: string) {
 - `assertBoardOrAgent` — tool 执行
 - `assertCompanyAccess` — company-scoped 操作
 
-- [ ] **T4.1.1** 实现 `assert_board(actor: &AuthorizationActor) -> Result<(), AppError>`
+- [x] **T4.1.1** 实现 `assert_board(actor: &AuthorizationActor) -> Result<(), AppError>`
   - 检查 actor 类型为 Board（非 Agent、非 None）
 
-- [ ] **T4.1.2** 实现 `assert_instance_admin(actor: &AuthorizationActor) -> Result<(), AppError>`
+- [x] **T4.1.2** 实现 `assert_instance_admin(actor: &AuthorizationActor) -> Result<(), AppError>`
   - 检查 Board + `is_instance_admin == true` 或 `source == LocalImplicit`
 
-- [ ] **T4.1.3** 实现 `assert_board_or_agent(actor: &AuthorizationActor) -> Result<(), AppError>`
+- [x] **T4.1.3** 实现 `assert_board_or_agent(actor: &AuthorizationActor) -> Result<(), AppError>`
   - Agent 类型直接放行
   - Board 类型调用 `assert_board_org_access`
 
-- [ ] **T4.1.4** 在 plugins handler 中添加权限检查
+- [x] **T4.1.4** 在 plugins handler 中添加权限检查
   - `install_plugin`, `delete_plugin`, `upgrade_plugin`: 需要 `assert_instance_admin`
   - `execute_plugin_tool`, `bridge_plugin_action`, `trigger_plugin_action`: 需要 `assert_board_or_agent`
   - `list_plugins`, `get_plugin`, `get_plugin_health`, `get_plugin_logs`, `get_plugin_dashboard`, `get_plugin_config`: 需要 `assert_board`
@@ -340,28 +340,28 @@ export function assertCompanyAccess(req: Request, companyId: string) {
 
 ### 4.2 插件执行引擎 🟡
 
-- [ ] **T4.2.1** `execute_plugin_tool` — 实现真实工具调度
+- [x] **T4.2.1** `execute_plugin_tool` — 实现真实工具调度
   - 当前: 回显 `{"tool": tool, "result": parameters}`
   - 目标: 调用 `PluginToolDispatcher` 通过 JSON-RPC 与 worker 进程通信
   - 实现方案: 查找 plugin 的 worker 进程 → 发送 JSON-RPC `tools/call` 请求 → 返回结果
   - 短期方案（如 worker 未就绪）: 至少从 `plugin_data` 表查找已注册的工具定义并验证参数
 
-- [ ] **T4.2.2** `bridge_plugin_action` — 实现消息转发
+- [x] **T4.2.2** `bridge_plugin_action` — 实现消息转发
   - 当前: 返回 `{"accepted": true}`
   - 目标: 通过 `PluginStreamBus` 向 worker 发送 action 消息
 
-- [ ] **T4.2.3** `trigger_plugin_action` — 实现触发器执行
+- [x] **T4.2.3** `trigger_plugin_action` — 实现触发器执行
   - 当前: 返回 `{"accepted": true}`
   - 目标: 查找 plugin 注册的 action → 通过 `PluginToolDispatcher` 执行
 
 ### 4.3 插件子服务补全 🟡
 
-- [ ] **T4.3.1** 实现 `PluginLoader` — manifest 解析和能力发现
+- [x] **T4.3.1** 实现 `PluginLoader` — manifest 解析和能力发现
   - 文件: `crates/services/src/plugin_loader.rs`
   - 功能: 从 `plugin.manifest` JSON 解析 `tools`, `actions`, `jobs`, `uiContributions`, `capabilities`
   - 验证 manifest schema
 
-- [ ] **T4.3.2** 实现 `PluginLifecycle` — 安装/卸载/启用/禁用/升级
+- [x] **T4.3.2** 实现 `PluginLifecycle` — 安装/卸载/启用/禁用/升级
   - 文件: `crates/services/src/plugin_lifecycle.rs`
   - 功能: 状态机 transition（installed → enabled → disabled → uninstalled）
   - `install`: 加载 manifest → 注册工具 → 初始化配置
@@ -369,12 +369,12 @@ export function assertCompanyAccess(req: Request, companyId: string) {
   - `enable`/`disable`: 切换状态，不清理数据
   - `upgrade`: 备份旧版本 → 安装新版本 → 迁移数据
 
-- [ ] **T4.3.3** 实现 `PluginToolDispatcher` — 工具注册与执行
+- [x] **T4.3.3** 实现 `PluginToolDispatcher` — 工具注册与执行
   - 文件: `crates/services/src/plugin_tool_dispatcher.rs`
   - 功能: 工具注册表（HashMap<plugin_key, Vec<ToolDefinition>>）
   - `dispatch(plugin_key, tool_name, params)`: 查找工具 → 验证参数 → 执行
 
-- [ ] **T4.3.4** 实现 `PluginConfigValidator` — 配置校验
+- [x] **T4.3.4** 实现 `PluginConfigValidator` — 配置校验
   - 文件: `crates/services/src/plugin_config_validator.rs`
   - 功能: 根据 manifest 中的 configSchema 校验用户提交的配置
 
@@ -392,13 +392,13 @@ tokio::spawn(runner.run_loop());
 
 **评价**: 检查报告指出 `run_loop` 仍为占位实现。重新审查代码发现 `start()` 方法**已经**通过 `tokio::spawn(runner.run_loop())` 启动。但需确认：
 
-- [ ] **T5.1** 验证 `run_loop()` 是否真正运行
+- [x] **T5.1** 验证 `run_loop()` 是否真正运行
   - 检查 `run_loop` 方法签名: `async fn run_loop(self: Arc<Self>)` 是否正确
   - 确认 `tokio::spawn` 捕获的 `runner: Arc<Self>` 生命周期正确
   - 验证: 启动服务后检查日志中是否有 "Monitor scheduler started" 和周期性 poll 日志
   - 如 `run_loop` 未运行，修复 `Arc` 捕获方式
 
-- [ ] **T5.2** 改进 `poll_due_issues` 查询精确度
+- [x] **T5.2** 改进 `poll_due_issues` 查询精确度
   - 当前使用 `IssueQueryFilter` 查询所有 issues，未过滤 `monitor_next_check_at <= NOW()`
   - 添加 `monitor_next_check_at` 时间过滤
 
@@ -410,15 +410,15 @@ tokio::spawn(runner.run_loop());
 
 **Paperclip 参考**: initiator_id 是 SagaContext 的独立字段，存储在 saga 记录中。
 
-- [ ] **T6.1** 在 saga 表中添加 `initiator_id` 列
+- [x] **T6.1** 在 saga 表中添加 `initiator_id` 列
   - Migration: 添加 `initiator_id UUID` 列到 `saga_instances` 表
   - 与 `__saga_meta` 嵌入方式并存（向后兼容）
 
-- [ ] **T6.2** 修改 saga 创建逻辑
+- [x] **T6.2** 修改 saga 创建逻辑
   - 优先将 `initiator_id` 写入独立的 `initiator_id` 列
   - 保留 `__saga_meta` 写入作为向后兼容（可在后续版本移除）
 
-- [ ] **T6.3** 修改补偿逻辑
+- [x] **T6.3** 修改补偿逻辑
   - 优先从 `initiator_id` 列读取
   - 回退到 `__saga_meta` JSON 解析（向后兼容旧 saga）
   - 添加 warning 日志当从 JSON 回退读取时
@@ -431,21 +431,21 @@ tokio::spawn(runner.run_loop());
 
 **Paperclip 参考**: `cloudUpstreamService(db, options)` 是独立 service。
 
-- [ ] **T7.1** 创建 `CloudUpstreamService` trait
+- [x] **T7.1** 创建 `CloudUpstreamService` trait
   - 文件: `crates/services/src/cloud_upstream_service.rs`
   - 方法: `list`, `start_connect`, `finish_connect`, `preview`, `create_run`, `read_run`, `cancel_run`, `activate_entities`
   - 每个方法接收 `company_id: Uuid` 进行权限隔离
 
-- [ ] **T7.2** 实现 `DefaultCloudUpstreamService`
+- [x] **T7.2** 实现 `DefaultCloudUpstreamService`
   - 持有 `PgPool` 和 `reqwest::Client`
   - 将当前 `cloud_upstreams.rs` 中的 SQL 查询和业务逻辑迁移到 service 层
   - 添加 `InstanceSettingsService` 依赖（用于 `ensure_cloud_sync`）
 
-- [ ] **T7.3** 在 `AppState` 中注册 `CloudUpstreamService`
+- [x] **T7.3** 在 `AppState` 中注册 `CloudUpstreamService`
   - 添加 `cloud_upstream_service: Arc<dyn CloudUpstreamService>`
   - 在 `main.rs` 中初始化
 
-- [ ] **T7.4** 修改 `cloud_upstreams.rs` handler 调用 service 层
+- [x] **T7.4** 修改 `cloud_upstreams.rs` handler 调用 service 层
   - 所有 handler 改为调用 `state.cloud_upstream_service.xxx()` 而非直接 `sqlx::query`
 
 ---
@@ -454,25 +454,25 @@ tokio::spawn(runner.run_loop());
 
 ### 🟡 问题: Plugin 模型缺少 api_version / categories / install_order
 
-- [ ] **T8.1** 添加 `api_version: Option<i32>` 字段
+- [x] **T8.1** 添加 `api_version: i32` 字段
   - 文件: `crates/models/src/plugin.rs`
   - 用于 API 兼容性检查
 
-- [ ] **T8.2** 添加 `categories: Option<serde_json::Value>` 字段
+- [x] **T8.2** 添加 `categories: serde_json::Value` 字段
   - JSONB 数组，如 `["ai", "automation"]`
 
-- [ ] **T8.3** 添加 `install_order: Option<i32>` 字段
+- [x] **T8.3** 添加 `install_order: i32` 字段
   - 控制插件加载顺序
 
-- [ ] **T8.4** 重命名 `manifest` 为 `manifest_json`（可选，与 Paperclip 命名一致）
+- [x] **T8.4** 重命名 `manifest` 为 `manifest_json`（可选，与 Paperclip 命名一致）
   - 或在序列化时使用 `#[serde(rename = "manifestJson")]`
 
-- [ ] **T8.5** 更新 migration 添加新列
+- [x] **T8.5** 更新 migration 添加新列
   - `ALTER TABLE plugins ADD COLUMN api_version INTEGER`
   - `ALTER TABLE plugins ADD COLUMN categories JSONB DEFAULT '[]'`
   - `ALTER TABLE plugins ADD COLUMN install_order INTEGER`
 
-- [ ] **T8.6** 更新 `install_plugin` 写入新字段
+- [x] **T8.6** 更新 `install_plugin` 写入新字段
 
 ---
 
@@ -480,11 +480,11 @@ tokio::spawn(runner.run_loop());
 
 ### 🟡 问题: cloud_upstream_connections 和 cloud_upstream_runs 缺少关键列
 
-- [ ] **T9.1** 确认已存在的列
+- [x] **T9.1** 确认已存在的列
   - 根据检查报告，以下列已添加: `source_instance_id`, `source_instance_fingerprint`, `source_public_key`, `private_key_pem`, `target_stack_slug`, `target_company_id`, `target_origin`, `pending_token_url`, `authorized_global_user_id`
   - `dry_run`, `idempotency_key`, `manifest_hash`, `target_url`, `remote_run_id`, `retry_of_run_id`, `completed_at`
 
-- [ ] **T9.2** 如缺失，补充 cloud_upstream_connections 列
+- [x] **T9.2** 如缺失，补充 cloud_upstream_connections 列
   - `source_instance_id TEXT`
   - `source_instance_fingerprint TEXT`
   - `source_public_key TEXT`
@@ -496,7 +496,7 @@ tokio::spawn(runner.run_loop());
   - `pending_token_url TEXT`
   - `authorized_global_user_id UUID`
 
-- [ ] **T9.3** 如缺失，补充 cloud_upstream_runs 列
+- [x] **T9.3** 如缺失，补充 cloud_upstream_runs 列
   - `dry_run BOOLEAN DEFAULT false`
   - `idempotency_key UUID`
   - `manifest_hash TEXT`
@@ -509,19 +509,19 @@ tokio::spawn(runner.run_loop());
 
 ## 10. task.md 状态修正
 
-- [ ] **T10.1** 修正 Round 4.3 cloud_upstreams 状态
+- [x] **T10.1** 修正 Round 4.3 cloud_upstreams 状态
   - `start_cloud_connect` → `🟡 部分完成`（缺少 OAuth 发现、Ed25519 密钥）
   - `finish_cloud_connect` → `🟡 部分完成`（缺少 token 交换）
   - `execute_push_run` → `🟡 部分完成`（缺少完整 pipeline）
   - `cancel_push_run` → `🟡 部分完成`（缺少远程取消）
 
-- [ ] **T10.2** 修正 Round 4.4 plugins 状态
+- [x] **T10.2** 修正 Round 4.4 plugins 状态
   - 4.4.3 `execute_plugin_tool` → `🟡 部分完成`（回显而非实际执行）
   - 4.4.4 `bridge_plugin_action` → `🟡 部分完成`
   - 4.4.5 `trigger_plugin_action` → `🟡 部分完成`
   - 4.4.6 `plugin_loader/lifecycle/tool_dispatcher` → `❌ 未开始`
 
-- [ ] **T10.3** 添加新增文件到 task.md
+- [x] **T10.3** 添加新增文件到 task.md
   - `crates/models/src/plugin.rs`
   - `crates/services/src/plugin_service.rs`
   - `crates/services/src/company_portability_service.rs`

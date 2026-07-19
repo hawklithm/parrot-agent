@@ -214,6 +214,14 @@ pub mod config;
 pub use config::*;
 pub mod adapter_plugin;
 pub mod plugin_service;
+pub mod plugin_loader;
+pub mod plugin_lifecycle;
+pub mod plugin_tool_dispatcher;
+pub mod plugin_config_validator;
+pub mod cloud_upstream_service;
+pub mod work_timeline_service;
+pub use cloud_upstream_service::{CloudUpstreamService, DefaultCloudUpstreamService};
+pub use work_timeline_service::{DefaultWorkTimelineService, WorkTimelineQuery, WorkTimelineService};
 pub use plugin_service::{DefaultPluginService, PluginService, PluginServiceError};
 pub mod company_portability_service;
 pub use adapter_plugin::{

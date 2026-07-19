@@ -1,0 +1,1 @@
+ALTER TABLE IF EXISTS saga_instances ADD COLUMN IF NOT EXISTS initiator_id UUID;

@@ -30,6 +30,10 @@ jwt = "0.16"
 dashmap = "5.5"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+	urlencoding = "2.1"
+	ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+	pkcs8 = { version = "0.10", features = ["pem"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -27,3 +27,8 @@ tracing = { workspace = true }
 sha2 = "0.10"
 base64 = "0.22"
 urlencoding = "2.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rand = { workspace = true }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+hex = "0.4"

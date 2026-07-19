@@ -29,6 +29,8 @@ pub trait PluginService: Send + Sync {
     async fn job_runs(&self, plugin_id: Uuid, job_id: Uuid) -> PluginResult<Vec<Value>>;
     async fn trigger_job(&self, plugin_id: Uuid, job_id: Uuid) -> PluginResult<Value>;
     async fn logs(&self, id: Uuid) -> PluginResult<Vec<Value>>;
+    async fn dispatch_tool(&self, id: Uuid, tool: &str, parameters: Value) -> PluginResult<Value>;
+    async fn dispatch_action(&self, id: Uuid, action: &str, payload: Value) -> PluginResult<Value>;
 }
 
 pub struct DefaultPluginService {
@@ -80,6 +82,7 @@ impl PluginService for DefaultPluginService {
             .ok_or(PluginServiceError::NotFound(id))
     }
     async fn install(&self, body: Value) -> PluginResult<Plugin> {
+        crate::plugin_loader::parse_manifest(&body).map_err(PluginServiceError::InvalidState)?;
         let id = Uuid::new_v4();
         let key = body
             .get("pluginKey")
@@ -139,7 +142,8 @@ impl PluginService for DefaultPluginService {
         Ok(())
     }
     async fn update_config(&self, id: Uuid, config: Value) -> PluginResult<Plugin> {
-        self.get(id).await?;
+        let plugin = self.get(id).await?;
+        crate::plugin_config_validator::validate_config(&plugin.manifest, &config).map_err(PluginServiceError::InvalidState)?;
         let r =
             sqlx::query("UPDATE plugins SET config=$2, updated_at=NOW() WHERE id=$1 RETURNING *")
                 .bind(id)
@@ -192,5 +196,25 @@ impl PluginService for DefaultPluginService {
         self.get(id).await?;
         let rs=sqlx::query("SELECT id,level,message,metadata,created_at FROM plugin_logs WHERE plugin_id=$1 ORDER BY created_at DESC LIMIT 500").bind(id).fetch_all(&self.pool).await?;
         Ok(rs.into_iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"level":r.get::<String,_>("level"),"message":r.get::<String,_>("message"),"metadata":r.get::<Value,_>("metadata"),"createdAt":r.get::<chrono::DateTime<chrono::Utc>,_>("created_at")})).collect())
+    }
+    async fn dispatch_tool(&self, id: Uuid, tool: &str, parameters: Value) -> PluginResult<Value> {
+        let plugin = self.get(id).await?;
+        if plugin.status != "ready" { return Err(PluginServiceError::InvalidState("plugin is not ready".into())); }
+        let declared = crate::plugin_tool_dispatcher::declared_tool(&plugin.manifest, tool);
+        if !declared { return Err(PluginServiceError::InvalidState(format!("tool '{}' is not declared by plugin", tool))); }
+        let result = json!({"pluginId": id, "tool": tool, "parameters": parameters, "dispatched": true});
+        sqlx::query("INSERT INTO plugin_logs(id,plugin_id,level,message,metadata) VALUES($1,$2,'info',$3,$4)")
+            .bind(Uuid::new_v4()).bind(id).bind(format!("tool dispatched: {tool}")).bind(&result).execute(&self.pool).await?;
+        Ok(result)
+    }
+    async fn dispatch_action(&self, id: Uuid, action: &str, payload: Value) -> PluginResult<Value> {
+        let plugin = self.get(id).await?;
+        if plugin.status != "ready" { return Err(PluginServiceError::InvalidState("plugin is not ready".into())); }
+        let declared = crate::plugin_tool_dispatcher::declared_action(&plugin.manifest, action);
+        if !declared { return Err(PluginServiceError::InvalidState(format!("action '{}' is not declared by plugin", action))); }
+        let result = json!({"pluginId": id, "action": action, "payload": payload, "dispatched": true});
+        sqlx::query("INSERT INTO plugin_logs(id,plugin_id,level,message,metadata) VALUES($1,$2,'info',$3,$4)")
+            .bind(Uuid::new_v4()).bind(id).bind(format!("action dispatched: {action}")).bind(&result).execute(&self.pool).await?;
+        Ok(result)
     }
 }
