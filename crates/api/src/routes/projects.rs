@@ -13,26 +13,51 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use models::{
-    Project, ProjectWorkspace, ProjectMembership, ResourceMemberships,
-    CreateProjectInput, UpdateProjectInput, CreateWorkspaceInput,
-    MembershipState,
+    CreateProjectInput, CreateWorkspaceInput, MembershipState, Project, ProjectMembership,
+    ProjectWorkspace, ResourceMemberships, UpdateProjectInput,
 };
 
 pub fn project_routes() -> Router<AppState> {
     Router::new()
         // Project list + create (scoped to company)
-        .route("/companies/:company_id/projects", get(list_projects).post(create_project))
+        .route(
+            "/companies/:company_id/projects",
+            get(list_projects).post(create_project),
+        )
         // Single project
-        .route("/projects/:project_id", get(get_project).patch(update_project).delete(delete_project))
+        .route(
+            "/projects/:project_id",
+            get(get_project)
+                .patch(update_project)
+                .delete(delete_project),
+        )
         // Workspaces
-        .route("/projects/:project_id/workspaces", get(list_workspaces).post(create_workspace))
-        .route("/projects/:project_id/workspaces/:workspace_id", patch(update_workspace).delete(delete_workspace))
+        .route(
+            "/projects/:project_id/workspaces",
+            get(list_workspaces).post(create_workspace),
+        )
+        .route(
+            "/projects/:project_id/workspaces/:workspace_id",
+            patch(update_workspace).delete(delete_workspace),
+        )
         // External object summary
-        .route("/projects/:project_id/external-object-summary", get(get_external_object_summary))
+        .route(
+            "/projects/:project_id/external-object-summary",
+            get(get_external_object_summary),
+        )
         // Resource memberships
-        .route("/companies/:company_id/resource-memberships/me", get(list_my_memberships))
-        .route("/companies/:company_id/resource-memberships/me/projects/:project_id", put(update_project_membership))
-        .route("/companies/:company_id/resource-memberships/me/agents/:agent_id", put(update_agent_membership))
+        .route(
+            "/companies/:company_id/resource-memberships/me",
+            get(list_my_memberships),
+        )
+        .route(
+            "/companies/:company_id/resource-memberships/me/projects/:project_id",
+            put(update_project_membership),
+        )
+        .route(
+            "/companies/:company_id/resource-memberships/me/agents/:agent_id",
+            put(update_agent_membership),
+        )
 }
 
 // ===== Project endpoints =====
@@ -137,11 +162,25 @@ async fn create_workspace(
 
 /// PATCH /projects/:project_id/workspaces/:workspace_id
 async fn update_workspace(
-    State(_state): State<AppState>,
-    Path((_project_id, _workspace_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Path((project_id, workspace_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ProjectWorkspace>, AppError> {
-    // TODO: Implement workspace update
-    Err(AppError::NotImplemented("Workspace update not yet implemented".to_string()))
+    let name = body.get("name").and_then(|v| v.as_str()).map(str::to_owned);
+    let config = body.get("config").cloned();
+    let is_primary = body
+        .get("isPrimary")
+        .and_then(|v| v.as_bool())
+        .or_else(|| body.get("is_primary").and_then(|v| v.as_bool()));
+    let workspace = state
+        .project_service
+        .update_workspace(project_id, workspace_id, name, config, is_primary)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project workspace {} not found", workspace_id))
+        })?;
+    Ok(Json(workspace))
 }
 
 /// DELETE /projects/:project_id/workspaces/:workspace_id
@@ -161,16 +200,15 @@ async fn delete_workspace(
 
 /// GET /projects/:project_id/external-object-summary
 async fn get_external_object_summary(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // TODO: Implement external object summary query
-    Ok(Json(serde_json::json!({
-        "project_id": project_id,
-        "issues_count": 0,
-        "agents_count": 0,
-        "workspaces_count": 0,
-    })))
+    let summary = state
+        .project_service
+        .external_object_summary(project_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok(Json(summary))
 }
 
 // ===== Resource membership endpoints =====
@@ -198,7 +236,10 @@ async fn update_project_membership(
 ) -> Result<Json<ProjectMembership>, AppError> {
     // TODO: Extract user_id from auth context
     let user_id = Uuid::nil();
-    let state_val = body.get("state").and_then(|v| v.as_str()).unwrap_or("joined");
+    let state_val = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("joined");
     let membership_state = match state_val {
         "left" => MembershipState::Left,
         _ => MembershipState::Joined,
@@ -224,7 +265,10 @@ async fn update_agent_membership(
 ) -> Result<Json<serde_json::Value>, AppError> {
     // TODO: Extract user_id from auth context
     let user_id = Uuid::nil();
-    let state_val = body.get("state").and_then(|v| v.as_str()).unwrap_or("joined");
+    let state_val = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("joined");
     let membership_state = match state_val {
         "left" => MembershipState::Left,
         _ => MembershipState::Joined,

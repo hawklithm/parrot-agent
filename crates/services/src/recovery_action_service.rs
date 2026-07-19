@@ -1,39 +1,58 @@
 use async_trait::async_trait;
-use uuid::Uuid;
 use std::sync::Arc;
+use uuid::Uuid;
 
-use models::{
-    RecoveryAction, CreateRecoveryActionInput, ResolveRecoveryActionInput,
-    Issue,
-};
-use repositories::{
-    RecoveryActionRepository, IssueRepository,
-    RepositoryError,
-};
+use models::{CreateRecoveryActionInput, Issue, RecoveryAction, ResolveRecoveryActionInput};
+use repositories::{IssueRepository, RecoveryActionRepository, RepositoryError};
 
 /// Recovery action service for managing issue recovery actions
 #[async_trait]
 pub trait RecoveryActionService: Send + Sync {
     /// Create a new recovery action for an issue
-    async fn create(&self, company_id: Uuid, issue_id: Uuid, input: &CreateRecoveryActionInput) -> Result<RecoveryAction, String>;
+    async fn create(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+        input: &CreateRecoveryActionInput,
+    ) -> Result<RecoveryAction, String>;
 
     /// List recovery actions for an issue
-    async fn list_by_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, String>;
+    async fn list_by_issue(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+    ) -> Result<Vec<RecoveryAction>, String>;
 
     /// List pending recovery actions
-    async fn list_pending(&self, company_id: Uuid, limit: i64) -> Result<Vec<RecoveryAction>, String>;
+    async fn list_pending(
+        &self,
+        company_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<RecoveryAction>, String>;
 
     /// Resolve a specific recovery action
-    async fn resolve(&self, action_id: Uuid, input: &ResolveRecoveryActionInput) -> Result<RecoveryAction, String>;
+    async fn resolve(
+        &self,
+        action_id: Uuid,
+        input: &ResolveRecoveryActionInput,
+    ) -> Result<RecoveryAction, String>;
 
     /// Reconcile recovery actions for an issue and its ancestors.
     /// Compares current issue state vs expected recovery outcome.
     /// - If issue is fixed: resolve matching actions
     /// - If still failing: keep or re-trigger
-    async fn reconcile_for_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, String>;
+    async fn reconcile_for_issue(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+    ) -> Result<Vec<RecoveryAction>, String>;
 
     /// Resolve all active recovery actions for an issue (when issue is resolved)
-    async fn resolve_active_for_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, String>;
+    async fn resolve_active_for_issue(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+    ) -> Result<Vec<RecoveryAction>, String>;
 }
 
 /// Default implementation of RecoveryActionService
@@ -90,9 +109,15 @@ impl DefaultRecoveryActionService {
 
 #[async_trait]
 impl RecoveryActionService for DefaultRecoveryActionService {
-    async fn create(&self, company_id: Uuid, issue_id: Uuid, input: &CreateRecoveryActionInput) -> Result<RecoveryAction, String> {
+    async fn create(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+        input: &CreateRecoveryActionInput,
+    ) -> Result<RecoveryAction, String> {
         // Verify issue exists
-        let _issue = self.issue_repo
+        let _issue = self
+            .issue_repo
             .get_by_id(issue_id)
             .await
             .map_err(|e| format!("Failed to verify issue: {}", e))?
@@ -104,37 +129,55 @@ impl RecoveryActionService for DefaultRecoveryActionService {
             .map_err(|e| format!("Failed to create recovery action: {}", e))
     }
 
-    async fn list_by_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, String> {
+    async fn list_by_issue(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+    ) -> Result<Vec<RecoveryAction>, String> {
         self.recovery_repo
             .list_by_issue(company_id, issue_id)
             .await
             .map_err(|e| format!("Failed to list recovery actions: {}", e))
     }
 
-    async fn list_pending(&self, company_id: Uuid, limit: i64) -> Result<Vec<RecoveryAction>, String> {
+    async fn list_pending(
+        &self,
+        company_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<RecoveryAction>, String> {
         self.recovery_repo
             .list_pending(company_id, limit)
             .await
             .map_err(|e| format!("Failed to list pending recovery actions: {}", e))
     }
 
-    async fn resolve(&self, action_id: Uuid, input: &ResolveRecoveryActionInput) -> Result<RecoveryAction, String> {
+    async fn resolve(
+        &self,
+        action_id: Uuid,
+        input: &ResolveRecoveryActionInput,
+    ) -> Result<RecoveryAction, String> {
         self.recovery_repo
             .resolve(action_id, input)
             .await
             .map_err(|e| format!("Failed to resolve recovery action: {}", e))
     }
 
-    async fn reconcile_for_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, String> {
+    async fn reconcile_for_issue(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+    ) -> Result<Vec<RecoveryAction>, String> {
         // Get the issue
-        let issue = self.issue_repo
+        let issue = self
+            .issue_repo
             .get_by_id(issue_id)
             .await
             .map_err(|e| format!("Failed to get issue: {}", e))?
             .ok_or_else(|| format!("Issue {} not found", issue_id))?;
 
         // Get pending recovery actions for this issue and ancestors
-        let pending_actions = self.recovery_repo
+        let pending_actions = self
+            .recovery_repo
             .reconcile_for_issue_and_ancestors(company_id, issue_id)
             .await
             .map_err(|e| format!("Failed to get pending recovery actions: {}", e))?;
@@ -143,7 +186,8 @@ impl RecoveryActionService for DefaultRecoveryActionService {
         let mut resolved = Vec::new();
         for action in &pending_actions {
             if self.should_resolve_action(action, &issue) {
-                let resolved_action = self.recovery_repo
+                let resolved_action = self
+                    .recovery_repo
                     .resolve(action.id, &ResolveRecoveryActionInput { resolved_at: None })
                     .await
                     .map_err(|e| format!("Failed to resolve action {}: {}", action.id, e))?;
@@ -154,7 +198,11 @@ impl RecoveryActionService for DefaultRecoveryActionService {
         Ok(resolved)
     }
 
-    async fn resolve_active_for_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, String> {
+    async fn resolve_active_for_issue(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+    ) -> Result<Vec<RecoveryAction>, String> {
         self.recovery_repo
             .resolve_active_for_issue(company_id, issue_id)
             .await
@@ -216,34 +264,63 @@ mod tests {
 struct MockRecoveryRepo;
 #[allow(dead_code)]
 impl MockRecoveryRepo {
-    fn new() -> Self { Self }
+    fn new() -> Self {
+        Self
+    }
 }
 
 #[allow(dead_code)]
 struct MockIssueRepo;
 #[allow(dead_code)]
 impl MockIssueRepo {
-    fn new() -> Self { Self }
+    fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait]
 impl RecoveryActionRepository for MockRecoveryRepo {
-    async fn create(&self, _company_id: Uuid, _issue_id: Uuid, _input: &CreateRecoveryActionInput) -> Result<RecoveryAction, RepositoryError> {
+    async fn create(
+        &self,
+        _company_id: Uuid,
+        _issue_id: Uuid,
+        _input: &CreateRecoveryActionInput,
+    ) -> Result<RecoveryAction, RepositoryError> {
         unimplemented!()
     }
-    async fn list_by_issue(&self, _company_id: Uuid, _issue_id: Uuid) -> Result<Vec<RecoveryAction>, RepositoryError> {
+    async fn list_by_issue(
+        &self,
+        _company_id: Uuid,
+        _issue_id: Uuid,
+    ) -> Result<Vec<RecoveryAction>, RepositoryError> {
         unimplemented!()
     }
-    async fn list_pending(&self, _company_id: Uuid, _limit: i64) -> Result<Vec<RecoveryAction>, RepositoryError> {
+    async fn list_pending(
+        &self,
+        _company_id: Uuid,
+        _limit: i64,
+    ) -> Result<Vec<RecoveryAction>, RepositoryError> {
         unimplemented!()
     }
-    async fn resolve(&self, _action_id: Uuid, _input: &ResolveRecoveryActionInput) -> Result<RecoveryAction, RepositoryError> {
+    async fn resolve(
+        &self,
+        _action_id: Uuid,
+        _input: &ResolveRecoveryActionInput,
+    ) -> Result<RecoveryAction, RepositoryError> {
         unimplemented!()
     }
-    async fn reconcile_for_issue_and_ancestors(&self, _company_id: Uuid, _issue_id: Uuid) -> Result<Vec<RecoveryAction>, RepositoryError> {
+    async fn reconcile_for_issue_and_ancestors(
+        &self,
+        _company_id: Uuid,
+        _issue_id: Uuid,
+    ) -> Result<Vec<RecoveryAction>, RepositoryError> {
         unimplemented!()
     }
-    async fn resolve_active_for_issue(&self, _company_id: Uuid, _issue_id: Uuid) -> Result<Vec<RecoveryAction>, RepositoryError> {
+    async fn resolve_active_for_issue(
+        &self,
+        _company_id: Uuid,
+        _issue_id: Uuid,
+    ) -> Result<Vec<RecoveryAction>, RepositoryError> {
         unimplemented!()
     }
 }
@@ -253,22 +330,40 @@ impl IssueRepository for MockIssueRepo {
     async fn get_by_id(&self, _id: Uuid) -> Result<Option<Issue>, RepositoryError> {
         Ok(None)
     }
-    async fn list_by_company(&self, _company_id: Uuid, _filter: &models::IssueQueryFilter, _pagination: &models::Pagination) -> Result<Vec<Issue>, RepositoryError> {
+    async fn list_by_company(
+        &self,
+        _company_id: Uuid,
+        _filter: &models::IssueQueryFilter,
+        _pagination: &models::Pagination,
+    ) -> Result<Vec<Issue>, RepositoryError> {
         unimplemented!()
     }
-    async fn count_by_company(&self, _company_id: Uuid, _filter: &models::IssueQueryFilter) -> Result<i64, RepositoryError> {
+    async fn count_by_company(
+        &self,
+        _company_id: Uuid,
+        _filter: &models::IssueQueryFilter,
+    ) -> Result<i64, RepositoryError> {
         unimplemented!()
     }
     async fn create(&self, _input: models::CreateIssueInput) -> Result<Issue, RepositoryError> {
         unimplemented!()
     }
-    async fn update(&self, _id: Uuid, _input: models::UpdateIssueInput) -> Result<Issue, RepositoryError> {
+    async fn update(
+        &self,
+        _id: Uuid,
+        _input: models::UpdateIssueInput,
+    ) -> Result<Issue, RepositoryError> {
         unimplemented!()
     }
     async fn delete(&self, _id: Uuid) -> Result<(), RepositoryError> {
         unimplemented!()
     }
-    async fn search(&self, _company_id: Uuid, _query: &str, _pagination: &models::Pagination) -> Result<Vec<Issue>, RepositoryError> {
+    async fn search(
+        &self,
+        _company_id: Uuid,
+        _query: &str,
+        _pagination: &models::Pagination,
+    ) -> Result<Vec<Issue>, RepositoryError> {
         unimplemented!()
     }
     async fn list_children(&self, _parent_id: Uuid) -> Result<Vec<Issue>, RepositoryError> {
@@ -277,7 +372,11 @@ impl IssueRepository for MockIssueRepo {
     async fn get_by_identifier(&self, _identifier: &str) -> Result<Option<Issue>, RepositoryError> {
         unimplemented!()
     }
-    async fn list_by_parent(&self, _parent_id: Uuid, _pagination: &models::Pagination) -> Result<Vec<Issue>, RepositoryError> {
+    async fn list_by_parent(
+        &self,
+        _parent_id: Uuid,
+        _pagination: &models::Pagination,
+    ) -> Result<Vec<Issue>, RepositoryError> {
         unimplemented!()
     }
     async fn get_by_ids(&self, _ids: Vec<Uuid>) -> Result<Vec<Issue>, RepositoryError> {

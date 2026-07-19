@@ -1,22 +1,19 @@
-use std::sync::Arc;
 use axum::Router;
 use sqlx::PgPool;
+use std::sync::Arc;
 
 // Re-export services
 pub use services::{
-    AgentService, ConfigRevisionService, IssueService, CaseService,
-    IssueCommentService, IssueTreeControlService,
-    BuiltInAgentService, AdapterRegistry, EnvironmentRuntimeService,
-    OrgChartService, LowTrustService, CompanyService, ProjectService,
-    RoutineService, GoalService, EnvironmentService, PipelineService,
-    SkillRegistryService, SseService, InviteService, OpenClawService,
-    UserDirectoryService, CustomImageSetupService, SecretProviderConfigService,
-    SecretRemoteImportService, EnvironmentDiagnosticsService,
-    InviteResourceService, RoutineAnnotationService, WorkProductService,
-    AttachmentService, UserSecretDefinitionService, UserSecretService,
-    WatchdogService, ApprovalService, TermService, LabelService,
-    InstanceSettingsService,
-    CostService, BudgetService, FinanceService,
+    AdapterRegistry, AgentService, ApprovalService, AttachmentService, BudgetService,
+    BuiltInAgentService, CaseService, CompanyService, ConfigRevisionService, CostService,
+    CustomImageSetupService, EnvironmentDiagnosticsService, EnvironmentRuntimeService,
+    EnvironmentService, ExportService, FinanceService, GoalService, ImportService, InboxService,
+    InstanceSettingsService, InviteResourceService, InviteService, IssueCommentService,
+    IssueService, IssueTreeControlService, LabelService, LowTrustService, OpenClawService,
+    OrgChartService, PipelineService, PluginService, ProjectService, RoutineAnnotationService,
+    RoutineService, SecretProviderConfigService, SecretRemoteImportService, SkillRegistryService,
+    SseService, TermService, UserDirectoryService, UserSecretDefinitionService, UserSecretService,
+    WatchdogService, WorkProductService,
 };
 
 pub use access::AccessService;
@@ -55,7 +52,8 @@ pub struct AppState {
     pub org_chart_service: Arc<dyn OrgChartService>,
 
     // Issue diagnostics
-    pub issue_diagnostics_service: Arc<dyn services::issue_diagnostics_service::IssueDiagnosticsService>,
+    pub issue_diagnostics_service:
+        Arc<dyn services::issue_diagnostics_service::IssueDiagnosticsService>,
 
     // Low trust review
     pub low_trust_service: Arc<dyn LowTrustService>,
@@ -112,6 +110,10 @@ pub struct AppState {
     pub cost_service: Arc<dyn CostService>,
     pub budget_service: Arc<dyn BudgetService>,
     pub finance_service: Arc<dyn FinanceService>,
+    pub plugin_service: Arc<dyn PluginService>,
+    pub export_service: Arc<dyn ExportService>,
+    pub import_service: Arc<dyn ImportService>,
+    pub inbox_service: Arc<dyn InboxService>,
 
     // Event bus
     pub event_bus: Arc<dyn EventBus>,
@@ -134,7 +136,9 @@ impl AppState {
         issue_comment_service: Arc<dyn IssueCommentService>,
         issue_tree_control_service: Arc<dyn IssueTreeControlService>,
         org_chart_service: Arc<dyn OrgChartService>,
-        issue_diagnostics_service: Arc<dyn services::issue_diagnostics_service::IssueDiagnosticsService>,
+        issue_diagnostics_service: Arc<
+            dyn services::issue_diagnostics_service::IssueDiagnosticsService,
+        >,
         low_trust_service: Arc<dyn LowTrustService>,
         company_service: Arc<CompanyService>,
         project_service: Arc<ProjectService>,
@@ -165,6 +169,10 @@ impl AppState {
         cost_service: Arc<dyn CostService>,
         budget_service: Arc<dyn BudgetService>,
         finance_service: Arc<dyn FinanceService>,
+        plugin_service: Arc<dyn PluginService>,
+        export_service: Arc<dyn ExportService>,
+        import_service: Arc<dyn ImportService>,
+        inbox_service: Arc<dyn InboxService>,
         event_bus: Arc<dyn EventBus>,
         pool: PgPool,
     ) -> Self {
@@ -211,6 +219,10 @@ impl AppState {
             cost_service,
             budget_service,
             finance_service,
+            plugin_service,
+            export_service,
+            import_service,
+            inbox_service,
             event_bus,
             pool,
         }
@@ -230,13 +242,14 @@ pub fn create_router(state: AppState) -> Router {
         // Phase 1: Agent Management routes
         .merge(crate::routes::agents::agent_routes())
         .merge(crate::routes::auth::auth_routes(state.clone()))
-        .merge(crate::routes::access_control::access_control_routes(state.clone()))
+        .merge(crate::routes::access_control::access_control_routes(
+            state.clone(),
+        ))
         .merge(crate::routes::adapters::adapter_routes())
         .merge(crate::routes::config_revisions::config_revision_routes())
         .merge(crate::routes::built_in_agents::built_in_agent_routes())
         // Org chart routes (includes /companies/:companyId/org, /org-chart.svg, /org.png)
         .merge(crate::routes::org_chart::org_chart_routes())
-
         // Phase 2: Issue/Case Management routes
         .merge(crate::routes::issues::issue_routes())
         .merge(crate::routes::cases::case_routes())
@@ -244,7 +257,6 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::issue_tree_control::issue_tree_control_routes())
         .merge(crate::routes::issue_diagnostics::issue_diagnostics_routes())
         .merge(crate::routes::low_trust::low_trust_routes())
-
         // Phase 3: Company/Org routes
         .merge(crate::routes::companies::company_routes())
         .merge(crate::routes::projects::project_routes())
@@ -255,7 +267,6 @@ pub fn create_router(state: AppState) -> Router {
         // Routine/Goal routes
         .merge(crate::routes::routines::routine_routes())
         .merge(crate::routes::goals::goal_routes())
-
         // Phase 4: Additional service routes (now all AppState compatible)
         .merge(crate::routes::attachments::attachment_routes())
         .merge(crate::routes::work_products::work_product_routes())
@@ -271,12 +282,18 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::user_directory::user_directory_routes())
         .merge(crate::routes::user_secret_definitions::user_secret_definition_routes())
         // Routes with Arc<dyn X> state type (need wrapping)
-        .merge(crate::routes::user_secrets::user_secret_routes().with_state(state.user_secret_service.clone()))
-        .merge(crate::routes::invites::invite_subresource_routes().with_state(state.invite_service.clone()))
-
+        .merge(
+            crate::routes::user_secrets::user_secret_routes()
+                .with_state(state.user_secret_service.clone()),
+        )
+        .merge(
+            crate::routes::invites::invite_subresource_routes()
+                .with_state(state.invite_service.clone()),
+        )
         // Task watchdog routes (Arc<dyn WatchdogService> state)
-        .merge(crate::routes::watchdogs::watchdog_routes().with_state(state.watchdog_service.clone()))
-
+        .merge(
+            crate::routes::watchdogs::watchdog_routes().with_state(state.watchdog_service.clone()),
+        )
         // P2: New domain routes
         .merge(crate::routes::approvals::approval_routes())
         .merge(crate::routes::costs::cost_routes())
@@ -301,7 +318,6 @@ pub fn create_router(state: AppState) -> Router {
         // The Paperclip HTTP contract exposes all service routes below `/api`.
         .route("/api/health", axum::routing::get(health_check))
         .nest("/api", api_routes)
-
         // Middleware layers
         .layer(axum::middleware::from_fn(
             crate::middleware::security_headers::security_headers_middleware,

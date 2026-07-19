@@ -1,18 +1,21 @@
 use async_trait::async_trait;
-use models::{AvailableSkill, AvailableSkillsResponse, SkillDetails, SkillIndexEntry, SkillIndexResponse};
+use models::{
+    AvailableSkill, AvailableSkillsResponse, SkillDetails, SkillIndexEntry, SkillIndexResponse,
+};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::errors::ServiceResult;
 use crate::skill_registry_service::SkillRegistryService;
 use repositories::{
-    CompanySkillRepository, SkillCatalogRepository, SkillCommentRepository,
-    SkillFileRepository, SkillStarRepository, SkillTestInputRepository,
-    SkillTestRunRepository, SkillTestRunTemplateRepository, SkillVersionRepository,
+    CompanySkillRepository, SkillCatalogRepository, SkillCommentRepository, SkillFileRepository,
+    SkillStarRepository, SkillTestInputRepository, SkillTestRunRepository,
+    SkillTestRunTemplateRepository, SkillVersionRepository,
 };
 
 /// Default implementation of SkillRegistryService backed by PostgreSQL.
 pub struct DefaultSkillRegistryServiceImpl {
+    user_id: Option<Uuid>,
     catalog_repo: Arc<dyn SkillCatalogRepository>,
     company_skill_repo: Arc<dyn CompanySkillRepository>,
     version_repo: Arc<dyn SkillVersionRepository>,
@@ -27,6 +30,7 @@ pub struct DefaultSkillRegistryServiceImpl {
 impl DefaultSkillRegistryServiceImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        user_id: Option<Uuid>,
         catalog_repo: Arc<dyn SkillCatalogRepository>,
         company_skill_repo: Arc<dyn CompanySkillRepository>,
         version_repo: Arc<dyn SkillVersionRepository>,
@@ -38,6 +42,7 @@ impl DefaultSkillRegistryServiceImpl {
         file_repo: Arc<dyn SkillFileRepository>,
     ) -> Self {
         Self {
+            user_id,
             catalog_repo,
             company_skill_repo,
             version_repo,
@@ -180,10 +185,7 @@ impl SkillRegistryService for DefaultSkillRegistryServiceImpl {
             .await
             .map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))?
             .ok_or_else(|| {
-                crate::errors::ServiceError::NotFound(format!(
-                    "Skill {} not found",
-                    skill_id
-                ))
+                crate::errors::ServiceError::NotFound(format!("Skill {} not found", skill_id))
             })
     }
 
@@ -382,8 +384,11 @@ impl SkillRegistryService for DefaultSkillRegistryServiceImpl {
         company_id: Uuid,
         skill_id: Uuid,
     ) -> ServiceResult<serde_json::Value> {
-        // Use a placeholder user_id since auth is not yet wired
-        let user_id = Uuid::nil();
+        let user_id = self.user_id.ok_or_else(|| {
+            crate::errors::ServiceError::Forbidden(
+                "Skill mutations require an authenticated user".to_string(),
+            )
+        })?;
         self.star_repo
             .star(company_id, skill_id, user_id)
             .await
@@ -391,7 +396,11 @@ impl SkillRegistryService for DefaultSkillRegistryServiceImpl {
     }
 
     async fn unstar_skill(&self, company_id: Uuid, skill_id: Uuid) -> ServiceResult<()> {
-        let user_id = Uuid::nil();
+        let user_id = self.user_id.ok_or_else(|| {
+            crate::errors::ServiceError::Forbidden(
+                "Skill mutations require an authenticated user".to_string(),
+            )
+        })?;
         self.star_repo
             .unstar(company_id, skill_id, user_id)
             .await
@@ -540,11 +549,7 @@ impl SkillRegistryService for DefaultSkillRegistryServiceImpl {
             .map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))
     }
 
-    async fn delete_skill_files(
-        &self,
-        company_id: Uuid,
-        skill_id: Uuid,
-    ) -> ServiceResult<()> {
+    async fn delete_skill_files(&self, company_id: Uuid, skill_id: Uuid) -> ServiceResult<()> {
         self.file_repo
             .delete(company_id, skill_id)
             .await
@@ -575,12 +580,9 @@ impl SkillRegistryService for DefaultSkillRegistryServiceImpl {
             .map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))?;
 
         if let Some(catalog) = catalogs.first() {
-            let catalog_id_str = catalog
-                .get("id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    crate::errors::ServiceError::Internal("Invalid catalog id".to_string())
-                })?;
+            let catalog_id_str = catalog.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                crate::errors::ServiceError::Internal("Invalid catalog id".to_string())
+            })?;
             let catalog_id: Uuid = catalog_id_str.parse().map_err(|_| {
                 crate::errors::ServiceError::Internal("Invalid catalog id format".to_string())
             })?;

@@ -1,15 +1,18 @@
 use async_trait::async_trait;
 use chrono::Utc;
-use repositories::{PipelineRepository, PipelineCaseRepository, PipelineStageRepository, PipelineTransitionRepository};
+use repositories::{
+    PipelineCaseRepository, PipelineRepository, PipelineStageRepository,
+    PipelineTransitionRepository,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use models::pipeline::{
-    Pipeline, PipelineStage, PipelineCase, PipelineTransition, CaseEvent,
-    PipelineStageKind, TerminalKind, PipelineStageConfig, CreatePipelineInput
-};
 use crate::ServiceError;
+use models::pipeline::{
+    CaseEvent, CreatePipelineInput, Pipeline, PipelineCase, PipelineStage, PipelineStageConfig,
+    PipelineStageKind, PipelineTransition, TerminalKind,
+};
 
 /// Case advancement input
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +73,12 @@ pub struct HealthWarning {
 /// Pipeline Service trait
 #[async_trait]
 pub trait PipelineService: Send + Sync {
+    async fn list_by_company(&self, company_id: Uuid) -> Result<Vec<Pipeline>, ServiceError>;
+    async fn list_stages(&self, pipeline_id: Uuid) -> Result<Vec<PipelineStage>, ServiceError>;
+    async fn list_transitions(
+        &self,
+        pipeline_id: Uuid,
+    ) -> Result<Vec<PipelineTransition>, ServiceError>;
     /// Create pipeline with stages and transitions
     async fn create_pipeline(&self, input: CreatePipelineInput) -> Result<Pipeline, ServiceError>;
 
@@ -86,13 +95,25 @@ pub trait PipelineService: Send + Sync {
     async fn get_case(&self, id: Uuid) -> Result<PipelineCase, ServiceError>;
 
     /// List cases in pipeline
-    async fn list_cases(&self, pipeline_id: Uuid, stage_id: Option<Uuid>) -> Result<Vec<PipelineCase>, ServiceError>;
+    async fn list_cases(
+        &self,
+        pipeline_id: Uuid,
+        stage_id: Option<Uuid>,
+    ) -> Result<Vec<PipelineCase>, ServiceError>;
 
     /// Mark case as terminal (done/cancelled)
-    async fn mark_terminal(&self, case_id: Uuid, kind: TerminalKind) -> Result<PipelineCase, ServiceError>;
+    async fn mark_terminal(
+        &self,
+        case_id: Uuid,
+        kind: TerminalKind,
+    ) -> Result<PipelineCase, ServiceError>;
 
     /// Validate transition is allowed
-    async fn validate_transition(&self, case_id: Uuid, to_stage_id: Uuid) -> Result<bool, ServiceError>;
+    async fn validate_transition(
+        &self,
+        case_id: Uuid,
+        to_stage_id: Uuid,
+    ) -> Result<bool, ServiceError>;
 
     /// Get case history (events)
     async fn get_case_events(&self, case_id: Uuid) -> Result<Vec<CaseEvent>, ServiceError>;
@@ -104,16 +125,29 @@ pub trait PipelineService: Send + Sync {
     async fn review_case(&self, input: CaseReviewInput) -> Result<PipelineCase, ServiceError>;
 
     /// Breakdown a case into sub-cases
-    async fn breakdown_case(&self, case_id: Uuid, sub_cases: Vec<CreateCaseInput>) -> Result<Vec<PipelineCase>, ServiceError>;
+    async fn breakdown_case(
+        &self,
+        case_id: Uuid,
+        sub_cases: Vec<CreateCaseInput>,
+    ) -> Result<Vec<PipelineCase>, ServiceError>;
 
     /// Bulk review cases
-    async fn bulk_review_cases(&self, reviews: Vec<CaseReviewInput>) -> Result<BulkReviewResult, ServiceError>;
+    async fn bulk_review_cases(
+        &self,
+        reviews: Vec<CaseReviewInput>,
+    ) -> Result<BulkReviewResult, ServiceError>;
 
     /// Get health warnings for a pipeline
-    async fn get_health_warnings(&self, pipeline_id: Uuid) -> Result<Vec<HealthWarning>, ServiceError>;
+    async fn get_health_warnings(
+        &self,
+        pipeline_id: Uuid,
+    ) -> Result<Vec<HealthWarning>, ServiceError>;
 
     /// Get pipelines needing attention for a company
-    async fn get_pipelines_attention(&self, company_id: Uuid) -> Result<Vec<HealthWarning>, ServiceError>;
+    async fn get_pipelines_attention(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<HealthWarning>, ServiceError>;
 }
 
 /// Default Pipeline Service Implementation
@@ -168,11 +202,18 @@ impl DefaultPipelineService {
 
     /// Check if stage is terminal
     fn is_terminal_stage(&self, stage_kind: PipelineStageKind) -> bool {
-        matches!(stage_kind, PipelineStageKind::Done | PipelineStageKind::Cancelled)
+        matches!(
+            stage_kind,
+            PipelineStageKind::Done | PipelineStageKind::Cancelled
+        )
     }
 
     /// Evaluate transition conditions
-    async fn evaluate_conditions(&self, _case: &PipelineCase, conditions: &serde_json::Value) -> Result<bool, ServiceError> {
+    async fn evaluate_conditions(
+        &self,
+        _case: &PipelineCase,
+        conditions: &serde_json::Value,
+    ) -> Result<bool, ServiceError> {
         // Simplified condition evaluation
         // Full implementation would parse conditions and evaluate against case state
 
@@ -189,6 +230,29 @@ impl DefaultPipelineService {
 
 #[async_trait]
 impl PipelineService for DefaultPipelineService {
+    async fn list_by_company(&self, company_id: Uuid) -> Result<Vec<Pipeline>, ServiceError> {
+        self.pipeline_repo
+            .list_by_company(company_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list pipelines: {}", e)))
+    }
+
+    async fn list_stages(&self, pipeline_id: Uuid) -> Result<Vec<PipelineStage>, ServiceError> {
+        self.stage_repo
+            .find_by_pipeline_id(pipeline_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list stages: {}", e)))
+    }
+
+    async fn list_transitions(
+        &self,
+        pipeline_id: Uuid,
+    ) -> Result<Vec<PipelineTransition>, ServiceError> {
+        self.transition_repo
+            .find_by_pipeline_id(pipeline_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list transitions: {}", e)))
+    }
     async fn create_pipeline(&self, input: CreatePipelineInput) -> Result<Pipeline, ServiceError> {
         let now = Utc::now();
 
@@ -205,7 +269,8 @@ impl PipelineService for DefaultPipelineService {
             updated_at: now,
         };
 
-        let created_pipeline = self.pipeline_repo
+        let created_pipeline = self
+            .pipeline_repo
             .create(pipeline.clone())
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to create pipeline: {}", e)))?;
@@ -220,16 +285,17 @@ impl PipelineService for DefaultPipelineService {
                 name: stage_input.name.clone(),
                 kind: stage_input.kind,
                 position: stage_input.position,
-                config: serde_json::to_value(&stage_input.config)
-                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize config: {}", e)))?,
+                config: serde_json::to_value(&stage_input.config).map_err(|e| {
+                    ServiceError::Internal(format!("Failed to serialize config: {}", e))
+                })?,
                 created_at: now,
                 updated_at: now,
             };
 
-            let created_stage = self.stage_repo
-                .create(stage)
-                .await
-                .map_err(|e| ServiceError::Internal(format!("Failed to create stage: {}", e)))?;
+            let created_stage =
+                self.stage_repo.create(stage).await.map_err(|e| {
+                    ServiceError::Internal(format!("Failed to create stage: {}", e))
+                })?;
 
             stage_ids.insert(stage_input.key.clone(), created_stage.id);
         }
@@ -247,14 +313,17 @@ impl PipelineService for DefaultPipelineService {
                 pipeline_id: created_pipeline.id,
                 from_stage_id,
                 to_stage_id,
-                label: Some(format!("{} -> {}", sorted_stages[i].name, sorted_stages[i + 1].name)),
+                label: Some(format!(
+                    "{} -> {}",
+                    sorted_stages[i].name,
+                    sorted_stages[i + 1].name
+                )),
                 conditions: serde_json::json!({}),
             };
 
-            self.transition_repo
-                .create(transition)
-                .await
-                .map_err(|e| ServiceError::Internal(format!("Failed to create transition: {}", e)))?;
+            self.transition_repo.create(transition).await.map_err(|e| {
+                ServiceError::Internal(format!("Failed to create transition: {}", e))
+            })?;
         }
 
         Ok(created_pipeline)
@@ -272,14 +341,17 @@ impl PipelineService for DefaultPipelineService {
         // Verify pipeline and stage exist
         let pipeline = self.get_pipeline(input.pipeline_id).await?;
 
-        let stage = self.stage_repo
+        let stage = self
+            .stage_repo
             .find_by_id(input.stage_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find stage: {}", e)))?
             .ok_or_else(|| ServiceError::NotFound("Stage not found".to_string()))?;
 
         if stage.pipeline_id != pipeline.id {
-            return Err(ServiceError::InvalidInput("Stage does not belong to pipeline".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "Stage does not belong to pipeline".to_string(),
+            ));
         }
 
         let now = Utc::now();
@@ -299,7 +371,8 @@ impl PipelineService for DefaultPipelineService {
             updated_at: now,
         };
 
-        let created_case = self.case_repo
+        let created_case = self
+            .case_repo
             .create(case)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to create case: {}", e)))?;
@@ -315,7 +388,8 @@ impl PipelineService for DefaultPipelineService {
             }),
             None,
             None,
-        ).await?;
+        )
+        .await?;
 
         Ok(created_case)
     }
@@ -326,11 +400,14 @@ impl PipelineService for DefaultPipelineService {
 
         // Check if case is terminal
         if case.terminal_kind.is_some() {
-            return Err(ServiceError::InvalidInput("Cannot advance terminal case".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "Cannot advance terminal case".to_string(),
+            ));
         }
 
         // Get target stage
-        let to_stage = self.stage_repo
+        let to_stage = self
+            .stage_repo
             .find_by_id(input.to_stage_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find target stage: {}", e)))?
@@ -365,16 +442,13 @@ impl PipelineService for DefaultPipelineService {
         }
 
         // Update case
-        let updated_case = self.case_repo
-            .update(case)
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("version") {
-                    ServiceError::Conflict("Case was modified by another operation".to_string())
-                } else {
-                    ServiceError::Internal(format!("Failed to update case: {}", e))
-                }
-            })?;
+        let updated_case = self.case_repo.update(case).await.map_err(|e| {
+            if e.to_string().contains("version") {
+                ServiceError::Conflict("Case was modified by another operation".to_string())
+            } else {
+                ServiceError::Internal(format!("Failed to update case: {}", e))
+            }
+        })?;
 
         // Record advancement event
         self.record_event(
@@ -387,7 +461,8 @@ impl PipelineService for DefaultPipelineService {
             }),
             input.actor_type,
             input.actor_id,
-        ).await?;
+        )
+        .await?;
 
         Ok(updated_case)
     }
@@ -400,7 +475,11 @@ impl PipelineService for DefaultPipelineService {
             .ok_or_else(|| ServiceError::NotFound("Case not found".to_string()))
     }
 
-    async fn list_cases(&self, pipeline_id: Uuid, stage_id: Option<Uuid>) -> Result<Vec<PipelineCase>, ServiceError> {
+    async fn list_cases(
+        &self,
+        pipeline_id: Uuid,
+        stage_id: Option<Uuid>,
+    ) -> Result<Vec<PipelineCase>, ServiceError> {
         if let Some(stage_id) = stage_id {
             self.case_repo
                 .find_by_stage_id(stage_id)
@@ -414,18 +493,25 @@ impl PipelineService for DefaultPipelineService {
         }
     }
 
-    async fn mark_terminal(&self, case_id: Uuid, kind: TerminalKind) -> Result<PipelineCase, ServiceError> {
+    async fn mark_terminal(
+        &self,
+        case_id: Uuid,
+        kind: TerminalKind,
+    ) -> Result<PipelineCase, ServiceError> {
         let mut case = self.get_case(case_id).await?;
 
         if case.terminal_kind.is_some() {
-            return Err(ServiceError::InvalidInput("Case is already terminal".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "Case is already terminal".to_string(),
+            ));
         }
 
         case.terminal_kind = Some(kind);
         case.version += 1;
         case.updated_at = Utc::now();
 
-        let updated_case = self.case_repo
+        let updated_case = self
+            .case_repo
             .update(case)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to update case: {}", e)))?;
@@ -439,16 +525,22 @@ impl PipelineService for DefaultPipelineService {
             }),
             None,
             None,
-        ).await?;
+        )
+        .await?;
 
         Ok(updated_case)
     }
 
-    async fn validate_transition(&self, case_id: Uuid, to_stage_id: Uuid) -> Result<bool, ServiceError> {
+    async fn validate_transition(
+        &self,
+        case_id: Uuid,
+        to_stage_id: Uuid,
+    ) -> Result<bool, ServiceError> {
         let case = self.get_case(case_id).await?;
 
         // Find valid transitions from current stage
-        let transitions = self.transition_repo
+        let transitions = self
+            .transition_repo
             .find_by_from_stage_id(case.stage_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find transitions: {}", e)))?;
@@ -459,7 +551,8 @@ impl PipelineService for DefaultPipelineService {
         match valid_transition {
             Some(transition) => {
                 // Evaluate transition conditions
-                self.evaluate_conditions(&case, &transition.conditions).await
+                self.evaluate_conditions(&case, &transition.conditions)
+                    .await
             }
             None => Ok(false),
         }
@@ -476,7 +569,8 @@ impl PipelineService for DefaultPipelineService {
         let case = self.get_case(case_id).await?;
 
         // Get current stage config
-        let stage = self.stage_repo
+        let stage = self
+            .stage_repo
             .find_by_id(case.stage_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find stage: {}", e)))?
@@ -490,7 +584,8 @@ impl PipelineService for DefaultPipelineService {
         }
 
         // Check if all children are terminal
-        let children = self.case_repo
+        let children = self
+            .case_repo
             .find_by_parent_case_id(case_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find child cases: {}", e)))?;
@@ -505,8 +600,7 @@ impl PipelineService for DefaultPipelineService {
         }
 
         // Determine next stage from config - use approve_to_stage_key or find next by position
-        let next_stage_key = config.approve_to_stage_key.clone()
-            .unwrap_or_default();
+        let next_stage_key = config.approve_to_stage_key.clone().unwrap_or_default();
 
         let next_stage = if !next_stage_key.is_empty() {
             // Find by configured key
@@ -516,12 +610,12 @@ impl PipelineService for DefaultPipelineService {
                 .map_err(|e| ServiceError::Internal(format!("Failed to find next stage: {}", e)))?
         } else {
             // Find next stage by position
-            let stages = self.stage_repo
+            let stages = self
+                .stage_repo
                 .find_by_pipeline_id(case.pipeline_id)
                 .await
                 .map_err(|e| ServiceError::Internal(format!("Failed to list stages: {}", e)))?;
-            stages.into_iter()
-                .find(|s| s.position > stage.position)
+            stages.into_iter().find(|s| s.position > stage.position)
         };
 
         if let Some(target_stage) = next_stage {
@@ -543,11 +637,14 @@ impl PipelineService for DefaultPipelineService {
         let case = self.get_case(input.case_id).await?;
 
         if case.terminal_kind.is_some() {
-            return Err(ServiceError::InvalidInput("Cannot review terminal case".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "Cannot review terminal case".to_string(),
+            ));
         }
 
         // Get current stage to find target stage based on decision
-        let stage = self.stage_repo
+        let stage = self
+            .stage_repo
             .find_by_id(case.stage_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find stage: {}", e)))?
@@ -568,11 +665,14 @@ impl PipelineService for DefaultPipelineService {
         // Record review event
         self.record_event(
             input.case_id,
-            format!("case.review.{}", match input.decision {
-                CaseReviewDecision::Approve => "approved",
-                CaseReviewDecision::Reject => "rejected",
-                CaseReviewDecision::RequestChanges => "changes_requested",
-            }),
+            format!(
+                "case.review.{}",
+                match input.decision {
+                    CaseReviewDecision::Approve => "approved",
+                    CaseReviewDecision::Reject => "rejected",
+                    CaseReviewDecision::RequestChanges => "changes_requested",
+                }
+            ),
             serde_json::json!({
                 "decision": input.decision,
                 "reason": input.reason,
@@ -581,13 +681,17 @@ impl PipelineService for DefaultPipelineService {
             }),
             actor_type.clone(),
             actor_id,
-        ).await?;
+        )
+        .await?;
 
         if let Some(to_stage_key) = target_stage_key {
-            let target_stage = self.stage_repo
+            let target_stage = self
+                .stage_repo
                 .find_by_key(case.pipeline_id, to_stage_key.as_str())
                 .await
-                .map_err(|e| ServiceError::Internal(format!("Failed to find target stage: {}", e)))?;
+                .map_err(|e| {
+                    ServiceError::Internal(format!("Failed to find target stage: {}", e))
+                })?;
 
             if let Some(target_stage) = target_stage {
                 let advance_input = AdvanceCaseInput {
@@ -605,11 +709,17 @@ impl PipelineService for DefaultPipelineService {
         self.get_case(input.case_id).await
     }
 
-    async fn breakdown_case(&self, case_id: Uuid, sub_cases: Vec<CreateCaseInput>) -> Result<Vec<PipelineCase>, ServiceError> {
+    async fn breakdown_case(
+        &self,
+        case_id: Uuid,
+        sub_cases: Vec<CreateCaseInput>,
+    ) -> Result<Vec<PipelineCase>, ServiceError> {
         let parent = self.get_case(case_id).await?;
 
         if parent.terminal_kind.is_some() {
-            return Err(ServiceError::InvalidInput("Cannot breakdown terminal case".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "Cannot breakdown terminal case".to_string(),
+            ));
         }
 
         let mut created_cases = Vec::new();
@@ -631,12 +741,16 @@ impl PipelineService for DefaultPipelineService {
             }),
             None,
             None,
-        ).await?;
+        )
+        .await?;
 
         Ok(created_cases)
     }
 
-    async fn bulk_review_cases(&self, reviews: Vec<CaseReviewInput>) -> Result<BulkReviewResult, ServiceError> {
+    async fn bulk_review_cases(
+        &self,
+        reviews: Vec<CaseReviewInput>,
+    ) -> Result<BulkReviewResult, ServiceError> {
         let mut succeeded = Vec::new();
         let mut failed = Vec::new();
 
@@ -651,11 +765,15 @@ impl PipelineService for DefaultPipelineService {
         Ok(BulkReviewResult { succeeded, failed })
     }
 
-    async fn get_health_warnings(&self, pipeline_id: Uuid) -> Result<Vec<HealthWarning>, ServiceError> {
+    async fn get_health_warnings(
+        &self,
+        pipeline_id: Uuid,
+    ) -> Result<Vec<HealthWarning>, ServiceError> {
         let mut warnings = Vec::new();
 
         // Get all cases in pipeline
-        let cases = self.case_repo
+        let cases = self
+            .case_repo
             .find_by_pipeline_id(pipeline_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list cases: {}", e)))?;
@@ -670,7 +788,11 @@ impl PipelineService for DefaultPipelineService {
                     warning_type: "stalled_case".to_string(),
                     pipeline_id,
                     case_id: case.id,
-                    message: format!("Case '{}' has been in stage for {} days without progress", case.title, age.num_days()),
+                    message: format!(
+                        "Case '{}' has been in stage for {} days without progress",
+                        case.title,
+                        age.num_days()
+                    ),
                     severity: "warning".to_string(),
                 });
             }
@@ -681,7 +803,11 @@ impl PipelineService for DefaultPipelineService {
                     warning_type: "blocked_case".to_string(),
                     pipeline_id,
                     case_id: case.id,
-                    message: format!("Case '{}' has been blocked for {} days", case.title, age.num_days()),
+                    message: format!(
+                        "Case '{}' has been blocked for {} days",
+                        case.title,
+                        age.num_days()
+                    ),
                     severity: "critical".to_string(),
                 });
             }
@@ -690,11 +816,15 @@ impl PipelineService for DefaultPipelineService {
         Ok(warnings)
     }
 
-    async fn get_pipelines_attention(&self, company_id: Uuid) -> Result<Vec<HealthWarning>, ServiceError> {
+    async fn get_pipelines_attention(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<HealthWarning>, ServiceError> {
         let mut all_warnings = Vec::new();
 
         // Get all pipelines for company
-        let pipelines = self.pipeline_repo
+        let pipelines = self
+            .pipeline_repo
             .list_by_company(company_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list pipelines: {}", e)))?;

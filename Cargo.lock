@@ -114,6 +114,7 @@ dependencies = [
  "access",
  "adapters",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "garde",
@@ -130,6 +131,7 @@ dependencies = [
  "tower 0.4.13",
  "tower-http",
  "tracing",
+ "urlencoding",
  "uuid",
 ]
 
@@ -1701,6 +1703,7 @@ dependencies = [
  "chrono",
  "csv",
  "dashmap",
+ "futures",
  "hex",
  "hmac",
  "jwt",

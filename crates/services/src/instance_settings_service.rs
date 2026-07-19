@@ -53,12 +53,14 @@ impl Default for GeneralSettings {
 #[serde(rename_all = "camelCase")]
 pub struct ExperimentalSettings {
     pub issue_graph_liveness_auto_recovery: bool,
+    pub enable_cloud_sync: bool,
 }
 
 impl Default for ExperimentalSettings {
     fn default() -> Self {
         Self {
             issue_graph_liveness_auto_recovery: false,
+            enable_cloud_sync: false,
         }
     }
 }
@@ -94,19 +96,28 @@ pub trait InstanceSettingsService: Send + Sync {
     async fn get_settings(&self) -> Result<InstanceSettings, String>;
 
     /// 更新实例设置
-    async fn update_settings(&self, settings: serde_json::Value) -> Result<InstanceSettings, String>;
+    async fn update_settings(
+        &self,
+        settings: serde_json::Value,
+    ) -> Result<InstanceSettings, String>;
 
     /// 获取通用设置
     async fn get_general_settings(&self) -> Result<GeneralSettings, String>;
 
     /// 更新通用设置
-    async fn update_general_settings(&self, settings: serde_json::Value) -> Result<GeneralSettings, String>;
+    async fn update_general_settings(
+        &self,
+        settings: serde_json::Value,
+    ) -> Result<GeneralSettings, String>;
 
     /// 获取实验性功能设置
     async fn get_experimental_settings(&self) -> Result<ExperimentalSettings, String>;
 
     /// 更新实验性功能设置
-    async fn update_experimental_settings(&self, settings: serde_json::Value) -> Result<ExperimentalSettings, String>;
+    async fn update_experimental_settings(
+        &self,
+        settings: serde_json::Value,
+    ) -> Result<ExperimentalSettings, String>;
 
     /// 预览自动恢复
     async fn preview_auto_recovery(&self) -> Result<AutoRecoveryPreview, String>;
@@ -144,7 +155,10 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         Ok(settings.clone())
     }
 
-    async fn update_settings(&self, updates: serde_json::Value) -> Result<InstanceSettings, String> {
+    async fn update_settings(
+        &self,
+        updates: serde_json::Value,
+    ) -> Result<InstanceSettings, String> {
         let mut settings = self.settings.write().await;
 
         if let Some(name) = updates.get("instanceName").and_then(|v| v.as_str()) {
@@ -162,7 +176,10 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         Ok(settings.general.clone())
     }
 
-    async fn update_general_settings(&self, updates: serde_json::Value) -> Result<GeneralSettings, String> {
+    async fn update_general_settings(
+        &self,
+        updates: serde_json::Value,
+    ) -> Result<GeneralSettings, String> {
         let mut settings = self.settings.write().await;
 
         if let Some(tz) = updates.get("timezone").and_then(|v| v.as_str()) {
@@ -180,10 +197,16 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         Ok(settings.experimental.clone())
     }
 
-    async fn update_experimental_settings(&self, updates: serde_json::Value) -> Result<ExperimentalSettings, String> {
+    async fn update_experimental_settings(
+        &self,
+        updates: serde_json::Value,
+    ) -> Result<ExperimentalSettings, String> {
         let mut settings = self.settings.write().await;
 
-        if let Some(val) = updates.get("issueGraphLivenessAutoRecovery").and_then(|v| v.as_bool()) {
+        if let Some(val) = updates
+            .get("issueGraphLivenessAutoRecovery")
+            .and_then(|v| v.as_bool())
+        {
             settings.experimental.issue_graph_liveness_auto_recovery = val;
         }
 

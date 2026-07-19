@@ -1,7 +1,7 @@
 use models::{
-    CreateProjectInput, CreateWorkspaceInput, Project, ProjectMembership, ProjectWorkspace,
-    UpdateProjectInput, AgentMembership, ResourceMemberships, ProjectMembershipWithProject,
-    AgentMembershipWithAgent, MembershipState,
+    AgentMembership, AgentMembershipWithAgent, CreateProjectInput, CreateWorkspaceInput,
+    MembershipState, Project, ProjectMembership, ProjectMembershipWithProject, ProjectWorkspace,
+    ResourceMemberships, UpdateProjectInput,
 };
 use sqlx::{PgPool, Result};
 use uuid::Uuid;
@@ -35,7 +35,11 @@ impl ProjectRepository {
         .bind(&input.color)
         .bind(&input.icon)
         .bind(&input.env)
-        .bind(input.execution_workspace_policy.unwrap_or(models::ExecutionWorkspacePolicy::Shared))
+        .bind(
+            input
+                .execution_workspace_policy
+                .unwrap_or(models::ExecutionWorkspacePolicy::Shared),
+        )
         .fetch_one(&self.pool)
         .await
     }
@@ -182,7 +186,46 @@ impl ProjectRepository {
         .await
     }
 
-    pub async fn get_primary_workspace(&self, project_id: Uuid) -> Result<Option<ProjectWorkspace>> {
+    pub async fn update_workspace(
+        &self,
+        project_id: Uuid,
+        workspace_id: Uuid,
+        name: Option<String>,
+        config: Option<serde_json::Value>,
+        is_primary: Option<bool>,
+    ) -> Result<Option<ProjectWorkspace>> {
+        sqlx::query_as::<_, ProjectWorkspace>(
+            "UPDATE project_workspaces SET name = COALESCE($3, name), config = COALESCE($4, config), is_primary = COALESCE($5, is_primary), updated_at = NOW() WHERE id = $1 AND project_id = $2 RETURNING *",
+        )
+        .bind(workspace_id)
+        .bind(project_id)
+        .bind(name)
+        .bind(config)
+        .bind(is_primary)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn external_object_summary(&self, project_id: Uuid) -> Result<serde_json::Value> {
+        let row = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM issues WHERE project_id = $1) AS issues, (SELECT COUNT(*) FROM agents a JOIN projects p ON p.company_id = a.company_id WHERE p.id = $1) AS agents, (SELECT COUNT(*) FROM project_workspaces WHERE project_id = $1) AS workspaces",
+        )
+        .bind(project_id)
+        .fetch_one(&self.pool)
+        .await?;
+        use sqlx::Row;
+        Ok(serde_json::json!({
+            "projectId": project_id,
+            "issues": row.get::<i64, _>("issues"),
+            "agents": row.get::<i64, _>("agents"),
+            "workspaces": row.get::<i64, _>("workspaces"),
+        }))
+    }
+
+    pub async fn get_primary_workspace(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<ProjectWorkspace>> {
         sqlx::query_as::<_, ProjectWorkspace>(
             "SELECT * FROM project_workspaces WHERE project_id = $1 AND is_primary = true",
         )
@@ -329,7 +372,10 @@ impl ProjectRepository {
         let mut project_memberships = Vec::new();
         for membership in memberships {
             if let Some(project) = self.get_by_id(membership.project_id).await? {
-                project_memberships.push(ProjectMembershipWithProject { membership, project });
+                project_memberships.push(ProjectMembershipWithProject {
+                    membership,
+                    project,
+                });
             }
         }
 
@@ -349,12 +395,11 @@ impl ProjectRepository {
 
         let mut agent_memberships = Vec::new();
         for membership in agent_memberships_raw {
-            let agent_info: Option<(String, String)> = sqlx::query_as(
-                r#"SELECT name, status FROM agents WHERE id = $1"#
-            )
-            .bind(membership.agent_id)
-            .fetch_optional(&self.pool)
-            .await?;
+            let agent_info: Option<(String, String)> =
+                sqlx::query_as(r#"SELECT name, status FROM agents WHERE id = $1"#)
+                    .bind(membership.agent_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
 
             if let Some((agent_name, agent_status)) = agent_info {
                 agent_memberships.push(AgentMembershipWithAgent {

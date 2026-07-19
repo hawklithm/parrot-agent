@@ -1,8 +1,9 @@
 use models::{
-    AgentMembership, AppResult, CreateProjectInput, CreateWorkspaceInput, Project, ProjectMembership,
-    ProjectWorkspace, ResourceMemberships, UpdateProjectInput, MembershipState,
+    AgentMembership, AppResult, CreateProjectInput, CreateWorkspaceInput, MembershipState, Project,
+    ProjectMembership, ProjectWorkspace, ResourceMemberships, UpdateProjectInput,
 };
 use repositories::ProjectRepository;
+use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 pub struct ProjectService {
@@ -44,7 +45,10 @@ impl ProjectService {
     }
 
     // Workspace operations
-    pub async fn create_workspace(&self, input: CreateWorkspaceInput) -> AppResult<ProjectWorkspace> {
+    pub async fn create_workspace(
+        &self,
+        input: CreateWorkspaceInput,
+    ) -> AppResult<ProjectWorkspace> {
         Ok(self.project_repo.create_workspace(input).await?)
     }
 
@@ -52,7 +56,31 @@ impl ProjectService {
         Ok(self.project_repo.list_workspaces(project_id).await?)
     }
 
-    pub async fn get_primary_workspace(&self, project_id: Uuid) -> AppResult<Option<ProjectWorkspace>> {
+    pub async fn update_workspace(
+        &self,
+        project_id: Uuid,
+        workspace_id: Uuid,
+        name: Option<String>,
+        config: Option<JsonValue>,
+        is_primary: Option<bool>,
+    ) -> AppResult<Option<ProjectWorkspace>> {
+        Ok(self
+            .project_repo
+            .update_workspace(project_id, workspace_id, name, config, is_primary)
+            .await?)
+    }
+
+    pub async fn external_object_summary(&self, project_id: Uuid) -> AppResult<serde_json::Value> {
+        Ok(self
+            .project_repo
+            .external_object_summary(project_id)
+            .await?)
+    }
+
+    pub async fn get_primary_workspace(
+        &self,
+        project_id: Uuid,
+    ) -> AppResult<Option<ProjectWorkspace>> {
         Ok(self.project_repo.get_primary_workspace(project_id).await?)
     }
 
@@ -61,8 +89,15 @@ impl ProjectService {
     }
 
     // Resource membership operations
-    pub async fn list_memberships_for_user(&self, company_id: Uuid, user_id: Uuid) -> AppResult<ResourceMemberships> {
-        Ok(self.project_repo.list_memberships_for_user(company_id, user_id).await?)
+    pub async fn list_memberships_for_user(
+        &self,
+        company_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<ResourceMemberships> {
+        Ok(self
+            .project_repo
+            .list_memberships_for_user(company_id, user_id)
+            .await?)
     }
 
     pub async fn update_project_membership(
@@ -73,7 +108,10 @@ impl ProjectService {
         state: MembershipState,
     ) -> AppResult<ProjectMembership> {
         // TODO: assert_mutation_allowed when AccessService is integrated
-        Ok(self.project_repo.upsert_project_membership(company_id, project_id, user_id, state).await?)
+        Ok(self
+            .project_repo
+            .upsert_project_membership(company_id, project_id, user_id, state)
+            .await?)
     }
 
     pub async fn star_project(
@@ -82,7 +120,10 @@ impl ProjectService {
         project_id: Uuid,
         user_id: Uuid,
     ) -> AppResult<ProjectMembership> {
-        Ok(self.project_repo.star_project(company_id, project_id, user_id).await?)
+        Ok(self
+            .project_repo
+            .star_project(company_id, project_id, user_id)
+            .await?)
     }
 
     pub async fn unstar_project(
@@ -91,7 +132,10 @@ impl ProjectService {
         project_id: Uuid,
         user_id: Uuid,
     ) -> AppResult<ProjectMembership> {
-        Ok(self.project_repo.unstar_project(company_id, project_id, user_id).await?)
+        Ok(self
+            .project_repo
+            .unstar_project(company_id, project_id, user_id)
+            .await?)
     }
 
     /// Upsert an agent membership (joined/left + optional starred).

@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use models::{Approval, ApprovalType, ApprovalStatus};
-use models::event_bus::{EventBus, SystemEvent, SystemEventPayload, ApprovalEvent, EventMetadata};
 use crate::ServiceError;
+use models::event_bus::{ApprovalEvent, EventBus, EventMetadata, SystemEvent, SystemEventPayload};
+use models::{Approval, ApprovalStatus, ApprovalType};
 
 /// Create Approval Input
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +55,17 @@ pub trait ApprovalService: Send + Sync {
     async fn get_by_id(&self, id: Uuid) -> Result<ApprovalWithContext, ServiceError>;
 
     /// List approvals by company
-    async fn list_by_company(&self, company_id: Uuid, status: Option<ApprovalStatus>) -> Result<Vec<Approval>, ServiceError>;
+    async fn list_by_company(
+        &self,
+        company_id: Uuid,
+        status: Option<ApprovalStatus>,
+    ) -> Result<Vec<Approval>, ServiceError>;
 
     /// List pending approvals for user
-    async fn list_pending_for_user(&self, user_id: Uuid) -> Result<Vec<ApprovalWithContext>, ServiceError>;
+    async fn list_pending_for_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<ApprovalWithContext>, ServiceError>;
 
     /// Review approval (approve/reject/request revision)
     async fn review(&self, input: ReviewApprovalInput) -> Result<Approval, ServiceError>;
@@ -98,39 +105,90 @@ impl DefaultApprovalService {
     }
 
     /// Validate approval payload based on type
-    fn validate_payload(&self, approval_type: ApprovalType, payload: &serde_json::Value) -> Result<(), ServiceError> {
+    fn validate_payload(
+        &self,
+        approval_type: ApprovalType,
+        payload: &serde_json::Value,
+    ) -> Result<(), ServiceError> {
         match approval_type {
             ApprovalType::HireAgent => {
                 // Validate agent hiring payload
                 if !payload.get("agent_role").is_some() {
-                    return Err(ServiceError::InvalidInput("Missing agent_role in payload".to_string()));
+                    return Err(ServiceError::InvalidInput(
+                        "Missing agent_role in payload".to_string(),
+                    ));
                 }
                 if !payload.get("agent_name").is_some() {
-                    return Err(ServiceError::InvalidInput("Missing agent_name in payload".to_string()));
+                    return Err(ServiceError::InvalidInput(
+                        "Missing agent_name in payload".to_string(),
+                    ));
                 }
             }
             ApprovalType::SpendCredits => {
                 // Validate credit spending payload
                 if !payload.get("amount").and_then(|v| v.as_i64()).is_some() {
-                    return Err(ServiceError::InvalidInput("Missing or invalid amount in payload".to_string()));
+                    return Err(ServiceError::InvalidInput(
+                        "Missing or invalid amount in payload".to_string(),
+                    ));
                 }
                 if !payload.get("purpose").is_some() {
-                    return Err(ServiceError::InvalidInput("Missing purpose in payload".to_string()));
+                    return Err(ServiceError::InvalidInput(
+                        "Missing purpose in payload".to_string(),
+                    ));
                 }
             }
             ApprovalType::CreateResource => {
                 // Validate resource creation payload
                 if !payload.get("resource_type").is_some() {
-                    return Err(ServiceError::InvalidInput("Missing resource_type in payload".to_string()));
+                    return Err(ServiceError::InvalidInput(
+                        "Missing resource_type in payload".to_string(),
+                    ));
                 }
             }
             ApprovalType::DeployAgent => {
                 // Validate agent deployment payload
                 if !payload.get("agent_id").and_then(|v| v.as_str()).is_some() {
-                    return Err(ServiceError::InvalidInput("Missing agent_id in payload".to_string()));
+                    return Err(ServiceError::InvalidInput(
+                        "Missing agent_id in payload".to_string(),
+                    ));
                 }
                 if !payload.get("environment").is_some() {
-                    return Err(ServiceError::InvalidInput("Missing environment in payload".to_string()));
+                    return Err(ServiceError::InvalidInput(
+                        "Missing environment in payload".to_string(),
+                    ));
+                }
+            }
+            ApprovalType::BudgetOverrideRequired => {
+                for field in [
+                    "scopeType",
+                    "scopeId",
+                    "metric",
+                    "windowKind",
+                    "thresholdType",
+                    "policyId",
+                ] {
+                    if payload
+                        .get(field)
+                        .and_then(|value| value.as_str())
+                        .is_none()
+                    {
+                        return Err(ServiceError::InvalidInput(format!(
+                            "Missing {} in budget override payload",
+                            field
+                        )));
+                    }
+                }
+                for field in ["budgetAmount", "observedAmount"] {
+                    if payload
+                        .get(field)
+                        .and_then(|value| value.as_f64())
+                        .is_none()
+                    {
+                        return Err(ServiceError::InvalidInput(format!(
+                            "Missing or invalid {} in budget override payload",
+                            field
+                        )));
+                    }
                 }
             }
         }
@@ -139,7 +197,11 @@ impl DefaultApprovalService {
     }
 
     /// Send notification about approval status change
-    async fn notify_approval_change(&self, approval: &Approval, decision: Option<ApprovalDecision>) -> Result<(), ServiceError> {
+    async fn notify_approval_change(
+        &self,
+        approval: &Approval,
+        decision: Option<ApprovalDecision>,
+    ) -> Result<(), ServiceError> {
         let _event_type = match decision {
             Some(ApprovalDecision::Approve) => "approval.approved",
             Some(ApprovalDecision::Reject) => "approval.rejected",
@@ -149,7 +211,8 @@ impl DefaultApprovalService {
 
         // Publish event to EventBus if available
         if let Some(ref event_bus) = self.event_bus {
-            let linked_issue_ids = self.approval_repo
+            let linked_issue_ids = self
+                .approval_repo
                 .find_linked_issues(approval.id)
                 .await
                 .unwrap_or_default();
@@ -207,7 +270,9 @@ impl ApprovalService for DefaultApprovalService {
     async fn create(&self, input: CreateApprovalInput) -> Result<Approval, ServiceError> {
         // Validate requester
         if input.requested_by_agent_id.is_none() && input.requested_by_user_id.is_none() {
-            return Err(ServiceError::InvalidInput("Either agent_id or user_id must be provided".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "Either agent_id or user_id must be provided".to_string(),
+            ));
         }
 
         // Validate payload
@@ -215,13 +280,17 @@ impl ApprovalService for DefaultApprovalService {
 
         // Validate linked issues exist
         for issue_id in &input.linked_issue_ids {
-            let issue = self.issue_repo
+            let issue = self
+                .issue_repo
                 .get_by_id(*issue_id)
                 .await
                 .map_err(|e| ServiceError::Internal(format!("Failed to find issue: {}", e)))?;
 
             if issue.is_none() {
-                return Err(ServiceError::NotFound(format!("Issue {} not found", issue_id)));
+                return Err(ServiceError::NotFound(format!(
+                    "Issue {} not found",
+                    issue_id
+                )));
             }
         }
 
@@ -242,7 +311,8 @@ impl ApprovalService for DefaultApprovalService {
         };
 
         // Create approval
-        let created_approval = self.approval_repo
+        let created_approval = self
+            .approval_repo
             .create(approval.clone())
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to create approval: {}", e)))?;
@@ -252,7 +322,9 @@ impl ApprovalService for DefaultApprovalService {
             self.approval_repo
                 .link_to_issue(created_approval.id, issue_id)
                 .await
-                .map_err(|e| ServiceError::Internal(format!("Failed to link approval to issue: {}", e)))?;
+                .map_err(|e| {
+                    ServiceError::Internal(format!("Failed to link approval to issue: {}", e))
+                })?;
         }
 
         // Send notification
@@ -262,13 +334,15 @@ impl ApprovalService for DefaultApprovalService {
     }
 
     async fn get_by_id(&self, id: Uuid) -> Result<ApprovalWithContext, ServiceError> {
-        let approval = self.approval_repo
+        let approval = self
+            .approval_repo
             .find_by_id(id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find approval: {}", e)))?
             .ok_or_else(|| ServiceError::NotFound("Approval not found".to_string()))?;
 
-        let linked_issue_ids = self.approval_repo
+        let linked_issue_ids = self
+            .approval_repo
             .find_linked_issues(id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find linked issues: {}", e)))?;
@@ -282,27 +356,40 @@ impl ApprovalService for DefaultApprovalService {
         })
     }
 
-    async fn list_by_company(&self, company_id: Uuid, status: Option<ApprovalStatus>) -> Result<Vec<Approval>, ServiceError> {
+    async fn list_by_company(
+        &self,
+        company_id: Uuid,
+        status: Option<ApprovalStatus>,
+    ) -> Result<Vec<Approval>, ServiceError> {
         self.approval_repo
             .find_by_company_id(company_id, status)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list approvals: {}", e)))
     }
 
-    async fn list_pending_for_user(&self, user_id: Uuid) -> Result<Vec<ApprovalWithContext>, ServiceError> {
+    async fn list_pending_for_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<ApprovalWithContext>, ServiceError> {
         // Get user's company memberships
         // For now, simplified - get all pending approvals the user can see
-        let approvals = self.approval_repo
+        let approvals = self
+            .approval_repo
             .find_pending_for_reviewer(user_id)
             .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to list pending approvals: {}", e)))?;
+            .map_err(|e| {
+                ServiceError::Internal(format!("Failed to list pending approvals: {}", e))
+            })?;
 
         let mut results = Vec::new();
         for approval in approvals {
-            let linked_issue_ids = self.approval_repo
+            let linked_issue_ids = self
+                .approval_repo
                 .find_linked_issues(approval.id)
                 .await
-                .map_err(|e| ServiceError::Internal(format!("Failed to find linked issues: {}", e)))?;
+                .map_err(|e| {
+                    ServiceError::Internal(format!("Failed to find linked issues: {}", e))
+                })?;
 
             let can_proceed = self.check_can_proceed(approval.id).await?;
 
@@ -317,7 +404,8 @@ impl ApprovalService for DefaultApprovalService {
     }
 
     async fn review(&self, input: ReviewApprovalInput) -> Result<Approval, ServiceError> {
-        let mut approval = self.approval_repo
+        let mut approval = self
+            .approval_repo
             .find_by_id(input.approval_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find approval: {}", e)))?
@@ -349,13 +437,15 @@ impl ApprovalService for DefaultApprovalService {
         approval.updated_at = Utc::now();
 
         // Update approval
-        let updated_approval = self.approval_repo
+        let updated_approval = self
+            .approval_repo
             .update(approval)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to update approval: {}", e)))?;
 
         // Send notification
-        self.notify_approval_change(&updated_approval, Some(input.decision)).await?;
+        self.notify_approval_change(&updated_approval, Some(input.decision))
+            .await?;
 
         // If approved, publish event to unblock linked issues
         if input.decision == ApprovalDecision::Approve {
@@ -367,15 +457,20 @@ impl ApprovalService for DefaultApprovalService {
     }
 
     async fn cancel(&self, approval_id: Uuid, user_id: Uuid) -> Result<Approval, ServiceError> {
-        let mut approval = self.approval_repo
+        let mut approval = self
+            .approval_repo
             .find_by_id(approval_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find approval: {}", e)))?
             .ok_or_else(|| ServiceError::NotFound("Approval not found".to_string()))?;
 
         // Check if approval can be cancelled
-        if approval.status != ApprovalStatus::Pending && approval.status != ApprovalStatus::RevisionRequested {
-            return Err(ServiceError::InvalidInput("Only pending or revision-requested approvals can be cancelled".to_string()));
+        if approval.status != ApprovalStatus::Pending
+            && approval.status != ApprovalStatus::RevisionRequested
+        {
+            return Err(ServiceError::InvalidInput(
+                "Only pending or revision-requested approvals can be cancelled".to_string(),
+            ));
         }
 
         // Check if user is the requester
@@ -383,7 +478,9 @@ impl ApprovalService for DefaultApprovalService {
             || approval.requested_by_agent_id.is_some(); // Agent-requested can be cancelled by any board user
 
         if !is_requester {
-            return Err(ServiceError::Forbidden("Only the requester can cancel this approval".to_string()));
+            return Err(ServiceError::Forbidden(
+                "Only the requester can cancel this approval".to_string(),
+            ));
         }
 
         approval.status = ApprovalStatus::Rejected;
@@ -392,7 +489,8 @@ impl ApprovalService for DefaultApprovalService {
         approval.decision_note = Some("Cancelled by requester".to_string());
         approval.updated_at = Utc::now();
 
-        let updated_approval = self.approval_repo
+        let updated_approval = self
+            .approval_repo
             .update(approval)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to update approval: {}", e)))?;
@@ -401,7 +499,8 @@ impl ApprovalService for DefaultApprovalService {
     }
 
     async fn check_can_proceed(&self, approval_id: Uuid) -> Result<bool, ServiceError> {
-        let approval = self.approval_repo
+        let approval = self
+            .approval_repo
             .find_by_id(approval_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find approval: {}", e)))?
@@ -413,13 +512,15 @@ impl ApprovalService for DefaultApprovalService {
         }
 
         // Check if all linked issues are resolved
-        let linked_issue_ids = self.approval_repo
+        let linked_issue_ids = self
+            .approval_repo
             .find_linked_issues(approval_id)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to find linked issues: {}", e)))?;
 
         for issue_id in linked_issue_ids {
-            let issue = self.issue_repo
+            let issue = self
+                .issue_repo
                 .get_by_id(issue_id)
                 .await
                 .map_err(|e| ServiceError::Internal(format!("Failed to find issue: {}", e)))?
@@ -443,7 +544,9 @@ impl ApprovalService for DefaultApprovalService {
         self.approval_repo
             .find_by_issue_id(issue_id)
             .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to find approvals for issue: {}", e)))
+            .map_err(|e| {
+                ServiceError::Internal(format!("Failed to find approvals for issue: {}", e))
+            })
     }
 }
 
@@ -465,14 +568,18 @@ mod tests {
             "budget": 1000
         });
 
-        assert!(service.validate_payload(ApprovalType::HireAgent, &valid_payload).is_ok());
+        assert!(service
+            .validate_payload(ApprovalType::HireAgent, &valid_payload)
+            .is_ok());
 
         // Invalid payload - missing agent_role
         let invalid_payload = serde_json::json!({
             "agent_name": "Research Agent"
         });
 
-        assert!(service.validate_payload(ApprovalType::HireAgent, &invalid_payload).is_err());
+        assert!(service
+            .validate_payload(ApprovalType::HireAgent, &invalid_payload)
+            .is_err());
     }
 
     #[test]
@@ -488,13 +595,17 @@ mod tests {
             "purpose": "API calls for data analysis"
         });
 
-        assert!(service.validate_payload(ApprovalType::SpendCredits, &valid_payload).is_ok());
+        assert!(service
+            .validate_payload(ApprovalType::SpendCredits, &valid_payload)
+            .is_ok());
 
         // Invalid payload - missing amount
         let invalid_payload = serde_json::json!({
             "purpose": "API calls"
         });
 
-        assert!(service.validate_payload(ApprovalType::SpendCredits, &invalid_payload).is_err());
+        assert!(service
+            .validate_payload(ApprovalType::SpendCredits, &invalid_payload)
+            .is_err());
     }
 }

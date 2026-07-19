@@ -10,10 +10,10 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 
+use access::DefaultAccessService;
 use api::app_state::AppState;
 use api::create_router;
 use models::event_bus::EventBus;
-use access::DefaultAccessService;
 use repositories::{
     agent_api_key_repository::PgAgentApiKeyRepository,
     approval_repository::PostgresApprovalRepository,
@@ -38,43 +38,80 @@ use repositories::{
     routine_repository::RoutineRepository,
     routine_revision_repository::RoutineRevisionRepository,
     routine_trigger_repository::RoutineTriggerRepository,
-    PgSecretProviderConfigRepository,
     secret_provider_config_repository::SecretProviderConfigRepository,
-    user_secret_repository::UserSecretRepository,
     secret_repository::UserSecretDefinitionRepository,
     task_watchdog_repository::{
         AgentWakeupRequestRepository, HeartbeatRunRepository, IssueThreadInteractionRepository,
         IssueWatchdogRepository,
     },
-    PgSkillCatalogRepository, PgCompanySkillRepository, PgSkillVersionRepository,
-    PgSkillTestInputRepository, PgSkillTestRunTemplateRepository, PgSkillTestRunRepository,
-    PgSkillStarRepository, PgSkillCommentRepository, PgSkillFileRepository,
+    user_secret_repository::UserSecretRepository,
+    PgCompanySkillRepository, PgSecretProviderConfigRepository, PgSkillCatalogRepository,
+    PgSkillCommentRepository, PgSkillFileRepository, PgSkillStarRepository,
+    PgSkillTestInputRepository, PgSkillTestRunRepository, PgSkillTestRunTemplateRepository,
+    PgSkillVersionRepository,
 };
 use services::{
-    // Traits (re-exported from crate root)
-    AdapterRegistry, AgentService, ApprovalService, AttachmentService, BuiltInAgentService, CaseService,
-    CompanyService, ConfigRevisionService, CustomImageSetupService, EnvironmentDiagnosticsService,
-    EnvironmentRuntimeService, EnvironmentService, GoalService, InviteResourceService, InviteService,
-    IssueCommentService, IssueDiagnosticsService, IssueService,
-    IssueTreeControlService, LowTrustService, OpenClawService, OrgChartService, PipelineService,
-    ProjectService, RoutineAnnotationService, RoutineService, SecretProviderConfigService,
-    SecretRemoteImportService, SseService, UserDirectoryService, UserSecretDefinitionService,
-    UserSecretService, WatchdogService, WorkProductService,
-    InstanceSettingsService,
-    // Real service impls
-    DefaultAgentService, DefaultApprovalService, DefaultBuiltInAgentService,
-    DefaultLowTrustService, DefaultOrgChartService, DefaultGoalService, DefaultPipelineService,
-    DefaultEnvironmentRuntimeService, RoutineServiceImpl, ConfigRevisionServiceImpl, InviteServiceImpl,
-    UserSecretServiceImpl, DefaultSkillRegistryServiceImpl,
+    issue_comment_service::IssueCommentServiceImpl,
     // Namespaced impls (avoid root-level name collisions)
     issue_tree_control_service::IssueTreeControlServiceImpl,
+    openclaw_service::OpenClawServiceImpl,
     user_secret_definition_service::UserSecretDefinitionServiceImpl,
-    issue_comment_service::IssueCommentServiceImpl,
-    InMemoryEventBus, InMemorySseService, DefaultWatchdogService,
+    // Traits (re-exported from crate root)
+    AdapterRegistry,
+    AgentService,
+    ApprovalService,
+    AttachmentService,
+    BuiltInAgentService,
+    CaseService,
+    CompanyService,
+    ConfigRevisionService,
+    ConfigRevisionServiceImpl,
+    CustomImageSetupService,
+    // Real service impls
+    DefaultAgentService,
+    DefaultApprovalService,
+    DefaultBuiltInAgentService,
+    DefaultEnvironmentRuntimeService,
+    DefaultGoalService,
     DefaultInstanceSettingsService,
+    DefaultLowTrustService,
+    DefaultOrgChartService,
+    DefaultPipelineService,
+    DefaultSkillRegistryServiceImpl,
+    DefaultWatchdogService,
+    EnvironmentDiagnosticsService,
+    EnvironmentRuntimeService,
+    EnvironmentService,
+    GoalService,
+    InMemoryEventBus,
+    InMemorySseService,
+    InstanceSettingsService,
+    InviteResourceService,
+    InviteService,
+    InviteServiceImpl,
+    IssueCommentService,
+    IssueDiagnosticsService,
+    IssueService,
+    IssueTreeControlService,
+    LowTrustService,
     // Mock impls for not-yet-implemented domains
     MockCaseService,
-    openclaw_service::OpenClawServiceImpl,
+    OpenClawService,
+    OrgChartService,
+    PipelineService,
+    ProjectService,
+    RoutineAnnotationService,
+    RoutineService,
+    RoutineServiceImpl,
+    SecretProviderConfigService,
+    SecretRemoteImportService,
+    SseService,
+    UserDirectoryService,
+    UserSecretDefinitionService,
+    UserSecretService,
+    UserSecretServiceImpl,
+    WatchdogService,
+    WorkProductService,
 };
 
 #[tokio::main]
@@ -83,11 +120,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5433/parrot_agent_dev".to_string());
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@localhost:5433/parrot_agent_dev".to_string()
+    });
 
     tracing::info!("connecting to database...");
     let pool = PgPoolOptions::new()
@@ -141,8 +181,9 @@ fn build_app_state(pool: PgPool) -> AppState {
     let company_repo = CompanyRepository::new(pool.clone());
     let company_repo_for_services = CompanyRepository::new(pool.clone());
     let project_repo = ProjectRepository::new(pool.clone());
-    let goal_repo: Arc<dyn GoalRepository> =
-        Arc::new(repositories::goal_repository::PostgresGoalRepository::new(pool.clone()));
+    let goal_repo: Arc<dyn GoalRepository> = Arc::new(
+        repositories::goal_repository::PostgresGoalRepository::new(pool.clone()),
+    );
     let environment_repo: Arc<dyn EnvironmentRepository> =
         Arc::new(repositories::environment_repository::PgEnvironmentRepository::new(pool.clone()));
     let _case_repo: Arc<dyn CaseRepository> = Arc::new(PgCaseRepository::new(pool.clone()));
@@ -155,7 +196,9 @@ fn build_app_state(pool: PgPool) -> AppState {
     let budget_incident_repo: Arc<repositories::budget_repository::PgBudgetIncidentRepository> =
         Arc::new(repositories::budget_repository::PgBudgetIncidentRepository::new(pool.clone()));
     let finance_event_repo: Arc<repositories::finance_event_repository::PgFinanceEventRepository> =
-        Arc::new(repositories::finance_event_repository::PgFinanceEventRepository::new(pool.clone()));
+        Arc::new(
+            repositories::finance_event_repository::PgFinanceEventRepository::new(pool.clone()),
+        );
     let activity_log_repo: Arc<repositories::activity_log_repository::PgActivityLogRepository> =
         Arc::new(repositories::activity_log_repository::PgActivityLogRepository::new(pool.clone()));
     let pipeline_repo: Arc<dyn PipelineRepository> =
@@ -164,7 +207,9 @@ fn build_app_state(pool: PgPool) -> AppState {
         repositories::pipeline_stage_repository::PostgresPipelineStageRepository::new(pool.clone()),
     );
     let pipeline_transition_repo: Arc<dyn PipelineTransitionRepository> = Arc::new(
-        repositories::pipeline_transition_repository::PostgresPipelineTransitionRepository::new(pool.clone()),
+        repositories::pipeline_transition_repository::PostgresPipelineTransitionRepository::new(
+            pool.clone(),
+        ),
     );
     let pipeline_case_repo: Arc<dyn PipelineCaseRepository> = Arc::new(
         repositories::pipeline_case_repository::PostgresPipelineCaseRepository::new(pool.clone()),
@@ -172,10 +217,14 @@ fn build_app_state(pool: PgPool) -> AppState {
     let routine_repo: Arc<dyn RoutineRepository> =
         Arc::new(repositories::routine_repository::PostgresRoutineRepository::new(pool.clone()));
     let _routine_trigger_repo: Arc<dyn RoutineTriggerRepository> = Arc::new(
-        repositories::routine_trigger_repository::PostgresRoutineTriggerRepository::new(pool.clone()),
+        repositories::routine_trigger_repository::PostgresRoutineTriggerRepository::new(
+            pool.clone(),
+        ),
     );
     let _routine_revision_repo: Arc<dyn RoutineRevisionRepository> = Arc::new(
-        repositories::routine_revision_repository::PostgresRoutineRevisionRepository::new(pool.clone()),
+        repositories::routine_revision_repository::PostgresRoutineRevisionRepository::new(
+            pool.clone(),
+        ),
     );
     let _secret_provider_config_repo: Arc<dyn SecretProviderConfigRepository> = Arc::new(
         repositories::secret_provider_config_repository::PostgresSecretProviderConfigRepository::new(pool.clone()),
@@ -187,7 +236,9 @@ fn build_app_state(pool: PgPool) -> AppState {
         repositories::secret_repository::PgUserSecretDefinitionRepository::new(pool.clone()),
     );
     let _exec_workspace_repo: Arc<dyn ExecutionWorkspaceRepository> = Arc::new(
-        repositories::execution_workspace_repository::PgExecutionWorkspaceRepository::new(pool.clone()),
+        repositories::execution_workspace_repository::PgExecutionWorkspaceRepository::new(
+            pool.clone(),
+        ),
     );
     let watchdog_repo: Arc<dyn IssueWatchdogRepository> = Arc::new(
         repositories::task_watchdog_repository::PostgresIssueWatchdogRepository::new(pool.clone()),
@@ -196,10 +247,14 @@ fn build_app_state(pool: PgPool) -> AppState {
         repositories::task_watchdog_repository::PostgresHeartbeatRunRepository::new(pool.clone()),
     );
     let wakeup_repo: Arc<dyn AgentWakeupRequestRepository> = Arc::new(
-        repositories::task_watchdog_repository::PostgresAgentWakeupRequestRepository::new(pool.clone()),
+        repositories::task_watchdog_repository::PostgresAgentWakeupRequestRepository::new(
+            pool.clone(),
+        ),
     );
     let interaction_repo: Arc<dyn IssueThreadInteractionRepository> = Arc::new(
-        repositories::task_watchdog_repository::PostgresIssueThreadInteractionRepository::new(pool.clone()),
+        repositories::task_watchdog_repository::PostgresIssueThreadInteractionRepository::new(
+            pool.clone(),
+        ),
     );
 
     // --- Services ---
@@ -209,24 +264,29 @@ fn build_app_state(pool: PgPool) -> AppState {
             .with_cost_event_repo(cost_event_repo.clone())
             .with_activity_log_repo(activity_log_repo.clone()),
     );
-    let access_service: Arc<dyn access::AccessService> =
-        Arc::new(DefaultAccessService::new());
-    let config_revision_service: Arc<dyn ConfigRevisionService> =
-        Arc::new(ConfigRevisionServiceImpl::new(Arc::new(agent_repo.clone()), config_revision_repo.clone()));
-    let built_in_agent_service: Arc<dyn BuiltInAgentService> =
-        Arc::new(DefaultBuiltInAgentService::new(Arc::new(agent_repo.clone())));
+    let access_service: Arc<dyn access::AccessService> = Arc::new(DefaultAccessService::new());
+    let config_revision_service: Arc<dyn ConfigRevisionService> = Arc::new(
+        ConfigRevisionServiceImpl::new(Arc::new(agent_repo.clone()), config_revision_repo.clone()),
+    );
+    let built_in_agent_service: Arc<dyn BuiltInAgentService> = Arc::new(
+        DefaultBuiltInAgentService::new(Arc::new(agent_repo.clone())),
+    );
     let adapter_registry: Arc<AdapterRegistry> = Arc::new(AdapterRegistry::new());
     let environment_runtime_service: Arc<dyn EnvironmentRuntimeService> =
         Arc::new(DefaultEnvironmentRuntimeService::new());
-    let issue_comment_service: Arc<dyn IssueCommentService> =
-        Arc::new(IssueCommentServiceImpl::new(issue_comment_repo.clone(), issue_repo.clone()));
+    let issue_comment_service: Arc<dyn IssueCommentService> = Arc::new(
+        IssueCommentServiceImpl::new(issue_comment_repo.clone(), issue_repo.clone()),
+    );
     let issue_tree_control_service: Arc<dyn IssueTreeControlService> = Arc::new(
         IssueTreeControlServiceImpl::new(tree_hold_repo.clone(), issue_repo.clone()),
     );
     let org_chart_service: Arc<dyn OrgChartService> =
         Arc::new(DefaultOrgChartService::new(pool.clone()));
-    let issue_diagnostics_service: Arc<dyn IssueDiagnosticsService> =
-        Arc::new(services::issue_diagnostics_service::DefaultIssueDiagnosticsService::new(issue_repo.clone()));
+    let issue_diagnostics_service: Arc<dyn IssueDiagnosticsService> = Arc::new(
+        services::issue_diagnostics_service::DefaultIssueDiagnosticsService::new(
+            issue_repo.clone(),
+        ),
+    );
     let low_trust_service: Arc<dyn LowTrustService> =
         Arc::new(DefaultLowTrustService::new(issue_repo.clone()));
     let company_service: Arc<CompanyService> = Arc::new(CompanyService::new(company_repo));
@@ -243,6 +303,9 @@ fn build_app_state(pool: PgPool) -> AppState {
     ));
     let skill_registry_service: Arc<dyn services::skill_registry_service::SkillRegistryService> =
         Arc::new(DefaultSkillRegistryServiceImpl::new(
+            std::env::var("LOCAL_TRUSTED_USER_ID")
+                .ok()
+                .and_then(|id| uuid::Uuid::parse_str(&id).ok()),
             Arc::new(PgSkillCatalogRepository::new(pool.clone())),
             Arc::new(PgCompanySkillRepository::new(pool.clone())),
             Arc::new(PgSkillVersionRepository::new(pool.clone())),
@@ -279,8 +342,10 @@ fn build_app_state(pool: PgPool) -> AppState {
         Arc::new(services::attachment_service::MockAttachmentService);
     let user_secret_definition_service: Arc<dyn UserSecretDefinitionService> =
         Arc::new(UserSecretDefinitionServiceImpl::new());
-    let user_secret_service: Arc<dyn UserSecretService> =
-        Arc::new(UserSecretServiceImpl::new(user_secret_repo, user_secret_definition_repo));
+    let user_secret_service: Arc<dyn UserSecretService> = Arc::new(UserSecretServiceImpl::new(
+        user_secret_repo,
+        user_secret_definition_repo,
+    ));
     let case_service: Arc<dyn CaseService> = Arc::new(MockCaseService);
     let approval_service: Arc<dyn ApprovalService> = Arc::new(DefaultApprovalService::new(
         approval_repo.clone(),
@@ -296,8 +361,9 @@ fn build_app_state(pool: PgPool) -> AppState {
     let event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new(1024));
 
     // Label service
-    let label_repo: Arc<repositories::label_repository::PgLabelRepository> =
-        Arc::new(repositories::label_repository::PgLabelRepository::new(pool.clone()));
+    let label_repo: Arc<repositories::label_repository::PgLabelRepository> = Arc::new(
+        repositories::label_repository::PgLabelRepository::new(pool.clone()),
+    );
     let label_service: Arc<dyn services::LabelService> =
         Arc::new(services::DefaultLabelService::new(label_repo));
 
@@ -316,6 +382,9 @@ fn build_app_state(pool: PgPool) -> AppState {
         attachment_service.clone(),
     ));
 
+    let company_portability_service = Arc::new(services::DefaultCompanyPortabilityService::new(
+        pool.clone(),
+    ));
     AppState::new(
         agent_service,
         access_service,
@@ -356,11 +425,14 @@ fn build_app_state(pool: PgPool) -> AppState {
         Arc::new(services::DefaultTermService::new()),
         label_service,
         instance_settings_service,
-        Arc::new(services::DefaultCostService::new(
-            cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
-            Arc::new(agent_repo.clone()) as Arc<dyn repositories::AgentRepository>,
-            Arc::new(company_repo_for_services.clone()),
-        ).with_adapter_registry(adapter_registry.clone())),
+        Arc::new(
+            services::DefaultCostService::new(
+                cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
+                Arc::new(agent_repo.clone()) as Arc<dyn repositories::AgentRepository>,
+                Arc::new(company_repo_for_services.clone()),
+            )
+            .with_adapter_registry(adapter_registry.clone()),
+        ),
         Arc::new(services::DefaultBudgetService::new(
             cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
             budget_policy_repo.clone() as Arc<dyn repositories::BudgetPolicyRepository>,
@@ -372,6 +444,10 @@ fn build_app_state(pool: PgPool) -> AppState {
             finance_event_repo.clone() as Arc<dyn repositories::FinanceEventRepository>,
             Arc::new(company_repo_for_services.clone()),
         )),
+        Arc::new(services::DefaultPluginService::new(pool.clone())),
+        company_portability_service.clone(),
+        company_portability_service.clone(),
+        company_portability_service,
         event_bus,
         pool,
     )

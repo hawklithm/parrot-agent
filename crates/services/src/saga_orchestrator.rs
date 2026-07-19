@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use models::event_bus::EventBus;
 use models::saga::{
-    RetryPolicy, SagaContext, SagaInstance, SagaOrchestrator, SagaRepository, SagaStatus,
-    SagaStep, SagaStepExecution, StepExecutionStatus,
+    RetryPolicy, SagaContext, SagaInstance, SagaOrchestrator, SagaRepository, SagaStatus, SagaStep,
+    SagaStepExecution, StepExecutionStatus,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -43,10 +43,7 @@ impl DefaultSagaOrchestrator {
             retry_count: 0,
         };
 
-        let mut execution = self
-            .saga_repo
-            .create_step_execution(step_execution)
-            .await?;
+        let mut execution = self.saga_repo.create_step_execution(step_execution).await?;
 
         // Execute step with retry policy
         let result = self
@@ -85,7 +82,8 @@ impl DefaultSagaOrchestrator {
 
         loop {
             match self.execute_step_logic(step, context).await {
-                Ok(result) => return Ok(result),              Err(e) => {
+                Ok(result) => return Ok(result),
+                Err(e) => {
                     if retry_count >= retry_policy.max_retries {
                         return Err(format!(
                             "Step '{}' failed after {} retries: {}",
@@ -132,10 +130,7 @@ impl DefaultSagaOrchestrator {
             retry_count: 0,
         };
 
-        let mut execution = self
-            .saga_repo
-            .create_step_execution(step_execution)
-            .await?;
+        let mut execution = self.saga_repo.create_step_execution(step_execution).await?;
 
         // Execute compensation logic
         let result = self.compensate_step_logic(step_name, context).await;
@@ -178,13 +173,25 @@ impl SagaOrchestrator for DefaultSagaOrchestrator {
         initiator_id: Uuid,
         initial_context: serde_json::Value,
     ) -> Result<SagaInstance, String> {
+        let mut persisted_context = initial_context.clone();
+        if let Some(object) = persisted_context.as_object_mut() {
+            object.insert(
+                "__saga_meta".to_string(),
+                serde_json::json!({ "initiator_id": initiator_id }),
+            );
+        } else {
+            persisted_context = serde_json::json!({
+                "value": persisted_context,
+                "__saga_meta": { "initiator_id": initiator_id },
+            });
+        }
         let saga_instance = SagaInstance {
             id: Uuid::new_v4(),
             saga_name: saga_name.clone(),
             company_id,
             status: SagaStatus::Pending,
             current_step: None,
-            context: initial_context.clone(),
+            context: persisted_context.clone(),
             started_at: Utc::now(),
             completed_at: None,
             error_message: None,
@@ -197,7 +204,7 @@ impl SagaOrchestrator for DefaultSagaOrchestrator {
             saga_id: instance.id,
             company_id,
             initiator_id,
-            state: initial_context,
+            state: persisted_context,
             completed_steps: vec![],
         };
 
@@ -278,10 +285,17 @@ impl SagaOrchestrator for DefaultSagaOrchestrator {
             .filter(|e| e.status == StepExecutionStatus::Succeeded)
             .collect();
 
+        let initiator_id = instance
+            .context
+            .get("__saga_meta")
+            .and_then(|meta| meta.get("initiator_id"))
+            .and_then(|value| value.as_str())
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| format!("Saga {} is missing its initiator id", saga_id))?;
         let context = SagaContext {
             saga_id: instance.id,
             company_id: instance.company_id,
-            initiator_id: Uuid::nil(), // Placeholder
+            initiator_id,
             state: instance.context.clone(),
             completed_steps: vec![],
         };
@@ -427,10 +441,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_saga() {
-        let orchestrator = DefaultSagaOrchestrator::new(
-            Arc::new(MockSagaRepository),
-            Arc::new(MockEventBus),
-        );
+        let orchestrator =
+            DefaultSagaOrchestrator::new(Arc::new(MockSagaRepository), Arc::new(MockEventBus));
 
         let result = orchestrator
             .start_saga(
@@ -448,10 +460,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_saga_status() {
-        let orchestrator = DefaultSagaOrchestrator::new(
-            Arc::new(MockSagaRepository),
-            Arc::new(MockEventBus),
-        );
+        let orchestrator =
+            DefaultSagaOrchestrator::new(Arc::new(MockSagaRepository), Arc::new(MockEventBus));
 
         let result = orchestrator.get_saga_status(Uuid::new_v4()).await;
         assert!(result.is_ok());

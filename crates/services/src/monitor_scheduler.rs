@@ -1,11 +1,11 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc, Duration};
+use chrono::{DateTime, Duration, Utc};
 use std::sync::Arc;
-use uuid::Uuid;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use models::{Issue, UpdateIssueInput};
-use repositories::IssueRepository;
+use repositories::{auth_repositories::CompanyRepository, IssueRepository};
 
 /// Configuration for the monitor scheduler
 #[derive(Debug, Clone)]
@@ -51,6 +51,7 @@ pub trait MonitorSchedulerService: Send + Sync {
 /// Default implementation of MonitorSchedulerService
 pub struct DefaultMonitorScheduler {
     issue_repo: Arc<dyn IssueRepository>,
+    company_repo: Arc<dyn CompanyRepository>,
     config: MonitorSchedulerConfig,
     running: Arc<Mutex<bool>>,
 }
@@ -58,10 +59,12 @@ pub struct DefaultMonitorScheduler {
 impl DefaultMonitorScheduler {
     pub fn new(
         issue_repo: Arc<dyn IssueRepository>,
+        company_repo: Arc<dyn CompanyRepository>,
         config: MonitorSchedulerConfig,
     ) -> Self {
         Self {
             issue_repo,
+            company_repo,
             config,
             running: Arc::new(Mutex::new(false)),
         }
@@ -107,7 +110,7 @@ impl DefaultMonitorScheduler {
 
     /// Main background loop
     #[allow(dead_code)]
-    async fn run_loop(&self) {
+    async fn run_loop(self: Arc<Self>) {
         let config = self.config.clone();
         let interval = tokio::time::Duration::from_secs(config.poll_interval_seconds);
 
@@ -120,10 +123,16 @@ impl DefaultMonitorScheduler {
                 }
             }
 
-            // Poll for due issues across all companies
-            // In production, this would iterate over active companies
-            // For now, use nil UUID as a placeholder for "all companies"
-            let _ = self.poll_due_issues(Uuid::nil()).await;
+            match self.company_repo.list_all().await {
+                Ok(companies) => {
+                    for company in companies {
+                        let _ = self.poll_due_issues(company.id).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!("Failed to list companies for monitor poll: {}", error)
+                }
+            }
 
             tokio::time::sleep(interval).await;
         }
@@ -140,14 +149,13 @@ impl MonitorSchedulerService for DefaultMonitorScheduler {
         *running = true;
         drop(running);
 
-        // Spawn the background loop
-        let _this_ref = Arc::new(()); // We need to capture self
-        // Since we can't easily clone Arc<Self>, use a simpler approach
-        tokio::spawn(async move {
-            // In production: self.run_loop().await;
-            // For now, placeholder to avoid complex self-capture
-            tracing::info!("Monitor scheduler started (placeholder)");
+        let runner = Arc::new(Self {
+            issue_repo: self.issue_repo.clone(),
+            company_repo: self.company_repo.clone(),
+            config: self.config.clone(),
+            running: self.running.clone(),
         });
+        tokio::spawn(runner.run_loop());
 
         tracing::info!("Monitor scheduler started");
     }
@@ -179,7 +187,8 @@ impl MonitorSchedulerService for DefaultMonitorScheduler {
             cursor: None,
         };
 
-        let issues = self.issue_repo
+        let issues = self
+            .issue_repo
             .list_by_company(company_id, &filter, &pagination)
             .await
             .map_err(|e| format!("Failed to list issues: {}", e))?;
@@ -187,7 +196,8 @@ impl MonitorSchedulerService for DefaultMonitorScheduler {
         let mut processed = Vec::new();
         for issue in &issues {
             // Check if issue is due for monitoring
-            let is_due = issue.monitor_next_check_at
+            let is_due = issue
+                .monitor_next_check_at
                 .map(|t| t <= Utc::now())
                 .unwrap_or(false);
 
@@ -218,6 +228,7 @@ mod tests {
         let config = MonitorSchedulerConfig::default();
         let scheduler = DefaultMonitorScheduler::new(
             Arc::new(MockIssueRepo::new()),
+            Arc::new(MockCompanyRepo::new()),
             config,
         );
 
@@ -225,43 +236,138 @@ mod tests {
         let next = scheduler.calculate_next_check(0);
         let diff = next - Utc::now();
         let diff_minutes = diff.num_minutes();
-        assert!(diff_minutes >= 3 && diff_minutes <= 10,
-            "First backoff should be ~5 minutes, got {} minutes", diff_minutes);
+        assert!(
+            diff_minutes >= 3 && diff_minutes <= 10,
+            "First backoff should be ~5 minutes, got {} minutes",
+            diff_minutes
+        );
 
         // Second attempt should be ~10 minutes
         let next2 = scheduler.calculate_next_check(1);
         let diff2 = next2 - Utc::now();
         let diff2_minutes = diff2.num_minutes();
-        assert!(diff2_minutes >= 6 && diff2_minutes <= 20,
-            "Second backoff should be ~10 minutes, got {} minutes", diff2_minutes);
+        assert!(
+            diff2_minutes >= 6 && diff2_minutes <= 20,
+            "Second backoff should be ~10 minutes, got {} minutes",
+            diff2_minutes
+        );
 
         // After max retries, should use max backoff (120 min)
         let next_max = scheduler.calculate_next_check(config.max_retry_attempts);
         let diff_max = next_max - Utc::now();
         let diff_max_minutes = diff_max.num_minutes();
-        assert!(diff_max_minutes >= 80 && diff_max_minutes <= 160,
-            "Max backoff should be ~120 minutes, got {} minutes", diff_max_minutes);
+        assert!(
+            diff_max_minutes >= 80 && diff_max_minutes <= 160,
+            "Max backoff should be ~120 minutes, got {} minutes",
+            diff_max_minutes
+        );
     }
 
     struct MockIssueRepo;
 
+    struct MockCompanyRepo;
+    impl MockCompanyRepo {
+        fn new() -> Self {
+            Self
+        }
+    }
+
+    #[async_trait]
+    impl CompanyRepository for MockCompanyRepo {
+        async fn find_by_id(&self, _id: Uuid) -> Result<Option<models::Company>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_by_slug(
+            &self,
+            _slug: &str,
+        ) -> Result<Option<models::Company>, RepositoryError> {
+            Ok(None)
+        }
+        async fn create(
+            &self,
+            _company: models::Company,
+        ) -> Result<models::Company, RepositoryError> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _company: models::Company,
+        ) -> Result<models::Company, RepositoryError> {
+            unimplemented!()
+        }
+        async fn list_all(&self) -> Result<Vec<models::Company>, RepositoryError> {
+            Ok(vec![])
+        }
+    }
+
     impl MockIssueRepo {
-        fn new() -> Self { Self }
+        fn new() -> Self {
+            Self
+        }
     }
 
     #[async_trait]
     impl IssueRepository for MockIssueRepo {
-        async fn get_by_id(&self, _id: Uuid) -> Result<Option<Issue>, RepositoryError> { Ok(None) }
-        async fn list_by_company(&self, _company_id: Uuid, _filter: &models::IssueQueryFilter, _pagination: &models::Pagination) -> Result<Vec<Issue>, RepositoryError> { Ok(vec![]) }
-        async fn count_by_company(&self, _company_id: Uuid, _filter: &models::IssueQueryFilter) -> Result<i64, RepositoryError> { Ok(0) }
-        async fn create(&self, _input: models::CreateIssueInput) -> Result<Issue, RepositoryError> { unimplemented!() }
-        async fn update(&self, _id: Uuid, _input: UpdateIssueInput) -> Result<Issue, RepositoryError> { unimplemented!() }
-        async fn delete(&self, _id: Uuid) -> Result<(), RepositoryError> { Ok(()) }
-        async fn search(&self, _company_id: Uuid, _query: &str, _pagination: &models::Pagination) -> Result<Vec<Issue>, RepositoryError> { Ok(vec![]) }
-        async fn list_children(&self, _parent_id: Uuid) -> Result<Vec<Issue>, RepositoryError> { Ok(vec![]) }
-        async fn get_by_identifier(&self, _identifier: &str) -> Result<Option<Issue>, RepositoryError> { Ok(None) }
-        async fn list_by_parent(&self, _parent_id: Uuid, _pagination: &models::Pagination) -> Result<Vec<Issue>, RepositoryError> { Ok(vec![]) }
-        async fn get_by_ids(&self, _ids: Vec<Uuid>) -> Result<Vec<Issue>, RepositoryError> { Ok(vec![]) }
-        async fn list_ancestors(&self, _issue_id: Uuid) -> Result<Vec<Issue>, RepositoryError> { Ok(vec![]) }
+        async fn get_by_id(&self, _id: Uuid) -> Result<Option<Issue>, RepositoryError> {
+            Ok(None)
+        }
+        async fn list_by_company(
+            &self,
+            _company_id: Uuid,
+            _filter: &models::IssueQueryFilter,
+            _pagination: &models::Pagination,
+        ) -> Result<Vec<Issue>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn count_by_company(
+            &self,
+            _company_id: Uuid,
+            _filter: &models::IssueQueryFilter,
+        ) -> Result<i64, RepositoryError> {
+            Ok(0)
+        }
+        async fn create(&self, _input: models::CreateIssueInput) -> Result<Issue, RepositoryError> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _id: Uuid,
+            _input: UpdateIssueInput,
+        ) -> Result<Issue, RepositoryError> {
+            unimplemented!()
+        }
+        async fn delete(&self, _id: Uuid) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn search(
+            &self,
+            _company_id: Uuid,
+            _query: &str,
+            _pagination: &models::Pagination,
+        ) -> Result<Vec<Issue>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn list_children(&self, _parent_id: Uuid) -> Result<Vec<Issue>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn get_by_identifier(
+            &self,
+            _identifier: &str,
+        ) -> Result<Option<Issue>, RepositoryError> {
+            Ok(None)
+        }
+        async fn list_by_parent(
+            &self,
+            _parent_id: Uuid,
+            _pagination: &models::Pagination,
+        ) -> Result<Vec<Issue>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn get_by_ids(&self, _ids: Vec<Uuid>) -> Result<Vec<Issue>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn list_ancestors(&self, _issue_id: Uuid) -> Result<Vec<Issue>, RepositoryError> {
+            Ok(vec![])
+        }
     }
 }
