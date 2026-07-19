@@ -48,6 +48,7 @@ pub use membership::{CompanyMembership, MembershipRole, MembershipStatus, Princi
 pub use middleware::{
     ActorResolver, AuthMiddleware, AuthMode, BearerTokenResolver, CloudTenantHeaderResolver,
     SessionCookieResolver, auth_middleware_fn, authenticated_middleware, extract_actor,
-    local_trusted_middleware,
+    local_trusted_middleware, middleware_from_env, require_agent, require_board,
+    auth_cookie_prefix, auth_trusted_origins,
 };
 pub use permission::{GrantScope, PermissionGrant, PermissionKey};

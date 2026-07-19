@@ -11,6 +11,7 @@ pub enum ApprovalType {
     SpendCredits,
     CreateResource,
     DeployAgent,
+    BudgetOverrideRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]

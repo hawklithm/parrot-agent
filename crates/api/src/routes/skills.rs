@@ -362,6 +362,14 @@ async fn delete_company_skill(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// SK39: List all skills for a company
+async fn list_company_skills(
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    state.skill_registry_service.list_company_skills(company_id).await.map(Json).map_err(|e| AppError::InternalServerError(e.to_string()))
+}
+
 /// Router setup for skills endpoints
 pub fn skill_routes() -> Router<AppState> {
     axum::Router::new()
@@ -372,6 +380,7 @@ pub fn skill_routes() -> Router<AppState> {
         .route("/skills/catalog", get(get_skill_catalog))
         .route("/skills/catalog/:catalog_id", get(get_skill_catalog_detail))
         .route("/skills/catalog/files", get(get_skill_catalog_files))
+        .route("/companies/:company_id/skills", get(list_company_skills))
         .route("/companies/:company_id/skills/categories", get(list_skill_categories))
         .route("/companies/:company_id/skills/:skill_id", get(get_company_skill).delete(delete_company_skill))
         .route("/companies/:company_id/skills/:skill_id/fork-precheck", get(fork_skill_precheck))

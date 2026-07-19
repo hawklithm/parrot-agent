@@ -13,6 +13,17 @@ use uuid::Uuid;
 use models::{Case, CaseDetail, CaseEvent, CreateCaseInput, PipelineCase, UpdateCaseInput};
 use services::{AdvanceCaseInput, CaseQueryFilter, Pagination};
 
+/// Helper: 通过 case_id 查询 company_id
+async fn get_company_id_for_case(state: &AppState, case_id: Uuid) -> Result<Uuid, StatusCode> {
+    let case = state
+        .case_service
+        .get(case_id, Uuid::nil())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(case.company_id)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListCasesQuery {
@@ -81,7 +92,7 @@ async fn get_case(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Case>, StatusCode> {
     let service = state.case_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
 
     service
         .get(id, company_id)
@@ -97,7 +108,7 @@ async fn get_case_detail(
     Path(id): Path<Uuid>,
 ) -> Result<Json<CaseDetail>, StatusCode> {
     let service = state.case_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
 
     service
         .get_detail(id, company_id)
@@ -114,7 +125,7 @@ async fn update_case(
     Json(input): Json<UpdateCaseInput>,
 ) -> Result<Json<Case>, StatusCode> {
     let service = state.case_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
 
     service
         .update(id, company_id, input)
@@ -130,13 +141,13 @@ async fn list_case_events(
     Query(query): Query<ListCasesQuery>,
 ) -> Result<Json<Vec<CaseEvent>>, StatusCode> {
     let service = state.case_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     let pagination = Pagination {
         limit: query.limit.unwrap_or(50),
         offset: query.offset.unwrap_or(0),
         cursor: None,
     };
-    
+
     service
         .list_events(id, company_id, &pagination)
         .await
@@ -153,7 +164,7 @@ async fn get_case_children(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<Case>>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.get_children(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -162,7 +173,7 @@ async fn get_case_children_tree(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.get_children_tree(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -171,7 +182,7 @@ async fn get_case_rollup(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.get_rollup(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -180,7 +191,7 @@ async fn get_case_context_pack(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.get_context_pack(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -189,7 +200,7 @@ async fn get_case_outputs(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.get_outputs(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -198,7 +209,7 @@ async fn list_issue_links(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.get_issue_links(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -208,7 +219,7 @@ async fn create_issue_link(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     let issue_id = payload.get("issueId")
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok())
@@ -222,7 +233,7 @@ async fn delete_issue_link(
     State(state): State<AppState>,
     Path((id, link_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.delete_issue_link(id, link_id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -233,7 +244,7 @@ async fn create_link(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     let link = state.case_service.create_link(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(link)))
 }
@@ -244,7 +255,7 @@ async fn update_blockers(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     let blocker_ids = payload.get("blockerIds")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok())).collect())
@@ -258,7 +269,7 @@ async fn suggest_transition(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.suggest_transition(id, company_id, payload).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -268,7 +279,7 @@ async fn resolve_suggestion(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.resolve_suggestion(id, company_id, payload).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -278,7 +289,7 @@ async fn review_case(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.review_case(id, company_id, payload).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -287,7 +298,7 @@ async fn acknowledge_drift(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.acknowledge_drift(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -296,7 +307,7 @@ async fn open_conversation(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.open_conversation(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -306,7 +317,7 @@ async fn breakdown_case(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.breakdown_case(id, company_id, payload).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -316,6 +327,7 @@ async fn upload_case_attachment(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Use attachment service
+    // TODO: company_id 需要从 case 查询，当前 attachment 功能为存根
     let _company_id = Uuid::nil();
     // TODO: multipart upload handling
     Ok(Json(serde_json::json!({
@@ -492,7 +504,7 @@ async fn automation_retry(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.automation_retry(id, company_id, payload).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -502,7 +514,7 @@ async fn automation_retry_plan(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.automation_retry_plan(id, company_id, payload).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -511,7 +523,7 @@ async fn automation_rerun_stage(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.automation_rerun_stage(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -520,7 +532,7 @@ async fn automation_retry_single(
     State(state): State<AppState>,
     Path((id, automation_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_case(&state, id).await?;
     state.case_service.automation_retry_single(id, company_id, automation_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 

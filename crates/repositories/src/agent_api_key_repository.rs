@@ -39,7 +39,7 @@ impl AgentApiKeyRepository for PgAgentApiKeyRepository {
     async fn find_by_key_hash(&self, key_hash: &str) -> Result<Option<AgentApiKey>, RepoError> {
         let result = sqlx::query_as::<_, AgentApiKey>(
             r#"
-            SELECT id, agent_id, company_id, name, key_hash, last_used_at, revoked_at, created_at
+            SELECT id, agent_id, company_id, name, key_hash, scope, last_used_at, revoked_at, created_at
             FROM agent_api_keys
             WHERE key_hash = $1 AND revoked_at IS NULL
             "#,
@@ -55,9 +55,9 @@ impl AgentApiKeyRepository for PgAgentApiKeyRepository {
     async fn create(&self, api_key: AgentApiKey) -> Result<AgentApiKey, RepoError> {
         let result = sqlx::query_as::<_, AgentApiKey>(
             r#"
-            INSERT INTO agent_api_keys (id, agent_id, company_id, name, key_hash, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, agent_id, company_id, name, key_hash, last_used_at, revoked_at, created_at
+            INSERT INTO agent_api_keys (id, agent_id, company_id, name, key_hash, scope, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, agent_id, company_id, name, key_hash, scope, last_used_at, revoked_at, created_at
             "#,
         )
         .bind(api_key.id)
@@ -65,6 +65,7 @@ impl AgentApiKeyRepository for PgAgentApiKeyRepository {
         .bind(api_key.company_id)
         .bind(api_key.name)
         .bind(api_key.key_hash)
+        .bind(&api_key.scope)
         .bind(api_key.created_at)
         .fetch_one(&self.pool)
         .await
@@ -108,7 +109,7 @@ impl AgentApiKeyRepository for PgAgentApiKeyRepository {
     async fn list_by_agent(&self, agent_id: Uuid) -> Result<Vec<AgentApiKey>, RepoError> {
         let results = sqlx::query_as::<_, AgentApiKey>(
             r#"
-            SELECT id, agent_id, company_id, name, key_hash, last_used_at, revoked_at, created_at
+            SELECT id, agent_id, company_id, name, key_hash, scope, last_used_at, revoked_at, created_at
             FROM agent_api_keys
             WHERE agent_id = $1
             ORDER BY created_at DESC

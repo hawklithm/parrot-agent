@@ -10,53 +10,31 @@
 //! handler 通过 `extract_actor` 读取。
 
 use axum::{
-    extract::{Extension, Path, Request, State},
-    http::StatusCode,
-    middleware::Next,
+    extract::{Extension, State},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
 use uuid::Uuid;
 
-use services::auth::{
-    AuthError, AuthMiddleware, AuthorizationActor, JwtConfig, authenticated_middleware,
-};
+use services::auth::{auth_cookie_prefix, AuthError, AuthorizationActor};
 use services::auth::{ActorSource, MembershipRole};
 
 use crate::app_state::AppState;
 
-use repositories::auth_repositories::{AuthUserRepository, PgAuthUserRepository};
+use repositories::auth_repositories::{AuthSessionRepository, AuthUserRepository, PgAuthSessionRepository, PgAuthUserRepository};
+use repositories::models::auth::{AuthSession, AuthUser};
+use sha2::{Digest, Sha256};
 
 /// 构建 `/api/auth` 路由组，并挂载认证中间件层。
 pub fn auth_routes(state: AppState) -> Router<AppState> {
-    let pool = Arc::new(state.pool.clone());
-    let jwt_config = JwtConfig::from_env().map(Arc::new);
-    let middleware = match &jwt_config {
-        Some(cfg) => authenticated_middleware(pool.clone(), cfg.clone()),
-        None => {
-            // 无 JWT 配置时仍使用 Bearer/Session/CloudTenant 解析器（JWT 校验会返回 None）。
-            let m = AuthMiddleware::new(services::auth::AuthMode::Authenticated)
-                .with_resolver(Arc::new(
-                    services::auth::BearerTokenResolver::new(pool.clone(), Arc::new(JwtConfig::new(
-                        String::new(),
-                        3600,
-                        "parrot-agent".to_string(),
-                        "agent-runtime".to_string(),
-                        "local".to_string(),
-                    ))),
-                ))
-                .with_resolver(Arc::new(services::auth::SessionCookieResolver::new(pool.clone())))
-                .with_resolver(Arc::new(services::auth::CloudTenantHeaderResolver::new(pool.clone())));
-            m
-        }
-    };
-    let mw = Arc::new(middleware);
-
     Router::new()
+        .route("/auth/sign-up/email", post(sign_up_email))
+        .route("/auth/sign-in/email", post(sign_in_email))
+        .route("/auth/sign-out", post(sign_out))
         .route("/auth/get-session", get(get_session))
         .route("/auth/profile", get(get_profile).patch(update_profile))
         // --- P3: Admin routes (AU1-AU5) ---
@@ -64,23 +42,78 @@ pub fn auth_routes(state: AppState) -> Router<AppState> {
         .route("/admin/users/:user_id/demote-instance-admin", post(demote_instance_admin))
         .route("/admin/users/:user_id/company-access", get(get_user_company_access).put(update_user_company_access))
         .route("/join-requests/:request_id/claim-api-key", post(claim_join_request_api_key))
-        .layer(axum::middleware::from_fn_with_state(
-            mw,
-            resolve_actor_layer,
-        ))
         .with_state(state)
 }
 
-/// 认证中间件层：解析 `AuthorizationActor` 并注入 request extensions。
-async fn resolve_actor_layer(
-    State(middleware): State<Arc<AuthMiddleware>>,
-    mut request: Request,
-    next: Next,
+#[derive(Debug, Deserialize)]
+struct EmailAuthRequest { email: String, password: String, #[serde(default)] name: Option<String> }
+
+fn password_digest(password: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"parrot-auth-password-v1:");
+    h.update(password.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn session_cookie(token: &str, max_age: i64) -> Result<HeaderValue, AuthError> {
+    let prefix = auth_cookie_prefix(&std::env::var("INSTANCE_ID").unwrap_or_else(|_| "default".to_string()));
+    let secure = std::env::var("PAPERCLIP_PUBLIC_URL").ok().map(|v| v.starts_with("https://")).unwrap_or(false);
+    let secure_attr = if secure { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!("{}-session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}", prefix, token, max_age, secure_attr))
+        .map_err(|_| AuthError::internal("Failed to build session cookie"))
+}
+
+async fn sign_up_email(
+    State(state): State<AppState>, Json(payload): Json<EmailAuthRequest>,
 ) -> Result<Response, AuthError> {
-    let headers = request.headers().clone();
-    let actor = middleware.resolve_actor(&headers).await?;
-    request.extensions_mut().insert(actor);
-    Ok(next.run(request).await)
+    let email = payload.email.trim().to_ascii_lowercase();
+    if email.is_empty() || payload.password.len() < 8 { return Err(AuthError::bad_request("Email and a password of at least 8 characters are required")); }
+    let repo = PgAuthUserRepository::new(state.pool.clone());
+    if repo.find_by_email(&email).await.map_err(|e| AuthError::internal(e.to_string()))?.is_some() {
+        return Err(AuthError::bad_request("An account with this email already exists"));
+    }
+    let mut user = AuthUser::new_with_password(email, password_digest(&payload.password), payload.name);
+    user.record_login();
+    let user = repo.create(user).await.map_err(|e| AuthError::internal(e.to_string()))?;
+    create_session_response(&state, user).await
+}
+
+async fn sign_in_email(
+    State(state): State<AppState>, Json(payload): Json<EmailAuthRequest>,
+) -> Result<Response, AuthError> {
+    let email = payload.email.trim().to_ascii_lowercase();
+    let repo = PgAuthUserRepository::new(state.pool.clone());
+    let mut user = repo.find_by_email(&email).await.map_err(|e| AuthError::internal(e.to_string()))?
+        .ok_or_else(|| AuthError::unauthenticated("Invalid email or password"))?;
+    if user.password_hash.as_deref() != Some(password_digest(&payload.password).as_str()) || !user.is_active {
+        return Err(AuthError::unauthenticated("Invalid email or password"));
+    }
+    user.record_login();
+    let user = repo.update(user).await.map_err(|e| AuthError::internal(e.to_string()))?;
+    create_session_response(&state, user).await
+}
+
+async fn create_session_response(state: &AppState, user: AuthUser) -> Result<Response, AuthError> {
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let session = AuthSession::new(user.id, token.clone(), 30 * 24 * 60 * 60, None, None);
+    PgAuthSessionRepository::new(state.pool.clone()).create(session).await.map_err(|e| AuthError::internal(e.to_string()))?;
+    let mut response = Json(json!({"user": {"id": user.id, "email": user.email, "name": user.name}})).into_response();
+    response.headers_mut().append(header::SET_COOKIE, session_cookie(&token, 30 * 24 * 60 * 60)?);
+    Ok(response)
+}
+
+async fn sign_out(
+    State(state): State<AppState>, headers: axum::http::HeaderMap,
+) -> Result<Response, AuthError> {
+    let cookie_name = format!("{}-session", auth_cookie_prefix(&std::env::var("INSTANCE_ID").unwrap_or_else(|_| "default".to_string())));
+    if let Some(token) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()).and_then(|v| v.split(';').find_map(|p| p.trim().strip_prefix(&format!("{}=", cookie_name)))) {
+        if let Some(session) = PgAuthSessionRepository::new(state.pool.clone()).find_by_token(token).await.map_err(|e| AuthError::internal(e.to_string()))? {
+            PgAuthSessionRepository::new(state.pool.clone()).delete(session.id).await.map_err(|e| AuthError::internal(e.to_string()))?;
+        }
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().append(header::SET_COOKIE, session_cookie("", 0)?);
+    Ok(response)
 }
 
 /// GET /api/auth/get-session

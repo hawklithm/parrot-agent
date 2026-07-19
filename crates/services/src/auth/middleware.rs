@@ -40,6 +40,40 @@ pub enum AuthMode {
     Authenticated,
 }
 
+/// Derive an instance-isolated BetterAuth-compatible cookie prefix.
+pub fn auth_cookie_prefix(instance_id: &str) -> String {
+    let safe: String = instance_id.trim().chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' }).collect();
+    format!("parrot-{}", if safe.trim_matches('-').is_empty() { "default" } else { safe.trim_matches('-') })
+}
+
+/// Build trusted origins from configured hostnames and listen port.
+pub fn auth_trusted_origins(hostnames: &[String], port: u16, explicit_base_url: Option<&str>) -> Vec<String> {
+    let mut origins = std::collections::BTreeSet::new();
+    if let Some(base) = explicit_base_url.map(str::trim).filter(|v| !v.is_empty()) {
+        let origin = base.split_once("//").map(|(_, rest)| rest.split('/').next().unwrap_or(rest)).unwrap_or(base);
+        origins.insert(format!("{}://{}", base.split("://").next().unwrap_or("https"), origin));
+    }
+    for hostname in hostnames.iter().map(|h| h.trim()).filter(|h| !h.is_empty()) {
+        for scheme in ["http", "https"] {
+            origins.insert(format!("{scheme}://{hostname}:{port}"));
+            if port == 80 || port == 443 { origins.insert(format!("{scheme}://{hostname}")); }
+        }
+    }
+    origins.into_iter().collect()
+}
+
+impl AuthMode {
+    /// Development defaults to local_trusted; release builds fail closed.
+    pub fn from_env() -> Self {
+        match std::env::var("DEPLOYMENT_MODE").ok().as_deref() {
+            Some("authenticated") => Self::Authenticated,
+            Some("local_trusted") => Self::LocalTrusted,
+            _ if cfg!(debug_assertions) => Self::LocalTrusted,
+            _ => Self::Authenticated,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ActorResolver: Send + Sync {
     async fn resolve(&self, headers: &HeaderMap) -> AuthResult<Option<AuthorizationActor>>;
@@ -168,8 +202,12 @@ impl BearerTokenResolver {
 
         let _ = repo.update_last_used(key.id).await;
 
-        // 当前 models::AgentApiKey 未持久化 scope 字段，使用全量 scope。
-        let scope = AgentApiKeyScope::new(key.agent_id, key.company_id);
+        let scope = if key.scope.is_null() || key.scope == serde_json::json!({}) {
+            AgentApiKeyScope::new(key.agent_id, key.company_id)
+        } else {
+            AgentApiKeyScope::from_json(key.scope.clone())
+                .ok_or_else(|| AuthError::InvalidApiKey { reason: "Invalid agent API key scope".to_string() })?
+        };
 
         // 查询关联的 Agent 记录，确认其存在且处于活跃状态。
         let agent_repo = PgAgentRepository::new((*self.pool).clone());
@@ -180,7 +218,7 @@ impl BearerTokenResolver {
         let responsible_user_id = match &agent {
             a if a.status == AgentStatus::Running => a.reports_to,
             _ => {
-                // Agent 不存在或未激活：拒绝该 key（审计日志由上层决策触发，此处直接拒绝）。
+                crate::auth::audit::audit_missing_responsible_user(&self.pool, key.agent_id, key.company_id).await;
                 return Err(AuthError::Forbidden {
                     reason: "Agent is not active or does not exist".to_string(),
                     code: Some("AGENT_INACTIVE".to_string()),
@@ -211,7 +249,7 @@ impl BearerTokenResolver {
         Ok(Some(actor))
     }
 
-    async fn resolve_jwt(&self, token: &str) -> AuthResult<Option<AuthorizationActor>> {
+    async fn resolve_jwt(&self, token: &str, headers: &HeaderMap) -> AuthResult<Option<AuthorizationActor>> {
         let claims = match verify_local_agent_jwt(&self.jwt_config, token) {
             Some(c) => c,
             None => return Ok(None),
@@ -248,24 +286,44 @@ impl BearerTokenResolver {
             }
         };
 
-        // 验证 run_id 是否匹配（不匹配返回 403 + 审计日志）。
-        // 注意：当前 Agent 模型未持久化 run_id，故仅当 JWT 携带 run_id 时做存在性审计；
-        // 若后续 Agent 记录增加 run_id 字段，可在此处补充精确等值比较。
-        if run_id.is_some() && agent.status != AgentStatus::Running {
-            self.audit_jwt_rejected(&agent_id, &company_id, run_id, "run_id mismatch")
-                .await;
-            return Err(AuthError::Forbidden {
-                reason: "JWT run_id does not match agent run_id".to_string(),
-                code: Some("RUN_ID_MISMATCH".to_string()),
-            });
+        if let Some(claim_run_id) = run_id {
+            if let Some(header_run_id) = headers.get("x-paperclip-run-id")
+                .or_else(|| headers.get("x-parrot-run-id"))
+                .and_then(|v| v.to_str().ok()).map(str::trim)
+            {
+                if header_run_id != claim_run_id.to_string() {
+                    self.audit_jwt_rejected(&agent_id, &company_id, Some(claim_run_id), "run_id mismatch").await;
+                    return Err(AuthError::unprocessable(
+                        "Run ID header does not match signed agent JWT run_id",
+                        "agent_jwt_run_id_mismatch",
+                    ));
+                }
+            }
         }
 
-        Ok(Some(AuthorizationActor::agent_with_source(
-            agent_id,
-            company_id,
-            run_id,
-            ActorSource::AgentJwt,
-        )))
+        let responsible_user_id = if let Some(value) = claims.responsible_user_id {
+            Uuid::parse_str(&value).ok()
+        } else if std::env::var("PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK").ok().as_deref() == Some("true") {
+            None
+        } else if let Some(run) = run_id {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT responsible_user_id FROM heartbeat_runs WHERE id = $1 AND company_id = $2 AND agent_id = $3"
+            ).bind(run).bind(company_id).bind(agent_id).fetch_optional(&*self.pool).await.ok().flatten()
+                .flatten().and_then(|v| Uuid::parse_str(&v).ok())
+        } else { None };
+        let memberships = match responsible_user_id {
+            Some(uid) => load_responsible_user_memberships(&self.pool, uid, company_id).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        Ok(Some(AuthorizationActor::Agent {
+            agent_id, company_id, run_id, source: ActorSource::AgentJwt,
+            key_id: None,
+            key_scope: claims.key_scope.and_then(AgentApiKeyScope::from_json),
+            responsible_user_id,
+            on_behalf_of_user_id: responsible_user_id,
+            on_behalf_of_memberships: memberships,
+        }))
     }
 
     /// 记录 JWT 认证拒绝事件（最佳努力，不阻塞主流程）。
@@ -309,7 +367,7 @@ impl ActorResolver for BearerTokenResolver {
         } else if token.starts_with("aak_") {
             self.resolve_agent_key(&token).await
         } else {
-            self.resolve_jwt(&token).await
+            self.resolve_jwt(&token, headers).await
         }
     }
 
@@ -335,7 +393,7 @@ impl ActorResolver for SessionCookieResolver {
         let session_token = match headers
             .get("cookie")
             .and_then(|h| h.to_str().ok())
-            .and_then(|c| extract_cookie(c, "session"))
+            .and_then(|c| extract_cookie(c, &format!("{}-session", auth_cookie_prefix(&std::env::var("INSTANCE_ID").unwrap_or_else(|_| "default".to_string())))))
         {
             Some(t) => t,
             None => return Ok(None),
@@ -349,6 +407,9 @@ impl ActorResolver for SessionCookieResolver {
             Some(s) => s,
             None => return Ok(None),
         };
+
+        // Sliding session expiry, matching BetterAuth's active-session behavior.
+        let _ = session_repo.extend(session.id, 30 * 24 * 60 * 60).await;
 
         let (_, memberships, is_instance_admin) =
             resolve_board_access(&self.pool, session.user_id).await?;
@@ -388,6 +449,14 @@ impl CloudTenantHeaderResolver {
 #[async_trait]
 impl ActorResolver for CloudTenantHeaderResolver {
     async fn resolve(&self, headers: &HeaderMap) -> AuthResult<Option<AuthorizationActor>> {
+        let expected = match std::env::var("PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN") {
+            Ok(value) if !value.is_empty() => value,
+            _ => return Ok(None),
+        };
+        let supplied = headers.get("x-paperclip-cloud-tenant-token").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if !constant_time_eq(expected.as_bytes(), supplied.as_bytes()) {
+            return Ok(None);
+        }
         let stack_id = headers
             .get("x-paperclip-cloud-stack-id")
             .and_then(|h| h.to_str().ok())
@@ -402,9 +471,15 @@ impl ActorResolver for CloudTenantHeaderResolver {
             _ => return Ok(None),
         };
 
-        // 基于 stack id 派生稳定的公司 ID 与用户 ID
+        // Prefer the cloud identity headers; stack-derived identities retain
+        // compatibility with older cloud callers.
         let company_id = derive_uuid_from(&stack_id);
-        let user_id = derive_uuid_from(&format!("{}-user", stack_id));
+        let user_id = headers.get("x-paperclip-cloud-user-id").and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok()).unwrap_or_else(|| derive_uuid_from(&format!("{}-user", stack_id)));
+        let user_email = headers.get("x-paperclip-cloud-user-email").and_then(|v| v.to_str().ok())
+            .map(str::to_owned).unwrap_or_else(|| format!("{}@cloud.paperclip.local", stack_id));
+        let user_name = headers.get("x-paperclip-cloud-user-name").and_then(|v| v.to_str().ok())
+            .map(str::to_owned).or_else(|| Some(stack_id.clone()));
 
         let user_repo = PgAuthUserRepository::new((*self.pool).clone());
         if user_repo.find_by_id(user_id).await.map_err(|e| {
@@ -413,8 +488,8 @@ impl ActorResolver for CloudTenantHeaderResolver {
         {
             let user = repositories::models::auth::AuthUser {
                 id: user_id,
-                email: format!("{}@cloud.paperclip.local", stack_id),
-                name: Some(stack_id.clone()),
+                email: user_email,
+                name: user_name,
                 password_hash: None,
                 email_verified: true,
                 email_verified_at: Some(chrono::Utc::now()),
@@ -429,6 +504,11 @@ impl ActorResolver for CloudTenantHeaderResolver {
             };
             let _ = user_repo.create(user).await;
         }
+
+        // Cloud identities must never inherit the historical instance-admin
+        // grant from an older deployment.
+        let _ = sqlx::query("DELETE FROM instance_user_roles WHERE user_id = $1 AND role = 'instance_admin'")
+            .bind(user_id).execute(&*self.pool).await;
 
         let company_repo = PgCompanyRepository::new((*self.pool).clone());
         if company_repo.find_by_id(company_id).await.map_err(|e| {
@@ -461,12 +541,11 @@ impl ActorResolver for CloudTenantHeaderResolver {
         };
 
         let membership_repo = PgCompanyMembershipRepository::new((*self.pool).clone());
-        if membership_repo
+        if let Some(existing) = membership_repo
             .find_by_principal(company_id, "user", user_id)
             .await
             .map_err(|e| AuthError::Internal { message: format!("Cloud membership lookup failed: {}", e) })?
-            .is_none()
-        {
+            .is_none() {
             let _ = membership_repo
                 .create(repositories::models::authorization::CompanyMembershipRow::new(
                     company_id,
@@ -475,6 +554,8 @@ impl ActorResolver for CloudTenantHeaderResolver {
                     format!("{:?}", role).to_lowercase(),
                 ))
                 .await;
+        } else {
+            let _ = membership_repo.update_role(existing.id, format!("{:?}", role).to_lowercase()).await;
         }
 
         let membership = crate::auth::membership::CompanyMembership::new(
@@ -483,6 +564,8 @@ impl ActorResolver for CloudTenantHeaderResolver {
             user_id,
             role,
         );
+
+        ensure_human_role_default_grants(&self.pool, company_id, user_id, role).await;
 
         Ok(Some(AuthorizationActor::board_with_source(
             user_id,
@@ -498,6 +581,29 @@ impl ActorResolver for CloudTenantHeaderResolver {
     }
 }
 
+/// Seed the company-scoped defaults used by CloudTenant users. This mirrors
+/// Paperclip's `ensureHumanRoleDefaultGrants` while remaining idempotent.
+async fn ensure_human_role_default_grants(
+    pool: &PgPool,
+    company_id: Uuid,
+    user_id: Uuid,
+    role: crate::auth::MembershipRole,
+) {
+    let permissions: &[&str] = match role {
+        crate::auth::MembershipRole::Owner | crate::auth::MembershipRole::Admin => &[
+            "companies:read", "companies:update", "projects:read", "projects:create",
+            "issues:read", "issues:write", "agents:read", "tasks:assign",
+        ],
+        crate::auth::MembershipRole::Operator => &["companies:read", "projects:read", "issues:read", "issues:write"],
+        crate::auth::MembershipRole::Viewer => &["companies:read", "projects:read", "issues:read"],
+    };
+    for permission in permissions {
+        let _ = sqlx::query(
+            "INSERT INTO principal_permission_grants (id, company_id, principal_type, principal_id, permission_key, scope, granted_by_user_id, created_at, updated_at) VALUES ($1,$2,'user',$3,$4,'{}'::jsonb,$3,NOW(),NOW()) ON CONFLICT DO NOTHING"
+        ).bind(Uuid::new_v4()).bind(company_id).bind(user_id).bind(permission).execute(pool).await;
+    }
+}
+
 /// 从稳定字符串派生确定性 UUID（用于 cloud tenant 的 id 映射）。
 fn derive_uuid_from(seed: &str) -> Uuid {
     use sha2::{Digest, Sha256};
@@ -505,6 +611,14 @@ fn derive_uuid_from(seed: &str) -> Uuid {
     hasher.update(seed.as_bytes());
     let digest = hasher.finalize();
     Uuid::from_slice(&digest[..16]).unwrap_or_else(|_| Uuid::nil())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        diff |= usize::from(*left.get(index).unwrap_or(&0) ^ *right.get(index).unwrap_or(&0));
+    }
+    diff == 0
 }
 
 /// 从 Cookie 头中解析指定名称的 cookie 值。
@@ -548,7 +662,9 @@ impl AuthMiddleware {
                         return Ok(actor);
                     }
                 }
-                Err(AuthError::unauthenticated("No actor resolver succeeded"))
+                Ok(AuthorizationActor::board_with_source(
+                    Uuid::nil(), Uuid::nil(), ActorSource::LocalImplicit, vec![], false,
+                ))
             }
             AuthMode::Authenticated => {
                 for resolver in &self.resolvers {
@@ -584,6 +700,24 @@ pub fn extract_actor(request: &axum::extract::Request) -> AuthResult<&Authorizat
         })
 }
 
+/// Require a Board actor in handlers that operate on human-owned resources.
+pub fn require_board(actor: &AuthorizationActor) -> AuthResult<Uuid> {
+    match actor {
+        AuthorizationActor::Board { user_id, .. } => Ok(*user_id),
+        AuthorizationActor::None => Err(AuthError::unauthenticated("Board authentication required")),
+        AuthorizationActor::Agent { .. } => Err(AuthError::forbidden_with_code("Board actor required", "BOARD_ACTOR_REQUIRED")),
+    }
+}
+
+/// Require an Agent actor in agent-runtime handlers.
+pub fn require_agent(actor: &AuthorizationActor) -> AuthResult<Uuid> {
+    match actor {
+        AuthorizationActor::Agent { agent_id, .. } => Ok(*agent_id),
+        AuthorizationActor::None => Err(AuthError::unauthenticated("Agent authentication required")),
+        AuthorizationActor::Board { .. } => Err(AuthError::forbidden_with_code("Agent actor required", "AGENT_ACTOR_REQUIRED")),
+    }
+}
+
 /// 便捷构造：用 Bearer + Session + CloudTenant 解析器组装 Authenticated 模式中间件。
 pub fn authenticated_middleware(pool: Arc<PgPool>, jwt_config: Arc<JwtConfig>) -> AuthMiddleware {
     AuthMiddleware::new(AuthMode::Authenticated)
@@ -596,4 +730,22 @@ pub fn authenticated_middleware(pool: Arc<PgPool>, jwt_config: Arc<JwtConfig>) -
 pub fn local_trusted_middleware(default_user_id: Uuid, default_company_id: Uuid) -> AuthMiddleware {
     AuthMiddleware::new(AuthMode::LocalTrusted)
         .with_resolver(Arc::new(LocalTrustedResolver::new(default_user_id, default_company_id)))
+}
+
+/// Builds the resolver chain used by every API route, in Paperclip order.
+pub fn middleware_from_env(pool: Arc<PgPool>) -> AuthMiddleware {
+    let mode = AuthMode::from_env();
+    let jwt = JwtConfig::from_env().unwrap_or_else(|| JwtConfig::new(
+        String::new(), 3600, "parrot-agent".to_string(), "agent-runtime".to_string(), "local".to_string(),
+    ));
+    let mut middleware = AuthMiddleware::new(mode)
+        .with_resolver(Arc::new(BearerTokenResolver::new(pool.clone(), Arc::new(jwt))))
+        .with_resolver(Arc::new(SessionCookieResolver::new(pool.clone())))
+        .with_resolver(Arc::new(CloudTenantHeaderResolver::new(pool)));
+    if mode == AuthMode::LocalTrusted {
+        let user_id = std::env::var("LOCAL_TRUSTED_USER_ID").ok().and_then(|v| Uuid::parse_str(&v).ok()).unwrap_or_else(Uuid::nil);
+        let company_id = std::env::var("LOCAL_TRUSTED_COMPANY_ID").ok().and_then(|v| Uuid::parse_str(&v).ok()).unwrap_or_else(Uuid::nil);
+        middleware = middleware.with_resolver(Arc::new(LocalTrustedResolver::new(user_id, company_id)));
+    }
+    middleware
 }

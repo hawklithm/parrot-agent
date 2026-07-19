@@ -14,7 +14,9 @@ pub use services::{
     SecretRemoteImportService, EnvironmentDiagnosticsService,
     InviteResourceService, RoutineAnnotationService, WorkProductService,
     AttachmentService, UserSecretDefinitionService, UserSecretService,
-    WatchdogService, ApprovalService, TermService,
+    WatchdogService, ApprovalService, TermService, LabelService,
+    InstanceSettingsService,
+    CostService, BudgetService, FinanceService,
 };
 
 pub use access::AccessService;
@@ -100,6 +102,17 @@ pub struct AppState {
     // Terms service
     pub term_service: Arc<dyn TermService>,
 
+    // Label service
+    pub label_service: Arc<dyn LabelService>,
+
+    // Instance settings service
+    pub instance_settings_service: Arc<dyn InstanceSettingsService>,
+
+    // Cost / Budget / Finance services
+    pub cost_service: Arc<dyn CostService>,
+    pub budget_service: Arc<dyn BudgetService>,
+    pub finance_service: Arc<dyn FinanceService>,
+
     // Event bus
     pub event_bus: Arc<dyn EventBus>,
 
@@ -147,6 +160,11 @@ impl AppState {
         approval_service: Arc<dyn ApprovalService>,
         watchdog_service: Arc<dyn WatchdogService>,
         term_service: Arc<dyn TermService>,
+        label_service: Arc<dyn LabelService>,
+        instance_settings_service: Arc<dyn InstanceSettingsService>,
+        cost_service: Arc<dyn CostService>,
+        budget_service: Arc<dyn BudgetService>,
+        finance_service: Arc<dyn FinanceService>,
         event_bus: Arc<dyn EventBus>,
         pool: PgPool,
     ) -> Self {
@@ -188,6 +206,11 @@ impl AppState {
             approval_service,
             watchdog_service,
             term_service,
+            label_service,
+            instance_settings_service,
+            cost_service,
+            budget_service,
+            finance_service,
             event_bus,
             pool,
         }
@@ -200,6 +223,9 @@ impl AppState {
 /// 返回 `Router<AppState>`，或返回已绑定状态的无状态 `Router`，方可被
 /// `merge` 合并。
 pub fn create_router(state: AppState) -> Router {
+    let auth_middleware = std::sync::Arc::new(services::auth::middleware_from_env(
+        std::sync::Arc::new(state.pool.clone()),
+    ));
     let api_routes = Router::new()
         // Phase 1: Agent Management routes
         .merge(crate::routes::agents::agent_routes())
@@ -265,6 +291,10 @@ pub fn create_router(state: AppState) -> Router {
         // P2: Execution workspace + heartbeat-run routes (X1-X18)
         .merge(crate::routes::execution_workspaces::execution_workspace_routes())
         .merge(crate::routes::heartbeat_runs::heartbeat_run_routes())
+        .layer(axum::middleware::from_fn_with_state(
+            auth_middleware,
+            services::auth::auth_middleware_fn,
+        ))
         .with_state(state);
 
     Router::new()

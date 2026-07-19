@@ -49,13 +49,24 @@ pub struct StatusCount {
     pub count: i64,
 }
 
+/// Helper: 通过 issue_id 查询 company_id
+async fn get_company_id_for_issue(state: &AppState, issue_id: Uuid) -> Result<Uuid, StatusCode> {
+    let issue = state
+        .issue_service
+        .get(issue_id, Uuid::nil())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(issue.company_id)
+}
+
 /// GET /issues/:id/diagnostics/blockers
 async fn get_blockers_diagnostics(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BlockersDiagnostics>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_issue(&state, id).await?;
 
     let issue = service
         .get(id, company_id)
@@ -110,7 +121,7 @@ async fn get_subtree_diagnostics(
     Path(id): Path<Uuid>,
 ) -> Result<Json<SubtreeDiagnostics>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = get_company_id_for_issue(&state, id).await?;
 
     // Verify issue exists
     let _ = service

@@ -69,6 +69,9 @@ impl JwtConfig {
 /// Local Agent JWT Claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalAgentJwtClaims {
+    /// Unique token id, allowing downstream replay protection/auditing.
+    #[serde(default)]
+    pub jti: String,
     /// Subject (Agent ID)
     pub sub: String,
     /// 公司ID
@@ -106,6 +109,7 @@ impl LocalAgentJwtClaims {
     ) -> Self {
         let now = Utc::now().timestamp();
         Self {
+            jti: Uuid::new_v4().to_string(),
             sub: agent_id.to_string(),
             company_id: company_id.to_string(),
             adapter_type,

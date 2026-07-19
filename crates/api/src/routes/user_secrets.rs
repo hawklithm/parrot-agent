@@ -94,11 +94,11 @@ pub async fn create_definition(
     State(service): State<Arc<dyn UserSecretService>>,
     Json(req): Json<CreateDefinitionRequest>,
 ) -> Result<Json<UserSecretDefinition>, StatusCode> {
-    // TODO: Extract user_id from auth context
-    let user_id = Uuid::nil();
+    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
+    let current_user_id = Uuid::nil();
 
     let definition = service
-        .create_definition(company_id, req.key, req.description, req.required, req.scope, user_id)
+        .create_definition(company_id, req.key, req.description, req.required, req.scope, current_user_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(definition))
@@ -159,11 +159,11 @@ pub async fn list_user_secrets(
     Path(company_id): Path<Uuid>,
     State(service): State<Arc<dyn UserSecretService>>,
 ) -> Result<Json<Vec<UserSecretResponse>>, StatusCode> {
-    // TODO: Extract user_id from auth context
-    let user_id = Uuid::nil();
+    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
+    let current_user_id = Uuid::nil();
 
     let secrets = service
-        .list_user_secrets(user_id, company_id)
+        .list_user_secrets(current_user_id, company_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -177,11 +177,11 @@ pub async fn set_user_secret(
     State(service): State<Arc<dyn UserSecretService>>,
     Json(req): Json<SetUserSecretRequest>,
 ) -> Result<Json<UserSecretResponse>, StatusCode> {
-    // TODO: Extract user_id from auth context
-    let user_id = Uuid::nil();
+    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
+    let current_user_id = Uuid::nil();
 
     let secret = service
-        .set_user_secret(user_id, req.definition_id, req.value)
+        .set_user_secret(current_user_id, req.definition_id, req.value)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -193,11 +193,11 @@ pub async fn get_user_secret(
     Path((_company_id, definition_id)): Path<(Uuid, Uuid)>,
     State(service): State<Arc<dyn UserSecretService>>,
 ) -> Result<Json<UserSecretResponse>, StatusCode> {
-    // TODO: Extract user_id from auth context
-    let user_id = Uuid::nil();
+    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
+    let current_user_id = Uuid::nil();
 
     let secret = service
-        .get_user_secret(user_id, definition_id)
+        .get_user_secret(current_user_id, definition_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;

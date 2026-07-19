@@ -60,6 +60,7 @@ use services::{
     ProjectService, RoutineAnnotationService, RoutineService, SecretProviderConfigService,
     SecretRemoteImportService, SseService, UserDirectoryService, UserSecretDefinitionService,
     UserSecretService, WatchdogService, WorkProductService,
+    InstanceSettingsService,
     // Real service impls
     DefaultAgentService, DefaultApprovalService, DefaultBuiltInAgentService,
     DefaultLowTrustService, DefaultOrgChartService, DefaultGoalService, DefaultPipelineService,
@@ -70,6 +71,7 @@ use services::{
     user_secret_definition_service::UserSecretDefinitionServiceImpl,
     issue_comment_service::IssueCommentServiceImpl,
     InMemoryEventBus, InMemorySseService, DefaultWatchdogService,
+    DefaultInstanceSettingsService,
     // Mock impls for not-yet-implemented domains
     MockCaseService,
     openclaw_service::OpenClawServiceImpl,
@@ -137,6 +139,7 @@ fn build_app_state(pool: PgPool) -> AppState {
     let approval_repo: Arc<PostgresApprovalRepository> =
         Arc::new(PostgresApprovalRepository::new(pool.clone()));
     let company_repo = CompanyRepository::new(pool.clone());
+    let company_repo_for_services = CompanyRepository::new(pool.clone());
     let project_repo = ProjectRepository::new(pool.clone());
     let goal_repo: Arc<dyn GoalRepository> =
         Arc::new(repositories::goal_repository::PostgresGoalRepository::new(pool.clone()));
@@ -147,6 +150,12 @@ fn build_app_state(pool: PgPool) -> AppState {
         Arc::new(PgCaseIssueLinkRepository::new(pool.clone()));
     let cost_event_repo: Arc<repositories::cost_event_repository::PgCostEventRepository> =
         Arc::new(repositories::cost_event_repository::PgCostEventRepository::new(pool.clone()));
+    let budget_policy_repo: Arc<repositories::budget_repository::PgBudgetPolicyRepository> =
+        Arc::new(repositories::budget_repository::PgBudgetPolicyRepository::new(pool.clone()));
+    let budget_incident_repo: Arc<repositories::budget_repository::PgBudgetIncidentRepository> =
+        Arc::new(repositories::budget_repository::PgBudgetIncidentRepository::new(pool.clone()));
+    let finance_event_repo: Arc<repositories::finance_event_repository::PgFinanceEventRepository> =
+        Arc::new(repositories::finance_event_repository::PgFinanceEventRepository::new(pool.clone()));
     let activity_log_repo: Arc<repositories::activity_log_repository::PgActivityLogRepository> =
         Arc::new(repositories::activity_log_repository::PgActivityLogRepository::new(pool.clone()));
     let pipeline_repo: Arc<dyn PipelineRepository> =
@@ -286,6 +295,16 @@ fn build_app_state(pool: PgPool) -> AppState {
     ));
     let event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new(1024));
 
+    // Label service
+    let label_repo: Arc<repositories::label_repository::PgLabelRepository> =
+        Arc::new(repositories::label_repository::PgLabelRepository::new(pool.clone()));
+    let label_service: Arc<dyn services::LabelService> =
+        Arc::new(services::DefaultLabelService::new(label_repo));
+
+    // Instance settings service (in-memory implementation)
+    let instance_settings_service: Arc<dyn InstanceSettingsService> =
+        Arc::new(DefaultInstanceSettingsService::new());
+
     // Adapt the complete service to the route-facing legacy trait while preserving the
     // shared repository instances used by approvals and issue sub-resources.
     let issue_service: Arc<dyn IssueService> = Arc::new(services::LegacyIssueService::new(
@@ -335,6 +354,24 @@ fn build_app_state(pool: PgPool) -> AppState {
         approval_service,
         watchdog_service,
         Arc::new(services::DefaultTermService::new()),
+        label_service,
+        instance_settings_service,
+        Arc::new(services::DefaultCostService::new(
+            cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
+            Arc::new(agent_repo.clone()) as Arc<dyn repositories::AgentRepository>,
+            Arc::new(company_repo_for_services.clone()),
+        ).with_adapter_registry(adapter_registry.clone())),
+        Arc::new(services::DefaultBudgetService::new(
+            cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
+            budget_policy_repo.clone() as Arc<dyn repositories::BudgetPolicyRepository>,
+            budget_incident_repo.clone() as Arc<dyn repositories::BudgetIncidentRepository>,
+            Arc::new(agent_repo.clone()) as Arc<dyn repositories::AgentRepository>,
+            Arc::new(company_repo_for_services.clone()),
+        )),
+        Arc::new(services::DefaultFinanceService::new(
+            finance_event_repo.clone() as Arc<dyn repositories::FinanceEventRepository>,
+            Arc::new(company_repo_for_services.clone()),
+        )),
         event_bus,
         pool,
     )

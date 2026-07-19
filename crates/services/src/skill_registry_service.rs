@@ -101,6 +101,9 @@ pub trait SkillRegistryService: Send + Sync {
 
     /// SK38: Delete skill
     async fn delete_skill(&self, company_id: Uuid, skill_id: Uuid) -> ServiceResult<()>;
+
+    /// SK39: List all skills for a company
+    async fn list_company_skills(&self, company_id: Uuid) -> ServiceResult<Vec<serde_json::Value>>;
 }
 
 /// Mock implementation for testing
@@ -383,5 +386,12 @@ impl SkillRegistryService for MockSkillRegistryService {
 
     async fn delete_skill(&self, _company_id: Uuid, _skill_id: Uuid) -> ServiceResult<()> {
         Ok(())
+    }
+
+    async fn list_company_skills(&self, _company_id: Uuid) -> ServiceResult<Vec<serde_json::Value>> {
+        Ok(vec![
+            serde_json::json!({"id": Uuid::new_v4(), "name": "Code Review", "category": "Development", "version": "1.0.0"}),
+            serde_json::json!({"id": Uuid::new_v4(), "name": "Test Generator", "category": "Testing", "version": "1.0.0"}),
+        ])
     }
 }

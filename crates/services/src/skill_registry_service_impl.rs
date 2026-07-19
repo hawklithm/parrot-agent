@@ -616,4 +616,13 @@ impl SkillRegistryService for DefaultSkillRegistryServiceImpl {
             .await
             .map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))
     }
+
+    // ─── SK39: List company skills ─────────────────────────
+
+    async fn list_company_skills(&self, company_id: Uuid) -> ServiceResult<Vec<serde_json::Value>> {
+        self.company_skill_repo
+            .list_by_company(company_id)
+            .await
+            .map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))
+    }
 }

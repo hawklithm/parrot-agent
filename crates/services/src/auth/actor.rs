@@ -246,6 +246,9 @@ impl ActorSource {
 /// 限制Agent API密钥的使用范围，防止密钥泄露后的权限滥用
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentApiKeyScope {
+    /// Paperclip-compatible scope discriminator: standard, task_bridge, skill_test.
+    #[serde(default = "default_scope_type")]
+    pub scope_type: String,
     /// 密钥所属Agent ID
     pub agent_id: Uuid,
     /// 密钥所属公司ID
@@ -260,12 +263,23 @@ pub struct AgentApiKeyScope {
     pub created_at: DateTime<Utc>,
     /// 密钥过期时间（None表示永不过期）
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub parent_issue_id: Option<Uuid>,
+    #[serde(default)]
+    pub allowed_assignee_agent_ids: Option<Vec<Uuid>>,
+    #[serde(default)]
+    pub issue_id: Option<Uuid>,
 }
+
+fn default_scope_type() -> String { "standard".to_string() }
 
 impl AgentApiKeyScope {
     /// 创建新的AgentApiKeyScope
     pub fn new(agent_id: Uuid, company_id: Uuid) -> Self {
         Self {
+            scope_type: default_scope_type(),
             agent_id,
             company_id,
             allowed_issue_ids: None,
@@ -273,6 +287,10 @@ impl AgentApiKeyScope {
             allow_sensitive_read: false,
             created_at: Utc::now(),
             expires_at: None,
+            project_id: None,
+            parent_issue_id: None,
+            allowed_assignee_agent_ids: None,
+            issue_id: None,
         }
     }
 
@@ -323,6 +341,20 @@ impl AgentApiKeyScope {
             None => true, // 允许所有操作
             Some(actions) => actions.contains(&action.to_string()),
         }
+    }
+
+    /// Parse and normalize persisted/JWT scope JSON. Unknown or malformed
+    /// scope configurations are rejected instead of silently becoming global.
+    pub fn from_json(value: serde_json::Value) -> Option<Self> {
+        if value.is_null() || value == serde_json::json!({}) {
+            return None;
+        }
+        let scope: Self = serde_json::from_value(value).ok()?;
+        let valid = matches!(scope.scope_type.as_str(), "standard" | "task_bridge" | "skill_test");
+        if !valid { return None; }
+        if scope.scope_type == "task_bridge" && (scope.project_id.is_none() || scope.parent_issue_id.is_none()) { return None; }
+        if scope.scope_type == "skill_test" && scope.issue_id.is_none() { return None; }
+        Some(scope)
     }
 }
 

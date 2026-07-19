@@ -494,7 +494,20 @@ async fn create_agent_key(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Missing 'name' field".to_string()))?
         .to_string();
-    let key = state.agent_service.create_key(id, name).await?;
+    let scope = payload.get("scope").cloned();
+    if let Some(ref value) = scope {
+        let kind = value.get("scope_type").and_then(|v| v.as_str()).unwrap_or("standard");
+        if !matches!(kind, "standard" | "task_bridge" | "skill_test") {
+            return Err(AppError::BadRequest("Invalid agent key scope_type".to_string()));
+        }
+        if kind == "task_bridge" && (value.get("project_id").is_none() || value.get("parent_issue_id").is_none()) {
+            return Err(AppError::BadRequest("task_bridge scope requires project_id and parent_issue_id".to_string()));
+        }
+        if kind == "skill_test" && value.get("issue_id").is_none() {
+            return Err(AppError::BadRequest("skill_test scope requires issue_id".to_string()));
+        }
+    }
+    let key = state.agent_service.create_key(id, name, scope).await?;
     Ok((StatusCode::CREATED, Json(key)))
 }
 

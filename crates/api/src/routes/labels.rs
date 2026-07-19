@@ -1,4 +1,7 @@
-//! Label routes — P4 收尾域 (LB1-LB3)
+//! Label routes — Paperclip 一比一迁移
+//!
+//! 对应 Paperclip: Labels are embedded in the issue model.
+//! 提供标签的 CRUD 端点。
 
 use axum::{
     extract::{Path, State},
@@ -7,9 +10,18 @@ use axum::{
     routing::{delete, get},
     Json, Router,
 };
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::errors::AppError;
+
+/// 创建标签请求体
+#[derive(Debug, Deserialize)]
+pub struct CreateLabelRequest {
+    pub name: String,
+    pub color: Option<String>,
+}
 
 pub fn label_routes() -> Router<AppState> {
     Router::new()
@@ -17,31 +29,71 @@ pub fn label_routes() -> Router<AppState> {
         .route("/labels/:label_id", delete(delete_label))
 }
 
+/// GET /companies/:company_id/labels
+/// 列出公司标签。
 async fn list_labels(
-    State(_state): State<AppState>,
-    Path(_company_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![
-        serde_json::json!({"id": Uuid::new_v4(), "name": "bug", "color": "red"}),
-        serde_json::json!({"id": Uuid::new_v4(), "name": "enhancement", "color": "blue"}),
-    ]))
-}
-
-async fn create_label(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
-    Json(_body): Json<serde_json::Value>,
-) -> Result<impl IntoResponse, StatusCode> {
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "id": Uuid::new_v4(),
-        "companyId": company_id,
-        "created": true,
-    }))))
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let labels = state
+        .label_service
+        .list_by_company(company_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    let result: Vec<serde_json::Value> = labels
+        .into_iter()
+        .map(|l| {
+            serde_json::json!({
+                "id": l.id,
+                "companyId": l.company_id,
+                "name": l.name,
+                "color": l.color,
+                "createdAt": l.created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(result))
 }
 
+/// POST /companies/:company_id/labels
+/// 创建标签。
+async fn create_label(
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Json(body): Json<CreateLabelRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let label = state
+        .label_service
+        .create(company_id, body.name, body.color)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": label.id,
+            "companyId": label.company_id,
+            "name": label.name,
+            "color": label.color,
+            "createdAt": label.created_at,
+            "created": true,
+        })),
+    ))
+}
+
+/// DELETE /labels/:label_id
+/// 删除标签。
 async fn delete_label(
-    State(_state): State<AppState>,
-    Path(_label_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
+    State(state): State<AppState>,
+    Path(label_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .label_service
+        .delete(label_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
     Ok(StatusCode::NO_CONTENT)
 }

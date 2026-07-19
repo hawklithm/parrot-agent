@@ -42,6 +42,9 @@ pub mod user_secret;
 pub mod user_secret_definition;
 pub mod websocket;
 pub mod task_watchdog;
+pub mod label;
+pub mod budget;
+pub mod finance_event;
 
 // ===== 显式导出：消除 glob re-export 歧义 =====
 // 规则：显式导出优先于 glob 导出，放在 glob 之前即可消除歧义
@@ -116,3 +119,4 @@ pub use user_directory::*;
 pub use user_secret::*;
 pub use user_secret_definition::*;
 pub use websocket::*;
+pub use label::*;

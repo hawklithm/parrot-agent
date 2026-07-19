@@ -10,7 +10,7 @@ access = { path = "../access" }
 repositories = { path = "../repositories" }
 adapters = { path = "../adapters" }
 
-axum = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
 tokio = { workspace = true }
@@ -24,3 +24,4 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+sha2 = "0.10"

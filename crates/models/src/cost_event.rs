@@ -35,3 +35,43 @@ pub struct CostSummary {
     pub total_output_tokens: i64,
     pub event_count: i64,
 }
+
+/// IssueTreeCostSummary — Issue 树成本汇总（含子 Issue 递归聚合）
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueTreeCostSummary {
+    pub issue_id: Uuid,
+    pub issue_count: i64,
+    pub include_descendants: bool,
+    pub cost_cents: i64,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub run_count: i64,
+    pub runtime_ms: f64,
+}
+
+/// RunSummaryRow — 运行汇总行（用于 issue_tree_cost_summary 的 heartbeat_runs 查询）
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RunSummaryRow {
+    pub run_count: i64,
+    pub runtime_ms: f64,
+}
+
+/// CostSummaryRow — 成本汇总行（通用聚合结果，支持按多种维度分组）
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct CostSummaryRow {
+    pub dimension: String,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_cached_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub event_count: i64,
+    pub api_run_count: i64,
+    pub subscription_run_count: i64,
+    pub subscription_cached_input_tokens: i64,
+    pub subscription_input_tokens: i64,
+    pub subscription_output_tokens: i64,
+    pub provider_count: i64,
+    pub model_count: i64,
+}

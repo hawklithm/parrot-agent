@@ -184,8 +184,25 @@ pub mod heartbeat_service;
 pub use heartbeat_service::*;
 pub mod task_watchdog;
 pub use task_watchdog::{WatchdogService, DefaultWatchdogService, classify_subtree, ClassifierState, ClassifierInput, StoppedLeaf};
+pub mod label_service;
 pub mod term_service;
 pub use term_service::*;
+pub mod instance_settings_service;
+pub use instance_settings_service::{
+    InstanceSettingsService, DefaultInstanceSettingsService,
+    InstanceSettings, GeneralSettings, ExperimentalSettings,
+    AutoRecoveryPreview, AutoRecoveryResult, DatabaseBackupResult,
+};
+pub mod cost_service;
+pub use cost_service::{
+    CostService, DefaultCostService,
+    BudgetService, DefaultBudgetService,
+    FinanceService, DefaultFinanceService,
+    CostEventDto, CostSummaryDto, CostSummaryWithBudget, WindowSpend, WindowSpendEntry, QuotaWindow,
+    BudgetOverview, BudgetPolicy, BudgetPolicySummary, BudgetIncidentDto, BudgetEnforcementScope,
+    FinanceEventDto, FinanceSummaryDto, FinanceSummaryRowDto,
+    CreateCostEventInput, CreateFinanceEventInput, BudgetIncidentResolveInput, UpsertPolicyInput,
+};
 pub mod retry;
 pub use retry::*;
 pub mod job_scheduler;
@@ -206,6 +223,7 @@ pub use adapter_executor::*;
 pub mod issue_execution_lock_service;
 pub use issue_execution_lock_service::*;
 pub use low_trust_service::*;
+pub use label_service::*;
 pub use adapter_registry::*;
 pub use adapters::*;
 // 注意: activity_log_service 和 access 都定义了 ResourceType，

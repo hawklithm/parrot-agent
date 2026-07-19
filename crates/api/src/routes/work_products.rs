@@ -10,13 +10,24 @@ use uuid::Uuid;
 
 use models::issue_auxiliary::{CreateWorkProductInput, UpdateWorkProductInput, WorkProduct};
 
+/// Helper: 通过 issue_id 查询 company_id
+async fn get_company_id_for_issue(state: &AppState, issue_id: Uuid) -> Result<Uuid, AppError> {
+    let issue = state
+        .issue_service
+        .get(issue_id, Uuid::nil())
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        .ok_or(AppError::NotFound("Issue not found".to_string()))?;
+    Ok(issue.company_id)
+}
+
 /// GET /issues/:id/work-products - List work products
 async fn list_work_products(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<WorkProduct>>, AppError> {
-    let company_id = Uuid::nil();
-    
+    let company_id = get_company_id_for_issue(&state, id).await?;
+
     state.work_product_service
         .list_work_products(id, company_id)
         .await
@@ -30,8 +41,8 @@ async fn create_work_product(
     Path(id): Path<Uuid>,
     Json(input): Json<CreateWorkProductInput>,
 ) -> Result<Json<WorkProduct>, AppError> {
-    let company_id = Uuid::nil();
-    
+    let company_id = get_company_id_for_issue(&state, id).await?;
+
     state.work_product_service
         .create_work_product(id, company_id, input)
         .await
@@ -45,8 +56,10 @@ async fn update_work_product(
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateWorkProductInput>,
 ) -> Result<Json<WorkProduct>, AppError> {
+    // Note: work_product 没有 issue_id 路径参数，无法直接获取 company_id。
+    // 当前 work_product_service 实现中 company_id 参数被忽略（_company_id）。
     let company_id = Uuid::nil();
-    
+
     state.work_product_service
         .update_work_product(id, company_id, input)
         .await
@@ -59,8 +72,10 @@ async fn delete_work_product(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
+    // Note: work_product 没有 issue_id 路径参数，无法直接获取 company_id。
+    // 当前 work_product_service 实现中 company_id 参数被忽略（_company_id）。
     let company_id = Uuid::nil();
-    
+
     state.work_product_service
         .delete_work_product(id, company_id)
         .await

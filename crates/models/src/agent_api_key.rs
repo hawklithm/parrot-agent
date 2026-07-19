@@ -14,6 +14,10 @@ pub struct AgentApiKey {
     pub company_id: Uuid,
     /// 密钥名称/描述
     pub name: String,
+    /// Paperclip-compatible scope. `{}` is treated as the standard scope for
+    /// keys created before scope persistence was introduced.
+    #[sqlx(default)]
+    pub scope: serde_json::Value,
     /// 密钥哈希值（bcrypt）
     pub key_hash: String,
     /// 最后使用时间

@@ -65,11 +65,13 @@ async fn create_approval(
 ) -> Result<impl IntoResponse, StatusCode> {
     use models::ApprovalType;
     use services::approval_service::CreateApprovalInput;
+    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
+    let current_user_id = Uuid::nil();
     let input = CreateApprovalInput {
         company_id,
         approval_type: ApprovalType::CreateResource,
         requested_by_agent_id: None,
-        requested_by_user_id: Some(Uuid::nil()),
+        requested_by_user_id: Some(current_user_id),
         payload: serde_json::json!({
             "title": body.title,
             "description": body.description,
@@ -99,10 +101,12 @@ async fn approve_approval(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use services::approval_service::*;
+    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
+    let current_user_id = Uuid::nil();
     let input = ReviewApprovalInput {
         approval_id: id,
         decision: ApprovalDecision::Approve,
-        decided_by_user_id: Uuid::nil(),
+        decided_by_user_id: current_user_id,
         decision_note: body.get("decisionNote").and_then(|v| v.as_str()).map(String::from),
     };
     let approval = state.approval_service.review(input).await
@@ -117,10 +121,12 @@ async fn reject_approval(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use services::approval_service::*;
+    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
+    let current_user_id = Uuid::nil();
     let input = ReviewApprovalInput {
         approval_id: id,
         decision: ApprovalDecision::Reject,
-        decided_by_user_id: Uuid::nil(),
+        decided_by_user_id: current_user_id,
         decision_note: body.get("decisionNote").and_then(|v| v.as_str()).map(String::from),
     };
     let approval = state.approval_service.review(input).await
@@ -135,10 +141,12 @@ async fn request_approval_revision(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use services::approval_service::*;
+    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
+    let current_user_id = Uuid::nil();
     let input = ReviewApprovalInput {
         approval_id: id,
         decision: ApprovalDecision::RequestRevision,
-        decided_by_user_id: Uuid::nil(),
+        decided_by_user_id: current_user_id,
         decision_note: body.get("decisionNote").and_then(|v| v.as_str()).map(String::from),
     };
     let approval = state.approval_service.review(input).await

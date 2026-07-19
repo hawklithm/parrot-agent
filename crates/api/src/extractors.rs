@@ -3,10 +3,15 @@ use axum::{
     extract::{FromRequestParts, Path},
     http::request::Parts,
 };
+use std::collections::HashMap;
 use uuid::Uuid;
 use crate::errors::AppError;
+use services::auth::AuthorizationActor;
 
 /// Agent ID 提取器 - 支持 UUID 或 shortname
+///
+/// 从路径参数 `:agent_id` 中提取代理 ID，支持 UUID 或 shortname (ag_*) 格式。
+/// 适用于有多个路径参数的路由。
 #[derive(Debug, Clone)]
 pub struct AgentIdOrShortname(pub Uuid);
 
@@ -18,18 +23,22 @@ where
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let Path(id_str): Path<String> = Path::from_request_parts(parts, state)
+        let Path(params): Path<HashMap<String, String>> = Path::from_request_parts(parts, state)
             .await
             .map_err(|_| AppError::BadRequest("Invalid agent ID parameter".to_string()))?;
 
+        let id_str = params.get("agent_id").or_else(|| params.get("id")).ok_or_else(|| {
+            AppError::BadRequest("Missing agent_id path parameter".to_string())
+        })?;
+
         // 尝试直接解析为 UUID
-        if let Ok(uuid) = Uuid::parse_str(&id_str) {
+        if let Ok(uuid) = Uuid::parse_str(id_str) {
             return Ok(AgentIdOrShortname(uuid));
         }
 
         // 尝试作为 shortname 解析（格式: "ag_" + base62编码）
         if id_str.starts_with("ag_") {
-            if let Some(uuid) = decode_shortname(&id_str) {
+            if let Some(uuid) = decode_shortname(id_str) {
                 return Ok(AgentIdOrShortname(uuid));
             }
         }
@@ -42,6 +51,9 @@ where
 }
 
 /// Company ID 提取器
+///
+/// 从路径参数 `:company_id` 中提取公司 ID，支持 UUID 或 shortname (co_*) 格式。
+/// 适用于有多个路径参数的路由（例如 `/companies/:company_id/adapters/:adapter_type/models`）。
 #[derive(Debug, Clone)]
 pub struct CompanyIdOrShortname(pub Uuid);
 
@@ -53,18 +65,22 @@ where
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let Path(id_str): Path<String> = Path::from_request_parts(parts, state)
+        let Path(params): Path<HashMap<String, String>> = Path::from_request_parts(parts, state)
             .await
             .map_err(|_| AppError::BadRequest("Invalid company ID parameter".to_string()))?;
 
+        let id_str = params.get("company_id").or_else(|| params.get("companyId")).ok_or_else(|| {
+            AppError::BadRequest("Missing company_id path parameter".to_string())
+        })?;
+
         // 尝试直接解析为 UUID
-        if let Ok(uuid) = Uuid::parse_str(&id_str) {
+        if let Ok(uuid) = Uuid::parse_str(id_str) {
             return Ok(CompanyIdOrShortname(uuid));
         }
 
         // 尝试作为 shortname 解析（格式: "co_" + base62编码）
         if id_str.starts_with("co_") {
-            if let Some(uuid) = decode_shortname(&id_str) {
+            if let Some(uuid) = decode_shortname(id_str) {
                 return Ok(CompanyIdOrShortname(uuid));
             }
         }
@@ -79,6 +95,38 @@ where
 /// Revision ID 提取器
 #[derive(Debug, Clone)]
 pub struct RevisionId(pub Uuid);
+
+/// Board actor guard. The global auth middleware must run before this extractor.
+#[derive(Debug, Clone, Copy)]
+pub struct BoardActor(pub Uuid);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for BoardActor
+where S: Send + Sync {
+    type Rejection = AppError;
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let actor = parts.extensions.get::<AuthorizationActor>()
+            .ok_or_else(|| AppError::InternalServerError("Authorization actor missing".to_string()))?;
+        services::auth::require_board(actor).map(BoardActor)
+            .map_err(|e| AppError::Forbidden(e.user_message()))
+    }
+}
+
+/// Agent actor guard. The global auth middleware must run before this extractor.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentActor(pub Uuid);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for AgentActor
+where S: Send + Sync {
+    type Rejection = AppError;
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let actor = parts.extensions.get::<AuthorizationActor>()
+            .ok_or_else(|| AppError::InternalServerError("Authorization actor missing".to_string()))?;
+        services::auth::require_agent(actor).map(AgentActor)
+            .map_err(|e| AppError::Forbidden(e.user_message()))
+    }
+}
 
 #[async_trait]
 impl<S> FromRequestParts<S> for RevisionId

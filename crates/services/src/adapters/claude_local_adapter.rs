@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use models::{AdapterType, AdapterModel, AdapterEnvironmentTestResult, AdapterEnvironmentTestStatus, AdapterEnvironmentCheck};
 use crate::adapter_registry::ServerAdapterModule;
 use models::TestEnvironmentContext;
@@ -7,12 +9,25 @@ use std::process::Command;
 
 /// Claude Local 适配器
 /// 对接 Claude Code CLI，支持本地 Claude 模型执行
-pub struct ClaudeLocalAdapter;
+///
+/// 模型发现策略（参考 paperclip cursor-models.ts）：
+/// 1. 尝试通过 `claude models` CLI 命令发现可用模型
+/// 2. 解析 CLI 输出（JSON 格式或纯文本格式）
+/// 3. 如果 CLI 发现成功，合并默认模型列表后缓存结果（60s TTL）
+/// 4. 如果 CLI 发现失败，回退到默认模型列表
+pub struct ClaudeLocalAdapter {
+    /// 缓存：模型列表 + 过期时间
+    models_cache: Mutex<Option<(Vec<AdapterModel>, Instant)>>,
+}
 
 impl ClaudeLocalAdapter {
     pub fn new() -> Self {
-        Self
+        Self {
+            models_cache: Mutex::new(None),
+        }
     }
+
+    const CACHE_TTL: Duration = Duration::from_secs(60);
 
     /// 检查 Claude CLI 是否已安装
     fn is_claude_cli_installed(&self) -> bool {
@@ -23,48 +38,7 @@ impl ClaudeLocalAdapter {
             .unwrap_or(false)
     }
 
-    /// 获取 Claude 可用模型列表
-    fn discover_claude_models(&self) -> Vec<AdapterModel> {
-        // 尝试通过 CLI 发现模型
-        if let Ok(output) = Command::new("claude").arg("models").output() {
-            if output.status.success() {
-                if let Ok(stdout) = String::from_utf8(output.stdout) {
-                    return self.parse_models_from_cli(&stdout);
-                }
-            }
-        }
-
-        // 如果无法发现，返回默认的 Claude 模型列表
-        self.get_default_models()
-    }
-
-    /// 从 CLI 输出解析模型列表
-    fn parse_models_from_cli(&self, output: &str) -> Vec<AdapterModel> {
-        let mut models = Vec::new();
-
-        for line in output.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // 解析模型 ID（假设格式为 "model-id" 或 "model-id - description"）
-            if let Some(model_id) = line.split_whitespace().next() {
-                models.push(AdapterModel {
-                    id: model_id.to_string(),
-                    label: model_id.to_string(),
-                });
-            }
-        }
-
-        if models.is_empty() {
-            self.get_default_models()
-        } else {
-            models
-        }
-    }
-
-    /// 获取默认的 Claude 模型列表
+    /// 获取默认的 Claude 模型列表（CLI 不可用时的回退）
     fn get_default_models(&self) -> Vec<AdapterModel> {
         vec![
             AdapterModel {
@@ -77,7 +51,8 @@ impl ClaudeLocalAdapter {
             },
             AdapterModel {
                 id: "claude-opus-4-6".to_string(),
-                label: "Claude Opus 4.6".to_string(),           },
+                label: "Claude Opus 4.6".to_string(),
+            },
             AdapterModel {
                 id: "claude-sonnet-4-6".to_string(),
                 label: "Claude Sonnet 4.6".to_string(),
@@ -91,6 +66,147 @@ impl ClaudeLocalAdapter {
                 label: "Claude Haiku 4.5".to_string(),
             },
         ]
+    }
+
+    /// 通过 CLI 发现模型并缓存（参考 paperclip cursor-models.ts 模式）
+    fn discover_and_cache_models(&self) -> Vec<AdapterModel> {
+        // 检查缓存是否有效
+        if let Ok(cache) = self.models_cache.lock() {
+            if let Some((models, expires_at)) = cache.as_ref() {
+                if Instant::now() < *expires_at {
+                    return models.clone();
+                }
+            }
+        }
+
+        // 尝试通过 CLI 发现模型
+        let discovered = self.discover_models_from_cli();
+        let merged = self.merge_with_defaults(discovered);
+
+        // 更新缓存
+        if let Ok(mut cache) = self.models_cache.lock() {
+            *cache = Some((merged.clone(), Instant::now() + Self::CACHE_TTL));
+        }
+
+        merged
+    }
+
+    /// 从 CLI 发现模型
+    fn discover_models_from_cli(&self) -> Vec<AdapterModel> {
+        if let Ok(output) = Command::new("claude").arg("models").output() {
+            if output.status.success() {
+                if let Ok(stdout) = String::from_utf8(output.stdout) {
+                    let parsed = self.parse_models_from_cli(&stdout);
+                    if !parsed.is_empty() {
+                        return parsed;
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// 解析 CLI 输出中的模型列表
+    /// 支持两种格式：
+    /// - JSON 格式: ["model-1", "model-2"] 或 {"models": [...]}
+    /// - 纯文本格式: 每行一个模型 ID
+    fn parse_models_from_cli(&self, output: &str) -> Vec<AdapterModel> {
+        let trimmed = output.trim();
+        let mut models = Vec::new();
+
+        // 尝试 JSON 解析
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                let items: Vec<String> = match &parsed {
+                    serde_json::Value::Array(arr) => {
+                        arr.iter().filter_map(|v| {
+                            let s = v.as_str().map(String::from)
+                                .or_else(|| v.get("id").and_then(|id| id.as_str().map(String::from)));
+                            s
+                        }).collect()
+                    }
+                    serde_json::Value::Object(obj) => {
+                        // Try common keys: "models", "data", "modelIds"
+                        for key in &["models", "data", "modelIds", "available"] {
+                            if let Some(arr) = obj.get(*key).and_then(|v| v.as_array()) {
+                                let result: Vec<String> = arr.iter().filter_map(|v| {
+                                    v.as_str().map(String::from)
+                                        .or_else(|| v.get("id").and_then(|id| id.as_str().map(String::from)))
+                                }).collect();
+                                if !result.is_empty() {
+                                    return result.into_iter().map(|id| AdapterModel {
+                                        id: id.clone(),
+                                        label: id,
+                                    }).collect();
+                                }
+                            }
+                        }
+                        Vec::new()
+                    }
+                    _ => Vec::new(),
+                };
+                for id in items {
+                    let id = id.trim().to_string();
+                    if !id.is_empty() {
+                        models.push(AdapterModel {
+                            id: id.clone(),
+                            label: id,
+                        });
+                    }
+                }
+                return models;
+            }
+        }
+
+        // 纯文本格式：逐行解析
+        for line in output.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // 跳过非模型行的常见模式
+            if line.starts_with("Available") || line.starts_with("Models:") || line.starts_with("---") {
+                continue;
+            }
+            // 解析模型 ID（格式: "model-id" 或 "model-id - description"）
+            if let Some(model_id) = line.split_whitespace().next() {
+                let id = model_id.trim().to_string();
+                if !id.is_empty() && !id.starts_with('-') && !id.starts_with('*') {
+                    models.push(AdapterModel {
+                        id: id.clone(),
+                        label: id,
+                    });
+                }
+            }
+        }
+
+        models
+    }
+
+    /// 合并 CLI 发现结果与默认模型列表，去重
+    fn merge_with_defaults(&self, discovered: Vec<AdapterModel>) -> Vec<AdapterModel> {
+        if discovered.is_empty() {
+            return self.get_default_models();
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+
+        // 先加入默认模型
+        for model in self.get_default_models() {
+            if seen.insert(model.id.clone()) {
+                merged.push(model);
+            }
+        }
+
+        // 再加入 CLI 发现的额外模型
+        for model in discovered {
+            if seen.insert(model.id.clone()) {
+                merged.push(model);
+            }
+        }
+
+        merged
     }
 
     /// 检查 API Key 是否配置
@@ -145,7 +261,11 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
     }
 
     async fn list_models(&self) -> Vec<AdapterModel> {
-        self.discover_claude_models()
+        // 参考 paperclip registry.ts listAdapterModels 模式：
+        // 1. 尝试通过 CLI 动态发现模型
+        // 2. 如果发现成功，合并默认模型并缓存
+        // 3. 如果发现失败，回退到默认模型
+        self.discover_and_cache_models()
     }
 
     async fn test_environment(&self, ctx: &TestEnvironmentContext)
@@ -233,7 +353,7 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         }
 
         // 检查 4: 模型可用性
-        let models = self.discover_claude_models();
+        let models = self.discover_and_cache_models();
         checks.push(AdapterEnvironmentCheck {
             name: Some("models_available".to_string()),
             status: Some(if models.is_empty() {

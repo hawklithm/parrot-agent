@@ -34,6 +34,7 @@ pub mod auth_repositories;
 pub mod company_repository;
 pub mod project_repository;
 pub mod repository;
+pub mod label_repository;
 
 pub use repository::{CrudOps, Repository, RepositoryExt};
 
@@ -95,6 +96,14 @@ pub use pipeline_repository::{PipelineRepository, PostgresPipelineRepository};
 pub use pipeline_stage_repository::{PipelineStageRepository, PostgresPipelineStageRepository};
 pub use pipeline_transition_repository::{PipelineTransitionRepository, PostgresPipelineTransitionRepository};
 pub use pipeline_case_repository::{PipelineCaseRepository, PostgresPipelineCaseRepository};
+pub use label_repository::{LabelRepository, PgLabelRepository};
+pub mod budget_repository;
+pub use budget_repository::{
+    BudgetPolicyRepository, PgBudgetPolicyRepository,
+    BudgetIncidentRepository, PgBudgetIncidentRepository,
+};
+pub mod finance_event_repository;
+pub use finance_event_repository::{FinanceEventRepository, PgFinanceEventRepository, FinanceSummaryRow};
 pub use task_watchdog_repository::{
     HeartbeatRunRepository, PostgresHeartbeatRunRepository, IssueWatchdogRepository,
     PostgresIssueWatchdogRepository, AgentWakeupRequestRepository,

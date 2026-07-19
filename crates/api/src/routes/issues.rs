@@ -559,9 +559,16 @@ async fn cancel_interaction(
 /// I42: GET /issues/:id/comments/:comment_id
 async fn get_single_comment(
     State(state): State<AppState>,
-    Path((_id, comment_id)): Path<(Uuid, Uuid)>,
+    Path((id, comment_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    // 通过 issue_id 查询 company_id
+    let company_id = state
+        .issue_service
+        .get(id, Uuid::nil())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?
+        .company_id;
     let comment = state.issue_service.get_comment(comment_id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     comment.map(Json).ok_or(StatusCode::NOT_FOUND)
 }

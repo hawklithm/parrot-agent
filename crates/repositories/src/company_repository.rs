@@ -2,8 +2,9 @@ use models::{Company, CompanyMembership, CompanyStats, CreateCompanyInput, Updat
 use sqlx::{PgPool, Result};
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct CompanyRepository {
-    pool: PgPool,
+    pub pool: PgPool,
 }
 
 impl CompanyRepository {

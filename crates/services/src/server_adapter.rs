@@ -149,6 +149,12 @@ pub trait ServerAdapterModule: Send + Sync {
     fn apply_create_defaults(&self, config: serde_json::Value) -> AdapterResult<serde_json::Value> {
         Ok(config)
     }
+
+    /// Return provider quota windows when this adapter can expose them.  The
+    /// default keeps adapters without a quota API out of the aggregate result.
+    async fn get_quota_windows(&self) -> AdapterResult<Vec<crate::cost_service::QuotaWindow>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Adapter registry
@@ -180,6 +186,10 @@ impl AdapterRegistry {
     /// List all registered adapters
     pub fn list_all(&self) -> Vec<AdapterType> {
         self.adapters.keys().copied().collect()
+    }
+
+    pub fn adapters(&self) -> Vec<&dyn ServerAdapterModule> {
+        self.adapters.values().map(|adapter| adapter.as_ref()).collect()
     }
 
     /// Check if adapter is registered

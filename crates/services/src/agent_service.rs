@@ -139,7 +139,7 @@ pub trait AgentService: Send + Sync {
     async fn list_keys(&self, id: Uuid) -> Result<Vec<AgentApiKey>, ServiceError>;
 
     /// 创建 API Key
-    async fn create_key(&self, id: Uuid, name: String) -> Result<AgentApiKey, ServiceError>;
+    async fn create_key(&self, id: Uuid, name: String, scope: Option<serde_json::Value>) -> Result<AgentApiKey, ServiceError>;
 
     /// 吊销 API Key
     async fn revoke_key(&self, id: Uuid, key_id: Uuid) -> Result<(), ServiceError>;
@@ -802,15 +802,19 @@ where
         Ok(keys)
     }
 
-    async fn create_key(&self, id: Uuid, name: String) -> Result<AgentApiKey, ServiceError> {
-        let _agent = self.repository.get_by_id(id).await?;
-        // 创建一个占位密钥，实际实现应使用密码学安全的哈希
+    async fn create_key(&self, id: Uuid, name: String, scope: Option<serde_json::Value>) -> Result<AgentApiKey, ServiceError> {
+        let agent = self.repository.get_by_id(id).await?;
+        let raw_key = format!("aak_{}", Uuid::new_v4().simple());
+        let mut digest = Sha256::new();
+        digest.update(raw_key.as_bytes());
+        let scope = scope.unwrap_or_else(|| serde_json::json!({"scope_type":"standard","agent_id":id,"company_id":agent.company_id}));
         let key = AgentApiKey {
             id: Uuid::new_v4(),
             agent_id: id,
-            company_id: Uuid::nil(), // 将在完整实现中设置
+            company_id: agent.company_id,
             name,
-            key_hash: String::new(),
+            scope,
+            key_hash: digest.finalize().iter().map(|b| format!("{b:02x}")).collect(),
             last_used_at: None,
             revoked_at: None,
             created_at: Utc::now(),
