@@ -28,7 +28,6 @@ impl MockIssueService {
             priority: IssuePriority::Medium,
             assignee_agent_id: None,
             assignee_user_id: None,
-            assigned_to: None,
             checkout_run_id: None,
             execution_run_id: None,
             execution_agent_name_key: None,
@@ -46,6 +45,7 @@ impl MockIssueService {
             billing_code: None,
             execution_policy: None,
             execution_state: None,
+            execution_workspace_settings: None,
             monitor_next_check_at: None,
             monitor_last_triggered_at: None,
             monitor_attempt_count: None,
@@ -57,6 +57,7 @@ impl MockIssueService {
             completed_at: None,
             cancelled_at: None,
             hidden_at: None,
+            source_trust: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

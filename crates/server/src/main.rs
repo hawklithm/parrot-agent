@@ -271,7 +271,8 @@ fn build_app_state(pool: PgPool) -> AppState {
     let built_in_agent_service: Arc<dyn BuiltInAgentService> = Arc::new(
         DefaultBuiltInAgentService::new(Arc::new(agent_repo.clone())),
     );
-    let adapter_registry: Arc<AdapterRegistry> = Arc::new(AdapterRegistry::new());
+    let adapter_registry: Arc<AdapterRegistry> =
+        Arc::new(services::create_default_adapter_registry());
     let server_adapter_registry = Arc::new(services::server_adapter::AdapterRegistry::new());
     let environment_runtime_service: Arc<dyn EnvironmentRuntimeService> =
         Arc::new(DefaultEnvironmentRuntimeService::new());

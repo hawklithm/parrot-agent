@@ -128,7 +128,9 @@ impl ActorResolver for LocalTrustedResolver {
             self.default_company_id,
             ActorSource::LocalImplicit,
             vec![],
-            false,
+            // Paperclip's local trusted Board principal is the self-hosted
+            // instance operator and therefore has instance-admin access.
+            true,
         )))
     }
 

@@ -5,7 +5,7 @@ use uuid::Uuid;
 /// Issue status enumeration
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[sqlx(type_name = "issue_status", rename_all = "snake_case")]
 pub enum IssueStatus {
     Backlog,
     Todo,
@@ -207,7 +207,7 @@ impl IssueStateMachine {
 /// Issue priority enumeration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[sqlx(type_name = "issue_priority", rename_all = "lowercase")]
 pub enum IssuePriority {
     Critical,
     High,
@@ -218,7 +218,7 @@ pub enum IssuePriority {
 /// Issue work mode enumeration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[sqlx(type_name = "issue_work_mode", rename_all = "snake_case")]
 pub enum IssueWorkMode {
     Standard,
     Ask,
@@ -229,7 +229,7 @@ pub enum IssueWorkMode {
 /// Issue monitor scheduled by
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[sqlx(type_name = "issue_monitor_scheduled_by", rename_all = "lowercase")]
 pub enum IssueMonitorScheduledBy {
     Assignee,
     Board,
@@ -276,7 +276,6 @@ pub struct Issue {
     pub priority: IssuePriority,
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
-    pub assigned_to: Option<Uuid>,
     pub checkout_run_id: Option<Uuid>,
     pub execution_run_id: Option<Uuid>,
     pub execution_agent_name_key: Option<String>,
@@ -294,6 +293,7 @@ pub struct Issue {
     pub billing_code: Option<String>,
     pub execution_policy: Option<sqlx::types::Json<IssueExecutionPolicy>>,
     pub execution_state: Option<sqlx::types::Json<IssueExecutionState>>,
+    pub execution_workspace_settings: Option<sqlx::types::Json<serde_json::Value>>,
     pub monitor_next_check_at: Option<chrono::DateTime<chrono::Utc>>,
     pub monitor_last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub monitor_attempt_count: Option<i32>,
@@ -305,6 +305,7 @@ pub struct Issue {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub cancelled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub hidden_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub source_trust: Option<sqlx::types::Json<serde_json::Value>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -313,6 +314,8 @@ pub struct Issue {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateIssueInput {
+    /// Filled from the company path parameter by the API route.
+    #[serde(default)]
     pub company_id: Uuid,
     pub project_id: Option<Uuid>,
     pub project_workspace_id: Option<Uuid>,

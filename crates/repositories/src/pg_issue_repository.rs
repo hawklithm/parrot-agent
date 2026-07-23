@@ -297,7 +297,10 @@ impl IssueRepository for PgIssueRepository {
         .bind(input.created_by_agent_id)
         .bind(input.created_by_user_id)
         .bind(input.responsible_user_id)
-        .bind(input.origin_kind.as_ref())
+        // PostgreSQL defaults are not applied when a column is explicitly
+        // bound as NULL. Paperclip normalizes ordinary issue creation to the
+        // manual origin kind before inserting.
+        .bind(input.origin_kind.as_deref().unwrap_or("manual"))
         .bind(input.origin_id.as_ref())
         .bind(input.origin_run_id)
         .bind(input.request_depth.unwrap_or(0))

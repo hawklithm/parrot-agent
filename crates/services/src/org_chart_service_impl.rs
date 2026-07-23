@@ -31,7 +31,7 @@ impl OrgChartService for DefaultOrgChartService {
         // 查询公司下所有 agents
         let agents = sqlx::query_as::<_, AgentRecord>(
             r#"
-            SELECT id, name, role, status, reports_to_agent_id
+            SELECT id, name, role, status, reports_to AS reports_to_agent_id
             FROM agents
             WHERE company_id = $1
             ORDER BY name
@@ -113,9 +113,9 @@ impl OrgChartService for DefaultOrgChartService {
     async fn get_direct_reports(&self, agent_id: Uuid) -> Result<Vec<OrgNode>, OrgChartError> {
         let agents = sqlx::query_as::<_, AgentRecord>(
             r#"
-            SELECT id, name, role, status, reports_to_agent_id
+            SELECT id, name, role, status, reports_to AS reports_to_agent_id
             FROM agents
-            WHERE reports_to_agent_id = $1
+            WHERE reports_to = $1
             ORDER BY name
             "#,
         )
@@ -141,7 +141,7 @@ impl OrgChartService for DefaultOrgChartService {
         // 查询根节点
         let root = sqlx::query_as::<_, AgentRecord>(
             r#"
-            SELECT id, name, role, status, reports_to_agent_id
+            SELECT id, name, role, status, reports_to AS reports_to_agent_id
             FROM agents
             WHERE id = $1
             "#,
@@ -155,7 +155,7 @@ impl OrgChartService for DefaultOrgChartService {
         // 查询所有可能的下属（用于递归构建）
         let all_agents = sqlx::query_as::<_, AgentRecord>(
             r#"
-            SELECT id, name, role, status, reports_to_agent_id
+            SELECT id, name, role, status, reports_to AS reports_to_agent_id
             FROM agents
             WHERE company_id = (SELECT company_id FROM agents WHERE id = $1)
             "#,

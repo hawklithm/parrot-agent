@@ -100,6 +100,7 @@ pub struct ListCompaniesQuery {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct TimelineQuery {
     pub from: Option<chrono::DateTime<chrono::Utc>>,
     pub to: Option<chrono::DateTime<chrono::Utc>>,
@@ -458,29 +459,36 @@ async fn search_company(
 async fn get_sidebar_badges(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    // Query pending approvals count
-    let pending_approvals: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM approvals WHERE company_id = $1 AND status = 'pending'",
+) -> Result<Json<serde_json::Value>, AppError> {
+    let approvals: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM approvals WHERE company_id = $1 AND status IN ('pending', 'revision_requested')",
     )
     .bind(company_id)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
-    // Query active monitors count (issues with active watchdogs)
-    let active_monitors: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM issue_watchdogs WHERE company_id = $1 AND enabled = true",
+    // Paperclip counts the latest failed/timed-out heartbeat per non-terminated agent.
+    let failed_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           SELECT DISTINCT ON (hr.agent_id) hr.status
+           FROM heartbeat_runs hr
+           JOIN agents a ON a.id = hr.agent_id AND a.company_id = $1
+           WHERE hr.company_id = $1 AND a.status <> 'terminated'
+           ORDER BY hr.agent_id, hr.created_at DESC
+         ) latest WHERE status IN ('failed', 'timed_out')",
     )
     .bind(company_id)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
-    Ok(Json(vec![
-        serde_json::json!({"key": "pending_approvals", "count": pending_approvals}),
-        serde_json::json!({"key": "active_monitors", "count": active_monitors}),
-    ]))
+    Ok(Json(serde_json::json!({
+        "inbox": approvals + failed_runs,
+        "approvals": approvals,
+        "failedRuns": failed_runs,
+        "joinRequests": 0
+    })))
 }
 
 /// CM9: GET /companies/:company_id/sidebar-preferences/me
@@ -554,7 +562,7 @@ async fn get_company_timeline(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
     Query(query): Query<TimelineQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let wq = services::work_timeline_service::WorkTimelineQuery {
         company_id,
         issue_id: query.issue_id,
@@ -562,12 +570,67 @@ async fn get_company_timeline(
         goal_id: query.goal_id,
         project_id: query.project_id,
     };
-    let events = state
+    let raw_events = state
         .work_timeline_service
         .load_events(&wq)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(events))
+    let now = chrono::Utc::now();
+    let from = query
+        .from
+        .unwrap_or_else(|| now - chrono::Duration::days(7));
+    let to = query.to.unwrap_or(now);
+
+    let mut actors = Vec::new();
+    let mut events = Vec::new();
+    for event in raw_events {
+        let actor_id = event
+            .get("actorId")
+            .and_then(|value| value.as_str())
+            .map(|id| format!("system:{id}"))
+            .unwrap_or_else(|| "system:system".to_string());
+        if !actors.iter().any(|actor: &serde_json::Value| actor["id"] == actor_id) {
+            actors.push(serde_json::json!({
+                "id": actor_id,
+                "type": "system",
+                "name": "System",
+                "avatar": null
+            }));
+        }
+        let issue_id = event.get("resourceId").cloned().unwrap_or(serde_json::Value::Null);
+        let at = event.get("createdAt").cloned().unwrap_or(serde_json::json!(to));
+        let kind = match event.get("eventType").and_then(|value| value.as_str()) {
+            Some(value) if value.contains("comment") => "commented",
+            Some(value) if value.contains("assign") => "assigned",
+            Some(value) if value.contains("approv") => "approved",
+            Some(value) if value.contains("delegat") => "delegated",
+            _ => "created",
+        };
+        events.push(serde_json::json!({
+            "actorId": actor_id,
+            "kind": kind,
+            "issueId": issue_id,
+            "at": at
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "actors": actors,
+        "spans": [],
+        "events": events,
+        "edges": [],
+        "pagination": {
+            "limit": 200,
+            "offset": 0,
+            "totalIssues": events.len(),
+            "hasMore": false
+        },
+        "window": {
+            "from": from,
+            "to": to,
+            "capped": false
+        }
+    })))
 }
 
 /// CM15: GET /companies/:company_id/artifacts

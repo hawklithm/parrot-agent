@@ -52,6 +52,8 @@ pub struct CreateIssueInput {
     pub status: Option<IssueStatus>,
     pub priority: Option<IssuePriority>,
     pub assigned_to: Option<Uuid>,
+    pub assignee_agent_id: Option<Uuid>,
+    pub assignee_user_id: Option<Uuid>,
     pub parent_id: Option<Uuid>,
     pub goal_id: Option<Uuid>,
 }
@@ -251,8 +253,8 @@ impl IssueService for DefaultIssueService {
             status: input.status,
             priority: input.priority,
             parent_id: input.parent_id,
-            assignee_agent_id: None,
-            assignee_user_id: None,
+            assignee_agent_id: input.assignee_agent_id,
+            assignee_user_id: input.assignee_user_id,
             work_mode: None,
             responsible_user_id: None,
             origin_kind: None,
@@ -725,6 +727,8 @@ impl issue_service::IssueService for LegacyIssueService {
             status: input.status,
             priority: input.priority,
             assigned_to: input.assignee_agent_id.or(input.assignee_user_id),
+            assignee_agent_id: input.assignee_agent_id,
+            assignee_user_id: input.assignee_user_id,
             parent_id: input.parent_id,
             goal_id: input.goal_id,
         };
@@ -745,6 +749,8 @@ impl issue_service::IssueService for LegacyIssueService {
             status: input.status,
             priority: input.priority,
             assigned_to: input.assignee_agent_id.or(input.assignee_user_id),
+            assignee_agent_id: input.assignee_agent_id,
+            assignee_user_id: input.assignee_user_id,
             parent_id: input.parent_id,
             goal_id: input.goal_id,
         };

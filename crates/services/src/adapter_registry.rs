@@ -135,6 +135,9 @@ pub fn create_default_adapter_registry() -> AdapterRegistry {
     // 注册 Claude Local 适配器
     registry.register(Arc::new(crate::adapters::ClaudeLocalAdapter::new()));
 
+    // 注册 Codex Local 适配器（Paperclip 内置 adapter）
+    registry.register(Arc::new(crate::adapters::CodexLocalAdapter::new()));
+    
     registry
 }
 

@@ -267,6 +267,7 @@ pub fn create_router(state: AppState) -> Router {
         // Phase 3: Company/Org routes
         .merge(crate::routes::companies::company_routes())
         .merge(crate::routes::projects::project_routes())
+        .merge(crate::routes::tools::tool_routes())
         // Company secrets + secret providers (SE5, SE14-SE20)
         .merge(crate::routes::secrets::secret_routes())
         // Pipeline routes

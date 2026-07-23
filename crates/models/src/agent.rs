@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 /// Agent 状态枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "text")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Idle,
@@ -23,7 +23,7 @@ impl Default for AgentStatus {
 
 /// Agent 角色枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "text")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     Ceo,
@@ -106,26 +106,61 @@ pub enum SkillSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSkillSyncMode {
-    Auto,
-    Manual,
+    Unsupported,
+    Persistent,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSkillState {
+    Available,
+    Configured,
+    Installed,
+    Missing,
+    Stale,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSkillOrigin {
+    CompanyManaged,
+    UserInstalled,
+    ExternalUnknown,
 }
 
 /// Agent skill entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSkillEntry {
-    pub skill_id: String,
-    pub source: SkillSource,
-    pub enabled: bool,
+    pub key: String,
+    pub runtime_name: Option<String>,
+    pub version_id: Option<String>,
+    pub current_version_id: Option<String>,
+    pub desired: bool,
+    pub managed: bool,
+    pub state: AgentSkillState,
+    pub origin: Option<AgentSkillOrigin>,
+    pub origin_label: Option<String>,
+    pub location_label: Option<String>,
+    pub read_only: bool,
+    pub source_path: Option<String>,
+    pub target_path: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// Agent skill snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSkillSnapshot {
-    pub skills: Vec<AgentSkillEntry>,
-    pub sync_mode: AgentSkillSyncMode,
-    pub last_synced_at: Option<DateTime<Utc>>,
+    pub adapter_type: String,
+    pub supported: bool,
+    pub mode: AgentSkillSyncMode,
+    pub desired_skills: Vec<String>,
+    pub desired_skill_entries: Option<Vec<String>>,
+    pub entries: Vec<AgentSkillEntry>,
+    pub warnings: Vec<String>,
 }
 
 /// Agent 实体

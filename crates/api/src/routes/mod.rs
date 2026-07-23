@@ -30,6 +30,7 @@ pub mod secrets;
 pub mod skills;
 pub mod sse;
 pub mod tree_control;
+pub mod tools;
 pub mod user_directory;
 pub mod user_secret_definitions;
 pub mod user_secrets;

@@ -404,7 +404,7 @@ pub trait CostService: Send + Sync {
     async fn by_biller(&self, company_id: Uuid, start_time: DateTime<Utc>, end_time: DateTime<Utc>) -> ServiceResult<Vec<CostSummaryDto>>;
 
     /// 按 Project 聚合
-    async fn by_project(&self, company_id: Uuid, start_time: DateTime<Utc>, end_time: DateTime<Utc>) -> ServiceResult<Vec<CostSummaryDto>>;
+    async fn by_project(&self, company_id: Uuid, start_time: DateTime<Utc>, end_time: DateTime<Utc>) -> ServiceResult<Vec<models::cost_event::CostByProjectRow>>;
 
     /// 窗口期花费（多窗口按 provider 聚合，对应 paperclip windowSpend）
     async fn window_spend(&self, company_id: Uuid, start_time: DateTime<Utc>, end_time: DateTime<Utc>) -> ServiceResult<WindowSpend>;
@@ -627,10 +627,10 @@ impl CostService for DefaultCostService {
         Ok(rows.into_iter().map(CostSummaryDto::from).collect())
     }
 
-    async fn by_project(&self, company_id: Uuid, start_time: DateTime<Utc>, end_time: DateTime<Utc>) -> ServiceResult<Vec<CostSummaryDto>> {
+    async fn by_project(&self, company_id: Uuid, start_time: DateTime<Utc>, end_time: DateTime<Utc>) -> ServiceResult<Vec<models::cost_event::CostByProjectRow>> {
         let rows = self.repo.by_project(company_id, start_time, end_time).await
             .map_err(|e| ServiceError::Repository(e.to_string()))?;
-        Ok(rows.into_iter().map(CostSummaryDto::from).collect())
+        Ok(rows)
     }
 
     async fn window_spend(&self, company_id: Uuid, start_time: DateTime<Utc>, end_time: DateTime<Utc>) -> ServiceResult<WindowSpend> {

@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -13,6 +13,7 @@ use models::{CreateIssueInput, Issue, UpdateIssueInput};
 use services::{
     CheckoutInput, IssueQueryFilter, Pagination, ReleaseInput,
 };
+use services::auth::AuthorizationActor;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +29,74 @@ struct ListIssuesQuery {
     assignee_agent_id: Option<Uuid>,
     assignee_user_id: Option<Uuid>,
     project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ListIssueDocumentsQuery {
+    #[serde(default)]
+    include_system: bool,
+}
+
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct IssueDocumentResponse {
+    id: Uuid,
+    company_id: Uuid,
+    issue_id: Uuid,
+    key: String,
+    content: String,
+    content_type: Option<String>,
+    locked_by_type: Option<String>,
+    locked_by_id: Option<Uuid>,
+    locked_at: Option<chrono::DateTime<chrono::Utc>>,
+    locked_run_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn list_issue_documents(
+    State(state): State<AppState>,
+    Path(issue_id): Path<Uuid>,
+    Query(query): Query<ListIssueDocumentsQuery>,
+) -> Result<Json<Vec<IssueDocumentResponse>>, StatusCode> {
+    let issue_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1)",
+    )
+    .bind(issue_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %issue_id, "failed to check issue for documents");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if !issue_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let mut sql = String::from(
+        "SELECT d.id, d.company_id, l.issue_id, l.key, d.content, d.content_type, \
+                d.locked_by_type, d.locked_by_id, d.locked_at, d.locked_run_id, \
+                d.created_at, d.updated_at \
+         FROM issue_documents l \
+         JOIN documents d ON d.id = l.document_id \
+         WHERE l.issue_id = $1",
+    );
+    if !query.include_system {
+        sql.push_str(" AND l.key NOT LIKE '__system/%'");
+    }
+    sql.push_str(" ORDER BY l.key ASC");
+
+    sqlx::query_as::<_, IssueDocumentResponse>(&sql)
+        .bind(issue_id)
+        .fetch_all(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::error!(error = %error, issue_id = %issue_id, "failed to list issue documents");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,15 +158,21 @@ async fn get_issue(
 /// POST /companies/:companyId/issues - Create issue
 async fn create_issue(
     State(state): State<AppState>,
-    Path(_company_id): Path<Uuid>,
-    Json(input): Json<CreateIssueInput>,
+    Path(company_id): Path<Uuid>,
+    Json(mut input): Json<CreateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
+    // Paperclip takes the company scope from the URL. The body must not need
+    // to repeat companyId, and the path is authoritative if it is supplied.
+    input.company_id = company_id;
     let service = state.issue_service.clone();
     service
         .create(input)
         .await
         .map(|result| Json(result.issue))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| {
+            tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// GET /companies/:companyId/issues - List issues for a company
@@ -386,11 +461,51 @@ async fn create_child_issue(
 /// I12: POST /issues/:id/read
 async fn mark_issue_read(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
-    let company_id = Uuid::nil();
-    state.issue_service.mark_read(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let user_id = match actor {
+        AuthorizationActor::Board { user_id, .. } => user_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+
+    let company_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT company_id FROM issues WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to load issue company for read state");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let read_at = chrono::Utc::now();
+    let row = sqlx::query_as::<_, (Uuid, Uuid, Uuid, chrono::DateTime<chrono::Utc>)>(
+        "INSERT INTO issue_read_status (company_id, issue_id, user_id, read_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (issue_id, user_id) DO UPDATE SET read_at = EXCLUDED.read_at, updated_at = NOW() \
+         RETURNING id, company_id, issue_id, read_at",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(user_id)
+    .bind(read_at)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, user_id = %user_id, "failed to mark issue read");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "id": row.0,
+        "companyId": row.1,
+        "issueId": row.2,
+        "userId": user_id,
+        "lastReadAt": row.3,
+    })))
 }
 
 /// I13: DELETE /issues/:id/read
@@ -634,6 +749,7 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/external-objects", get(list_external_objects))
         .route("/issues/:id/external-object-summary", get(get_external_object_summary))
         .route("/issues/:id/external-objects/refresh", post(refresh_external_objects))
+        .route("/issues/:id/documents", get(list_issue_documents))
         .route("/issues/:id/file-resources/list", get(list_file_resources))
         .route("/issues/:id/file-resources/resolve", get(resolve_file_resource))
         .route("/issues/:id/file-resources/content", get(get_file_resource_content))

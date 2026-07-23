@@ -1,4 +1,4 @@
-use models::{CostEvent, CostSummary, CostSummaryRow, IssueTreeCostSummary, RunSummaryRow};
+use models::{CostByProjectRow, CostEvent, CostSummary, CostSummaryRow, IssueTreeCostSummary, RunSummaryRow};
 use sqlx::PgPool;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
@@ -87,7 +87,7 @@ pub trait CostEventRepository: Send + Sync {
         company_id: Uuid,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-    ) -> Result<Vec<CostSummaryRow>, RepoError>;
+    ) -> Result<Vec<CostByProjectRow>, RepoError>;
 
     /// 窗口期花费
     async fn window_spend(
@@ -491,19 +491,16 @@ impl CostEventRepository for PgCostEventRepository {
         company_id: Uuid,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-    ) -> Result<Vec<CostSummaryRow>, RepoError> {
-        let results = sqlx::query_as::<_, CostSummaryRow>(
+    ) -> Result<Vec<CostByProjectRow>, RepoError> {
+        let results = sqlx::query_as::<_, CostByProjectRow>(
             r#"
             SELECT
-                COALESCE(ce.project_id::text, run_project_links.project_id::text) as dimension,
-                COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents,
-                COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens,
-                COALESCE(SUM(cached_input_tokens), 0)::bigint as total_cached_input_tokens,
-                COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens,
-                COUNT(*)::bigint as event_count,
-                0::bigint as api_run_count, 0::bigint as subscription_run_count,
-                0::bigint as subscription_cached_input_tokens, 0::bigint as subscription_input_tokens,
-                0::bigint as subscription_output_tokens, 0::bigint as provider_count, 0::bigint as model_count
+                effective.project_id,
+                p.name AS project_name,
+                COALESCE(SUM(cost_cents), 0)::bigint as cost_cents,
+                COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
+                COALESCE(SUM(cached_input_tokens), 0)::bigint as cached_input_tokens,
+                COALESCE(SUM(output_tokens), 0)::bigint as output_tokens
             FROM cost_events ce
             LEFT JOIN (
                 SELECT DISTINCT ON (al.run_id, i.project_id) al.run_id, i.project_id
@@ -512,12 +509,15 @@ impl CostEventRepository for PgCostEventRepository {
                 WHERE al.company_id = $1 AND i.company_id = $1 AND al.run_id IS NOT NULL AND i.project_id IS NOT NULL
                 ORDER BY al.run_id, i.project_id, al.created_at DESC
             ) run_project_links ON ce.heartbeat_run_id = run_project_links.run_id
-            JOIN projects p ON p.id = COALESCE(ce.project_id, run_project_links.project_id)
+            CROSS JOIN LATERAL (
+                SELECT COALESCE(ce.project_id, run_project_links.project_id) AS project_id
+            ) effective
+            JOIN projects p ON p.id = effective.project_id
             WHERE ce.company_id = $1
               AND ce.occurred_at >= $2
-              AND ce.occurred_at < $3
-            GROUP BY COALESCE(ce.project_id, run_project_links.project_id)
-            ORDER BY total_cost_cents DESC
+              AND ce.occurred_at <= $3
+            GROUP BY effective.project_id, p.name
+            ORDER BY cost_cents DESC
             "#
         )
         .bind(company_id)

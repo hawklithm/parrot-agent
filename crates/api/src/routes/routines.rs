@@ -1,13 +1,15 @@
 //! Routine routes — CRUD + trigger + run management
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, patch, post},
     Json, Router,
 };
 use uuid::Uuid;
+use serde::Deserialize;
+use sqlx::Row;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
@@ -15,6 +17,7 @@ use models::routine::{Routine, RoutineRun, RoutineTriggerConfig};
 
 pub fn routine_routes() -> Router<AppState> {
     Router::new()
+        .route("/companies/:company_id/folders", get(list_company_folders))
         // Routine CRUD
         .route("/companies/:company_id/routines", get(list_routines).post(create_routine))
         .route("/routines/:routine_id", get(get_routine).patch(update_routine).delete(delete_routine))
@@ -32,6 +35,78 @@ pub fn routine_routes() -> Router<AppState> {
         .route("/routine-triggers/:trigger_id/rotate-secret", post(rotate_trigger_secret))
         .route("/routine-triggers/public/:public_id/fire", post(fire_public_trigger))
         .route("/routines/:routine_id/run", post(trigger_routine_run))
+}
+
+#[derive(Debug, Deserialize)]
+struct FolderQuery {
+    kind: String,
+}
+
+/// Paperclip GET /companies/:companyId/folders.
+/// Folder rows and item counts come from the database; no folder names are synthesized.
+async fn list_company_folders(
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Query(query): Query<FolderQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if query.kind != "routine" && query.kind != "skill" {
+        return Err(AppError::BadRequest("Folder kind query parameter is required".into()));
+    }
+
+    let rows = sqlx::query(
+        r#"WITH RECURSIVE folder_tree AS (
+             SELECT id, company_id, kind, parent_id, name, slug, system_key, color,
+                    position, created_at, updated_at, 0::int AS depth, name::text AS path
+             FROM folders
+             WHERE company_id = $1 AND kind = $2 AND parent_id IS NULL
+             UNION ALL
+             SELECT f.id, f.company_id, f.kind, f.parent_id, f.name, f.slug, f.system_key,
+                    f.color, f.position, f.created_at, f.updated_at, t.depth + 1,
+                    (t.path || ' / ' || f.name)::text
+             FROM folders f JOIN folder_tree t ON f.parent_id = t.id
+             WHERE f.company_id = $1 AND f.kind = $2
+           )
+           SELECT t.*, CASE WHEN $2 = 'routine'
+             THEN (SELECT COUNT(*) FROM routines r WHERE r.company_id = $1 AND r.folder_id = t.id)
+             ELSE (SELECT COUNT(*) FROM company_skills s WHERE s.company_id = $1 AND s.folder_id = t.id)
+             END::bigint AS item_count
+           FROM folder_tree t
+           ORDER BY t.position, t.name, t.id"#,
+    )
+    .bind(company_id)
+    .bind(&query.kind)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Failed to list folders: {e}")))?;
+
+    let folders: Vec<_> = rows.iter().map(|r| serde_json::json!({
+        "id": r.get::<Uuid, _>("id"),
+        "companyId": r.get::<Uuid, _>("company_id"),
+        "kind": r.get::<String, _>("kind"),
+        "parentId": r.get::<Option<Uuid>, _>("parent_id"),
+        "name": r.get::<String, _>("name"),
+        "slug": r.get::<String, _>("slug"),
+        "systemKey": r.get::<Option<String>, _>("system_key"),
+        "path": r.get::<String, _>("path"),
+        "depth": r.get::<i32, _>("depth"),
+        "color": r.get::<Option<String>, _>("color"),
+        "position": r.get::<i32, _>("position"),
+        "itemCount": r.get::<i64, _>("item_count"),
+        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+    })).collect();
+    let all_count: i64 = if query.kind == "routine" {
+        sqlx::query_scalar("SELECT COUNT(*) FROM routines WHERE company_id = $1").bind(company_id).fetch_one(&state.pool).await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM company_skills WHERE company_id = $1").bind(company_id).fetch_one(&state.pool).await
+    }.map_err(|e| AppError::InternalServerError(format!("Failed to count folder items: {e}")))?;
+    let unfiled_count: i64 = if query.kind == "routine" {
+        sqlx::query_scalar("SELECT COUNT(*) FROM routines WHERE company_id = $1 AND folder_id IS NULL").bind(company_id).fetch_one(&state.pool).await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM company_skills WHERE company_id = $1 AND folder_id IS NULL").bind(company_id).fetch_one(&state.pool).await
+    }.map_err(|e| AppError::InternalServerError(format!("Failed to count unfiled items: {e}")))?;
+
+    Ok(Json(serde_json::json!({ "kind": query.kind, "folders": folders, "allCount": all_count, "unfiledCount": unfiled_count })))
 }
 
 /// POST /companies/:company_id/routines

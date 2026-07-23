@@ -60,7 +60,9 @@ pub fn cost_routes() -> Router<AppState> {
 /// 时间范围查询参数
 #[derive(Debug, Deserialize)]
 pub struct TimeRangeParams {
+    #[serde(alias = "from")]
     pub start_time: Option<DateTime<Utc>>,
+    #[serde(alias = "to")]
     pub end_time: Option<DateTime<Utc>>,
     pub limit: Option<i64>,
 }
@@ -131,7 +133,7 @@ async fn get_costs_by_agent(
     let (start, end) = params.get_range();
     let costs = state.cost_service.by_agent(company_id, start, end).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "costs": costs})))
+    Ok(Json(serde_json::to_value(costs).unwrap_or_else(|_| serde_json::json!([]))))
 }
 
 /// CO5: GET /companies/:company_id/costs/by-agent-model
@@ -143,7 +145,7 @@ async fn get_costs_by_agent_model(
     let (start, end) = params.get_range();
     let costs = state.cost_service.by_agent_model(company_id, start, end).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "costs": costs})))
+    Ok(Json(serde_json::to_value(costs).unwrap_or_else(|_| serde_json::json!([]))))
 }
 
 /// CO6: GET /companies/:company_id/costs/by-provider
@@ -155,7 +157,7 @@ async fn get_costs_by_provider(
     let (start, end) = params.get_range();
     let costs = state.cost_service.by_provider(company_id, start, end).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "costs": costs})))
+    Ok(Json(serde_json::to_value(costs).unwrap_or_else(|_| serde_json::json!([]))))
 }
 
 /// CO7: GET /companies/:company_id/costs/by-biller
@@ -167,7 +169,7 @@ async fn get_costs_by_biller(
     let (start, end) = params.get_range();
     let costs = state.cost_service.by_biller(company_id, start, end).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "costs": costs})))
+    Ok(Json(serde_json::to_value(costs).unwrap_or_else(|_| serde_json::json!([]))))
 }
 
 /// CO8: GET /companies/:company_id/costs/by-project
@@ -179,24 +181,18 @@ async fn get_costs_by_project(
     let (start, end) = params.get_range();
     let costs = state.cost_service.by_project(company_id, start, end).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "costs": costs})))
+    Ok(Json(serde_json::to_value(costs).unwrap_or_else(|_| serde_json::json!([]))))
 }
 
 /// CO9: GET /companies/:company_id/costs/window-spend
 async fn get_window_spend(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
-    Query(params): Query<TimeRangeParams>,
+    Query(_params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let (start, end) = params.get_range();
-    let spend = state.cost_service.window_spend(company_id, start, end).await
+    let spend = state.cost_service.window_spend_multi(company_id).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({
-        "companyId": company_id,
-        "windowSpend": spend.total_cost_cents,
-        "periodStart": spend.period_start,
-        "periodEnd": spend.period_end,
-    })))
+    Ok(Json(serde_json::to_value(spend).unwrap_or_else(|_| serde_json::json!([]))))
 }
 
 /// CO10: GET /companies/:company_id/costs/quota-windows
@@ -206,7 +202,7 @@ async fn get_quota_windows(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let windows = state.cost_service.get_quota_windows(company_id).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "quotaWindows": windows})))
+    Ok(Json(serde_json::to_value(windows).unwrap_or_else(|_| serde_json::json!([]))))
 }
 
 /// CO11: GET /companies/:company_id/costs/finance-summary
@@ -218,7 +214,7 @@ async fn get_finance_summary(
     let (start, end) = params.get_range();
     let summary = state.finance_service.get_summary(company_id, start, end).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "financeSummary": summary})))
+    Ok(Json(serde_json::to_value(summary).unwrap_or_else(|_| serde_json::json!({}))))
 }
 
 /// CO12: GET /companies/:company_id/costs/finance-by-biller
@@ -230,7 +226,7 @@ async fn get_finance_by_biller(
     let (start, end) = params.get_range();
     let rows = state.finance_service.by_biller(company_id, start, end).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "financeByBiller": rows})))
+    Ok(Json(serde_json::to_value(rows).unwrap_or_else(|_| serde_json::json!([]))))
 }
 
 /// CO13: GET /companies/:company_id/costs/finance-by-kind
@@ -242,7 +238,7 @@ async fn get_finance_by_kind(
     let (start, end) = params.get_range();
     let rows = state.finance_service.by_kind(company_id, start, end).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "financeByKind": rows})))
+    Ok(Json(serde_json::to_value(rows).unwrap_or_else(|_| serde_json::json!([]))))
 }
 
 /// CO14: GET /companies/:company_id/costs/finance-events

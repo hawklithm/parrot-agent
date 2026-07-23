@@ -26,7 +26,6 @@ pub fn environment_routes() -> Router<AppState> {
         .route("/environment-custom-image-setup-sessions/:id/finish", get(finish_custom_image_setup_session))
         .route("/environment-custom-image-setup-sessions/:id/cancel", post(cancel_custom_image_setup_session))
         .route("/environment-leases/:lease_id", get(get_environment_lease))
-        .route("/companies/:company_id/adapters/:adapter_type/model-profiles", get(list_model_profiles))
 }
 
 // ===== V2 Handlers (AppState-based) =====
@@ -176,12 +175,4 @@ async fn get_environment_lease(
     Path(lease_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(json!({"leaseId": lease_id, "status": "active", "leasedAt": chrono::Utc::now()})))
-}
-
-/// E24: GET /companies/:company_id/adapters/:type/model-profiles
-async fn list_model_profiles(
-    State(_state): State<AppState>,
-    Path((_company_id, _adapter_type)): Path<(Uuid, String)>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
 }

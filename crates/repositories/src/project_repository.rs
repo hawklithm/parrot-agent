@@ -20,17 +20,18 @@ impl ProjectRepository {
             r#"
             INSERT INTO projects (
                 company_id, goal_id, name, description, lead_agent_id,
-                target_date, color, icon, env, execution_workspace_policy
+                status, target_date, color, icon, env, execution_workspace_policy
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING *
             "#,
         )
         .bind(input.company_id)
-        .bind(input.goal_id)
+        .bind(input.goal_id.or_else(|| input.goal_ids.and_then(|ids| ids.into_iter().next())))
         .bind(&input.name)
         .bind(&input.description)
         .bind(input.lead_agent_id)
+        .bind(input.status.unwrap_or(models::ProjectStatus::Backlog))
         .bind(input.target_date)
         .bind(&input.color)
         .bind(&input.icon)

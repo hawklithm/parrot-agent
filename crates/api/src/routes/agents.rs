@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, patch, post},
@@ -12,8 +12,10 @@ use crate::errors::AppError;
 use crate::redaction::redact_config;
 use crate::validation::{AgentPermissionsInput, CreateAgentHireSchema, UpdateAgentSchema};
 use access::UserActor;
-use models::{AgentPermissions, AgentStatus, TrustAuthorizationPolicy, TrustPreset};
+use models::{AgentPermissions, AgentStatus, ApprovalType, TrustAuthorizationPolicy, TrustPreset};
 use services::{CreateAgentInput, UpdateAgentInput};
+use services::auth::{AuthorizationAction, AuthorizationActor};
+use services::approval_service::CreateApprovalInput;
 use serde_json::json;
 
 use crate::routes::heartbeats::list_scheduler_heartbeats;
@@ -23,6 +25,12 @@ use crate::routes::heartbeats::list_scheduler_heartbeats;
 /// 与 `crate::app_state::AppState` 为同一类型（统一状态），
 /// 此处仅作为别名以保持路由模块内部的引用一致。
 pub use crate::app_state::AppState;
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentReferenceQuery {
+    company_id: Option<Uuid>,
+}
 
 /// 创建Agent路由
 pub fn agent_routes() -> Router<AppState> {
@@ -87,45 +95,198 @@ async fn list_agents(
 /// POST /companies/:company_id/agent-hires - 创建Agent
 async fn create_agent(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(payload): Json<CreateAgentHireSchema>,
 ) -> Result<impl IntoResponse, AppError> {
     // 验证请求
     payload.validate(&()).map_err(|e| AppError::Validation(e.to_string()))?;
 
-    // TODO: 从请求中提取Actor
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id,
-        is_admin: true,
+    // Use the actor resolved by the global auth middleware. This matches
+    // Paperclip's assertCanCreateAgentsForCompany behavior, including the
+    // local_implicit development bypass and company-scoped role/grant checks.
+    let action = AuthorizationAction::AgentHire { company_id };
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &action,
+        Some(company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agents:create permission".to_string(),
+        ));
+    }
+
+    // Paperclip creates the agent in pending_approval status when the company
+    // requires board approval. Keep the company lookup here so the behavior is
+    // identical for both the normal and approval-backed paths.
+    let requires_approval = sqlx::query_scalar::<_, bool>(
+        "SELECT require_board_approval_for_new_agents FROM companies WHERE id = $1",
+    )
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| AppError::InternalServerError(format!("Failed to load company: {error}")))?
+    .ok_or_else(|| AppError::NotFound("Company not found".to_string()))?;
+
+    let (requested_by_agent_id, requested_by_user_id) = match &auth_actor {
+        AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
+        AuthorizationActor::Board { user_id, .. } => (None, Some(*user_id)),
+        AuthorizationActor::None => (None, None),
     };
 
-    // 验证创建权限
-    state.access_service.assert_can_create_agents_for_company(&actor, company_id).await?;
+    let source_issue_ids = payload
+        .source_issue_ids
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(payload.source_issue_id.iter().copied())
+        .collect::<Vec<_>>();
 
     // 创建Agent
     let input = CreateAgentInput {
         company_id,
-        name: payload.name,
+        name: payload.name.clone(),
         role: payload.role,
-        adapter_type: payload.adapter_type,
-        adapter_config: payload.adapter_config,
-        runtime_config: Some(payload.runtime_config),
+        status: Some(if requires_approval {
+            AgentStatus::PendingApproval
+        } else {
+            AgentStatus::Idle
+        }),
+        adapter_type: payload.adapter_type.clone(),
+        adapter_config: payload.adapter_config.clone(),
+        runtime_config: Some(payload.runtime_config.clone()),
         permissions: payload.permissions.map(agent_permissions_from_input),
         budget_monthly_cents: Some(payload.budget_monthly_cents),
         reports_to: payload.reports_to,
     };
 
-    let agent = state.agent_service.create(input).await?;
+    let agent = state
+        .agent_service
+        .create(input)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "agent hire failed while creating agent");
+            error
+        })?;
 
-    Ok((StatusCode::CREATED, Json(agent)))
+    let approval = if requires_approval {
+        let approval_payload = json!({
+            // These two keys are required by ApprovalService's hire payload
+            // validation and are also compatible with Paperclip's payload.
+            "agent_name": payload.name,
+            "agent_role": payload.role,
+            "agent_id": agent.id,
+            "name": agent.name,
+            "role": agent.role,
+            "title": payload.title,
+            "icon": payload.icon,
+            "reportsTo": payload.reports_to,
+            "capabilities": payload.capabilities,
+            "desiredSkills": payload.desired_skills,
+            "adapterType": agent.adapter_type,
+            "adapterConfig": agent.adapter_config.0,
+            "runtimeConfig": agent.runtime_config.0,
+            "budgetMonthlyCents": agent.budget_monthly_cents,
+            "metadata": payload.metadata,
+            "agentId": agent.id,
+            "requestedByAgentId": requested_by_agent_id,
+            "requestedConfigurationSnapshot": {
+                "adapterType": agent.adapter_type,
+                "adapterConfig": agent.adapter_config.0,
+                "runtimeConfig": agent.runtime_config.0,
+                "budgetMonthlyCents": agent.budget_monthly_cents,
+            },
+        });
+
+        Some(
+            state
+                .approval_service
+                .create(CreateApprovalInput {
+                    company_id,
+                    approval_type: ApprovalType::HireAgent,
+                    requested_by_agent_id,
+                    requested_by_user_id,
+                    payload: approval_payload,
+                    linked_issue_ids: source_issue_ids,
+                })
+                .await
+                .map_err(|error| {
+                    tracing::error!(error = %error, agent_id = %agent.id, "agent hire approval creation failed");
+                    error
+                })?,
+        )
+    } else {
+        None
+    };
+
+    // Paperclip's hire contract is an envelope. The UI reads `hire.agent.id`
+    // and optionally follows `hire.approval.id` during onboarding.
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "agent": agent,
+            "approval": approval,
+        })),
+    ))
 }
 
 /// GET /agents/:id - 获取Agent详情
 async fn get_agent(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(raw_id): Path<String>,
+    Query(query): Query<AgentReferenceQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Paperclip accepts either a UUID or a company-scoped shortname/slug.
+    // Shortname lookup is intentionally scoped by the companyId query value.
+    let id = match raw_id.parse::<Uuid>() {
+        Ok(id) => id,
+        Err(_) => {
+            let company_id = query.company_id.ok_or_else(|| {
+                AppError::BadRequest(
+                    "Agent shortname lookup requires companyId query parameter".to_string(),
+                )
+            })?;
+            let slug = raw_id.trim().to_lowercase();
+            let matches = sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM agents \
+                 WHERE company_id = $1 \
+                   AND lower(regexp_replace(trim(name), '[^a-zA-Z0-9]+', '-', 'g')) = $2 \
+                 ORDER BY created_at ASC",
+            )
+            .bind(company_id)
+            .bind(&slug)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|error| AppError::InternalServerError(format!("Failed to resolve agent reference: {error}")))?;
+            match matches.as_slice() {
+                [] => return Err(AppError::NotFound("Agent not found".to_string())),
+                [id] => *id,
+                _ => return Err(AppError::Conflict(
+                    "Agent shortname is ambiguous in this company. Use the agent ID.".to_string(),
+                )),
+            }
+        }
+    };
+
+    // Paperclip resolves a missing UUID as a normal 404.  The repository
+    // abstraction currently returns an error for a missing row, which the
+    // generic handler exposed as 500 (this is especially visible for stale
+    // links to agents removed during onboarding cleanup).
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM agents WHERE id = $1 AND ($2::uuid IS NULL OR company_id = $2))",
+    )
+    .bind(id)
+    .bind(query.company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| AppError::InternalServerError(format!("Failed to resolve agent: {error}")))?;
+    if !exists {
+        return Err(AppError::NotFound("Agent not found".to_string()));
+    }
+
     let agent = state.agent_service.get_by_id(id).await?;
 
     // TODO: 从请求中提取Actor并验证读取权限
@@ -481,7 +642,20 @@ async fn list_agent_keys(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let keys = state.agent_service.list_keys(id).await?;
-    Ok(Json(keys))
+    let response: Vec<serde_json::Value> = keys
+        .into_iter()
+        .map(|key| serde_json::json!({
+            "id": key.id,
+            "agentId": key.agent_id,
+            "companyId": key.company_id,
+            "name": key.name,
+            "scope": key.scope,
+            "lastUsedAt": key.last_used_at,
+            "revokedAt": key.revoked_at,
+            "createdAt": key.created_at,
+        }))
+        .collect();
+    Ok(Json(response))
 }
 
 /// POST /agents/:id/keys - 创建 API Key

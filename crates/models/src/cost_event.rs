@@ -75,3 +75,15 @@ pub struct CostSummaryRow {
     pub provider_count: i64,
     pub model_count: i64,
 }
+
+/// Paperclip-compatible project cost aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct CostByProjectRow {
+    pub project_id: Option<Uuid>,
+    pub project_name: Option<String>,
+    pub cost_cents: i64,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+}

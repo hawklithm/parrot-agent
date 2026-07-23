@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: parrot-agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: parrot_agent_dev
+    ports:
+      # The Rust server's default DATABASE_URL uses host port 5433.
+      - "5433:5432"
+    volumes:
+      - parrot-agent-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d parrot_agent_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  parrot-agent-postgres-data:

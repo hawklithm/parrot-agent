@@ -7,7 +7,6 @@ use sha2::{Sha256, Digest};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::session_service::SkillInfo;
 
 /// ConfigSnapshot - 配置快照
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +36,7 @@ pub struct CreateAgentInput {
     pub company_id: Uuid,
     pub name: String,
     pub role: models::AgentRole,
+    pub status: Option<AgentStatus>,
     pub adapter_type: String,
     pub adapter_config: serde_json::Value,
     pub runtime_config: Option<serde_json::Value>,
@@ -100,7 +100,7 @@ pub trait AgentService: Send + Sync {
     async fn get_skills(&self, agent_id: Uuid) -> Result<models::AgentSkillSnapshot, ServiceError>;
 
     /// 同步Agent技能列表
-    async fn sync_skills(&self, agent_id: Uuid) -> Result<Vec<SkillInfo>, ServiceError>;
+    async fn sync_skills(&self, agent_id: Uuid) -> Result<models::AgentSkillSnapshot, ServiceError>;
 
     /// 重置Agent会话运行时状态
     async fn reset_session(&self, agent_id: Uuid) -> Result<(), ServiceError>;
@@ -328,7 +328,7 @@ where
             company_id: input.company_id,
             name: input.name.clone(),
             role: input.role,
-            status: AgentStatus::Idle,
+            status: input.status.unwrap_or(AgentStatus::Idle),
             adapter_type: input.adapter_type,
             adapter_config: sqlx::types::Json(input.adapter_config),
             runtime_config: sqlx::types::Json(input.runtime_config.unwrap_or(serde_json::json!({}))),
@@ -672,48 +672,37 @@ where
         // 构建技能条目（简化实现，实际应查询skill表）
         let entries = desired_skills.iter().map(|name| {
             models::AgentSkillEntry {
-                skill_id: name.clone(),
-                source: models::SkillSource::Company,
-                enabled: true,
+                key: name.clone(),
+                runtime_name: Some(name.clone()),
+                version_id: None,
+                current_version_id: None,
+                desired: true,
+                managed: true,
+                state: models::AgentSkillState::Configured,
+                origin: Some(models::AgentSkillOrigin::CompanyManaged),
+                origin_label: Some("Company managed".to_string()),
+                location_label: None,
+                read_only: false,
+                source_path: None,
+                target_path: None,
+                detail: None,
             }
         }).collect();
 
         // 返回技能快照
         Ok(models::AgentSkillSnapshot {
-            skills: entries,
-            sync_mode: models::AgentSkillSyncMode::Auto,
-            last_synced_at: None,
+            adapter_type: agent.adapter_type,
+            supported: true,
+            mode: models::AgentSkillSyncMode::Persistent,
+            desired_skills,
+            desired_skill_entries: None,
+            entries,
+            warnings: vec![],
         })
     }
 
-    async fn sync_skills(&self, agent_id: Uuid) -> Result<Vec<SkillInfo>, ServiceError> {
-        // 获取Agent信息以读取 desired_skills
-        let agent = self.repository.get_by_id(agent_id).await?;
-
-        let desired_skills = agent.adapter_config.0
-            .get("desired_skills")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
-
-        // 将 desired_skills 映射为 SkillInfo（简化实现，实际应查询 skill 表）
-        let skills = desired_skills
-            .into_iter()
-            .enumerate()
-            .map(|(i, name)| SkillInfo {
-                id: Uuid::new_v4(),
-                name,
-                description: String::new(),
-                skill_type: crate::session_service::SkillType::Custom,
-                enabled: i < i.saturating_add(usize::MAX), // 全部启用
-            })
-            .collect();
-
-        Ok(skills)
+    async fn sync_skills(&self, agent_id: Uuid) -> Result<models::AgentSkillSnapshot, ServiceError> {
+        self.get_skills(agent_id).await
     }
 
     async fn reset_session(&self, _agent_id: Uuid) -> Result<(), ServiceError> {

@@ -516,14 +516,21 @@ async fn list_issue_runs(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let pool = &state.pool;
+    // Keep one projection for both discovery paths.  The previous UNION used
+    // `hr.*` for the second branch, which made the enum `status` disagree with
+    // the `status::text` projection in RUN_SELECT and caused PostgreSQL to
+    // return 500 for issues with execution runs.
     let rows = sqlx::query(&format!(
-        "{} WHERE context_snapshot->>'issueId' = $1 \
-          UNION ALL \
-          SELECT hr.* FROM heartbeat_runs hr JOIN issues i ON i.execution_run_id = hr.id WHERE i.id = $1 \
-          ORDER BY created_at DESC",
+        "{} hr WHERE EXISTS (SELECT 1 FROM issues i WHERE i.id = $1 AND i.company_id = hr.company_id) \
+          AND (hr.context_snapshot->>'issueId' = $1::text \
+            OR EXISTS (SELECT 1 FROM activity_logs al WHERE al.company_id = hr.company_id \
+                      AND al.resource_type = 'issue' AND al.resource_id = $1 \
+                      AND al.run_id = hr.id) \
+            OR EXISTS (SELECT 1 FROM issues i WHERE i.id = $1 AND i.execution_run_id = hr.id)) \
+          ORDER BY hr.created_at DESC",
         RUN_SELECT
     ))
-    .bind(id.to_string())
+    .bind(id)
     .fetch_all(pool)
     .await
     .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;

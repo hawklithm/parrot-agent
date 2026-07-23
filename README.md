@@ -52,6 +52,17 @@ parrot-agent/
 migrations::run_migrations(&pool).await?;
 ```
 
+For local development, start PostgreSQL with Docker Compose:
+
+```bash
+docker compose up -d postgres
+cargo run -p parrot-server
+```
+
+The container publishes PostgreSQL on `localhost:5433`, matching the default
+`DATABASE_URL` in `.env`. Data is kept in the `parrot-agent-postgres-data`
+Docker volume.
+
 ## Quick Start
 
 ```bash

@@ -19,6 +19,7 @@ use crate::errors::AppError;
 
 /// 活动查询参数
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivityQueryParams {
     #[allow(dead_code)]
     actor_id: Option<Uuid>,
@@ -26,6 +27,7 @@ pub struct ActivityQueryParams {
     entity_type: Option<String>,
     #[allow(dead_code)]
     entity_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
     limit: Option<i64>,
 }
 
@@ -56,6 +58,23 @@ struct ActivityRow {
     created_at: DateTime<Utc>,
 }
 
+fn activity_json(r: ActivityRow) -> serde_json::Value {
+    let details = r.metadata.clone();
+    serde_json::json!({
+        "id": r.id,
+        "companyId": r.company_id,
+        "actorType": r.actor_type,
+        "actorId": r.actor_id,
+        "action": r.action,
+        "entityType": r.resource_type,
+        "entityId": r.resource_id,
+        "agentId": details.as_ref().and_then(|v| v.get("agentId")).and_then(|v| v.as_str()),
+        "runId": details.as_ref().and_then(|v| v.get("runId")).and_then(|v| v.as_str()),
+        "details": details,
+        "createdAt": r.created_at,
+    })
+}
+
 pub fn activity_routes() -> Router<AppState> {
     Router::new()
         .route("/companies/:company_id/activity", get(list_company_activity).post(create_activity))
@@ -77,32 +96,23 @@ async fn list_company_activity(
 SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
         FROM activity_logs
         WHERE company_id = $1
+          AND ($3::uuid IS NULL OR actor_id = $3)
+          AND ($4::text IS NULL OR resource_type = $4)
+          AND ($5::uuid IS NULL OR resource_id = $5)
         ORDER BY created_at DESC
         LIMIT $2
         "#,
     )
     .bind(company_id)
     .bind(limit)
+    .bind(params.agent_id)
+    .bind(params.entity_type.as_deref())
+    .bind(params.entity_id)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| AppError::InternalServerError(format!("Failed to query activity: {}", e)))?;
 
-    let result: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "companyId": r.company_id,
-                "actorType": r.actor_type,
-                "actorId": r.actor_id,
-                "action": r.action,
-                "resourceType": r.resource_type,
-                "resourceId": r.resource_id,
-                "metadata": r.metadata,
-                "createdAt": r.created_at,
-            })
-        })
-        .collect();
+    let result: Vec<serde_json::Value> = rows.into_iter().map(activity_json).collect();
 
     Ok(Json(result))
 }
@@ -165,22 +175,7 @@ SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type
     .await
     .map_err(|e| AppError::InternalServerError(format!("Failed to query issue activity: {}", e)))?;
 
-    let result: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "companyId": r.company_id,
-                "actorType": r.actor_type,
-                "actorId": r.actor_id,
-                "action": r.action,
-                "resourceType": r.resource_type,
-                "resourceId": r.resource_id,
-                "metadata": r.metadata,
-                "createdAt": r.created_at,
-            })
-        })
-        .collect();
+    let result: Vec<serde_json::Value> = rows.into_iter().map(activity_json).collect();
 
     Ok(Json(result))
 }

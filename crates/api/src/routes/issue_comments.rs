@@ -49,15 +49,6 @@ pub struct CommentResponse {
     pub comment: IssueComment,
 }
 
-/// Comments list response
-#[derive(Debug, Serialize)]
-pub struct CommentsListResponse {
-    pub comments: Vec<IssueComment>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
 // Convert service errors to API errors
 impl From<CommentServiceError> for ApiError {
     fn from(err: CommentServiceError) -> Self {
@@ -114,14 +105,11 @@ pub async fn list_comments(
     };
 
     let comments = service.list_comments(issue_id, &pagination).await?;
-    let total = service.count_comments(issue_id).await?;
-
-    Ok(Json(CommentsListResponse {
-        comments,
-        total,
-        limit: pagination.limit,
-        offset: pagination.offset,
-    }))
+    // Paperclip's client consumes this endpoint as `IssueComment[]`.  The
+    // previous envelope (`{ comments, total, ... }`) was passed directly into
+    // the chat message builder, producing messages without `content` and
+    // causing both the normal renderer and its fallback to crash.
+    Ok(Json(comments))
 }
 
 /// GET /comments/:comment_id - Get a single comment

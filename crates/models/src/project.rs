@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "project_status", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ProjectStatus {
     Backlog,
     Todo,
@@ -17,6 +18,7 @@ pub enum ProjectStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "execution_workspace_policy", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionWorkspacePolicy {
     Shared,
     IsolatedPerIssue,
@@ -48,10 +50,14 @@ pub struct Project {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateProjectInput {
+    /// Filled from the company path parameter by the API route.
+    #[serde(default)]
     pub company_id: Uuid,
     pub goal_id: Option<Uuid>,
+    pub goal_ids: Option<Vec<Uuid>>,
     pub name: String,
     pub description: Option<String>,
+    pub status: Option<ProjectStatus>,
     pub lead_agent_id: Option<Uuid>,
     pub target_date: Option<DateTime<Utc>>,
     pub color: Option<String>,

@@ -5,12 +5,13 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
+use uuid::Uuid;
 
 use crate::errors::AppError;
 use crate::schemas::{
     AdapterInfoResponse, AdapterModelResponse, ListAdaptersResponse,
     TestAdapterEnvironmentRequest, TestAdapterEnvironmentResponse,
-    ListAdapterModelsResponse, DetectModelRequest, DetectModelResponse,
+    DetectModelRequest, DetectModelResponse,
     ModelDetectionStatus,
 };
 use crate::extractors::CompanyIdOrShortname;
@@ -24,7 +25,8 @@ pub fn adapter_routes() -> Router<AdapterAppState> {
         .route("/companies/:company_id/adapters", get(list_adapters))
         .route("/companies/:company_id/adapters/:adapter_type", get(get_adapter_info))
         .route("/companies/:company_id/adapters/:adapter_type/models", get(list_models))
-        .route("/companies/:company_id/adapters/:adapter_type/detect-model", post(detect_model))
+        .route("/companies/:company_id/adapters/:adapter_type/detect-model", get(detect_model_get).post(detect_model))
+        .route("/companies/:company_id/adapters/:adapter_type/model-profiles", get(list_model_profiles))
         .route("/companies/:company_id/adapters/:adapter_type/test-environment", post(test_environment))
         // --- P1: Adapter 补齐 (E1-E10) ---
         .route("/adapters", get(list_global_adapters))
@@ -75,8 +77,7 @@ async fn list_adapters(
 /// GET /companies/:company_id/adapters/:adapter_type - 获取指定适配器详细信息
 async fn get_adapter_info(
     State(state): State<AdapterAppState>,
-    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
-    Path(adapter_type_str): Path<String>,
+    Path((_company_id, adapter_type_str)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let adapter = state
         .adapter_registry
@@ -108,8 +109,7 @@ async fn get_adapter_info(
 /// GET /companies/:company_id/adapters/:adapter_type/models - 获取适配器支持的模型列表
 async fn list_models(
     State(state): State<AdapterAppState>,
-    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
-    Path(adapter_type_str): Path<String>,
+    Path((_company_id, adapter_type_str)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let adapter = state
         .adapter_registry
@@ -126,19 +126,15 @@ async fn list_models(
         })
         .collect();
 
-    let response = ListAdapterModelsResponse {
-        adapter_type: adapter_type_str,
-        models,
-    };
-
-    Ok(Json(response))
+    // Keep parity with Paperclip: this endpoint returns the model array
+    // directly, rather than wrapping it with adapter metadata.
+    Ok(Json(models))
 }
 
 /// POST /companies/:company_id/adapters/:adapter_type/detect-model - 检测可用模型
 async fn detect_model(
     State(state): State<AdapterAppState>,
-    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
-    Path(adapter_type_str): Path<String>,
+    Path((_company_id, adapter_type_str)): Path<(String, String)>,
     Json(payload): Json<DetectModelRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let _adapter = state
@@ -172,13 +168,49 @@ async fn detect_model(
     Ok(Json(response))
 }
 
+/// GET /companies/:company_id/adapters/:adapter_type/detect-model
+/// Paperclip performs adapter detection without a request body.
+async fn detect_model_get(
+    State(state): State<AdapterAppState>,
+    Path((_company_id, adapter_type_str)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .adapter_registry
+        .find_server_adapter(&adapter_type_str)
+        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
+
+    // A local adapter can only report a detected runtime model when its
+    // executable is available. Returning null matches Paperclip's contract
+    // when detection is unavailable; configured model selection remains in
+    // the agent adapter configuration.
+    Ok(Json(serde_json::Value::Null))
+}
+
+/// GET /companies/:company_id/adapters/:adapter_type/model-profiles
+async fn list_model_profiles(
+    State(state): State<AdapterAppState>,
+    Path((_company_id, adapter_type_str)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    state
+        .adapter_registry
+        .find_server_adapter(&adapter_type_str)
+        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
+    Ok(Json(
+        state
+            .adapter_registry
+            .list_adapter_model_profiles(&adapter_type_str)
+            .await,
+    ))
+}
+
 /// POST /companies/:company_id/adapters/:adapter_type/test-environment - 测试适配器环境
 async fn test_environment(
     State(state): State<AdapterAppState>,
-    CompanyIdOrShortname(company_id): CompanyIdOrShortname,
-    Path(adapter_type_str): Path<String>,
+    Path((company_id_str, adapter_type_str)): Path<(String, String)>,
     Json(payload): Json<TestAdapterEnvironmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let company_id = Uuid::parse_str(&company_id_str)
+        .map_err(|_| AppError::BadRequest("Invalid company ID parameter".to_string()))?;
     let adapter = state
         .adapter_registry
         .find_server_adapter(&adapter_type_str)

@@ -66,13 +66,34 @@ pub fn project_routes() -> Router<AppState> {
 async fn list_projects(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
-) -> Result<Json<Vec<Project>>, AppError> {
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let projects = state
         .project_service
         .list_by_company(company_id)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(projects))
+    let mut result = Vec::with_capacity(projects.len());
+    for project in projects {
+        result.push(hydrate_project(&state, project).await?);
+    }
+    Ok(Json(result))
+}
+
+async fn hydrate_project(state: &AppState, project: Project) -> Result<serde_json::Value, AppError> {
+    let workspaces: Vec<ProjectWorkspace> = sqlx::query_as(
+        "SELECT id, project_id, name, config, is_primary, created_at, updated_at FROM project_workspaces WHERE project_id = $1 ORDER BY is_primary DESC, created_at ASC",
+    )
+    .bind(project.id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Failed to load project workspaces: {e}")))?;
+    let primary = workspaces.iter().find(|w| w.is_primary).cloned();
+    let mut value = serde_json::to_value(project).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("workspaces".into(), serde_json::to_value(&workspaces).unwrap_or_default());
+        object.insert("primaryWorkspace".into(), serde_json::to_value(primary).unwrap_or(serde_json::Value::Null));
+    }
+    Ok(value)
 }
 
 /// POST /companies/:company_id/projects
@@ -80,28 +101,28 @@ async fn create_project(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
     Json(mut input): Json<CreateProjectInput>,
-) -> Result<(StatusCode, Json<Project>), AppError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     input.company_id = company_id;
     let project = state
         .project_service
         .create(input)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(project)))
+    Ok((StatusCode::CREATED, Json(hydrate_project(&state, project).await?)))
 }
 
 /// GET /projects/:project_id
 async fn get_project(
     State(state): State<AppState>,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Project>, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .project_service
         .get_by_id(project_id)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?
         .ok_or_else(|| AppError::NotFound(format!("Project {} not found", project_id)))?;
-    Ok(Json(project))
+    Ok(Json(hydrate_project(&state, project).await?))
 }
 
 /// PATCH /projects/:project_id
@@ -109,13 +130,13 @@ async fn update_project(
     State(state): State<AppState>,
     Path(project_id): Path<Uuid>,
     Json(input): Json<UpdateProjectInput>,
-) -> Result<Json<Project>, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .project_service
         .update(project_id, input)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(project))
+    Ok(Json(hydrate_project(&state, project).await?))
 }
 
 /// DELETE /projects/:project_id
