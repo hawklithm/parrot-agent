@@ -331,7 +331,7 @@ fn build_app_state(pool: PgPool) -> AppState {
         services::DefaultSecretProviderConfigServiceImpl::new(secret_provider_config_repo),
     );
     let secret_remote_import_service: Arc<dyn SecretRemoteImportService> =
-        Arc::new(services::secret_remote_import_service::MockSecretRemoteImportService);
+        Arc::new(services::secret_remote_import_service::ProviderSecretRemoteImportService::new(pool.clone()));
     let environment_diagnostics_service: Arc<dyn EnvironmentDiagnosticsService> =
         Arc::new(services::environment_diagnostics_service::PgEnvironmentDiagnosticsService::new(pool.clone()));
     let invite_resource_service: Arc<dyn InviteResourceService> =
