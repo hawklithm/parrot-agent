@@ -107,13 +107,21 @@ struct SearchQuery {
     limit: Option<i64>,
 }
 
+async fn issue_company_id(state: &AppState, issue_id: Uuid) -> Result<Uuid, StatusCode> {
+    sqlx::query_scalar("SELECT company_id FROM issues WHERE id=$1")
+        .bind(issue_id).fetch_optional(&state.pool).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 /// GET /issues - List all issues
 async fn list_issues(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Query(query): Query<ListIssuesQuery>,
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = actor.company_id().ok_or(StatusCode::FORBIDDEN)?;
     
     let filter = IssueQueryFilter {
         status: None,
@@ -145,7 +153,7 @@ async fn get_issue(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
 
     service
         .get(id, company_id)
@@ -249,7 +257,7 @@ async fn delete_issue(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
 
     service
         .delete(id, company_id)
@@ -260,10 +268,12 @@ async fn delete_issue(
 
 /// GET /companies/:companyId/issues/count - Count issues
 async fn count_issues(
-    State(_state): State<AppState>,
-    Path(_company_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"count": 0})))
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM issues WHERE company_id=$1")
+        .bind(company_id).fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({"count": count})))
 }
 
 /// GET /companies/:companyId/issues/search - Search issues
@@ -294,7 +304,7 @@ async fn checkout_issue(
     Json(input): Json<CheckoutInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
 
     service
         .checkout(id, company_id, input)
@@ -310,7 +320,7 @@ async fn release_issue(
     Json(input): Json<ReleaseInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
 
     service
         .release(id, company_id, input)
@@ -371,7 +381,7 @@ async fn get_heartbeat_context(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
 
     service
         .get_heartbeat_context(id, company_id)

@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use services::low_trust_service::{PromoteLowTrustInput, PromoteLowTrustResult};
 use models::Issue;
+use services::auth::AuthorizationActor;
 
 /// POST /issues/:id/low-trust/promotions - Promote a low-trust issue
 async fn promote_low_trust(
@@ -17,7 +18,9 @@ async fn promote_low_trust(
     Json(input): Json<PromoteLowTrustInput>,
 ) -> Result<Json<PromoteLowTrustResult>, StatusCode> {
     let service = state.low_trust_service.clone();
-    let company_id = Uuid::nil();
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id=$1")
+        .bind(id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::NOT_FOUND)?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     service
         .promote_low_trust(company_id, id, input)
@@ -29,9 +32,10 @@ async fn promote_low_trust(
 /// GET /issues/low-trust - List low-trust issues
 async fn list_low_trust_issues(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
     let service = state.low_trust_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = actor.company_id().ok_or(StatusCode::FORBIDDEN)?;
 
     service
         .list_low_trust_issues(company_id, 100)

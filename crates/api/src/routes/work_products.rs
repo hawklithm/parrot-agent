@@ -12,13 +12,10 @@ use models::issue_auxiliary::{CreateWorkProductInput, UpdateWorkProductInput, Wo
 
 /// Helper: 通过 issue_id 查询 company_id
 async fn get_company_id_for_issue(state: &AppState, issue_id: Uuid) -> Result<Uuid, AppError> {
-    let issue = state
-        .issue_service
-        .get(issue_id, Uuid::nil())
-        .await
+    sqlx::query_scalar("SELECT company_id FROM issues WHERE id=$1")
+        .bind(issue_id).fetch_optional(&state.pool).await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?
-        .ok_or(AppError::NotFound("Issue not found".to_string()))?;
-    Ok(issue.company_id)
+        .ok_or(AppError::NotFound("Issue not found".to_string()))
 }
 
 /// GET /issues/:id/work-products - List work products
