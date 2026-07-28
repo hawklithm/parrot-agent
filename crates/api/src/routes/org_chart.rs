@@ -44,10 +44,14 @@ pub async fn generate_org_chart_svg(
         _ => OrgChartStyle::Warmth,
     };
 
+    let (company_name, agent_count) = sqlx::query_as::<_, (String, i64)>(
+        "SELECT c.name, (SELECT COUNT(*) FROM agents a WHERE a.company_id=c.id) FROM companies c WHERE c.id=$1")
+        .bind(company_id).fetch_optional(&state.pool).await.ok().flatten()
+        .unwrap_or_else(|| ("Company".to_string(), 0));
     let options = OrgChartOptions {
         style,
-        company_name: Some("Parrot Agent".to_string()),
-        stats: Some("Agents: 6".to_string()),
+        company_name: Some(company_name),
+        stats: Some(format!("Agents: {agent_count}")),
     };
 
     match state.org_chart_service.generate_org_chart_svg(company_id, options).await {
@@ -82,22 +86,26 @@ pub fn org_chart_routes() -> Router<AppState> {
         )
 }
 
-/// GET /companies/:companyId/org.png - 生成 PNG 组织架构图（占位）
+/// GET /companies/:companyId/org.png - 生成组织架构图。
+///
+/// The renderer is SVG-based in both the web UI and Paperclip. Keep this
+/// endpoint useful for clients that historically requested `.png` by returning
+/// the same standards-compliant SVG bytes instead of a fake/501 response.
 async fn generate_org_png(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
-    let _tree = state
-        .org_chart_service
-        .build_org_tree(company_id)
-        .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-
-    // TODO: 实现 PNG 渲染逻辑（需要 resvg 或 image 库）
-    // 当前返回 501 Not Implemented
-    Err(AppError::NotImplemented(
-        "PNG rendering not yet implemented".to_string(),
-    ))
+    let (company_name, agent_count) = sqlx::query_as::<_, (String, i64)>(
+        "SELECT c.name, (SELECT COUNT(*) FROM agents a WHERE a.company_id=c.id) FROM companies c WHERE c.id=$1")
+        .bind(company_id).fetch_optional(&state.pool).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Company not found".to_string()))?;
+    let svg = state.org_chart_service.generate_org_chart_svg(company_id, OrgChartOptions {
+        style: OrgChartStyle::Warmth,
+        company_name: Some(company_name),
+        stats: Some(format!("Agents: {agent_count}")),
+    }).await.map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok(([(header::CONTENT_TYPE, "image/svg+xml"), (header::CONTENT_DISPOSITION, "inline")], svg).into_response())
 }
 
 #[cfg(test)]

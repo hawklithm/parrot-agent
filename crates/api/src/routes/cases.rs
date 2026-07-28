@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use sqlx::Row;
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use uuid::Uuid;
@@ -15,13 +16,12 @@ use services::{AdvanceCaseInput, CaseQueryFilter, Pagination};
 
 /// Helper: 通过 case_id 查询 company_id
 async fn get_company_id_for_case(state: &AppState, case_id: Uuid) -> Result<Uuid, StatusCode> {
-    let case = state
-        .case_service
-        .get(case_id, Uuid::nil())
+    sqlx::query_scalar("SELECT company_id FROM cases WHERE id = $1")
+        .bind(case_id)
+        .fetch_optional(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(case.company_id)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,178 +323,203 @@ async fn breakdown_case(
 
 /// C15: POST /cases/:id/attachments
 async fn upload_case_attachment(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Json(input): Json<models::issue_auxiliary::UploadAttachmentInput>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Use attachment service
-    // TODO: company_id 需要从 case 查询，当前 attachment 功能为存根
-    let _company_id = Uuid::nil();
-    // TODO: multipart upload handling
-    Ok(Json(serde_json::json!({
-        "caseId": id,
-        "attachmentId": Uuid::new_v4(),
-        "uploaded": true,
-    })))
+    let company_id = get_company_id_for_case(&state, id).await?;
+    state.attachment_service
+        .upload_attachment("case", id, company_id, input)
+        .await
+        .map(|attachment| Json(serde_json::to_value(attachment).unwrap_or_default()))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn case_document_id(state: &AppState, case_id: Uuid, key: &str) -> Result<(Uuid, Uuid), StatusCode> {
+    sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT d.id, cd.company_id FROM case_documents cd JOIN documents d ON d.id = cd.document_id WHERE cd.case_id=$1 AND cd.key=$2")
+        .bind(case_id).bind(key).fetch_optional(&state.pool).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// C16: GET /cases/:id/documents/:key — Get case document content
 async fn get_case_document(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, key)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Use case document service
-    Ok(Json(serde_json::json!({"id": _id, "key": _key, "content": "", "contentType": "text/markdown"})))
+    let row = sqlx::query("SELECT d.id, cd.company_id, cd.key, d.content, d.content_type, d.locked_by_type, d.locked_by_id, d.locked_at, d.locked_run_id, d.created_at, d.updated_at FROM case_documents cd JOIN documents d ON d.id=cd.document_id WHERE cd.case_id=$1 AND cd.key=$2")
+        .bind(id).bind(&key).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({"id": row.get::<Uuid,_>("id"), "caseId": id, "companyId": row.get::<Uuid,_>("company_id"), "key": row.get::<String,_>("key"), "content": row.get::<String,_>("content"), "contentType": row.get::<Option<String>,_>("content_type").unwrap_or_else(|| "text/markdown".into()), "lockedByType": row.get::<Option<String>,_>("locked_by_type"), "lockedById": row.get::<Option<Uuid>,_>("locked_by_id"), "lockedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("locked_at"), "lockedRunId": row.get::<Option<Uuid>,_>("locked_run_id"), "createdAt": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"), "updatedAt": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")})))
 }
 
 /// C17: POST /cases/:id/documents/:key — Create case document
 async fn create_case_document(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, key)): Path<(Uuid, String)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // TODO: Use case document service
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "caseId": _id,
-        "key": _key,
-        "document": payload,
-        "created": true,
-    }))))
+    let company_id = get_company_id_for_case(&state, id).await?;
+    let content = payload.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+    let content_type = payload.get("contentType").and_then(|v| v.as_str()).unwrap_or("text/markdown");
+    let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let document_id: Uuid = sqlx::query_scalar("INSERT INTO documents (company_id, content, content_type) VALUES ($1,$2,$3) RETURNING id").bind(company_id).bind(content).bind(content_type).fetch_one(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("INSERT INTO case_documents (company_id, case_id, document_id, key) VALUES ($1,$2,$3,$4)").bind(company_id).bind(id).bind(document_id).bind(&key).execute(&mut *tx).await.map_err(|_| StatusCode::CONFLICT)?;
+    sqlx::query("INSERT INTO document_revisions (document_id, revision_number, content) VALUES ($1,1,$2)").bind(document_id).bind(content).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({"id": document_id, "caseId": id, "key": key, "content": content, "contentType": content_type, "revisionNumber": 1}))))
 }
 
 /// C18: PUT /cases/:id/documents/:key — Update case document
 async fn update_case_document(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, key)): Path<(Uuid, String)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Use case document service
-    Ok(Json(serde_json::json!({
-        "caseId": _id,
-        "key": _key,
-        "document": payload,
-        "updated": true,
-    })))
+    let (document_id, _) = case_document_id(&state, id, &key).await?;
+    let content = payload.get("content").and_then(|v| v.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
+    let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let revision: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1").bind(document_id).fetch_one(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("UPDATE documents SET content=$2, content_type=COALESCE($3,content_type), updated_at=NOW() WHERE id=$1").bind(document_id).bind(content).bind(payload.get("contentType").and_then(|v| v.as_str())).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("INSERT INTO document_revisions (document_id,revision_number,content) VALUES ($1,$2,$3)").bind(document_id).bind(revision).bind(content).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({"id": document_id, "caseId": id, "key": key, "content": content, "revisionNumber": revision})))
 }
 
 /// C19: POST /cases/:id/documents/:key/lock — Lock case document
 async fn lock_case_document(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, key)): Path<(Uuid, String)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Use case document service
-    Ok(Json(serde_json::json!({
-        "caseId": _id,
-        "key": _key,
-        "locked": true,
-        "lockedBy": payload,
-    })))
+    let (document_id, _) = case_document_id(&state, id, &key).await?;
+    sqlx::query("UPDATE documents SET locked_by_type=$2, locked_by_id=$3, locked_at=NOW(), locked_run_id=$4 WHERE id=$1 AND locked_at IS NULL")
+        .bind(document_id).bind(payload.get("actorType").and_then(|v|v.as_str()).unwrap_or("user"))
+        .bind(payload.get("actorId").and_then(|v|v.as_str()).and_then(|v|Uuid::parse_str(v).ok()))
+        .bind(payload.get("runId").and_then(|v|v.as_str()).and_then(|v|Uuid::parse_str(v).ok())).execute(&state.pool).await.map_err(|_| StatusCode::CONFLICT)?;
+    Ok(Json(serde_json::json!({"caseId": id, "key": key, "locked": true, "lockedBy": payload})))
 }
 
 /// C20: POST /cases/:id/documents/:key/unlock — Unlock case document
 async fn unlock_case_document(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, key)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Use case document service
-    Ok(Json(serde_json::json!({
-        "caseId": _id,
-        "key": _key,
-        "unlocked": true,
-    })))
+    let (document_id, _) = case_document_id(&state, id, &key).await?;
+    sqlx::query("UPDATE documents SET locked_by_type=NULL, locked_by_id=NULL, locked_at=NULL, locked_run_id=NULL WHERE id=$1").bind(document_id).execute(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({"caseId": id, "key": key, "unlocked": true})))
 }
 
 /// C21: GET /cases/:id/documents/:key/revisions
 async fn get_document_revisions(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, key)): Path<(Uuid, String)>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    // TODO: Use document service revisions
-    Ok(Json(vec![
-        serde_json::json!({"revisionId": Uuid::new_v4(), "version": 1, "createdAt": chrono::Utc::now()}),
-        serde_json::json!({"revisionId": Uuid::new_v4(), "version": 2, "createdAt": chrono::Utc::now()}),
-    ]))
+    let (document_id, _) = case_document_id(&state, id, &key).await?;
+    let rows = sqlx::query("SELECT id,revision_number,content,created_at FROM document_revisions WHERE document_id=$1 ORDER BY revision_number DESC").bind(document_id).fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(rows.into_iter().map(|r| serde_json::json!({"id":r.get::<Uuid,_>("id"),"revisionId":r.get::<Uuid,_>("id"),"revisionNumber":r.get::<i32,_>("revision_number"),"version":r.get::<i32,_>("revision_number"),"content":r.get::<String,_>("content"),"createdAt":r.get::<chrono::DateTime<chrono::Utc>,_>("created_at")})).collect()))
 }
 
 /// C22: POST /cases/:id/documents/:key/revisions/:revision_id/restore
 async fn restore_document_revision(
-    State(_state): State<AppState>,
-    Path((_id, _key, _revision_id)): Path<(Uuid, String, Uuid)>,
+    State(state): State<AppState>,
+    Path((id, key, revision_id)): Path<(Uuid, String, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"restored": true, "revisionId": _revision_id})))
+    let (document_id, _) = case_document_id(&state, id, &key).await?;
+    let content: String = sqlx::query_scalar("SELECT content FROM document_revisions WHERE id=$1 AND document_id=$2").bind(revision_id).bind(document_id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    let revision: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1").bind(document_id).fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("UPDATE documents SET content=$2,updated_at=NOW() WHERE id=$1").bind(document_id).bind(&content).execute(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("INSERT INTO document_revisions(document_id,revision_number,content) VALUES($1,$2,$3)").bind(document_id).bind(revision).bind(&content).execute(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({"restored":true,"revisionId":revision_id,"revisionNumber":revision,"content":content})))
 }
 
 /// C23: DELETE /cases/:id/documents/:key
 async fn delete_case_document(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, key)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    let (_, company_id) = case_document_id(&state, id, &key).await?;
+    sqlx::query("DELETE FROM case_documents WHERE case_id=$1 AND key=$2 AND company_id=$3").bind(id).bind(key).bind(company_id).execute(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// C24: GET /cases/:id/documents/:key/annotations
 async fn get_document_annotations(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, key)): Path<(Uuid, String)>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
+    let (document_id, _) = case_document_id(&state, id, &key).await?;
+    let rows = sqlx::query("SELECT id, status, anchor_state, selected_text, anchor_selector, created_at, updated_at FROM document_annotation_threads WHERE case_id=$1 AND document_id=$2 AND document_key=$3 ORDER BY updated_at DESC")
+        .bind(id).bind(document_id).bind(&key).fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        let thread_id: Uuid = row.get("id");
+        let comments = sqlx::query("SELECT id, body, author_type, author_agent_id, author_user_id, created_at, updated_at FROM document_annotation_comments WHERE thread_id=$1 ORDER BY created_at ASC")
+            .bind(thread_id).fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        result.push(serde_json::json!({"id":thread_id,"threadId":thread_id,"caseId":id,"documentKey":key,"status":row.get::<String,_>("status"),"anchorState":row.get::<String,_>("anchor_state"),"selectedText":row.get::<String,_>("selected_text"),"anchorSelector":row.get::<serde_json::Value,_>("anchor_selector"),"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at"),"comments":comments.into_iter().map(|c|serde_json::json!({"id":c.get::<Uuid,_>("id"),"body":c.get::<String,_>("body"),"authorType":c.get::<String,_>("author_type"),"authorAgentId":c.get::<Option<Uuid>,_>("author_agent_id"),"authorUserId":c.get::<Option<String>,_>("author_user_id"),"createdAt":c.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":c.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")})).collect::<Vec<_>>() }));
+    }
+    Ok(Json(result))
 }
 
 /// C25: GET /cases/:id/documents/:key/annotations/:thread_id
 async fn get_document_annotation_thread(
-    State(_state): State<AppState>,
-    Path((_id, _key, _thread_id)): Path<(Uuid, String, Uuid)>,
+    State(state): State<AppState>,
+    Path((id, key, thread_id)): Path<(Uuid, String, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({
-        "threadId": _thread_id,
-        "caseId": _id,
-        "documentKey": _key,
-        "annotations": [],
-    })))
+    let (document_id, _) = case_document_id(&state, id, &key).await?;
+    let row = sqlx::query("SELECT id,status,anchor_state,selected_text,anchor_selector,created_at,updated_at FROM document_annotation_threads WHERE id=$1 AND case_id=$2 AND document_id=$3 AND document_key=$4")
+        .bind(thread_id).bind(id).bind(document_id).bind(&key).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    let comments = sqlx::query("SELECT id,body,author_type,author_agent_id,author_user_id,created_at,updated_at FROM document_annotation_comments WHERE thread_id=$1 ORDER BY created_at ASC").bind(thread_id).fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({"id":thread_id,"threadId":thread_id,"caseId":id,"documentKey":key,"status":row.get::<String,_>("status"),"anchorState":row.get::<String,_>("anchor_state"),"selectedText":row.get::<String,_>("selected_text"),"anchorSelector":row.get::<serde_json::Value,_>("anchor_selector"),"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at"),"comments":comments.into_iter().map(|c|serde_json::json!({"id":c.get::<Uuid,_>("id"),"body":c.get::<String,_>("body"),"authorType":c.get::<String,_>("author_type"),"authorAgentId":c.get::<Option<Uuid>,_>("author_agent_id"),"authorUserId":c.get::<Option<String>,_>("author_user_id"),"createdAt":c.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":c.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")})).collect::<Vec<_>>() })))
 }
 
 /// C26: POST /cases/:id/documents/:key/annotations — Create document annotation
 async fn create_document_annotation(
-    State(_state): State<AppState>,
-    Path((_id, _key)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, key)): Path<(Uuid, String)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let (document_id, company_id) = case_document_id(&state, id, &key).await?;
+    let selected = payload.get("selectedText").and_then(|v|v.as_str()).unwrap_or_default();
+    let selector = payload.get("anchorSelector").or_else(||payload.get("selector")).cloned().unwrap_or_else(||serde_json::json!({}));
+    let thread_id: Uuid = sqlx::query_scalar("INSERT INTO document_annotation_threads (company_id,case_id,document_id,document_key,selected_text,anchor_selector,original_revision_number,current_revision_number) SELECT $1,$2,$3,$4,$5,$6,COALESCE(MAX(revision_number),0),COALESCE(MAX(revision_number),0) FROM document_revisions WHERE document_id=$3 RETURNING id")
+        .bind(company_id).bind(id).bind(document_id).bind(&key).bind(selected).bind(&selector).fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "threadId": Uuid::new_v4(),
-        "caseId": _id,
-        "documentKey": _key,
-        "annotation": payload,
-        "created": true,
+        "threadId": thread_id, "id": thread_id, "caseId": id, "documentKey": key,
+        "status": "open", "selectedText": selected, "anchorSelector": selector, "comments": [],
     }))))
 }
 
 /// C27: POST /cases/:id/documents/:key/annotations/:thread_id/reply — Reply to annotation thread
 async fn reply_document_annotation(
-    State(_state): State<AppState>,
-    Path((_id, _key, _thread_id)): Path<(Uuid, String, Uuid)>,
+    State(state): State<AppState>,
+    Path((id, key, thread_id)): Path<(Uuid, String, Uuid)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let (document_id, company_id) = case_document_id(&state, id, &key).await?;
+    let body = payload.get("body").and_then(|v|v.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
+    let comment_id: Uuid = sqlx::query_scalar("INSERT INTO document_annotation_comments (company_id,thread_id,case_id,document_id,body,author_type) SELECT $1,$2,$3,$4,$5,'user' WHERE EXISTS (SELECT 1 FROM document_annotation_threads WHERE id=$2 AND case_id=$3 AND document_id=$4) RETURNING id")
+        .bind(company_id).bind(thread_id).bind(id).bind(document_id).bind(body).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    sqlx::query("UPDATE document_annotation_threads SET updated_at=NOW() WHERE id=$1").bind(thread_id).execute(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "threadId": _thread_id,
-        "caseId": _id,
-        "documentKey": _key,
-        "reply": payload,
-        "created": true,
+        "id": comment_id, "threadId": thread_id, "caseId": id, "documentKey": key, "body": body,
     }))))
 }
 
 /// C28: PATCH /cases/:id/documents/:key/annotations/:thread_id — Update annotation thread
 async fn update_document_annotation(
-    State(_state): State<AppState>,
-    Path((_id, _key, _thread_id)): Path<(Uuid, String, Uuid)>,
+    State(state): State<AppState>,
+    Path((id, key, thread_id)): Path<(Uuid, String, Uuid)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let (document_id, _) = case_document_id(&state, id, &key).await?;
+    let status = payload.get("status").and_then(|v|v.as_str()).unwrap_or("open");
+    if !matches!(status, "open" | "resolved") { return Err(StatusCode::BAD_REQUEST); }
+    let updated = sqlx::query("UPDATE document_annotation_threads SET status=$1, resolved_at=CASE WHEN $1='resolved' THEN NOW() ELSE NULL END, updated_at=NOW() WHERE id=$2 AND case_id=$3 AND document_id=$4 RETURNING id,status,updated_at")
+        .bind(status).bind(thread_id).bind(id).bind(document_id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(serde_json::json!({
-        "threadId": _thread_id,
-        "caseId": _id,
-        "documentKey": _key,
-        "annotation": payload,
-        "updated": true,
+        "threadId": updated.get::<Uuid,_>("id"), "caseId": id, "documentKey": key,
+        "status": updated.get::<String,_>("status"), "updatedAt": updated.get::<chrono::DateTime<chrono::Utc>,_>("updated_at"),
     })))
 }
 

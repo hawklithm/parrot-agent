@@ -322,7 +322,7 @@ fn build_app_state(pool: PgPool) -> AppState {
     let invite_service: Arc<dyn InviteService> = Arc::new(InviteServiceImpl::new());
     let openclaw_service: Arc<dyn OpenClawService> = Arc::new(OpenClawServiceImpl::new());
     let user_directory_service: Arc<dyn UserDirectoryService> =
-        Arc::new(services::user_directory_service::UserDirectoryServiceImpl::new());
+        Arc::new(services::user_directory_service::UserDirectoryServiceImpl::with_pool(pool.clone()));
     let custom_image_setup_service: Arc<dyn CustomImageSetupService> =
         Arc::new(services::custom_image_setup_service::PgCustomImageSetupService::new(pool.clone()));
     let secret_provider_config_repo: Arc<PgSecretProviderConfigRepository> =
