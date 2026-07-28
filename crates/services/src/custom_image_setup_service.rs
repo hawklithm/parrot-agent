@@ -16,8 +16,18 @@ impl PgCustomImageSetupService { pub fn new(pool: PgPool) -> Self { Self { pool 
 #[async_trait]
 impl CustomImageSetupService for PgCustomImageSetupService {
     async fn get_session(&self, session_id: Uuid) -> ServiceResult<EnvironmentCustomImageSetupSessionResult> {
-        let row = sqlx::query("SELECT row_to_json(environment_custom_image_setup_sessions.*) AS value FROM environment_custom_image_setup_sessions WHERE id = $1").bind(session_id).fetch_optional(&self.pool).await?.ok_or_else(|| crate::errors::ServiceError::NotFound("custom image setup session not found".into()))?;
-        let value: serde_json::Value = row.get("value");
+        let row = sqlx::query("SELECT id, environment_id, template_id, promoted_template_id, provider, provider_lease_id, environment_lease_id, status, started_by_user_id, started_by_agent_id, base_template_ref, expires_at, finished_at, failure_reason, connection_summary, connection_secret_ref, metadata, created_at, updated_at FROM environment_custom_image_setup_sessions WHERE id = $1").bind(session_id).fetch_optional(&self.pool).await?.ok_or_else(|| crate::errors::ServiceError::NotFound("custom image setup session not found".into()))?;
+        let value = serde_json::json!({
+            "id": row.get::<Uuid,_>("id"), "environmentId": row.get::<Uuid,_>("environment_id"),
+            "templateId": row.get::<Option<Uuid>,_>("template_id"), "promotedTemplateId": row.get::<Option<Uuid>,_>("promoted_template_id"),
+            "provider": row.get::<String,_>("provider"), "providerLeaseId": row.get::<Option<String>,_>("provider_lease_id"),
+            "environmentLeaseId": row.get::<Option<Uuid>,_>("environment_lease_id"), "status": row.get::<String,_>("status"),
+            "startedByUserId": row.get::<Option<String>,_>("started_by_user_id"), "startedByAgentId": row.get::<Option<Uuid>,_>("started_by_agent_id"),
+            "baseTemplateRef": row.get::<Option<String>,_>("base_template_ref"), "expiresAt": row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("expires_at"),
+            "finishedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("finished_at"), "failureReason": row.get::<Option<String>,_>("failure_reason"),
+            "connectionSummary": row.get::<Option<serde_json::Value>,_>("connection_summary"), "connectionSecretRef": row.get::<Option<String>,_>("connection_secret_ref"),
+            "metadata": row.get::<Option<serde_json::Value>,_>("metadata"), "createdAt": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"), "updatedAt": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")
+        });
         let session: EnvironmentCustomImageSetupSession = serde_json::from_value(value.clone()).map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))?;
         let payload = value.get("metadata").and_then(|m| m.get("connectionPayload")).cloned().map(|v| serde_json::from_value(v).map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))).transpose()?;
         Ok(EnvironmentCustomImageSetupSessionResult { session, connection_payload: payload })
