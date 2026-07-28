@@ -25,7 +25,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
@@ -100,9 +100,22 @@ pub struct LiveRunsQuery {
 }
 
 /// Run log query (Paperclip).
+fn deserialize_nullable_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref().map(str::trim) {
+        None | Some("") | Some("null") => Ok(None),
+        Some(value) => value.parse::<i64>().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct RunLogQuery {
+    #[serde(default, deserialize_with = "deserialize_nullable_i64")]
     pub offset: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_nullable_i64")]
     pub limit_bytes: Option<i64>,
 }
 
