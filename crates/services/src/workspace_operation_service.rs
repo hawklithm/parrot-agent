@@ -294,21 +294,6 @@ impl WorkspaceOperationService for DefaultWorkspaceOperationService {
         &self,
         request: CreateOperationRequest,
     ) -> WorkspaceOperationResult<WorkspaceOperation> {
-        let now = Utc::now();
-        let operation = WorkspaceOperation {
-            id: Uuid::new_v4(),
-            company_id: request.company_id,
-            execution_workspace_id: request.execution_workspace_id,
-            phase: request.phase,
-            command: request.command,
-            status: OperationStatus::InProgress,
-            started_at: now,
-            completed_at: None,
-            duration_ms: None,
-            metadata: request.metadata,
-            error_message: None,
-        };
-
         let pool = self.pool()?;
         let row = sqlx::query("INSERT INTO workspace_operations (company_id, execution_workspace_id, phase, command, metadata) VALUES ($1,$2,$3,$4,$5) RETURNING id, company_id, execution_workspace_id, phase, command, status, metadata, started_at, finished_at, stderr_excerpt").bind(request.company_id).bind(request.execution_workspace_id).bind(request.phase.to_string()).bind(request.command).bind(request.metadata).fetch_one(pool).await?;
         Self::from_row(&row)

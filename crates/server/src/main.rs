@@ -337,7 +337,7 @@ fn build_app_state(pool: PgPool) -> AppState {
     let invite_resource_service: Arc<dyn InviteResourceService> =
         Arc::new(services::invite_resource_service::MockInviteResourceService);
     let routine_annotation_service: Arc<dyn RoutineAnnotationService> =
-        Arc::new(services::routine_annotation_service::MockRoutineAnnotationService);
+        Arc::new(services::routine_annotation_service::PgRoutineAnnotationService::new(pool.clone()));
     let work_product_service: Arc<dyn WorkProductService> =
         Arc::new(services::work_product_service::PgWorkProductService::new(pool.clone()));
     let attachment_service: Arc<dyn AttachmentService> =
