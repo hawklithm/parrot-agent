@@ -578,7 +578,20 @@ async fn list_issue_runs(
     .await
     .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
 
-    let runs: Vec<Value> = rows.iter().map(run_to_json).collect();
+    // Paperclip's issue-run client uses `runId` (while the general heartbeat
+    // run contract uses `id`). Keep both names here so the UI can construct
+    // stable historical transcript message ids.
+    let runs: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut run = run_to_json(row);
+            if let Some(object) = run.as_object_mut() {
+                let id = object.get("id").cloned().unwrap_or(Value::Null);
+                object.insert("runId".to_string(), id);
+            }
+            run
+        })
+        .collect();
     Ok(Json(Value::Array(runs)))
 }
 
