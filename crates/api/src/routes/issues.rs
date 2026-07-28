@@ -336,7 +336,7 @@ async fn force_release_issue(
     Json(input): Json<services::ForceReleaseInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
 
     // Validate force release schema
     let schema = crate::validation::ForceReleaseSchema {
@@ -399,7 +399,7 @@ async fn get_issue_cases(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     state.issue_service.get_cases(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -408,7 +408,7 @@ async fn get_issue_active_run(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     let run = state.issue_service.get_active_run(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     match run {
         Some(r) => Ok(Json(r)),
@@ -421,7 +421,7 @@ async fn get_issue_live_runs(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     state.issue_service.get_live_runs(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -430,7 +430,7 @@ async fn list_plan_decompositions(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     state.issue_service.get_accepted_plan_decompositions(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -440,7 +440,7 @@ async fn submit_plan_decomposition(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     let result = state.issue_service.submit_plan_decomposition(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -450,7 +450,7 @@ async fn list_issue_approvals(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     state.issue_service.get_approvals(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -460,7 +460,7 @@ async fn create_issue_approval(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     let result = state.issue_service.create_approval(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -470,7 +470,7 @@ async fn delete_issue_approval(
     State(state): State<AppState>,
     Path((id, approval_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     state.issue_service.delete_approval(id, approval_id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -545,7 +545,7 @@ async fn unmark_issue_read(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     state.issue_service.unmark_read(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -555,7 +555,7 @@ async fn archive_issue_inbox(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     state.issue_service.archive_inbox(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -565,7 +565,7 @@ async fn unarchive_issue_inbox(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     state.issue_service.unarchive_inbox(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -664,7 +664,7 @@ async fn list_recovery_actions(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     state.issue_service.get_recovery_actions(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -674,7 +674,7 @@ async fn resolve_recovery_action(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = Uuid::nil();
+    let company_id = issue_company_id(&state, id).await?;
     let action_id = payload.get("actionId")
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok())
@@ -753,14 +753,7 @@ async fn get_single_comment(
     State(state): State<AppState>,
     Path((id, comment_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 通过 issue_id 查询 company_id
-    let company_id = state
-        .issue_service
-        .get(id, Uuid::nil())
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?
-        .company_id;
+    let company_id = issue_company_id(&state, id).await?;
     let comment = state.issue_service.get_comment(comment_id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     comment.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
