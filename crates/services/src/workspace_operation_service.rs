@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 use uuid::Uuid;
+use sqlx::{PgPool, Row};
 
 #[derive(Debug, Error)]
 pub enum WorkspaceOperationError {
@@ -250,12 +251,30 @@ impl OperationRecorder {
 
 /// Default implementation of workspace operation service
 pub struct DefaultWorkspaceOperationService {
-    // TODO: Add database pool
+    pool: Option<PgPool>,
 }
 
 impl DefaultWorkspaceOperationService {
     pub fn new() -> Self {
-        Self {}
+        Self { pool: None }
+    }
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self { pool: Some(pool) }
+    }
+    fn pool(&self) -> WorkspaceOperationResult<&PgPool> {
+        self.pool.as_ref().ok_or_else(|| WorkspaceOperationError::InternalError("database pool is not configured".into()))
+    }
+    fn from_row(row: &sqlx::postgres::PgRow) -> WorkspaceOperationResult<WorkspaceOperation> {
+        let phase = match row.get::<String, _>("phase").as_str() {
+            "workspace_provision" => OperationPhase::WorkspaceProvision, "workspace_teardown" => OperationPhase::WorkspaceTeardown,
+            "runtime_start" => OperationPhase::RuntimeStart, "runtime_stop" => OperationPhase::RuntimeStop,
+            "runtime_restart" => OperationPhase::RuntimeRestart, "command_execution" => OperationPhase::CommandExecution,
+            "branch_reconcile" => OperationPhase::BranchReconcile, other => return Err(WorkspaceOperationError::InternalError(format!("unknown operation phase {other}"))),
+        };
+        let status = match row.get::<String, _>("status").as_str() { "running" | "in_progress" => OperationStatus::InProgress, "completed" | "succeeded" => OperationStatus::Completed, "failed" => OperationStatus::Failed, other => return Err(WorkspaceOperationError::InternalError(format!("unknown operation status {other}"))) };
+        let started_at = row.get::<DateTime<Utc>, _>("started_at");
+        let completed_at = row.get::<Option<DateTime<Utc>>, _>("finished_at");
+        Ok(WorkspaceOperation { id: row.get("id"), company_id: row.get("company_id"), execution_workspace_id: row.get("execution_workspace_id"), phase, command: row.get("command"), status, started_at, completed_at, duration_ms: completed_at.map(|v| v.signed_duration_since(started_at).num_milliseconds()), metadata: row.get("metadata"), error_message: row.get("stderr_excerpt") })
     }
 }
 
@@ -290,60 +309,43 @@ impl WorkspaceOperationService for DefaultWorkspaceOperationService {
             error_message: None,
         };
 
-        // TODO: Persist to database
-        Ok(operation)
+        let pool = self.pool()?;
+        let row = sqlx::query("INSERT INTO workspace_operations (company_id, execution_workspace_id, phase, command, metadata) VALUES ($1,$2,$3,$4,$5) RETURNING id, company_id, execution_workspace_id, phase, command, status, metadata, started_at, finished_at, stderr_excerpt").bind(request.company_id).bind(request.execution_workspace_id).bind(request.phase.to_string()).bind(request.command).bind(request.metadata).fetch_one(pool).await?;
+        Self::from_row(&row)
     }
 
     async fn complete_operation(
         &self,
         request: CompleteOperationRequest,
     ) -> WorkspaceOperationResult<WorkspaceOperation> {
-        // TODO: Load from database
-        let mut operation = self.get_operation(request.operation_id).await?;
-
-        let now = Utc::now();
-        operation.status = if request.success {
-            OperationStatus::Completed
-        } else {
-            OperationStatus::Failed
-        };
-        operation.completed_at = Some(now);
-        operation.duration_ms = operation.calculate_duration();
-        operation.error_message = request.error_message;
-
-        // TODO: Update in database
-        Ok(operation)
+        let pool = self.pool()?;
+        let row = sqlx::query("UPDATE workspace_operations SET status = $2, exit_code = $3, stderr_excerpt = $4, finished_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING id, company_id, execution_workspace_id, phase, command, status, metadata, started_at, finished_at, stderr_excerpt").bind(request.operation_id).bind(if request.success { "completed" } else { "failed" }).bind(if request.success { Some(0i32) } else { Some(1i32) }).bind(request.error_message).fetch_optional(pool).await?.ok_or(WorkspaceOperationError::OperationNotFound(request.operation_id))?;
+        Self::from_row(&row)
     }
 
     async fn get_operation(&self, operation_id: Uuid) -> WorkspaceOperationResult<WorkspaceOperation> {
-        // TODO: Load from database
-        Err(WorkspaceOperationError::OperationNotFound(operation_id))
+        let pool = self.pool()?;
+        let row = sqlx::query("SELECT id, company_id, execution_workspace_id, phase, command, status, metadata, started_at, finished_at, stderr_excerpt FROM workspace_operations WHERE id = $1").bind(operation_id).fetch_optional(pool).await?.ok_or(WorkspaceOperationError::OperationNotFound(operation_id))?;
+        Self::from_row(&row)
     }
 
     async fn list_operations(
         &self,
-        _query: ListOperationsQuery,
+        query: ListOperationsQuery,
     ) -> WorkspaceOperationResult<Vec<WorkspaceOperation>> {
-        // TODO: Query from database with filters
-        Ok(Vec::new())
+        let pool = self.pool()?;
+        let rows = sqlx::query("SELECT id, company_id, execution_workspace_id, phase, command, status, metadata, started_at, finished_at, stderr_excerpt FROM workspace_operations WHERE execution_workspace_id = $1 AND ($2::text IS NULL OR phase = $2) AND ($3::text IS NULL OR status = $3) ORDER BY started_at DESC LIMIT $4 OFFSET $5").bind(query.execution_workspace_id).bind(query.phase.map(|p| p.to_string())).bind(query.status.map(|s| s.to_string())).bind(query.limit.unwrap_or(100).clamp(1, 1000)).bind(query.offset.unwrap_or(0).max(0)).fetch_all(pool).await?;
+        rows.iter().map(Self::from_row).collect()
     }
 
     async fn get_statistics(
         &self,
-        _execution_workspace_id: Uuid,
-        _phase: Option<OperationPhase>,
+        execution_workspace_id: Uuid,
+        phase: Option<OperationPhase>,
     ) -> WorkspaceOperationResult<OperationStatistics> {
-        // TODO: Calculate from database
-        Ok(OperationStatistics {
-            total_count: 0,
-            completed_count: 0,
-            failed_count: 0,
-            in_progress_count: 0,
-            avg_duration_ms: None,
-            p50_duration_ms: None,
-            p95_duration_ms: None,
-            p99_duration_ms: None,
-        })
+        let pool = self.pool()?;
+        let row = sqlx::query("SELECT COUNT(*)::bigint AS total_count, COUNT(*) FILTER (WHERE status IN ('completed','succeeded'))::bigint AS completed_count, COUNT(*) FILTER (WHERE status='failed')::bigint AS failed_count, COUNT(*) FILTER (WHERE status IN ('running','in_progress'))::bigint AS in_progress_count, AVG(EXTRACT(EPOCH FROM (finished_at - started_at)) * 1000) FILTER (WHERE finished_at IS NOT NULL) AS avg_duration_ms FROM workspace_operations WHERE execution_workspace_id = $1 AND ($2::text IS NULL OR phase = $2)").bind(execution_workspace_id).bind(phase.map(|p| p.to_string())).fetch_one(pool).await?;
+        Ok(OperationStatistics { total_count: row.get("total_count"), completed_count: row.get("completed_count"), failed_count: row.get("failed_count"), in_progress_count: row.get("in_progress_count"), avg_duration_ms: row.get("avg_duration_ms"), p50_duration_ms: None, p95_duration_ms: None, p99_duration_ms: None })
     }
 }
 
