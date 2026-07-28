@@ -8,7 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use models::{IssueComment, CommentActorType, Pagination};
+use models::{IssueComment, CommentActorType};
 use services::CommentServiceError;
 use crate::errors::ApiError;
 use crate::app_state::AppState;
@@ -41,6 +41,9 @@ pub struct DeleteCommentRequest {
 pub struct CommentPaginationQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// Paperclip uses the last comment id as a cursor for loading older pages.
+    pub after: Option<Uuid>,
+    pub order: Option<String>,
 }
 
 /// Comment response
@@ -97,14 +100,76 @@ pub async fn list_comments(
     Path(issue_id): Path<Uuid>,
     Query(query): Query<CommentPaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let service = state.issue_comment_service.clone();
-    let pagination = Pagination {
-        limit: query.limit.unwrap_or(50).min(100),
-        offset: query.offset.unwrap_or(0),
-        cursor: None,
-    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let order = query.order.as_deref().unwrap_or("desc").to_ascii_lowercase();
 
-    let comments = service.list_comments(issue_id, &pagination).await?;
+    // The Paperclip UI paginates comments with an opaque-looking, but in
+    // practice stable, comment-id cursor.  The generic repository API only
+    // supports offset pagination, so use the shared pool here to preserve the
+    // ordering/cursor contract and avoid returning the same page repeatedly.
+    let comments = if let Some(after_id) = query.after {
+        let anchor: Option<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT id, created_at FROM issue_comments WHERE issue_id = $1 AND id = $2",
+        )
+        .bind(issue_id)
+        .bind(after_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        let Some((anchor_id, anchor_created_at)) = anchor else {
+            return Ok(Json(Vec::<models::IssueComment>::new()));
+        };
+
+        if order == "asc" {
+            sqlx::query_as::<_, models::IssueComment>(
+                "SELECT * FROM issue_comments
+                 WHERE issue_id = $1 AND (created_at > $2 OR (created_at = $2 AND id > $3))
+                 ORDER BY created_at ASC, id ASC LIMIT $4",
+            )
+            .bind(issue_id)
+            .bind(anchor_created_at)
+            .bind(anchor_id)
+            .bind(limit)
+            .fetch_all(&state.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, models::IssueComment>(
+                "SELECT * FROM issue_comments
+                 WHERE issue_id = $1 AND (created_at < $2 OR (created_at = $2 AND id < $3))
+                 ORDER BY created_at DESC, id DESC LIMIT $4",
+            )
+            .bind(issue_id)
+            .bind(anchor_created_at)
+            .bind(anchor_id)
+            .bind(limit)
+            .fetch_all(&state.pool)
+            .await
+        }
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+    } else if order == "asc" {
+        sqlx::query_as::<_, models::IssueComment>(
+            "SELECT * FROM issue_comments WHERE issue_id = $1
+             ORDER BY created_at ASC, id ASC LIMIT $2 OFFSET $3",
+        )
+        .bind(issue_id)
+        .bind(limit)
+        .bind(query.offset.unwrap_or(0).max(0))
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+    } else {
+        sqlx::query_as::<_, models::IssueComment>(
+            "SELECT * FROM issue_comments WHERE issue_id = $1
+             ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(issue_id)
+        .bind(limit)
+        .bind(query.offset.unwrap_or(0).max(0))
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+    };
     // Paperclip's client consumes this endpoint as `IssueComment[]`.  The
     // previous envelope (`{ comments, total, ... }`) was passed directly into
     // the chat message builder, producing messages without `content` and
