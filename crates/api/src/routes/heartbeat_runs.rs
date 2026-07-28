@@ -411,11 +411,21 @@ async fn list_run_issues(
 
     // Issues whose execution_run_id = run_id.
     let rows = sqlx::query(
-        r#"SELECT id, company_id, identifier, title, status::text, parent_id,
+        r#"SELECT id, company_id, identifier, title, status::text, priority::text, parent_id,
                   assignee_agent_id, assignee_user_id, execution_run_id, created_at, updated_at
              FROM issues
             WHERE company_id = $1
-              AND (execution_run_id = $2 OR id = $3)
+              AND (
+                    execution_run_id = $2
+                 OR id = $3
+                 OR EXISTS (
+                      SELECT 1 FROM activity_logs al
+                       WHERE al.company_id = issues.company_id
+                         AND al.run_id = $2
+                         AND al.resource_type = 'issue'
+                         AND al.resource_id = issues.id
+                    )
+              )
             ORDER BY created_at DESC"#,
     )
     .bind(company_id)
@@ -429,11 +439,13 @@ async fn list_run_issues(
         .into_iter()
         .map(|r| {
             json!({
+                "issueId": r.get::<Uuid, _>("id"),
                 "id": r.get::<Uuid, _>("id"),
                 "companyId": r.get::<Uuid, _>("company_id"),
                 "identifier": r.get::<Option<String>, _>("identifier"),
                 "title": r.get::<String, _>("title"),
                 "status": r.get::<String, _>("status"),
+                "priority": r.get::<String, _>("priority"),
                 "parentId": r.get::<Option<Uuid>, _>("parent_id"),
                 "assigneeAgentId": r.get::<Option<Uuid>, _>("assignee_agent_id"),
                 "assigneeUserId": r.get::<Option<String>, _>("assignee_user_id"),
