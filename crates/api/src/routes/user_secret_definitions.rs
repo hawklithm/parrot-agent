@@ -1,13 +1,14 @@
 use crate::app_state::AppState;
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use models::user_secret::{UserSecret, UserSecretScope};
 use uuid::Uuid;
+use services::auth::AuthorizationActor;
 
 // ============================================================================
 // Request types
@@ -87,9 +88,11 @@ impl From<UserSecret> for UserSecretResponse {
 // Handler helpers
 // ============================================================================
 
-fn extract_user_id() -> Uuid {
-    // TODO: Extract user_id from auth context
-    Uuid::nil()
+fn extract_user_id(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
+    match actor {
+        AuthorizationActor::Board { user_id, .. } => Ok(*user_id),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, String) {
@@ -123,9 +126,10 @@ async fn list_definitions(
 async fn create_definition(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(req): Json<CreateDefinitionRequest>,
 ) -> impl IntoResponse {
-    let user_id = extract_user_id();
+    let Ok(user_id) = extract_user_id(&actor) else { return StatusCode::FORBIDDEN.into_response(); };
     let scope = req.scope.unwrap_or(UserSecretScope {
         project_ids: None,
         agent_ids: None,
@@ -212,8 +216,9 @@ async fn get_coverage(
 async fn list_user_secrets(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
-    let user_id = extract_user_id();
+    let Ok(user_id) = extract_user_id(&actor) else { return StatusCode::FORBIDDEN.into_response(); };
     match state
         .user_secret_service
         .list_user_secrets(user_id, company_id)
@@ -231,9 +236,10 @@ async fn list_user_secrets(
 async fn upsert_user_secret(
     Path(_company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(req): Json<SetUserSecretRequest>,
 ) -> impl IntoResponse {
-    let user_id = extract_user_id();
+    let Ok(user_id) = extract_user_id(&actor) else { return StatusCode::FORBIDDEN.into_response(); };
     match state
         .user_secret_service
         .set_user_secret(user_id, req.definition_id, req.value)
@@ -252,8 +258,9 @@ async fn upsert_user_secret(
 async fn get_user_secret(
     Path((_company_id, definition_id)): Path<(Uuid, Uuid)>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
-    let user_id = extract_user_id();
+    let Ok(user_id) = extract_user_id(&actor) else { return StatusCode::FORBIDDEN.into_response(); };
     match state
         .user_secret_service
         .get_user_secret(user_id, definition_id)

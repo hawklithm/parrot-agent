@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     Json,
 };
@@ -9,6 +9,14 @@ use uuid::Uuid;
 
 use models::user_secret::{UserSecretDefinition, UserSecret, UserSecretScope, UserSecretCoverage, SecretBinding};
 use services::user_secret_service::UserSecretService;
+use services::auth::AuthorizationActor;
+
+fn current_user_id(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
+    match actor {
+        AuthorizationActor::Board { user_id, .. } => Ok(*user_id),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
+}
 
 pub struct UserSecretRoutes {
     #[allow(dead_code)]
@@ -92,10 +100,11 @@ pub async fn list_definitions(
 pub async fn create_definition(
     Path(company_id): Path<Uuid>,
     State(service): State<Arc<dyn UserSecretService>>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(req): Json<CreateDefinitionRequest>,
 ) -> Result<Json<UserSecretDefinition>, StatusCode> {
     // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
-    let current_user_id = Uuid::nil();
+    let current_user_id = current_user_id(&actor)?;
 
     let definition = service
         .create_definition(company_id, req.key, req.description, req.required, req.scope, current_user_id)
@@ -158,9 +167,10 @@ pub async fn get_coverage_stats(
 pub async fn list_user_secrets(
     Path(company_id): Path<Uuid>,
     State(service): State<Arc<dyn UserSecretService>>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<UserSecretResponse>>, StatusCode> {
     // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
-    let current_user_id = Uuid::nil();
+    let current_user_id = current_user_id(&actor)?;
 
     let secrets = service
         .list_user_secrets(current_user_id, company_id)
@@ -175,10 +185,11 @@ pub async fn list_user_secrets(
 pub async fn set_user_secret(
     Path(_company_id): Path<Uuid>,
     State(service): State<Arc<dyn UserSecretService>>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(req): Json<SetUserSecretRequest>,
 ) -> Result<Json<UserSecretResponse>, StatusCode> {
     // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
-    let current_user_id = Uuid::nil();
+    let current_user_id = current_user_id(&actor)?;
 
     let secret = service
         .set_user_secret(current_user_id, req.definition_id, req.value)
@@ -192,9 +203,10 @@ pub async fn set_user_secret(
 pub async fn get_user_secret(
     Path((_company_id, definition_id)): Path<(Uuid, Uuid)>,
     State(service): State<Arc<dyn UserSecretService>>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<UserSecretResponse>, StatusCode> {
     // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
-    let current_user_id = Uuid::nil();
+    let current_user_id = current_user_id(&actor)?;
 
     let secret = service
         .get_user_secret(current_user_id, definition_id)
