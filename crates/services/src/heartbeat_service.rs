@@ -6,9 +6,10 @@ use sqlx::{PgPool, Row};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 /// Heartbeat service for managing agent wake/sleep lifecycle
@@ -125,7 +126,13 @@ impl DefaultHeartbeatService {
             Ok((code, out)) => (
                 "failed",
                 Some(code),
-                Some(format!("adapter exited with code {code}")),
+                Some(format!(
+                    "adapter exited with code {code}: {}",
+                    out.lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .unwrap_or("no adapter output")
+                )),
                 out,
             ),
             Err(e) => ("failed", None, Some(e), String::new()),
@@ -160,12 +167,24 @@ impl DefaultHeartbeatService {
             .unwrap_or_default();
         let description: Option<String> =
             issue.as_ref().and_then(|r| r.try_get("description").ok());
-        let prompt = format!(
+        let default_prompt = format!(
             "Task: {title}\n{}\n\nReport the work performed and final result.",
-            description.unwrap_or_default()
+            description.as_deref().unwrap_or_default()
         );
         let cfg = agent.adapter_config.0;
         let adapter = agent.adapter_type.as_str();
+        let prompt = cfg
+            .get("promptTemplate")
+            .or_else(|| cfg.get("prompt_template"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(|template| {
+                template
+                    .replace("{{issue.title}}", &title)
+                    .replace("{{issue.description}}", description.as_deref().unwrap_or(""))
+                    .replace("{{issueId}}", &issue_id.to_string())
+            })
+            .unwrap_or(default_prompt);
         let configured_model = cfg
             .get("model")
             .and_then(|v| v.as_str())
@@ -226,6 +245,7 @@ impl DefaultHeartbeatService {
                     .collect()
             })
             .unwrap_or_default();
+        let custom_args = !args.is_empty();
         if args.is_empty() {
             args = match adapter {
                 "process" => vec![
@@ -233,6 +253,13 @@ impl DefaultHeartbeatService {
                     format!("printf '%s' '{}'", prompt.replace('\'', "'\\''")),
                 ],
                 "codex_local" => vec!["exec".into(), prompt.clone()],
+                "claude_local" => vec![
+                    "--print".into(),
+                    "-".into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--verbose".into(),
+                ],
                 _ => vec!["-p".into(), prompt.clone()],
             };
             if matches!(adapter, "claude_local" | "codex_local" | "opencode") {
@@ -240,6 +267,47 @@ impl DefaultHeartbeatService {
                     args.splice(1..1, ["--model".to_string(), configured_model.to_string()]);
                 } else {
                     args.splice(0..0, ["--model".to_string(), configured_model.to_string()]);
+                }
+            }
+        }
+        if adapter == "claude_local" {
+            let skip_permissions = cfg
+                .get("dangerouslySkipPermissions")
+                .or_else(|| cfg.get("dangerously_skip_permissions"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if skip_permissions && !args.iter().any(|arg| arg == "--dangerously-skip-permissions") {
+                args.push("--dangerously-skip-permissions".into());
+            }
+            if let Some(max_turns) = cfg
+                .get("maxTurnsPerRun")
+                .or_else(|| cfg.get("max_turns_per_run"))
+                .and_then(|v| v.as_u64())
+                .filter(|value| *value > 0)
+            {
+                args.extend(["--max-turns".into(), max_turns.to_string()]);
+            }
+            if let Some(effort) = cfg
+                .get("effort")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            {
+                args.extend(["--effort".into(), effort.to_owned()]);
+            }
+            if cfg.get("chrome").and_then(|value| value.as_bool()).unwrap_or(false) {
+                args.push("--chrome".into());
+            }
+            if let Some(instructions_path) = cfg
+                .get("instructionsFilePath")
+                .or_else(|| cfg.get("instructions_file_path"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            {
+                args.extend(["--append-system-prompt-file".into(), instructions_path.to_owned()]);
+            }
+            if let Some(extra_args) = cfg.get("extraArgs").or_else(|| cfg.get("extra_args")) {
+                if let Some(extra_args) = extra_args.as_array() {
+                    args.extend(extra_args.iter().filter_map(|value| value.as_str().map(str::to_owned)));
                 }
             }
         }
@@ -290,7 +358,36 @@ impl DefaultHeartbeatService {
             }
             _ => {}
         }
+        // Do not accidentally inherit Claude Code's OpenAI compatibility mode
+        // from the shell that launched parrot-server. Explicit per-agent env
+        // values remain authoritative below.
+        if adapter == "claude_local" {
+            let explicit_env = cfg.get("env").and_then(|v| v.as_object());
+            if explicit_env.map_or(true, |env| !env.contains_key("CLAUDE_CODE_USE_OPENAI")) {
+                cmd.env_remove("CLAUDE_CODE_USE_OPENAI");
+            }
+            if explicit_env.map_or(true, |env| !env.contains_key("OPENAI_API_KEY")) {
+                cmd.env_remove("OPENAI_API_KEY");
+            }
+            if explicit_env.map_or(true, |env| !env.contains_key("OPENAI_BASE_URL")) {
+                cmd.env_remove("OPENAI_BASE_URL");
+            }
+            if explicit_env.map_or(true, |env| !env.contains_key("OPENAI_MODEL")) {
+                cmd.env_remove("OPENAI_MODEL");
+            }
+        }
+        let stdin_prompt = adapter == "claude_local" && !custom_args;
+        let timeout_sec = cfg
+            .get("timeoutSec")
+            .or_else(|| cfg.get("timeout_sec"))
+            .and_then(|v| v.as_u64())
+            .filter(|value| *value > 0);
         cmd.args(args)
+            .stdin(if stdin_prompt {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .env("PAPERCLIP_RUN_ID", run_id.to_string())
             .env("PAPERCLIP_AGENT_ID", agent_id.to_string())
             .env("PAPERCLIP_TOOL_GATEWAY_URL", gateway_url)
@@ -314,12 +411,42 @@ impl DefaultHeartbeatService {
         let child_ref = Arc::new(Mutex::new(child));
         self.children.lock().await.insert(run_id, child_ref.clone());
         let mut child = child_ref.lock().await;
+        if stdin_prompt {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(prompt.as_bytes())
+                    .await
+                    .map_err(|e| format!("failed to write Claude prompt: {e}"))?;
+                stdin
+                    .shutdown()
+                    .await
+                    .map_err(|e| format!("failed to close Claude stdin: {e}"))?;
+            }
+        }
         let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
         let mut stderr = child.stderr.take().ok_or("stderr unavailable")?;
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let (_stdout_result, _stderr_result) =
-            tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
-        let status = child.wait().await.map_err(|e| e.to_string())?;
+        let wait_result = timeout(
+            timeout_sec.map(Duration::from_secs).unwrap_or(Duration::from_secs(u64::MAX)),
+            async {
+                let (_stdout_result, _stderr_result) =
+                    tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+                child.wait().await
+            },
+        )
+        .await;
+        let status = match wait_result {
+            Ok(status) => status.map_err(|e| e.to_string())?,
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(format!(
+                    "adapter timed out after {} seconds\n{}\n{}",
+                    timeout_sec.unwrap_or(0),
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&err),
+                ));
+            }
+        };
         let mut output = String::from_utf8_lossy(&out).to_string();
         output.push_str(&String::from_utf8_lossy(&err));
         Ok((status.code().unwrap_or(-1), output))
