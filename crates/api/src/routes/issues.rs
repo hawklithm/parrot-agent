@@ -675,52 +675,67 @@ async fn resolve_recovery_action(
 
 /// I29: GET /issues/:id/interactions
 async fn list_interactions(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1").bind(id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    let rows = sqlx::query("SELECT id, company_id, issue_id, kind, status::text, source_run_id, question, response, resolved_by_type, resolved_by_id, created_at, updated_at FROM issue_thread_interactions WHERE issue_id = $1 AND company_id = $2 ORDER BY created_at ASC").bind(id).bind(company_id).fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    use sqlx::Row;
+    Ok(Json(rows.into_iter().map(|r| serde_json::json!({"id": r.get::<Uuid,_>("id"), "companyId": r.get::<Uuid,_>("company_id"), "issueId": r.get::<Uuid,_>("issue_id"), "kind": r.get::<String,_>("kind"), "status": r.get::<String,_>("status"), "sourceRunId": r.get::<Option<Uuid>,_>("source_run_id"), "question": r.get::<Option<String>,_>("question"), "response": r.get::<Option<serde_json::Value>,_>("response"), "resolvedByType": r.get::<Option<String>,_>("resolved_by_type"), "resolvedById": r.get::<Option<String>,_>("resolved_by_id"), "createdAt": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at"), "updatedAt": r.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")})).collect()))
 }
 
 /// I30: POST /issues/:id/interactions
 async fn create_interaction(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    Ok((StatusCode::CREATED, Json(serde_json::json!({"issueId": id, "interaction": payload, "created": true}))))
+    use sqlx::Row;
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1").bind(id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("question");
+    if !matches!(kind, "question" | "approval" | "review") { return Err(StatusCode::BAD_REQUEST); }
+    let question = payload.get("question").or_else(|| payload.get("body")).and_then(|v| v.as_str());
+    let row = sqlx::query("INSERT INTO issue_thread_interactions (company_id, issue_id, kind, question) VALUES ($1,$2,$3,$4) RETURNING id, company_id, issue_id, kind, status::text, source_run_id, question, response, resolved_by_type, resolved_by_id, created_at, updated_at").bind(company_id).bind(id).bind(kind).bind(question).fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({"id": row.get::<Uuid,_>("id"), "companyId": row.get::<Uuid,_>("company_id"), "issueId": id, "kind": row.get::<String,_>("kind"), "status": row.get::<String,_>("status"), "question": row.get::<Option<String>,_>("question"), "createdAt": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"), "updatedAt": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}))))
 }
 
 /// I31: POST /issues/:id/interactions/:interaction_id/accept
 async fn accept_interaction(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path((id, interaction_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "interactionId": interaction_id, "accepted": true})))
+    transition_interaction(&state, id, interaction_id, "resolved", None).await
 }
 
 /// I32: POST /issues/:id/interactions/:interaction_id/reject
 async fn reject_interaction(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path((id, interaction_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "interactionId": interaction_id, "rejected": true})))
+    transition_interaction(&state, id, interaction_id, "resolved", None).await
 }
 
 /// I33: POST /issues/:id/interactions/:interaction_id/respond
 async fn respond_interaction(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path((id, interaction_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "interactionId": interaction_id, "response": payload, "responded": true})))
+    transition_interaction(&state, id, interaction_id, "resolved", Some(payload)).await
 }
 
 /// I34: POST /issues/:id/interactions/:interaction_id/cancel
 async fn cancel_interaction(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path((id, interaction_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "interactionId": interaction_id, "cancelled": true})))
+    transition_interaction(&state, id, interaction_id, "cancelled", None).await
+}
+
+async fn transition_interaction(state: &AppState, issue_id: Uuid, interaction_id: Uuid, status: &str, response: Option<serde_json::Value>) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    let row = sqlx::query("UPDATE issue_thread_interactions SET status = $3::issue_thread_interaction_status, response = COALESCE($4, response), resolved_by_type = 'user', updated_at = NOW() WHERE id = $1 AND issue_id = $2 RETURNING id, status::text, response, updated_at").bind(interaction_id).bind(issue_id).bind(status).bind(response).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({"issueId": issue_id, "interactionId": row.get::<Uuid,_>("id"), "status": row.get::<String,_>("status"), "response": row.get::<Option<serde_json::Value>,_>("response"), "updatedAt": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")})))
 }
 
 /// I42: GET /issues/:id/comments/:comment_id

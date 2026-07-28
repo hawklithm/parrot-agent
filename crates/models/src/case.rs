@@ -117,7 +117,7 @@ pub struct CaseIssueLink {
 }
 
 /// Case document
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct CaseDocument {
     pub id: Uuid,

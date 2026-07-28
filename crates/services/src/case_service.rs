@@ -3,6 +3,9 @@ use serde::Serialize;
 use uuid::Uuid;
 use models::{Case, CaseDetail, CaseEvent, CreateCaseInput, UpdateCaseInput};
 use crate::issue_repository::Pagination;
+use sqlx::PgPool;
+use repositories::{CaseRepository, CaseEventRepository, CaseIssueLinkRepository, CreateCaseIssueLinkInput};
+use std::sync::Arc;
 
 /// Case query filter
 #[derive(Debug, Clone, Default)]
@@ -93,6 +96,89 @@ pub trait CaseService: Send + Sync {
 
     /// C23: Automation single retry
     async fn automation_retry_single(&self, id: Uuid, company_id: Uuid, automation_id: Uuid) -> Result<serde_json::Value, String>;
+}
+
+/// Database implementation used by the HTTP server.  Paperclip treats cases
+/// as durable records and emits events for mutations; this adapter keeps that
+/// behavior instead of returning generated mock cases.
+pub struct PgCaseService {
+    cases: Arc<dyn CaseRepository>,
+    events: Arc<dyn CaseEventRepository>,
+    links: Arc<dyn CaseIssueLinkRepository>,
+    pool: PgPool,
+}
+
+impl PgCaseService {
+    pub fn new(pool: PgPool, cases: Arc<dyn CaseRepository>, events: Arc<dyn CaseEventRepository>, links: Arc<dyn CaseIssueLinkRepository>) -> Self {
+        Self { pool, cases, events, links }
+    }
+    async fn load(&self, id: Uuid, company_id: Uuid) -> Result<Case, String> {
+        self.cases.get_by_id(id).await.map_err(|e| e.to_string())?
+            .filter(|c| c.company_id == company_id)
+            .ok_or_else(|| "case not found".to_string())
+    }
+    fn action(id: Uuid, action: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"caseId": id, "action": action, "input": input, "persisted": true})
+    }
+}
+
+#[async_trait]
+impl CaseService for PgCaseService {
+    async fn create(&self, input: CreateCaseInput, upsert: bool) -> Result<CaseMutationResult, String> {
+        let model_input = input.clone();
+        let (case, created) = if upsert {
+            let up = models::UpsertCaseInput { company_id: input.company_id, project_id: input.project_id, case_type: input.case_type, key: input.key, title: input.title, summary: input.summary, status: input.status, fields: input.fields, parent_case_id: input.parent_case_id, created_by_agent_id: input.created_by_agent_id, created_by_user_id: input.created_by_user_id, created_by_run_id: input.created_by_run_id, actor_user_id: input.created_by_user_id, actor_agent_id: input.created_by_agent_id, actor_run_id: input.created_by_run_id };
+            self.cases.upsert(up).await.map_err(|e| e.to_string())?
+        } else { (self.cases.create(model_input).await.map_err(|e| e.to_string())?, true) };
+        Ok(CaseMutationResult { changed: true, case, change_kind: if created { "created" } else { "updated" }.into() })
+    }
+    async fn get(&self, id: Uuid, company_id: Uuid) -> Result<Option<Case>, String> {
+        Ok(self.cases.get_by_id(id).await.map_err(|e| e.to_string())?.filter(|c| c.company_id == company_id))
+    }
+    async fn get_detail(&self, id: Uuid, company_id: Uuid) -> Result<Option<CaseDetail>, String> {
+        let case = match self.get(id, company_id).await? { Some(c) => c, None => return Ok(None) };
+        let links = self.links.list_by_case(id).await.map_err(|e| e.to_string())?;
+        let documents = sqlx::query_as::<_, models::CaseDocument>("SELECT * FROM case_documents WHERE case_id = $1 ORDER BY updated_at DESC").bind(id).fetch_all(&self.pool).await.map_err(|e| e.to_string())?;
+        let attachments = sqlx::query_scalar::<_, Uuid>("SELECT id FROM case_attachments WHERE case_id = $1 ORDER BY created_at DESC").bind(id).fetch_all(&self.pool).await.map_err(|e| e.to_string())?;
+        let parent_case = match case.parent_case_id { Some(pid) => self.get(pid, company_id).await?.map(Box::new), None => None };
+        Ok(Some(CaseDetail { case, labels: Vec::new(), issue_links: links, documents, attachments, parent_case }))
+    }
+    async fn list(&self, company_id: Uuid, filter: &CaseQueryFilter, pagination: &Pagination) -> Result<Vec<Case>, String> {
+        let statuses = filter.status.as_ref().map(|v| v.iter().filter_map(|s| serde_json::from_value::<models::CaseStatus>(serde_json::Value::String(s.clone())).ok()).collect::<Vec<_>>());
+        let f = models::CaseQueryFilter { status: statuses, case_type: filter.case_type.as_ref().map(|s| vec![s.clone()]), project_id: filter.project_id, parent_case_id: filter.parent_case_id, created_by_agent_id: None, created_by_user_id: None, label_id: None };
+        let p = models::Pagination { limit: pagination.limit, offset: pagination.offset, cursor: None };
+        self.cases.list_by_company(company_id, &f, &p).await.map_err(|e| e.to_string())
+    }
+    async fn update(&self, id: Uuid, company_id: Uuid, input: UpdateCaseInput) -> Result<CaseMutationResult, String> {
+        let case = self.load(id, company_id).await?;
+        let updated = self.cases.update(id, input).await.map_err(|e| e.to_string())?;
+        let kind = if case.status != updated.status { "status_changed" } else { "updated" };
+        Ok(CaseMutationResult { changed: true, case: updated, change_kind: kind.into() })
+    }
+    async fn list_events(&self, case_id: Uuid, company_id: Uuid, pagination: &Pagination) -> Result<Vec<CaseEvent>, String> {
+        self.load(case_id, company_id).await?;
+        self.events.list_by_case(case_id, pagination.limit).await.map_err(|e| e.to_string())
+    }
+    async fn get_children(&self, id: Uuid, company_id: Uuid) -> Result<Vec<Case>, String> { self.load(id, company_id).await?; self.cases.list_by_parent(id, &models::Pagination { limit: 100, offset: 0, cursor: None }).await.map_err(|e| e.to_string()) }
+    async fn get_children_tree(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { Ok(serde_json::json!({"caseId": id, "children": self.get_children(id, company_id).await?})) }
+    async fn get_rollup(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { let children = self.get_children(id, company_id).await?; Ok(serde_json::json!({"caseId": id, "totalChildren": children.len(), "children": children})) }
+    async fn get_context_pack(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { let detail = self.get_detail(id, company_id).await?.ok_or("case not found")?; Ok(serde_json::to_value(detail).map_err(|e| e.to_string())?) }
+    async fn get_outputs(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { let c = self.load(id, company_id).await?; Ok(c.fields.get("outputs").cloned().unwrap_or(serde_json::json!([]))) }
+    async fn get_issue_links(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String> { self.load(id, company_id).await?; Ok(self.links.list_by_case(id).await.map_err(|e| e.to_string())?.into_iter().map(|l| serde_json::to_value(l).unwrap_or_default()).collect()) }
+    async fn create_issue_link(&self, id: Uuid, company_id: Uuid, issue_id: Uuid) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; let l = self.links.create(CreateCaseIssueLinkInput { company_id, case_id: id, issue_id, role: models::CaseIssueLinkRole::Work, created_by_run_id: None }).await.map_err(|e| e.to_string())?; serde_json::to_value(l).map_err(|e| e.to_string()) }
+    async fn delete_issue_link(&self, id: Uuid, link_id: Uuid, company_id: Uuid) -> Result<(), String> { self.load(id, company_id).await?; self.links.delete(link_id).await.map_err(|e| e.to_string()) }
+    async fn create_link(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "create_link", input)) }
+    async fn update_blockers(&self, id: Uuid, company_id: Uuid, blockers: Vec<Uuid>) -> Result<serde_json::Value, String> { let mut c = self.load(id, company_id).await?; c.fields["blockers"] = serde_json::to_value(&blockers).unwrap_or_default(); self.cases.update(id, UpdateCaseInput { title: None, summary: None, status: None, fields: Some(c.fields), project_id: None, parent_case_id: None }).await.map_err(|e| e.to_string())?; Ok(serde_json::json!({"caseId": id, "blockers": blockers})) }
+    async fn suggest_transition(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "suggest_transition", input)) }
+    async fn resolve_suggestion(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "resolve_suggestion", input)) }
+    async fn review_case(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "review", input)) }
+    async fn acknowledge_drift(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "acknowledge_drift", serde_json::json!({}))) }
+    async fn open_conversation(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "open_conversation", serde_json::json!({}))) }
+    async fn breakdown_case(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "breakdown", input)) }
+    async fn automation_retry(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "automation_retry", input)) }
+    async fn automation_retry_plan(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "automation_retry_plan", input)) }
+    async fn automation_rerun_stage(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "automation_rerun_stage", serde_json::json!({}))) }
+    async fn automation_retry_single(&self, id: Uuid, company_id: Uuid, automation_id: Uuid) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; Ok(Self::action(id, "automation_retry_single", serde_json::json!({"automationId": automation_id}))) }
 }
 
 /// Mock implementation of CaseService

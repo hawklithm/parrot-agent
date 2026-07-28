@@ -25,7 +25,7 @@ use repositories::{
     goal_repository::GoalRepository,
     pg_agent_repository::PgAgentRepository,
     pg_case_issue_link_repository::PgCaseIssueLinkRepository,
-    pg_case_repository::PgCaseRepository,
+    pg_case_repository::{PgCaseRepository, PgCaseEventRepository},
     pg_config_revision_repository::PgConfigRevisionRepository,
     pg_issue_comment_repository::PgIssueCommentRepository,
     pg_issue_repository::PgIssueRepository,
@@ -95,8 +95,6 @@ use services::{
     IssueService,
     IssueTreeControlService,
     LowTrustService,
-    // Mock impls for not-yet-implemented domains
-    MockCaseService,
     OpenClawService,
     OrgChartService,
     PipelineService,
@@ -187,8 +185,9 @@ fn build_app_state(pool: PgPool) -> AppState {
     );
     let environment_repo: Arc<dyn EnvironmentRepository> =
         Arc::new(repositories::environment_repository::PgEnvironmentRepository::new(pool.clone()));
-    let _case_repo: Arc<dyn CaseRepository> = Arc::new(PgCaseRepository::new(pool.clone()));
-    let _case_issue_link_repo: Arc<dyn CaseIssueLinkRepository> =
+    let case_repo: Arc<dyn CaseRepository> = Arc::new(PgCaseRepository::new(pool.clone()));
+    let case_event_repo: Arc<dyn repositories::CaseEventRepository> = Arc::new(PgCaseEventRepository::new(pool.clone()));
+    let case_issue_link_repo: Arc<dyn CaseIssueLinkRepository> =
         Arc::new(PgCaseIssueLinkRepository::new(pool.clone()));
     let cost_event_repo: Arc<repositories::cost_event_repository::PgCostEventRepository> =
         Arc::new(repositories::cost_event_repository::PgCostEventRepository::new(pool.clone()));
@@ -340,16 +339,18 @@ fn build_app_state(pool: PgPool) -> AppState {
     let routine_annotation_service: Arc<dyn RoutineAnnotationService> =
         Arc::new(services::routine_annotation_service::MockRoutineAnnotationService);
     let work_product_service: Arc<dyn WorkProductService> =
-        Arc::new(services::work_product_service::MockWorkProductService);
+        Arc::new(services::work_product_service::PgWorkProductService::new(pool.clone()));
     let attachment_service: Arc<dyn AttachmentService> =
-        Arc::new(services::attachment_service::MockAttachmentService);
+        Arc::new(services::attachment_service::LocalAttachmentService::new(pool.clone()));
     let user_secret_definition_service: Arc<dyn UserSecretDefinitionService> =
         Arc::new(UserSecretDefinitionServiceImpl::new());
     let user_secret_service: Arc<dyn UserSecretService> = Arc::new(UserSecretServiceImpl::new(
         user_secret_repo,
         user_secret_definition_repo,
     ));
-    let case_service: Arc<dyn CaseService> = Arc::new(MockCaseService);
+    let case_service: Arc<dyn CaseService> = Arc::new(services::case_service::PgCaseService::new(
+        pool.clone(), case_repo, case_event_repo, case_issue_link_repo,
+    ));
     let approval_service: Arc<dyn ApprovalService> = Arc::new(DefaultApprovalService::new(
         approval_repo.clone(),
         issue_repo.clone(),

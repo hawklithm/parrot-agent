@@ -360,35 +360,59 @@ async fn cancel_heartbeat_run(
     }
 }
 
-/// X5: GET /heartbeat-runs/:run_id/events
-///
-/// Parrot Agent does not yet persist a `heartbeat_run_events` table; returns
-/// an empty list consistent with the stub-handler convention.
+/// X5: GET /heartbeat-runs/:run_id/events.  Tool calls are the durable
+/// execution events available in Parrot's schema, so expose them in the same
+/// cursor-shaped projection consumed by Paperclip's run detail page.
 async fn list_run_events(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
     Query(q): Query<RunEventsQuery>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let after_seq = q.after_seq.unwrap_or(0);
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
-    let _ = (run_id, after_seq, limit);
-    Ok(Json(json!([])))
+    let rows = sqlx::query(
+        "SELECT id, event_type, actor_type, actor_id, tool_name, decision, outcome, metadata, created_at
+         FROM tool_call_events WHERE run_id = $1 ORDER BY created_at ASC, id ASC OFFSET $2 LIMIT $3")
+        .bind(run_id).bind(after_seq).bind(limit as i64).fetch_all(&state.pool).await
+        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+    let events: Vec<Value> = rows.into_iter().enumerate().map(|(i, r)| json!({
+        "seq": after_seq + i as i64 + 1,
+        "id": r.get::<Uuid, _>("id"),
+        "type": r.get::<String, _>("event_type"),
+        "eventType": r.get::<String, _>("event_type"),
+        "actorType": r.get::<String, _>("actor_type"),
+        "actorId": r.get::<Option<String>, _>("actor_id"),
+        "toolName": r.get::<Option<String>, _>("tool_name"),
+        "decision": r.get::<Option<String>, _>("decision"),
+        "outcome": r.get::<String, _>("outcome"),
+        "metadata": r.get::<Option<Value>, _>("metadata"),
+        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+    })).collect();
+    Ok(Json(Value::Array(events)))
 }
 
 /// X6: GET /heartbeat-runs/:run_id/log
 async fn get_run_log(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
-    Query(_q): Query<RunLogQuery>,
+    Query(q): Query<RunLogQuery>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
-    // Parrot Agent does not yet persist run log bytes; return the exact empty
-    // log shape consumed by Paperclip's UI.
+    let offset = q.offset.unwrap_or(0).max(0) as usize;
+    let limit = q.limit_bytes.unwrap_or(256 * 1024).clamp(1, 16 * 1024 * 1024) as usize;
+    let output: Option<String> = sqlx::query_scalar("SELECT output FROM heartbeat_runs WHERE id = $1")
+        .bind(run_id).fetch_optional(&state.pool).await
+        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+    let output = output.ok_or(HeartbeatRunError::NotFound(run_id))?;
+    let bytes = output.as_bytes();
+    let start = offset.min(bytes.len());
+    let end = (start + limit).min(bytes.len());
+    let content = String::from_utf8_lossy(&bytes[start..end]).to_string();
     Ok(Json(json!({
         "runId": run_id,
-        "store": "local_file",
-        "logRef": "",
-        "content": "",
-        "nextOffset": Value::Null,
+        "store": "database",
+        "logRef": "heartbeat_runs.output",
+        "content": content,
+        "nextOffset": if end < bytes.len() { json!(end) } else { Value::Null },
     })))
 }
 
@@ -524,27 +548,51 @@ async fn submit_watchdog_decision(
 
 /// X10: GET /heartbeat-runs/:run_id/workspace-operations
 async fn list_run_workspace_operations(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
-    let _ = run_id;
-    Ok(Json(json!([])))
+    let rows = sqlx::query("SELECT id, company_id, execution_workspace_id, heartbeat_run_id, issue_id, phase, command, cwd, status, exit_code, log_store, log_ref, log_bytes, log_sha256, log_compressed, stdout_excerpt, stderr_excerpt, metadata, started_at, finished_at, created_at, updated_at FROM workspace_operations WHERE heartbeat_run_id = $1 ORDER BY started_at ASC")
+        .bind(run_id).fetch_all(&state.pool).await.map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+    let operations: Vec<Value> = rows.into_iter().map(|r| json!({
+        "id": r.get::<Uuid, _>("id"), "companyId": r.get::<Uuid, _>("company_id"),
+        "executionWorkspaceId": r.get::<Option<Uuid>, _>("execution_workspace_id"), "heartbeatRunId": r.get::<Option<Uuid>, _>("heartbeat_run_id"),
+        "issueId": r.get::<Option<Uuid>, _>("issue_id"), "phase": r.get::<String, _>("phase"), "command": r.get::<Option<String>, _>("command"),
+        "cwd": r.get::<Option<String>, _>("cwd"), "status": r.get::<String, _>("status"), "exitCode": r.get::<Option<i32>, _>("exit_code"),
+        "logStore": r.get::<Option<String>, _>("log_store"), "logRef": r.get::<Option<String>, _>("log_ref"), "logBytes": r.get::<Option<i64>, _>("log_bytes"),
+        "logSha256": r.get::<Option<String>, _>("log_sha256"), "logCompressed": r.get::<bool, _>("log_compressed"),
+        "stdoutExcerpt": r.get::<Option<String>, _>("stdout_excerpt"), "stderrExcerpt": r.get::<Option<String>, _>("stderr_excerpt"),
+        "metadata": r.get::<Option<Value>, _>("metadata"), "startedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("started_at"),
+        "finishedAt": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"), "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"), "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+    })).collect();
+    Ok(Json(Value::Array(operations)))
 }
 
 /// X11: GET /workspace-operations/:operation_id/log
 async fn get_workspace_operation_log(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(operation_id): Path<Uuid>,
     Query(q): Query<RunLogQuery>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let offset = q.offset.unwrap_or(0).max(0);
     let limit_bytes = q.limit_bytes.unwrap_or(256 * 1024).clamp(1, 16 * 1024 * 1024);
-    let _ = (offset, limit_bytes);
+    let row = sqlx::query("SELECT log_store, log_ref, stdout_excerpt, stderr_excerpt FROM workspace_operations WHERE id = $1")
+        .bind(operation_id).fetch_optional(&state.pool).await
+        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?
+        .ok_or(HeartbeatRunError::NotFound(operation_id))?;
+    let store = row.get::<Option<String>, _>("log_store").unwrap_or_else(|| "database".into());
+    let reference = row.get::<Option<String>, _>("log_ref");
+    let content = match (&store[..], reference.as_deref()) {
+        ("local_file", Some(path)) => tokio::fs::read(path).await.ok().map(|b| {
+            let start = (offset as usize).min(b.len()); let end = (start + limit_bytes as usize).min(b.len());
+            String::from_utf8_lossy(&b[start..end]).to_string()
+        }).unwrap_or_default(),
+        _ => format!("{}{}", row.get::<Option<String>, _>("stdout_excerpt").unwrap_or_default(), row.get::<Option<String>, _>("stderr_excerpt").unwrap_or_default()),
+    };
     Ok(Json(json!({
         "operationId": operation_id,
-        "store": "local_file",
-        "logRef": "",
-        "content": "",
+        "store": store,
+        "logRef": reference,
+        "content": content,
         "nextOffset": Value::Null,
     })))
 }

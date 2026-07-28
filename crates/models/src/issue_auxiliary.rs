@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Work product
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkProduct {
     pub id: Uuid,
@@ -34,7 +34,7 @@ pub struct UpdateWorkProductInput {
 }
 
 /// Attachment
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct Attachment {
     pub id: Uuid,

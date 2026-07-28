@@ -15,7 +15,9 @@ async fn list_issue_attachments(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<Attachment>>, AppError> {
-    let company_id = Uuid::nil();
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(id).fetch_one(&state.pool).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
     state
         .attachment_service
@@ -31,7 +33,9 @@ async fn upload_issue_attachment(
     Path(id): Path<Uuid>,
     Json(input): Json<UploadAttachmentInput>,
 ) -> Result<Json<Attachment>, AppError> {
-    let company_id = Uuid::nil();
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(id).fetch_one(&state.pool).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
     state
         .attachment_service
@@ -46,7 +50,10 @@ async fn get_attachment_content(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Vec<u8>, AppError> {
-    let company_id = Uuid::nil();
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM attachments WHERE id = $1")
+        .bind(id).fetch_optional(&state.pool).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        .ok_or(AppError::NotFound("Attachment not found".to_string()))?;
 
     state
         .attachment_service
@@ -60,7 +67,10 @@ async fn delete_attachment(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    let company_id = Uuid::nil();
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM attachments WHERE id = $1")
+        .bind(id).fetch_optional(&state.pool).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        .ok_or(AppError::NotFound("Attachment not found".to_string()))?;
 
     state
         .attachment_service

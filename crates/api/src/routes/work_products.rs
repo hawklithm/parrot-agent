@@ -56,9 +56,10 @@ async fn update_work_product(
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateWorkProductInput>,
 ) -> Result<Json<WorkProduct>, AppError> {
-    // Note: work_product 没有 issue_id 路径参数，无法直接获取 company_id。
-    // 当前 work_product_service 实现中 company_id 参数被忽略（_company_id）。
-    let company_id = Uuid::nil();
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issue_work_products WHERE id = $1")
+        .bind(id).fetch_optional(&state.pool).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        .ok_or(AppError::NotFound("Work product not found".to_string()))?;
 
     state.work_product_service
         .update_work_product(id, company_id, input)
@@ -72,9 +73,10 @@ async fn delete_work_product(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    // Note: work_product 没有 issue_id 路径参数，无法直接获取 company_id。
-    // 当前 work_product_service 实现中 company_id 参数被忽略（_company_id）。
-    let company_id = Uuid::nil();
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issue_work_products WHERE id = $1")
+        .bind(id).fetch_optional(&state.pool).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        .ok_or(AppError::NotFound("Work product not found".to_string()))?;
 
     state.work_product_service
         .delete_work_product(id, company_id)
