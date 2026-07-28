@@ -14,6 +14,9 @@ pub const MIGRATION_009: &str = include_str!("../009_create_cases.sql");
 pub const MIGRATION_010: &str = include_str!("../010_create_issue_auxiliary_tables.sql");
 pub const MIGRATION_011: &str = include_str!("../011_create_auth_tables.sql");
 pub const MIGRATION_012: &str = include_str!("../../../migrations/20260712000002_create_heartbeat_runs.sql");
+pub const MIGRATION_039: &str = include_str!("../../../migrations/20260727000001_add_heartbeat_run_output.sql");
+pub const MIGRATION_040: &str = include_str!("../../../migrations/20260728000001_create_tool_invocation_audit.sql");
+pub const MIGRATION_041: &str = include_str!("../../../migrations/20260728000002_create_named_mcp_gateways.sql");
 pub const MIGRATION_013: &str = include_str!("../../../migrations/20260712000003_create_issue_watchdogs.sql");
 pub const MIGRATION_014: &str = include_str!("../../../migrations/20260712000004_create_agent_wakeup_requests.sql");
 pub const MIGRATION_015: &str = include_str!("../../../migrations/20260712000005_create_issue_thread_interactions.sql");
@@ -32,6 +35,9 @@ pub const ALL_MIGRATIONS: &[(&str, &str)] = &[
     ("013_create_issue_watchdogs", MIGRATION_013),
     ("014_create_agent_wakeup_requests", MIGRATION_014),
     ("015_create_issue_thread_interactions", MIGRATION_015),
+    ("039_add_heartbeat_run_output", MIGRATION_039),
+    ("040_create_tool_invocation_audit", MIGRATION_040),
+    ("041_create_named_mcp_gateways", MIGRATION_041),
 ];
 
 /// Run all embedded migrations against the given pool in order.

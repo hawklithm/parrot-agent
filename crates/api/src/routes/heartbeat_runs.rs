@@ -125,17 +125,30 @@ pub struct WatchdogDecisionInput {
 /// Serialize a `heartbeat_runs` row to the Paperclip-shaped JSON projection.
 fn run_to_json(r: &sqlx::postgres::PgRow) -> Value {
     let context_snapshot: Option<Value> = r.try_get("context_snapshot").unwrap_or(None);
+    let output: Option<String> = r.try_get("output").unwrap_or(None);
+    let result_json: Option<Value> = r.try_get("result_json").unwrap_or(None);
     json!({
         "id": r.get::<Uuid, _>("id"),
         "companyId": r.get::<Uuid, _>("company_id"),
         "agentId": r.get::<Uuid, _>("agent_id"),
+        "agentName": r.try_get::<Option<String>, _>("agent_name").unwrap_or(None),
+        "adapterType": r.try_get::<Option<String>, _>("adapter_type").unwrap_or(None),
         "invocationSource": r.get::<String, _>("invocation_source"),
+        "triggerDetail": Value::Null,
         "status": r.get::<String, _>("status"),
         "responsibleUserId": r.get::<Option<String>, _>("responsible_user_id"),
         "startedAt": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at"),
         "finishedAt": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"),
         "error": r.get::<Option<String>, _>("error"),
         "exitCode": r.get::<Option<i32>, _>("exit_code"),
+        "stdoutExcerpt": output,
+        "stderrExcerpt": Value::Null,
+        "resultJson": result_json,
+        "usageJson": Value::Null,
+        "errorCode": Value::Null,
+        "logStore": Value::Null,
+        "logRef": Value::Null,
+        "logBytes": Value::Null,
         "contextSnapshot": context_snapshot.clone(),
         "issueId": context_snapshot.as_ref().and_then(|c| c.get("issueId")).cloned(),
         "taskId": context_snapshot.as_ref().and_then(|c| c.get("taskId")).cloned(),
@@ -146,7 +159,9 @@ fn run_to_json(r: &sqlx::postgres::PgRow) -> Value {
 
 const RUN_SELECT: &str = r#"SELECT id, company_id, agent_id, invocation_source, status::text,
        responsible_user_id, started_at, finished_at, error, exit_code,
-       context_snapshot, created_at, updated_at
+       context_snapshot, output, result_json, created_at, updated_at,
+       (SELECT name FROM agents WHERE agents.id = agent_id) AS agent_name,
+       (SELECT adapter_type FROM agents WHERE agents.id = agent_id) AS adapter_type
   FROM heartbeat_runs"#;
 
 /// X1: GET /companies/:company_id/heartbeat-runs
@@ -290,6 +305,16 @@ async fn cancel_heartbeat_run(
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let pool = &state.pool;
+    if let Some(row) = sqlx::query("SELECT company_id, agent_id, context_snapshot FROM heartbeat_runs WHERE id = $1")
+        .bind(run_id).fetch_optional(pool).await.map_err(|e| HeartbeatRunError::Database(e.to_string()))? {
+        let company_id: Uuid = row.try_get("company_id").map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+        let agent_id: Uuid = row.try_get("agent_id").map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+        let context: Option<Value> = row.try_get("context_snapshot").unwrap_or(None);
+        if let Some(issue_id) = context.and_then(|v| v.get("issueId").and_then(Value::as_str).and_then(|v| Uuid::parse_str(v).ok())) {
+            state.heartbeat_service.cancel_run(agent_id, issue_id, company_id, "cancelled by API").await
+                .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+        }
+    }
     let row = sqlx::query(
         r#"UPDATE heartbeat_runs
               SET status = 'cancelled',
@@ -333,30 +358,24 @@ async fn list_run_events(
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let after_seq = q.after_seq.unwrap_or(0);
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
-    Ok(Json(json!({
-        "runId": run_id,
-        "afterSeq": after_seq,
-        "limit": limit,
-        "events": [],
-    })))
+    let _ = (run_id, after_seq, limit);
+    Ok(Json(json!([])))
 }
 
 /// X6: GET /heartbeat-runs/:run_id/log
 async fn get_run_log(
     State(_state): State<AppState>,
     Path(run_id): Path<Uuid>,
-    Query(q): Query<RunLogQuery>,
+    Query(_q): Query<RunLogQuery>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
-    let offset = q.offset.unwrap_or(0).max(0);
-    let limit_bytes = q.limit_bytes.unwrap_or(256 * 1024).clamp(1, 16 * 1024 * 1024);
-    // Parrot Agent does not yet persist run log bytes; return an empty log
-    // envelope matching Paperclip's `readLog` shape.
+    // Parrot Agent does not yet persist run log bytes; return the exact empty
+    // log shape consumed by Paperclip's UI.
     Ok(Json(json!({
         "runId": run_id,
-        "offset": offset,
-        "limitBytes": limit_bytes,
-        "bytes": "",
-        "eof": true,
+        "store": "local_file",
+        "logRef": "",
+        "content": "",
+        "nextOffset": Value::Null,
     })))
 }
 
@@ -483,10 +502,8 @@ async fn list_run_workspace_operations(
     State(_state): State<AppState>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
-    Ok(Json(json!({
-        "runId": run_id,
-        "operations": [],
-    })))
+    let _ = run_id;
+    Ok(Json(json!([])))
 }
 
 /// X11: GET /workspace-operations/:operation_id/log
@@ -497,12 +514,13 @@ async fn get_workspace_operation_log(
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let offset = q.offset.unwrap_or(0).max(0);
     let limit_bytes = q.limit_bytes.unwrap_or(256 * 1024).clamp(1, 16 * 1024 * 1024);
+    let _ = (offset, limit_bytes);
     Ok(Json(json!({
         "operationId": operation_id,
-        "offset": offset,
-        "limitBytes": limit_bytes,
-        "bytes": "",
-        "eof": true,
+        "store": "local_file",
+        "logRef": "",
+        "content": "",
+        "nextOffset": Value::Null,
     })))
 }
 

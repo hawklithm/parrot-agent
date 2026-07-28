@@ -1,21 +1,44 @@
 use async_trait::async_trait;
-use uuid::Uuid;
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use models::Agent;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
 /// Heartbeat service for managing agent wake/sleep lifecycle
 #[async_trait]
 pub trait HeartbeatService: Send + Sync {
     /// Wake up an agent to work on an issue
     /// Called after checkout to notify the assignee
-    async fn wakeup(&self, agent_id: Uuid, issue_id: Uuid, company_id: Uuid) -> Result<(), HeartbeatError>;
+    async fn wakeup(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<(), HeartbeatError>;
 
     /// Cancel an active run for an issue
     /// Called after force_release to stop ongoing execution
-    async fn cancel_run(&self, agent_id: Uuid, issue_id: Uuid, company_id: Uuid, reason: &str) -> Result<(), HeartbeatError>;
+    async fn cancel_run(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        reason: &str,
+    ) -> Result<(), HeartbeatError>;
 
     /// Get heartbeat context for an issue (diagnostics/monitoring)
-    async fn get_heartbeat_context(&self, issue_id: Uuid, company_id: Uuid) -> Result<HeartbeatContext, HeartbeatError>;
+    async fn get_heartbeat_context(
+        &self,
+        issue_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<HeartbeatContext, HeartbeatError>;
 }
 
 /// Heartbeat context information for an issue
@@ -67,38 +90,312 @@ pub enum HeartbeatError {
     Internal(String),
 }
 
-/// Default no-op implementation of HeartbeatService
-pub struct DefaultHeartbeatService;
+/// Production heartbeat coordinator.
+///
+/// A wake is durable before execution starts: the wake request and heartbeat
+/// run are inserted first, then the adapter is launched asynchronously. This
+/// keeps issue liveness correct across request failures and makes cancellation
+/// addressable by run id.
+pub struct DefaultHeartbeatService {
+    pool: PgPool,
+    children: Arc<Mutex<HashMap<Uuid, Arc<Mutex<Child>>>>>,
+}
+
+impl DefaultHeartbeatService {
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            children: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn load_agent(&self, id: Uuid) -> Result<Agent, HeartbeatError> {
+        sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::Internal(e.to_string()))?
+            .ok_or(HeartbeatError::AgentNotFound(id))
+    }
+
+    async fn execute_run(&self, run_id: Uuid, agent_id: Uuid, issue_id: Uuid, company_id: Uuid) {
+        let result = self.run_command(run_id, agent_id, issue_id).await;
+        let (status, exit_code, error, output) = match result {
+            Ok((code, out)) if code == 0 => ("succeeded", Some(code), None, out),
+            Ok((code, out)) => (
+                "failed",
+                Some(code),
+                Some(format!("adapter exited with code {code}")),
+                out,
+            ),
+            Err(e) => ("failed", None, Some(e), String::new()),
+        };
+        let _ = sqlx::query(
+            "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
+            .bind(run_id).bind(status).bind(exit_code).bind(error).bind(output).execute(&self.pool).await;
+        let _ = sqlx::query("UPDATE agent_wakeup_requests SET status = 'completed', updated_at = NOW() WHERE company_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running') AND payload->>'issueId' = $3")
+            .bind(company_id).bind(agent_id).bind(issue_id.to_string()).execute(&self.pool).await;
+        let _ = sqlx::query("UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE run_id = $1 AND revoked_at IS NULL")
+            .bind(run_id).execute(&self.pool).await;
+        let _ = sqlx::query("UPDATE agents SET status = 'idle', updated_at = NOW() WHERE id = $1 AND status = 'running'")
+            .bind(agent_id).execute(&self.pool).await;
+        self.children.lock().await.remove(&run_id);
+    }
+
+    async fn run_command(
+        &self,
+        run_id: Uuid,
+        agent_id: Uuid,
+        issue_id: Uuid,
+    ) -> Result<(i32, String), String> {
+        let agent = self.load_agent(agent_id).await.map_err(|e| e.to_string())?;
+        let issue = sqlx::query("SELECT title, description FROM issues WHERE id = $1")
+            .bind(issue_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        let title: String = issue
+            .as_ref()
+            .and_then(|r| r.try_get("title").ok())
+            .unwrap_or_default();
+        let description: Option<String> =
+            issue.as_ref().and_then(|r| r.try_get("description").ok());
+        let prompt = format!(
+            "Task: {title}\n{}\n\nReport the work performed and final result.",
+            description.unwrap_or_default()
+        );
+        let cfg = agent.adapter_config.0;
+        let adapter = agent.adapter_type.as_str();
+        let configured_model = cfg
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("DeepSeek-V4-Flash");
+        if let Some(api_key) = cfg
+            .get("apiKey")
+            .or_else(|| cfg.get("api_key"))
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+        {
+            let endpoint = cfg
+                .get("endpoint")
+                .or_else(|| cfg.get("baseUrl"))
+                .and_then(|v| v.as_str());
+            let model = if adapter == "claude_local" {
+                configured_model
+            } else {
+                cfg.get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("gpt-4o-mini")
+            };
+            let url = endpoint.unwrap_or(if adapter == "claude_local" {
+                "https://api.anthropic.com/v1/messages"
+            } else {
+                "https://api.openai.com/v1/chat/completions"
+            });
+            let client = reqwest::Client::new();
+            let response = if adapter == "claude_local" {
+                client.post(url).header("x-api-key", api_key).header("anthropic-version", "2023-06-01")
+                    .json(&serde_json::json!({"model": model, "max_tokens": cfg.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(4096), "messages": [{"role":"user","content":prompt}]})).send().await
+            } else {
+                client.post(url).bearer_auth(api_key)
+                    .json(&serde_json::json!({"model": model, "messages": [{"role":"user","content":prompt}]})).send().await
+            }.map_err(|e| e.to_string())?;
+            let status = response.status();
+            let body = response.text().await.map_err(|e| e.to_string())?;
+            if !status.is_success() {
+                return Err(format!("LLM request failed with HTTP {status}: {body}"));
+            }
+            return Ok((0, body));
+        }
+        let command = cfg
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or(match adapter {
+                "claude_local" => "claude",
+                "codex_local" => "codex",
+                "opencode" => "opencode",
+                _ => "sh",
+            });
+        let mut args: Vec<String> = cfg
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if args.is_empty() {
+            args = match adapter {
+                "process" => vec![
+                    "-c".into(),
+                    format!("printf '%s' '{}'", prompt.replace('\'', "'\\''")),
+                ],
+                "codex_local" => vec!["exec".into(), prompt.clone()],
+                _ => vec!["-p".into(), prompt.clone()],
+            };
+            if matches!(adapter, "claude_local" | "codex_local" | "opencode") {
+                if adapter == "codex_local" {
+                    args.splice(1..1, ["--model".to_string(), configured_model.to_string()]);
+                } else {
+                    args.splice(0..0, ["--model".to_string(), configured_model.to_string()]);
+                }
+            }
+        }
+        let mut cmd = Command::new(command);
+        let gateway_token = format!("ptg_{}", Uuid::new_v4().simple());
+        let mut token_hasher = Sha256::new();
+        token_hasher.update(gateway_token.as_bytes());
+        let gateway_token_hash = hex::encode(token_hasher.finalize());
+        let gateway_url = cfg
+            .get("toolGatewayUrl")
+            .or_else(|| cfg.get("tool_gateway_url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("http://127.0.0.1:3100/api/tool-gateway");
+        let _ = sqlx::query(
+            "INSERT INTO tool_gateway_sessions (company_id, agent_id, run_id, issue_id, token_hash, expires_at)
+             VALUES ($1,$2,$3,$4,$5,NOW() + INTERVAL '30 minutes')",
+        )
+        .bind(agent.company_id)
+        .bind(agent_id)
+        .bind(run_id)
+        .bind(issue_id)
+        .bind(gateway_token_hash)
+        .execute(&self.pool)
+        .await;
+        // Make the per-run gateway discoverable by the local CLIs. Environment
+        // variables alone are not consumed by Codex/Claude as MCP servers.
+        let mcp_url = format!("{}/mcp", gateway_url.trim_end_matches('/'));
+        match adapter {
+            "claude_local" => {
+                let config = serde_json::json!({
+                    "mcpServers": {
+                        "paperclip": {
+                            "type": "http",
+                            "url": mcp_url,
+                            "headers": {"Authorization": "Bearer ${PAPERCLIP_TOOL_GATEWAY_TOKEN}"}
+                        }
+                    }
+                });
+                args.splice(0..0, ["--mcp-config".to_string(), config.to_string()]);
+            }
+            "codex_local" => {
+                args.splice(0..0, [
+                    "-c".to_string(),
+                    format!("mcp_servers.paperclip.url={mcp_url:?}"),
+                    "-c".to_string(),
+                    "mcp_servers.paperclip.bearer_token_env_var=\"PAPERCLIP_TOOL_GATEWAY_TOKEN\"".to_string(),
+                ]);
+            }
+            _ => {}
+        }
+        cmd.args(args)
+            .env("PAPERCLIP_RUN_ID", run_id.to_string())
+            .env("PAPERCLIP_AGENT_ID", agent_id.to_string())
+            .env("PAPERCLIP_TOOL_GATEWAY_URL", gateway_url)
+            .env("PAPERCLIP_TOOL_GATEWAY_TOKEN", gateway_token);
+        if let Some(cwd) = cfg.get("cwd").and_then(|v| v.as_str()) {
+            cmd.current_dir(cwd);
+        }
+        if let Some(env) = cfg.get("env").and_then(|v| v.as_object()) {
+            for (k, v) in env {
+                if let Some(s) = v.as_str() {
+                    cmd.env(k, s);
+                }
+            }
+        }
+        let child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        sqlx::query("UPDATE heartbeat_runs SET status = 'running', started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND status = 'queued'").bind(run_id).execute(&self.pool).await.map_err(|e| e.to_string())?;
+        let child_ref = Arc::new(Mutex::new(child));
+        self.children.lock().await.insert(run_id, child_ref.clone());
+        let mut child = child_ref.lock().await;
+        let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
+        let mut stderr = child.stderr.take().ok_or("stderr unavailable")?;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (_stdout_result, _stderr_result) =
+            tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+        let status = child.wait().await.map_err(|e| e.to_string())?;
+        let mut output = String::from_utf8_lossy(&out).to_string();
+        output.push_str(&String::from_utf8_lossy(&err));
+        Ok((status.code().unwrap_or(-1), output))
+    }
+}
 
 #[async_trait]
 impl HeartbeatService for DefaultHeartbeatService {
-    async fn wakeup(&self, agent_id: Uuid, issue_id: Uuid, _company_id: Uuid) -> Result<(), HeartbeatError> {
-        // In production: send wakeup signal via WebSocket/SSE to the agent
-        // For now, log the wakeup event
-        tracing::info!(
-            "Heartbeat wakeup: agent_id={}, issue_id={}",
-            agent_id, issue_id
-        );
+    async fn wakeup(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<(), HeartbeatError> {
+        let _agent = self.load_agent(agent_id).await?;
+        let run_id: Uuid = sqlx::query_scalar("INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot) VALUES ($1,$2,'on_demand','queued',$3) RETURNING id")
+            .bind(company_id).bind(agent_id).bind(serde_json::json!({"issueId": issue_id})).fetch_one(&self.pool).await.map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        sqlx::query("INSERT INTO agent_wakeup_requests (company_id, agent_id, status, payload) VALUES ($1,$2,'dispatched',$3)")
+            .bind(company_id).bind(agent_id).bind(serde_json::json!({"issueId": issue_id, "runId": run_id})).execute(&self.pool).await.map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        sqlx::query("UPDATE agents SET status = 'running', updated_at = NOW() WHERE id = $1")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        let service = self.clone_for_task();
+        tokio::spawn(async move {
+            service
+                .execute_run(run_id, agent_id, issue_id, company_id)
+                .await;
+        });
         Ok(())
     }
 
-    async fn cancel_run(&self, agent_id: Uuid, issue_id: Uuid, _company_id: Uuid, reason: &str) -> Result<(), HeartbeatError> {
-        // In production: send cancel signal to the agent's active run
-        tracing::info!(
-            "Heartbeat cancel_run: agent_id={}, issue_id={}, reason={}",
-            agent_id, issue_id, reason
-        );
+    async fn cancel_run(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        reason: &str,
+    ) -> Result<(), HeartbeatError> {
+        let run: Option<Uuid> = sqlx::query_scalar("SELECT id FROM heartbeat_runs WHERE company_id=$1 AND agent_id=$2 AND status IN ('queued','running') AND (context_snapshot->>'issueId'=$3 OR context_snapshot->>'taskId'=$3) ORDER BY created_at DESC LIMIT 1")
+            .bind(company_id).bind(agent_id).bind(issue_id.to_string()).fetch_optional(&self.pool).await.map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+        if let Some(run_id) = run {
+            if let Some(child) = self.children.lock().await.remove(&run_id) {
+                let _ = child.lock().await.kill().await;
+            }
+            sqlx::query("UPDATE heartbeat_runs SET status='cancelled', error=$2, finished_at=NOW(), updated_at=NOW() WHERE id=$1").bind(run_id).bind(reason).execute(&self.pool).await.map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+        }
+        sqlx::query("UPDATE agent_wakeup_requests SET status='cancelled', updated_at=NOW() WHERE company_id=$1 AND agent_id=$2 AND status IN ('queued','dispatched','running') AND payload->>'issueId'=$3").bind(company_id).bind(agent_id).bind(issue_id.to_string()).execute(&self.pool).await.map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
         Ok(())
     }
 
-    async fn get_heartbeat_context(&self, issue_id: Uuid, _company_id: Uuid) -> Result<HeartbeatContext, HeartbeatError> {
+    async fn get_heartbeat_context(
+        &self,
+        issue_id: Uuid,
+        _company_id: Uuid,
+    ) -> Result<HeartbeatContext, HeartbeatError> {
+        let active_agents = sqlx::query("SELECT agent_id, status, started_at FROM heartbeat_runs WHERE company_id=$1 AND (context_snapshot->>'issueId'=$2 OR context_snapshot->>'taskId'=$2) AND status IN ('queued','running')")
+            .bind(_company_id).bind(issue_id.to_string()).fetch_all(&self.pool).await.map_err(|e| HeartbeatError::Internal(e.to_string()))?.into_iter().filter_map(|row| Some(AgentHeartbeatInfo { agent_id: row.try_get("agent_id").ok()?, last_heartbeat_at: row.try_get("started_at").ok(), status: HeartbeatStatus::Active })).collect::<Vec<_>>();
+        let wakeup_count = active_agents.len() as i64;
         Ok(HeartbeatContext {
             issue_id,
             company_id: _company_id,
-            active_agents: vec![],
+            active_agents,
             last_wakeup_at: None,
-            wakeup_count: 0,
+            wakeup_count,
         })
+    }
+}
+
+impl DefaultHeartbeatService {
+    fn clone_for_task(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            children: self.children.clone(),
+        }
     }
 }
 
@@ -131,17 +428,32 @@ pub mod mock {
 
     #[async_trait]
     impl HeartbeatService for MockHeartbeatService {
-        async fn wakeup(&self, _agent_id: Uuid, _issue_id: Uuid, _company_id: Uuid) -> Result<(), HeartbeatError> {
+        async fn wakeup(
+            &self,
+            _agent_id: Uuid,
+            _issue_id: Uuid,
+            _company_id: Uuid,
+        ) -> Result<(), HeartbeatError> {
             self.wakeup_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
-        async fn cancel_run(&self, _agent_id: Uuid, _issue_id: Uuid, _company_id: Uuid, _reason: &str) -> Result<(), HeartbeatError> {
+        async fn cancel_run(
+            &self,
+            _agent_id: Uuid,
+            _issue_id: Uuid,
+            _company_id: Uuid,
+            _reason: &str,
+        ) -> Result<(), HeartbeatError> {
             self.cancel_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
-        async fn get_heartbeat_context(&self, issue_id: Uuid, _company_id: Uuid) -> Result<HeartbeatContext, HeartbeatError> {
+        async fn get_heartbeat_context(
+            &self,
+            issue_id: Uuid,
+            _company_id: Uuid,
+        ) -> Result<HeartbeatContext, HeartbeatError> {
             Ok(HeartbeatContext {
                 issue_id,
                 company_id: _company_id,
@@ -158,27 +470,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_default_heartbeat_service() {
-        let service = DefaultHeartbeatService;
-        let agent_id = Uuid::new_v4();
-        let issue_id = Uuid::new_v4();
-        let company_id = Uuid::new_v4();
-
-        // Wakeup should succeed
-        let result = service.wakeup(agent_id, issue_id, company_id).await;
-        assert!(result.is_ok());
-
-        // Cancel run should succeed
-        let result = service.cancel_run(agent_id, issue_id, company_id, "test").await;
-        assert!(result.is_ok());
-
-        // Get context should succeed
-        let context = service.get_heartbeat_context(issue_id, company_id).await.unwrap();
-        assert_eq!(context.issue_id, issue_id);
-        assert_eq!(context.company_id, company_id);
-    }
-
-    #[tokio::test]
     async fn test_mock_heartbeat_service() {
         let service = mock::MockHeartbeatService::new();
         let agent_id = Uuid::new_v4();
@@ -188,10 +479,16 @@ mod tests {
         assert_eq!(service.wakeup_call_count(), 0);
         assert_eq!(service.cancel_call_count(), 0);
 
-        service.wakeup(agent_id, issue_id, company_id).await.unwrap();
+        service
+            .wakeup(agent_id, issue_id, company_id)
+            .await
+            .unwrap();
         assert_eq!(service.wakeup_call_count(), 1);
 
-        service.cancel_run(agent_id, issue_id, company_id, "test").await.unwrap();
+        service
+            .cancel_run(agent_id, issue_id, company_id, "test")
+            .await
+            .unwrap();
         assert_eq!(service.cancel_call_count(), 1);
     }
 }

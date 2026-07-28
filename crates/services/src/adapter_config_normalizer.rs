@@ -112,13 +112,13 @@ impl AdapterConfigNormalizer {
 
         // 确保必需字段存在
         if !obj.contains_key("model") {
-            obj.insert("model".to_string(), json!("claude-opus-4"));
+            obj.insert("model".to_string(), json!("DeepSeek-V4-Flash"));
         }
 
         // 标准化引擎配置
         if let Some(engine) = obj.get("engine") {
             if engine == "auto" {
-                obj.insert("engine".to_string(), json!("acp"));
+                obj.insert("engine".to_string(), json!("cli"));
             }
         }
 
@@ -217,13 +217,11 @@ impl AdapterConfigNormalizer {
     fn apply_claude_local_defaults(&self, config: &mut JsonValue) {
         if let Some(obj) = config.as_object_mut() {
             obj.entry("model".to_string())
-                .or_insert(json!("claude-opus-4"));
+                .or_insert(json!("DeepSeek-V4-Flash"));
             obj.entry("engine".to_string())
-                .or_insert(json!("acp"));
-            obj.entry("acpMode".to_string())
-                .or_insert(json!("persistent"));
-            obj.entry("acpNonInteractivePermissions".to_string())
-                .or_insert(json!("deny"));
+                .or_insert(json!("cli"));
+            obj.entry("command".to_string())
+                .or_insert(json!("claude"));
         }
     }
 
@@ -232,7 +230,9 @@ impl AdapterConfigNormalizer {
             obj.entry("model".to_string())
                 .or_insert(json!("codex"));
             obj.entry("engine".to_string())
-                .or_insert(json!("acp"));
+                .or_insert(json!("cli"));
+            obj.entry("command".to_string())
+                .or_insert(json!("codex"));
         }
     }
 
@@ -298,8 +298,9 @@ mod tests {
         let obj = result.as_object().unwrap();
         assert!(!obj.contains_key("_temp"));
         assert!(!obj.contains_key("thinkingEffort"));
-        assert_eq!(obj.get("engine").unwrap(), "acp");
-        assert_eq!(obj.get("model").unwrap(), "claude-opus-4");
+        assert_eq!(obj.get("engine").unwrap(), "cli");
+        assert_eq!(obj.get("model").unwrap(), "DeepSeek-V4-Flash");
+        assert_eq!(obj.get("command").unwrap(), "claude");
     }
 
     #[test]
@@ -313,9 +314,9 @@ mod tests {
         );
 
         let obj = result.as_object().unwrap();
-        assert_eq!(obj.get("model").unwrap(), "claude-opus-4");
-        assert_eq!(obj.get("engine").unwrap(), "acp");
-        assert_eq!(obj.get("acpMode").unwrap(), "persistent");
+        assert_eq!(obj.get("model").unwrap(), "DeepSeek-V4-Flash");
+        assert_eq!(obj.get("engine").unwrap(), "cli");
+        assert_eq!(obj.get("command").unwrap(), "claude");
     }
 
     #[test]

@@ -79,4 +79,24 @@ impl ServerAdapterModule for CodexLocalAdapter {
     fn supports_instructions_bundle(&self) -> bool {
         true
     }
+
+    fn agent_configuration_doc(&self) -> &str {
+        r#"# codex_local agent configuration
+
+Adapter: codex_local
+
+The runtime uses the locally installed Codex CLI. No API key is required in
+adapterConfig when the CLI is already authenticated.
+
+Fields:
+- model: model passed to `codex exec --model`
+- command: optional executable override; defaults to `codex`
+- engine: `cli`
+- cwd: optional working directory
+- env: optional environment variables
+
+The default invocation is:
+`codex exec --model <model> <prompt>`
+"#
+    }
 }

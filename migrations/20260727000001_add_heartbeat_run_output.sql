@@ -1,0 +1,3 @@
+ALTER TABLE heartbeat_runs
+    ADD COLUMN IF NOT EXISTS output TEXT,
+    ADD COLUMN IF NOT EXISTS result_json JSONB NOT NULL DEFAULT '{}';

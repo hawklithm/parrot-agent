@@ -60,8 +60,8 @@ mod tests {
 
     #[async_trait]
     impl EnvironmentDriverTrait for MockDriver {
-        async fn probe(&self, _environment: &ExecutionEnvironment) -> Result<super::EnvironmentProbeResult, DriverError> {
-            Ok(super::EnvironmentProbeResult {
+        async fn probe(&self, _environment: &ExecutionEnvironment) -> Result<crate::environment_driver::EnvironmentProbeResult, DriverError> {
+            Ok(crate::environment_driver::EnvironmentProbeResult {
                 ok: true,
                 driver: self.driver_type,
                 summary: "Mock probe successful".to_string(),
@@ -74,8 +74,8 @@ mod tests {
             _environment: &ExecutionEnvironment,
             _workspace_id: Option<String>,
             _metadata: Option<serde_json::Value>,
-        ) -> Result<super::LeaseAcquisitionResult, DriverError> {
-            Ok(super::LeaseAcquisitionResult {
+        ) -> Result<crate::environment_driver::LeaseAcquisitionResult, DriverError> {
+            Ok(crate::environment_driver::LeaseAcquisitionResult {
                 lease_id: Uuid::new_v4(),
                 provider: "mock".to_string(),
                 connection_info: serde_json::json!({}),

@@ -79,6 +79,7 @@ use services::{
     DefaultPipelineService,
     DefaultSkillRegistryServiceImpl,
     DefaultWatchdogService,
+    DefaultHeartbeatService,
     EnvironmentDiagnosticsService,
     EnvironmentRuntimeService,
     EnvironmentService,
@@ -360,6 +361,8 @@ fn build_app_state(pool: PgPool) -> AppState {
         wakeup_repo,
         interaction_repo,
     ));
+    let heartbeat_service: Arc<dyn services::HeartbeatService> =
+        Arc::new(DefaultHeartbeatService::new(pool.clone()));
     let event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new(1024));
 
     // Label service
@@ -424,6 +427,7 @@ fn build_app_state(pool: PgPool) -> AppState {
         user_secret_service,
         approval_service,
         watchdog_service,
+        heartbeat_service,
         Arc::new(services::DefaultTermService::new()),
         label_service,
         instance_settings_service,

@@ -211,14 +211,36 @@ async fn update_issue(
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
+    // Paperclip first loads the issue and uses its companyId for the mutation
+    // authorization check. Do the same here instead of passing the placeholder
+    // nil UUID used by the older route implementations.
+    let company_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT company_id FROM issues WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to resolve issue company");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
     let service = state.issue_service.clone();
-    let company_id = Uuid::nil();
 
     service
         .update(id, company_id, input)
         .await
         .map(|result| Json(result.issue))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| {
+            tracing::error!(
+                error = ?error,
+                issue_id = %id,
+                company_id = %company_id,
+                "issue update failed"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// DELETE /issues/:id - Delete issue

@@ -502,11 +502,11 @@ mod tests {
             heartbeat,
         );
 
-        assert_eq!(service.determine_checkout_status("todo"), "in_progress");
-        assert_eq!(service.determine_checkout_status("backlog"), "in_progress");
-        assert_eq!(service.determine_checkout_status("blocked"), "in_progress");
-        assert_eq!(service.determine_checkout_status("in_review"), "in_progress");
-        assert_eq!(service.determine_checkout_status("done"), "done");
+        assert_eq!(service.determine_checkout_status(&IssueStatus::Todo), IssueStatus::InProgress);
+        assert_eq!(service.determine_checkout_status(&IssueStatus::Backlog), IssueStatus::InProgress);
+        assert_eq!(service.determine_checkout_status(&IssueStatus::Blocked), IssueStatus::InProgress);
+        assert_eq!(service.determine_checkout_status(&IssueStatus::InReview), IssueStatus::InProgress);
+        assert_eq!(service.determine_checkout_status(&IssueStatus::Done), IssueStatus::Done);
     }
 
     #[test]
@@ -520,38 +520,38 @@ mod tests {
 
         // Explicit target
         assert_eq!(
-            service.determine_release_status("in_progress", None, Some("done")),
-            "done"
+            service.determine_release_status(&IssueStatus::InProgress, None, Some("done")),
+            IssueStatus::Done
         );
 
         // Result-based
         assert_eq!(
-            service.determine_release_status("in_progress", Some("success"), None),
-            "done"
+            service.determine_release_status(&IssueStatus::InProgress, Some("success"), None),
+            IssueStatus::Done
         );
         assert_eq!(
-            service.determine_release_status("in_progress", Some("failed"), None),
-            "todo"
+            service.determine_release_status(&IssueStatus::InProgress, Some("failed"), None),
+            IssueStatus::Todo
         );
         assert_eq!(
-            service.determine_release_status("in_progress", Some("cancelled"), None),
-            "cancelled"
+            service.determine_release_status(&IssueStatus::InProgress, Some("cancelled"), None),
+            IssueStatus::Cancelled
         );
         assert_eq!(
-            service.determine_release_status("in_progress", Some("needs_review"), None),
-            "in_review"
+            service.determine_release_status(&IssueStatus::InProgress, Some("needs_review"), None),
+            IssueStatus::InReview
         );
 
         // Default: in_progress -> in_review
         assert_eq!(
-            service.determine_release_status("in_progress", None, None),
-            "in_review"
+            service.determine_release_status(&IssueStatus::InProgress, None, None),
+            IssueStatus::InReview
         );
 
         // Other statuses unchanged
         assert_eq!(
-            service.determine_release_status("blocked", None, None),
-            "blocked"
+            service.determine_release_status(&IssueStatus::Blocked, None, None),
+            IssueStatus::Blocked
         );
     }
 }

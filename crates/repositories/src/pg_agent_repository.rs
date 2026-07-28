@@ -194,7 +194,7 @@ impl AgentRepository for PgAgentRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use models::AgentRole;
+    use models::{AgentMetadata, AgentPermissions, AgentRole};
     use sqlx::postgres::PgPoolOptions;
     use sqlx::types::Json;
 

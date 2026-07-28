@@ -553,6 +553,7 @@ impl ApprovalService for DefaultApprovalService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MockIssueRepository;
 
     #[test]
     fn test_validate_hire_agent_payload() {

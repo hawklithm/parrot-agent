@@ -937,26 +937,7 @@ mod tests {
     use repositories::RepositoryResult;
     use models::ApprovalStatus;
 
-    struct MockIssueRepo;
-    impl MockIssueRepo {
-        fn new() -> Self { Self }
-    }
-
-    #[async_trait]
-    impl IssueRepository for MockIssueRepo {
-        async fn get_by_id(&self, _id: Uuid) -> Result<Option<Issue>, String> { Ok(None) }
-        async fn list_by_company(&self, _company_id: Uuid, _filter: &crate::issue_repository::IssueQueryFilter, _pagination: &crate::issue_repository::Pagination) -> Result<Vec<Issue>, String> { Ok(vec![]) }
-        async fn count_by_company(&self, _company_id: Uuid, _filter: &crate::issue_repository::IssueQueryFilter) -> Result<i64, String> { Ok(0) }
-        async fn create(&self, _input: models::CreateIssueInput) -> Result<Issue, String> { unimplemented!() }
-        async fn update(&self, _id: Uuid, _input: models::UpdateIssueInput) -> Result<Issue, String> { unimplemented!() }
-        async fn delete(&self, _id: Uuid) -> Result<(), String> { Ok(()) }
-        async fn search(&self, _company_id: Uuid, _query: &str, _pagination: &crate::issue_repository::Pagination) -> Result<Vec<Issue>, String> { Ok(vec![]) }
-        async fn list_children(&self, _parent_id: Uuid) -> Result<Vec<Issue>, String> { Ok(vec![]) }
-        async fn get_by_identifier(&self, _identifier: &str) -> Result<Option<Issue>, String> { Ok(None) }
-        async fn list_by_parent(&self, _parent_id: Uuid, _pagination: &crate::issue_repository::Pagination) -> Result<Vec<Issue>, String> { Ok(vec![]) }
-        async fn get_by_ids(&self, _ids: Vec<Uuid>) -> Result<Vec<Issue>, String> { Ok(vec![]) }
-        async fn list_ancestors(&self, _issue_id: Uuid) -> Result<Vec<Issue>, String> { Ok(vec![]) }
-    }
+    type MockIssueRepo = crate::MockIssueRepository;
 
     struct MockApprovalRepo;
     impl MockApprovalRepo {
@@ -981,12 +962,13 @@ mod tests {
     }
     #[async_trait]
     impl IssueTreeControlService for MockTreeControlService {
-        async fn preview(&self, _root_issue_id: Uuid, _mode: &str) -> Result<crate::issue_tree_control_service::IssueTreeControlPreview, String> { unimplemented!() }
-        async fn create_hold(&self, _company_id: Uuid, _root_issue_id: Uuid, _input: crate::issue_tree_control_service::CreateIssueTreeHoldInput) -> Result<crate::issue_tree_control_service::IssueTreeHold, String> { unimplemented!() }
-        async fn release_hold(&self, _hold_id: Uuid) -> Result<(), String> { unimplemented!() }
-        async fn get_hold_by_id(&self, _hold_id: Uuid) -> Result<Option<crate::issue_tree_control_service::IssueTreeHold>, String> { Ok(None) }
-        async fn list_holds(&self, _issue_id: Uuid) -> Result<Vec<crate::issue_tree_control_service::IssueTreeHold>, String> { Ok(vec![]) }
-        async fn get_active_pause_hold_gate(&self, _issue_id: Uuid) -> Result<Option<crate::issue_tree_control_service::IssueTreeHold>, String> { Ok(None) }
+        async fn preview_tree_hold(&self, _root_issue_id: Uuid, _mode: models::IssueTreeControlMode) -> crate::issue_tree_control_service::TreeControlServiceResult<models::IssueTreeControlPreview> { unimplemented!() }
+        async fn create_tree_hold(&self, _company_id: Uuid, _root_issue_id: Uuid, _input: models::CreateIssueTreeHoldInput, _actor_type: Option<String>, _actor_id: Option<Uuid>) -> crate::issue_tree_control_service::TreeControlServiceResult<models::IssueTreeHold> { unimplemented!() }
+        async fn get_tree_hold(&self, _hold_id: Uuid) -> crate::issue_tree_control_service::TreeControlServiceResult<models::IssueTreeHold> { unimplemented!() }
+        async fn list_tree_holds(&self, _root_issue_id: Uuid) -> crate::issue_tree_control_service::TreeControlServiceResult<Vec<models::IssueTreeHold>> { Ok(vec![]) }
+        async fn release_tree_hold(&self, _hold_id: Uuid, _released_by_type: Option<String>, _released_by_id: Option<Uuid>) -> crate::issue_tree_control_service::TreeControlServiceResult<models::IssueTreeHold> { unimplemented!() }
+        async fn get_pause_state(&self, _issue_id: Uuid) -> crate::issue_tree_control_service::TreeControlServiceResult<Option<models::ActiveIssueTreePauseHoldGate>> { Ok(None) }
+        async fn get_hold_members(&self, _hold_id: Uuid) -> crate::issue_tree_control_service::TreeControlServiceResult<Vec<models::IssueTreeHoldMember>> { Ok(vec![]) }
     }
 
     struct MockCommentService;

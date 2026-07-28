@@ -744,8 +744,14 @@ async fn wakeup_agent(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state.agent_service.set_status(id, AgentStatus::Running).await?;
-    Ok(Json(agent))
+    let agent = state.agent_service.get_by_id(id).await?;
+    let issue_id: Uuid = sqlx::query_scalar("SELECT id FROM issues WHERE company_id=$1 AND assignee_agent_id=$2 AND status IN ('todo','in_progress') ORDER BY updated_at DESC LIMIT 1")
+        .bind(agent.company_id).bind(id).fetch_optional(&state.pool).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| AppError::BadRequest("Agent has no assigned executable issue".to_string()))?;
+    state.heartbeat_service.wakeup(id, issue_id, agent.company_id).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok(Json(state.agent_service.get_by_id(id).await?))
 }
 
 /// PATCH /agents/:id/budgets - 更新 Agent 预算
@@ -806,6 +812,15 @@ async fn heartbeat_invoke(
     let agent = state.agent_service.get_by_id(id).await?;
     let evaluated = state.watchdog_service.evaluate_all(agent.company_id).await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    // A direct invoke is still a real execution request. With no issue id the
+    // coordinator uses the agent's latest assigned issue, if one exists.
+    let issue_id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM issues WHERE company_id=$1 AND assignee_agent_id=$2 AND status IN ('todo','in_progress') ORDER BY updated_at DESC LIMIT 1")
+        .bind(agent.company_id).bind(id).fetch_optional(&state.pool).await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    if let Some(issue_id) = issue_id {
+        state.heartbeat_service.wakeup(id, issue_id, agent.company_id).await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    }
     Ok(Json(serde_json::json!({
         "heartbeatInvoked": true,
         "watchdogsEvaluated": evaluated,

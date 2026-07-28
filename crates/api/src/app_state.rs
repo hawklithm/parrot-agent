@@ -97,6 +97,7 @@ pub struct AppState {
 
     // Task watchdog subsystem
     pub watchdog_service: Arc<dyn WatchdogService>,
+    pub heartbeat_service: Arc<dyn services::HeartbeatService>,
 
     // Terms service
     pub term_service: Arc<dyn TermService>,
@@ -166,6 +167,7 @@ impl AppState {
         user_secret_service: Arc<dyn UserSecretService>,
         approval_service: Arc<dyn ApprovalService>,
         watchdog_service: Arc<dyn WatchdogService>,
+        heartbeat_service: Arc<dyn services::HeartbeatService>,
         term_service: Arc<dyn TermService>,
         label_service: Arc<dyn LabelService>,
         instance_settings_service: Arc<dyn InstanceSettingsService>,
@@ -218,6 +220,7 @@ impl AppState {
             user_secret_service,
             approval_service,
             watchdog_service,
+            heartbeat_service,
             term_service,
             label_service,
             instance_settings_service,

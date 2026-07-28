@@ -421,11 +421,10 @@ Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file
 - promptTemplate (string, optional): run prompt template
-- model (string, optional): Claude model id (claude-opus-4-8, claude-sonnet-4-6, etc.)
+- model (string, optional): model id passed to the local CLI (default: DeepSeek-V4-Flash)
 - thinkingEffort (string, optional): thinking effort level (low, medium, high)
-- engine (string, optional): execution engine (auto, cli, acp). Defaults to acp.
-- acpMode (string, optional): ACP mode (persistent, oneshot). Defaults to persistent.
-- acpNonInteractivePermissions (string, optional): permission handling (deny, fail)
+- engine (string, optional): execution engine. Defaults to cli.
+- command (string, optional): CLI executable. Defaults to claude.
 - env (object, optional): KEY=VALUE environment variables
 
 Operational fields:
@@ -433,8 +432,8 @@ Operational fields:
 - graceSec (number, optional): SIGTERM grace period in seconds
 
 Authentication:
-- Set ANTHROPIC_API_KEY environment variable, or
-- Include apiKey in adapterConfig
+- Authenticate the local Claude CLI before running the server.
+- Do not include apiKey/api_key when local CLI execution is desired.
 
 Notes:
 - Requires Claude Code CLI: npm install -g @anthropic-ai/claude-code

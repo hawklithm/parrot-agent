@@ -91,6 +91,7 @@ pub fn can_read_full_config(actor: &dyn Actor, agent: &Agent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
     use crate::models::{AgentActor, UserActor};
     use crate::service::DefaultAccessService;
     use models::{AgentRole, AgentStatus, AgentPermissions, AgentMetadata};

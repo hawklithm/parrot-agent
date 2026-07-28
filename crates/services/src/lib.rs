@@ -147,6 +147,33 @@ pub use issue_service::*;
 pub mod issue_service_mock;
 pub use case_service::*;
 pub use issue_service_mock::*;
+
+// Shared repository double used by service unit tests.  Several older tests
+// referenced this from the crate root, but the mock was removed when the
+// repository trait gained company-scoped method parameters.
+#[cfg(test)]
+pub struct MockIssueRepository;
+
+#[cfg(test)]
+impl MockIssueRepository {
+    pub fn new() -> Self { Self }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl repositories::IssueRepository for MockIssueRepository {
+    async fn get_by_id(&self, _id: uuid::Uuid) -> Result<Option<models::Issue>, repositories::RepositoryError> { unimplemented!() }
+    async fn list_by_company(&self, _company_id: uuid::Uuid, _filter: &models::IssueQueryFilter, _pagination: &models::Pagination) -> Result<Vec<models::Issue>, repositories::RepositoryError> { Ok(Vec::new()) }
+    async fn count_by_company(&self, _company_id: uuid::Uuid, _filter: &models::IssueQueryFilter) -> Result<i64, repositories::RepositoryError> { Ok(0) }
+    async fn create(&self, _input: models::CreateIssueInput) -> Result<models::Issue, repositories::RepositoryError> { unimplemented!() }
+    async fn update(&self, _id: uuid::Uuid, _input: models::UpdateIssueInput) -> Result<models::Issue, repositories::RepositoryError> { unimplemented!() }
+    async fn delete(&self, _id: uuid::Uuid) -> Result<(), repositories::RepositoryError> { Ok(()) }
+    async fn search(&self, _company_id: uuid::Uuid, _query: &str, _pagination: &models::Pagination) -> Result<Vec<models::Issue>, repositories::RepositoryError> { Ok(Vec::new()) }
+    async fn get_by_identifier(&self, _identifier: &str) -> Result<Option<models::Issue>, repositories::RepositoryError> { Ok(None) }
+    async fn list_by_parent(&self, _parent_id: uuid::Uuid, _pagination: &models::Pagination) -> Result<Vec<models::Issue>, repositories::RepositoryError> { Ok(Vec::new()) }
+    async fn get_by_ids(&self, _ids: Vec<uuid::Uuid>) -> Result<Vec<models::Issue>, repositories::RepositoryError> { Ok(Vec::new()) }
+    async fn list_ancestors(&self, _issue_id: uuid::Uuid) -> Result<Vec<models::Issue>, repositories::RepositoryError> { Ok(Vec::new()) }
+}
 pub mod comment_service;
 pub use comment_service::*;
 pub mod tree_control_service;

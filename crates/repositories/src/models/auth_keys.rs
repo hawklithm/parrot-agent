@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_cli_auth_challenge_generation() {
-        let code =Challenge::generate_challenge_code();
+        let code = CliAuthChallenge::generate_challenge_code();
         assert_eq!(code.len(), 8);
         assert!(code.chars().all(|c| c.is_alphanumeric()));
     }
