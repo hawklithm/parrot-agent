@@ -1,12 +1,35 @@
 use async_trait::async_trait;
 use models::{
     CreateEnvironmentCustomImageTerminalSessionTokenRequest,
-    EnvironmentCustomImageSetupSessionResult, EnvironmentCustomImageTerminalSessionToken,
+    EnvironmentCustomImageSetupSession, EnvironmentCustomImageSetupSessionResult,
+    EnvironmentCustomImageSetupSessionStatus, EnvironmentCustomImageTerminalSessionToken,
 };
 use base64::Engine;
 use uuid::Uuid;
 
 use crate::errors::ServiceResult;
+use sqlx::{PgPool, Row};
+
+pub struct PgCustomImageSetupService { pool: PgPool }
+impl PgCustomImageSetupService { pub fn new(pool: PgPool) -> Self { Self { pool } } }
+
+#[async_trait]
+impl CustomImageSetupService for PgCustomImageSetupService {
+    async fn get_session(&self, session_id: Uuid) -> ServiceResult<EnvironmentCustomImageSetupSessionResult> {
+        let row = sqlx::query("SELECT row_to_json(environment_custom_image_setup_sessions.*) AS value FROM environment_custom_image_setup_sessions WHERE id = $1").bind(session_id).fetch_optional(&self.pool).await?.ok_or_else(|| crate::errors::ServiceError::NotFound("custom image setup session not found".into()))?;
+        let value: serde_json::Value = row.get("value");
+        let session: EnvironmentCustomImageSetupSession = serde_json::from_value(value.clone()).map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))?;
+        let payload = value.get("metadata").and_then(|m| m.get("connectionPayload")).cloned().map(|v| serde_json::from_value(v).map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))).transpose()?;
+        Ok(EnvironmentCustomImageSetupSessionResult { session, connection_payload: payload })
+    }
+    async fn create_terminal_session_token(&self, session_id: Uuid, _request: CreateEnvironmentCustomImageTerminalSessionTokenRequest) -> ServiceResult<EnvironmentCustomImageTerminalSessionToken> {
+        let result = self.get_session(session_id).await?;
+        if !matches!(result.session.status, EnvironmentCustomImageSetupSessionStatus::Running) { return Err(crate::errors::ServiceError::InvalidState("setup session is not running".into())); }
+        let now = chrono::Utc::now();
+        let token_id = Uuid::new_v4().to_string();
+        Ok(EnvironmentCustomImageTerminalSessionToken { id: token_id.clone(), token: format!("parrot_{token_id}"), expires_at: result.session.expires_at.unwrap_or(now + chrono::Duration::minutes(5)).min(now + chrono::Duration::minutes(5)), setup_session_id: session_id.to_string(), environment_id: result.session.environment_id.to_string(), connection_type: "ssh".into(), websocket_path: format!("/api/environment-custom-image-setup-sessions/{session_id}/terminal/ws") })
+    }
+}
 
 /// Service for custom image setup session management
 #[async_trait]
