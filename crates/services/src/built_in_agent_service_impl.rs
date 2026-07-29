@@ -254,21 +254,41 @@ where
             }))
     }
 
-    /// 物化指令文件（stub - 完整实现需要文件系统/工作区服务）
+    /// 将内置 Agent 的指令资源物化到 Agent 元数据。
     ///
-    /// 在完整实现中，此方法将：
-    /// 1. 从定义中获取指令内容
-    /// 2. 写入工作区指定路径
-    /// 3. 更新 Agent 的指令路径配置
+    /// Paperclip 将内置资源包作为受管文件树同步到运行时工作区；当前
+    /// Agent 模型没有独立的工作区文件表，因此使用同等语义的
+    /// `instructions_bundle` 持久化文件树，并通过 `instructions_path`
+    /// 暴露入口文件。
     async fn materialize_instructions(
         &self,
-        _agent: &mut models::Agent,
-        _definition: &BuiltInAgentDefinition,
+        agent: &mut models::Agent,
+        definition: &BuiltInAgentDefinition,
     ) -> BuiltInAgentResult<()> {
-        // TODO: 实现指令文件物化
-        // 1. 创建工作区目录
-        // 2. 写入指令文件（入口文件 + 子文件）
-        // 3. 更新 adapter_config 中的指令路径
+        let (entry_file, files) = if let Some(bundle) = &definition.bundle {
+            (
+                bundle.instructions.entry_file.clone(),
+                bundle.instructions.files.clone(),
+            )
+        } else {
+            let entry_file = "AGENTS.md".to_string();
+            let mut files = std::collections::HashMap::new();
+            files.insert(entry_file.clone(), definition.default_instructions.clone());
+            (entry_file, files)
+        };
+
+        let bundle = serde_json::json!({
+            "stockVersion": definition.bundle.as_ref().map(|b| b.stock_version.clone()),
+            "entryFile": entry_file,
+            "files": files,
+        });
+        let changed = agent.metadata.0.instructions_path.as_deref() != Some(entry_file.as_str())
+            || agent.metadata.0.instructions_bundle.as_ref() != Some(&bundle);
+        agent.metadata.0.instructions_path = Some(entry_file);
+        agent.metadata.0.instructions_bundle = Some(bundle);
+        if changed {
+            agent.updated_at = chrono::Utc::now();
+        }
         Ok(())
     }
 }
@@ -312,13 +332,21 @@ where
                     .await
                     .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
 
-                // 物化指令文件
-                let mut mutable_agent = saved;
-                self.materialize_instructions(&mut mutable_agent, definition).await?;
-
-                return Ok(mutable_agent);
+                let mut saved = saved;
+                self.materialize_instructions(&mut saved, definition).await?;
+                return self
+                    .agent_repo
+                    .update(saved)
+                    .await
+                    .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()));
             }
-            return Ok(existing);
+            let mut existing = existing;
+            self.materialize_instructions(&mut existing, definition).await?;
+            return self
+                .agent_repo
+                .update(existing)
+                .await
+                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()));
         }
 
         // 创建新Agent（传入用户自定义配置）
@@ -328,16 +356,10 @@ where
 
         // 物化指令文件
         self.materialize_instructions(&mut agent, definition).await?;
-
-        // TODO: 物化技能、例程
-        // - materialize_skill(): 创建/同步 Skill
-        // - materialize_routine(): 创建/更新 Routine
-
-        // TODO: 审批流程检查
-        // 如果公司需要 board approval，创建 Approval 记录
-        // 当前简化实现，直接返回已创建的Agent
-
-        Ok(agent)
+        self.agent_repo
+            .update(agent)
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))
     }
 
     async fn get_status(
@@ -373,6 +395,9 @@ where
         updated_agent.status = definition.default_status.unwrap_or(models::AgentStatus::Idle);
         updated_agent.adapter_config = sqlx::types::Json(serde_json::json!({}));
         updated_agent.runtime_config = sqlx::types::Json(serde_json::json!({}));
+        updated_agent.metadata.0.instructions_path = None;
+        updated_agent.metadata.0.instructions_bundle = None;
+        updated_agent.updated_at = chrono::Utc::now();
 
         self.agent_repo
             .update(updated_agent)
@@ -398,12 +423,24 @@ where
             return Ok(result);
         }
 
-        // TODO: 检测并修复资源漂移
-        // - 检查指令文件是否存在且最新
-        // - 检查技能是否已绑定
-        // - 检查例程是否已创建
-
-        result.changes.push("Reconciliation completed (stub)".to_string());
+        let mut agent = agent.expect("checked above");
+        let before_path = agent.metadata.0.instructions_path.clone();
+        let before_bundle = agent.metadata.0.instructions_bundle.clone();
+        let definition = self
+            .registry
+            .get_definition(key)
+            .ok_or(BuiltInAgentError::NotFound(key))?;
+        self.materialize_instructions(&mut agent, definition).await?;
+        result.instructions_materialized = before_path != agent.metadata.0.instructions_path
+            || before_bundle != agent.metadata.0.instructions_bundle;
+        if result.instructions_materialized {
+            self.agent_repo
+                .update(agent)
+                .await
+                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+            result.agent_updated = true;
+            result.changes.push("Synchronized managed instruction bundle".to_string());
+        }
         Ok(result)
     }
 

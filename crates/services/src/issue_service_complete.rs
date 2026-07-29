@@ -977,9 +977,12 @@ mod tests {
     }
     #[async_trait]
     impl IssueCommentService for MockCommentService {
-        async fn add_comment(&self, _issue_id: Uuid, _body: &str, _actor_type: &str, _actor_id: Uuid) -> Result<models::IssueComment, String> { unimplemented!() }
-        async fn list_comments(&self, _issue_id: Uuid) -> Result<Vec<models::IssueComment>, String> { Ok(vec![]) }
-        async fn delete_comment(&self, _comment_id: Uuid) -> Result<(), String> { unimplemented!() }
+        async fn add_comment(&self, _issue_id: Uuid, _body: String, _actor_type: models::CommentActorType, _actor_id: Option<Uuid>, _actor_run_id: Option<Uuid>, _metadata: Option<serde_json::Value>) -> crate::issue_comment_service::CommentServiceResult<models::IssueComment> { unimplemented!() }
+        async fn list_comments(&self, _issue_id: Uuid, _pagination: &models::Pagination) -> crate::issue_comment_service::CommentServiceResult<Vec<models::IssueComment>> { Ok(vec![]) }
+        async fn count_comments(&self, _issue_id: Uuid) -> crate::issue_comment_service::CommentServiceResult<i64> { Ok(0) }
+        async fn get_comment(&self, _comment_id: Uuid) -> crate::issue_comment_service::CommentServiceResult<models::IssueComment> { unimplemented!() }
+        async fn update_comment(&self, _comment_id: Uuid, _body: String, _actor_id: Uuid) -> crate::issue_comment_service::CommentServiceResult<models::IssueComment> { unimplemented!() }
+        async fn delete_comment(&self, _comment_id: Uuid, _actor_id: Uuid) -> crate::issue_comment_service::CommentServiceResult<()> { unimplemented!() }
     }
 
     struct MockWorkProduct;
@@ -988,10 +991,10 @@ mod tests {
     }
     #[async_trait]
     impl WorkProductService for MockWorkProduct {
-        async fn list_work_products(&self, _issue_id: Uuid) -> Result<Vec<models::WorkProduct>, String> { Ok(vec![]) }
-        async fn create_work_product(&self, _issue_id: Uuid, _name: &str, _description: Option<&str>, _artifact: Option<serde_json::Value>) -> Result<models::WorkProduct, String> { unimplemented!() }
-        async fn update_work_product(&self, _id: Uuid, _name: Option<String>, _description: Option<String>) -> Result<models::WorkProduct, String> { unimplemented!() }
-        async fn delete_work_product(&self, _id: Uuid) -> Result<(), String> { unimplemented!() }
+        async fn list_work_products(&self, _issue_id: Uuid, _company_id: Uuid) -> crate::errors::ServiceResult<Vec<models::issue_auxiliary::WorkProduct>> { Ok(vec![]) }
+        async fn create_work_product(&self, _issue_id: Uuid, _company_id: Uuid, _input: models::issue_auxiliary::CreateWorkProductInput) -> crate::errors::ServiceResult<models::issue_auxiliary::WorkProduct> { unimplemented!() }
+        async fn update_work_product(&self, _id: Uuid, _company_id: Uuid, _input: models::issue_auxiliary::UpdateWorkProductInput) -> crate::errors::ServiceResult<models::issue_auxiliary::WorkProduct> { unimplemented!() }
+        async fn delete_work_product(&self, _id: Uuid, _company_id: Uuid) -> crate::errors::ServiceResult<()> { unimplemented!() }
     }
 
     struct MockAttachment;
@@ -1000,10 +1003,10 @@ mod tests {
     }
     #[async_trait]
     impl AttachmentService for MockAttachment {
-        async fn list_attachments(&self, _parent_type: &str, _parent_id: Uuid) -> Result<Vec<models::Attachment>, String> { Ok(vec![]) }
-        async fn upload_attachment(&self, _parent_type: &str, _parent_id: Uuid, _filename: &str, _content_type: &str, _data: Vec<u8>) -> Result<models::Attachment, String> { unimplemented!() }
-        async fn delete_attachment(&self, _id: Uuid) -> Result<(), String> { unimplemented!() }
-        async fn get_attachment_content(&self, _id: Uuid) -> Result<Vec<u8>, String> { unimplemented!() }
+        async fn list_attachments(&self, _parent_type: &str, _parent_id: Uuid, _company_id: Uuid) -> crate::errors::ServiceResult<Vec<models::issue_auxiliary::Attachment>> { Ok(vec![]) }
+        async fn upload_attachment(&self, _parent_type: &str, _parent_id: Uuid, _company_id: Uuid, _input: models::issue_auxiliary::UploadAttachmentInput) -> crate::errors::ServiceResult<models::issue_auxiliary::Attachment> { unimplemented!() }
+        async fn delete_attachment(&self, _id: Uuid, _company_id: Uuid) -> crate::errors::ServiceResult<()> { unimplemented!() }
+        async fn get_attachment_content(&self, _id: Uuid, _company_id: Uuid) -> crate::errors::ServiceResult<Vec<u8>> { unimplemented!() }
     }
 
     #[test]

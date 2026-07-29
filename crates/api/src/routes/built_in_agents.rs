@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use services::{
     BuiltInAgentStatus, BuiltInAgentDefinition,
     BuiltInAgentError, BuiltInAgentKey, ProvisionInput,
+    RoutineService,
 };
 use crate::extractors::CompanyIdOrShortname;
 use crate::validation::agent_schemas::ProvisionBuiltInAgentSchema;
@@ -229,44 +230,66 @@ pub async fn reset_built_in_agent(
     }))
 }
 
+async fn find_built_in_routine(
+    service: &dyn RoutineService,
+    company_id: uuid::Uuid,
+    routine_key: &str,
+) -> Result<models::Routine, (StatusCode, String)> {
+    let routines = service
+        .list_routines(company_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    routines
+        .into_iter()
+        .find(|routine| {
+            routine.name == routine_key
+                || routine.title == routine_key
+                || routine.name.replace(' ', "_").eq_ignore_ascii_case(routine_key)
+                || routine.title.replace(' ', "_").eq_ignore_ascii_case(routine_key)
+        })
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Built-in routine '{}' not found", routine_key),
+        ))
+}
+
 /// POST /companies/:companyId/built-in-agents/:key/routines/:routine_key/enable
 /// 启用内置 Agent 的定时任务
 pub async fn enable_built_in_routine(
-    State(_state): State<AppState>,
-    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
-    Path((_key, _routine_key)): Path<(String, String)>,
+    State(state): State<AppState>,
+    CompanyIdOrShortname(company_id): CompanyIdOrShortname,
+    Path((_key, routine_key)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // TODO: 实现 Routine enable 逻辑（需要 RoutineService 集成）
-    // 1. 解析 key 和 routine_key
-    // 2. 查找对应的 Routine
-    // 3. 设置 enabled = true
-    // 4. 保存更新
-    tracing::warn!("Routine enable not yet implemented (stub)");
-    Ok(Json(serde_json::json!({"status": "not_implemented"})))
+    let routine = find_built_in_routine(state.routine_service.as_ref(), company_id, &routine_key).await?;
+    let updated = state.routine_service.resume_routine(routine.id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({"status": "active", "routine": updated})))
 }
 
 /// POST /companies/:companyId/built-in-agents/:key/routines/:routine_key/disable
 /// 禁用内置 Agent 的定时任务
 pub async fn disable_built_in_routine(
-    State(_state): State<AppState>,
-    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
-    Path((_key, _routine_key)): Path<(String, String)>,
+    State(state): State<AppState>,
+    CompanyIdOrShortname(company_id): CompanyIdOrShortname,
+    Path((_key, routine_key)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // TODO: 实现 Routine disable 逻辑
-    tracing::warn!("Routine disable not yet implemented (stub)");
-    Ok(Json(serde_json::json!({"status": "not_implemented"})))
+    let routine = find_built_in_routine(state.routine_service.as_ref(), company_id, &routine_key).await?;
+    let updated = state.routine_service.pause_routine(routine.id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({"status": "paused", "routine": updated})))
 }
 
 /// POST /companies/:companyId/built-in-agents/:key/routines/:routine_key/run
 /// 手动触发内置 Agent 的定时任务
 pub async fn run_built_in_routine(
-    State(_state): State<AppState>,
-    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
-    Path((_key, _routine_key)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // TODO: 实现 Routine run 逻辑
-    tracing::warn!("Routine run not yet implemented (stub)");
-    Ok(Json(serde_json::json!({"status": "not_implemented"})))
+    State(state): State<AppState>,
+    CompanyIdOrShortname(company_id): CompanyIdOrShortname,
+    Path((_key, routine_key)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let routine = find_built_in_routine(state.routine_service.as_ref(), company_id, &routine_key).await?;
+    let run = state.routine_service.trigger_routine(routine.id, "manual".to_string()).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!(run))))
 }
 
 /// Create built-in agent routes.

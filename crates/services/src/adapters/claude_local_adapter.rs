@@ -492,7 +492,10 @@ mod tests {
     async fn test_test_environment_basic_structure() {
         let adapter = ClaudeLocalAdapter::new();
         let ctx = TestEnvironmentContext {
-            adapter_config: serde_json::json!({}),
+            agent_id: Some(uuid::Uuid::new_v4()),
+            company_id: uuid::Uuid::new_v4(),
+            adapter_config: std::collections::HashMap::new(),
+            runtime_config: std::collections::HashMap::new(),
         };
 
         let result = adapter.test_environment(&ctx).await;
@@ -503,6 +506,6 @@ mod tests {
         assert!(!test_result.checks.is_empty());
 
         // 应该至少有 CLI 安装检查
-        assert!(test_result.checks.iter().any(|c| c.name == "claude_cli_installed"));
+        assert!(test_result.checks.iter().any(|c| c.name.as_deref() == Some("claude_cli_installed")));
     }
 }

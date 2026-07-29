@@ -55,30 +55,17 @@ impl DefaultSkillRegistryServiceImpl {
         }
     }
 
-    /// Load hardcoded available skills (bundled / paperclip-managed skills)
-    fn load_bundled_skills(&self) -> Vec<AvailableSkill> {
-        vec![
-            AvailableSkill {
-                name: "code-review".to_string(),
-                description: "Perform automated code review with security checks".to_string(),
-                is_paperclip_managed: true,
-            },
-            AvailableSkill {
-                name: "test-generation".to_string(),
-                description: "Generate unit tests based on code analysis".to_string(),
-                is_paperclip_managed: true,
-            },
-            AvailableSkill {
-                name: "documentation".to_string(),
-                description: "Auto-generate API documentation from code".to_string(),
-                is_paperclip_managed: true,
-            },
-            AvailableSkill {
-                name: "refactoring".to_string(),
-                description: "Suggest and apply code refactoring patterns".to_string(),
-                is_paperclip_managed: true,
-            },
-        ]
+    async fn load_catalog_skills(&self) -> ServiceResult<Vec<AvailableSkill>> {
+        let catalogs = self.catalog_repo.list_catalogs().await
+            .map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))?;
+        Ok(catalogs.into_iter().filter_map(|catalog| {
+            let name = catalog.get("name")?.as_str()?.to_string();
+            Some(AvailableSkill {
+                name,
+                description: catalog.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                is_paperclip_managed: catalog.get("isPaperclipManaged").and_then(|v| v.as_bool()).unwrap_or(false),
+            })
+        }).collect())
     }
 }
 
@@ -87,13 +74,13 @@ impl SkillRegistryService for DefaultSkillRegistryServiceImpl {
     // ─── Original 3 methods (keep bundled implementation) ────
 
     async fn list_available_skills(&self) -> ServiceResult<AvailableSkillsResponse> {
-        let skills = self.load_bundled_skills();
+        let skills = self.load_catalog_skills().await?;
         Ok(AvailableSkillsResponse { skills })
     }
 
     async fn get_skill_index(&self) -> ServiceResult<SkillIndexResponse> {
-        let bundled = self.load_bundled_skills();
-        let skills: Vec<SkillIndexEntry> = bundled
+        let catalog = self.load_catalog_skills().await?;
+        let skills: Vec<SkillIndexEntry> = catalog
             .into_iter()
             .map(|skill| SkillIndexEntry {
                 name: skill.name.clone(),
@@ -110,8 +97,8 @@ impl SkillRegistryService for DefaultSkillRegistryServiceImpl {
     }
 
     async fn get_skill_details(&self, skill_name: &str) -> ServiceResult<SkillDetails> {
-        let bundled = self.load_bundled_skills();
-        let entry = bundled
+        let catalog = self.load_catalog_skills().await?;
+        let entry = catalog
             .into_iter()
             .find(|s| s.name == skill_name)
             .ok_or_else(|| {

@@ -222,6 +222,7 @@ impl MonitorSchedulerService for DefaultMonitorScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use repositories::RepositoryError;
 
     #[test]
     fn test_calculate_next_check() {
@@ -274,28 +275,28 @@ mod tests {
 
     #[async_trait]
     impl CompanyRepository for MockCompanyRepo {
-        async fn find_by_id(&self, _id: Uuid) -> Result<Option<models::Company>, RepositoryError> {
+        async fn find_by_id(&self, _id: Uuid) -> Result<Option<repositories::models::Company>, RepositoryError> {
             Ok(None)
         }
         async fn find_by_slug(
             &self,
             _slug: &str,
-        ) -> Result<Option<models::Company>, RepositoryError> {
+        ) -> Result<Option<repositories::models::Company>, RepositoryError> {
             Ok(None)
         }
         async fn create(
             &self,
-            _company: models::Company,
-        ) -> Result<models::Company, RepositoryError> {
+            _company: repositories::models::Company,
+        ) -> Result<repositories::models::Company, RepositoryError> {
             unimplemented!()
         }
         async fn update(
             &self,
-            _company: models::Company,
-        ) -> Result<models::Company, RepositoryError> {
+            _company: repositories::models::Company,
+        ) -> Result<repositories::models::Company, RepositoryError> {
             unimplemented!()
         }
-        async fn list_all(&self) -> Result<Vec<models::Company>, RepositoryError> {
+        async fn list_all(&self) -> Result<Vec<repositories::models::Company>, RepositoryError> {
             Ok(vec![])
         }
     }

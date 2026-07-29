@@ -7,6 +7,7 @@ use models::{
 };
 use std::sync::Arc;
 use uuid::Uuid;
+use sqlx::{PgPool, Row};
 
 #[async_trait]
 pub trait UserSecretDefinitionService: Send + Sync {
@@ -23,11 +24,30 @@ pub trait UserSecretDefinitionService: Send + Sync {
     async fn get_secret_bindings(&self, secret_id: Uuid) -> ServiceResult<Vec<SecretBinding>>;
 }
 
-pub struct UserSecretDefinitionServiceImpl {}
+pub struct UserSecretDefinitionServiceImpl {
+    pool: Option<PgPool>,
+}
 
 impl UserSecretDefinitionServiceImpl {
     pub fn new() -> Self {
-        Self {}
+        Self { pool: None }
+    }
+
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self { pool: Some(pool) }
+    }
+
+    fn from_row(row: &sqlx::postgres::PgRow) -> UserSecretDefinition {
+        UserSecretDefinition {
+            id: row.get("id"), company_id: row.get("company_id"),
+            key: row.get("key"), name: row.get("name"), description: row.get("description"), required: row.get("required"),
+            status: row.get("status"), provider: row.get("provider"), managed_mode: row.get("managed_mode"),
+            provider_config_id: row.get("provider_config_id"), provider_metadata: row.get("provider_metadata"),
+            usage_guidance: row.get("usage_guidance"), created_by_agent_id: row.get("created_by_agent_id"),
+            created_by_user_id: row.get("created_by_user_id"), updated_by_agent_id: row.get("updated_by_agent_id"),
+            updated_by_user_id: row.get("updated_by_user_id"), deleted_at: row.get("deleted_at"),
+            created_at: row.get("created_at"), updated_at: row.get("updated_at"),
+        }
     }
 
     fn mock_definition(&self, id: Uuid, company_id: Uuid, key: &str) -> UserSecretDefinition {
@@ -58,6 +78,11 @@ impl UserSecretDefinitionServiceImpl {
 #[async_trait]
 impl UserSecretDefinitionService for UserSecretDefinitionServiceImpl {
     async fn list_definitions(&self, company_id: Uuid) -> ServiceResult<Vec<UserSecretDefinition>> {
+        if let Some(pool) = &self.pool {
+            let rows = sqlx::query("SELECT * FROM user_secret_definitions WHERE company_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC")
+                .bind(company_id).fetch_all(pool).await.map_err(|e| crate::errors::ServiceError::Repository(e.to_string()))?;
+            return Ok(rows.iter().map(Self::from_row).collect());
+        }
         Ok(vec![
             self.mock_definition(Uuid::new_v4(), company_id, "github_token"),
             self.mock_definition(Uuid::new_v4(), company_id, "openai_api_key"),
@@ -65,6 +90,12 @@ impl UserSecretDefinitionService for UserSecretDefinitionServiceImpl {
     }
 
     async fn create_definition(&self, company_id: Uuid, req: CreateUserSecretDefinitionRequest) -> ServiceResult<UserSecretDefinition> {
+        if let Some(pool) = &self.pool {
+            let row = sqlx::query("INSERT INTO user_secret_definitions (company_id,key,name,description,provider,managed_mode,usage_guidance) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *")
+                .bind(company_id).bind(&req.key).bind(&req.name).bind(&req.description).bind(&req.provider).bind(&req.managed_mode).bind(&req.usage_guidance)
+                .fetch_one(pool).await.map_err(|e| crate::errors::ServiceError::Repository(e.to_string()))?;
+            return Ok(Self::from_row(&row));
+        }
         Ok(UserSecretDefinition {
             id: Uuid::new_v4(),
             company_id,
@@ -89,10 +120,23 @@ impl UserSecretDefinitionService for UserSecretDefinitionServiceImpl {
     }
 
     async fn get_definition(&self, definition_id: Uuid) -> ServiceResult<UserSecretDefinition> {
+        if let Some(pool) = &self.pool {
+            let row = sqlx::query("SELECT * FROM user_secret_definitions WHERE id = $1 AND deleted_at IS NULL")
+                .bind(definition_id).fetch_optional(pool).await.map_err(|e| crate::errors::ServiceError::Repository(e.to_string()))?
+                .ok_or_else(|| crate::errors::ServiceError::NotFound(format!("Definition {} not found", definition_id)))?;
+            return Ok(Self::from_row(&row));
+        }
         Ok(self.mock_definition(definition_id, Uuid::new_v4(), "example_key"))
     }
 
     async fn update_definition(&self, definition_id: Uuid, req: UpdateUserSecretDefinitionRequest) -> ServiceResult<UserSecretDefinition> {
+        if let Some(pool) = &self.pool {
+            let row = sqlx::query("UPDATE user_secret_definitions SET name = COALESCE($2,name), description = COALESCE($3,description), status = COALESCE($4,status), usage_guidance = COALESCE($5,usage_guidance), updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING *")
+                .bind(definition_id).bind(req.name).bind(req.description).bind(req.status).bind(req.usage_guidance)
+                .fetch_optional(pool).await.map_err(|e| crate::errors::ServiceError::Repository(e.to_string()))?
+                .ok_or_else(|| crate::errors::ServiceError::NotFound(format!("Definition {} not found", definition_id)))?;
+            return Ok(Self::from_row(&row));
+        }
         let mut def = self.mock_definition(definition_id, Uuid::new_v4(), "updated_key");
         if let Some(name) = req.name {
             def.name = name;
@@ -111,10 +155,26 @@ impl UserSecretDefinitionService for UserSecretDefinitionServiceImpl {
     }
 
     async fn delete_definition(&self, _definition_id: Uuid) -> ServiceResult<()> {
+        if let Some(pool) = &self.pool {
+            sqlx::query("UPDATE user_secret_definitions SET deleted_at = now(), status = 'archived', updated_at = now() WHERE id = $1")
+                .bind(_definition_id).execute(pool).await.map_err(|e| crate::errors::ServiceError::Repository(e.to_string()))?;
+            return Ok(());
+        }
         Ok(())
     }
 
     async fn get_coverage(&self, definition_id: Uuid) -> ServiceResult<UserSecretCoverageSummary> {
+        if let Some(pool) = &self.pool {
+            let row = sqlx::query("SELECT d.id, COUNT(s.id) FILTER (WHERE s.value_material IS NOT NULL) AS configured_count, COUNT(s.id) FILTER (WHERE s.value_material IS NULL) AS missing_count FROM user_secret_definitions d LEFT JOIN user_secret_declarations s ON s.user_secret_definition_id = d.id WHERE d.id = $1 AND d.deleted_at IS NULL GROUP BY d.id")
+                .bind(definition_id).fetch_optional(pool).await.map_err(|e| crate::errors::ServiceError::Repository(e.to_string()))?
+                .ok_or_else(|| crate::errors::ServiceError::NotFound(format!("Definition {} not found", definition_id)))?;
+            return Ok(UserSecretCoverageSummary {
+                definition_id: row.get("id"),
+                configured_count: row.get::<i64, _>("configured_count") as i32,
+                missing_count: row.get::<i64, _>("missing_count") as i32,
+                inactive_count: 0,
+            });
+        }
         Ok(UserSecretCoverageSummary {
             definition_id,
             configured_count: 8,

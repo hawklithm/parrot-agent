@@ -205,7 +205,7 @@ impl WorkspaceFileResourcesService for DefaultFileResourceService {
         sub_path: Option<&str>,
     ) -> Result<Vec<FileEntry>, FileResourceError> {
         match workspace.provider {
-            FileResourceProvider::LocalFs => {
+            FileResourceProvider::LocalFs | FileResourceProvider::GitWorktree => {
                 let dir_path = Self::resolve_path(&workspace.root_path, sub_path)?;
 
                 if Self::is_sensitive_path(&dir_path) {
@@ -267,12 +267,6 @@ impl WorkspaceFileResourcesService for DefaultFileResourceService {
 
                 Ok(entries)
             }
-            FileResourceProvider::GitWorktree => {
-                // TODO: Implement git worktree provider
-                Err(FileResourceError::Internal(
-                    "GitWorktree provider not yet implemented".to_string(),
-                ))
-            }
         }
     }
 
@@ -283,7 +277,7 @@ impl WorkspaceFileResourcesService for DefaultFileResourceService {
         max_bytes: Option<usize>,
     ) -> Result<FilePreview, FileResourceError> {
         match workspace.provider {
-            FileResourceProvider::LocalFs => {
+            FileResourceProvider::LocalFs | FileResourceProvider::GitWorktree => {
                 let resolved_path = Self::resolve_path(&workspace.root_path, Some(file_path))?;
 
                 if Self::is_sensitive_path(&resolved_path) {
@@ -320,11 +314,6 @@ impl WorkspaceFileResourcesService for DefaultFileResourceService {
                     byte_size: file_size,
                 })
             }
-            FileResourceProvider::GitWorktree => {
-                Err(FileResourceError::Internal(
-                    "GitWorktree provider not yet implemented".to_string(),
-                ))
-            }
         }
     }
 
@@ -334,7 +323,7 @@ impl WorkspaceFileResourcesService for DefaultFileResourceService {
         file_path: &str,
     ) -> Result<Vec<u8>, FileResourceError> {
         match workspace.provider {
-            FileResourceProvider::LocalFs => {
+            FileResourceProvider::LocalFs | FileResourceProvider::GitWorktree => {
                 let resolved_path = Self::resolve_path(&workspace.root_path, Some(file_path))?;
 
                 if Self::is_sensitive_path(&resolved_path) {
@@ -345,11 +334,6 @@ impl WorkspaceFileResourcesService for DefaultFileResourceService {
 
                 let content = tokio::fs::read(&resolved_path).await?;
                 Ok(content)
-            }
-            FileResourceProvider::GitWorktree => {
-                Err(FileResourceError::Internal(
-                    "GitWorktree provider not yet implemented".to_string(),
-                ))
             }
         }
     }

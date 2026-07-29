@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::models::{AccessDecision, Action, Actor};
@@ -177,14 +178,46 @@ pub enum AccessError {
 
     #[error("Feature not enabled: {0}")]
     FeatureNotEnabled(String),
+
+    #[error("Access service error: {0}")]
+    Internal(String),
 }
 
 /// DefaultAccessService - AccessService 的默认实现
-pub struct DefaultAccessService;
+pub struct DefaultAccessService {
+    pool: Option<PgPool>,
+}
 
 impl DefaultAccessService {
     pub fn new() -> Self {
-        Self
+        Self { pool: None }
+    }
+
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self { pool: Some(pool) }
+    }
+
+    async fn agent_company(&self, agent_id: Uuid) -> Result<Uuid, AccessError> {
+        let pool = self.pool.as_ref().ok_or_else(|| AccessError::Internal("Access service requires a database pool".to_string()))?;
+        sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM agents WHERE id = $1 AND status <> 'terminated'")
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| AccessError::Internal(e.to_string()))?
+            .ok_or_else(|| AccessError::ResourceNotFound(format!("Agent {} not found", agent_id)))
+    }
+
+    async fn feature_enabled(&self, company_id: Uuid, feature: &str) -> Result<(), AccessError> {
+        let pool = self.pool.as_ref().ok_or_else(|| AccessError::Internal("Access service requires a database pool".to_string()))?;
+        let enabled = sqlx::query_scalar::<_, bool>(
+            "SELECT COALESCE((experimental ->> $1)::boolean, true) FROM instance_settings WHERE id = 1",
+        )
+        .bind(feature)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AccessError::Internal(e.to_string()))?
+        .unwrap_or(true);
+        if enabled { Ok(()) } else { Err(AccessError::FeatureNotEnabled(format!("{} is disabled for company {}", feature, company_id))) }
     }
 }
 
@@ -240,14 +273,8 @@ impl AccessService for DefaultAccessService {
     }
 
     async fn assert_agent_read_allowed(&self, actor: &dyn Actor, agent_id: Uuid) -> Result<(), AccessError> {
-        // 简化实现：需要访问数据库查询 agent 的 company_id
-        // 这里假设调用方已经验证了 company_id
-        let _ = agent_id;
-        if actor.company_id().is_some() {
-            Ok(())
-        } else {
-            Err(AccessError::Denied("No company context".to_string()))
-        }
+        let company_id = self.agent_company(agent_id).await?;
+        self.assert_company_access(actor, company_id).await
     }
 
     async fn assert_can_create_agents_for_company(
@@ -274,23 +301,15 @@ impl AccessService for DefaultAccessService {
     }
 
     async fn assert_can_update_agent(&self, actor: &dyn Actor, agent_id: Uuid) -> Result<(), AccessError> {
-        // 简化实现：需要查询 agent 的详细信息
-        let _ = agent_id;
-        if actor.company_id().is_some() {
-            Ok(())
-        } else {
-            Err(AccessError::Denied("No company context".to_string()))
+        self.assert_agent_read_allowed(actor, agent_id).await?;
+        if !actor.has_permission(Action::AgentsCreate) {
+            return Err(AccessError::InsufficientPermissions("Missing agents:update permission".to_string()));
         }
+        Ok(())
     }
 
     async fn assert_can_read_configurations(&self, actor: &dyn Actor, agent_id: Uuid) -> Result<(), AccessError> {
-        // 简化实现
-        let _ = agent_id;
-        if actor.company_id().is_some() {
-            Ok(())
-        } else {
-            Err(AccessError::Denied("No company context".to_string()))
-        }
+        self.assert_agent_read_allowed(actor, agent_id).await
     }
 
     async fn assert_can_provision_built_in_agents(&self, actor: &dyn Actor, company_id: Uuid) -> Result<(), AccessError> {
@@ -309,9 +328,7 @@ impl AccessService for DefaultAccessService {
     }
 
     async fn assert_built_in_agents_enabled(&self, company_id: Uuid) -> Result<(), AccessError> {
-        // TODO: 查询公司配置检查实验特性是否启用
-        let _ = company_id;
-        Ok(())
+        self.feature_enabled(company_id, "enableBuiltInAgents").await
     }
 
     async fn decide_issue_access(
@@ -430,9 +447,7 @@ impl AccessService for DefaultAccessService {
     }
 
     async fn assert_cases_enabled(&self, company_id: Uuid) -> Result<(), AccessError> {
-        let _ = company_id;
-        // TODO: 查询公司配置检查 Cases 功能是否启用
-        Ok(())
+        self.feature_enabled(company_id, "enableCases").await
     }
 
     async fn assert_project_belongs_to_company(

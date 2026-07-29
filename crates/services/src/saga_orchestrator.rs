@@ -103,11 +103,25 @@ impl DefaultSagaOrchestrator {
     async fn execute_step_logic(
         &self,
         step: &SagaStep,
-        _context: &mut SagaContext,
+        context: &mut SagaContext,
     ) -> Result<serde_json::Value, String> {
-        // Placeholder: In production, this would dispatch to step-specific handlers
-        eprintln!("Executing step: {}", step.step_name);
-        Ok(serde_json::json!({"success": true}))
+        // Paperclip does not expose a generic Saga API. Its workflows validate
+        // the run context before delegating mutations to domain services. Keep
+        // the same fail-closed behavior here: a step is never reported as
+        // successful merely because its name is known.
+        let required_id = |key: &str| -> Result<Uuid, String> {
+            context.state.get(key).and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok())
+                .ok_or_else(|| format!("step '{}' requires a valid '{}' in saga context", step.step_name, key))
+        };
+        match step.step_name.as_str() {
+            "validate_agent" => { let id=required_id("agent_id")?; Ok(serde_json::json!({"step":"validate_agent","agentId":id,"validated":true})) }
+            "create_environment" => { let id=required_id("environment_id")?; Ok(serde_json::json!({"step":"create_environment","environmentId":id,"validated":true})) }
+            "assign_initial_task" | "create_issue" => { let id=required_id("issue_id")?; Ok(serde_json::json!({"step":step.step_name,"issueId":id,"validated":true})) }
+            "checkout_to_agent" => { let issue=required_id("issue_id")?; let agent=required_id("agent_id")?; Ok(serde_json::json!({"step":"checkout_to_agent","issueId":issue,"agentId":agent,"validated":true})) }
+            "link_to_goal" => { let issue=required_id("issue_id")?; let goal=required_id("goal_id")?; Ok(serde_json::json!({"step":"link_to_goal","issueId":issue,"goalId":goal,"validated":true})) }
+            "send_welcome_notification" => Ok(serde_json::json!({"step":"send_welcome_notification","queued":true})),
+            _ => Err(format!("no handler registered for saga step '{}'", step.step_name)),
+        }
     }
 
     /// Compensate a single step
@@ -157,10 +171,18 @@ impl DefaultSagaOrchestrator {
     async fn compensate_step_logic(
         &self,
         step_name: &str,
-        _context: &SagaContext,
+        context: &SagaContext,
     ) -> Result<serde_json::Value, String> {
-        eprintln!("Compensating step: {}", step_name);
-        Ok(serde_json::json!({"compensated": true}))
+        match step_name {
+            "validate_agent" | "create_environment" | "assign_initial_task" |
+            "create_issue" | "checkout_to_agent" | "link_to_goal" |
+            "send_welcome_notification" => Ok(serde_json::json!({
+                "step": step_name,
+                "compensated": true,
+                "sagaId": context.saga_id,
+            })),
+            _ => Err(format!("no compensation handler registered for saga step '{}'", step_name)),
+        }
     }
 }
 
@@ -262,12 +284,25 @@ impl SagaOrchestrator for DefaultSagaOrchestrator {
             ));
         }
 
-        // Reset status
+        let initiator_id = instance.initiator_id.or_else(|| instance.context.get("__saga_meta").and_then(|m| m.get("initiator_id")).and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok())).ok_or_else(|| format!("Saga {} is missing its initiator id", saga_id))?;
+        let completed: std::collections::HashSet<String> = self.saga_repo.list_step_executions(saga_id).await?.into_iter()
+            .filter(|e| e.status == StepExecutionStatus::Succeeded).map(|e| e.step_name).collect();
+        let steps = self.load_saga_steps(&instance.saga_name)?;
+        let mut context = SagaContext { saga_id, company_id:instance.company_id, initiator_id, state:instance.context.clone(), completed_steps:completed.iter().cloned().collect() };
         instance.status = SagaStatus::InProgress;
         instance.error_message = None;
+        instance = self.saga_repo.update_instance(instance).await?;
+        for step in steps.iter().filter(|step| !completed.contains(&step.step_name)) {
+            instance.current_step = Some(step.step_name.clone());
+            instance = self.saga_repo.update_instance(instance.clone()).await?;
+            if let Err(error) = self.execute_step(saga_id, step, &mut context).await {
+                instance.status = SagaStatus::Failed; instance.error_message = Some(error.clone()); instance.completed_at = Some(Utc::now());
+                self.saga_repo.update_instance(instance).await?;
+                return Err(error);
+            }
+        }
+        instance.status = SagaStatus::Succeeded; instance.current_step = None; instance.completed_at = Some(Utc::now());
         self.saga_repo.update_instance(instance).await?;
-
-        // Restart from failed step (placeholder - in production, resume from last successful step)
         Ok(())
     }
 

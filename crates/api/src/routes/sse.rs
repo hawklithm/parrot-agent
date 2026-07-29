@@ -1,6 +1,6 @@
 use crate::app_state::AppState;
 use axum::{Router, 
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
@@ -9,6 +9,7 @@ use axum::{Router,
 };
 use futures::stream::StreamExt;
 use models::{SseEvent, SseEventType, SseSubscription};
+use services::auth::AuthorizationActor;
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
@@ -19,9 +20,19 @@ use uuid::Uuid;
 pub async fn sse_stream(
     Path((company_id, channel)): Path<(Uuid, String)>,
     State(state): State<AppState>,
+    actor: Option<Extension<AuthorizationActor>>,
 ) -> Response {
-    // TODO: Extract actor_id from auth context
-    let actor_id = Uuid::new_v4(); // Mock for now
+    let actor = match actor {
+        Some(Extension(actor)) => actor,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    if actor.company_id() != Some(company_id) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let actor_id = match actor.principal_id() {
+        Some(id) => id,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
 
     let subscription = SseSubscription {
         company_id,

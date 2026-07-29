@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+use sqlx::{PgPool, Row};
 
 /// 实例设置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,13 +132,31 @@ pub trait InstanceSettingsService: Send + Sync {
 /// 内存实现的实例设置服务
 pub struct DefaultInstanceSettingsService {
     settings: Arc<RwLock<InstanceSettings>>,
+    pool: Option<PgPool>,
 }
 
 impl DefaultInstanceSettingsService {
     pub fn new() -> Self {
         Self {
             settings: Arc::new(RwLock::new(InstanceSettings::default())),
+            pool: None,
         }
+    }
+
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self { settings: Arc::new(RwLock::new(InstanceSettings::default())), pool: Some(pool) }
+    }
+
+    async fn load_from_db(&self) -> Result<InstanceSettings, String> {
+        let pool = self.pool.as_ref().ok_or_else(|| "instance settings persistence is not configured".to_string())?;
+        let row = sqlx::query("SELECT instance_name,version,general,experimental FROM instance_settings WHERE id=1").fetch_one(pool).await.map_err(|e| e.to_string())?;
+        Ok(InstanceSettings { instance_name:row.get("instance_name"), version:row.get("version"), general:serde_json::from_value(row.get("general")).map_err(|e|e.to_string())?, experimental:serde_json::from_value(row.get("experimental")).map_err(|e|e.to_string())? })
+    }
+
+    async fn persist(&self, settings: &InstanceSettings) -> Result<(), String> {
+        let pool = self.pool.as_ref().ok_or_else(|| "instance settings persistence is not configured".to_string())?;
+        sqlx::query("UPDATE instance_settings SET instance_name=$1,version=$2,general=$3,experimental=$4,updated_at=now() WHERE id=1").bind(&settings.instance_name).bind(&settings.version).bind(serde_json::to_value(&settings.general).map_err(|e|e.to_string())?).bind(serde_json::to_value(&settings.experimental).map_err(|e|e.to_string())?).execute(pool).await.map_err(|e|e.to_string())?;
+        Ok(())
     }
 }
 
@@ -150,6 +169,7 @@ impl Default for DefaultInstanceSettingsService {
 #[async_trait]
 impl InstanceSettingsService for DefaultInstanceSettingsService {
     async fn get_settings(&self) -> Result<InstanceSettings, String> {
+        if self.pool.is_some() { return self.load_from_db().await; }
         let settings = self.settings.read().await;
         Ok(settings.clone())
     }
@@ -158,6 +178,7 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         &self,
         updates: serde_json::Value,
     ) -> Result<InstanceSettings, String> {
+        if self.pool.is_some() { let mut settings=self.load_from_db().await?; if let Some(name)=updates.get("instanceName").and_then(|v|v.as_str()){settings.instance_name=name.into();} if let Some(version)=updates.get("version").and_then(|v|v.as_str()){settings.version=version.into();} self.persist(&settings).await?; return Ok(settings); }
         let mut settings = self.settings.write().await;
 
         if let Some(name) = updates.get("instanceName").and_then(|v| v.as_str()) {
@@ -171,6 +192,7 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
     }
 
     async fn get_general_settings(&self) -> Result<GeneralSettings, String> {
+        if self.pool.is_some() { return Ok(self.load_from_db().await?.general); }
         let settings = self.settings.read().await;
         Ok(settings.general.clone())
     }
@@ -179,6 +201,7 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         &self,
         updates: serde_json::Value,
     ) -> Result<GeneralSettings, String> {
+        if self.pool.is_some() { let mut settings=self.load_from_db().await?; if let Some(v)=updates.get("timezone").and_then(|v|v.as_str()){settings.general.timezone=v.into();} if let Some(v)=updates.get("language").and_then(|v|v.as_str()){settings.general.language=v.into();} self.persist(&settings).await?; return Ok(settings.general); }
         let mut settings = self.settings.write().await;
 
         if let Some(tz) = updates.get("timezone").and_then(|v| v.as_str()) {
@@ -192,6 +215,7 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
     }
 
     async fn get_experimental_settings(&self) -> Result<ExperimentalSettings, String> {
+        if self.pool.is_some() { return Ok(self.load_from_db().await?.experimental); }
         let settings = self.settings.read().await;
         Ok(settings.experimental.clone())
     }
@@ -200,6 +224,7 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         &self,
         updates: serde_json::Value,
     ) -> Result<ExperimentalSettings, String> {
+        if self.pool.is_some() { let mut settings=self.load_from_db().await?; if let Some(v)=updates.get("issueGraphLivenessAutoRecovery").and_then(|v|v.as_bool()){settings.experimental.issue_graph_liveness_auto_recovery=v;} if let Some(v)=updates.get("enableCloudSync").and_then(|v|v.as_bool()){settings.experimental.enable_cloud_sync=v;} self.persist(&settings).await?; return Ok(settings.experimental); }
         let mut settings = self.settings.write().await;
 
         if let Some(val) = updates

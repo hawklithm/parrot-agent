@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -217,21 +218,80 @@ impl AdapterExecutor for LocalExecutor {
 // 远程执行器（占位符）
 // ============================================================================
 
-pub struct RemoteExecutor;
+pub struct RemoteExecutor {
+    running_pids: Arc<Mutex<HashMap<String, u32>>>,
+}
+
+impl RemoteExecutor {
+    pub fn new() -> Self {
+        Self { running_pids: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    fn connection_value<'a>(ctx: &'a AdapterExecutionContext, key: &str) -> Option<&'a serde_json::Value> {
+        ctx.execution_target.connection_info.as_ref()
+            .and_then(|info| info.get(key))
+            .or_else(|| ctx.config.get(key))
+    }
+}
+
+impl Default for RemoteExecutor {
+    fn default() -> Self { Self::new() }
+}
 
 #[async_trait]
 impl AdapterExecutor for RemoteExecutor {
-    async fn execute(&self, _ctx: AdapterExecutionContext) -> AdapterExecutionResult {
-        AdapterExecutionResult {
-            status: ExecutionStatus::Error,
-            exit_code: None,
-            output: String::new(),
-            error: Some("Remote execution not yet implemented".to_string()),
-            metadata: serde_json::json!({}),
+    async fn execute(&self, ctx: AdapterExecutionContext) -> AdapterExecutionResult {
+        let host = Self::connection_value(&ctx, "host").and_then(|v| v.as_str());
+        let Some(host) = host.filter(|value| !value.trim().is_empty()) else {
+            return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some("Remote execution requires connection_info.host".to_string()), metadata: serde_json::json!({"run_id": ctx.run_id}) };
+        };
+        let command = ctx.config.get("command").and_then(|v| v.as_str());
+        let Some(command) = command.filter(|value| !value.trim().is_empty()) else {
+            return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some("Remote execution requires config.command".to_string()), metadata: serde_json::json!({"run_id": ctx.run_id}) };
+        };
+
+        let user = Self::connection_value(&ctx, "user").and_then(|v| v.as_str());
+        let target = user.map(|value| format!("{}@{}", value, host)).unwrap_or_else(|| host.to_string());
+        let port = Self::connection_value(&ctx, "port").and_then(|v| v.as_u64());
+        let identity_file = Self::connection_value(&ctx, "identity_file").and_then(|v| v.as_str());
+        let mut remote_script = String::new();
+        if let Some(dir) = &ctx.working_dir { remote_script.push_str("cd "); remote_script.push_str(&Self::shell_quote(dir)); remote_script.push_str(" && "); }
+        if let Some(env) = ctx.config.get("env").and_then(|v| v.as_object()) {
+            for (key, value) in env { if let Some(value) = value.as_str() { remote_script.push_str(key); remote_script.push('='); remote_script.push_str(&Self::shell_quote(value)); remote_script.push(' '); } }
+        }
+        remote_script.push_str(&Self::shell_quote(command));
+        if let Some(args) = ctx.config.get("args").and_then(|v| v.as_array()) {
+            for arg in args.iter().filter_map(|v| v.as_str()) { remote_script.push(' '); remote_script.push_str(&Self::shell_quote(arg)); }
+        }
+
+        let mut ssh = Command::new("ssh");
+        ssh.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]);
+        if let Some(port) = port { ssh.args(["-p", &port.to_string()]); }
+        if let Some(identity_file) = identity_file { ssh.args(["-i", identity_file]); }
+        ssh.arg(target).args(["sh", "-lc"]).arg(remote_script);
+        let child = match ssh.spawn() {
+            Ok(child) => child,
+            Err(error) => return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some(format!("Failed to start ssh: {}", error)), metadata: serde_json::json!({"run_id": ctx.run_id}) },
+        };
+        if let Some(pid) = child.id() { self.running_pids.lock().await.insert(ctx.run_id.clone(), pid); }
+        let result = child.wait_with_output().await;
+        self.running_pids.lock().await.remove(&ctx.run_id);
+        match result {
+            Ok(output) => AdapterExecutionResult { status: if output.status.success() { ExecutionStatus::Ok } else { ExecutionStatus::Error }, exit_code: output.status.code(), output: String::from_utf8_lossy(&output.stdout).to_string(), error: (!output.stderr.is_empty()).then(|| String::from_utf8_lossy(&output.stderr).to_string()), metadata: serde_json::json!({"run_id": ctx.run_id, "host": host, "command": command}) },
+            Err(error) => AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some(format!("Failed to wait for remote command: {}", error)), metadata: serde_json::json!({"run_id": ctx.run_id}) },
         }
     }
 
-    async fn cancel(&self, _run_id: &str) {
-        // TODO: Implement remote cancellation
+    async fn cancel(&self, run_id: &str) {
+        let pid = self.running_pids.lock().await.get(run_id).copied();
+        let Some(pid) = pid else { return; };
+        #[cfg(windows)]
+        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).status().await;
+        #[cfg(not(windows))]
+        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status().await;
     }
 }

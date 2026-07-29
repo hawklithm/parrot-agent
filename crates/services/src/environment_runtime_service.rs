@@ -3,6 +3,9 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
+use sqlx::{PgPool, Row};
+use std::path::PathBuf;
+use tokio::fs;
 
 /// 环境运行时租约错误
 #[derive(Debug, Error)]
@@ -133,11 +136,25 @@ pub trait EnvironmentRuntimeService: Send + Sync {
 }
 
 /// 默认的环境运行时服务实现（占位符，用于测试）
-pub struct DefaultEnvironmentRuntimeService;
+pub struct DefaultEnvironmentRuntimeService {
+    pool: Option<PgPool>,
+}
 
 impl DefaultEnvironmentRuntimeService {
     pub fn new() -> Self {
-        Self
+        Self { pool: None }
+    }
+
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self { pool: Some(pool) }
+    }
+
+    fn pool(&self) -> Result<&PgPool, EnvironmentRuntimeError> {
+        self.pool.as_ref().ok_or_else(|| EnvironmentRuntimeError::InvalidConfig("environment runtime persistence is not configured".into()))
+    }
+
+    fn parse_id(value: &str, field: &str) -> Result<Uuid, EnvironmentRuntimeError> {
+        Uuid::parse_str(value).map_err(|_| EnvironmentRuntimeError::InvalidConfig(format!("{} must be a UUID", field)))
     }
 }
 
@@ -156,40 +173,43 @@ impl EnvironmentRuntimeService for DefaultEnvironmentRuntimeService {
         lease_metadata: JsonValue,
     ) -> Result<EnvironmentLease, EnvironmentRuntimeError> {
         // 占位实现：创建一个临时租约
-        Ok(EnvironmentLease {
-            id: Uuid::new_v4(),
-            environment_id: environment_id.to_string(),
-            agent_id,
-       issue_id: None,
-            status: LeaseStatus::Active,
-            acquired_at: chrono::Utc::now(),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            released_at: None,
-            failure_reason: None,
-            metadata: lease_metadata,
-        })
+        let pool = self.pool()?;
+        let environment_id = Self::parse_id(environment_id, "environment_id")?;
+        let env = sqlx::query("SELECT company_id,driver,status FROM environments WHERE id=$1")
+            .bind(environment_id).fetch_optional(pool).await?.ok_or_else(|| EnvironmentRuntimeError::EnvironmentNotFound(environment_id.to_string()))?;
+        let status: String = env.get("status");
+        if status != "active" && status != "in_use" { return Err(EnvironmentRuntimeError::LeaseAcquireFailed(format!("environment is {}", status))); }
+        let company_id: Uuid = env.get("company_id");
+        let issue_id = lease_metadata.get("issueId").or_else(|| lease_metadata.get("issue_id")).and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok());
+        let workspace_id = lease_metadata.get("executionWorkspaceId").or_else(|| lease_metadata.get("execution_workspace_id")).and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok());
+        let ttl = lease_metadata.get("leaseDurationSeconds").and_then(|v| v.as_i64()).unwrap_or(3600).clamp(60, 86_400);
+        let row = sqlx::query("INSERT INTO environment_leases (company_id,environment_id,execution_workspace_id,issue_id,status,provider,expires_at,metadata) VALUES ($1,$2,$3,$4,'active',$5,now()+make_interval(secs => $6),$7) RETURNING id,acquired_at,expires_at")
+            .bind(company_id).bind(environment_id).bind(workspace_id).bind(issue_id).bind(env.get::<String,_>("driver")).bind(ttl).bind(&lease_metadata).fetch_one(pool).await?;
+        return Ok(EnvironmentLease { id:row.get("id"), environment_id:environment_id.to_string(), agent_id, issue_id, status:LeaseStatus::Active, acquired_at:row.get("acquired_at"), expires_at:Some(row.get("expires_at")), released_at:None, failure_reason:None, metadata:lease_metadata });
     }
 
     async fn release_run_lease(
         &self,
-        _lease_id: Uuid,
-        _status: LeaseStatus,
+        lease_id: Uuid,
+        status: LeaseStatus,
     ) -> Result<(), EnvironmentRuntimeError> {
         // 占位实现：直接返回成功
-        Ok(())
+        let status = match status { LeaseStatus::Released=>"released", LeaseStatus::Expired=>"expired", LeaseStatus::Failed=>"failed", LeaseStatus::Active=>"active" };
+        let result=sqlx::query("UPDATE environment_leases SET status=$2,released_at=CASE WHEN $2 <> 'active' THEN COALESCE(released_at,now()) ELSE released_at END,cleanup_status=CASE WHEN $2 <> 'active' THEN 'pending' ELSE cleanup_status END,updated_at=now() WHERE id=$1").bind(lease_id).bind(status).execute(self.pool()?).await?;
+        if result.rows_affected()==0 { return Err(EnvironmentRuntimeError::LeaseReleaseFailed(format!("lease {} not found", lease_id))); } Ok(())
     }
 
     async fn realize_workspace(
         &self,
-        _lease: &EnvironmentLease,
-        _workspace_config: JsonValue,
+        lease: &EnvironmentLease,
+        workspace_config: JsonValue,
     ) -> Result<WorkspaceRealizationResult, EnvironmentRuntimeError> {
         // 占位实现：返回本地路径
-        Ok(WorkspaceRealizationResult {
-            workspace_path: "/tmp/workspace".to_string(),
-            execution_target: None,
-            metadata: HashMap::new(),
-        })
+        let configured = workspace_config.get("workspacePath").or_else(|| workspace_config.get("workspace_path")).and_then(|v| v.as_str()).map(PathBuf::from);
+        let path = configured.or_else(|| lease.metadata.get("workspacePath").and_then(|v| v.as_str()).map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("data/workspaces").join(lease.id.to_string()));
+        fs::create_dir_all(&path).await.map_err(|e| EnvironmentRuntimeError::WorkspaceRealizationFailed(e.to_string()))?;
+        let mut metadata=HashMap::new(); metadata.insert("leaseId".into(),serde_json::json!(lease.id)); metadata.insert("created".into(),serde_json::json!(true));
+        Ok(WorkspaceRealizationResult { workspace_path:path.to_string_lossy().to_string(), execution_target:None, metadata })
     }
 
     async fn resolve_environment_execution_target(
@@ -197,6 +217,13 @@ impl EnvironmentRuntimeService for DefaultEnvironmentRuntimeService {
         environment_id: &str,
         adapter_type: &str,
     ) -> Result<ExecutionTargetResult, EnvironmentRuntimeError> {
+        let id=Self::parse_id(environment_id,"environment_id")?;
+        let row=sqlx::query("SELECT driver,config FROM environments WHERE id=$1 AND status <> 'archived'").bind(id).fetch_optional(self.pool()?).await?.ok_or_else(|| EnvironmentRuntimeError::EnvironmentNotFound(environment_id.into()))?;
+        let driver:String=row.get("driver"); let config:JsonValue=row.get("config");
+        let target_type=match driver.as_str(){"ssh"=>"ssh","sandbox"=>"sandbox","plugin"=>"plugin",_=>"local"};
+        let mut metadata=HashMap::new(); metadata.insert("environmentId".into(),serde_json::json!(id)); metadata.insert("adapterType".into(),serde_json::json!(adapter_type));
+        return Ok(ExecutionTargetResult { target_type:target_type.into(), connection_info:config, metadata });
+        /*
         // 占位实现：返回本地执行目标
         Ok(ExecutionTargetResult {
             target_type: "local".to_string(),
@@ -205,7 +232,7 @@ impl EnvironmentRuntimeService for DefaultEnvironmentRuntimeService {
                 "adapter_type": adapter_type,
             }),
             metadata: HashMap::new(),
-        })
+        }) */
     }
 }
 

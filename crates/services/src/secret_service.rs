@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 use uuid::Uuid;
+use sqlx::{PgPool, Row};
+use sha2::{Digest, Sha256};
 
 /// 密钥服务错误
 #[derive(Debug, Error)]
@@ -312,11 +314,31 @@ pub trait SecretService: Send + Sync {
 }
 
 /// 默认密钥服务实现（占位符）
-pub struct DefaultSecretService;
+pub struct DefaultSecretService {
+    pool: Option<PgPool>,
+}
 
 impl DefaultSecretService {
     pub fn new() -> Self {
-        Self
+        Self { pool: None }
+    }
+
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self { pool: Some(pool) }
+    }
+
+    fn pool(&self) -> Result<&PgPool, SecretServiceError> {
+        self.pool.as_ref().ok_or_else(|| SecretServiceError::ResolutionFailed("secret persistence is not configured".into()))
+    }
+
+    fn row_to_secret(row: &sqlx::postgres::PgRow, value: Option<String>) -> Secret {
+        Secret {
+            id: row.get("id"), company_id: row.get("company_id"), key: row.get("key"),
+            name: row.get("name"), provider: row.get("provider"), status: row.get("status"),
+            scope: row.get("scope"), description: row.get("description"),
+            latest_version: row.get("latest_version"), value,
+            created_at: row.get("created_at"), updated_at: row.get("updated_at"),
+        }
     }
 
     /// 检查环境变量名是否合法
@@ -410,7 +432,7 @@ impl SecretService for DefaultSecretService {
 
     async fn resolve_adapter_config_for_runtime(
         &self,
-        _company_id: Uuid,
+        company_id: Uuid,
         adapter_config: JsonValue,
     ) -> Result<ResolvedAdapterConfig, SecretServiceError> {
         let config_obj = adapter_config
@@ -438,8 +460,15 @@ impl SecretService for DefaultSecretService {
                         EnvBinding::SecretRef { secret_id, version } => {
                             // TODO: 从数据库解析密钥值
                             // 占位实现：返回占位符
-                            let placeholder = format!("***SECRET:{}***", secret_id);
-                            resolved_env.insert(key.clone(), JsonValue::String(placeholder.clone()));
+                            let pool = self.pool()?;
+                            let material: Option<JsonValue> = if version == "latest" {
+                                sqlx::query_scalar("SELECT v.material FROM company_secret_versions v JOIN company_secrets s ON s.id=v.secret_id WHERE s.id=$1 AND s.company_id=$2 AND s.deleted_at IS NULL ORDER BY v.version DESC LIMIT 1").bind(secret_id).bind(company_id).fetch_optional(pool).await?
+                            } else {
+                                let parsed: i32 = version.parse().map_err(|_| SecretServiceError::ResolutionFailed(format!("invalid secret version '{}'", version)))?;
+                                sqlx::query_scalar("SELECT v.material FROM company_secret_versions v JOIN company_secrets s ON s.id=v.secret_id WHERE s.id=$1 AND s.company_id=$2 AND s.deleted_at IS NULL AND v.version=$3").bind(secret_id).bind(company_id).bind(parsed).fetch_optional(pool).await?
+                            };
+                            let value = material.and_then(|m| m.get("value").and_then(|v| v.as_str()).map(str::to_owned)).ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
+                            resolved_env.insert(key.clone(), JsonValue::String(value));
 
                             secret_keys.push(key.clone());
                             manifest.push(RuntimeSecretManifestEntry {
@@ -455,8 +484,7 @@ impl SecretService for DefaultSecretService {
                         EnvBinding::UserSecretRef { key: user_key, .. } => {
                             // TODO: 从用户环境解析密钥
                             // 占位实现：返回占位符
-                            let placeholder = format!("***USER_SECRET:{}***", user_key);
-                            resolved_env.insert(key.clone(), JsonValue::String(placeholder));
+                            return Err(SecretServiceError::ResolutionFailed(format!("user secret '{}' requires an authenticated user context", user_key)));
                         }
                     }
                 }
@@ -514,54 +542,68 @@ impl SecretService for DefaultSecretService {
 
     async fn create_secret(
         &self,
-        _company_id: Uuid,
-        _input: CreateSecretInput,
+        company_id: Uuid,
+        input: CreateSecretInput,
     ) -> Result<Secret, SecretServiceError> {
         // TODO: 实现数据库持久化
         // 占位实现：返回错误
-        Err(SecretServiceError::ResolutionFailed(
-            "Secret creation not implemented yet".to_string(),
-        ))
+        if !Self::is_valid_env_key(&input.key) { return Err(SecretServiceError::InvalidEnvKey(input.key)); }
+        if input.value.is_empty() { return Err(SecretServiceError::ResolutionFailed("secret value cannot be empty".into())); }
+        let pool = self.pool()?;
+        let row = sqlx::query("INSERT INTO company_secrets (company_id,key,name,description) VALUES ($1,$2,$2,$3) RETURNING id,company_id,key,name,provider,status,scope,description,latest_version,created_at,updated_at")
+            .bind(company_id).bind(&input.key).bind(&input.description).fetch_one(pool).await?;
+        let id: Uuid = row.get("id"); let mut h=Sha256::new(); h.update(input.value.as_bytes()); let digest=format!("{:x}",h.finalize());
+        sqlx::query("INSERT INTO company_secret_versions (secret_id,version,material,value_sha256,fingerprint_sha256) VALUES ($1,1,$2,$3,$3)")
+            .bind(id).bind(serde_json::json!({"value": input.value})).bind(digest).execute(pool).await?;
+        Ok(Self::row_to_secret(&row, None))
     }
 
     async fn get_secret(
         &self,
-        _company_id: Uuid,
+        company_id: Uuid,
         secret_id: Uuid,
     ) -> Result<Secret, SecretServiceError> {
         // TODO: 实现数据库查询
         // 占位实现：返回错误
-        Err(SecretServiceError::SecretNotFound(secret_id.to_string()))
+        let row = sqlx::query("SELECT id,company_id,key,name,provider,status,scope,description,latest_version,created_at,updated_at FROM company_secrets WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL")
+            .bind(secret_id).bind(company_id).fetch_optional(self.pool()?).await?.ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
+        Ok(Self::row_to_secret(&row, None))
     }
 
     async fn update_secret(
         &self,
-        _company_id: Uuid,
+        company_id: Uuid,
         secret_id: Uuid,
-        _input: UpdateSecretInput,
+        input: UpdateSecretInput,
     ) -> Result<Secret, SecretServiceError> {
         // TODO: 实现数据库更新
         // 占位实现：返回错误
-        Err(SecretServiceError::SecretNotFound(secret_id.to_string()))
+        let pool = self.pool()?;
+        let row = sqlx::query("UPDATE company_secrets SET description=COALESCE($3,description), latest_version=CASE WHEN $4::text IS NULL THEN latest_version ELSE latest_version+1 END, updated_at=now() WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL RETURNING id,company_id,key,name,provider,status,scope,description,latest_version,created_at,updated_at")
+            .bind(secret_id).bind(company_id).bind(input.description).bind(input.value.as_deref()).fetch_optional(pool).await?.ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
+        if let Some(value) = input.value { let version:i32=row.get("latest_version"); let mut h=Sha256::new(); h.update(value.as_bytes()); let digest=format!("{:x}",h.finalize()); sqlx::query("INSERT INTO company_secret_versions (secret_id,version,material,value_sha256,fingerprint_sha256) VALUES ($1,$2,$3,$4,$4)").bind(secret_id).bind(version).bind(serde_json::json!({"value":value})).bind(digest).execute(pool).await?; }
+        Ok(Self::row_to_secret(&row, None))
     }
 
     async fn delete_secret(
         &self,
-        _company_id: Uuid,
+        company_id: Uuid,
         secret_id: Uuid,
     ) -> Result<(), SecretServiceError> {
         // TODO: 实现数据库删除
         // 占位实现：返回错误
-        Err(SecretServiceError::SecretNotFound(secret_id.to_string()))
+        let result=sqlx::query("UPDATE company_secrets SET deleted_at=now(),updated_at=now() WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL").bind(secret_id).bind(company_id).execute(self.pool()?).await?;
+        if result.rows_affected()==0 { return Err(SecretServiceError::SecretNotFound(secret_id.to_string())); } Ok(())
     }
 
     async fn list_secrets(
         &self,
-        _company_id: Uuid,
+        company_id: Uuid,
     ) -> Result<Vec<Secret>, SecretServiceError> {
         // TODO: 实现数据库查询
         // 占位实现：返回空列表
-        Ok(Vec::new())
+        let rows=sqlx::query("SELECT id,company_id,key,name,provider,status,scope,description,latest_version,created_at,updated_at FROM company_secrets WHERE company_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC").bind(company_id).fetch_all(self.pool()?).await?;
+        Ok(rows.iter().map(|r| Self::row_to_secret(r,None)).collect())
     }
 }
 

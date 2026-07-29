@@ -4,7 +4,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use models::{Issue, IssueStatus};
-use repositories::IssueRepository;
+use repositories::{AgentWakeupRequestRepository, IssueRepository};
 
 /// Blocker diagnostics for an issue
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,11 +75,17 @@ pub trait IssueDiagnosticsService: Send + Sync {
 /// Default implementation of IssueDiagnosticsService
 pub struct DefaultIssueDiagnosticsService {
     issue_repo: Arc<dyn IssueRepository>,
+    wakeup_repo: Option<Arc<dyn AgentWakeupRequestRepository>>,
 }
 
 impl DefaultIssueDiagnosticsService {
     pub fn new(issue_repo: Arc<dyn IssueRepository>) -> Self {
-        Self { issue_repo }
+        Self { issue_repo, wakeup_repo: None }
+    }
+
+    pub fn with_wakeup_repo(mut self, wakeup_repo: Arc<dyn AgentWakeupRequestRepository>) -> Self {
+        self.wakeup_repo = Some(wakeup_repo);
+        self
     }
 }
 
@@ -127,14 +133,20 @@ impl IssueDiagnosticsService for DefaultIssueDiagnosticsService {
         })
     }
 
-    async fn get_wakes_diagnostics(&self, _company_id: Uuid, _issue_id: Uuid) -> Result<WakesDiagnostics, String> {
-        // Wake diagnostics would query the heartbeat/wake system
-        // For now, return a placeholder
-        Ok(WakesDiagnostics {
-            pending_wakes: 0,
-            last_wake_at: None,
-            active_wakes: vec![],
-        })
+    async fn get_wakes_diagnostics(&self, company_id: Uuid, issue_id: Uuid) -> Result<WakesDiagnostics, String> {
+        let Some(wakeup_repo) = &self.wakeup_repo else {
+            return Ok(WakesDiagnostics { pending_wakes: 0, last_wake_at: None, active_wakes: vec![] });
+        };
+        let wakes = wakeup_repo.list_live_by_issue_ids(company_id, &[issue_id]).await
+            .map_err(|e| format!("Failed to list wake requests: {}", e))?;
+        let last_wake_at = wakes.iter().map(|wake| wake.created_at).max().map(|value| value.to_rfc3339());
+        let active_wakes = wakes.into_iter().map(|wake| WakeRequestInfo {
+            wake_id: wake.id,
+            actor_type: "agent".to_string(),
+            actor_id: wake.agent_id,
+            created_at: wake.created_at.to_rfc3339(),
+        }).collect::<Vec<_>>();
+        Ok(WakesDiagnostics { pending_wakes: active_wakes.len() as i64, last_wake_at, active_wakes })
     }
 
     async fn get_subtree_diagnostics(&self, _company_id: Uuid, issue_id: Uuid) -> Result<SubtreeDiagnostics, String> {

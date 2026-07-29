@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use models::skill::{SkillDetail, SkillIndexEntry};
 
 use crate::ServiceError;
+use sqlx::{PgPool, Row};
 
 pub type ServiceResult<T> = Result<T, ServiceError>;
 
@@ -38,12 +39,16 @@ pub struct InviteInfo {
 
 /// Default implementation of InviteService
 pub struct InviteServiceImpl {
-    // In production: would contain InviteRepository, CompanyRepository, SkillsService
+    pool: Option<PgPool>,
 }
 
 impl InviteServiceImpl {
     pub fn new() -> Self {
-        Self {}
+        Self { pool: None }
+    }
+
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self { pool: Some(pool) }
     }
 
     fn mock_onboarding_markdown() -> String {
@@ -107,31 +112,23 @@ impl Default for InviteServiceImpl {
 #[async_trait]
 impl InviteService for InviteServiceImpl {
     async fn verify_invite_token(&self, token: &str) -> ServiceResult<InviteInfo> {
-        // Placeholder: In production, would query database
         if token.is_empty() {
             return Err(ServiceError::Unauthorized("Invalid token".to_string()));
         }
-
+        let pool = self.pool.as_ref().ok_or_else(|| ServiceError::Internal("invite persistence is not configured".into()))?;
+        let row = sqlx::query("SELECT i.company_id, c.name, i.invite_type::text, i.expires_at FROM invites i JOIN companies c ON c.id=i.company_id WHERE i.token=$1 AND i.accepted=false AND i.expires_at > now()")
+            .bind(token).fetch_optional(pool).await.map_err(|e| ServiceError::Internal(e.to_string()))?
+            .ok_or_else(|| ServiceError::Unauthorized("Invalid or expired invite token".into()))?;
         Ok(InviteInfo {
-            company_id: uuid::Uuid::new_v4(),
-            company_name: "Parrot Agent Company".to_string(),
-            invite_type: "agent".to_string(),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::days(7)),
+            company_id: row.get("company_id"), company_name: row.get("name"),
+            invite_type: row.get("invite_type"), expires_at: Some(row.get("expires_at")),
         })
     }
 
     async fn get_invite_logo(&self, token: &str) -> ServiceResult<Vec<u8>> {
         self.verify_invite_token(token).await?;
 
-        // Placeholder: Return 1x1 transparent PNG
-        Ok(vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-            0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
-            0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-            0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ])
+        Err(ServiceError::NotFound("invite logo is not configured".into()))
     }
 
     async fn get_invite_onboarding(&self, token: &str) -> ServiceResult<String> {
@@ -147,27 +144,10 @@ impl InviteService for InviteServiceImpl {
     async fn get_invite_skills_index(&self, token: &str) -> ServiceResult<Vec<SkillIndexEntry>> {
         self.verify_invite_token(token).await?;
 
-        // Placeholder: Return mock skills
-        Ok(vec![
-            SkillIndexEntry {
-                name: "code-review".to_string(),
-                slug: "code-review".to_string(),
-                description: "Automated code review".to_string(),
-                category: None,
-                is_paperclip_managed: true,
-                version: Some("1.0.0".to_string()),
-                tags: Some(vec!["automation".to_string()]),
-            },
-            SkillIndexEntry {
-                name: "test-generation".to_string(),
-                slug: "test-generation".to_string(),
-                description: "Generate unit tests".to_string(),
-                category: None,
-                is_paperclip_managed: true,
-                version: Some("1.0.0".to_string()),
-                tags: Some(vec!["testing".to_string()]),
-            },
-        ])
+        let _info = self.verify_invite_token(token).await?;
+        let pool = self.pool.as_ref().ok_or_else(|| ServiceError::Internal("invite persistence is not configured".into()))?;
+        let rows = sqlx::query("SELECT name, description, category, is_paperclip_managed FROM skill_catalogs ORDER BY name").fetch_all(pool).await.map_err(|e| ServiceError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|row| SkillIndexEntry { name:row.get("name"), slug:row.get("name"), description:row.get("description"), category:row.get("category"), is_paperclip_managed:row.get("is_paperclip_managed"), version:None, tags:None }).collect())
     }
 
     async fn get_invite_skill_detail(&self, token: &str, skill_name: &str) -> ServiceResult<SkillDetail> {

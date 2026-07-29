@@ -157,10 +157,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Construct the full application state by wiring repositories -> services.
 ///
-/// Services that only have a `Mock` implementation in the codebase (case, work-product,
-/// attachment, custom-image-setup, environment-diagnostics, invite-resource, routine-annotation,
-/// secret-remote-import, skill-registry) are wired with their mocks so the server compiles and
-/// runs. They return mock data until real `Default*` implementations land.
+/// The server wires PostgreSQL/local-storage implementations in production;
+/// mock implementations are retained for unit tests only.
 ///
 /// **Recently upgraded from Mock:**
 /// - `secret-provider-config` → `DefaultSecretProviderConfigServiceImpl`
@@ -264,7 +262,7 @@ fn build_app_state(pool: PgPool) -> AppState {
             .with_cost_event_repo(cost_event_repo.clone())
             .with_activity_log_repo(activity_log_repo.clone()),
     );
-    let access_service: Arc<dyn access::AccessService> = Arc::new(DefaultAccessService::new());
+    let access_service: Arc<dyn access::AccessService> = Arc::new(DefaultAccessService::with_pool(pool.clone()));
     let config_revision_service: Arc<dyn ConfigRevisionService> = Arc::new(
         ConfigRevisionServiceImpl::new(Arc::new(agent_repo.clone()), config_revision_repo.clone()),
     );
@@ -275,7 +273,7 @@ fn build_app_state(pool: PgPool) -> AppState {
         Arc::new(services::create_default_adapter_registry());
     let server_adapter_registry = Arc::new(services::server_adapter::AdapterRegistry::new());
     let environment_runtime_service: Arc<dyn EnvironmentRuntimeService> =
-        Arc::new(DefaultEnvironmentRuntimeService::new());
+        Arc::new(DefaultEnvironmentRuntimeService::with_pool(pool.clone()));
     let issue_comment_service: Arc<dyn IssueCommentService> = Arc::new(
         IssueCommentServiceImpl::new(issue_comment_repo.clone(), issue_repo.clone()),
     );
@@ -287,7 +285,8 @@ fn build_app_state(pool: PgPool) -> AppState {
     let issue_diagnostics_service: Arc<dyn IssueDiagnosticsService> = Arc::new(
         services::issue_diagnostics_service::DefaultIssueDiagnosticsService::new(
             issue_repo.clone(),
-        ),
+        )
+        .with_wakeup_repo(wakeup_repo.clone()),
     );
     let low_trust_service: Arc<dyn LowTrustService> =
         Arc::new(DefaultLowTrustService::new(issue_repo.clone()));
@@ -319,8 +318,8 @@ fn build_app_state(pool: PgPool) -> AppState {
             Arc::new(PgSkillFileRepository::new(pool.clone())),
         ));
     let sse_service: Arc<dyn SseService> = InMemorySseService::new();
-    let invite_service: Arc<dyn InviteService> = Arc::new(InviteServiceImpl::new());
-    let openclaw_service: Arc<dyn OpenClawService> = Arc::new(OpenClawServiceImpl::new());
+    let invite_service: Arc<dyn InviteService> = Arc::new(InviteServiceImpl::with_pool(pool.clone()));
+    let openclaw_service: Arc<dyn OpenClawService> = Arc::new(OpenClawServiceImpl::with_pool(pool.clone()));
     let user_directory_service: Arc<dyn UserDirectoryService> =
         Arc::new(services::user_directory_service::UserDirectoryServiceImpl::with_pool(pool.clone()));
     let custom_image_setup_service: Arc<dyn CustomImageSetupService> =
@@ -343,7 +342,7 @@ fn build_app_state(pool: PgPool) -> AppState {
     let attachment_service: Arc<dyn AttachmentService> =
         Arc::new(services::attachment_service::LocalAttachmentService::new(pool.clone()));
     let user_secret_definition_service: Arc<dyn UserSecretDefinitionService> =
-        Arc::new(UserSecretDefinitionServiceImpl::new());
+        Arc::new(UserSecretDefinitionServiceImpl::with_pool(pool.clone()));
     let user_secret_service: Arc<dyn UserSecretService> = Arc::new(UserSecretServiceImpl::new(
         user_secret_repo,
         user_secret_definition_repo,
@@ -375,7 +374,7 @@ fn build_app_state(pool: PgPool) -> AppState {
 
     // Instance settings service (in-memory implementation)
     let instance_settings_service: Arc<dyn InstanceSettingsService> =
-        Arc::new(DefaultInstanceSettingsService::new());
+        Arc::new(DefaultInstanceSettingsService::with_pool(pool.clone()));
 
     // Adapt the complete service to the route-facing legacy trait while preserving the
     // shared repository instances used by approvals and issue sub-resources.
