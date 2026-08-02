@@ -1,11 +1,12 @@
 use crate::app_state::AppState;
-use axum::{Router, 
-    extract::{Path, Query, State},
+use axum::{
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Json, Router,
 };
 use models::UserDirectoryQuery;
+use services::auth::AuthorizationActor;
 use uuid::Uuid;
 
 /// GET /companies/:companyId/user-directory
@@ -14,10 +15,17 @@ pub async fn list_company_user_directory(
     Path(company_id): Path<Uuid>,
     Query(query): Query<UserDirectoryQuery>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
-    // TODO: Add permission check - user must be company member
+    if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.user_directory_service.list_company_users(company_id, query).await {
+    match state
+        .user_directory_service
+        .list_company_users(company_id, query)
+        .await
+    {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             let status = match e {
@@ -35,8 +43,11 @@ pub async fn list_company_user_directory(
 pub async fn list_admin_user_directory(
     Query(query): Query<UserDirectoryQuery>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
-    // TODO: Add permission check - assertIsInstanceAdmin
+    if crate::routes::assert_instance_admin(&actor).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     match state.user_directory_service.list_admin_users(query).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),

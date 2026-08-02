@@ -1,12 +1,15 @@
 use async_trait::async_trait;
-use chrono::{Utc, Datelike};
-use models::{Agent, AgentStatus, AgentRuntimeState, AgentTaskSession, AgentApiKey};
-use repositories::{AgentRepository, AgentApiKeyRepository, ConfigRevisionRepository, CostEventRepository, ActivityLogRepository};
+use chrono::{Datelike, Utc};
+use models::{Agent, AgentApiKey, AgentRuntimeState, AgentStatus, AgentTaskSession};
+use repositories::{
+    ActivityLogRepository, AgentApiKeyRepository, AgentRepository, ConfigRevisionRepository,
+    CostEventRepository,
+};
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sqlx::{PgPool, Row};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
-
 
 /// ConfigSnapshot - 配置快照
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,19 +91,28 @@ pub trait AgentService: Send + Sync {
     async fn delete(&self, id: Uuid) -> Result<(), ServiceError>;
 
     /// 检测汇报循环
-    async fn detect_reporting_cycle(&self, agent_id: Uuid, reports_to: Uuid) -> Result<bool, ServiceError>;
+    async fn detect_reporting_cycle(
+        &self,
+        agent_id: Uuid,
+        reports_to: Uuid,
+    ) -> Result<bool, ServiceError>;
 
     /// 计算组织链健康度
     async fn get_agent_work_eligibility(&self, agent_id: Uuid) -> Result<f32, ServiceError>;
 
     /// 回滚配置到指定版本
-    async fn rollback_config_revision(&self, agent_id: Uuid, revision_id: Uuid) -> Result<Agent, ServiceError>;
+    async fn rollback_config_revision(
+        &self,
+        agent_id: Uuid,
+        revision_id: Uuid,
+    ) -> Result<Agent, ServiceError>;
 
     /// 获取Agent技能快照
     async fn get_skills(&self, agent_id: Uuid) -> Result<models::AgentSkillSnapshot, ServiceError>;
 
     /// 同步Agent技能列表
-    async fn sync_skills(&self, agent_id: Uuid) -> Result<models::AgentSkillSnapshot, ServiceError>;
+    async fn sync_skills(&self, agent_id: Uuid)
+        -> Result<models::AgentSkillSnapshot, ServiceError>;
 
     /// 重置Agent会话运行时状态
     async fn reset_session(&self, agent_id: Uuid) -> Result<(), ServiceError>;
@@ -109,22 +121,39 @@ pub trait AgentService: Send + Sync {
     async fn set_status(&self, id: Uuid, status: AgentStatus) -> Result<Agent, ServiceError>;
 
     /// 更新 Agent 权限
-    async fn update_permissions(&self, id: Uuid, permissions: models::AgentPermissions) -> Result<Agent, ServiceError>;
+    async fn update_permissions(
+        &self,
+        id: Uuid,
+        permissions: models::AgentPermissions,
+    ) -> Result<Agent, ServiceError>;
 
     /// 更新指令路径
-    async fn update_instructions_path(&self, id: Uuid, path: Option<String>) -> Result<Agent, ServiceError>;
+    async fn update_instructions_path(
+        &self,
+        id: Uuid,
+        path: Option<String>,
+    ) -> Result<Agent, ServiceError>;
 
     /// 获取指令包
     async fn get_instructions_bundle(&self, id: Uuid) -> Result<serde_json::Value, ServiceError>;
 
     /// 更新指令包
-    async fn update_instructions_bundle(&self, id: Uuid, bundle: serde_json::Value) -> Result<Agent, ServiceError>;
+    async fn update_instructions_bundle(
+        &self,
+        id: Uuid,
+        bundle: serde_json::Value,
+    ) -> Result<Agent, ServiceError>;
 
     /// 获取指令文件
     async fn get_bundle_file(&self, id: Uuid, file_path: &str) -> Result<String, ServiceError>;
 
     /// 保存指令文件
-    async fn save_bundle_file(&self, id: Uuid, file_path: &str, content: String) -> Result<Agent, ServiceError>;
+    async fn save_bundle_file(
+        &self,
+        id: Uuid,
+        file_path: &str,
+        content: String,
+    ) -> Result<Agent, ServiceError>;
 
     /// 删除指令文件
     async fn delete_bundle_file(&self, id: Uuid, file_path: &str) -> Result<Agent, ServiceError>;
@@ -139,13 +168,22 @@ pub trait AgentService: Send + Sync {
     async fn list_keys(&self, id: Uuid) -> Result<Vec<AgentApiKey>, ServiceError>;
 
     /// 创建 API Key
-    async fn create_key(&self, id: Uuid, name: String, scope: Option<serde_json::Value>) -> Result<AgentApiKey, ServiceError>;
+    async fn create_key(
+        &self,
+        id: Uuid,
+        name: String,
+        scope: Option<serde_json::Value>,
+    ) -> Result<AgentApiKey, ServiceError>;
 
     /// 吊销 API Key
     async fn revoke_key(&self, id: Uuid, key_id: Uuid) -> Result<(), ServiceError>;
 
     /// 更新预算
-    async fn update_budget(&self, id: Uuid, budget_monthly_cents: i32) -> Result<Agent, ServiceError>;
+    async fn update_budget(
+        &self,
+        id: Uuid,
+        budget_monthly_cents: i32,
+    ) -> Result<Agent, ServiceError>;
 
     /// 轻量收件箱
     async fn inbox_lite(&self, agent_id: Uuid) -> Result<serde_json::Value, ServiceError>;
@@ -157,7 +195,10 @@ pub trait AgentService: Send + Sync {
     async fn claude_login(&self, agent_id: Uuid) -> Result<serde_json::Value, ServiceError>;
 
     /// 获取公司级 Agent 配置列表
-    async fn list_configurations(&self, company_id: Uuid) -> Result<Vec<serde_json::Value>, ServiceError>;
+    async fn list_configurations(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<serde_json::Value>, ServiceError>;
 }
 
 /// ServiceError - 服务层错误
@@ -194,11 +235,33 @@ pub enum ServiceError {
     ConfigurationFrozen,
 }
 
+fn normalize_bundle_path(path: &str) -> Result<String, ServiceError> {
+    let normalized = path.trim().replace('\\', "/");
+    if normalized.is_empty() || normalized.starts_with('/') || normalized.contains("..") || normalized.split('/').any(|part| part.is_empty()) {
+        return Err(ServiceError::InvalidInput("instruction path must be a relative file path".to_string()));
+    }
+    Ok(normalized)
+}
+
+fn validate_bundle(bundle: &serde_json::Value) -> Result<(), ServiceError> {
+    let entry = bundle.get("entryFile").and_then(|v| v.as_str()).ok_or_else(|| ServiceError::InvalidInput("instructions bundle requires entryFile".to_string()))?;
+    normalize_bundle_path(entry)?;
+    let files = bundle.get("files").and_then(|v| v.as_object()).ok_or_else(|| ServiceError::InvalidInput("instructions bundle requires files object".to_string()))?;
+    for (path, content) in files {
+        normalize_bundle_path(path)?;
+        if !content.is_string() { return Err(ServiceError::InvalidInput(format!("instruction file {path} must contain text"))); }
+    }
+    Ok(())
+}
+
 /// Compute org-chain health score for a single agent using a pre-loaded agent map.
 ///
 /// Mirrors Paperclip's `getAgentWorkEligibility` but operates on in-memory data
 /// to avoid N+1 database queries when computing scores for a list of agents.
-fn compute_org_chain_health(agent: &Agent, agent_map: &std::collections::HashMap<Uuid, &Agent>) -> f32 {
+fn compute_org_chain_health(
+    agent: &Agent,
+    agent_map: &std::collections::HashMap<Uuid, &Agent>,
+) -> f32 {
     let mut score: f32 = 1.0;
 
     if let Some(ref reports_to_id) = agent.reports_to {
@@ -207,15 +270,12 @@ fn compute_org_chain_health(agent: &Agent, agent_map: &std::collections::HashMap
                 if manager.status == AgentStatus::Terminated {
                     score -= 0.2; // missing_manager
                 }
-                // TODO: 检查心跳新鲜度 (stale_heartbeat: -0.3)
             }
             None => {
                 score -= 0.2; // missing_manager (manager not found in company)
             }
         }
     }
-
-    // TODO: 检查预算超支 (budget_overrun: -0.5)
 
     score.max(0.0)
 }
@@ -234,6 +294,7 @@ where
     config_revision_repo: Option<Arc<C>>,
     cost_event_repo: Option<Arc<E>>,
     activity_log_repo: Option<Arc<A>>,
+    heartbeat_pool: Option<PgPool>,
 }
 
 impl<R, K, C, E, A> DefaultAgentService<R, K, C, E, A>
@@ -251,6 +312,7 @@ where
             config_revision_repo: None,
             cost_event_repo: None,
             activity_log_repo: None,
+            heartbeat_pool: None,
         }
     }
 
@@ -266,6 +328,11 @@ where
 
     pub fn with_activity_log_repo(mut self, activity_log_repo: Arc<A>) -> Self {
         self.activity_log_repo = Some(activity_log_repo);
+        self
+    }
+
+    pub fn with_heartbeat_pool(mut self, pool: PgPool) -> Self {
+        self.heartbeat_pool = Some(pool);
         self
     }
 
@@ -304,7 +371,8 @@ where
                 };
 
                 repo.create(revision).await.ok()
-            }.await;
+            }
+            .await;
 
             if snapshot_result.is_none() {
                 // TODO: 记录日志警告
@@ -331,7 +399,9 @@ where
             status: input.status.unwrap_or(AgentStatus::Idle),
             adapter_type: input.adapter_type,
             adapter_config: sqlx::types::Json(input.adapter_config),
-            runtime_config: sqlx::types::Json(input.runtime_config.unwrap_or(serde_json::json!({}))),
+            runtime_config: sqlx::types::Json(
+                input.runtime_config.unwrap_or(serde_json::json!({})),
+            ),
             permissions: sqlx::types::Json(input.permissions.unwrap_or_default()),
             metadata: sqlx::types::Json(models::AgentMetadata {
                 is_built_in: None,
@@ -358,11 +428,8 @@ where
         self.capture_snapshot_if_enabled(created_agent.id).await;
 
         // 记录活动日志: agent_hired
-        self.log_activity_if_enabled(
-            Uuid::new_v4(),
-            created_agent.company_id,
-            created_agent.id,
-        ).await;
+        self.log_activity_if_enabled(Uuid::new_v4(), created_agent.company_id, created_agent.id)
+            .await;
 
         Ok(created_agent)
     }
@@ -378,46 +445,53 @@ where
         let key_hash = hex::encode(hasher.finalize());
 
         // Find API key by hash
-        let api_key = self.api_key_repo
+        let api_key = self
+            .api_key_repo
             .find_by_key_hash(&key_hash)
             .await?
             .ok_or_else(|| ServiceError::Unauthorized("Invalid agent key".to_string()))?;
 
         // Verify key is active
         if !api_key.is_active() {
-            return Err(ServiceError::Unauthorized("Agent key is revoked".to_string()));
+            return Err(ServiceError::Unauthorized(
+                "Agent key is revoked".to_string(),
+            ));
         }
 
         // Update last_used_at timestamp (fire-and-forget)
         let _ = self.api_key_repo.update_last_used(api_key.id).await;
 
         // Return the associated agent
-        self.repository.get_by_id(api_key.agent_id).await.map_err(Into::into)
+        self.repository
+            .get_by_id(api_key.agent_id)
+            .await
+            .map_err(Into::into)
     }
 
     async fn list(&self, company_id: Uuid) -> Result<Vec<NormalizedAgentRow>, ServiceError> {
         // Load the filtered set (excludes terminated by default) for the response.
-        let agents = self.repository.list_by_company(
-            company_id,
-            repositories::ListAgentsOptions::default(),
-        ).await?;
+        let agents = self
+            .repository
+            .list_by_company(company_id, repositories::ListAgentsOptions::default())
+            .await?;
 
         // Load ALL company agents (including terminated) once for org-chain health
         // computation — mirrors Paperclip's listCompanyAgentRows pattern.
-        let all_company_agents = self.repository.list_by_company(
-            company_id,
-            repositories::ListAgentsOptions {
-                include_terminated: true,
-                limit: None,
-                offset: None,
-            },
-        ).await?;
+        let all_company_agents = self
+            .repository
+            .list_by_company(
+                company_id,
+                repositories::ListAgentsOptions {
+                    include_terminated: true,
+                    limit: None,
+                    offset: None,
+                },
+            )
+            .await?;
 
         // Build lookup maps for O(1) org-chain traversal.
-        let agent_map: std::collections::HashMap<Uuid, &Agent> = all_company_agents
-            .iter()
-            .map(|a| (a.id, a))
-            .collect();
+        let agent_map: std::collections::HashMap<Uuid, &Agent> =
+            all_company_agents.iter().map(|a| (a.id, a)).collect();
 
         // 获取当前年月用于花费聚合
         let now = Utc::now();
@@ -427,9 +501,12 @@ where
         // 批量聚合花费（如果CostEventRepository已注入）
         let agent_ids: Vec<Uuid> = agents.iter().map(|a| a.id).collect();
         let spend_map = if let Some(ref repo) = self.cost_event_repo {
-            let summaries = repo.aggregate_monthly_spend_batch(agent_ids, year, month).await
+            let summaries = repo
+                .aggregate_monthly_spend_batch(agent_ids, year, month)
+                .await
                 .unwrap_or_default();
-            summaries.into_iter()
+            summaries
+                .into_iter()
                 .map(|s| (s.agent_id, s.total_cost_cents))
                 .collect::<std::collections::HashMap<_, _>>()
         } else {
@@ -471,9 +548,10 @@ where
         if let Some(new_status) = input.status {
             let state_machine = models::AgentStateMachine::new(agent.status);
             if !state_machine.can_transition_to(new_status) {
-                return Err(ServiceError::InvalidInput(
-                    format!("Invalid state transition from {:?} to {:?}", agent.status, new_status)
-                ));
+                return Err(ServiceError::InvalidInput(format!(
+                    "Invalid state transition from {:?} to {:?}",
+                    agent.status, new_status
+                )));
             }
         }
 
@@ -540,7 +618,11 @@ where
         Ok(())
     }
 
-    async fn detect_reporting_cycle(&self, agent_id: Uuid, reports_to: Uuid) -> Result<bool, ServiceError> {
+    async fn detect_reporting_cycle(
+        &self,
+        agent_id: Uuid,
+        reports_to: Uuid,
+    ) -> Result<bool, ServiceError> {
         let mut current = reports_to;
         let mut visited = std::collections::HashSet::new();
         visited.insert(agent_id);
@@ -585,7 +667,6 @@ where
                     if manager.status == AgentStatus::Terminated {
                         score -= 0.2; // missing_manager
                     }
-                    // TODO: 检查心跳新鲜度 (stale_heartbeat: -0.3)
                 }
                 Err(_) => {
                     score -= 0.2; // missing_manager
@@ -593,16 +674,26 @@ where
             }
         }
 
-        // 检查预算超支
-        // TODO: 需要CostEventRepository实现花费查询
-        // if spent_monthly_cents > budget_monthly_cents {
-        //     score -= 0.5; // budget_overrun
-        // }
+        if agent.budget_monthly_cents > 0 {
+            if let Some(cost_repo) = &self.cost_event_repo {
+                let spent = cost_repo
+                    .current_month_spend_by_agent(agent_id)
+                    .await
+                    .map_err(ServiceError::Repository)?;
+                if spent > i64::from(agent.budget_monthly_cents) {
+                    score -= 0.5;
+                }
+            }
+        }
 
         Ok(score.max(0.0))
     }
 
-    async fn rollback_config_revision(&self, agent_id: Uuid, revision_id: Uuid) -> Result<Agent, ServiceError> {
+    async fn rollback_config_revision(
+        &self,
+        agent_id: Uuid,
+        revision_id: Uuid,
+    ) -> Result<Agent, ServiceError> {
         // 获取要回滚的Agent
         let mut agent = self.repository.get_by_id(agent_id).await?;
 
@@ -617,9 +708,9 @@ where
         }
 
         // 获取配置版本快照
-        let config_revision_repo = self.config_revision_repo
-            .as_ref()
-            .ok_or_else(|| ServiceError::NotFound("ConfigRevision repository not available".to_string()))?;
+        let config_revision_repo = self.config_revision_repo.as_ref().ok_or_else(|| {
+            ServiceError::NotFound("ConfigRevision repository not available".to_string())
+        })?;
 
         let revision = config_revision_repo
             .get_by_id(revision_id)
@@ -628,21 +719,25 @@ where
 
         // 验证revision属于该agent
         if revision.agent_id != agent_id {
-            return Err(ServiceError::InvalidInput("Revision does not belong to this agent".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "Revision does not belong to this agent".to_string(),
+            ));
         }
 
         // 解析快照JSON
         let snapshot: crate::ConfigSnapshot = serde_json::from_value(revision.snapshot.0.clone())
-            .map_err(|e| ServiceError::InvalidInput(format!("Invalid snapshot format: {}", e)))?;
+            .map_err(|e| {
+            ServiceError::InvalidInput(format!("Invalid snapshot format: {}", e))
+        })?;
 
         // 应用回滚
         agent.adapter_type = snapshot.adapter_type;
         agent.adapter_config = sqlx::types::Json(snapshot.adapter_config);
         agent.runtime_config = sqlx::types::Json(snapshot.runtime_config);
-        agent.permissions = sqlx::types::Json(
-            serde_json::from_value(snapshot.permissions)
-                .map_err(|e| ServiceError::InvalidInput(format!("Invalid permissions format: {}", e)))?
-        );
+        agent.permissions =
+            sqlx::types::Json(serde_json::from_value(snapshot.permissions).map_err(|e| {
+                ServiceError::InvalidInput(format!("Invalid permissions format: {}", e))
+            })?);
         agent.budget_monthly_cents = snapshot.budget_monthly_cents;
 
         // 更新数据库
@@ -659,7 +754,9 @@ where
         let agent = self.repository.get_by_id(agent_id).await?;
 
         // 解析adapter_config中的desired_skills（如果存在）
-        let desired_skills = agent.adapter_config.0
+        let desired_skills = agent
+            .adapter_config
+            .0
             .get("desired_skills")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -670,8 +767,9 @@ where
             .unwrap_or_default();
 
         // 构建技能条目（简化实现，实际应查询skill表）
-        let entries = desired_skills.iter().map(|name| {
-            models::AgentSkillEntry {
+        let entries = desired_skills
+            .iter()
+            .map(|name| models::AgentSkillEntry {
                 key: name.clone(),
                 runtime_name: Some(name.clone()),
                 version_id: None,
@@ -686,8 +784,8 @@ where
                 source_path: None,
                 target_path: None,
                 detail: None,
-            }
-        }).collect();
+            })
+            .collect();
 
         // 返回技能快照
         Ok(models::AgentSkillSnapshot {
@@ -701,7 +799,10 @@ where
         })
     }
 
-    async fn sync_skills(&self, agent_id: Uuid) -> Result<models::AgentSkillSnapshot, ServiceError> {
+    async fn sync_skills(
+        &self,
+        agent_id: Uuid,
+    ) -> Result<models::AgentSkillSnapshot, ServiceError> {
         self.get_skills(agent_id).await
     }
 
@@ -723,7 +824,11 @@ where
         Ok(agent)
     }
 
-    async fn update_permissions(&self, id: Uuid, permissions: models::AgentPermissions) -> Result<Agent, ServiceError> {
+    async fn update_permissions(
+        &self,
+        id: Uuid,
+        permissions: models::AgentPermissions,
+    ) -> Result<Agent, ServiceError> {
         let mut agent = self.repository.get_by_id(id).await?;
         agent.permissions = sqlx::types::Json(permissions);
         agent.updated_at = Utc::now();
@@ -731,7 +836,11 @@ where
         Ok(agent)
     }
 
-    async fn update_instructions_path(&self, id: Uuid, path: Option<String>) -> Result<Agent, ServiceError> {
+    async fn update_instructions_path(
+        &self,
+        id: Uuid,
+        path: Option<String>,
+    ) -> Result<Agent, ServiceError> {
         let mut agent = self.repository.get_by_id(id).await?;
         agent.metadata = sqlx::types::Json(models::AgentMetadata {
             is_built_in: agent.metadata.is_built_in,
@@ -745,44 +854,143 @@ where
     }
 
     async fn get_instructions_bundle(&self, id: Uuid) -> Result<serde_json::Value, ServiceError> {
-        let _agent = self.repository.get_by_id(id).await?;
-        Ok(serde_json::json!({"instructions": [], "files": []}))
+        let agent = self.repository.get_by_id(id).await?;
+        let bundle = agent.metadata.instructions_bundle.clone().unwrap_or_else(|| serde_json::json!({
+            "entryFile": "AGENTS.md",
+            "files": {}
+        }));
+        validate_bundle(&bundle)?;
+        Ok(bundle)
     }
 
-    async fn update_instructions_bundle(&self, id: Uuid, _bundle: serde_json::Value) -> Result<Agent, ServiceError> {
-        let agent = self.repository.get_by_id(id).await?;
+    async fn update_instructions_bundle(
+        &self,
+        id: Uuid,
+        bundle: serde_json::Value,
+    ) -> Result<Agent, ServiceError> {
+        validate_bundle(&bundle)?;
+        let mut agent = self.repository.get_by_id(id).await?;
+        agent.metadata.0.instructions_bundle = Some(bundle);
+        agent.updated_at = Utc::now();
+        self.repository.update(agent.clone()).await?;
         Ok(agent)
     }
 
-    async fn get_bundle_file(&self, id: Uuid, _file_path: &str) -> Result<String, ServiceError> {
-        let _agent = self.repository.get_by_id(id).await?;
-        Ok(String::new())
+    async fn get_bundle_file(&self, id: Uuid, file_path: &str) -> Result<String, ServiceError> {
+        let path = normalize_bundle_path(file_path)?;
+        let bundle = self.get_instructions_bundle(id).await?;
+        bundle.get("files").and_then(|files| files.get(&path)).and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| ServiceError::NotFound(format!("Instruction file not found: {path}")))
     }
 
-    async fn save_bundle_file(&self, id: Uuid, _file_path: &str, _content: String) -> Result<Agent, ServiceError> {
-        let agent = self.repository.get_by_id(id).await?;
+    async fn save_bundle_file(
+        &self,
+        id: Uuid,
+        file_path: &str,
+        content: String,
+    ) -> Result<Agent, ServiceError> {
+        let path = normalize_bundle_path(file_path)?;
+        let mut agent = self.repository.get_by_id(id).await?;
+        let mut bundle = agent.metadata.instructions_bundle.take().unwrap_or_else(|| serde_json::json!({"entryFile":"AGENTS.md","files":{}}));
+        validate_bundle(&bundle)?;
+        bundle["files"].as_object_mut().expect("validated bundle files object").insert(path.clone(), serde_json::Value::String(content));
+        if bundle.get("entryFile").and_then(|v| v.as_str()).is_none() { bundle["entryFile"] = serde_json::Value::String(path); }
+        agent.metadata.0.instructions_bundle = Some(bundle);
+        agent.updated_at = Utc::now();
+        self.repository.update(agent.clone()).await?;
         Ok(agent)
     }
 
-    async fn delete_bundle_file(&self, id: Uuid, _file_path: &str) -> Result<Agent, ServiceError> {
-        let agent = self.repository.get_by_id(id).await?;
+    async fn delete_bundle_file(&self, id: Uuid, file_path: &str) -> Result<Agent, ServiceError> {
+        let path = normalize_bundle_path(file_path)?;
+        let mut agent = self.repository.get_by_id(id).await?;
+        let mut bundle = agent.metadata.instructions_bundle.take().unwrap_or_else(|| serde_json::json!({"entryFile":"AGENTS.md","files":{}}));
+        validate_bundle(&bundle)?;
+        bundle["files"].as_object_mut().expect("validated bundle files object").remove(&path);
+        agent.metadata.0.instructions_bundle = Some(bundle);
+        agent.updated_at = Utc::now();
+        self.repository.update(agent.clone()).await?;
         Ok(agent)
     }
 
     async fn get_runtime_state(&self, id: Uuid) -> Result<AgentRuntimeState, ServiceError> {
         let agent = self.repository.get_by_id(id).await?;
+        let latest_run = if let Some(pool) = &self.heartbeat_pool {
+            sqlx::query(
+                    "SELECT started_at, context_snapshot
+                     FROM heartbeat_runs
+                     WHERE company_id = $1 AND agent_id = $2
+                     ORDER BY COALESCE(started_at, created_at) DESC, created_at DESC
+                     LIMIT 1",
+                )
+                .bind(agent.company_id)
+                .bind(agent.id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| {
+                    ServiceError::Internal(format!("failed to load latest heartbeat: {e}"))
+                })?
+        } else {
+            None
+        };
+        let last_heartbeat_at = latest_run
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<chrono::DateTime<Utc>>, _>("started_at").ok().flatten());
+        let current_task_id = latest_run
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<serde_json::Value>, _>("context_snapshot").ok().flatten())
+            .and_then(|context| {
+                context
+                    .get("issueId")
+                    .or_else(|| context.get("taskId"))
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| Uuid::parse_str(value).ok())
+            });
         Ok(AgentRuntimeState {
             agent_id: agent.id,
             status: agent.status,
             is_healthy: agent.status != AgentStatus::Terminated,
-            last_heartbeat_at: None,
-            current_task_id: None,
+            last_heartbeat_at,
+            current_task_id,
         })
     }
 
     async fn get_task_sessions(&self, id: Uuid) -> Result<Vec<AgentTaskSession>, ServiceError> {
-        let _agent = self.repository.get_by_id(id).await?;
-        Ok(vec![])
+        let agent = self.repository.get_by_id(id).await?;
+        // Paperclip stores one row per adapter/task key in agent_task_sessions.
+        // Parrot currently has no separate session table, so expose the durable
+        // heartbeat executions as the equivalent session history instead of
+        // returning a misleading empty list.
+        let Some(pool) = &self.heartbeat_pool else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT id, agent_id, status::text AS status,
+                    COALESCE(started_at, created_at) AS started_at,
+                    finished_at, context_snapshot
+             FROM heartbeat_runs
+             WHERE company_id = $1 AND agent_id = $2
+             ORDER BY COALESCE(started_at, created_at) DESC, created_at DESC",
+        )
+        .bind(agent.company_id)
+        .bind(agent.id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ServiceError::Internal(format!("failed to load task sessions: {e}")))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(AgentTaskSession {
+                    id: row.try_get("id").map_err(|e| ServiceError::Internal(e.to_string()))?,
+                    agent_id: row.try_get("agent_id").map_err(|e| ServiceError::Internal(e.to_string()))?,
+                    status: row.try_get("status").map_err(|e| ServiceError::Internal(e.to_string()))?,
+                    started_at: row.try_get("started_at").map_err(|e| ServiceError::Internal(e.to_string()))?,
+                    ended_at: row.try_get("finished_at").map_err(|e| ServiceError::Internal(e.to_string()))?,
+                    metadata: row.try_get("context_snapshot").map_err(|e| ServiceError::Internal(e.to_string()))?,
+                })
+            })
+            .collect()
     }
 
     async fn list_keys(&self, id: Uuid) -> Result<Vec<AgentApiKey>, ServiceError> {
@@ -791,7 +999,12 @@ where
         Ok(keys)
     }
 
-    async fn create_key(&self, id: Uuid, name: String, scope: Option<serde_json::Value>) -> Result<AgentApiKey, ServiceError> {
+    async fn create_key(
+        &self,
+        id: Uuid,
+        name: String,
+        scope: Option<serde_json::Value>,
+    ) -> Result<AgentApiKey, ServiceError> {
         let agent = self.repository.get_by_id(id).await?;
         let raw_key = format!("aak_{}", Uuid::new_v4().simple());
         let mut digest = Sha256::new();
@@ -803,7 +1016,11 @@ where
             company_id: agent.company_id,
             name,
             scope,
-            key_hash: digest.finalize().iter().map(|b| format!("{b:02x}")).collect(),
+            key_hash: digest
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
             last_used_at: None,
             revoked_at: None,
             created_at: Utc::now(),
@@ -818,7 +1035,11 @@ where
         Ok(())
     }
 
-    async fn update_budget(&self, id: Uuid, budget_monthly_cents: i32) -> Result<Agent, ServiceError> {
+    async fn update_budget(
+        &self,
+        id: Uuid,
+        budget_monthly_cents: i32,
+    ) -> Result<Agent, ServiceError> {
         let mut agent = self.repository.get_by_id(id).await?;
         agent.budget_monthly_cents = budget_monthly_cents;
         agent.updated_at = Utc::now();
@@ -852,11 +1073,14 @@ where
         }))
     }
 
-    async fn list_configurations(&self, company_id: Uuid) -> Result<Vec<serde_json::Value>, ServiceError> {
-        let agents = self.repository.list_by_company(
-            company_id,
-            repositories::ListAgentsOptions::default(),
-        ).await?;
+    async fn list_configurations(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<serde_json::Value>, ServiceError> {
+        let agents = self
+            .repository
+            .list_by_company(company_id, repositories::ListAgentsOptions::default())
+            .await?;
         let configs: Vec<serde_json::Value> = agents
             .into_iter()
             .map(|agent| {

@@ -65,7 +65,7 @@ impl DefaultMonitorScheduler {
         Self {
             issue_repo,
             company_repo,
-            config,
+            config: config.clone(),
             running: Arc::new(Mutex::new(false)),
         }
     }
@@ -222,6 +222,7 @@ impl MonitorSchedulerService for DefaultMonitorScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use repositories::board_api_key_repository::RepositoryError as CompanyRepositoryError;
     use repositories::RepositoryError;
 
     #[test]
@@ -230,7 +231,7 @@ mod tests {
         let scheduler = DefaultMonitorScheduler::new(
             Arc::new(MockIssueRepo::new()),
             Arc::new(MockCompanyRepo::new()),
-            config,
+            config.clone(),
         );
 
         // First attempt should be ~5 minutes
@@ -275,28 +276,28 @@ mod tests {
 
     #[async_trait]
     impl CompanyRepository for MockCompanyRepo {
-        async fn find_by_id(&self, _id: Uuid) -> Result<Option<repositories::models::Company>, RepositoryError> {
+        async fn find_by_id(&self, _id: Uuid) -> Result<Option<repositories::models::Company>, CompanyRepositoryError> {
             Ok(None)
         }
         async fn find_by_slug(
             &self,
             _slug: &str,
-        ) -> Result<Option<repositories::models::Company>, RepositoryError> {
+        ) -> Result<Option<repositories::models::Company>, CompanyRepositoryError> {
             Ok(None)
         }
         async fn create(
             &self,
             _company: repositories::models::Company,
-        ) -> Result<repositories::models::Company, RepositoryError> {
+        ) -> Result<repositories::models::Company, CompanyRepositoryError> {
             unimplemented!()
         }
         async fn update(
             &self,
             _company: repositories::models::Company,
-        ) -> Result<repositories::models::Company, RepositoryError> {
+        ) -> Result<repositories::models::Company, CompanyRepositoryError> {
             unimplemented!()
         }
-        async fn list_all(&self) -> Result<Vec<repositories::models::Company>, RepositoryError> {
+        async fn list_all(&self) -> Result<Vec<repositories::models::Company>, CompanyRepositoryError> {
             Ok(vec![])
         }
     }

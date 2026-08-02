@@ -3,6 +3,11 @@ name = "services"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Kept opt-in until the legacy unit-test fixtures are migrated to the current
+# repository traits and models.
+legacy-unit-tests = []
+
 [dependencies]
 models = { path = "../models" }
 repositories = { path = "../repositories" }

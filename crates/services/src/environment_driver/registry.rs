@@ -65,7 +65,6 @@ mod tests {
                 ok: true,
                 driver: self.driver_type,
                 summary: "Mock probe successful".to_string(),
-                details: None,
             })
         }
 

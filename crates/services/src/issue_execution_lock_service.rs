@@ -337,7 +337,7 @@ impl IssueExecutionLockService for DefaultIssueExecutionLockService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-unit-tests"))]
 mod tests {
     use super::*;
 

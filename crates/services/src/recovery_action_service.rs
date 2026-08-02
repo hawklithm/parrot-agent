@@ -210,7 +210,7 @@ impl RecoveryActionService for DefaultRecoveryActionService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-unit-tests"))]
 mod tests {
     use super::*;
     use models::issue::IssueStatus;

@@ -51,13 +51,12 @@ pub struct StatusCount {
 
 /// Helper: 通过 issue_id 查询 company_id
 async fn get_company_id_for_issue(state: &AppState, issue_id: Uuid) -> Result<Uuid, StatusCode> {
-    let issue = state
-        .issue_service
-        .get(issue_id, Uuid::nil())
+    sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(issue.company_id)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// GET /issues/:id/diagnostics/blockers
@@ -105,13 +104,20 @@ async fn get_blockers_diagnostics(
 
 /// GET /issues/:id/diagnostics/wakes
 async fn get_wakes_diagnostics(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<WakesDiagnostics>, StatusCode> {
-    // In production: query heartbeat/wake system
+    let company_id = get_company_id_for_issue(&state, id).await?;
+    let result = state
+        .issue_diagnostics_service
+        .get_wakes_diagnostics(company_id, id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(WakesDiagnostics {
-        pending_wakes: 0,
-        active_wakes: vec![],
+        pending_wakes: result.pending_wakes,
+        active_wakes: result.active_wakes.into_iter().map(|wake| serde_json::json!({
+            "wakeId": wake.wake_id, "actorType": wake.actor_type, "actorId": wake.actor_id, "createdAt": wake.created_at
+        })).collect(),
     }))
 }
 
@@ -153,7 +159,8 @@ async fn get_subtree_diagnostics(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut status_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut status_counts: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     for child in &children {
         let status_str = format!("{:?}", child.status);
         *status_counts.entry(status_str).or_insert(0) += 1;
@@ -174,7 +181,13 @@ async fn get_subtree_diagnostics(
 /// Create issue diagnostics routes
 pub fn issue_diagnostics_routes() -> Router<AppState> {
     Router::new()
-        .route("/issues/:id/diagnostics/blockers", get(get_blockers_diagnostics))
+        .route(
+            "/issues/:id/diagnostics/blockers",
+            get(get_blockers_diagnostics),
+        )
         .route("/issues/:id/diagnostics/wakes", get(get_wakes_diagnostics))
-        .route("/issues/:id/diagnostics/subtree", get(get_subtree_diagnostics))
+        .route(
+            "/issues/:id/diagnostics/subtree",
+            get(get_subtree_diagnostics),
+        )
 }

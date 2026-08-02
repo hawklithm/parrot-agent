@@ -326,7 +326,7 @@ impl<R: RecoveryActionService> EventHandler for IssueCompletedToRecoveryResolveL
     }
 }
 
-// ==================== Service trait placeholders (existing) ====================
+// ==================== Listener service contracts ====================
 
 // RecoveryActionService trait used by the listeners above
 #[async_trait]
@@ -346,6 +346,30 @@ pub use crate::task_watchdog::WatchdogService;
 pub trait IssueService: Send + Sync {
     async fn unblock_by_approval(&self, approval_id: Uuid) -> Result<(), String>;
     async fn create_and_checkout_for_routine(&self, routine_id: Uuid) -> Result<(), String>;
+}
+
+/// Adapter for the database-backed issue service used by the server. Keeping
+/// the listener contract small prevents event delivery from depending on the
+/// HTTP compatibility trait.
+pub struct CompleteIssueServiceAdapter {
+    inner: Arc<dyn crate::issue_service_complete::IssueService>,
+}
+
+impl CompleteIssueServiceAdapter {
+    pub fn new(inner: Arc<dyn crate::issue_service_complete::IssueService>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl IssueService for CompleteIssueServiceAdapter {
+    async fn unblock_by_approval(&self, approval_id: Uuid) -> Result<(), String> {
+        self.inner.unblock_by_approval(approval_id).await.map_err(|e| e.to_string())
+    }
+
+    async fn create_and_checkout_for_routine(&self, routine_id: Uuid) -> Result<(), String> {
+        self.inner.create_and_checkout_for_routine(routine_id).await.map_err(|e| e.to_string())
+    }
 }
 
 #[async_trait]

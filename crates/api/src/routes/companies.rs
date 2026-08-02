@@ -3,7 +3,7 @@
 //! 对应 Company/Org 模块任务 §1.1 ~ §1.3 + §10 API 路由层
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{get, patch, post},
     Json, Router,
@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use models::{Company, CreateCompanyInput, UpdateCompanyInput};
+use services::auth::AuthorizationActor;
 
 pub fn company_routes() -> Router<AppState> {
     Router::new()
@@ -90,7 +91,9 @@ pub fn company_routes() -> Router<AppState> {
             "/companies/:company_id/teams-catalog",
             get(get_teams_catalog),
         )
-        .layer(axum::middleware::from_fn(crate::routes::require_company_access))
+        .layer(axum::middleware::from_fn(
+            crate::routes::require_company_access,
+        ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,10 +152,17 @@ async fn list_companies(
 /// POST /companies
 async fn create_company(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(input): Json<CreateCompanyInput>,
 ) -> Result<(StatusCode, Json<Company>), AppError> {
-    // TODO: Extract creator_user_id from auth context
-    let creator_user_id = Uuid::nil();
+    let creator_user_id = match actor {
+        AuthorizationActor::Board { user_id, .. } => user_id,
+        AuthorizationActor::Agent { .. } | AuthorizationActor::None => {
+            return Err(AppError::Forbidden(
+                "A board user is required to create a company".to_string(),
+            ));
+        }
+    };
     let company = state
         .company_service
         .create(input, creator_user_id)
@@ -223,7 +233,11 @@ async fn get_company_dashboard(
         let count: i64 = row
             .try_get("count")
             .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-        let bucket = if status == "idle" { "active" } else { status.as_str() };
+        let bucket = if status == "idle" {
+            "active"
+        } else {
+            status.as_str()
+        };
         if let Some(value) = agent_counts.get_mut(bucket) {
             *value = serde_json::json!(value.as_i64().unwrap_or(0) + count);
         }
@@ -252,14 +266,18 @@ async fn get_company_dashboard(
             .try_get("count")
             .map_err(|e| AppError::InternalServerError(e.to_string()))?;
         if status == "in_progress" {
-            task_counts["inProgress"] = serde_json::json!(task_counts["inProgress"].as_i64().unwrap_or(0) + count);
+            task_counts["inProgress"] =
+                serde_json::json!(task_counts["inProgress"].as_i64().unwrap_or(0) + count);
         } else if status == "blocked" {
-            task_counts["blocked"] = serde_json::json!(task_counts["blocked"].as_i64().unwrap_or(0) + count);
+            task_counts["blocked"] =
+                serde_json::json!(task_counts["blocked"].as_i64().unwrap_or(0) + count);
         } else if status == "done" {
-            task_counts["done"] = serde_json::json!(task_counts["done"].as_i64().unwrap_or(0) + count);
+            task_counts["done"] =
+                serde_json::json!(task_counts["done"].as_i64().unwrap_or(0) + count);
         }
         if status != "done" && status != "cancelled" {
-            task_counts["open"] = serde_json::json!(task_counts["open"].as_i64().unwrap_or(0) + count);
+            task_counts["open"] =
+                serde_json::json!(task_counts["open"].as_i64().unwrap_or(0) + count);
         }
     }
 
@@ -331,6 +349,7 @@ async fn get_company(
 /// the [`TermService`].
 async fn update_company(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(mut input): Json<UpdateCompanyInput>,
 ) -> Result<Json<Company>, AppError> {
@@ -345,8 +364,14 @@ async fn update_company(
             .ok_or_else(|| AppError::NotFound(format!("Company {} not found", company_id)))?;
 
         if !existing.feedback_data_sharing_enabled {
-            // TODO: Extract user_id from auth context
-            let user_id = Uuid::nil();
+            let user_id = match actor {
+                AuthorizationActor::Board { user_id, .. } => user_id,
+                AuthorizationActor::Agent { .. } | AuthorizationActor::None => {
+                    return Err(AppError::Forbidden(
+                        "A board user is required to update company settings".to_string(),
+                    ));
+                }
+            };
             input.feedback_data_sharing_consent_at = Some(chrono::Utc::now());
             input.feedback_data_sharing_consent_by_user_id = Some(user_id);
             input.feedback_data_sharing_terms_version = input
@@ -420,11 +445,17 @@ async fn update_member_permissions(
     Path((company_id, member_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let role = payload.get("role").or_else(|| payload.get("membershipRole")).and_then(|v| v.as_str()).ok_or_else(|| AppError::BadRequest("role is required".into()))?;
+    let role = payload
+        .get("role")
+        .or_else(|| payload.get("membershipRole"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("role is required".into()))?;
     let result = sqlx::query("UPDATE company_memberships SET role=$1, updated_at=NOW() WHERE id=$2 AND company_id=$3 AND status='active'")
         .bind(role).bind(member_id).bind(company_id).execute(&state.pool).await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    if result.rows_affected() == 0 { return Err(AppError::NotFound("Membership not found".into())); }
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("Membership not found".into()));
+    }
     Ok(Json(
         serde_json::json!({"companyId": company_id, "memberId": member_id, "updated": true}),
     ))
@@ -498,7 +529,9 @@ async fn get_sidebar_preferences(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let prefs = sqlx::query_scalar::<_, serde_json::Value>("SELECT preferences FROM user_preferences WHERE company_id=$1 AND user_id=(SELECT id FROM auth_users ORDER BY created_at LIMIT 1)")
         .bind(company_id).fetch_optional(&state.pool).await.map_err(|e| AppError::InternalServerError(e.to_string()))?.unwrap_or_else(|| serde_json::json!({}));
-    Ok(Json(serde_json::json!({"companyId": company_id, "preferences": prefs})))
+    Ok(Json(
+        serde_json::json!({"companyId": company_id, "preferences": prefs}),
+    ))
 }
 
 /// CM10: PUT /companies/:company_id/sidebar-preferences/me
@@ -507,10 +540,17 @@ async fn update_sidebar_preferences(
     Path(company_id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM auth_users ORDER BY created_at LIMIT 1").fetch_optional(&state.pool).await.map_err(|e| AppError::InternalServerError(e.to_string()))?.ok_or_else(|| AppError::NotFound("Current user not found".into()))?;
+    let user_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM auth_users ORDER BY created_at LIMIT 1")
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("Current user not found".into()))?;
     sqlx::query("INSERT INTO user_preferences(id,user_id,company_id,preferences) VALUES($1,$2,$3,$4) ON CONFLICT(user_id,company_id) DO UPDATE SET preferences=EXCLUDED.preferences, updated_at=NOW()")
         .bind(Uuid::new_v4()).bind(user_id).bind(company_id).bind(&payload).execute(&state.pool).await.map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(serde_json::json!({"companyId": company_id, "preferences": payload, "updated": true})))
+    Ok(Json(
+        serde_json::json!({"companyId": company_id, "preferences": payload, "updated": true}),
+    ))
 }
 
 /// CM11: GET /companies/:company_id/users/:user_slug/profile
@@ -519,9 +559,14 @@ async fn get_user_profile(
     Path((company_id, user_slug)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let row = sqlx::query("SELECT id,name,email,avatar_url FROM auth_users WHERE id::text=$1 OR email=$1 OR name=$1 LIMIT 1").bind(&user_slug).fetch_optional(&state.pool).await.map_err(|e| AppError::InternalServerError(e.to_string()))?.ok_or_else(|| AppError::NotFound("User not found".into()))?;
-    let email = row.get::<String,_>("email");
-    let masked = email.split_once('@').map(|(name,domain)| format!("{}***@{}", name.chars().next().unwrap_or('*'), domain)).unwrap_or_else(|| "***".into());
-    Ok(Json(serde_json::json!({"companyId": company_id, "userSlug": user_slug, "profile": {"id": row.get::<Uuid,_>("id"), "name": row.get::<String,_>("name"), "avatarUrl": row.get::<Option<String>,_>("avatar_url"), "email": masked}})))
+    let email = row.get::<String, _>("email");
+    let masked = email
+        .split_once('@')
+        .map(|(name, domain)| format!("{}***@{}", name.chars().next().unwrap_or('*'), domain))
+        .unwrap_or_else(|| "***".into());
+    Ok(Json(
+        serde_json::json!({"companyId": company_id, "userSlug": user_slug, "profile": {"id": row.get::<Uuid,_>("id"), "name": row.get::<String,_>("name"), "avatarUrl": row.get::<Option<String>,_>("avatar_url"), "email": masked}}),
+    ))
 }
 
 /// POST /companies/:company_id/export
@@ -589,7 +634,10 @@ async fn get_company_timeline(
             .and_then(|value| value.as_str())
             .map(|id| format!("system:{id}"))
             .unwrap_or_else(|| "system:system".to_string());
-        if !actors.iter().any(|actor: &serde_json::Value| actor["id"] == actor_id) {
+        if !actors
+            .iter()
+            .any(|actor: &serde_json::Value| actor["id"] == actor_id)
+        {
             actors.push(serde_json::json!({
                 "id": actor_id,
                 "type": "system",
@@ -597,8 +645,14 @@ async fn get_company_timeline(
                 "avatar": null
             }));
         }
-        let issue_id = event.get("resourceId").cloned().unwrap_or(serde_json::Value::Null);
-        let at = event.get("createdAt").cloned().unwrap_or(serde_json::json!(to));
+        let issue_id = event
+            .get("resourceId")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let at = event
+            .get("createdAt")
+            .cloned()
+            .unwrap_or(serde_json::json!(to));
         let kind = match event.get("eventType").and_then(|value| value.as_str()) {
             Some(value) if value.contains("comment") => "commented",
             Some(value) if value.contains("assign") => "assigned",

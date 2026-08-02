@@ -16,13 +16,8 @@ impl SandboxDriver {
 #[async_trait]
 impl EnvironmentDriverTrait for SandboxDriver {
     async fn probe(&self, _environment: &ExecutionEnvironment) -> Result<EnvironmentProbeResult, DriverError> {
-        // TODO: Implement sandbox provider health check
-        Ok(EnvironmentProbeResult {
-            ok: true,
-            driver: EnvironmentDriver::Sandbox,
-            summary: "Sandbox provider healthy".to_string(),
-            details: None,
-        })
+        let config = sandbox_config(_environment)?;
+        Err(DriverError::ConnectionError(format!("sandbox provider '{}' is not registered; configure a plugin provider before using the legacy driver", config.provider)))
     }
 
     async fn acquire_lease(
@@ -31,16 +26,8 @@ impl EnvironmentDriverTrait for SandboxDriver {
         workspace_id: Option<String>,
         _metadata: Option<JsonValue>,
     ) -> Result<LeaseAcquisitionResult, DriverError> {
-        // TODO: Implement sandbox instance creation
-        Ok(LeaseAcquisitionResult {
-            lease_id: Uuid::new_v4(),
-            provider: "sandbox".to_string(),
-            connection_info: serde_json::json!({
-                "type": "sandbox",
-                "workspace_id": workspace_id,
-            }),
-            expires_at: None,
-        })
+        let config = sandbox_config(environment)?;
+        Err(DriverError::LeaseAcquisitionFailed(format!("sandbox provider '{}' is not registered; no instance was created", config.provider)))
     }
 
     async fn release_lease(
@@ -48,16 +35,21 @@ impl EnvironmentDriverTrait for SandboxDriver {
         _environment: &ExecutionEnvironment,
         _lease_id: Uuid,
     ) -> Result<(), DriverError> {
-        // TODO: Implement sandbox instance destruction
-        Ok(())
+        Err(DriverError::ConnectionError("sandbox lease lifecycle is managed by the registered plugin provider".to_string()))
     }
 
-    async fn ensure_ready(&self, _environment: &ExecutionEnvironment) -> Result<(), DriverError> {
-        // TODO: Implement sandbox environment readiness check
-        Ok(())
+    async fn ensure_ready(&self, environment: &ExecutionEnvironment) -> Result<(), DriverError> {
+        self.probe(environment).await.map(|_| ())
     }
 
     fn driver_type(&self) -> EnvironmentDriver {
         EnvironmentDriver::Sandbox
+    }
+}
+
+fn sandbox_config(environment: &ExecutionEnvironment) -> Result<super::SandboxDriverConfig, DriverError> {
+    match super::resolve_driver_config(environment).map_err(DriverError::ConfigError)? {
+        super::DriverConfig::Sandbox(config) => Ok(config),
+        _ => Err(DriverError::ConfigError("sandbox driver received non-sandbox configuration".to_string())),
     }
 }

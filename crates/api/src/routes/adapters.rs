@@ -8,13 +8,12 @@ use axum::{
 use uuid::Uuid;
 
 use crate::errors::AppError;
-use crate::schemas::{
-    AdapterInfoResponse, AdapterModelResponse, ListAdaptersResponse,
-    TestAdapterEnvironmentRequest, TestAdapterEnvironmentResponse,
-    DetectModelRequest, DetectModelResponse,
-    ModelDetectionStatus,
-};
 use crate::extractors::CompanyIdOrShortname;
+use crate::schemas::{
+    AdapterInfoResponse, AdapterModelResponse, DetectModelRequest, DetectModelResponse,
+    ListAdaptersResponse, ModelDetectionStatus, TestAdapterEnvironmentRequest,
+    TestAdapterEnvironmentResponse,
+};
 
 /// AppState for adapter routes - 别名到统一的 `crate::app_state::AppState`
 pub use crate::app_state::AppState as AdapterAppState;
@@ -23,21 +22,48 @@ pub use crate::app_state::AppState as AdapterAppState;
 pub fn adapter_routes() -> Router<AdapterAppState> {
     Router::new()
         .route("/companies/:company_id/adapters", get(list_adapters))
-        .route("/companies/:company_id/adapters/:adapter_type", get(get_adapter_info))
-        .route("/companies/:company_id/adapters/:adapter_type/models", get(list_models))
-        .route("/companies/:company_id/adapters/:adapter_type/detect-model", get(detect_model_get).post(detect_model))
-        .route("/companies/:company_id/adapters/:adapter_type/model-profiles", get(list_model_profiles))
-        .route("/companies/:company_id/adapters/:adapter_type/test-environment", post(test_environment))
+        .route(
+            "/companies/:company_id/adapters/:adapter_type",
+            get(get_adapter_info),
+        )
+        .route(
+            "/companies/:company_id/adapters/:adapter_type/models",
+            get(list_models),
+        )
+        .route(
+            "/companies/:company_id/adapters/:adapter_type/detect-model",
+            get(detect_model_get).post(detect_model),
+        )
+        .route(
+            "/companies/:company_id/adapters/:adapter_type/model-profiles",
+            get(list_model_profiles),
+        )
+        .route(
+            "/companies/:company_id/adapters/:adapter_type/test-environment",
+            post(test_environment),
+        )
         // --- P1: Adapter 补齐 (E1-E10) ---
         .route("/adapters", get(list_global_adapters))
         .route("/adapters/install", post(install_adapter))
-        .route("/adapters/:adapter_type", get(get_global_adapter_info).patch(update_adapter_config))
-        .route("/adapters/:adapter_type/override", patch(override_adapter_config))
+        .route(
+            "/adapters/:adapter_type",
+            get(get_global_adapter_info).patch(update_adapter_config),
+        )
+        .route(
+            "/adapters/:adapter_type/override",
+            patch(override_adapter_config),
+        )
         .route("/adapters/:adapter_type", delete(delete_adapter))
         .route("/adapters/:adapter_type/reload", post(reload_adapter))
         .route("/adapters/:adapter_type/reinstall", post(reinstall_adapter))
-        .route("/adapters/:adapter_type/config-schema", get(get_adapter_config_schema))
-        .route("/adapters/:adapter_type/ui-parser.js", get(get_adapter_ui_parser))
+        .route(
+            "/adapters/:adapter_type/config-schema",
+            get(get_adapter_config_schema),
+        )
+        .route(
+            "/adapters/:adapter_type/ui-parser.js",
+            get(get_adapter_ui_parser),
+        )
 }
 
 /// GET /companies/:company_id/adapters - 列出所有可用适配器
@@ -63,7 +89,9 @@ async fn list_adapters(
                 adapter_type: adapter.adapter_type().as_str().to_string(),
                 label: adapter.label().to_string(),
                 models,
-                config_schema: None, // TODO: 从 adapter.get_config_schema() 获取
+                config_schema: Some(
+                    serde_json::to_value(adapter.get_config_schema()).unwrap_or_default(),
+                ),
                 supports_instructions_bundle: adapter.supports_instructions_bundle(),
                 instructions_path_key: adapter.instructions_path_key().map(String::from),
                 agent_configuration_doc: Some(adapter.agent_configuration_doc().to_string()),
@@ -97,7 +125,7 @@ async fn get_adapter_info(
         adapter_type: adapter.adapter_type().as_str().to_string(),
         label: adapter.label().to_string(),
         models,
-        config_schema: None, // TODO: 从 adapter.get_config_schema() 获取
+        config_schema: Some(serde_json::to_value(adapter.get_config_schema()).unwrap_or_default()),
         supports_instructions_bundle: adapter.supports_instructions_bundle(),
         instructions_path_key: adapter.instructions_path_key().map(String::from),
         agent_configuration_doc: Some(adapter.agent_configuration_doc().to_string()),
@@ -271,13 +299,10 @@ async fn test_environment(
     };
 
     // 执行环境测试
-    let test_result = adapter
-        .test_environment(&test_context)
-        .await
-        .map_err(|e| {
-            tracing::error!("Adapter environment test failed: {:?}", e);
-            AppError::Internal
-        })?;
+    let test_result = adapter.test_environment(&test_context).await.map_err(|e| {
+        tracing::error!("Adapter environment test failed: {:?}", e);
+        AppError::Internal
+    })?;
 
     // 租约会在 _lease_guard drop 时自动释放
     // 这确保即使测试失败，租约也会被正确释放
@@ -317,13 +342,16 @@ async fn list_global_adapters(
     State(state): State<AdapterAppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let all_adapters = state.adapter_registry.list_all();
-    let adapters: Vec<serde_json::Value> = all_adapters.iter().map(|a| {
-        serde_json::json!({
-            "adapterType": a.adapter_type().as_str(),
-            "label": a.label(),
-            "supportsInstructionsBundle": a.supports_instructions_bundle(),
+    let adapters: Vec<serde_json::Value> = all_adapters
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "adapterType": a.adapter_type().as_str(),
+                "label": a.label(),
+                "supportsInstructionsBundle": a.supports_instructions_bundle(),
+            })
         })
-    }).collect();
+        .collect();
     Ok(Json(adapters))
 }
 
@@ -332,12 +360,18 @@ async fn install_adapter(
     State(_state): State<AdapterAppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    let adapter_type = payload.get("adapterType").and_then(|v| v.as_str()).unwrap_or("unknown");
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "adapterType": adapter_type,
-        "installed": true,
-        "message": format!("Adapter '{}' installation initiated", adapter_type),
-    }))))
+    let adapter_type = payload
+        .get("adapterType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "adapterType": adapter_type,
+            "installed": true,
+            "message": format!("Adapter '{}' installation initiated", adapter_type),
+        })),
+    ))
 }
 
 /// E3: GET /adapters/:adapter_type - 获取全局适配器详情
@@ -416,21 +450,28 @@ async fn reinstall_adapter(
 
 /// E9: GET /adapters/:adapter_type/config-schema - 获取配置 Schema
 async fn get_adapter_config_schema(
-    State(_state): State<AdapterAppState>,
+    State(state): State<AdapterAppState>,
     Path(adapter_type_str): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    let adapter = state.adapter_registry
+        .find_server_adapter(&adapter_type_str)
+        .ok_or_else(|| AppError::NotFound(format!("Adapter \"{}\" is not registered", adapter_type_str)))?;
     Ok(Json(serde_json::json!({
         "adapterType": adapter_type_str,
-        "schema": null,
+        "schema": adapter.get_config_schema(),
     })))
 }
 
 /// E10: GET /adapters/:adapter_type/ui-parser.js - 获取 UI 解析器
 async fn get_adapter_ui_parser(
     State(_state): State<AdapterAppState>,
-    Path(_adapter_type_str): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
-    Ok((StatusCode::OK, "// UI parser not available").into_response())
+    Path(adapter_type_str): Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    // ServerAdapterModule intentionally exposes no executable UI parser. A
+    // 404 matches Paperclip's behavior when an adapter package does not ship
+    // its optional ./ui-parser entry; returning JavaScript that says it is
+    // unavailable causes clients to treat the asset as valid.
+    Err(AppError::NotFound(format!("No UI parser available for adapter \"{}\"", adapter_type_str)))
 }
 
 /// 将模型层的适配器环境测试状态映射到 API 响应枚举
@@ -438,9 +479,15 @@ fn map_adapter_test_status(
     status: models::AdapterEnvironmentTestStatus,
 ) -> crate::schemas::AdapterEnvironmentTestStatus {
     match status {
-        models::AdapterEnvironmentTestStatus::Pass => crate::schemas::AdapterEnvironmentTestStatus::Pass,
-        models::AdapterEnvironmentTestStatus::Fail => crate::schemas::AdapterEnvironmentTestStatus::Fail,
+        models::AdapterEnvironmentTestStatus::Pass => {
+            crate::schemas::AdapterEnvironmentTestStatus::Pass
+        }
+        models::AdapterEnvironmentTestStatus::Fail => {
+            crate::schemas::AdapterEnvironmentTestStatus::Fail
+        }
         models::AdapterEnvironmentTestStatus::Warn
-        | models::AdapterEnvironmentTestStatus::Warning => crate::schemas::AdapterEnvironmentTestStatus::Warning,
+        | models::AdapterEnvironmentTestStatus::Warning => {
+            crate::schemas::AdapterEnvironmentTestStatus::Warning
+        }
     }
 }

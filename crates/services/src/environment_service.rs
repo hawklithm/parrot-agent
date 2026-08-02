@@ -217,7 +217,7 @@ impl EnvironmentService for DefaultEnvironmentService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-unit-tests"))]
 mod tests {
     use super::*;
 

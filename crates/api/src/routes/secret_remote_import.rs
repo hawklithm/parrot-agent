@@ -1,13 +1,12 @@
 use crate::app_state::AppState;
-use axum::{Router, 
-    extract::{Path, State},
+use axum::{
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Json, Router,
 };
-use models::{
-    RemoteSecretImportPreviewRequest, RemoteSecretImportRequest,
-};
+use models::{RemoteSecretImportPreviewRequest, RemoteSecretImportRequest};
+use services::auth::AuthorizationActor;
 use uuid::Uuid;
 
 /// POST /companies/:companyId/secrets/remote-import/preview
@@ -15,11 +14,18 @@ use uuid::Uuid;
 pub async fn preview_remote_import(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(request): Json<RemoteSecretImportPreviewRequest>,
 ) -> Response {
-    // TODO: Add permission check - assertCanManageSecrets
+    if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.secret_remote_import_service.preview(company_id, request).await {
+    match state
+        .secret_remote_import_service
+        .preview(company_id, request)
+        .await
+    {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -30,11 +36,18 @@ pub async fn preview_remote_import(
 pub async fn execute_remote_import(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(request): Json<RemoteSecretImportRequest>,
 ) -> Response {
-    // TODO: Add permission check - assertCanManageSecrets
+    if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.secret_remote_import_service.execute(company_id, request).await {
+    match state
+        .secret_remote_import_service
+        .execute(company_id, request)
+        .await
+    {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

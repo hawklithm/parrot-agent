@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::errors::AppError;
 use crate::routes::agents::AppState;
+use services::auth::{AuthorizationAction, AuthorizationActor};
 
 /// 配置版本查询参数
 #[derive(Debug, Deserialize)]
@@ -44,10 +45,7 @@ pub struct RevisionListResponse {
 /// 创建配置版本路由
 pub fn config_revision_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/agents/:id/config-revisions",
-            get(list_config_revisions),
-        )
+        .route("/agents/:id/config-revisions", get(list_config_revisions))
         .route(
             "/agents/:id/config-revisions/:revision_id",
             get(get_config_revision),
@@ -61,10 +59,11 @@ pub fn config_revision_routes() -> Router<AppState> {
 /// GET /agents/:id/config-revisions - 查询Agent的配置版本列表
 async fn list_config_revisions(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(agent_id): Path<Uuid>,
     Query(params): Query<RevisionListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    // TODO: 验证权限（agent_config:read）
+    assert_agent_config_read(&state, &actor, agent_id).await?;
 
     let revisions = state
         .config_revision_service
@@ -97,9 +96,10 @@ async fn list_config_revisions(
 /// GET /agents/:id/config-revisions/:revision_id - 获取特定配置版本
 async fn get_config_revision(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((agent_id, revision_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, AppError> {
-    // TODO: 验证权限（agent_config:read）
+    assert_agent_config_read(&state, &actor, agent_id).await?;
 
     let revision = state
         .config_revision_service
@@ -128,10 +128,11 @@ async fn get_config_revision(
 /// GET /agents/:id/config-revisions/:revision_id/diff - 比较配置版本差异
 async fn compare_config_revisions(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((agent_id, revision_id)): Path<(Uuid, Uuid)>,
     Query(params): Query<CompareDiffQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    // TODO: 验证权限（agent_config:read）
+    assert_agent_config_read(&state, &actor, agent_id).await?;
 
     let diff = state
         .config_revision_service
@@ -160,4 +161,32 @@ async fn compare_config_revisions(
     }
 
     Ok(Json(diff))
+}
+
+async fn assert_agent_config_read(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    agent_id: Uuid,
+) -> Result<(), AppError> {
+    let company_id = sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| {
+            AppError::InternalServerError(format!("Failed to resolve agent: {error}"))
+        })?
+        .ok_or_else(|| AppError::NotFound(format!("Agent {} not found", agent_id)))?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        actor,
+        &AuthorizationAction::AgentRead { agent_id },
+        Some(company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:read permission".to_string(),
+        ));
+    }
+    Ok(())
 }

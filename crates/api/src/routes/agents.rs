@@ -11,12 +11,11 @@ use uuid::Uuid;
 use crate::errors::AppError;
 use crate::redaction::redact_config;
 use crate::validation::{AgentPermissionsInput, CreateAgentHireSchema, UpdateAgentSchema};
-use access::UserActor;
 use models::{AgentPermissions, AgentStatus, ApprovalType, TrustAuthorizationPolicy, TrustPreset};
-use services::{CreateAgentInput, UpdateAgentInput};
-use services::auth::{AuthorizationAction, AuthorizationActor};
-use services::approval_service::CreateApprovalInput;
 use serde_json::json;
+use services::approval_service::CreateApprovalInput;
+use services::auth::{AuthorizationAction, AuthorizationActor};
+use services::{CreateAgentInput, UpdateAgentInput};
 
 use crate::routes::heartbeats::list_scheduler_heartbeats;
 
@@ -43,17 +42,37 @@ pub fn agent_routes() -> Router<AppState> {
         .route("/agents/me", get(get_current_agent))
         .route("/agents/:id/configuration", get(get_agent_configuration))
         .route("/agents/:id/skills", get(get_agent_skills))
-        .route("/agents/:id/config-revisions/:revision_id/rollback", post(rollback_config))
+        .route(
+            "/agents/:id/config-revisions/:revision_id/rollback",
+            post(rollback_config),
+        )
         .route("/agents/:id/skills/sync", post(sync_agent_skills))
-        .route("/agents/:id/runtime-state/reset-session", post(reset_agent_session))
+        .route(
+            "/agents/:id/runtime-state/reset-session",
+            post(reset_agent_session),
+        )
         // --- P1: Agent 动作 / 子资源 ---
         .route("/agents/:id/runtime-state", get(get_runtime_state))
         .route("/agents/:id/task-sessions", get(get_task_sessions))
         .route("/agents/:id/permissions", patch(update_permissions))
-        .route("/agents/:id/instructions-path", patch(update_instructions_path))
-        .route("/agents/:id/instructions-bundle", get(get_instructions_bundle).patch(patch_instructions_bundle))
-        .route("/agents/:id/instructions-bundle/file", get(get_bundle_file).put(save_bundle_file).delete(delete_bundle_file))
-        .route("/agents/:id/keys", get(list_agent_keys).post(create_agent_key))
+        .route(
+            "/agents/:id/instructions-path",
+            patch(update_instructions_path),
+        )
+        .route(
+            "/agents/:id/instructions-bundle",
+            get(get_instructions_bundle).patch(patch_instructions_bundle),
+        )
+        .route(
+            "/agents/:id/instructions-bundle/file",
+            get(get_bundle_file)
+                .put(save_bundle_file)
+                .delete(delete_bundle_file),
+        )
+        .route(
+            "/agents/:id/keys",
+            get(list_agent_keys).post(create_agent_key),
+        )
         .route("/agents/:id/keys/:key_id", delete(revoke_agent_key))
         .route("/agents/:id/pause", post(pause_agent))
         .route("/agents/:id/resume", post(resume_agent))
@@ -67,24 +86,24 @@ pub fn agent_routes() -> Router<AppState> {
         // --- P1.1: 补齐缺失接口 (A1-A6) ---
         .route("/agents/:id/claude-login", post(claude_login))
         .route("/agents/:id/heartbeat/invoke", post(heartbeat_invoke))
-        .route("/companies/:company_id/agent-configurations", get(list_agent_configurations))
-        .route("/instance/scheduler-heartbeats", get(list_scheduler_heartbeats))
+        .route(
+            "/companies/:company_id/agent-configurations",
+            get(list_agent_configurations),
+        )
+        .route(
+            "/instance/scheduler-heartbeats",
+            get(list_scheduler_heartbeats),
+        )
 }
 
 /// GET /companies/:company_id/agents - 列出公司的所有Agent
 async fn list_agents(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    // TODO: 从请求中提取Actor
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id,
-        is_admin: true,
-    };
-
-    // 验证公司访问权限
-    state.access_service.assert_company_access(&actor, company_id).await?;
+    crate::routes::assert_company_access(&auth_actor, company_id, true)
+        .map_err(|error| AppError::Forbidden(error.to_string()))?;
 
     // 查询Agent列表
     let agents = state.agent_service.list(company_id).await?;
@@ -100,7 +119,9 @@ async fn create_agent(
     Json(payload): Json<CreateAgentHireSchema>,
 ) -> Result<impl IntoResponse, AppError> {
     // 验证请求
-    payload.validate(&()).map_err(|e| AppError::Validation(e.to_string()))?;
+    payload
+        .validate(&())
+        .map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Use the actor resolved by the global auth middleware. This matches
     // Paperclip's assertCanCreateAgentsForCompany behavior, including the
@@ -163,14 +184,10 @@ async fn create_agent(
         reports_to: payload.reports_to,
     };
 
-    let agent = state
-        .agent_service
-        .create(input)
-        .await
-        .map_err(|error| {
-            tracing::error!(error = %error, "agent hire failed while creating agent");
-            error
-        })?;
+    let agent = state.agent_service.create(input).await.map_err(|error| {
+        tracing::error!(error = %error, "agent hire failed while creating agent");
+        error
+    })?;
 
     let approval = if requires_approval {
         let approval_payload = json!({
@@ -236,6 +253,7 @@ async fn create_agent(
 /// GET /agents/:id - 获取Agent详情
 async fn get_agent(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(raw_id): Path<String>,
     Query(query): Query<AgentReferenceQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -260,13 +278,18 @@ async fn get_agent(
             .bind(&slug)
             .fetch_all(&state.pool)
             .await
-            .map_err(|error| AppError::InternalServerError(format!("Failed to resolve agent reference: {error}")))?;
+            .map_err(|error| {
+                AppError::InternalServerError(format!("Failed to resolve agent reference: {error}"))
+            })?;
             match matches.as_slice() {
                 [] => return Err(AppError::NotFound("Agent not found".to_string())),
                 [id] => *id,
-                _ => return Err(AppError::Conflict(
-                    "Agent shortname is ambiguous in this company. Use the agent ID.".to_string(),
-                )),
+                _ => {
+                    return Err(AppError::Conflict(
+                        "Agent shortname is ambiguous in this company. Use the agent ID."
+                            .to_string(),
+                    ))
+                }
             }
         }
     };
@@ -289,14 +312,18 @@ async fn get_agent(
 
     let agent = state.agent_service.get_by_id(id).await?;
 
-    // TODO: 从请求中提取Actor并验证读取权限
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id: agent.company_id,
-        is_admin: true,
-    };
-
-    state.access_service.assert_agent_read_allowed(&actor, id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentRead { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:read permission".to_string(),
+        ));
+    }
 
     Ok(Json(agent))
 }
@@ -304,24 +331,30 @@ async fn get_agent(
 /// PATCH /agents/:id - 更新Agent
 async fn update_agent(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateAgentSchema>,
 ) -> Result<impl IntoResponse, AppError> {
     // 验证请求
-    payload.validate(&()).map_err(|e| AppError::Validation(e.to_string()))?;
+    payload
+        .validate(&())
+        .map_err(|e| AppError::Validation(e.to_string()))?;
 
     // 查询现有Agent
     let agent = state.agent_service.get_by_id(id).await?;
 
-    // TODO: 从请求中提取Actor
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id: agent.company_id,
-        is_admin: true,
-    };
-
-    // 验证更新权限
-    state.access_service.assert_can_update_agent(&actor, id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentUpdate { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:update permission".to_string(),
+        ));
+    }
 
     // 更新Agent
     let input = UpdateAgentInput {
@@ -342,20 +375,24 @@ async fn update_agent(
 /// DELETE /agents/:id - 删除Agent（软删除）
 async fn delete_agent(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     // 查询现有Agent
     let agent = state.agent_service.get_by_id(id).await?;
 
-    // TODO: 从请求中提取Actor
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id: agent.company_id,
-        is_admin: true,
-    };
-
-    // 验证删除权限
-    state.access_service.assert_can_update_agent(&actor, id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentDelete { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:delete permission".to_string(),
+        ));
+    }
 
     // 删除Agent
     state.agent_service.delete(id).await?;
@@ -376,7 +413,9 @@ async fn get_current_agent(
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| AppError::BadRequest("Missing or invalid Authorization header".to_string()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest("Missing or invalid Authorization header".to_string())
+        })?;
 
     let agent = state.agent_service.get_me(agent_key).await?;
 
@@ -386,26 +425,28 @@ async fn get_current_agent(
 /// GET /agents/:id/configuration - 获取Agent的脱敏配置
 async fn get_agent_configuration(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     // 查询Agent
     let agent = state.agent_service.get_by_id(id).await?;
 
-    // TODO: 从请求中提取Actor
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id: agent.company_id,
-        is_admin: true,
-    };
-
-    // 验证配置读取权限
-    state.access_service.assert_agent_read_allowed(&actor, id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentRead { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:read permission".to_string(),
+        ));
+    }
 
     // 构建配置对象并脱敏
-    let adapter_config_value = serde_json::to_value(&agent.adapter_config)
-        .unwrap_or(json!({}));
-    let runtime_config_value = serde_json::to_value(&agent.runtime_config)
-        .unwrap_or(json!({}));
+    let adapter_config_value = serde_json::to_value(&agent.adapter_config).unwrap_or(json!({}));
+    let runtime_config_value = serde_json::to_value(&agent.runtime_config).unwrap_or(json!({}));
 
     let redacted_config = json!({
         "id": agent.id,
@@ -423,20 +464,24 @@ async fn get_agent_configuration(
 /// GET /agents/:id/skills - 获取Agent技能快照
 async fn get_agent_skills(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     // 查询Agent
     let agent = state.agent_service.get_by_id(id).await?;
 
-    // TODO: 从请求中提取Actor
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id: agent.company_id,
-        is_admin: true,
-    };
-
-    // 验证配置读取权限
-    state.access_service.assert_agent_read_allowed(&actor, id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentRead { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:read permission".to_string(),
+        ));
+    }
 
     // 获取技能快照
     let snapshot = state.agent_service.get_skills(id).await?;
@@ -447,23 +492,30 @@ async fn get_agent_skills(
 /// POST /agents/:id/config-revisions/:revision_id/rollback - 回滚配置到指定版本
 async fn rollback_config(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path((agent_id, revision_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, AppError> {
     // 查询现有Agent
     let agent = state.agent_service.get_by_id(agent_id).await?;
 
-    // TODO: 从请求中提取Actor
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id: agent.company_id,
-        is_admin: true,
-    };
-
-    // 验证更新权限
-    state.access_service.assert_can_update_agent(&actor, agent_id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentUpdate { agent_id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:update permission".to_string(),
+        ));
+    }
 
     // 执行回滚
-    let updated_agent = state.agent_service.rollback_config_revision(agent_id, revision_id).await?;
+    let updated_agent = state
+        .agent_service
+        .rollback_config_revision(agent_id, revision_id)
+        .await?;
 
     Ok(Json(updated_agent))
 }
@@ -471,20 +523,24 @@ async fn rollback_config(
 /// POST /agents/:id/skills/sync - 同步Agent技能列表
 async fn sync_agent_skills(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(agent_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     // 查询现有Agent
     let agent = state.agent_service.get_by_id(agent_id).await?;
 
-    // TODO: 从请求中提取Actor
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id: agent.company_id,
-        is_admin: true,
-    };
-
-    // 验证更新权限
-    state.access_service.assert_can_update_agent(&actor, agent_id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentUpdate { agent_id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:update permission".to_string(),
+        ));
+    }
 
     // 同步技能
     let skills = state.agent_service.sync_skills(agent_id).await?;
@@ -495,20 +551,24 @@ async fn sync_agent_skills(
 /// POST /agents/:id/runtime-state/reset-session - 重置Agent会话
 async fn reset_agent_session(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(agent_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     // 查询现有Agent
     let agent = state.agent_service.get_by_id(agent_id).await?;
 
-    // TODO: 从请求中提取Actor（Board管理员）
-    let actor = UserActor {
-        user_id: Uuid::new_v4(),
-        company_id: agent.company_id,
-        is_admin: true,
-    };
-
-    // 验证更新权限
-    state.access_service.assert_can_update_agent(&actor, agent_id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentUpdate { agent_id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:update permission".to_string(),
+        ));
+    }
 
     // 重置会话
     state.agent_service.reset_session(agent_id).await?;
@@ -564,9 +624,17 @@ async fn update_permissions(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    let permissions = payload.get("permissions")
+    let permissions = payload
+        .get("permissions")
         .ok_or_else(|| AppError::BadRequest("Missing 'permissions' field".to_string()))?;
-    let agent = state.agent_service.update_permissions(id, serde_json::from_value(permissions.clone()).map_err(|e| AppError::BadRequest(e.to_string()))?).await?;
+    let agent = state
+        .agent_service
+        .update_permissions(
+            id,
+            serde_json::from_value(permissions.clone())
+                .map_err(|e| AppError::BadRequest(e.to_string()))?,
+        )
+        .await?;
     Ok(Json(agent))
 }
 
@@ -576,11 +644,15 @@ async fn update_instructions_path(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    let path = payload.get("instructionsPath")
+    let path = payload
+        .get("instructionsPath")
         .or_else(|| payload.get("instructions_path"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    let agent = state.agent_service.update_instructions_path(id, path).await?;
+    let agent = state
+        .agent_service
+        .update_instructions_path(id, path)
+        .await?;
     Ok(Json(agent))
 }
 
@@ -599,7 +671,10 @@ async fn patch_instructions_bundle(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state.agent_service.update_instructions_bundle(id, payload).await?;
+    let agent = state
+        .agent_service
+        .update_instructions_bundle(id, payload)
+        .await?;
     Ok(Json(agent))
 }
 
@@ -607,10 +682,14 @@ async fn patch_instructions_bundle(
 async fn get_bundle_file(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<InstructionsFileQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    // TODO: 从 query string 提取 file_path
-    let content = state.agent_service.get_bundle_file(id, "default.md").await?;
-    Ok(Json(serde_json::json!({"content": content})))
+    let path = required_instruction_path(query.path)?;
+    let content = state
+        .agent_service
+        .get_bundle_file(id, &path)
+        .await?;
+    Ok(Json(serde_json::json!({"path": path, "content": content})))
 }
 
 /// PUT /agents/:id/instructions-bundle/file - 保存指令文件
@@ -619,11 +698,19 @@ async fn save_bundle_file(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    let content = payload.get("content")
+    let path = payload
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("Missing 'path' field".to_string()))?;
+    let content = payload
+        .get("content")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Missing 'content' field".to_string()))?
         .to_string();
-    let agent = state.agent_service.save_bundle_file(id, "default.md", content).await?;
+    let agent = state
+        .agent_service
+        .save_bundle_file(id, path, content)
+        .await?;
     Ok(Json(agent))
 }
 
@@ -631,9 +718,23 @@ async fn save_bundle_file(
 async fn delete_bundle_file(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<InstructionsFileQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state.agent_service.delete_bundle_file(id, "default.md").await?;
+    let path = required_instruction_path(query.path)?;
+    let agent = state
+        .agent_service
+        .delete_bundle_file(id, &path)
+        .await?;
     Ok(Json(agent))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InstructionsFileQuery { path: Option<String> }
+
+fn required_instruction_path(path: Option<String>) -> Result<String, AppError> {
+    let path = path.ok_or_else(|| AppError::Validation("Query parameter 'path' is required".to_string()))?;
+    if path.trim().is_empty() { return Err(AppError::Validation("Query parameter 'path' is required".to_string())); }
+    Ok(path)
 }
 
 /// GET /agents/:id/keys - 列出 API Key
@@ -644,16 +745,18 @@ async fn list_agent_keys(
     let keys = state.agent_service.list_keys(id).await?;
     let response: Vec<serde_json::Value> = keys
         .into_iter()
-        .map(|key| serde_json::json!({
-            "id": key.id,
-            "agentId": key.agent_id,
-            "companyId": key.company_id,
-            "name": key.name,
-            "scope": key.scope,
-            "lastUsedAt": key.last_used_at,
-            "revokedAt": key.revoked_at,
-            "createdAt": key.created_at,
-        }))
+        .map(|key| {
+            serde_json::json!({
+                "id": key.id,
+                "agentId": key.agent_id,
+                "companyId": key.company_id,
+                "name": key.name,
+                "scope": key.scope,
+                "lastUsedAt": key.last_used_at,
+                "revokedAt": key.revoked_at,
+                "createdAt": key.created_at,
+            })
+        })
         .collect();
     Ok(Json(response))
 }
@@ -664,21 +767,33 @@ async fn create_agent_key(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    let name = payload.get("name")
+    let name = payload
+        .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Missing 'name' field".to_string()))?
         .to_string();
     let scope = payload.get("scope").cloned();
     if let Some(ref value) = scope {
-        let kind = value.get("scope_type").and_then(|v| v.as_str()).unwrap_or("standard");
+        let kind = value
+            .get("scope_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("standard");
         if !matches!(kind, "standard" | "task_bridge" | "skill_test") {
-            return Err(AppError::BadRequest("Invalid agent key scope_type".to_string()));
+            return Err(AppError::BadRequest(
+                "Invalid agent key scope_type".to_string(),
+            ));
         }
-        if kind == "task_bridge" && (value.get("project_id").is_none() || value.get("parent_issue_id").is_none()) {
-            return Err(AppError::BadRequest("task_bridge scope requires project_id and parent_issue_id".to_string()));
+        if kind == "task_bridge"
+            && (value.get("project_id").is_none() || value.get("parent_issue_id").is_none())
+        {
+            return Err(AppError::BadRequest(
+                "task_bridge scope requires project_id and parent_issue_id".to_string(),
+            ));
         }
         if kind == "skill_test" && value.get("issue_id").is_none() {
-            return Err(AppError::BadRequest("skill_test scope requires issue_id".to_string()));
+            return Err(AppError::BadRequest(
+                "skill_test scope requires issue_id".to_string(),
+            ));
         }
     }
     let key = state.agent_service.create_key(id, name, scope).await?;
@@ -699,7 +814,10 @@ async fn pause_agent(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state.agent_service.set_status(id, AgentStatus::Paused).await?;
+    let agent = state
+        .agent_service
+        .set_status(id, AgentStatus::Paused)
+        .await?;
     Ok(Json(agent))
 }
 
@@ -708,7 +826,10 @@ async fn resume_agent(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state.agent_service.set_status(id, AgentStatus::Running).await?;
+    let agent = state
+        .agent_service
+        .set_status(id, AgentStatus::Running)
+        .await?;
     Ok(Json(agent))
 }
 
@@ -717,7 +838,10 @@ async fn clear_error_agent(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state.agent_service.set_status(id, AgentStatus::Idle).await?;
+    let agent = state
+        .agent_service
+        .set_status(id, AgentStatus::Idle)
+        .await?;
     Ok(Json(agent))
 }
 
@@ -726,7 +850,10 @@ async fn approve_agent(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state.agent_service.set_status(id, AgentStatus::Idle).await?;
+    let agent = state
+        .agent_service
+        .set_status(id, AgentStatus::Idle)
+        .await?;
     Ok(Json(agent))
 }
 
@@ -735,7 +862,10 @@ async fn terminate_agent(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state.agent_service.set_status(id, AgentStatus::Terminated).await?;
+    let agent = state
+        .agent_service
+        .set_status(id, AgentStatus::Terminated)
+        .await?;
     Ok(Json(agent))
 }
 
@@ -749,7 +879,10 @@ async fn wakeup_agent(
         .bind(agent.company_id).bind(id).fetch_optional(&state.pool).await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?
         .ok_or_else(|| AppError::BadRequest("Agent has no assigned executable issue".to_string()))?;
-    state.heartbeat_service.wakeup(id, issue_id, agent.company_id).await
+    state
+        .heartbeat_service
+        .wakeup(id, issue_id, agent.company_id)
+        .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     Ok(Json(state.agent_service.get_by_id(id).await?))
 }
@@ -764,8 +897,12 @@ async fn update_budget(
         .get("budgetMonthlyCents")
         .or_else(|| payload.get("budget_monthly_cents"))
         .and_then(|v| v.as_i64())
-        .ok_or_else(|| AppError::BadRequest("Missing 'budgetMonthlyCents' field".to_string()))? as i32;
-    let agent = state.agent_service.update_budget(id, budget_monthly_cents).await?;
+        .ok_or_else(|| AppError::BadRequest("Missing 'budgetMonthlyCents' field".to_string()))?
+        as i32;
+    let agent = state
+        .agent_service
+        .update_budget(id, budget_monthly_cents)
+        .await?;
     Ok(Json(agent))
 }
 
@@ -810,7 +947,10 @@ async fn heartbeat_invoke(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let agent = state.agent_service.get_by_id(id).await?;
-    let evaluated = state.watchdog_service.evaluate_all(agent.company_id).await
+    let evaluated = state
+        .watchdog_service
+        .evaluate_all(agent.company_id)
+        .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     // A direct invoke is still a real execution request. With no issue id the
     // coordinator uses the agent's latest assigned issue, if one exists.
@@ -818,7 +958,10 @@ async fn heartbeat_invoke(
         .bind(agent.company_id).bind(id).fetch_optional(&state.pool).await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     if let Some(issue_id) = issue_id {
-        state.heartbeat_service.wakeup(id, issue_id, agent.company_id).await
+        state
+            .heartbeat_service
+            .wakeup(id, issue_id, agent.company_id)
+            .await
             .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     }
     Ok(Json(serde_json::json!({

@@ -1,25 +1,61 @@
 use crate::app_state::AppState;
-use axum::{Router, 
-    extract::{Path, State},
+use axum::{
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Json, Router,
 };
 use models::{
-    CreateSecretProviderConfigRequest,
-    SecretProviderConfigDiscoveryPreviewRequest, UpdateSecretProviderConfigRequest,
+    CreateSecretProviderConfigRequest, SecretProviderConfigDiscoveryPreviewRequest,
+    UpdateSecretProviderConfigRequest,
 };
+use services::auth::AuthorizationActor;
 use uuid::Uuid;
+
+async fn allow_company(
+    _state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    write: bool,
+) -> bool {
+    crate::routes::assert_company_access(actor, company_id, write).is_ok()
+}
+
+async fn allow_config(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    config_id: Uuid,
+    write: bool,
+) -> bool {
+    let company_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT company_id FROM secret_provider_configs WHERE id = $1",
+    )
+    .bind(config_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+    company_id
+        .map(|id| crate::routes::assert_company_access(actor, id, write).is_ok())
+        .unwrap_or(false)
+}
 
 /// GET /companies/:companyId/secret-provider-configs
 /// List all provider configurations for a company
 pub async fn list_configs(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
-    // TODO: Add permission check - user must be company member
+    if !allow_company(&state, &actor, company_id, false).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.secret_provider_config_service.list_configs(company_id).await {
+    match state
+        .secret_provider_config_service
+        .list_configs(company_id)
+        .await
+    {
         Ok(configs) => (StatusCode::OK, Json(configs)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -30,11 +66,18 @@ pub async fn list_configs(
 pub async fn discovery_preview(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(request): Json<SecretProviderConfigDiscoveryPreviewRequest>,
 ) -> Response {
-    // TODO: Add permission check - assertCanManageSecrets
+    if !allow_company(&state, &actor, company_id, true).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.secret_provider_config_service.discovery_preview(company_id, request).await {
+    match state
+        .secret_provider_config_service
+        .discovery_preview(company_id, request)
+        .await
+    {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -45,11 +88,18 @@ pub async fn discovery_preview(
 pub async fn create_config(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(request): Json<CreateSecretProviderConfigRequest>,
 ) -> Response {
-    // TODO: Add permission check - assertCanManageSecrets
+    if !allow_company(&state, &actor, company_id, true).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.secret_provider_config_service.create_config(company_id, request).await {
+    match state
+        .secret_provider_config_service
+        .create_config(company_id, request)
+        .await
+    {
         Ok(config) => (StatusCode::CREATED, Json(config)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -60,8 +110,16 @@ pub async fn create_config(
 pub async fn get_config(
     Path(config_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
-    match state.secret_provider_config_service.get_config(config_id).await {
+    if !allow_config(&state, &actor, config_id, false).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match state
+        .secret_provider_config_service
+        .get_config(config_id)
+        .await
+    {
         Ok(config) => (StatusCode::OK, Json(config)).into_response(),
         Err(e) => match e {
             services::errors::ServiceError::NotFound(_) => {
@@ -77,11 +135,18 @@ pub async fn get_config(
 pub async fn update_config(
     Path(config_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(request): Json<UpdateSecretProviderConfigRequest>,
 ) -> Response {
-    // TODO: Add permission check - assertCanManageSecrets
+    if !allow_config(&state, &actor, config_id, true).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.secret_provider_config_service.update_config(config_id, request).await {
+    match state
+        .secret_provider_config_service
+        .update_config(config_id, request)
+        .await
+    {
         Ok(config) => (StatusCode::OK, Json(config)).into_response(),
         Err(e) => match e {
             services::errors::ServiceError::NotFound(_) => {
@@ -97,10 +162,17 @@ pub async fn update_config(
 pub async fn delete_config(
     Path(config_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
-    // TODO: Add permission check - assertCanManageSecrets
+    if !allow_config(&state, &actor, config_id, true).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.secret_provider_config_service.delete_config(config_id).await {
+    match state
+        .secret_provider_config_service
+        .delete_config(config_id)
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => match e {
             services::errors::ServiceError::NotFound(_) => {
@@ -116,10 +188,17 @@ pub async fn delete_config(
 pub async fn set_default(
     Path(config_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
-    // TODO: Add permission check - assertCanManageSecrets
+    if !allow_config(&state, &actor, config_id, true).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.secret_provider_config_service.set_default(config_id).await {
+    match state
+        .secret_provider_config_service
+        .set_default(config_id)
+        .await
+    {
         Ok(config) => (StatusCode::OK, Json(config)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -130,8 +209,16 @@ pub async fn set_default(
 pub async fn health_check(
     Path(config_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
-    match state.secret_provider_config_service.health_check(config_id).await {
+    if !allow_config(&state, &actor, config_id, false).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match state
+        .secret_provider_config_service
+        .health_check(config_id)
+        .await
+    {
         Ok(health) => (StatusCode::OK, Json(health)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -142,8 +229,16 @@ pub async fn health_check(
 pub async fn company_health(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
-    match state.secret_provider_config_service.company_health(company_id).await {
+    if !allow_company(&state, &actor, company_id, false).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match state
+        .secret_provider_config_service
+        .company_health(company_id)
+        .await
+    {
         Ok(health_list) => (StatusCode::OK, Json(health_list)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

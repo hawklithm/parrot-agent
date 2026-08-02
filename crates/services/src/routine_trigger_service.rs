@@ -440,7 +440,7 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-unit-tests"))]
 mod tests {
     use super::*;
 

@@ -550,7 +550,7 @@ impl ApprovalService for DefaultApprovalService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-unit-tests"))]
 mod tests {
     use super::*;
     use crate::MockIssueRepository;

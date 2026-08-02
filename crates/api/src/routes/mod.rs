@@ -5,7 +5,6 @@ pub mod attachments;
 pub mod auth;
 pub mod built_in_agents;
 pub mod cases;
-pub mod comments;
 pub mod companies;
 pub mod config_revisions;
 pub mod custom_image_setup;
@@ -29,7 +28,6 @@ pub mod secret_remote_import;
 pub mod secrets;
 pub mod skills;
 pub mod sse;
-pub mod tree_control;
 pub mod tools;
 pub mod user_directory;
 pub mod user_secret_definitions;
@@ -70,11 +68,28 @@ pub async fn require_cloud_company_access(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use services::auth::AuthorizationActor;
-    let Some(actor) = request.extensions().get::<AuthorizationActor>() else { return axum::http::StatusCode::UNAUTHORIZED.into_response(); };
-    if actor.is_anonymous() { return axum::http::StatusCode::UNAUTHORIZED.into_response(); }
-    if let Some(raw) = request.uri().query().and_then(|query| query.split('&').find_map(|part| part.strip_prefix("companyId=").or_else(|| part.strip_prefix("company_id=")))) {
+    let Some(actor) = request.extensions().get::<AuthorizationActor>() else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    if actor.is_anonymous() {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(raw) = request.uri().query().and_then(|query| {
+        query.split('&').find_map(|part| {
+            part.strip_prefix("companyId=")
+                .or_else(|| part.strip_prefix("company_id="))
+        })
+    }) {
         if let Ok(company_id) = uuid::Uuid::parse_str(raw) {
-            if assert_company_access(actor, company_id, request.method() == axum::http::Method::GET).is_err() { return axum::http::StatusCode::FORBIDDEN.into_response(); }
+            if assert_company_access(
+                actor,
+                company_id,
+                request.method() == axum::http::Method::GET,
+            )
+            .is_err()
+            {
+                return axum::http::StatusCode::FORBIDDEN.into_response();
+            }
         }
     }
     next.run(request).await
@@ -89,7 +104,9 @@ pub async fn require_plugin_access(
     let Some(actor) = request.extensions().get::<AuthorizationActor>() else {
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
     };
-    if actor.is_anonymous() { return axum::http::StatusCode::UNAUTHORIZED.into_response(); }
+    if actor.is_anonymous() {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
     let path = request.uri().path();
     let method = request.method().as_str();
     let mutation_admin = method == "DELETE"
@@ -97,9 +114,8 @@ pub async fn require_plugin_access(
         || path.ends_with("/enable")
         || path.ends_with("/disable")
         || path.ends_with("/upgrade");
-    let agent_allowed = path == "/plugins/tools/execute"
-        || path.contains("/bridge/")
-        || path.contains("/actions/");
+    let agent_allowed =
+        path == "/plugins/tools/execute" || path.contains("/bridge/") || path.contains("/actions/");
     if mutation_admin && assert_instance_admin(actor).is_err() {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
@@ -118,11 +134,25 @@ pub async fn require_company_access(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use services::auth::AuthorizationActor;
-    let Some(actor) = request.extensions().get::<AuthorizationActor>() else { return axum::http::StatusCode::UNAUTHORIZED.into_response(); };
-    if actor.is_anonymous() { return axum::http::StatusCode::UNAUTHORIZED.into_response(); }
-    let company_id = request.uri().path().split('/').find_map(|part| uuid::Uuid::parse_str(part).ok());
+    let Some(actor) = request.extensions().get::<AuthorizationActor>() else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    if actor.is_anonymous() {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
+    let company_id = request
+        .uri()
+        .path()
+        .split('/')
+        .find_map(|part| uuid::Uuid::parse_str(part).ok());
     if let Some(company_id) = company_id {
-        if assert_company_access(actor, company_id, request.method() == axum::http::Method::GET).is_err() {
+        if assert_company_access(
+            actor,
+            company_id,
+            request.method() == axum::http::Method::GET,
+        )
+        .is_err()
+        {
             return axum::http::StatusCode::FORBIDDEN.into_response();
         }
     }
@@ -146,20 +176,39 @@ pub fn assert_company_access(
     if actor.is_anonymous() || !has_company_access {
         return Err(axum::http::StatusCode::FORBIDDEN);
     }
-    if !read_only && actor.role_in(company_id).is_some_and(|role| role.is_read_only()) { return Err(axum::http::StatusCode::FORBIDDEN); }
+    if !read_only
+        && actor
+            .role_in(company_id)
+            .is_some_and(|role| role.is_read_only())
+    {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
     Ok(())
 }
 
-pub fn assert_board(actor: &services::auth::AuthorizationActor) -> Result<(), axum::http::StatusCode> {
-    actor.is_board().then_some(()).ok_or(axum::http::StatusCode::FORBIDDEN)
+pub fn assert_board(
+    actor: &services::auth::AuthorizationActor,
+) -> Result<(), axum::http::StatusCode> {
+    actor
+        .is_board()
+        .then_some(())
+        .ok_or(axum::http::StatusCode::FORBIDDEN)
 }
 
-pub fn assert_instance_admin(actor: &services::auth::AuthorizationActor) -> Result<(), axum::http::StatusCode> {
-    (actor.is_instance_admin() || actor.is_board() && actor.company_id() == Some(uuid::Uuid::nil())).then_some(()).ok_or(axum::http::StatusCode::FORBIDDEN)
+pub fn assert_instance_admin(
+    actor: &services::auth::AuthorizationActor,
+) -> Result<(), axum::http::StatusCode> {
+    (actor.is_instance_admin() || actor.is_board() && actor.company_id() == Some(uuid::Uuid::nil()))
+        .then_some(())
+        .ok_or(axum::http::StatusCode::FORBIDDEN)
 }
 
-pub fn assert_board_or_agent(actor: &services::auth::AuthorizationActor) -> Result<(), axum::http::StatusCode> {
-    (actor.is_board() || actor.is_agent()).then_some(()).ok_or(axum::http::StatusCode::FORBIDDEN)
+pub fn assert_board_or_agent(
+    actor: &services::auth::AuthorizationActor,
+) -> Result<(), axum::http::StatusCode> {
+    (actor.is_board() || actor.is_agent())
+        .then_some(())
+        .ok_or(axum::http::StatusCode::FORBIDDEN)
 }
 
 pub use access_control::{access_control_routes, CompanyId, MemberId, Token};
@@ -171,7 +220,6 @@ pub use built_in_agents::{
     built_in_agent_routes, list_built_in_agents, provision_built_in_agent, reconcile_built_in_agent,
 };
 pub use cases::case_routes;
-pub use comments::comment_routes;
 pub use config_revisions::config_revision_routes;
 pub use custom_image_setup::custom_image_setup_routes;
 pub use environment_diagnostics::environment_diagnostics_routes;
@@ -188,7 +236,6 @@ pub use secret_remote_import::secret_remote_import_routes;
 pub use secrets::secret_routes;
 pub use skills::skill_routes;
 pub use sse::sse_routes;
-pub use tree_control::tree_control_routes;
 pub use user_directory::user_directory_routes;
 pub use user_secret_definitions::user_secret_definition_routes;
 pub use user_secrets::user_secret_routes;

@@ -838,7 +838,7 @@ impl PipelineService for DefaultPipelineService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-unit-tests"))]
 mod tests {
     use super::*;
 

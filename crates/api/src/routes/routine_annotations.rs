@@ -1,14 +1,15 @@
 use crate::app_state::AppState;
-use axum::{Router, 
-    extract::{Path, Query, State},
+use axum::{
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Json, Router,
 };
 use models::{
     CreateRoutineAnnotationCommentRequest, CreateRoutineAnnotationThreadRequest,
     UpdateRoutineAnnotationThreadRequest,
 };
+use services::auth::AuthorizationActor;
 use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize)]
@@ -23,10 +24,14 @@ pub async fn list_annotations(
     Path(routine_id): Path<Uuid>,
     Query(query): Query<ListAnnotationsQuery>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
-    // TODO: Add permission check - assertCanReadRoutine(routine_id, auth)
+    if !routine_access(&state, &actor, routine_id, true).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.routine_annotation_service
+    match state
+        .routine_annotation_service
         .list_annotations(routine_id, query.include_comments)
         .await
     {
@@ -43,11 +48,18 @@ pub async fn list_annotations(
 pub async fn create_annotation_thread(
     Path(routine_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(request): Json<CreateRoutineAnnotationThreadRequest>,
 ) -> Response {
-    // TODO: Add permission check - assertCanWriteRoutine(routine_id, auth)
+    if !routine_access(&state, &actor, routine_id, false).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.routine_annotation_service.create_annotation_thread(routine_id, request).await {
+    match state
+        .routine_annotation_service
+        .create_annotation_thread(routine_id, request)
+        .await
+    {
         Ok(thread) => (StatusCode::CREATED, Json(thread)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -61,11 +73,18 @@ pub async fn create_annotation_thread(
 pub async fn add_annotation_comment(
     Path((routine_id, thread_id)): Path<(Uuid, Uuid)>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(request): Json<CreateRoutineAnnotationCommentRequest>,
 ) -> Response {
-    // TODO: Add permission check - assertCanWriteRoutine(routine_id, auth)
+    if !routine_access(&state, &actor, routine_id, false).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.routine_annotation_service.add_comment(routine_id, thread_id, request).await {
+    match state
+        .routine_annotation_service
+        .add_comment(routine_id, thread_id, request)
+        .await
+    {
         Ok(comment) => (StatusCode::CREATED, Json(comment)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -79,11 +98,18 @@ pub async fn add_annotation_comment(
 pub async fn update_annotation_thread(
     Path((routine_id, thread_id)): Path<(Uuid, Uuid)>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(request): Json<UpdateRoutineAnnotationThreadRequest>,
 ) -> Response {
-    // TODO: Add permission check - assertCanWriteRoutine(routine_id, auth)
+    if !routine_access(&state, &actor, routine_id, false).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
-    match state.routine_annotation_service.update_thread(routine_id, thread_id, request).await {
+    match state
+        .routine_annotation_service
+        .update_thread(routine_id, thread_id, request)
+        .await
+    {
         Ok(thread) => (StatusCode::OK, Json(thread)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -91,6 +117,25 @@ pub async fn update_annotation_thread(
         )
             .into_response(),
     }
+}
+
+async fn routine_access(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    routine_id: Uuid,
+    read_only: bool,
+) -> bool {
+    let company_id = sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM routines WHERE id = $1")
+        .bind(routine_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+    company_id
+        .map(|company_id| {
+            crate::routes::assert_company_access(actor, company_id, !read_only).is_ok()
+        })
+        .unwrap_or(false)
 }
 
 /// 创建Routine Annotation路由器

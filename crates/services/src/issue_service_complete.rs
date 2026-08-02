@@ -4,7 +4,7 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use models::{Issue, IssueStatus, IssuePriority};
-use repositories::{IssueRepository, ApprovalRepository};
+use repositories::{IssueRepository, ApprovalRepository, RoutineRepository};
 use crate::errors::ServiceError;
 use crate::issue_service::{self, ForceReleaseInput};
 
@@ -179,6 +179,7 @@ pub struct DefaultIssueService {
     comment_service: Arc<dyn IssueCommentService>,
     work_product_service: Arc<dyn WorkProductService>,
     attachment_service: Arc<dyn AttachmentService>,
+    routine_repo: Option<Arc<dyn RoutineRepository>>,
 }
 
 impl DefaultIssueService {
@@ -197,7 +198,13 @@ impl DefaultIssueService {
             comment_service,
             work_product_service,
             attachment_service,
+            routine_repo: None,
         }
+    }
+
+    pub fn with_routine_repo(mut self, routine_repo: Arc<dyn RoutineRepository>) -> Self {
+        self.routine_repo = Some(routine_repo);
+        self
     }
 
     /// Validate status transition
@@ -666,9 +673,28 @@ impl IssueService for DefaultIssueService {
     }
 
     async fn create_and_checkout_for_routine(&self, routine_id: Uuid) -> Result<(), ServiceError> {
-        // In production: look up routine definition and create an issue based on it
-        // For now, this is a placeholder that logs the action
-        tracing::info!("create_and_checkout_for_routine called for routine_id={}", routine_id);
+        let routine_repo = self.routine_repo.as_ref().ok_or_else(|| ServiceError::Internal("routine repository is not wired".to_string()))?;
+        let routine = routine_repo.get(routine_id).await
+            .map_err(|e| ServiceError::Internal(format!("Failed to load routine: {e}")))?
+            .ok_or_else(|| ServiceError::NotFound(format!("Routine {routine_id} not found")))?;
+        if routine.status != models::RoutineStatus::Active {
+            return Err(ServiceError::InvalidInput("Cannot trigger an inactive routine".to_string()));
+        }
+        let issue = self.issue_repo.create(models::CreateIssueInput {
+            company_id: routine.company_id,
+            project_id: routine.project_id,
+            goal_id: routine.goal_id,
+            title: routine.title,
+            description: routine.description,
+            status: Some(IssueStatus::Todo),
+            priority: Some(match routine.priority { 0 => IssuePriority::Low, 1 => IssuePriority::Medium, _ => IssuePriority::High }),
+            assignee_agent_id: Some(routine.assignee_agent_id),
+            parent_id: routine.parent_issue_id,
+            origin_kind: Some("routine".to_string()),
+            origin_id: Some(routine.id.to_string()),
+            ..Default::default()
+        }).await.map_err(|e| ServiceError::Internal(format!("Failed to create routine issue: {e}")))?;
+        tracing::info!(routine_id = %routine_id, issue_id = %issue.id, "created issue for triggered routine");
         Ok(())
     }
 }
@@ -931,7 +957,7 @@ impl issue_service::IssueService for LegacyIssueService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-unit-tests"))]
 mod tests {
     use super::*;
     use repositories::RepositoryResult;

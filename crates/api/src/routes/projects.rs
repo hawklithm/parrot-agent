@@ -3,7 +3,7 @@
 //! 对应 Company/Org 模块任务 §1.2 ~ §1.3 + §10 API 路由层
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{get, patch, put},
     Json, Router,
@@ -16,6 +16,7 @@ use models::{
     CreateProjectInput, CreateWorkspaceInput, MembershipState, Project, ProjectMembership,
     ProjectWorkspace, ResourceMemberships, UpdateProjectInput,
 };
+use services::auth::AuthorizationActor;
 
 pub fn project_routes() -> Router<AppState> {
     Router::new()
@@ -79,7 +80,10 @@ async fn list_projects(
     Ok(Json(result))
 }
 
-async fn hydrate_project(state: &AppState, project: Project) -> Result<serde_json::Value, AppError> {
+async fn hydrate_project(
+    state: &AppState,
+    project: Project,
+) -> Result<serde_json::Value, AppError> {
     let workspaces: Vec<ProjectWorkspace> = sqlx::query_as(
         "SELECT id, project_id, name, config, is_primary, created_at, updated_at FROM project_workspaces WHERE project_id = $1 ORDER BY is_primary DESC, created_at ASC",
     )
@@ -90,8 +94,14 @@ async fn hydrate_project(state: &AppState, project: Project) -> Result<serde_jso
     let primary = workspaces.iter().find(|w| w.is_primary).cloned();
     let mut value = serde_json::to_value(project).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = value.as_object_mut() {
-        object.insert("workspaces".into(), serde_json::to_value(&workspaces).unwrap_or_default());
-        object.insert("primaryWorkspace".into(), serde_json::to_value(primary).unwrap_or(serde_json::Value::Null));
+        object.insert(
+            "workspaces".into(),
+            serde_json::to_value(&workspaces).unwrap_or_default(),
+        );
+        object.insert(
+            "primaryWorkspace".into(),
+            serde_json::to_value(primary).unwrap_or(serde_json::Value::Null),
+        );
     }
     Ok(value)
 }
@@ -108,7 +118,10 @@ async fn create_project(
         .create(input)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(hydrate_project(&state, project).await?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(hydrate_project(&state, project).await?),
+    ))
 }
 
 /// GET /projects/:project_id
@@ -237,10 +250,12 @@ async fn get_external_object_summary(
 /// GET /companies/:company_id/resource-memberships/me
 async fn list_my_memberships(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<ResourceMemberships>, AppError> {
-    // TODO: Extract user_id from auth context
-    let user_id = Uuid::nil();
+    crate::routes::assert_company_access(&actor, company_id, true)
+        .map_err(|e| AppError::Forbidden(e.to_string()))?;
+    let user_id = board_user_id(&actor)?;
     let memberships = state
         .project_service
         .list_memberships_for_user(company_id, user_id)
@@ -252,11 +267,13 @@ async fn list_my_memberships(
 /// PUT /companies/:company_id/resource-memberships/me/projects/:project_id
 async fn update_project_membership(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, project_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ProjectMembership>, AppError> {
-    // TODO: Extract user_id from auth context
-    let user_id = Uuid::nil();
+    crate::routes::assert_company_access(&actor, company_id, false)
+        .map_err(|e| AppError::Forbidden(e.to_string()))?;
+    let user_id = board_user_id(&actor)?;
     let state_val = body
         .get("state")
         .and_then(|v| v.as_str())
@@ -281,11 +298,13 @@ async fn update_project_membership(
 /// and returns `{ resourceType, resourceId, state, starredAt, updatedAt }`.
 async fn update_agent_membership(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, agent_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // TODO: Extract user_id from auth context
-    let user_id = Uuid::nil();
+    crate::routes::assert_company_access(&actor, company_id, false)
+        .map_err(|e| AppError::Forbidden(e.to_string()))?;
+    let user_id = board_user_id(&actor)?;
     let state_val = body
         .get("state")
         .and_then(|v| v.as_str())
@@ -310,4 +329,13 @@ async fn update_agent_membership(
         "starredAt": membership.starred_at,
         "updatedAt": membership.updated_at,
     })))
+}
+
+fn board_user_id(actor: &AuthorizationActor) -> Result<Uuid, AppError> {
+    match actor {
+        AuthorizationActor::Board { user_id, .. } => Ok(*user_id),
+        AuthorizationActor::Agent { .. } | AuthorizationActor::None => Err(AppError::Forbidden(
+            "A board user is required for resource membership changes".to_string(),
+        )),
+    }
 }

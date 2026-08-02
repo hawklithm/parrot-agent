@@ -299,18 +299,42 @@ async fn get_close_readiness(
 
 /// X16: GET /execution-workspaces/:id/workspace-operations
 ///
-/// Lists workspace operations recorded for this execution workspace. Parrot
-/// Agent does not yet persist a dedicated `workspace_operations` table, so this
-/// returns an empty list (consistent with the stub-handler convention used
-/// across other domain route modules).
 async fn list_workspace_operations(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ExecutionWorkspaceError> {
-    Ok(Json(json!({
+    let workspace = sqlx::query("SELECT company_id FROM execution_workspaces WHERE id = $1")
+        .bind(id).fetch_optional(&state.pool).await
+        .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?
+        .ok_or(ExecutionWorkspaceError::NotFound(id))?;
+    let company_id: Uuid = workspace.get("company_id");
+    let rows = sqlx::query(
+        "SELECT id, phase, command, cwd, status, exit_code, log_store, log_ref, log_bytes, log_sha256, log_compressed, stdout_excerpt, stderr_excerpt, metadata, started_at, finished_at, created_at, updated_at FROM workspace_operations WHERE execution_workspace_id = $1 ORDER BY started_at DESC",
+    ).bind(id).fetch_all(&state.pool).await
+        .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
+    let operations = rows.into_iter().map(|row| json!({
+        "id": row.get::<Uuid, _>("id"),
+        "companyId": company_id,
         "executionWorkspaceId": id,
-        "operations": [],
-    })))
+        "phase": row.get::<String, _>("phase"),
+        "command": row.get::<Option<String>, _>("command"),
+        "cwd": row.get::<Option<String>, _>("cwd"),
+        "status": row.get::<String, _>("status"),
+        "exitCode": row.get::<Option<i32>, _>("exit_code"),
+        "logStore": row.get::<Option<String>, _>("log_store"),
+        "logRef": row.get::<Option<String>, _>("log_ref"),
+        "logBytes": row.get::<Option<i64>, _>("log_bytes"),
+        "logSha256": row.get::<Option<String>, _>("log_sha256"),
+        "logCompressed": row.get::<bool, _>("log_compressed"),
+        "stdoutExcerpt": row.get::<Option<String>, _>("stdout_excerpt"),
+        "stderrExcerpt": row.get::<Option<String>, _>("stderr_excerpt"),
+        "metadata": row.get::<Option<Value>, _>("metadata"),
+        "startedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("started_at"),
+        "finishedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })).collect::<Vec<_>>();
+    Ok(Json(Value::Array(operations)))
 }
 
 /// Reconcile-branch request body — mirrors Paperclip's

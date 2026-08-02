@@ -8,12 +8,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::{app_state::AppState, errors::ApiError};
 use models::{
-    IssueTreeHold, IssueTreeHoldMember, IssueTreeControlMode, CreateIssueTreeHoldInput,
-    IssueTreeHoldReleasePolicy, IssueTreeHoldReleasePolicyStrategy, ActiveIssueTreePauseHoldGate,
+    ActiveIssueTreePauseHoldGate, CreateIssueTreeHoldInput, IssueTreeControlMode, IssueTreeHold,
+    IssueTreeHoldMember, IssueTreeHoldReleasePolicy, IssueTreeHoldReleasePolicyStrategy,
 };
 use services::TreeControlServiceError;
-use crate::{errors::ApiError, app_state::AppState};
 
 /// Preview tree control request
 #[derive(Debug, Deserialize)]
@@ -77,12 +77,8 @@ impl From<TreeControlServiceError> for ApiError {
             TreeControlServiceError::HoldAlreadyReleased => {
                 ApiError::Conflict("Hold already released".to_string())
             }
-            TreeControlServiceError::InvalidOperation(msg) => {
-                ApiError::BadRequest(msg)
-            }
-            TreeControlServiceError::Validation(msg) => {
-                ApiError::BadRequest(msg)
-            }
+            TreeControlServiceError::InvalidOperation(msg) => ApiError::BadRequest(msg),
+            TreeControlServiceError::Validation(msg) => ApiError::BadRequest(msg),
             TreeControlServiceError::Repository(repo_err) => {
                 ApiError::InternalServerError(format!("Database error: {}", repo_err))
             }
@@ -96,7 +92,8 @@ pub async fn preview_tree_control(
     Path(issue_id): Path<Uuid>,
     Json(req): Json<PreviewTreeControlRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let preview = state.issue_tree_control_service
+    let preview = state
+        .issue_tree_control_service
         .preview_tree_hold(issue_id, req.mode)
         .await?;
 
@@ -110,30 +107,28 @@ pub async fn create_tree_hold(
     Json(req): Json<CreateTreeHoldRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue to determine company_id
-    let issue = state.issue_service.get(issue_id, Uuid::nil()).await
-        .map_err(|_| ApiError::NotFound(format!("Issue not found: {}", issue_id)))?;
-    let company_id = issue
-        .map(|i| i.company_id)
+    let company_id = sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("Issue not found: {}", issue_id)))?;
 
     let input = CreateIssueTreeHoldInput {
         mode: req.mode,
         reason: req.reason,
-        release_policy: req.release_policy.unwrap_or_else(|| IssueTreeHoldReleasePolicy {
-            strategy: IssueTreeHoldReleasePolicyStrategy::Manual,
-            note: None,
-        }),
+        release_policy: req
+            .release_policy
+            .unwrap_or_else(|| IssueTreeHoldReleasePolicy {
+                strategy: IssueTreeHoldReleasePolicyStrategy::Manual,
+                note: None,
+            }),
         metadata: req.metadata,
     };
 
-    let hold = state.issue_tree_control_service
-        .create_tree_hold(
-            company_id,
-            issue_id,
-            input,
-            req.actor_type,
-            req.actor_id,
-        )
+    let hold = state
+        .issue_tree_control_service
+        .create_tree_hold(company_id, issue_id, input, req.actor_type, req.actor_id)
         .await?;
 
     Ok((StatusCode::CREATED, Json(TreeHoldResponse { hold })))
@@ -144,7 +139,8 @@ pub async fn list_tree_holds(
     State(state): State<AppState>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let holds = state.issue_tree_control_service
+    let holds = state
+        .issue_tree_control_service
         .list_tree_holds(issue_id)
         .await?;
 
@@ -156,7 +152,8 @@ pub async fn get_tree_hold(
     State(state): State<AppState>,
     Path((_issue_id, hold_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let hold = state.issue_tree_control_service
+    let hold = state
+        .issue_tree_control_service
         .get_tree_hold(hold_id)
         .await?;
 
@@ -169,12 +166,9 @@ pub async fn release_tree_hold(
     Path((_issue_id, hold_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<ReleaseTreeHoldRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let hold = state.issue_tree_control_service
-        .release_tree_hold(
-            hold_id,
-            req.released_by_type,
-            req.released_by_id,
-        )
+    let hold = state
+        .issue_tree_control_service
+        .release_tree_hold(hold_id, req.released_by_type, req.released_by_id)
         .await?;
 
     Ok(Json(TreeHoldResponse { hold }))
@@ -185,7 +179,8 @@ pub async fn get_pause_state(
     State(state): State<AppState>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let gate = state.issue_tree_control_service
+    let gate = state
+        .issue_tree_control_service
         .get_pause_state(issue_id)
         .await?;
 
@@ -199,7 +194,8 @@ pub async fn get_hold_members(
     State(state): State<AppState>,
     Path((_issue_id, hold_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let members = state.issue_tree_control_service
+    let members = state
+        .issue_tree_control_service
         .get_hold_members(hold_id)
         .await?;
 
@@ -209,11 +205,20 @@ pub async fn get_hold_members(
 /// Create Issue Tree Control routes
 pub fn issue_tree_control_routes() -> Router<AppState> {
     Router::new()
-        .route("/issues/:id/tree-control/preview", post(preview_tree_control))
+        .route(
+            "/issues/:id/tree-control/preview",
+            post(preview_tree_control),
+        )
         .route("/issues/:id/tree-control/state", get(get_pause_state))
         .route("/issues/:id/tree-holds", post(create_tree_hold))
         .route("/issues/:id/tree-holds", get(list_tree_holds))
         .route("/issues/:id/tree-holds/:hold_id", get(get_tree_hold))
-        .route("/issues/:id/tree-holds/:hold_id/release", post(release_tree_hold))
-        .route("/issues/:id/tree-holds/:hold_id/members", get(get_hold_members))
+        .route(
+            "/issues/:id/tree-holds/:hold_id/release",
+            post(release_tree_hold),
+        )
+        .route(
+            "/issues/:id/tree-holds/:hold_id/members",
+            get(get_hold_members),
+        )
 }

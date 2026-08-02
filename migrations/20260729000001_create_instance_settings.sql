@@ -3,7 +3,7 @@ CREATE TABLE IF NOT EXISTS instance_settings (
     instance_name TEXT NOT NULL DEFAULT 'Parrot Agent',
     version TEXT NOT NULL DEFAULT '0.1.0',
     general JSONB NOT NULL DEFAULT '{"timezone":"UTC","language":"en"}',
-    experimental JSONB NOT NULL DEFAULT '{"issueGraphLivenessAutoRecovery":false,"enableCloudSync":false}',
+    experimental JSONB NOT NULL DEFAULT '{"issueGraphLivenessAutoRecovery":false,"enableCloudSync":false,"enableBuiltInAgents":true,"enableCases":true}',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
