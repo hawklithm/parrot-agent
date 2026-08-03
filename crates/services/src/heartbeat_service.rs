@@ -140,6 +140,16 @@ impl DefaultHeartbeatService {
         let _ = sqlx::query(
             "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
             .bind(run_id).bind(status).bind(exit_code).bind(error).bind(output).execute(&self.pool).await;
+        let issue_status = if status == "succeeded" { "done" } else { "todo" };
+        let _ = sqlx::query(
+            "UPDATE issues SET status = $2::issue_status, checkout_run_id = NULL, execution_run_id = NULL, execution_locked_at = NULL, execution_agent_name_key = NULL, completed_at = CASE WHEN $2 = 'done' THEN NOW() ELSE NULL END, updated_at = NOW() WHERE id = $1 AND company_id = $3 AND execution_run_id = $4",
+        )
+        .bind(issue_id)
+        .bind(issue_status)
+        .bind(company_id)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await;
         let _ = sqlx::query("UPDATE agent_wakeup_requests SET status = 'completed', updated_at = NOW() WHERE company_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running') AND payload->>'issueId' = $3")
             .bind(company_id).bind(agent_id).bind(issue_id.to_string()).execute(&self.pool).await;
         let _ = sqlx::query("UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE run_id = $1 AND revoked_at IS NULL")
@@ -462,10 +472,30 @@ impl HeartbeatService for DefaultHeartbeatService {
         company_id: Uuid,
     ) -> Result<(), HeartbeatError> {
         let _agent = self.load_agent(agent_id).await?;
+        let active_run: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM heartbeat_runs WHERE company_id = $1 AND agent_id = $2 AND status IN ('queued','running') AND (context_snapshot->>'issueId' = $3 OR context_snapshot->>'taskId' = $3) ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(issue_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        if active_run.is_some() {
+            return Ok(());
+        }
         let run_id: Uuid = sqlx::query_scalar("INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot) VALUES ($1,$2,'on_demand','queued',$3) RETURNING id")
             .bind(company_id).bind(agent_id).bind(serde_json::json!({"issueId": issue_id})).fetch_one(&self.pool).await.map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
         sqlx::query("INSERT INTO agent_wakeup_requests (company_id, agent_id, status, payload) VALUES ($1,$2,'dispatched',$3)")
             .bind(company_id).bind(agent_id).bind(serde_json::json!({"issueId": issue_id, "runId": run_id})).execute(&self.pool).await.map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        sqlx::query("UPDATE issues SET assignee_agent_id = $2, assignee_user_id = NULL, status = CASE WHEN status IN ('todo','backlog') THEN 'in_progress'::issue_status ELSE status END, checkout_run_id = $3, execution_run_id = $3, started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND company_id = $4 AND (assignee_agent_id IS NULL OR assignee_agent_id = $2) AND status NOT IN ('done','cancelled')")
+            .bind(issue_id)
+            .bind(agent_id)
+            .bind(run_id)
+            .bind(company_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
         sqlx::query("UPDATE agents SET status = 'running', updated_at = NOW() WHERE id = $1")
             .bind(agent_id)
             .execute(&self.pool)
@@ -518,6 +548,33 @@ impl HeartbeatService for DefaultHeartbeatService {
 }
 
 impl DefaultHeartbeatService {
+    /// Requeue assigned todo issues that were created before assignment wakeups
+    /// were wired into the issue API.
+    pub async fn reconcile_pending_issues(&self) -> Result<usize, HeartbeatError> {
+        let rows = sqlx::query(
+            "SELECT i.id, i.assignee_agent_id, i.company_id FROM issues i WHERE i.status = 'todo' AND i.assignee_agent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM heartbeat_runs r WHERE r.company_id = i.company_id AND r.agent_id = i.assignee_agent_id AND r.status IN ('queued','running') AND (r.context_snapshot->>'issueId' = i.id::text OR r.context_snapshot->>'taskId' = i.id::text)) AND NOT EXISTS (SELECT 1 FROM agent_wakeup_requests w WHERE w.company_id = i.company_id AND w.agent_id = i.assignee_agent_id AND w.status IN ('queued','dispatched','running') AND w.payload->>'issueId' = i.id::text)",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+        let mut reconciled = 0;
+        for row in rows {
+            let issue_id: Uuid = row
+                .try_get("id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let agent_id: Uuid = row
+                .try_get("assignee_agent_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let company_id: Uuid = row
+                .try_get("company_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            self.wakeup(agent_id, issue_id, company_id).await?;
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
     fn clone_for_task(&self) -> Self {
         Self {
             pool: self.pool.clone(),

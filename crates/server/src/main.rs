@@ -402,8 +402,8 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         wakeup_repo,
         interaction_repo,
     ));
-    let heartbeat_service: Arc<dyn services::HeartbeatService> =
-        Arc::new(DefaultHeartbeatService::new(pool.clone()));
+    let heartbeat_coordinator = Arc::new(DefaultHeartbeatService::new(pool.clone()));
+    let heartbeat_service: Arc<dyn services::HeartbeatService> = heartbeat_coordinator.clone();
     // Label service
     let label_repo: Arc<repositories::label_repository::PgLabelRepository> = Arc::new(
         repositories::label_repository::PgLabelRepository::new(pool.clone()),
@@ -427,7 +427,14 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         issue_comment_service.clone(),
         work_product_service.clone(),
         attachment_service.clone(),
+        heartbeat_service.clone(),
     ));
+
+    match heartbeat_coordinator.reconcile_pending_issues().await {
+        Ok(count) if count > 0 => tracing::info!(count, "reconciled pending assigned issues"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "failed to reconcile pending assigned issues"),
+    }
 
     let company_portability_service = Arc::new(services::DefaultCompanyPortabilityService::new(
         pool.clone(),

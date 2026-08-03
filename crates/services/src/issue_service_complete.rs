@@ -13,6 +13,7 @@ use crate::issue_tree_control_service::IssueTreeControlService;
 use crate::issue_comment_service::IssueCommentService;
 use crate::work_product_service::WorkProductService;
 use crate::attachment_service::AttachmentService;
+use crate::heartbeat_service::HeartbeatService;
 
 /// Issue mutation result
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +67,8 @@ pub struct UpdateIssueInput {
     pub status: Option<IssueStatus>,
     pub priority: Option<IssuePriority>,
     pub assigned_to: Option<Uuid>,
+    pub assignee_agent_id: Option<Uuid>,
+    pub assignee_user_id: Option<Uuid>,
 }
 
 /// Issue query filter
@@ -344,8 +347,8 @@ impl IssueService for DefaultIssueService {
             description: input.description,
             status: input.status,
             priority: input.priority,
-            assignee_agent_id: None,
-            assignee_user_id: None,
+            assignee_agent_id: input.assignee_agent_id,
+            assignee_user_id: input.assignee_user_id,
             work_mode: None,
             responsible_user_id: None,
             source_trust: None,
@@ -713,6 +716,7 @@ pub struct LegacyIssueService {
     work_product_service: Arc<dyn WorkProductService>,
     #[allow(dead_code)]
     attachment_service: Arc<dyn AttachmentService>,
+    heartbeat_service: Arc<dyn HeartbeatService>,
 }
 
 impl LegacyIssueService {
@@ -723,6 +727,7 @@ impl LegacyIssueService {
         comment_service: Arc<dyn IssueCommentService>,
         work_product_service: Arc<dyn WorkProductService>,
         attachment_service: Arc<dyn AttachmentService>,
+        heartbeat_service: Arc<dyn HeartbeatService>,
     ) -> Self {
         Self {
             inner: DefaultIssueService::new(
@@ -737,7 +742,23 @@ impl LegacyIssueService {
             comment_service,
             work_product_service,
             attachment_service,
+            heartbeat_service,
         }
+    }
+
+    fn wake_assigned_issue(&self, issue: &Issue) {
+        let Some(agent_id) = issue.assignee_agent_id else { return };
+        if !matches!(issue.status, models::IssueStatus::Todo | models::IssueStatus::InProgress) {
+            return;
+        }
+        let heartbeat = self.heartbeat_service.clone();
+        let issue_id = issue.id;
+        let company_id = issue.company_id;
+        tokio::spawn(async move {
+            if let Err(error) = heartbeat.wakeup(agent_id, issue_id, company_id).await {
+                tracing::warn!(%error, %agent_id, %issue_id, "failed to wake assigned issue");
+            }
+        });
     }
 }
 
@@ -759,6 +780,7 @@ impl issue_service::IssueService for LegacyIssueService {
             goal_id: input.goal_id,
         };
         let result = self.inner.create(compat_input).await.map_err(|e| e.to_string())?;
+        self.wake_assigned_issue(&result.issue);
         Ok(crate::issue_service::IssueMutationResult {
             changed: result.changed,
             issue: result.issue,
@@ -781,6 +803,7 @@ impl issue_service::IssueService for LegacyIssueService {
             goal_id: input.goal_id,
         };
         let result = self.inner.create_child(parent_id, compat_input).await.map_err(|e| e.to_string())?;
+        self.wake_assigned_issue(&result.issue);
         Ok(crate::issue_service::IssueMutationResult {
             changed: result.changed,
             issue: result.issue,
@@ -820,8 +843,22 @@ impl issue_service::IssueService for LegacyIssueService {
             status: input.status,
             priority: input.priority,
             assigned_to: input.assignee_agent_id.or(input.assignee_user_id),
+            assignee_agent_id: input.assignee_agent_id,
+            assignee_user_id: input.assignee_user_id,
         };
+        let previous = self.issue_repo.get_by_id(id).await.map_err(|e| e.to_string())?;
         let result = self.inner.update(id, company_id, compat_input).await.map_err(|e| e.to_string())?;
+        let should_wake = previous.as_ref().is_some_and(|previous| {
+            let assignee_changed = previous.assignee_agent_id != result.issue.assignee_agent_id;
+            let became_runnable = previous.status == models::IssueStatus::Backlog
+                && result.issue.status != models::IssueStatus::Backlog;
+            let reopened = result.issue.status == models::IssueStatus::Todo
+                && previous.status != models::IssueStatus::Todo;
+            assignee_changed || became_runnable || reopened
+        });
+        if should_wake {
+            self.wake_assigned_issue(&result.issue);
+        }
         Ok(crate::issue_service::IssueMutationResult {
             changed: result.changed,
             issue: result.issue,

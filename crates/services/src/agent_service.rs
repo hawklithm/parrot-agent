@@ -254,6 +254,67 @@ fn validate_bundle(bundle: &serde_json::Value) -> Result<(), ServiceError> {
     Ok(())
 }
 
+fn instruction_language(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase().as_str() {
+        "md" | "markdown" => "markdown",
+        "mdx" => "mdx",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "rs" => "rust",
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" => "javascript",
+        _ => "text",
+    }
+}
+
+fn public_instructions_bundle(
+    agent: &Agent,
+    bundle: &serde_json::Value,
+) -> serde_json::Value {
+    let entry_file = bundle
+        .get("entryFile")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("AGENTS.md");
+    let files = bundle
+        .get("files")
+        .and_then(serde_json::Value::as_object)
+        .map(|files| {
+            files
+                .iter()
+                .map(|(path, content)| {
+                    let content_len = content.as_str().map_or(0, str::len);
+                    serde_json::json!({
+                        "path": path,
+                        "size": content_len,
+                        "language": instruction_language(path),
+                        "markdown": path.ends_with(".md") || path.ends_with(".markdown"),
+                        "isEntryFile": path == entry_file,
+                        "editable": true,
+                        "deprecated": false,
+                        "virtual": false,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "agentId": agent.id,
+        "companyId": agent.company_id,
+        "mode": "managed",
+        "rootPath": null,
+        "managedRootPath": "",
+        "entryFile": entry_file,
+        "resolvedEntryPath": null,
+        "editable": true,
+        "warnings": [],
+        "legacyPromptTemplateActive": false,
+        "legacyBootstrapPromptTemplateActive": false,
+        "files": files,
+    })
+}
+
 /// Compute org-chain health score for a single agent using a pre-loaded agent map.
 ///
 /// Mirrors Paperclip's `getAgentWorkEligibility` but operates on in-memory data
@@ -860,7 +921,7 @@ where
             "files": {}
         }));
         validate_bundle(&bundle)?;
-        Ok(bundle)
+        Ok(public_instructions_bundle(&agent, &bundle))
     }
 
     async fn update_instructions_bundle(
@@ -868,9 +929,24 @@ where
         id: Uuid,
         bundle: serde_json::Value,
     ) -> Result<Agent, ServiceError> {
-        validate_bundle(&bundle)?;
         let mut agent = self.repository.get_by_id(id).await?;
-        agent.metadata.0.instructions_bundle = Some(bundle);
+        let mut next_bundle = agent
+            .metadata
+            .instructions_bundle
+            .take()
+            .unwrap_or_else(|| serde_json::json!({"entryFile":"AGENTS.md","files":{}}));
+
+        if bundle.get("files").is_some() {
+            validate_bundle(&bundle)?;
+            next_bundle = bundle;
+        } else {
+            if let Some(entry_file) = bundle.get("entryFile") {
+                next_bundle["entryFile"] = entry_file.clone();
+            }
+            validate_bundle(&next_bundle)?;
+        }
+
+        agent.metadata.0.instructions_bundle = Some(next_bundle);
         agent.updated_at = Utc::now();
         self.repository.update(agent.clone()).await?;
         Ok(agent)
@@ -878,7 +954,16 @@ where
 
     async fn get_bundle_file(&self, id: Uuid, file_path: &str) -> Result<String, ServiceError> {
         let path = normalize_bundle_path(file_path)?;
-        let bundle = self.get_instructions_bundle(id).await?;
+        let agent = self.repository.get_by_id(id).await?;
+        let bundle = agent
+            .metadata
+            .instructions_bundle
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({
+                "entryFile": "AGENTS.md",
+                "files": {}
+            }));
+        validate_bundle(&bundle)?;
         bundle.get("files").and_then(|files| files.get(&path)).and_then(|v| v.as_str())
             .map(ToOwned::to_owned)
             .ok_or_else(|| ServiceError::NotFound(format!("Instruction file not found: {path}")))

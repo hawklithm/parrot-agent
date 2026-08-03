@@ -671,11 +671,12 @@ async fn patch_instructions_bundle(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state
+    state
         .agent_service
         .update_instructions_bundle(id, payload)
         .await?;
-    Ok(Json(agent))
+    let bundle = state.agent_service.get_instructions_bundle(id).await?;
+    Ok(Json(bundle))
 }
 
 /// GET /agents/:id/instructions-bundle/file - 获取指令文件
