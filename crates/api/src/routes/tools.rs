@@ -410,9 +410,14 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             }
         }
     }
-    if matches!(tool_name, "paperclipSuggestTasks" | "paperclipAskUserQuestions" | "paperclipRequestConfirmation" | "paperclipRequestCheckboxConfirmation")
-        && !object.get("payload").is_some_and(Value::is_object) {
-        return Err("payload must be an object".to_string());
+    if matches!(tool_name, "paperclipSuggestTasks" | "paperclipAskUserQuestions" | "paperclipRequestConfirmation" | "paperclipRequestCheckboxConfirmation") {
+        let payload = object.get("payload").ok_or("payload is required")?;
+        validate_interaction_payload(tool_name, payload)?;
+        if let Some(policy) = object.get("continuationPolicy").and_then(Value::as_str) {
+            if !matches!(policy, "none" | "wake_assignee" | "wake_assignee_on_accept") {
+                return Err("continuationPolicy is invalid".to_string());
+            }
+        }
     }
     if let Some(key) = object.get("key").and_then(Value::as_str) {
         let valid = !key.trim().is_empty()
@@ -561,6 +566,72 @@ fn validate_text_field(value: Option<&Value>, name: &str) -> Result<(), String> 
 fn validate_uuid_field(value: Option<&Value>, name: &str) -> Result<(), String> {
     let value = value.and_then(Value::as_str).ok_or_else(|| format!("{name} must be a UUID"))?;
     Uuid::parse_str(value).map_err(|_| format!("{name} must be a valid UUID"))?;
+    Ok(())
+}
+
+fn validate_interaction_payload(tool_name: &str, payload: &Value) -> Result<(), String> {
+    let object = payload.as_object().ok_or("payload must be an object")?;
+    if object.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err("payload.version must be 1".to_string());
+    }
+    if tool_name == "paperclipSuggestTasks" {
+        let tasks = object.get("tasks").and_then(Value::as_array).ok_or("payload.tasks is required")?;
+        if tasks.is_empty() || tasks.len() > 50 { return Err("payload.tasks must contain 1 to 50 tasks".to_string()); }
+        let mut keys = std::collections::HashSet::new();
+        for task in tasks {
+            let task = task.as_object().ok_or("suggested task must be an object")?;
+            let key = task.get("clientKey").and_then(Value::as_str).filter(|v| !v.trim().is_empty()).ok_or("task.clientKey is required")?;
+            if key.len() > 120 || !keys.insert(key) { return Err("task.clientKey must be unique and at most 120 characters".to_string()); }
+            let title = task.get("title").and_then(Value::as_str).filter(|v| !v.trim().is_empty()).ok_or("task.title is required")?;
+            if title.len() > 240 { return Err("task.title must be at most 240 characters".to_string()); }
+            if let Some(priority) = task.get("priority").filter(|v| !v.is_null()).and_then(Value::as_str) {
+                if !matches!(priority, "urgent" | "high" | "medium" | "low" | "no_priority") { return Err("task.priority is invalid".to_string()); }
+            }
+            if let Some(work_mode) = task.get("workMode").filter(|v| !v.is_null()).and_then(Value::as_str) {
+                if !matches!(work_mode, "standard" | "ask" | "planning" | "skill_test") { return Err("task.workMode is invalid".to_string()); }
+            }
+            for key in ["parentId", "assigneeAgentId", "projectId", "goalId"] {
+                if let Some(value) = task.get(key).filter(|v| !v.is_null()) { validate_uuid_field(Some(value), &format!("task.{key}"))?; }
+            }
+            if task.get("assigneeAgentId").is_some_and(|v| !v.is_null()) && task.get("assigneeUserId").is_some_and(|v| !v.is_null()) {
+                return Err("suggested tasks can only target one assignee".to_string());
+            }
+        }
+        return Ok(());
+    }
+    if tool_name == "paperclipAskUserQuestions" {
+        let questions = object.get("questions").and_then(Value::as_array).ok_or("payload.questions is required")?;
+        if questions.is_empty() || questions.len() > 10 { return Err("payload.questions must contain 1 to 10 questions".to_string()); }
+        let mut question_ids = std::collections::HashSet::new();
+        for question in questions {
+            let question = question.as_object().ok_or("question must be an object")?;
+            let id = question.get("id").and_then(Value::as_str).filter(|v| !v.trim().is_empty()).ok_or("question.id is required")?;
+            if id.len() > 120 || !question_ids.insert(id) { return Err("question.id must be unique and at most 120 characters".to_string()); }
+            let selection = question.get("selectionMode").and_then(Value::as_str).ok_or("question.selectionMode is required")?;
+            if !matches!(selection, "single" | "multi") { return Err("question.selectionMode is invalid".to_string()); }
+            validate_text_field(question.get("prompt"), "question.prompt")?;
+            let options = question.get("options").and_then(Value::as_array).ok_or("question.options is required")?;
+            if options.is_empty() || options.len() > 10 { return Err("question.options must contain 1 to 10 options".to_string()); }
+        }
+    } else {
+        let prompt = object.get("prompt").and_then(Value::as_str).filter(|v| !v.trim().is_empty()).ok_or("payload.prompt is required")?;
+        if prompt.len() > 1000 { return Err("payload.prompt must be at most 1000 characters".to_string()); }
+        if tool_name != "paperclipRequestCheckboxConfirmation" {
+            return Ok(());
+        }
+        let options = object.get("options").and_then(Value::as_array).ok_or("payload.options is required")?;
+        if options.is_empty() || options.len() > 20 { return Err("payload.options must contain 1 to 20 options".to_string()); }
+        let mut option_ids = std::collections::HashSet::new();
+        for option in options {
+            let option = option.as_object().ok_or("checkbox option must be an object")?;
+            let id = option.get("id").and_then(Value::as_str).filter(|v| !v.trim().is_empty()).ok_or("option.id is required")?;
+            if id.len() > 120 || !option_ids.insert(id) { return Err("option.id must be unique and at most 120 characters".to_string()); }
+            validate_text_field(option.get("label"), "option.label")?;
+        }
+        if let Some(min) = object.get("minSelected").and_then(Value::as_i64) {
+            if min < 0 || min as usize > options.len() { return Err("minSelected is invalid".to_string()); }
+        }
+    }
     Ok(())
 }
 
@@ -2562,6 +2633,26 @@ mod tests {
         })).is_err());
         assert!(validate_paperclip_arguments("paperclipAddComment", &serde_json::json!({
             "issueId": "ABC-1", "body": "details", "metadata": {"version": 2, "sections": []}
+        })).is_err());
+    }
+
+    #[test]
+    fn paperclip_interaction_contract_validates_versioned_payloads() {
+        let suggest = serde_json::json!({
+            "issueId": "ABC-1",
+            "payload": {"version": 1, "tasks": [{"clientKey": "task-1", "title": "Do work"}]}
+        });
+        assert!(validate_paperclip_arguments("paperclipSuggestTasks", &suggest).is_ok());
+        assert!(validate_paperclip_arguments("paperclipSuggestTasks", &serde_json::json!({
+            "issueId": "ABC-1", "payload": {"version": 1, "tasks": [{"clientKey": "dup", "title": "a"}, {"clientKey": "dup", "title": "b"}]}
+        })).is_err());
+        let questions = serde_json::json!({
+            "issueId": "ABC-1",
+            "payload": {"version": 1, "questions": [{"id": "choice", "prompt": "Choose", "selectionMode": "single", "options": [{"id": "yes", "label": "Yes"}]}]}
+        });
+        assert!(validate_paperclip_arguments("paperclipAskUserQuestions", &questions).is_ok());
+        assert!(validate_paperclip_arguments("paperclipRequestConfirmation", &serde_json::json!({
+            "issueId": "ABC-1", "payload": {"version": 1}
         })).is_err());
     }
 

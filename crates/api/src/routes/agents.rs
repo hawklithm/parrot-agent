@@ -228,6 +228,7 @@ async fn create_agent(
                     requested_by_user_id,
                     payload: approval_payload,
                     linked_issue_ids: source_issue_ids,
+                    validate_payload: true,
                 })
                 .await
                 .map_err(|error| {

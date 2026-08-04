@@ -6,16 +6,20 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "approval_type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalType {
     HireAgent,
     SpendCredits,
     CreateResource,
     DeployAgent,
     BudgetOverrideRequired,
+    ApproveCeoStrategy,
+    RequestBoardApproval,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "approval_status", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalStatus {
     Pending,
     Approved,

@@ -30,6 +30,19 @@ BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' \
 
 脚本覆盖无 token、initialize、tools/list、invalid params、未知 method、notification、SSE GET、DELETE 撤销和撤销后拒绝。token 不要写入日志、Issue、shell history 或提交。
 
+业务成功路径和安全负向路径：
+
+```sh
+BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' \
+  node scripts/paperclip-mcp-business-smoke.mjs
+
+BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' \
+ISSUE_ID='<issue>' AGENT_ID='<agent>' \
+  node scripts/paperclip-mcp-security-smoke.mjs
+```
+
+业务脚本会实际调用 41 个内置工具集合中的 Issue、Comment、Document、Interaction、Approval、Heartbeat、workspace runtime 和 API request；安全脚本验证跨 Agent checkout、session id、错误 token 和路径穿越拒绝。过期 token 测试会等待最短 60 秒：额外设置 `COMPANY_ID`、`RUN_ID` 和 `TEST_EXPIRY=1`。
+
 ## Claude/Codex adapter
 
 - `claude_local` 使用 stdin prompt，并注入 `/api/tool-gateway/mcp` 与 `PAPERCLIP_TOOL_GATEWAY_TOKEN`。

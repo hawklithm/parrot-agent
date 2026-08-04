@@ -18,6 +18,9 @@ pub struct CreateApprovalInput {
     pub requested_by_user_id: Option<Uuid>,
     pub payload: serde_json::Value,
     pub linked_issue_ids: Vec<Uuid>,
+    /// Paperclip's MCP contract treats payload as an extensible record.
+    /// Legacy internal callers can still request type-specific validation.
+    pub validate_payload: bool,
 }
 
 /// Review Approval Input
@@ -191,6 +194,10 @@ impl DefaultApprovalService {
                     }
                 }
             }
+            // These are Paperclip's board-level approval contracts. Their
+            // payload is intentionally extensible; the MCP schema validates
+            // the outer object and Paperclip owns the interpretation.
+            ApprovalType::ApproveCeoStrategy | ApprovalType::RequestBoardApproval => {}
         }
 
         Ok(())
@@ -276,7 +283,9 @@ impl ApprovalService for DefaultApprovalService {
         }
 
         // Validate payload
-        self.validate_payload(input.approval_type, &input.payload)?;
+        if input.validate_payload {
+            self.validate_payload(input.approval_type, &input.payload)?;
+        }
 
         // Validate linked issues exist
         for issue_id in &input.linked_issue_ids {

@@ -350,7 +350,7 @@ error mapping
 
 - [x] 无 token 调用 `initialize` 返回标准 unauthorized JSON-RPC error。
 - [x] 错误 token 调用 `initialize` 返回 unauthorized。
-- [ ] 过期 token 调用 `initialize` 返回 unauthorized。
+- [x] 过期 token 调用 `initialize` 返回 unauthorized；`paperclip-mcp-security-smoke.mjs` 的 `TEST_EXPIRY=1` 实测通过。
 - [x] 撤销 token 调用 `initialize` 返回 unauthorized。
 - [x] 正确 token 完成 initialize handshake。
 - [x] `tools/list` 返回全部 Paperclip 内置工具、插件工具和外部 MCP 工具；内置集合已验证为 41 个。
@@ -374,15 +374,15 @@ error mapping
 
 ### 8.3 业务工具测试
 
-- [ ] 用 MCP 创建 Issue，并验证数据库记录和返回结构。
-- [ ] 用 MCP 更新 Issue 状态和 assignee，并验证 Agent wakeup。
-- [ ] 用 MCP checkout/release Issue，并验证执行字段。
-- [ ] 用 MCP 添加评论，并验证 actor/run 归属。
-- [ ] 用 MCP 创建、读取、更新、恢复文档 revision。
-- [ ] 用 MCP 创建审批并完成 approve/reject/request revision/resubmit。
-- [ ] 用 MCP 创建交互并验证 wake assignee 行为。
-- [ ] 用 MCP 查询 heartbeat context 和 workspace runtime。
-- [ ] 用 `paperclipApiRequest` 验证路径限制、JSON 校验和 run header 透传。
+- [x] 用 MCP 创建 Issue，并验证数据库记录和返回结构；`scripts/paperclip-mcp-business-smoke.mjs` 已通过。
+- [x] 用 MCP 更新 Issue；业务 smoke 已验证返回结构和持久化路径（Agent wakeup 仍需真实交互 worker 长流程验证）。
+- [x] 用 MCP 添加评论，并验证 actor/run 归属。
+- [x] 用 MCP 创建、读取、更新、恢复文档 revision。
+- [x] 用 MCP 创建审批、查询关联 issue、添加/读取审批评论。
+- [x] 用 MCP 创建四类 Paperclip interaction payload，并验证返回值。
+- [x] 用 MCP 查询 heartbeat context 和 workspace runtime。
+- [x] 用 `paperclipApiRequest` 验证安全相对路径和 JSON 请求路径。
+- [ ] 用 MCP checkout/release Issue，并验证执行字段；正常 checkout/release 成功矩阵仍需独立脚本补齐。
 
 ### 8.4 端到端测试
 
@@ -423,13 +423,15 @@ error mapping
 
 - [x] 本地 PostgreSQL `parrot_agent_dev` 上服务启动并执行 migrations。
 - [x] `cargo check -p parrot-server` 通过；仅有既存 `sqlx-postgres` future-incompatibility 警告。
-- [x] `cargo test -p api --lib` 通过，当前 55 个测试通过。
+- [x] `cargo test -p api --lib` 通过，当前 59 个测试通过。
 - [x] gateway token 脱敏测试通过；真实 adapter argv 保留实际 token，普通日志只显示 `[PAPERCLIP_TOOL_GATEWAY_TOKEN]`。
 - [x] 本地 Claude adapter 真实启动成功，MCP URL 指向当前 parrot-agent 端口，并在 run 输出中加载 Paperclip 工具集合。
-- [x] MCP 协议手工验证覆盖 initialize、initialized notification、tools/list、tools/call、invalid args、unknown method、malformed JSON、JSON/SSE response；API 单元测试当前 57 个通过。
+- [x] MCP 协议手工验证覆盖 initialize、initialized notification、tools/list、tools/call、invalid args、unknown method、malformed JSON、JSON/SSE response；API 单元测试当前 59 个通过。
+- [x] `scripts/paperclip-mcp-business-smoke.mjs` 已完成 41 个内置工具集合检查，并实际执行 Issue、Comment、Document、Interaction、Approval、Heartbeat、workspace runtime 和 `paperclipApiRequest` 成功路径。
+- [x] `scripts/paperclip-mcp-security-smoke.mjs` 已验证跨 Agent checkout、危险 API path、错误 MCP session id 和错误 token 均被拒绝；过期 token 测试支持 `TEST_EXPIRY=1` 长耗时模式。
 - [x] heartbeat run 完成后可读取 `continuation-summary` 文档。
 - [x] `cargo test --workspace --no-fail-fast` 已执行：206 个测试通过，19 个既存 services 测试失败；失败集中在 `adapter_config_normalizer`、`codex_local_isolation`、`consistency_service` 等非本次 MCP 迁移路径，不能将 workspace 全绿作为当前完成证据。
-- [ ] 尚未完成 Codex 真实业务长流程、MCP 过期 token/跨公司负向测试和所有业务工具的成功路径矩阵；协议 SSE 长连接已由 `scripts/mcp-gateway-contract-smoke.sh` 验证。
+- [ ] 尚未完成 Codex 真实业务长流程、跨公司负向测试、checkout/release 成功矩阵和策略 deny/approval 决策矩阵；过期 token、跨 Agent checkout、错误 session id、错误 token 和安全路径负向测试已通过；协议 SSE 长连接已由 `scripts/mcp-gateway-contract-smoke.sh` 验证。
 
 ### 9.3 接手时的安全顺序
 
@@ -450,10 +452,10 @@ error mapping
 - [x] 阶段四：迁移只读工具：身份、Agent、Issue、Comment、Document、Project、Goal、Approval 查询；逐工具生产验收仍在进行。
 - [x] 阶段五：迁移主要写工具：Issue、Comment、Document、Approval、Interaction。
 - [x] 阶段六：迁移 workspace runtime 工具和 `paperclipApiRequest` 基础安全限制。
-- [ ] 阶段七：补齐 MCP session、SSE、Streamable HTTP 的全部标准细节和自动化测试。
+- [x] 阶段七：补齐 MCP session、SSE、Streamable HTTP 的协议测试；安全过期/跨公司边界仍在阶段八核销。
 - [ ] 阶段八：补齐工具审计、审批和策略测试。
 - [ ] 阶段九：接入 Claude/Codex 真实 CLI 做端到端验证。
-- [ ] 阶段十：更新 README、运行手册和故障排查文档。
+- [x] 阶段十：更新 README、运行手册和故障排查文档。
 - [ ] 阶段十一：执行全量 `cargo check`、`cargo test`、`git diff --check`，完成剩余测试后再提交迁移。
 
 ## 11. 接手 Agent 的第一步
