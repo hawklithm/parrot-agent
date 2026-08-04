@@ -73,23 +73,11 @@ struct IssueDocumentResponse {
 
 async fn list_issue_documents(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(issue_id): Path<Uuid>,
     Query(query): Query<ListIssueDocumentsQuery>,
 ) -> Result<Json<Vec<IssueDocumentResponse>>, StatusCode> {
-    let issue_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1)",
-    )
-    .bind(issue_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|error| {
-        tracing::error!(error = %error, issue_id = %issue_id, "failed to check issue for documents");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    if !issue_exists {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    scoped_issue_company(&state, &actor, issue_id).await?;
 
     let mut sql = String::from(
         "SELECT d.id, d.company_id, l.issue_id, l.key, d.content, d.content_type, \
@@ -118,22 +106,10 @@ async fn list_issue_documents(
 /// GET /issues/:id/documents/:key
 async fn get_issue_document(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, key)): Path<(Uuid, String)>,
 ) -> Result<Json<IssueDocumentResponse>, StatusCode> {
-    let issue_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1)",
-    )
-    .bind(issue_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|error| {
-        tracing::error!(error = %error, issue_id = %issue_id, "failed to check issue for document");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    if !issue_exists {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    scoped_issue_company(&state, &actor, issue_id).await?;
 
     let key = key.trim().to_lowercase();
     sqlx::query_as::<_, IssueDocumentResponse>(
@@ -167,6 +143,7 @@ fn validate_issue_document_key(key: &str) -> Result<String, StatusCode> {
 /// PUT /issues/:id/documents/:key — Create or update an issue document.
 async fn upsert_issue_document(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, raw_key)): Path<(Uuid, String)>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
@@ -176,7 +153,7 @@ async fn upsert_issue_document(
     if content.len() > 524_288 {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let company_id = issue_company_id(&state, issue_id).await?;
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let content_type = if payload.get("format").and_then(|value| value.as_str()).unwrap_or("markdown") == "markdown" { "text/markdown" } else { return Err(StatusCode::BAD_REQUEST) };
     let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let existing = sqlx::query("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2 FOR UPDATE")
@@ -238,8 +215,10 @@ async fn upsert_issue_document(
 /// GET /issues/:id/documents/:key/revisions — List issue document revisions.
 async fn list_issue_document_revisions(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, raw_key)): Path<(Uuid, String)>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    scoped_issue_company(&state, &actor, issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
     let document_id: Uuid = sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
         .bind(issue_id).bind(&key).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
@@ -255,9 +234,11 @@ async fn list_issue_document_revisions(
 /// POST /issues/:id/documents/:key/revisions/:revision_id/restore.
 async fn restore_issue_document_revision(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, raw_key, revision_id)): Path<(Uuid, String, Uuid)>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    scoped_issue_company(&state, &actor, issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
     let document_id: Uuid = sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
         .bind(issue_id).bind(&key).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
@@ -295,6 +276,25 @@ async fn issue_company_id(state: &AppState, issue_id: Uuid) -> Result<Uuid, Stat
     sqlx::query_scalar("SELECT company_id FROM issues WHERE id=$1")
         .bind(issue_id).fetch_optional(&state.pool).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn scoped_issue_company(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    issue_id: Uuid,
+) -> Result<Uuid, StatusCode> {
+    let company_id = actor.company_id().ok_or(StatusCode::FORBIDDEN)?;
+    let belongs_to_company = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1 AND company_id = $2)",
+    )
+    .bind(issue_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    belongs_to_company
+        .then_some(company_id)
         .ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -572,10 +572,11 @@ async fn batch_update_issues(
 /// POST /issues/:id/heartbeat-context - Get heartbeat context for issue
 async fn get_heartbeat_context(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = issue_company_id(&state, id).await?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
 
     service
         .get_heartbeat_context(id, company_id)

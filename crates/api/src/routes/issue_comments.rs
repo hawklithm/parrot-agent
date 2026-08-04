@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
@@ -13,6 +13,7 @@ use services::CommentServiceError;
 use crate::errors::ApiError;
 use crate::app_state::AppState;
 use repositories::ISSUE_COMMENT_COLUMNS;
+use services::auth::AuthorizationActor;
 
 /// Add comment request
 #[derive(Debug, Deserialize)]
@@ -79,9 +80,11 @@ impl From<CommentServiceError> for ApiError {
 /// POST /issues/:issue_id/comments - Add a comment
 pub async fn add_comment(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(issue_id): Path<Uuid>,
     Json(req): Json<AddCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    assert_issue_company(&state, &actor, issue_id).await?;
     let service = state.issue_comment_service.clone();
     let comment = service.add_comment(
         issue_id,
@@ -98,9 +101,11 @@ pub async fn add_comment(
 /// GET /issues/:issue_id/comments - List comments for an issue
 pub async fn list_comments(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(issue_id): Path<Uuid>,
     Query(query): Query<CommentPaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    assert_issue_company(&state, &actor, issue_id).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let order = query.order.as_deref().unwrap_or("desc").to_ascii_lowercase();
 
@@ -175,12 +180,46 @@ pub async fn list_comments(
 /// GET /comments/:comment_id - Get a single comment
 pub async fn get_comment(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(comment_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let company_id = actor.company_id().ok_or_else(|| ApiError::Forbidden("Missing company scope".into()))?;
+    let visible = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+           SELECT 1 FROM issue_comments c
+           JOIN issues i ON i.id = c.issue_id
+          WHERE c.id = $1 AND i.company_id = $2
+        )",
+    )
+    .bind(comment_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    if !visible {
+        return Err(ApiError::NotFound(format!("Comment not found: {comment_id}")));
+    }
     let service = state.issue_comment_service.clone();
     let comment = service.get_comment(comment_id).await?;
 
     Ok(Json(CommentResponse { comment }))
+}
+
+async fn assert_issue_company(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    issue_id: Uuid,
+) -> Result<(), ApiError> {
+    let company_id = actor.company_id().ok_or_else(|| ApiError::Forbidden("Missing company scope".into()))?;
+    let visible = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1 AND company_id = $2)",
+    )
+    .bind(issue_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    if visible { Ok(()) } else { Err(ApiError::NotFound(format!("Issue not found: {issue_id}"))) }
 }
 
 /// PUT /comments/:comment_id - Update a comment
