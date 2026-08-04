@@ -234,20 +234,20 @@ McpInvocationContext {
 - [x] 所有内置工具先解析 required 字段、文档 key/body、approval action、JSON body、HTTP method 和主要字段类型，再调用现有 service/API contract；复杂 payload 仍需补充逐字段 JSON Schema 校验。
 - [ ] 优先调用 `AppState` 中已有 service，避免通过 HTTP 回环调用自身。
 - [ ] 如果必须复用 HTTP contract，增加专用内部调用层，不能通过伪造 Board API Key 绕过认证。
-- [ ] 所有写操作都要检查当前 Agent 是否属于 session 的 Agent 和 company。
-- [ ] Issue 相关工具必须额外检查 Issue 是否属于 session company。
-- [ ] 需要 run 的工具必须检查 `run_id` 存在且处于 queued/running 状态。
+- [x] 所有写操作都要检查当前 Agent 是否属于 session 的 Agent 和 company；gateway actor 与 REST handler 均使用 session-derived actor。
+- [x] Issue 相关工具必须额外检查 Issue 是否属于 session company；Issue、comment、document、approval 子资源已补齐 company scope。
+- [x] 需要 run 的工具必须检查 `run_id` 存在且处于 queued/running 状态。
 
 ### 5.3 MCP Streamable HTTP 层
 
-- [ ] 保留 `POST /api/tool-gateway/mcp`。
-- [ ] 增加 MCP session 建立和 `Mcp-Session-Id` 响应。
+- [x] 保留 `POST /api/tool-gateway/mcp`。
+- [x] 增加 MCP session 建立和 `Mcp-Session-Id` 响应。
 - [x] 处理客户端带 session id 的后续请求，并确认 session 属于同一个 gateway token。
 - [x] 按 MCP 客户端要求处理 `Accept: application/json, text/event-stream`；明确拒绝不支持的媒体类型。
 - [x] 支持 JSON/SSE 响应；GET SSE 保持连接并发送 KeepAlive。
 - [x] 正确区分 request、notification 和 response；`notifications/initialized` 不返回普通 JSON-RPC response。
 - [x] 对未知 method 返回标准 JSON-RPC method-not-found error。
-- [ ] 对无效 JSON、缺少 jsonrpc、缺少 id、参数类型错误返回标准 JSON-RPC parse/invalid-params error。（缺少 jsonrpc、缺少 id、工具参数已覆盖；Axum 的无效 JSON extractor 仍需统一 envelope。）
+- [x] 对无效 JSON、缺少 `jsonrpc`、缺少 request id、参数类型错误返回标准 JSON-RPC parse/invalid-params error；合法 notification 按 JSON-RPC 规则返回 202 空响应。
 - [x] 提供 `GET /api/tool-gateway/mcp` session info/SSE stream，并用 `DELETE /api/tool-gateway/mcp` 关闭 session。
 - [ ] 为 Claude 和 Codex 各自验证实际握手流程，不能只用手写 curl 验证。
 
@@ -365,6 +365,7 @@ error mapping
 - [x] adapter 已解析 Claude/Codex JSONL 的显式 result/error、tool call 和 handoff 记录，并写入 `heartbeat_runs.result_json`；零退出码不再覆盖显式失败。
 - [x] Approval 的 issue 查询、approve、reject、request-revision 路径均先校验当前 actor 的 company scope。
 - [x] Issue 文档、revision、heartbeat context 和 comment REST 子资源均校验 gateway actor 的 company scope，跨公司 UUID 返回 404/403，不再只按资源 UUID 查询。
+- [x] checkout/release 已校验 Agent actor 与 run id，checkout 写入 `assignee_agent_id`、`checkout_run_id`、`execution_run_id`，release 清理执行锁字段。
 
 ### 9.2 已执行验证
 

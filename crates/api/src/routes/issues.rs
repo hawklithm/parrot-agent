@@ -491,16 +491,61 @@ async fn checkout_issue(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-    Json(input): Json<CheckoutInput>,
+    Json(mut input): Json<CheckoutInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
     let company_id = scoped_issue_company(&state, &actor, id).await?;
 
+    if let AuthorizationActor::Agent { agent_id, run_id, .. } = &actor {
+        if input.agent_id.is_some_and(|requested| requested != *agent_id)
+            || run_id.is_some_and(|current| current != input.checkout_run_id)
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        input.agent_id = Some(*agent_id);
+    }
+    let valid_run = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+           SELECT 1 FROM heartbeat_runs
+          WHERE id = $1 AND company_id = $2 AND agent_id = $3
+            AND status IN ('queued', 'running')
+        )",
+    )
+    .bind(input.checkout_run_id)
+    .bind(company_id)
+    .bind(input.agent_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !valid_run {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let checkout_agent_id = input.agent_id;
+    let checkout_run_id = input.checkout_run_id;
+
     service
         .checkout(id, company_id, input)
         .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query(
+        "UPDATE issues
+            SET assignee_agent_id = $2, checkout_run_id = $3,
+                execution_run_id = $3, updated_at = NOW()
+          WHERE id = $1 AND company_id = $4",
+    )
+    .bind(id)
+    .bind(checkout_agent_id)
+    .bind(checkout_run_id)
+    .bind(company_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    service
+        .get(id, company_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// POST /issues/:id/release - Release issue
@@ -512,12 +557,32 @@ async fn release_issue(
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-
+    if let AuthorizationActor::Agent { run_id, .. } = &actor {
+        if run_id.is_some_and(|current| current != input.release_run_id) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
     service
         .release(id, company_id, input)
         .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query(
+        "UPDATE issues
+            SET checkout_run_id = NULL, execution_run_id = NULL,
+                execution_locked_at = NULL, updated_at = NOW()
+          WHERE id = $1 AND company_id = $2",
+    )
+    .bind(id)
+    .bind(company_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    service
+        .get(id, company_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// POST /issues/:id/admin/force-release - Force release issue (admin only)
