@@ -362,7 +362,8 @@ error mapping
 - [x] Issue comments 已按 Paperclip `comment_actor_type`/`actor_id`/`actor_run_id` 数据库契约显式投影，兼容旧模型字段，不再依赖错误的 `SELECT *`。
 - [x] MCP 已增加 JSON-RPC batch、Accept 406、`Mcp-Protocol-Version`、named gateway scope 校验和保持连接的 SSE GET。
 - [x] 文档 PUT 已支持 `baseRevisionId` 乐观并发检查，并把 gateway run 的 Agent 归属写入 revision provenance。
-- [x] adapter 已解析 Claude/Codex JSONL 的显式 result/error、tool call 和 handoff 记录；零退出码不再覆盖显式失败。
+- [x] adapter 已解析 Claude/Codex JSONL 的显式 result/error、tool call 和 handoff 记录，并写入 `heartbeat_runs.result_json`；零退出码不再覆盖显式失败。
+- [x] Approval 的 issue 查询、approve、reject、request-revision 路径均先校验当前 actor 的 company scope。
 
 ### 9.2 已执行验证
 
