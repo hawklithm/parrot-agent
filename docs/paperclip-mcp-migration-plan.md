@@ -364,6 +364,7 @@ error mapping
 - [x] 文档 PUT 已支持 `baseRevisionId` 乐观并发检查，并把 gateway run 的 Agent 归属写入 revision provenance。
 - [x] adapter 已解析 Claude/Codex JSONL 的显式 result/error、tool call 和 handoff 记录，并写入 `heartbeat_runs.result_json`；零退出码不再覆盖显式失败。
 - [x] Approval 的 issue 查询、approve、reject、request-revision 路径均先校验当前 actor 的 company scope。
+- [x] Issue 文档、revision、heartbeat context 和 comment REST 子资源均校验 gateway actor 的 company scope，跨公司 UUID 返回 404/403，不再只按资源 UUID 查询。
 
 ### 9.2 已执行验证
 
