@@ -367,6 +367,7 @@ error mapping
 - [x] Issue 文档、revision、heartbeat context 和 comment REST 子资源均校验 gateway actor 的 company scope，跨公司 UUID 返回 404/403，不再只按资源 UUID 查询。
 - [x] checkout/release 已校验 Agent actor 与 run id，checkout 写入 `assignee_agent_id`、`checkout_run_id`、`execution_run_id`，release 清理执行锁字段。
 - [x] `paperclipListIssues` 已把 status、priority、assignee、project、goal、parent、query、participant、label、execution workspace 和 origin filters 传入 repository；数据库层使用 company-scoped `EXISTS`/字段条件。
+- [x] 对 create/update issue、approval、UUID 数组和日期/枚举字段补充 Paperclip shared schema 对应的 runtime 校验；invalid params 会在实际 REST bridge 前被拒绝。
 
 ### 9.2 已执行验证
 

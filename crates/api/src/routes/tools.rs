@@ -183,11 +183,12 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "projectWorkspaceId": {"type": ["string", "null"], "format": "uuid"}, "goalId": {"type": ["string", "null"], "format": "uuid"},
                         "parentId": {"type": ["string", "null"], "format": "uuid"}, "blockedByIssueIds": {"type": "array", "items": {"type": "string", "format": "uuid"}},
                         "inheritExecutionWorkspaceFromIssueId": {"type": ["string", "null"], "format": "uuid"}, "title": {"type": "string", "minLength": 1},
-                        "description": {"type": ["string", "null"]}, "status": {"type": "string"}, "workMode": {"type": "string"},
-                        "harnessKind": {"type": ["string", "null"]}, "priority": {"type": "string"}, "assigneeAgentId": {"type": ["string", "null"], "format": "uuid"},
+                        "description": {"type": ["string", "null"]}, "status": {"type": "string", "enum": ["backlog", "todo", "in_progress", "blocked", "in_review", "done", "cancelled"]}, "workMode": {"type": "string", "enum": ["standard", "ask", "planning", "skill_test"]},
+                        "harnessKind": {"type": ["string", "null"], "enum": ["skill_test", null]}, "priority": {"type": "string", "enum": ["urgent", "high", "medium", "low", "no_priority"]}, "assigneeAgentId": {"type": ["string", "null"], "format": "uuid"},
                         "assigneeUserId": {"type": ["string", "null"]}, "requestDepth": {"type": "integer", "minimum": 0},
                         "billingCode": {"type": ["string", "null"]}, "assigneeAdapterOverrides": {"type": ["object", "null"]},
-                        "executionPolicy": {"type": ["object", "null"]}, "executionWorkspaceId": {"type": ["string", "null"], "format": "uuid"},
+                        "createdByUserId": {"type": ["string", "null"]}, "responsibleUserId": {"type": ["string", "null"]},
+                        "watchdog": {"type": ["object", "null"]}, "executionPolicy": {"type": ["object", "null"]}, "executionWorkspaceId": {"type": ["string", "null"], "format": "uuid"},
                         "executionWorkspacePreference": {"type": ["string", "null"]}, "executionWorkspaceSettings": {"type": ["object", "null"]},
                         "labelIds": {"type": "array", "items": {"type": "string", "format": "uuid"}}, "watchdogDiscovery": {"type": ["object", "null"]}
                     }, "required": ["title"], "additionalProperties": false
@@ -197,9 +198,9 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "issueId": {"type": "string"}, "projectId": {"type": ["string", "null"], "format": "uuid"},
                         "projectWorkspaceId": {"type": ["string", "null"], "format": "uuid"}, "goalId": {"type": ["string", "null"], "format": "uuid"},
                         "parentId": {"type": ["string", "null"], "format": "uuid"}, "title": {"type": "string"}, "description": {"type": ["string", "null"]},
-                        "status": {"type": "string"}, "workMode": {"type": "string"}, "harnessKind": {"type": ["string", "null"]},
-                        "priority": {"type": "string"}, "assigneeAgentId": {"type": ["string", "null"]}, "assigneeUserId": {"type": ["string", "null"]},
-                        "comment": {"type": "string"}, "reviewRequest": {"type": ["object", "null"]}, "reopen": {"type": "boolean"},
+                        "status": {"type": "string", "enum": ["backlog", "todo", "in_progress", "blocked", "in_review", "done", "cancelled"]}, "workMode": {"type": "string", "enum": ["standard", "ask", "planning", "skill_test"]}, "harnessKind": {"type": ["string", "null"], "enum": ["skill_test", null]},
+                        "priority": {"type": "string", "enum": ["urgent", "high", "medium", "low", "no_priority"]}, "assigneeAgentId": {"type": ["string", "null"]}, "assigneeUserId": {"type": ["string", "null"]},
+                        "comment": {"type": "string"}, "reviewRequest": {"type": ["object", "null"]}, "hiddenAt": {"type": ["string", "null"], "format": "date-time"}, "reopen": {"type": "boolean"},
                         "resume": {"type": "boolean"}, "interrupt": {"type": "boolean"}, "requestDepth": {"type": "integer", "minimum": 0},
                         "executionPolicy": {"type": ["object", "null"]}, "executionWorkspacePreference": {"type": ["string", "null"]},
                         "executionWorkspaceSettings": {"type": ["object", "null"]}, "labelIds": {"type": "array", "items": {"type": "string", "format": "uuid"}}
@@ -246,7 +247,7 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                 "paperclipCreateApproval" => serde_json::json!({
                     "type": "object", "properties": {
                         "companyId": {"type": ["string", "null"], "format": "uuid"},
-                        "type": {"type": "string"}, "requestedByAgentId": {"type": ["string", "null"], "format": "uuid"},
+                        "type": {"type": "string", "enum": ["hire_agent", "approve_ceo_strategy", "budget_override_required", "request_board_approval"]}, "requestedByAgentId": {"type": ["string", "null"], "format": "uuid"},
                         "payload": {"type": "object"}, "issueIds": {"type": "array", "items": {"type": "string", "format": "uuid"}}
                     }, "required": ["type", "payload"], "additionalProperties": false
                 }),
@@ -352,6 +353,25 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             return Err(format!("{key} must be a string"));
         }
     }
+    for key in [
+        "companyId", "projectId", "projectWorkspaceId", "goalId", "parentId",
+        "inheritExecutionWorkspaceFromIssueId", "assigneeAgentId", "executionWorkspaceId",
+        "sourceCommentId", "sourceRunId", "baseRevisionId", "requestedByAgentId",
+    ] {
+        if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
+            let raw = value.as_str().ok_or_else(|| format!("{key} must be a UUID string"))?;
+            Uuid::parse_str(raw).map_err(|_| format!("{key} must be a valid UUID"))?;
+        }
+    }
+    for key in ["blockedByIssueIds", "labelIds", "issueIds"] {
+        if let Some(values) = object.get(key) {
+            let values = values.as_array().ok_or_else(|| format!("{key} must be an array"))?;
+            for value in values {
+                let raw = value.as_str().ok_or_else(|| format!("{key} must contain UUID strings"))?;
+                Uuid::parse_str(raw).map_err(|_| format!("{key} must contain valid UUIDs"))?;
+            }
+        }
+    }
     if let Some(limit) = object.get("limit") {
         if !limit.is_u64() || !(1..=500).contains(&limit.as_u64().unwrap_or_default()) {
             return Err("limit must be an integer between 1 and 500".to_string());
@@ -385,6 +405,26 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
     if let Some(body) = object.get("body").and_then(Value::as_str) {
         if body.is_empty() || body.len() > 524_288 {
             return Err("body must contain between 1 and 524288 characters".to_string());
+        }
+    }
+    if let Some(title) = object.get("title").and_then(Value::as_str) {
+        if title.trim().is_empty() {
+            return Err("title must not be empty".to_string());
+        }
+    }
+    if let Some(status) = object.get("status").and_then(Value::as_str) {
+        if !matches!(status, "backlog" | "todo" | "in_progress" | "blocked" | "in_review" | "done" | "cancelled") {
+            return Err("status is not a valid Paperclip issue status".to_string());
+        }
+    }
+    if let Some(work_mode) = object.get("workMode").and_then(Value::as_str) {
+        if !matches!(work_mode, "standard" | "ask" | "planning" | "skill_test") {
+            return Err("workMode is not a valid Paperclip issue work mode".to_string());
+        }
+    }
+    if let Some(priority) = object.get("priority").and_then(Value::as_str) {
+        if !matches!(priority, "urgent" | "high" | "medium" | "low" | "no_priority") {
+            return Err("priority is not a valid Paperclip issue priority".to_string());
         }
     }
     if tool_name == "paperclipApprovalDecision" {
@@ -2383,6 +2423,8 @@ mod tests {
         assert!(validate_paperclip_arguments("paperclipApiRequest", &serde_json::json!({
             "method": "POST", "path": "/issues/1", "jsonBody": "not-json"
         })).is_err());
+        assert!(validate_paperclip_arguments("paperclipCreateIssue", &serde_json::json!({"title":"x", "priority":"invalid"})).is_err());
+        assert!(validate_paperclip_arguments("paperclipCreateIssue", &serde_json::json!({"title":"x", "parentId":"not-a-uuid"})).is_err());
     }
 
     #[test]
