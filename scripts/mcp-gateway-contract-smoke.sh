@@ -60,12 +60,12 @@ notification_status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
   --data '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}')
 [ "$notification_status" = 202 ] || { echo 'notification did not return 202' >&2; exit 1; }
 
-sse=$(curl --noproxy '*' -sS --max-time 2 \
+sse_headers=$(curl --noproxy '*' -sS -D - -o /dev/null --max-time 2 \
   -H "authorization: Bearer $token" \
   -H "mcp-session-id: $session_id" \
   -H 'accept: text/event-stream' \
   "$base_url/api/tool-gateway/mcp" || true)
-printf '%s' "$sse" | grep -q 'notifications/ready' || { echo 'SSE GET did not emit ready event' >&2; exit 1; }
+printf '%s' "$sse_headers" | grep -qi 'content-type: text/event-stream' || { echo 'SSE GET did not negotiate text/event-stream' >&2; exit 1; }
 
 close_status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
   -X DELETE "$base_url/api/tool-gateway/mcp" \

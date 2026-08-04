@@ -496,6 +496,20 @@ impl DefaultHeartbeatService {
                 }
             }
         }
+        if adapter == "codex_local" {
+            let skip_permissions = cfg
+                .get("dangerouslySkipPermissions")
+                .or_else(|| cfg.get("dangerously_skip_permissions"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            if skip_permissions
+                && !args
+                    .iter()
+                    .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+            {
+                args.push("--dangerously-bypass-approvals-and-sandbox".into());
+            }
+        }
         let mut cmd = Command::new(command);
         let gateway_token = format!("ptg_{}", Uuid::new_v4().simple());
         let mut token_hasher = Sha256::new();
@@ -550,7 +564,12 @@ impl DefaultHeartbeatService {
                     "-c".to_string(),
                     format!("mcp_servers.paperclip.url={mcp_url:?}"),
                     "-c".to_string(),
-                    "mcp_servers.paperclip.bearer_token_env_var=\"PAPERCLIP_TOOL_GATEWAY_TOKEN\"".to_string(),
+                    // Codex 0.144.x reads `env_http_headers` for Streamable
+                    // HTTP bearer auth. `bearer_token_env_var` is accepted by
+                    // its config printer but is not emitted on requests in
+                    // this CLI version. Keep the value in a dedicated env var
+                    // whose value already contains the required scheme.
+                    "mcp_servers.paperclip.env_http_headers.Authorization=\"PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION\"".to_string(),
                 ]);
             }
             _ => {}
@@ -618,7 +637,11 @@ impl DefaultHeartbeatService {
             .env("PAPERCLIP_RUN_ID", run_id.to_string())
             .env("PAPERCLIP_AGENT_ID", agent_id.to_string())
             .env("PAPERCLIP_TOOL_GATEWAY_URL", gateway_url)
-            .env("PAPERCLIP_TOOL_GATEWAY_TOKEN", gateway_token);
+            .env("PAPERCLIP_TOOL_GATEWAY_TOKEN", &gateway_token)
+            .env(
+                "PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION",
+                format!("Bearer {gateway_token}"),
+            );
         if let Some(cwd) = cfg.get("cwd").and_then(|v| v.as_str()) {
             cmd.current_dir(cwd);
         }

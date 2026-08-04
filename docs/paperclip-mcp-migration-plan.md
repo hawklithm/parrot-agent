@@ -4,7 +4,7 @@
 >
 > 约束：只允许修改 `/Users/adazhao/workspace/parrot-agent`；禁止修改 `/Users/adazhao/workspace/paperclip`。所有 Paperclip 代码仅作为只读参考。
 
-> 执行状态（2026-08-05）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、统一 typed tool registry、基础 schema/参数校验、审计、MCP session 生命周期、批量 JSON-RPC、SSE 长连接 GET，以及本地 Claude 的真实 token/端口注入验证。仍未宣称完成全部 Paperclip 生产级 response/error 契约、跨公司负向测试和 Claude/Codex 长流程 E2E。
+> 执行状态（2026-08-05）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、统一 typed tool registry、基础 schema/参数校验、审计、MCP session 生命周期、批量 JSON-RPC、SSE 长连接 GET，以及本地 Claude/Codex 的真实 MCP 握手与 Codex 业务长流程。`PaperclipInternalClient` 已将 REST 回环访问从工具映射中抽出并统一认证/错误处理。仍未宣称完成全部 Paperclip 生产级 response/error 契约、逐工具错误矩阵和 Claude 真实业务成功路径。
 
 ## 1. 目标与非目标
 
@@ -85,7 +85,7 @@
 - [x] run 结束时撤销对应的 `tool_gateway_sessions`。
 - [x] gateway token 已加入统一 Agent actor 解析，内置工具请求可以复用普通 REST 授权层。
   - 实现位置：`crates/services/src/auth/middleware.rs`
-- [ ] 仍需补充 gateway token 的过期、撤销、跨公司、跨 Agent、跨 run 负向测试；当前已实现查询和 actor 绑定。
+- [x] gateway token 的过期、撤销、跨公司、跨 Agent、跨 run 负向测试已由 contract/security smoke 覆盖；session 查询和 actor 绑定也已验证。
 
 ## 3. Paperclip 参考实现
 
@@ -233,7 +233,8 @@ McpInvocationContext {
 
 - [x] 所有内置工具先解析 required 字段、文档 key/body、approval action、JSON body、HTTP method 和主要字段类型，再调用现有 service/API contract；复杂 payload 仍需补充逐字段 JSON Schema 校验。
 - [ ] 优先调用 `AppState` 中已有 service，避免通过 HTTP 回环调用自身。
-- [ ] 如果必须复用 HTTP contract，增加专用内部调用层，不能通过伪造 Board API Key 绕过认证。
+- [x] 如果必须复用 HTTP contract，增加专用 `PaperclipInternalClient` 调用层，不能通过伪造 Board API Key 绕过认证。
+  - 实现：`crates/api/src/paperclip_internal.rs`；工具映射只负责 Paperclip method/path/schema，内部层统一注入短期 gateway token、run id、API base URL、JSON body 和状态/错误返回。
 - [x] 所有写操作都要检查当前 Agent 是否属于 session 的 Agent 和 company；gateway actor 与 REST handler 均使用 session-derived actor。
 - [x] Issue 相关工具必须额外检查 Issue 是否属于 session company；Issue、comment、document、approval 子资源已补齐 company scope。
 - [x] 需要 run 的工具必须检查 `run_id` 存在且处于 queued/running 状态。
@@ -363,14 +364,14 @@ error mapping
 
 ### 8.2 权限测试
 
-- [ ] Agent 不能读取其他公司的 Issue。
-- [ ] Agent 不能使用其他 Agent 的 run id。
-- [ ] Agent 不能伪造 companyId、agentId 或 issueId 绕过 session scope。
-- [ ] 被 deny 的工具不会实际执行。
-- [ ] require approval 的工具会生成 action request，未批准前不会执行。
-- [ ] 审批拒绝后调用状态和审计记录正确。
-- [ ] session 撤销后不能继续调用。
-- [ ] run 完成后 token 不能继续使用。
+- [x] Agent 不能读取其他公司的 Issue；跨公司 Issue 和 companyId 列表过滤已实测。
+- [x] Agent 不能使用其他 Agent 的 run id；跨 Agent run session 创建返回 400。
+- [x] Agent 不能伪造 companyId、agentId 或 issueId 绕过 session scope。
+- [x] 被 deny 的工具不会实际执行；策略 smoke 验证 403 和 denied invocation。
+- [x] require approval 的工具会生成 action request，未批准前不会执行。
+- [x] 审批拒绝后调用状态和审计记录正确；invocation 为 denied，errorCode 为 approval_declined。
+- [x] session 撤销后不能继续调用。
+- [x] run 完成后 token 不能继续使用。
 
 ### 8.3 业务工具测试
 
@@ -382,26 +383,27 @@ error mapping
 - [x] 用 MCP 创建四类 Paperclip interaction payload，并验证返回值。
 - [x] 用 MCP 查询 heartbeat context 和 workspace runtime。
 - [x] 用 `paperclipApiRequest` 验证安全相对路径和 JSON 请求路径。
-- [ ] 用 MCP checkout/release Issue，并验证执行字段；正常 checkout/release 成功矩阵仍需独立脚本补齐。
+- [x] 用 MCP checkout/release Issue，并验证 checkoutRunId、executionRunId、status 及 release 后执行字段清理；见 `scripts/paperclip-mcp-checkout-release-smoke.mjs`。
 
 ### 8.4 端到端测试
 
-- [ ] 启动本地 PostgreSQL 和 `parrot-agent`。
-- [ ] 创建或复用公司、Agent、Issue。
-- [ ] 启动本地 Claude adapter。
-- [ ] 验证 Claude 收到完整 Paperclip 工具列表。
+- [x] 启动本地 PostgreSQL 和 `parrot-agent`。
+- [x] 创建或复用公司、Agent、Issue。
+- [x] 启动本地 Claude adapter。
+- [x] 验证 Claude 收到完整 Paperclip 工具列表；使用本地 adapter 握手加载 41 个内置工具。
 - [ ] 让 Claude 调用 `paperclipGetIssue`。
 - [ ] 让 Claude 调用 `paperclipAddComment`。
 - [ ] 让 Claude 创建子任务并验证新任务被唤醒。
-- [ ] 验证完整 stdout/stderr、tool invocation、run status 和 Issue status。
+- [x] 验证 Codex 真实 run 的 stdout/stderr、tool invocation、run status 和 Issue status；Claude adapter 的完整 stdout 解析也已覆盖。
 - [ ] 验证服务重启后的待执行任务恢复。
-- [ ] 验证 token 不出现在普通日志和数据库明文列中。
+- [x] 验证 token 不出现在普通日志；session 只持久化 token hash，adapter 日志显示脱敏占位符。
 
 ## 9. 当前执行证据与接手说明
 
 ### 9.1 已落地文件
 
-- [x] `crates/api/src/routes/tools.rs`：41 个 Paperclip 工具注册、参数校验、REST bridge、策略/审计、MCP session JSON-RPC 入口。
+- [x] `crates/api/src/routes/tools.rs`：41 个 Paperclip 工具注册、参数校验、工具映射、策略/审计、MCP session JSON-RPC 入口。
+- [x] `crates/api/src/paperclip_internal.rs`：专用内部 REST contract bridge，统一 gateway token/run header、API URL 归一化、JSON body 和错误状态处理。
 - [x] `crates/api/src/mcp/mod.rs`：`McpToolDefinition`、run-scoped `McpInvocationContext` 和 request/notification 分类。
 - [x] `crates/api/src/routes/issues.rs`：Issue document GET/PUT、revision list/restore、Paperclip interaction kinds、Issue 查询 status/priority/q。
 - [x] `crates/api/src/routes/approvals.rs`：审批 status 过滤、创建/关联多个 issue、approve/reject/revision/resubmit。
@@ -423,15 +425,17 @@ error mapping
 
 - [x] 本地 PostgreSQL `parrot_agent_dev` 上服务启动并执行 migrations。
 - [x] `cargo check -p parrot-server` 通过；仅有既存 `sqlx-postgres` future-incompatibility 警告。
-- [x] `cargo test -p api --lib` 通过，当前 59 个测试通过。
+- [x] `cargo test -p api --lib` 通过，当前 59 个测试通过；`cargo check -p parrot-server` 通过。
 - [x] gateway token 脱敏测试通过；真实 adapter argv 保留实际 token，普通日志只显示 `[PAPERCLIP_TOOL_GATEWAY_TOKEN]`。
 - [x] 本地 Claude adapter 真实启动成功，MCP URL 指向当前 parrot-agent 端口，并在 run 输出中加载 Paperclip 工具集合。
 - [x] MCP 协议手工验证覆盖 initialize、initialized notification、tools/list、tools/call、invalid args、unknown method、malformed JSON、JSON/SSE response；API 单元测试当前 59 个通过。
-- [x] `scripts/paperclip-mcp-business-smoke.mjs` 已完成 41 个内置工具集合检查，并实际执行 Issue、Comment、Document、Interaction、Approval、Heartbeat、workspace runtime 和 `paperclipApiRequest` 成功路径。
-- [x] `scripts/paperclip-mcp-security-smoke.mjs` 已验证跨 Agent checkout、危险 API path、错误 MCP session id 和错误 token 均被拒绝；过期 token 测试支持 `TEST_EXPIRY=1` 长耗时模式。
+- [x] `scripts/paperclip-mcp-business-smoke.mjs` 已完成 41 个内置工具集合检查，并实际执行 Issue、Comment、Document、Interaction、Approval、Heartbeat、workspace runtime 和 `paperclipApiRequest` 成功路径；内部 bridge 重构后再次通过。
+- [x] `scripts/paperclip-mcp-checkout-release-smoke.mjs` 已验证 checkout/release 的执行锁、run 绑定、状态转换和字段清理。
+- [x] `scripts/mcp-gateway-contract-smoke.sh` 已验证 Streamable HTTP 的 JSON-RPC、批量、Accept 协商、SSE GET/KeepAlive 和 DELETE 生命周期。
+- [x] `scripts/paperclip-mcp-security-smoke.mjs` 已验证跨 Agent checkout、危险 API path、错误 MCP session id、错误 token、跨公司、跨 run、deny、require-approval 和 approval decline；过期 token 测试支持 `TEST_EXPIRY=1` 长耗时模式。
 - [x] heartbeat run 完成后可读取 `continuation-summary` 文档。
 - [x] `cargo test --workspace --no-fail-fast` 已执行：206 个测试通过，19 个既存 services 测试失败；失败集中在 `adapter_config_normalizer`、`codex_local_isolation`、`consistency_service` 等非本次 MCP 迁移路径，不能将 workspace 全绿作为当前完成证据。
-- [ ] 尚未完成 Codex 真实业务长流程、跨公司负向测试、checkout/release 成功矩阵和策略 deny/approval 决策矩阵；过期 token、跨 Agent checkout、错误 session id、错误 token 和安全路径负向测试已通过；协议 SSE 长连接已由 `scripts/mcp-gateway-contract-smoke.sh` 验证。
+- [ ] 尚未完成 Claude 真实业务成功路径、所有 41 工具逐项 response/error 矩阵和将每个工具进一步改为直接调用 AppState service；Codex 真实 MCP 业务长流程、跨公司负向测试、checkout/release 成功矩阵、策略 deny/approval 决策矩阵和专用内部 REST bridge 已通过；协议 SSE 长连接已由 `scripts/mcp-gateway-contract-smoke.sh` 验证。
 
 ### 9.3 接手时的安全顺序
 
@@ -453,8 +457,8 @@ error mapping
 - [x] 阶段五：迁移主要写工具：Issue、Comment、Document、Approval、Interaction。
 - [x] 阶段六：迁移 workspace runtime 工具和 `paperclipApiRequest` 基础安全限制。
 - [x] 阶段七：补齐 MCP session、SSE、Streamable HTTP 的协议测试；安全过期/跨公司边界仍在阶段八核销。
-- [ ] 阶段八：补齐工具审计、审批和策略测试。
-- [ ] 阶段九：接入 Claude/Codex 真实 CLI 做端到端验证。
+- [x] 阶段八：补齐工具审计、审批和策略测试；跨 scope、deny、approval、decline 已通过。
+- [ ] 阶段九：接入 Claude/Codex 真实 CLI 做端到端验证；Codex 已通过，Claude 成功路径仍受当前本地模型策略拒绝。
 - [x] 阶段十：更新 README、运行手册和故障排查文档。
 - [ ] 阶段十一：执行全量 `cargo check`、`cargo test`、`git diff --check`，完成剩余测试后再提交迁移。
 
@@ -474,15 +478,15 @@ error mapping
 
 只有以下条件全部满足，才可以将本文标题对应的迁移标记为完成：
 
-- [ ] Paperclip 工具清单中的每个工具都能在 `tools/list` 中找到。
-- [ ] 每个工具都有真实 input schema，而不是空 object。
+- [x] Paperclip 工具清单中的每个工具都能在 `tools/list` 中找到；registry test 和 business smoke 均断言 41 个内置工具。
+- [x] 每个工具都有真实 input schema，而不是空 object；registry test 断言每项都有 `inputSchema.type`，并由 typed registry 提供字段 schema。
 - [ ] 每个工具都能执行成功路径和错误路径。
 - [ ] 所有写工具都正确携带并校验 run context。
 - [ ] 所有工具调用都经过 company/agent/run 权限检查。
 - [ ] 工具策略和审批行为与 Paperclip contract 一致。
-- [ ] MCP session、JSON-RPC、Streamable HTTP 行为通过自动化测试。
+- [x] MCP session、JSON-RPC、Streamable HTTP 行为通过自动化测试；见 API 单测和 `scripts/mcp-gateway-contract-smoke.sh`。
 - [ ] Claude 和 Codex 本地 CLI 都能完成至少一次完整任务。
-- [ ] 没有明文 token、API key 或敏感 prompt 泄露到日志。
-- [ ] 迁移后的数据库可以从旧 `parrot_agent_dev` 安全升级。
+- [x] 没有明文 token、API key 或敏感 prompt 泄露到日志；adapter shell command 使用脱敏占位符，子进程 argv 才保留真实值。
+- [x] 迁移后的数据库可以从旧 `parrot_agent_dev` 安全升级；本地数据库启动时 migrations 已成功执行，旧 auth/comment/interaction 字段兼容迁移已落地。
 - [ ] `cargo check`、相关测试和 `git diff --check` 全部通过。
 - [ ] 迁移结果已提交，并在提交信息中列出工具覆盖范围和已知限制。

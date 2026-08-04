@@ -7,7 +7,7 @@
 
 use axum::{
     body::to_bytes,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     response::sse::{Event, KeepAlive, Sse},
@@ -25,6 +25,8 @@ use futures::StreamExt;
 
 use crate::app_state::AppState;
 use crate::mcp::{request_kind, McpInvocationContext, McpRequestKind, McpToolDefinition};
+use crate::paperclip_internal::PaperclipInternalClient;
+use services::auth::AuthorizationActor;
 
 fn hash_gateway_token(token: &str) -> String {
     let mut hasher = Sha256::new();
@@ -850,19 +852,15 @@ async fn mcp_session_info_for_gateway(
         .map(|value| value.split(',').any(|item| item.trim() == "text/event-stream"))
         .unwrap_or(false)
     {
-        let initial_event = futures::stream::once(async move {
-            Ok::<Event, Infallible>(Event::default().event("message").data(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/ready",
-                    "params": {"sessionId": session_id},
-                })
-                .to_string(),
-            ))
+        // Flush an ordinary SSE comment immediately so clients receive the
+        // response headers without waiting for the keep-alive interval. Do
+        // not emit a proprietary JSON-RPC notification here: Codex treats
+        // unknown unsolicited notifications as a failed transport and
+        // reconnects in a loop. The pending tail keeps the channel open.
+        let initial_comment = futures::stream::once(async {
+            Ok::<Event, Infallible>(Event::default().comment("mcp stream ready"))
         });
-        // Keep the server-to-client stream open. `KeepAlive` emits comment
-        // frames while the pending tail leaves room for future server events.
-        let stream = initial_event.chain(futures::stream::pending::<Result<Event, Infallible>>());
+        let stream = initial_comment.chain(futures::stream::pending::<Result<Event, Infallible>>());
         let mut response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
         response.headers_mut().insert(
             "mcp-protocol-version",
@@ -987,11 +985,13 @@ fn mcp_accepts_json_or_sse(headers: &HeaderMap) -> bool {
 }
 
 fn mcp_wants_sse(headers: &HeaderMap) -> bool {
-    headers
-        .get("accept")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.split(',').any(|item| item.trim() == "text/event-stream"))
-        .unwrap_or(false)
+    let Some(value) = headers.get("accept").and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let accepts_json = value.split(',').map(str::trim).any(|item| {
+        item == "*/*" || item == "application/json"
+    });
+    !accepts_json && value.split(',').map(str::trim).any(|item| item == "text/event-stream")
 }
 
 fn mcp_error(status: StatusCode, id: Value, code: i64, message: impl Into<String>, session_id: Option<Uuid>) -> Response {
@@ -1020,6 +1020,19 @@ async fn mcp_session_protocol_for_gateway(
         if let Err(response) = gateway_matches_selector(&state, &headers, selector).await {
             return response;
         }
+    }
+    // Codex opens the server-to-client Streamable HTTP channel with an empty
+    // POST (rather than GET) after initialize. Treat that as the same
+    // long-lived SSE channel as GET; parsing it as JSON would produce a parse
+    // error and the Codex connector reports the tool call as "cancelled".
+    if body.is_empty()
+        && headers.get("mcp-session-id").is_some()
+        && headers
+            .get("accept")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|item| item.trim() == "text/event-stream"))
+    {
+        return mcp_session_info_for_gateway(state, headers, selector).await;
     }
     let body: Value = match serde_json::from_slice(&body) {
         Ok(body) => body,
@@ -1194,7 +1207,11 @@ async fn mcp_session_protocol_json(
             if !status.is_success() {
                 return mcp_response(status, serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":value.get("error").cloned().unwrap_or(Value::String("Tool call failed".into())),"data":value}}), Some(session_id));
             }
-            let result = value.get("result").cloned().unwrap_or(Value::Null);
+            // Allowed calls wrap the upstream value under `result`; policy
+            // holds (require_approval) return a decision envelope directly
+            // because there is no upstream result yet. Preserve that envelope
+            // so MCP clients can receive and display `actionRequestId`.
+            let result = value.get("result").cloned().unwrap_or_else(|| value.clone());
             mcp_response(StatusCode::OK, serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":result.to_string()}],"structuredContent":result,"isError":false}}), Some(session_id))
         }
         _ => mcp_error(StatusCode::OK, id, -32601, "Method not found", Some(session_id)),
@@ -1360,20 +1377,6 @@ fn optional_query(parameters: &Value, key: &str) -> String {
         .filter(|value| !value.trim().is_empty())
         .map(|value| format!("{}={}", key, urlencoding::encode(value)))
         .unwrap_or_default()
-}
-
-fn paperclip_api_url(path: &str) -> Result<String, String> {
-    validate_paperclip_api_path(path)?;
-    let path = path.strip_prefix("/api").unwrap_or(path);
-    let configured = std::env::var("PAPERCLIP_API_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:3100/api".to_string());
-    let base = configured.trim_end_matches('/');
-    let base = if base.ends_with("/api") {
-        base.to_string()
-    } else {
-        format!("{base}/api")
-    };
-    Ok(format!("{base}{path}"))
 }
 
 fn validate_paperclip_api_path(path: &str) -> Result<(), String> {
@@ -1800,28 +1803,12 @@ async fn call_paperclip_builtin_tool(
         }
         _ => return Err(format!("Unknown Paperclip tool: {tool_name}")),
     };
-    let url = paperclip_api_url(&path)?;
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|error| format!("invalid HTTP method: {error}"))?;
-    let client = reqwest::Client::new();
-    let mut request = client
-        .request(method.clone(), &url)
-        .header("x-paperclip-tool-gateway-token", token)
-        .header("x-paperclip-run-id", run_id.to_string())
-        .header("accept", "application/json");
-    if let Some(body) = body {
-        request = request.json(&body);
-    }
-    let response = request.send().await.map_err(|error| error.to_string())?;
-    let status = response.status();
-    let text = response.text().await.map_err(|error| error.to_string())?;
-    let value = if text.trim().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()))
-    };
+    let client = PaperclipInternalClient::new(token, run_id);
+    let (status, value) = client.request(method.clone(), &path, body).await?;
     if !status.is_success() {
-        return Err(format!("{} {} failed with {}: {}", method, url, status, value));
+        return Err(format!("{} {} failed with {}: {}", method, path, status, value));
     }
     if tool_name == "paperclipGetIssueWorkspaceRuntime" {
         let workspace = value
@@ -2255,9 +2242,13 @@ async fn list_connections(
 }
 
 async fn list_policies(
-    Path(_company_id): Path<Uuid>,
+    Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
+    if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"Company access denied"})));
+    }
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(\
             'id', id, 'companyId', company_id, 'name', name, 'description', description,\
@@ -2266,8 +2257,71 @@ async fn list_policies(
             'createdByAgentId', created_by_agent_id, 'createdByUserId', created_by_user_id,\
             'createdAt', created_at, 'updatedAt', updated_at) ORDER BY priority, name), '[]'::jsonb)\
          FROM tool_policies WHERE company_id = $1",
-    ).bind(_company_id).fetch_one(&state.pool).await.unwrap_or(Value::Array(vec![]));
+    ).bind(company_id).fetch_one(&state.pool).await.unwrap_or(Value::Array(vec![]));
     (StatusCode::OK, Json(serde_json::json!({ "policies": rows })))
+}
+
+async fn create_policy(
+    Path(company_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if crate::routes::assert_company_access(&actor, company_id, false).is_err() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"Company access denied"})));
+    }
+    let Some(name) = body.get("name").and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"name is required"})));
+    };
+    let policy_type = body.get("policyType").or_else(|| body.get("policy_type"))
+        .and_then(Value::as_str).unwrap_or("allow");
+    if !matches!(policy_type, "allow" | "deny" | "block" | "require_approval" | "approval" | "ask_first") {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"policyType is invalid"})));
+    }
+    let selectors = body.get("selectors").cloned().unwrap_or_else(|| serde_json::json!({}));
+    if !selectors.is_object() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"selectors must be an object"})));
+    }
+    let priority = body.get("priority").and_then(Value::as_i64).unwrap_or(0).clamp(-1_000_000, 1_000_000) as i32;
+    let enabled = body.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let description = body.get("description").and_then(Value::as_str);
+    let config = body.get("config").cloned().filter(Value::is_object);
+    let row = sqlx::query(
+        "INSERT INTO tool_policies (company_id,name,description,policy_type,priority,enabled,selectors,conditions,config,created_by_user_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         RETURNING id,created_at,updated_at",
+    )
+    .bind(company_id).bind(name).bind(description).bind(policy_type).bind(priority).bind(enabled)
+    .bind(&selectors).bind(body.get("conditions")).bind(&config)
+    .bind(match actor { AuthorizationActor::Board { user_id, .. } => Some(user_id.to_string()), _ => None })
+    .fetch_one(&state.pool).await;
+    match row {
+        Ok(row) => (StatusCode::CREATED, Json(serde_json::json!({
+            "id": row.get::<Uuid,_>("id"), "companyId": company_id, "name": name,
+            "description": description, "policyType": policy_type, "priority": priority,
+            "enabled": enabled, "selectors": selectors, "conditions": body.get("conditions"),
+            "config": config, "createdAt": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")
+        })) ),
+        Err(error) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": error.to_string()}))),
+    }
+}
+
+async fn delete_policy(
+    Path((company_id, policy_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+) -> impl IntoResponse {
+    if crate::routes::assert_company_access(&actor, company_id, false).is_err() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"Company access denied"})));
+    }
+    let deleted = sqlx::query("DELETE FROM tool_policies WHERE id=$1 AND company_id=$2 RETURNING id")
+        .bind(policy_id).bind(company_id).fetch_optional(&state.pool).await;
+    match deleted {
+        Ok(Some(_)) => (StatusCode::OK, Json(serde_json::json!({"id": policy_id, "deleted": true}))),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"Policy not found"}))),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": error.to_string()}))),
+    }
 }
 
 async fn effective_profiles_for_agent(
@@ -2545,7 +2599,8 @@ pub fn tool_routes() -> Router<AppState> {
         .route("/tool-gateway/action-requests/:action_id/approve", post(approve_gateway_action))
         .route("/tool-gateway/action-requests/:action_id/decline", post(decline_gateway_action))
         .route("/companies/:company_id/tools/connections", get(list_connections))
-        .route("/companies/:company_id/tools/policies", get(list_policies))
+        .route("/companies/:company_id/tools/policies", get(list_policies).post(create_policy))
+        .route("/companies/:company_id/tools/policies/:policy_id", axum::routing::delete(delete_policy))
         .route(
             "/companies/:company_id/tools/runs/:run_id/decisions",
             get(get_run_decisions),
@@ -2587,16 +2642,6 @@ mod tests {
             .get("inputSchema")
             .and_then(|schema| schema.get("type"))
             .is_some()));
-    }
-
-    #[test]
-    fn paperclip_api_url_normalizes_api_prefix_and_rejects_traversal() {
-        let without_prefix = paperclip_api_url("/issues/123").unwrap();
-        let with_prefix = paperclip_api_url("/api/issues/123").unwrap();
-        assert!(without_prefix.ends_with("/api/issues/123"));
-        assert_eq!(without_prefix, with_prefix);
-        assert!(paperclip_api_url("/../secrets").is_err());
-        assert!(paperclip_api_url("/tool-gateway/mcp").is_err());
     }
 
     #[test]
@@ -2664,6 +2709,15 @@ mod tests {
         assert!(mcp_accepts_json_or_sse(&headers));
         headers.insert("accept", HeaderValue::from_static("text/plain"));
         assert!(!mcp_accepts_json_or_sse(&headers));
+    }
+
+    #[test]
+    fn mcp_prefers_json_when_client_accepts_json_and_sse() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("application/json, text/event-stream"));
+        assert!(!mcp_wants_sse(&headers));
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        assert!(mcp_wants_sse(&headers));
     }
 
     #[test]

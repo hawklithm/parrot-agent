@@ -39,16 +39,21 @@ BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' \
 BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' \
 ISSUE_ID='<issue>' AGENT_ID='<agent>' \
   node scripts/paperclip-mcp-security-smoke.mjs
+
+BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' \
+ISSUE_ID='<unassigned_issue>' RUN_ID='<active_run>' \
+  node scripts/paperclip-mcp-checkout-release-smoke.mjs
 ```
 
-业务脚本会实际调用 41 个内置工具集合中的 Issue、Comment、Document、Interaction、Approval、Heartbeat、workspace runtime 和 API request；安全脚本验证跨 Agent checkout、session id、错误 token 和路径穿越拒绝。过期 token 测试会等待最短 60 秒：额外设置 `COMPANY_ID`、`RUN_ID` 和 `TEST_EXPIRY=1`。
+业务脚本会实际调用 41 个内置工具集合中的 Issue、Comment、Document、Interaction、Approval、Heartbeat、workspace runtime 和 API request；checkout/release 脚本验证执行锁和 run 绑定；安全脚本验证跨 Agent checkout、跨公司/跨 run、session id、错误 token、策略 deny/approval 和路径穿越拒绝。过期 token 测试会等待最短 60 秒：额外设置 `COMPANY_ID`、`RUN_ID` 和 `TEST_EXPIRY=1`。
 
 ## Claude/Codex adapter
 
 - `claude_local` 使用 stdin prompt，并注入 `/api/tool-gateway/mcp` 与 `PAPERCLIP_TOOL_GATEWAY_TOKEN`。
-- `codex_local` 使用 `codex exec`，通过 `-c mcp_servers.paperclip.url=...` 和 `-c mcp_servers.paperclip.bearer_token_env_var=...` 注入同一网关。
+- `codex_local` 使用 `codex exec`，通过 `-c mcp_servers.paperclip.url=...` 和 `-c mcp_servers.paperclip.env_http_headers.Authorization=...` 注入同一网关；Authorization 环境变量的值包含 `Bearer ` 前缀。非交互运行会追加 `--dangerously-bypass-approvals-and-sandbox`（可用 `dangerouslySkipPermissions=false` 关闭）。
 - 真实 CLI 的模型名必须是本机账号支持的模型；不支持的模型会在 MCP 之前直接失败。
 - 日志中的 shell command 会保留完整参数结构，但 Bearer token 已替换为 `[PAPERCLIP_TOOL_GATEWAY_TOKEN]`。
+- 内置 Paperclip 工具的 REST contract 访问集中在 `crates/api/src/paperclip_internal.rs`；不要在工具 dispatcher 中伪造 Board API Key 或复制 REST handler。
 
 ## 常见故障
 
