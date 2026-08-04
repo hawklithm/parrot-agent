@@ -215,10 +215,30 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                     "required": ["issueId"], "additionalProperties": false
                 }),
                 "paperclipAddComment" => serde_json::json!({
-                    "type": "object", "properties": {"issueId": {"type": "string"}, "body": {"type": "string", "minLength": 1},
-                        "authorType": {"type": "string"}, "presentation": {"type": ["object", "null"]}, "metadata": {"type": ["object", "null"]},
-                        "reopen": {"type": "boolean"}, "resume": {"type": "boolean"}, "interrupt": {"type": "boolean"}},
-                    "required": ["issueId", "body"], "additionalProperties": false
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"}, "body": {"type": "string", "minLength": 1},
+                        "authorType": {"type": "string", "enum": ["user", "agent", "system"]},
+                        "presentation": {"type": ["object", "null"], "properties": {
+                            "kind": {"type": "string", "enum": ["message", "system_notice"]},
+                            "tone": {"type": "string", "enum": ["neutral", "info", "success", "warning", "danger"]},
+                            "title": {"type": ["string", "null"], "maxLength": 160}, "detailsDefaultOpen": {"type": "boolean"}
+                        }, "additionalProperties": false},
+                        "metadata": {"type": ["object", "null"], "properties": {
+                            "version": {"type": "integer", "const": 1}, "sourceRunId": {"type": ["string", "null"], "format": "uuid"},
+                            "sections": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "object", "properties": {
+                                "title": {"type": ["string", "null"], "maxLength": 160}, "rows": {"type": "array", "minItems": 1, "maxItems": 50, "items": {"type": "object", "properties": {
+                                    "type": {"type": "string", "enum": ["text", "code", "key_value", "issue_link", "agent_link", "run_link"]},
+                                    "label": {"type": ["string", "null"], "maxLength": 120}, "text": {"type": "string", "maxLength": 2000},
+                                    "code": {"type": "string", "minLength": 1, "maxLength": 4000}, "language": {"type": ["string", "null"], "maxLength": 40},
+                                    "value": {"type": "string", "maxLength": 2000}, "issueId": {"type": ["string", "null"], "format": "uuid"},
+                                    "identifier": {"type": ["string", "null"], "maxLength": 80}, "title": {"type": ["string", "null"], "maxLength": 240},
+                                    "agentId": {"type": "string", "format": "uuid"}, "name": {"type": ["string", "null"], "maxLength": 160},
+                                    "runId": {"type": "string", "format": "uuid"}
+                                }, "required": ["type"], "additionalProperties": false}}
+                            }, "required": ["rows"], "additionalProperties": false}}
+                        }, "required": ["version", "sections"], "additionalProperties": false},
+                        "reopen": {"type": "boolean"}, "resume": {"type": "boolean"}, "interrupt": {"type": "boolean"}
+                    }, "required": ["issueId", "body"], "additionalProperties": false
                 }),
                 "paperclipUpsertIssueDocument" => serde_json::json!({
                     "type": "object", "properties": {"issueId": {"type": "string"}, "key": {"type": "string", "minLength": 1, "maxLength": 64}, "title": {"type": ["string", "null"]}, "format": {"type": "string", "enum": ["markdown"]}, "body": {"type": "string", "maxLength": 524288}, "changeSummary": {"type": ["string", "null"]}, "baseRevisionId": {"type": ["string", "null"]}},
@@ -407,6 +427,87 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             return Err("body must contain between 1 and 524288 characters".to_string());
         }
     }
+    if tool_name == "paperclipAddComment" {
+        if let Some(presentation) = object.get("presentation").filter(|value| !value.is_null()) {
+            let presentation = presentation.as_object().ok_or("presentation must be an object or null")?;
+            if let Some(kind) = presentation.get("kind").and_then(Value::as_str) {
+                if !matches!(kind, "message" | "system_notice") {
+                    return Err("presentation.kind must be message or system_notice".to_string());
+                }
+            }
+            if let Some(tone) = presentation.get("tone").and_then(Value::as_str) {
+                if !matches!(tone, "neutral" | "info" | "success" | "warning" | "danger") {
+                    return Err("presentation.tone is invalid".to_string());
+                }
+            }
+            if let Some(title) = presentation.get("title").filter(|value| !value.is_null()) {
+                let title = title.as_str().ok_or("presentation.title must be a string or null")?;
+                if title.trim().is_empty() || title.len() > 160 {
+                    return Err("presentation.title must contain 1 to 160 characters".to_string());
+                }
+            }
+            if let Some(value) = presentation.get("detailsDefaultOpen") {
+                if !value.is_boolean() {
+                    return Err("presentation.detailsDefaultOpen must be a boolean".to_string());
+                }
+            }
+        }
+        if let Some(metadata) = object.get("metadata").filter(|value| !value.is_null()) {
+            let metadata = metadata.as_object().ok_or("metadata must be an object or null")?;
+            if metadata.get("version").and_then(Value::as_u64) != Some(1) {
+                return Err("metadata.version must be 1".to_string());
+            }
+            if let Some(source_run_id) = metadata.get("sourceRunId").filter(|value| !value.is_null()) {
+                let source_run_id = source_run_id.as_str().ok_or("metadata.sourceRunId must be a UUID or null")?;
+                Uuid::parse_str(source_run_id).map_err(|_| "metadata.sourceRunId must be a valid UUID".to_string())?;
+            }
+            let sections = metadata.get("sections").and_then(Value::as_array).ok_or("metadata.sections is required")?;
+            if sections.is_empty() || sections.len() > 20 {
+                return Err("metadata.sections must contain 1 to 20 sections".to_string());
+            }
+            for section in sections {
+                let section = section.as_object().ok_or("metadata section must be an object")?;
+                if let Some(title) = section.get("title").filter(|value| !value.is_null()) {
+                    let title = title.as_str().ok_or("metadata section title must be a string or null")?;
+                    if title.trim().is_empty() || title.len() > 160 {
+                        return Err("metadata section title must contain 1 to 160 characters".to_string());
+                    }
+                }
+                let rows = section.get("rows").and_then(Value::as_array).ok_or("metadata section rows is required")?;
+                if rows.is_empty() || rows.len() > 50 {
+                    return Err("metadata section rows must contain 1 to 50 rows".to_string());
+                }
+                for row in rows {
+                    let row = row.as_object().ok_or("metadata row must be an object")?;
+                    let row_type = row.get("type").and_then(Value::as_str).ok_or("metadata row type is required")?;
+                    if !matches!(row_type, "text" | "code" | "key_value" | "issue_link" | "agent_link" | "run_link") {
+                        return Err("metadata row type is invalid".to_string());
+                    }
+                    match row_type {
+                        "text" => validate_text_field(row.get("text"), "metadata text")?,
+                        "code" => validate_text_field(row.get("code"), "metadata code")?,
+                        "key_value" => {
+                            validate_text_field(row.get("label"), "metadata key_value label")?;
+                            validate_text_field(row.get("value"), "metadata key_value value")?;
+                        }
+                        "agent_link" => validate_uuid_field(row.get("agentId"), "metadata agent_link agentId")?,
+                        "run_link" => validate_uuid_field(row.get("runId"), "metadata run_link runId")?,
+                        "issue_link" => {
+                            let issue_id = row.get("issueId").filter(|value| !value.is_null());
+                            let identifier = row.get("identifier").filter(|value| !value.is_null());
+                            if issue_id.is_none() && identifier.is_none() {
+                                return Err("metadata issue_link requires issueId or identifier".to_string());
+                            }
+                            if let Some(issue_id) = issue_id {
+                                validate_uuid_field(Some(issue_id), "metadata issue_link issueId")?;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
     if let Some(title) = object.get("title").and_then(Value::as_str) {
         if title.trim().is_empty() {
             return Err("title must not be empty".to_string());
@@ -446,6 +547,20 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             serde_json::from_str::<Value>(json_body).map_err(|error| format!("invalid jsonBody: {error}"))?;
         }
     }
+    Ok(())
+}
+
+fn validate_text_field(value: Option<&Value>, name: &str) -> Result<(), String> {
+    let value = value.and_then(Value::as_str).ok_or_else(|| format!("{name} must be a string"))?;
+    if value.trim().is_empty() || value.len() > 4000 {
+        return Err(format!("{name} must contain 1 to 4000 characters"));
+    }
+    Ok(())
+}
+
+fn validate_uuid_field(value: Option<&Value>, name: &str) -> Result<(), String> {
+    let value = value.and_then(Value::as_str).ok_or_else(|| format!("{name} must be a UUID"))?;
+    Uuid::parse_str(value).map_err(|_| format!("{name} must be a valid UUID"))?;
     Ok(())
 }
 
@@ -2425,6 +2540,29 @@ mod tests {
         })).is_err());
         assert!(validate_paperclip_arguments("paperclipCreateIssue", &serde_json::json!({"title":"x", "priority":"invalid"})).is_err());
         assert!(validate_paperclip_arguments("paperclipCreateIssue", &serde_json::json!({"title":"x", "parentId":"not-a-uuid"})).is_err());
+    }
+
+    #[test]
+    fn paperclip_comment_contract_validates_presentation_and_metadata_rows() {
+        let valid = serde_json::json!({
+            "issueId": "ABC-1",
+            "body": "details",
+            "presentation": {"kind": "system_notice", "tone": "warning"},
+            "metadata": {
+                "version": 1,
+                "sections": [{"title": "Run", "rows": [
+                    {"type": "text", "text": "completed"},
+                    {"type": "run_link", "runId": "00000000-0000-0000-0000-000000000001"}
+                ]}]
+            }
+        });
+        assert!(validate_paperclip_arguments("paperclipAddComment", &valid).is_ok());
+        assert!(validate_paperclip_arguments("paperclipAddComment", &serde_json::json!({
+            "issueId": "ABC-1", "body": "details", "presentation": {"tone": "loud"}
+        })).is_err());
+        assert!(validate_paperclip_arguments("paperclipAddComment", &serde_json::json!({
+            "issueId": "ABC-1", "body": "details", "metadata": {"version": 2, "sections": []}
+        })).is_err());
     }
 
     #[test]

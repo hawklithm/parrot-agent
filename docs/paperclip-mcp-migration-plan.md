@@ -118,40 +118,40 @@
 
 ### 4.1 身份与 Agent
 
-- [ ] `paperclipMe`
+- [x] `paperclipMe`
   - GET `/agents/me`
   - 验证当前 Agent actor 与 run 上下文。
-- [ ] `paperclipInboxLite`
+- [x] `paperclipInboxLite`
   - GET `/agents/me/inbox-lite`
-- [ ] `paperclipListAgents`
+- [x] `paperclipListAgents`
   - GET `/companies/:companyId/agents`
-- [ ] `paperclipGetAgent`
+- [x] `paperclipGetAgent`
   - GET `/agents/:agentId`
 
 ### 4.2 Issue 与执行
 
-- [ ] `paperclipListIssues`
+- [x] `paperclipListIssues`
   - 支持 company、status、project、assignee、participant、label、workspace、origin、query 等过滤字段。
-- [ ] `paperclipGetIssue`
+- [x] `paperclipGetIssue`
   - 支持 UUID 和业务 identifier。
-- [ ] `paperclipGetHeartbeatContext`
+- [x] `paperclipGetHeartbeatContext`
   - 支持 `wakeCommentId`。
-- [ ] `paperclipCreateIssue`
+- [x] `paperclipCreateIssue`
   - 创建后触发现有 Agent wakeup 逻辑。
-- [ ] `paperclipUpdateIssue`
+- [x] `paperclipUpdateIssue`
   - 支持 status、assignee、comment、resume 等字段。
-- [ ] `paperclipCheckoutIssue`
+- [x] `paperclipCheckoutIssue`
   - 默认 `expectedStatuses` 为 `todo`、`backlog`、`blocked`。
   - 必须绑定当前 `agentId` 和 `runId`。
-- [ ] `paperclipReleaseIssue`
+- [x] `paperclipReleaseIssue`
   - 将 release result 正确映射到 done / todo / cancelled。
-- [ ] `paperclipListComments`
-- [ ] `paperclipGetComment`
-- [ ] `paperclipAddComment`
-- [ ] `paperclipSuggestTasks`
-- [ ] `paperclipAskUserQuestions`
-- [ ] `paperclipRequestConfirmation`
-- [ ] `paperclipRequestCheckboxConfirmation`
+- [x] `paperclipListComments`
+- [x] `paperclipGetComment`
+- [x] `paperclipAddComment`
+- [x] `paperclipSuggestTasks`
+- [x] `paperclipAskUserQuestions`
+- [x] `paperclipRequestConfirmation`
+- [x] `paperclipRequestCheckboxConfirmation`
 
 ### 4.3 Documents
 
@@ -166,32 +166,32 @@
 
 ### 4.4 Project、Goal 与 Approval
 
-- [ ] `paperclipListProjects`
-- [ ] `paperclipGetProject`
-- [ ] `paperclipListGoals`
-- [ ] `paperclipGetGoal`
-- [ ] `paperclipListApprovals`
-- [ ] `paperclipCreateApproval`
-- [ ] `paperclipGetApproval`
-- [ ] `paperclipGetApprovalIssues`
-- [ ] `paperclipListApprovalComments`
-- [ ] `paperclipLinkIssueApproval`
-- [ ] `paperclipUnlinkIssueApproval`
-- [ ] `paperclipApprovalDecision`
+- [x] `paperclipListProjects`
+- [x] `paperclipGetProject`
+- [x] `paperclipListGoals`
+- [x] `paperclipGetGoal`
+- [x] `paperclipListApprovals`
+- [x] `paperclipCreateApproval`
+- [x] `paperclipGetApproval`
+- [x] `paperclipGetApprovalIssues`
+- [x] `paperclipListApprovalComments`
+- [x] `paperclipLinkIssueApproval`
+- [x] `paperclipUnlinkIssueApproval`
+- [x] `paperclipApprovalDecision`
   - 支持 approve、reject、requestRevision、resubmit。
-- [ ] `paperclipAddApprovalComment`
+- [x] `paperclipAddApprovalComment`
 
 ### 4.5 Execution Workspace
 
-- [ ] `paperclipGetIssueWorkspaceRuntime`
-- [ ] `paperclipControlIssueWorkspaceServices`
+- [x] `paperclipGetIssueWorkspaceRuntime`
+- [x] `paperclipControlIssueWorkspaceServices`
   - 支持 start、stop、restart。
-- [ ] `paperclipWaitForIssueWorkspaceService`
+- [x] `paperclipWaitForIssueWorkspaceService`
   - 支持 timeout、runtimeServiceId、serviceName。
 
 ### 4.6 Escape hatch
 
-- [ ] `paperclipApiRequest`
+- [x] `paperclipApiRequest`
   - 只允许 `/api` 相对路径。
   - 拒绝 `..` 路径穿越。
   - 只允许 GET、POST、PUT、PATCH、DELETE。
@@ -249,7 +249,7 @@ McpInvocationContext {
 - [x] 对未知 method 返回标准 JSON-RPC method-not-found error。
 - [x] 对无效 JSON、缺少 `jsonrpc`、缺少 request id、参数类型错误返回标准 JSON-RPC parse/invalid-params error；合法 notification 按 JSON-RPC 规则返回 202 空响应。
 - [x] 提供 `GET /api/tool-gateway/mcp` session info/SSE stream，并用 `DELETE /api/tool-gateway/mcp` 关闭 session。
-- [ ] 为 Claude 和 Codex 各自验证实际握手流程，不能只用手写 curl 验证。
+- [x] 为 Claude 和 Codex 各自验证实际握手流程，不能只用手写 curl 验证；Claude 已加载 41 个工具，Codex 已加载网关并发起真实工具调用，业务调用因本机缺少 `psql` 失败，详见 9.2。
 
 ### 5.4 鉴权与上下文
 
@@ -263,7 +263,7 @@ McpInvocationContext {
 
 ## 6. 工具与现有 parrot-agent API 对照步骤
 
-- [ ] 为每个 Paperclip tool 建立以下映射表：
+- [x] 为每个 Paperclip tool 建立以下映射表：
 
 ```text
 MCP tool name
@@ -285,11 +285,61 @@ error mapping
 - [ ] 检查 Paperclip 对 404、400、401、403、409、422 的错误语义。
 - [ ] 对缺失 endpoint 先补 API/service，再接入 MCP tool，避免在 MCP 层直接写重复 SQL。
 
+### 6.1 当前 41 个工具映射总表
+
+下表是当前 Rust registry 与 `call_paperclip_builtin_tool` 的单一验收清单。`scope` 表示请求进入 REST bridge 前使用 session-derived company/agent/run；Issue 子资源还会在 REST handler 中再次检查 Issue 所属公司。`response` 是 bridge 原样返回的 API JSON（空响应转换为 `null`），错误统一转换为 MCP `isError=true` 的文本内容并保留 HTTP 状态和响应体摘要。
+
+| MCP 工具 | HTTP 映射 | scope | 类型 |
+|---|---|---|---|
+| `paperclipMe` | `GET /agents/me` | company/agent/run | read |
+| `paperclipInboxLite` | `GET /agents/me/inbox-lite` | company/agent/run | read |
+| `paperclipListAgents` | `GET /companies/{session.company}/agents` | company | read |
+| `paperclipGetAgent` | `GET /agents/{agentId}` | company/agent | read |
+| `paperclipListIssues` | `GET /companies/{session.company}/issues` + filters | company | read |
+| `paperclipGetIssue` | `GET /issues/{issueId|identifier}` | company/issue | read |
+| `paperclipGetHeartbeatContext` | `GET /issues/{issueId}/heartbeat-context` | company/issue/run | read |
+| `paperclipListComments` | `GET /issues/{issueId}/comments` | company/issue | read |
+| `paperclipGetComment` | `GET /issues/{issueId}/comments/{commentId}` | company/issue/comment | read |
+| `paperclipListIssueApprovals` | `GET /issues/{issueId}/approvals` | company/issue | read |
+| `paperclipListDocuments` | `GET /issues/{issueId}/documents` | company/issue | read |
+| `paperclipGetDocument` | `GET /issues/{issueId}/documents/{key}` | company/issue | read |
+| `paperclipListDocumentRevisions` | `GET /issues/{issueId}/documents/{key}/revisions` | company/issue | read |
+| `paperclipListProjects` | `GET /companies/{session.company}/projects` | company | read |
+| `paperclipGetProject` | `GET /projects/{projectId}` | company/project | read |
+| `paperclipListGoals` | `GET /companies/{session.company}/goals` | company | read |
+| `paperclipGetGoal` | `GET /goals/{goalId}` | company/goal | read |
+| `paperclipListApprovals` | `GET /companies/{session.company}/approvals` | company | read |
+| `paperclipCreateApproval` | `POST /companies/{session.company}/approvals` | company/agent/run | write |
+| `paperclipGetApproval` | `GET /approvals/{approvalId}` | company/approval | read |
+| `paperclipGetApprovalIssues` | `GET /approvals/{approvalId}/issues` | company/approval | read |
+| `paperclipListApprovalComments` | `GET /approvals/{approvalId}/comments` | company/approval | read |
+| `paperclipAddApprovalComment` | `POST /approvals/{approvalId}/comments` | company/approval/agent/run | write |
+| `paperclipApprovalDecision` | `POST /approvals/{id}/{approve|reject|request-revision|resubmit}` | company/approval/agent/run | write |
+| `paperclipCreateIssue` | `POST /companies/{session.company}/issues` | company/agent/run | write |
+| `paperclipUpdateIssue` | `PATCH /issues/{issueId}` | company/issue/agent/run | write |
+| `paperclipCheckoutIssue` | `POST /issues/{issueId}/checkout` | company/issue/agent/run | write |
+| `paperclipReleaseIssue` | `POST /issues/{issueId}/release` | company/issue/agent/run | write |
+| `paperclipAddComment` | `POST /issues/{issueId}/comments` | company/issue/agent/run | write |
+| `paperclipSuggestTasks` | `POST /issues/{issueId}/interactions` kind=`suggest_tasks` | company/issue/agent/run | write |
+| `paperclipAskUserQuestions` | `POST /issues/{issueId}/interactions` kind=`ask_user_questions` | company/issue/agent/run | write |
+| `paperclipRequestConfirmation` | `POST /issues/{issueId}/interactions` kind=`request_confirmation` | company/issue/agent/run | write |
+| `paperclipRequestCheckboxConfirmation` | `POST /issues/{issueId}/interactions` kind=`request_checkbox_confirmation` | company/issue/agent/run | write |
+| `paperclipUpsertIssueDocument` | `PUT /issues/{issueId}/documents/{key}` | company/issue/agent/run | write |
+| `paperclipRestoreIssueDocumentRevision` | `POST /issues/{issueId}/documents/{key}/revisions/{revisionId}/restore` | company/issue/agent/run | write |
+| `paperclipLinkIssueApproval` | `POST /issues/{issueId}/approvals` | company/issue/approval/agent/run | write |
+| `paperclipUnlinkIssueApproval` | `DELETE /issues/{issueId}/approvals/{approvalId}` | company/issue/approval/agent/run | write |
+| `paperclipGetIssueWorkspaceRuntime` | `GET /issues/{issueId}/heartbeat-context` runtime projection | company/issue/run | read |
+| `paperclipControlIssueWorkspaceServices` | `POST /execution-workspaces/{workspaceId}/runtime-services/{action}` | company/issue/agent/run | write |
+| `paperclipWaitForIssueWorkspaceService` | poll `paperclipGetIssueWorkspaceRuntime` until ready/timeout | company/issue/run | read |
+| `paperclipApiRequest` | constrained relative `/api` path | session/agent/run | read/write |
+
+验收要求：工具名只能来自该表；任何新增 Paperclip 工具必须同时增加 registry、schema、dispatch、scope 测试和本表行，不能只在 `tools/list` 中伪造名称。
+
 ## 7. 数据库与持久化检查
 
-- [ ] 确认 `tool_gateway_sessions` 的完整字段与迁移一致。
-- [ ] 确认 `tool_invocations`、`tool_call_events`、`tool_action_requests` 可覆盖成功、失败、拒绝和审批状态。
-- [ ] 确认 `tool_connections`、`tool_profiles`、`tool_profile_entries`、`tool_policies` 的字段与查询一致。
+- [x] 确认 `tool_gateway_sessions` 的完整字段与迁移一致。
+- [x] 确认 `tool_invocations`、`tool_call_events`、`tool_action_requests` 可覆盖成功、失败、拒绝和审批状态。
+- [x] 确认 `tool_connections`、`tool_profiles`、`tool_profile_entries`、`tool_policies` 的字段与查询一致。
 - [x] 明确复用现有 `tool_gateway_sessions` 作为 MCP session：其 id 是 `Mcp-Session-Id`，并更新 `last_used_at`；目前不额外引入独立 MCP session 表。
 - [x] 确认旧 `parrot_agent_dev` 能通过迁移启动，不使用破坏性删表重建。
 - [x] 新增迁移使用 `IF NOT EXISTS` 或安全的数据回填策略；本地 PostgreSQL 启动已验证。
@@ -298,18 +348,18 @@ error mapping
 
 ### 8.1 协议测试
 
-- [ ] 无 token 调用 `initialize` 返回标准 unauthorized JSON-RPC error。
-- [ ] 错误 token 调用 `initialize` 返回 unauthorized。
+- [x] 无 token 调用 `initialize` 返回标准 unauthorized JSON-RPC error。
+- [x] 错误 token 调用 `initialize` 返回 unauthorized。
 - [ ] 过期 token 调用 `initialize` 返回 unauthorized。
-- [ ] 撤销 token 调用 `initialize` 返回 unauthorized。
-- [ ] 正确 token 完成 initialize handshake。
-- [ ] `tools/list` 返回全部 Paperclip 内置工具、插件工具和外部 MCP 工具。
-- [ ] `tools/call` 能调用一个只读工具。
-- [ ] `tools/call` 能调用一个写工具。
-- [ ] `tools/call` 参数不符合 schema 时返回 invalid params。
-- [ ] notification 不产生错误的普通 response。
-- [ ] 未知 method 返回 method-not-found。
-- [ ] Streamable HTTP JSON response 和 SSE response 都能被客户端解析。
+- [x] 撤销 token 调用 `initialize` 返回 unauthorized。
+- [x] 正确 token 完成 initialize handshake。
+- [x] `tools/list` 返回全部 Paperclip 内置工具、插件工具和外部 MCP 工具；内置集合已验证为 41 个。
+- [x] `tools/call` 能调用一个只读工具。
+- [x] `tools/call` 能调用一个写工具。
+- [x] `tools/call` 参数不符合 schema 时返回 invalid params。
+- [x] notification 不产生错误的普通 response。
+- [x] 未知 method 返回 method-not-found。
+- [x] Streamable HTTP JSON response 和 SSE response 都能被客户端解析。
 
 ### 8.2 权限测试
 
@@ -379,7 +429,7 @@ error mapping
 - [x] MCP 协议手工验证覆盖 initialize、initialized notification、tools/list、tools/call、invalid args、unknown method、malformed JSON、JSON/SSE response；API 单元测试当前 57 个通过。
 - [x] heartbeat run 完成后可读取 `continuation-summary` 文档。
 - [x] `cargo test --workspace --no-fail-fast` 已执行：206 个测试通过，19 个既存 services 测试失败；失败集中在 `adapter_config_normalizer`、`codex_local_isolation`、`consistency_service` 等非本次 MCP 迁移路径，不能将 workspace 全绿作为当前完成证据。
-- [ ] 尚未完成 Codex 真实长流程、MCP 全部会话错误矩阵、跨公司负向测试和完整 SSE 长连接测试。
+- [ ] 尚未完成 Codex 真实业务长流程、MCP 过期 token/跨公司负向测试和所有业务工具的成功路径矩阵；协议 SSE 长连接已由 `scripts/mcp-gateway-contract-smoke.sh` 验证。
 
 ### 9.3 接手时的安全顺序
 

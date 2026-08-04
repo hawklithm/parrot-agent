@@ -110,6 +110,27 @@ impl IssueRepository for PgIssueRepository {
                 param_count
             ));
         }
+        if let Some(_touched_by_user_id) = filter.touched_by_user_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM issue_comments touched_comments WHERE touched_comments.issue_id = issues.id AND touched_comments.actor_type = 'user'::comment_actor_type AND touched_comments.actor_id = ${})",
+                param_count
+            ));
+        }
+        if let Some(_user_id) = filter.inbox_archived_by_user_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM issue_inbox_archives archived_issues WHERE archived_issues.issue_id = issues.id AND archived_issues.company_id = issues.company_id AND archived_issues.user_id = ${})",
+                param_count
+            ));
+        }
+        if let Some(_user_id) = filter.unread_for_user_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM issue_read_status read_issues WHERE read_issues.issue_id = issues.id AND read_issues.company_id = issues.company_id AND read_issues.user_id = ${})",
+                param_count
+            ));
+        }
         if let Some(_label_id) = filter.label_id {
             param_count += 1;
             query.push_str(&format!(
@@ -186,6 +207,15 @@ impl IssueRepository for PgIssueRepository {
 
         if let Some(participant_agent_id) = filter.participant_agent_id {
             q = q.bind(participant_agent_id);
+        }
+        if let Some(user_id) = filter.touched_by_user_id {
+            q = q.bind(user_id);
+        }
+        if let Some(user_id) = filter.inbox_archived_by_user_id {
+            q = q.bind(user_id);
+        }
+        if let Some(user_id) = filter.unread_for_user_id {
+            q = q.bind(user_id);
         }
         if let Some(label_id) = filter.label_id {
             q = q.bind(label_id);
@@ -274,6 +304,27 @@ impl IssueRepository for PgIssueRepository {
                 param_count
             ));
         }
+        if let Some(_touched_by_user_id) = filter.touched_by_user_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM issue_comments touched_comments WHERE touched_comments.issue_id = issues.id AND touched_comments.actor_type = 'user'::comment_actor_type AND touched_comments.actor_id = ${})",
+                param_count
+            ));
+        }
+        if let Some(_user_id) = filter.inbox_archived_by_user_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM issue_inbox_archives archived_issues WHERE archived_issues.issue_id = issues.id AND archived_issues.company_id = issues.company_id AND archived_issues.user_id = ${})",
+                param_count
+            ));
+        }
+        if let Some(_user_id) = filter.unread_for_user_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM issue_read_status read_issues WHERE read_issues.issue_id = issues.id AND read_issues.company_id = issues.company_id AND read_issues.user_id = ${})",
+                param_count
+            ));
+        }
         if let Some(_label_id) = filter.label_id {
             param_count += 1;
             query.push_str(&format!(
@@ -341,6 +392,15 @@ impl IssueRepository for PgIssueRepository {
 
         if let Some(participant_agent_id) = filter.participant_agent_id {
             q = q.bind(participant_agent_id);
+        }
+        if let Some(user_id) = filter.touched_by_user_id {
+            q = q.bind(user_id);
+        }
+        if let Some(user_id) = filter.inbox_archived_by_user_id {
+            q = q.bind(user_id);
+        }
+        if let Some(user_id) = filter.unread_for_user_id {
+            q = q.bind(user_id);
         }
         if let Some(label_id) = filter.label_id {
             q = q.bind(label_id);

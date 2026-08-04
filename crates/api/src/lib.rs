@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 pub mod errors;
 pub mod schemas;
 pub mod routes;

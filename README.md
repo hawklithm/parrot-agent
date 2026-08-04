@@ -52,7 +52,20 @@ parrot-agent/
 migrations::run_migrations(&pool).await?;
 ```
 
-For local development, start PostgreSQL with Docker Compose:
+For local development, PostgreSQL may be either a local service or Docker. For
+the existing local database used by the Paperclip migration:
+
+```bash
+export DATABASE_URL=postgres://postgres:admin123@localhost:5432/parrot_agent_dev
+export PAPERCLIP_API_URL=http://127.0.0.1:3102/api
+cargo run -p parrot-server
+```
+
+The server runs idempotent migrations against the existing database; do not
+drop and recreate `parrot_agent_dev` to resolve schema errors. The MCP gateway
+runbook is in [`docs/paperclip-mcp-runbook.md`](docs/paperclip-mcp-runbook.md).
+
+Alternatively, start PostgreSQL with Docker Compose:
 
 ```bash
 docker compose up -d postgres

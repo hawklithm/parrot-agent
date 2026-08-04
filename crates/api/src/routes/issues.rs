@@ -30,6 +30,9 @@ struct ListIssuesQuery {
     project_id: Option<Uuid>,
     q: Option<String>,
     participant_agent_id: Option<Uuid>,
+    touched_by_user_id: Option<Uuid>,
+    inbox_archived_by_user_id: Option<Uuid>,
+    unread_for_user_id: Option<Uuid>,
     label_id: Option<Uuid>,
     execution_workspace_id: Option<Uuid>,
     origin_kind: Option<String>,
@@ -322,6 +325,9 @@ async fn list_issues(
         goal_id: None,
         search_query: query.q.clone().filter(|value| !value.trim().is_empty()),
         participant_agent_id: query.participant_agent_id,
+        touched_by_user_id: query.touched_by_user_id,
+        inbox_archived_by_user_id: query.inbox_archived_by_user_id,
+        unread_for_user_id: query.unread_for_user_id,
         label_id: query.label_id,
         execution_workspace_id: query.execution_workspace_id,
         origin_kind: query.origin_kind.clone(),
@@ -407,6 +413,9 @@ async fn list_company_issues(
         goal_id: None,
         search_query: query.q.clone().filter(|value| !value.trim().is_empty()),
         participant_agent_id: query.participant_agent_id,
+        touched_by_user_id: query.touched_by_user_id,
+        inbox_archived_by_user_id: query.inbox_archived_by_user_id,
+        unread_for_user_id: query.unread_for_user_id,
         label_id: query.label_id,
         execution_workspace_id: query.execution_workspace_id,
         origin_kind: query.origin_kind.clone(),
@@ -1045,16 +1054,6 @@ async fn transition_interaction(state: &AppState, issue_id: Uuid, interaction_id
     Ok(Json(serde_json::json!({"issueId": issue_id, "interactionId": row.get::<Uuid,_>("id"), "status": row.get::<String,_>("status"), "response": row.get::<Option<serde_json::Value>,_>("response"), "updatedAt": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")})))
 }
 
-/// I42: GET /issues/:id/comments/:comment_id
-async fn get_single_comment(
-    State(state): State<AppState>,
-    Path((id, comment_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
-    let comment = state.issue_service.get_comment(comment_id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    comment.map(Json).ok_or(StatusCode::NOT_FOUND)
-}
-
 /// Create issue routes
 pub fn issue_routes() -> Router<AppState> {
     Router::new()
@@ -1102,5 +1101,4 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/interactions/:interaction_id/reject", post(reject_interaction))
         .route("/issues/:id/interactions/:interaction_id/respond", post(respond_interaction))
         .route("/issues/:id/interactions/:interaction_id/cancel", post(cancel_interaction))
-        .route("/issues/:id/comments/:comment_id", get(get_single_comment))
 }

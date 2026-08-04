@@ -449,6 +449,9 @@ pub struct IssueQueryFilter {
     pub search_query: Option<String>,
     /// Paperclip listIssues filters retained at the persistence boundary.
     pub participant_agent_id: Option<Uuid>,
+    pub touched_by_user_id: Option<Uuid>,
+    pub inbox_archived_by_user_id: Option<Uuid>,
+    pub unread_for_user_id: Option<Uuid>,
     pub label_id: Option<Uuid>,
     pub execution_workspace_id: Option<Uuid>,
     pub origin_kind: Option<String>,
