@@ -6,6 +6,7 @@ pub mod app_state;
 pub mod validation;
 pub mod extractors;
 pub mod middleware;
+pub mod mcp;
 
 pub use errors::AppError;
 pub use validation::{CreateAgentHireSchema, UpdateAgentSchema, TestAdapterEnvironmentSchema};

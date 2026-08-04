@@ -102,6 +102,43 @@ pub struct DefaultHeartbeatService {
     children: Arc<Mutex<HashMap<Uuid, Arc<Mutex<Child>>>>>,
 }
 
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&byte))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn shell_command(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    stdin_prompt: Option<&str>,
+) -> String {
+    let command_line = std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let invocation = match stdin_prompt {
+        Some(prompt) => format!("printf '%s' {} | {}", shell_quote(prompt), command_line),
+        None => command_line,
+    };
+    match cwd {
+        Some(cwd) => format!("cd {} && {{ {}; }}", shell_quote(cwd), invocation),
+        None => invocation,
+    }
+}
+
+fn redact_gateway_token(value: &str, token: &str) -> String {
+    value.replace(token, "[PAPERCLIP_TOOL_GATEWAY_TOKEN]")
+}
+
 impl DefaultHeartbeatService {
     pub fn new(pool: PgPool) -> Self {
         Self {
@@ -117,6 +154,85 @@ impl DefaultHeartbeatService {
             .await
             .map_err(|e| HeartbeatError::Internal(e.to_string()))?
             .ok_or(HeartbeatError::AgentNotFound(id))
+    }
+
+    async fn refresh_continuation_summary(
+        &self,
+        issue_id: Uuid,
+        run_id: Uuid,
+        agent_id: Uuid,
+        run_status: &str,
+        run_error: Option<&str>,
+        output: &str,
+    ) {
+        let issue = sqlx::query("SELECT company_id, identifier, title, description, status::text AS status, priority::text AS priority FROM issues WHERE id=$1")
+            .bind(issue_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+        let Some(issue) = issue else { return };
+        let agent = sqlx::query("SELECT name, adapter_type FROM agents WHERE id=$1")
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+        let identifier: Option<String> = issue.try_get("identifier").ok();
+        let title: String = issue.try_get("title").unwrap_or_default();
+        let description: Option<String> = issue.try_get("description").ok();
+        let status: String = issue.try_get("status").unwrap_or_else(|_| run_status.to_string());
+        let priority: String = issue.try_get("priority").unwrap_or_else(|_| "medium".to_string());
+        let agent_name: String = agent.as_ref().and_then(|row| row.try_get("name").ok()).unwrap_or_else(|| "unknown".to_string());
+        let adapter_type: String = agent.as_ref().and_then(|row| row.try_get("adapter_type").ok()).unwrap_or_else(|| "unknown".to_string());
+        let output_excerpt = output.trim();
+        let output_excerpt = if output_excerpt.len() > 1_200 { &output_excerpt[output_excerpt.len() - 1_200..] } else { output_excerpt };
+        let objective = description.as_deref().unwrap_or("No objective captured.").trim();
+        let next_action = if status == "done" {
+            "Review the completed issue output and close any remaining follow-up comments."
+        } else if status == "in_review" {
+            "Wait for reviewer feedback or approval before continuing executor work."
+        } else if matches!(run_status, "failed" | "timed_out" | "cancelled") {
+            "Inspect the failed run, fix the cause, and resume from the latest concrete action."
+        } else {
+            "Resume implementation from the acceptance criteria, latest comments, and this summary."
+        };
+        let error_section = run_error.map(|error| format!("\n\nLatest run error:\n- {}", error.trim())).unwrap_or_default();
+        let body = format!(
+            "# Continuation Summary\n\n- Issue: {} — {}\n- Status: {}\n- Priority: {}\n- Last updated by run: {}\n- Agent: {} ({})\n\n## Objective\n\n{}\n\n## Recent Concrete Actions\n\n- Run `{}` finished with status `{}`.\n- Adapter output excerpt:\n\n```text\n{}\n```{}\n\n## Commands Run\n\n- Detailed shell command and tool events remain in the heartbeat run log.\n\n## Next Action\n\n- {}",
+            identifier.as_deref().unwrap_or(&issue_id.to_string()), title, status, priority, run_id,
+            agent_name, adapter_type, objective, run_id, run_status, output_excerpt, error_section, next_action
+        );
+        let body = if body.len() > 8_000 { format!("{}\n[truncated]", &body[..7_980]) } else { body };
+        let existing = sqlx::query("SELECT d.id FROM issue_documents l JOIN documents d ON d.id=l.document_id WHERE l.issue_id=$1 AND l.key='continuation-summary' FOR UPDATE")
+            .bind(issue_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+        let mut tx = match self.pool.begin().await { Ok(tx) => tx, Err(_) => return };
+        let document_id = if let Some(row) = existing {
+            let document_id: Uuid = row.try_get("id").unwrap_or_else(|_| Uuid::new_v4());
+            let revision: Option<i32> = sqlx::query_scalar("SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1")
+                .bind(document_id).fetch_optional(&mut *tx).await.ok().flatten();
+            let revision = revision.unwrap_or(1);
+            if sqlx::query("UPDATE documents SET content=$2, content_type='text/markdown', updated_at=NOW() WHERE id=$1")
+                .bind(document_id).bind(&body).execute(&mut *tx).await.is_err() { return; }
+            if sqlx::query("INSERT INTO document_revisions (document_id, revision_number, content) VALUES ($1,$2,$3)")
+                .bind(document_id).bind(revision).bind(&body).execute(&mut *tx).await.is_err() { return; }
+            document_id
+        } else {
+            let company_id: Uuid = issue.try_get("company_id").unwrap_or_default();
+            let document_id: Uuid = match sqlx::query_scalar("INSERT INTO documents (company_id, content, content_type) VALUES ($1,$2,'text/markdown') RETURNING id")
+                .bind(company_id).bind(&body).fetch_one(&mut *tx).await { Ok(id) => id, Err(_) => return };
+            if sqlx::query("INSERT INTO issue_documents (company_id, issue_id, document_id, key) VALUES ($1,$2,$3,'continuation-summary')")
+                .bind(company_id).bind(issue_id).bind(document_id).execute(&mut *tx).await.is_err() { return; }
+            if sqlx::query("INSERT INTO document_revisions (document_id, revision_number, content) VALUES ($1,1,$2)")
+                .bind(document_id).bind(&body).execute(&mut *tx).await.is_err() { return; }
+            document_id
+        };
+        if tx.commit().await.is_err() { return; }
+        tracing::debug!(%issue_id, %run_id, %document_id, "refreshed issue continuation summary");
     }
 
     async fn execute_run(&self, run_id: Uuid, agent_id: Uuid, issue_id: Uuid, company_id: Uuid) {
@@ -139,7 +255,7 @@ impl DefaultHeartbeatService {
         };
         let _ = sqlx::query(
             "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
-            .bind(run_id).bind(status).bind(exit_code).bind(error).bind(output).execute(&self.pool).await;
+            .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output).execute(&self.pool).await;
         let issue_status = if status == "succeeded" { "done" } else { "todo" };
         let _ = sqlx::query(
             "UPDATE issues SET status = $2::issue_status, checkout_run_id = NULL, execution_run_id = NULL, execution_locked_at = NULL, execution_agent_name_key = NULL, completed_at = CASE WHEN $2 = 'done' THEN NOW() ELSE NULL END, updated_at = NOW() WHERE id = $1 AND company_id = $3 AND execution_run_id = $4",
@@ -148,8 +264,9 @@ impl DefaultHeartbeatService {
         .bind(issue_status)
         .bind(company_id)
         .bind(run_id)
-        .execute(&self.pool)
-        .await;
+            .execute(&self.pool)
+            .await;
+        self.refresh_continuation_summary(issue_id, run_id, agent_id, status, error.as_deref(), &output).await;
         let _ = sqlx::query("UPDATE agent_wakeup_requests SET status = 'completed', updated_at = NOW() WHERE company_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running') AND payload->>'issueId' = $3")
             .bind(company_id).bind(agent_id).bind(issue_id.to_string()).execute(&self.pool).await;
         let _ = sqlx::query("UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE run_id = $1 AND revoked_at IS NULL")
@@ -199,7 +316,7 @@ impl DefaultHeartbeatService {
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or("DeepSeek-V4-Flash");
+            .unwrap_or("deepseek-v4-flash");
         if let Some(api_key) = cfg
             .get("apiKey")
             .or_else(|| cfg.get("api_key"))
@@ -330,7 +447,19 @@ impl DefaultHeartbeatService {
             .get("toolGatewayUrl")
             .or_else(|| cfg.get("tool_gateway_url"))
             .and_then(|v| v.as_str())
-            .unwrap_or("http://127.0.0.1:3100/api/tool-gateway");
+            .map(ToOwned::to_owned)
+            .or_else(|| std::env::var("PAPERCLIP_TOOL_GATEWAY_URL").ok())
+            .or_else(|| {
+                std::env::var("PAPERCLIP_API_URL").ok().map(|value| {
+                    let base = value.trim_end_matches('/');
+                    if base.ends_with("/api") {
+                        format!("{base}/tool-gateway")
+                    } else {
+                        format!("{base}/api/tool-gateway")
+                    }
+                })
+            })
+            .unwrap_or_else(|| "http://127.0.0.1:3100/api/tool-gateway".to_string());
         let _ = sqlx::query(
             "INSERT INTO tool_gateway_sessions (company_id, agent_id, run_id, issue_id, token_hash, expires_at)
              VALUES ($1,$2,$3,$4,$5,NOW() + INTERVAL '30 minutes')",
@@ -352,7 +481,7 @@ impl DefaultHeartbeatService {
                         "paperclip": {
                             "type": "http",
                             "url": mcp_url,
-                            "headers": {"Authorization": "Bearer ${PAPERCLIP_TOOL_GATEWAY_TOKEN}"}
+                            "headers": {"Authorization": format!("Bearer {gateway_token}")}
                         }
                     }
                 });
@@ -392,6 +521,36 @@ impl DefaultHeartbeatService {
             .or_else(|| cfg.get("timeout_sec"))
             .and_then(|v| v.as_u64())
             .filter(|value| *value > 0);
+        let working_dir = cfg.get("cwd").and_then(|value| value.as_str());
+        let shell_command_text = shell_command(
+            command,
+            &args,
+            working_dir,
+            stdin_prompt.then_some(prompt.as_str()),
+        );
+        let configured_env_keys = cfg
+            .get("env")
+            .and_then(|value| value.as_object())
+            .map(|env| env.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let logged_shell_command = redact_gateway_token(&shell_command_text, &gateway_token);
+        let logged_argv = std::iter::once(command.to_owned())
+            .chain(args.iter().cloned())
+            .map(|value| redact_gateway_token(&value, &gateway_token))
+            .collect::<Vec<_>>();
+        tracing::info!(
+            run_id = %run_id,
+            agent_id = %agent_id,
+            issue_id = %issue_id,
+            adapter,
+            shell_command = %logged_shell_command,
+            argv = ?logged_argv,
+            working_dir = ?working_dir,
+            configured_env_keys = ?configured_env_keys,
+            stdin_prompt,
+            prompt_bytes = prompt.len(),
+            "starting local adapter process"
+        );
         cmd.args(args)
             .stdin(if stdin_prompt {
                 std::process::Stdio::piped()
@@ -652,6 +811,21 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_command_logs_redact_gateway_token_without_redacting_the_real_argv() {
+        let token = "ptg_test_secret";
+        let command = shell_command(
+            "claude",
+            &[format!("--header=Bearer {token}"), "--print".to_string()],
+            None,
+            Some("hello"),
+        );
+        let logged = redact_gateway_token(&command, token);
+        assert!(!logged.contains(token));
+        assert!(logged.contains("[PAPERCLIP_TOOL_GATEWAY_TOKEN]"));
+        assert!(command.contains(token));
+    }
 
     #[tokio::test]
     async fn test_mock_heartbeat_service() {

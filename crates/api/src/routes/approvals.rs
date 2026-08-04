@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use axum::extract::Query;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -37,12 +38,8 @@ pub fn approval_routes() -> Router<AppState> {
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateApprovalBody {
-    pub issue_id: Option<Uuid>,
-    pub title: String,
-    pub description: Option<String>,
-    #[allow(dead_code)]
-    pub required_approvers: Option<Vec<Uuid>>,
+struct ListApprovalsQuery {
+    status: Option<models::ApprovalStatus>,
 }
 
 /// AP1: GET /companies/:company_id/approvals
@@ -50,13 +47,14 @@ async fn list_approvals(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
+    Query(query): Query<ListApprovalsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     crate::routes::assert_company_access(&actor, company_id, true)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     // Use the approval_service from the state
     let approvals = state
         .approval_service
-        .list_by_company(company_id, None)
+        .list_by_company(company_id, query.status)
         .await
         .map(|a| {
             a.into_iter()
@@ -88,23 +86,43 @@ async fn create_approval(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
-    Json(body): Json<CreateApprovalBody>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     use models::ApprovalType;
     use services::approval_service::CreateApprovalInput;
     crate::routes::assert_company_access(&actor, company_id, false)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    let current_user_id = actor_user_id(&actor)?;
+    let approval_type = body
+        .get("type")
+        .cloned()
+        .ok_or(StatusCode::BAD_REQUEST)
+        .and_then(|value| serde_json::from_value::<ApprovalType>(value).map_err(|_| StatusCode::BAD_REQUEST))?;
+    let payload = body
+        .get("payload")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let (requested_by_agent_id, requested_by_user_id) = match actor {
+        AuthorizationActor::Agent { agent_id, .. } => (Some(agent_id), None),
+        AuthorizationActor::Board { user_id, .. } => (
+            body.get("requestedByAgentId")
+                .and_then(|value| value.as_str())
+                .and_then(|value| Uuid::parse_str(value).ok()),
+            Some(user_id),
+        ),
+        AuthorizationActor::None => return Err(StatusCode::FORBIDDEN),
+    };
     let input = CreateApprovalInput {
         company_id,
-        approval_type: ApprovalType::CreateResource,
-        requested_by_agent_id: None,
-        requested_by_user_id: Some(current_user_id),
-        payload: serde_json::json!({
-            "title": body.title,
-            "description": body.description,
-        }),
-        linked_issue_ids: body.issue_id.map(|id| vec![id]).unwrap_or_default(),
+        approval_type,
+        requested_by_agent_id,
+        requested_by_user_id,
+        payload,
+        linked_issue_ids: body
+            .get("issueIds")
+            .and_then(|value| value.as_array())
+            .map(|values| values.iter().filter_map(|value| value.as_str()).filter_map(|value| Uuid::parse_str(value).ok()).collect())
+            .unwrap_or_default(),
     };
     let approval = state
         .approval_service
@@ -122,16 +140,16 @@ async fn get_approval_issues(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let issues = state
-        .approval_service
-        .get_by_issue_id(id)
-        .await
-        .map(|a| {
-            a.into_iter()
-                .map(|app| serde_json::to_value(app).unwrap_or_default())
-                .collect()
-        })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let issues = sqlx::query_as::<_, models::Issue>(
+        "SELECT i.* FROM issues i JOIN issue_approvals ia ON ia.issue_id=i.id JOIN approvals a ON a.id=ia.approval_id WHERE ia.approval_id=$1 AND i.company_id=a.company_id ORDER BY i.created_at ASC",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .into_iter()
+    .map(|issue| serde_json::to_value(issue).unwrap_or_default())
+    .collect();
     Ok(Json(issues))
 }
 
@@ -218,6 +236,7 @@ async fn resubmit_approval(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let approval = state
         .approval_service
@@ -226,8 +245,8 @@ async fn resubmit_approval(
         .map_err(|_| StatusCode::NOT_FOUND)?;
     crate::routes::assert_company_access(&actor, approval.approval.company_id, false)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    sqlx::query("UPDATE approvals SET status = 'pending', decision_note = NULL, decided_by_user_id = NULL, decided_at = NULL, updated_at = NOW() WHERE id = $1 AND status = 'revision_requested'")
-        .bind(id).execute(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("UPDATE approvals SET status = 'pending', payload = CASE WHEN $2::jsonb = '{}'::jsonb THEN payload ELSE $2::jsonb END, decision_note = NULL, decided_by_user_id = NULL, decided_at = NULL, updated_at = NOW() WHERE id = $1 AND status = 'revision_requested'")
+        .bind(id).bind(body.get("payload").cloned().unwrap_or_else(|| body.clone())).execute(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let updated = state
         .approval_service
         .get_by_id(id)

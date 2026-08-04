@@ -6,12 +6,15 @@
 //! policies are backed by their repositories.
 
 use axum::{
+    body::to_bytes,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
 };
+use std::convert::Infallible;
 use serde_json::Value;
 use sqlx::Row;
 use sha2::{Digest, Sha256};
@@ -20,6 +23,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::mcp::{request_kind, McpInvocationContext, McpRequestKind};
 
 fn hash_gateway_token(token: &str) -> String {
     let mut hasher = Sha256::new();
@@ -62,6 +66,329 @@ async fn mcp_http_request(url: &str, method: &str, params: Value) -> Result<Valu
     if !status.is_success() { return Err(format!("MCP server returned HTTP {}", status)); }
     if let Some(error) = body.get("error") { return Err(error.to_string()); }
     Ok(body.get("result").cloned().unwrap_or(body))
+}
+
+fn paperclip_builtin_tools() -> Vec<Value> {
+    const TOOLS: &[(&str, &str)] = &[
+        ("paperclipMe", "Get the current authenticated Paperclip actor details"),
+        ("paperclipInboxLite", "Get the current authenticated agent inbox-lite assignment list"),
+        ("paperclipListAgents", "List agents in a company"),
+        ("paperclipGetAgent", "Get a single agent by id"),
+        ("paperclipListIssues", "List issues for a company with optional filters"),
+        ("paperclipGetIssue", "Get a single issue by UUID or identifier"),
+        ("paperclipGetHeartbeatContext", "Get compact heartbeat context for an issue"),
+        ("paperclipListComments", "List comments for an issue"),
+        ("paperclipGetComment", "Get a specific issue comment"),
+        ("paperclipListIssueApprovals", "List approvals linked to an issue"),
+        ("paperclipListDocuments", "List issue documents"),
+        ("paperclipGetDocument", "Get one issue document by key"),
+        ("paperclipListDocumentRevisions", "List revisions for an issue document"),
+        ("paperclipListProjects", "List projects in a company"),
+        ("paperclipGetProject", "Get a project by id"),
+        ("paperclipGetIssueWorkspaceRuntime", "Get the current issue execution workspace"),
+        ("paperclipControlIssueWorkspaceServices", "Start, stop, or restart workspace services"),
+        ("paperclipWaitForIssueWorkspaceService", "Wait for an issue workspace service"),
+        ("paperclipListGoals", "List goals in a company"),
+        ("paperclipGetGoal", "Get a goal by id"),
+        ("paperclipListApprovals", "List approvals in a company"),
+        ("paperclipCreateApproval", "Create an approval request"),
+        ("paperclipGetApproval", "Get an approval by id"),
+        ("paperclipGetApprovalIssues", "List issues linked to an approval"),
+        ("paperclipListApprovalComments", "List comments for an approval"),
+        ("paperclipCreateIssue", "Create a new issue"),
+        ("paperclipUpdateIssue", "Update an issue"),
+        ("paperclipCheckoutIssue", "Checkout an issue for an agent"),
+        ("paperclipReleaseIssue", "Release an issue checkout"),
+        ("paperclipAddComment", "Add a comment to an issue"),
+        ("paperclipSuggestTasks", "Create a suggest_tasks interaction"),
+        ("paperclipAskUserQuestions", "Create an ask_user_questions interaction"),
+        ("paperclipRequestConfirmation", "Create a request_confirmation interaction"),
+        ("paperclipRequestCheckboxConfirmation", "Create a checkbox confirmation interaction"),
+        ("paperclipUpsertIssueDocument", "Create or update an issue document"),
+        ("paperclipRestoreIssueDocumentRevision", "Restore a document revision"),
+        ("paperclipLinkIssueApproval", "Link an approval to an issue"),
+        ("paperclipUnlinkIssueApproval", "Unlink an approval from an issue"),
+        ("paperclipApprovalDecision", "Approve, reject, revise, or resubmit an approval"),
+        ("paperclipAddApprovalComment", "Add a comment to an approval"),
+        ("paperclipApiRequest", "Make a JSON request to an existing /api endpoint"),
+    ];
+    TOOLS
+        .iter()
+        .map(|(name, description)| {
+            let input_schema = match *name {
+                "paperclipMe" | "paperclipInboxLite" => serde_json::json!({
+                    "type": "object", "properties": {}, "additionalProperties": false
+                }),
+                "paperclipGetAgent" => serde_json::json!({
+                    "type": "object", "properties": {"agentId": {"type": "string"}, "companyId": {"type": ["string", "null"], "format": "uuid"}},
+                    "required": ["agentId"], "additionalProperties": false
+                }),
+                "paperclipListAgents" | "paperclipListProjects" | "paperclipListGoals" => serde_json::json!({
+                    "type": "object", "properties": {"companyId": {"type": ["string", "null"], "format": "uuid"}},
+                    "additionalProperties": false
+                }),
+                "paperclipListIssues" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "companyId": {"type": ["string", "null"], "format": "uuid"},
+                        "status": {"type": "string"}, "projectId": {"type": "string", "format": "uuid"},
+                        "assigneeAgentId": {"type": "string", "format": "uuid"},
+                        "participantAgentId": {"type": "string", "format": "uuid"},
+                        "assigneeUserId": {"type": "string"}, "touchedByUserId": {"type": "string"},
+                        "inboxArchivedByUserId": {"type": "string"}, "unreadForUserId": {"type": "string"},
+                        "labelId": {"type": "string", "format": "uuid"},
+                        "executionWorkspaceId": {"type": "string", "format": "uuid"},
+                        "originKind": {"type": "string"}, "originId": {"type": "string"},
+                        "includeRoutineExecutions": {"type": "boolean"},
+                        "includeLiveDescendantSummary": {"type": "boolean"}, "q": {"type": "string"}
+                    }, "additionalProperties": false
+                }),
+                "paperclipGetIssue" | "paperclipGetHeartbeatContext" | "paperclipListIssueApprovals" | "paperclipListDocuments" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}},
+                    "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipListComments" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "after": {"type": "string", "format": "uuid"}, "order": {"type": "string", "enum": ["asc", "desc"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+                    "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipGetComment" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "commentId": {"type": "string"}},
+                    "required": ["issueId", "commentId"], "additionalProperties": false
+                }),
+                "paperclipGetDocument" | "paperclipListDocumentRevisions" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "key": {"type": "string", "minLength": 1, "maxLength": 64}},
+                    "required": ["issueId", "key"], "additionalProperties": false
+                }),
+                "paperclipGetProject" => serde_json::json!({
+                    "type": "object", "properties": {"projectId": {"type": "string"}, "companyId": {"type": ["string", "null"], "format": "uuid"}},
+                    "required": ["projectId"], "additionalProperties": false
+                }),
+                "paperclipGetGoal" => serde_json::json!({
+                    "type": "object", "properties": {"goalId": {"type": "string", "format": "uuid"}},
+                    "required": ["goalId"], "additionalProperties": false
+                }),
+                "paperclipGetApproval" | "paperclipGetApprovalIssues" | "paperclipListApprovalComments" => serde_json::json!({
+                    "type": "object", "properties": {"approvalId": {"type": "string", "format": "uuid"}},
+                    "required": ["approvalId"], "additionalProperties": false
+                }),
+                "paperclipCreateIssue" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "companyId": {"type": ["string", "null"], "format": "uuid"}, "projectId": {"type": ["string", "null"], "format": "uuid"},
+                        "projectWorkspaceId": {"type": ["string", "null"], "format": "uuid"}, "goalId": {"type": ["string", "null"], "format": "uuid"},
+                        "parentId": {"type": ["string", "null"], "format": "uuid"}, "blockedByIssueIds": {"type": "array", "items": {"type": "string", "format": "uuid"}},
+                        "inheritExecutionWorkspaceFromIssueId": {"type": ["string", "null"], "format": "uuid"}, "title": {"type": "string", "minLength": 1},
+                        "description": {"type": ["string", "null"]}, "status": {"type": "string"}, "workMode": {"type": "string"},
+                        "harnessKind": {"type": ["string", "null"]}, "priority": {"type": "string"}, "assigneeAgentId": {"type": ["string", "null"], "format": "uuid"},
+                        "assigneeUserId": {"type": ["string", "null"]}, "requestDepth": {"type": "integer", "minimum": 0},
+                        "billingCode": {"type": ["string", "null"]}, "assigneeAdapterOverrides": {"type": ["object", "null"]},
+                        "executionPolicy": {"type": ["object", "null"]}, "executionWorkspaceId": {"type": ["string", "null"], "format": "uuid"},
+                        "executionWorkspacePreference": {"type": ["string", "null"]}, "executionWorkspaceSettings": {"type": ["object", "null"]},
+                        "labelIds": {"type": "array", "items": {"type": "string", "format": "uuid"}}, "watchdogDiscovery": {"type": ["object", "null"]}
+                    }, "required": ["title"], "additionalProperties": false
+                }),
+                "paperclipUpdateIssue" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"}, "projectId": {"type": ["string", "null"], "format": "uuid"},
+                        "projectWorkspaceId": {"type": ["string", "null"], "format": "uuid"}, "goalId": {"type": ["string", "null"], "format": "uuid"},
+                        "parentId": {"type": ["string", "null"], "format": "uuid"}, "title": {"type": "string"}, "description": {"type": ["string", "null"]},
+                        "status": {"type": "string"}, "workMode": {"type": "string"}, "harnessKind": {"type": ["string", "null"]},
+                        "priority": {"type": "string"}, "assigneeAgentId": {"type": ["string", "null"]}, "assigneeUserId": {"type": ["string", "null"]},
+                        "comment": {"type": "string"}, "reviewRequest": {"type": ["object", "null"]}, "reopen": {"type": "boolean"},
+                        "resume": {"type": "boolean"}, "interrupt": {"type": "boolean"}, "requestDepth": {"type": "integer", "minimum": 0},
+                        "executionPolicy": {"type": ["object", "null"]}, "executionWorkspacePreference": {"type": ["string", "null"]},
+                        "executionWorkspaceSettings": {"type": ["object", "null"]}, "labelIds": {"type": "array", "items": {"type": "string", "format": "uuid"}}
+                    }, "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipCheckoutIssue" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "agentId": {"type": "string"}, "expectedStatuses": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipReleaseIssue" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "result": {"type": "string"}, "targetStatus": {"type": "string"}},
+                    "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipAddComment" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "body": {"type": "string", "minLength": 1},
+                        "authorType": {"type": "string"}, "presentation": {"type": ["object", "null"]}, "metadata": {"type": ["object", "null"]},
+                        "reopen": {"type": "boolean"}, "resume": {"type": "boolean"}, "interrupt": {"type": "boolean"}},
+                    "required": ["issueId", "body"], "additionalProperties": false
+                }),
+                "paperclipUpsertIssueDocument" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "key": {"type": "string", "minLength": 1, "maxLength": 64}, "title": {"type": ["string", "null"]}, "format": {"type": "string", "enum": ["markdown"]}, "body": {"type": "string", "maxLength": 524288}, "changeSummary": {"type": ["string", "null"]}, "baseRevisionId": {"type": ["string", "null"]}},
+                    "required": ["issueId", "key", "body"], "additionalProperties": false
+                }),
+                "paperclipRestoreIssueDocumentRevision" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "key": {"type": "string"}, "revisionId": {"type": "string", "format": "uuid"}},
+                    "required": ["issueId", "key", "revisionId"], "additionalProperties": false
+                }),
+                "paperclipLinkIssueApproval" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "approvalId": {"type": "string", "format": "uuid"}},
+                    "required": ["issueId", "approvalId"], "additionalProperties": false
+                }),
+                "paperclipUnlinkIssueApproval" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}, "approvalId": {"type": "string", "format": "uuid"}},
+                    "required": ["issueId", "approvalId"], "additionalProperties": false
+                }),
+                "paperclipApprovalDecision" => serde_json::json!({
+                    "type": "object", "properties": {"approvalId": {"type": "string"}, "action": {"type": "string", "enum": ["approve", "reject", "requestRevision", "resubmit"]}, "decisionNote": {"type": "string"}, "payloadJson": {"type": "string"}},
+                    "required": ["approvalId", "action"], "additionalProperties": false
+                }),
+                "paperclipAddApprovalComment" => serde_json::json!({
+                    "type": "object", "properties": {"approvalId": {"type": "string"}, "body": {"type": "string"}},
+                    "required": ["approvalId", "body"], "additionalProperties": false
+                }),
+                "paperclipCreateApproval" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "companyId": {"type": ["string", "null"], "format": "uuid"},
+                        "type": {"type": "string"}, "requestedByAgentId": {"type": ["string", "null"], "format": "uuid"},
+                        "payload": {"type": "object"}, "issueIds": {"type": "array", "items": {"type": "string", "format": "uuid"}}
+                    }, "required": ["type", "payload"], "additionalProperties": false
+                }),
+                "paperclipSuggestTasks" | "paperclipAskUserQuestions"
+                | "paperclipRequestConfirmation" | "paperclipRequestCheckboxConfirmation" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"}, "idempotencyKey": {"type": ["string", "null"]},
+                        "sourceCommentId": {"type": ["string", "null"], "format": "uuid"},
+                        "sourceRunId": {"type": ["string", "null"], "format": "uuid"},
+                        "title": {"type": ["string", "null"]}, "summary": {"type": ["string", "null"]},
+                        "continuationPolicy": {"type": "string"}, "payload": {"type": "object"}
+                    }, "required": ["issueId", "payload"], "additionalProperties": false
+                }),
+                "paperclipGetIssueWorkspaceRuntime" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}},
+                    "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipControlIssueWorkspaceServices" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"}, "action": {"type": "string", "enum": ["start", "stop", "restart"]},
+                        "workspaceCommandId": {"type": ["string", "null"]}, "runtimeServiceId": {"type": ["string", "null"], "format": "uuid"},
+                        "serviceIndex": {"type": ["integer", "null"], "minimum": 0}
+                    }, "required": ["issueId", "action"], "additionalProperties": false
+                }),
+                "paperclipWaitForIssueWorkspaceService" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"}, "runtimeServiceId": {"type": ["string", "null"], "format": "uuid"},
+                        "serviceName": {"type": ["string", "null"]}, "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 300}
+                    }, "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipListApprovals" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "companyId": {"type": ["string", "null"], "format": "uuid"}, "status": {"type": "string"}
+                    }, "additionalProperties": false
+                }),
+                "paperclipApiRequest" => serde_json::json!({
+                    "type": "object", "properties": {"method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]}, "path": {"type": "string"}, "jsonBody": {"type": "string"}},
+                    "required": ["method", "path"], "additionalProperties": false
+                }),
+                _ => serde_json::json!({
+                    "type": "object", "properties": {}, "additionalProperties": false
+                }),
+            };
+            serde_json::json!({
+                "name": name,
+                "description": description,
+                "inputSchema": input_schema,
+                "source": "paperclip_builtin"
+            })
+        })
+        .collect()
+}
+
+fn is_paperclip_builtin_tool(name: &str) -> bool {
+    paperclip_builtin_tools()
+        .iter()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+}
+
+fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(), String> {
+    let Some(object) = parameters.as_object() else {
+        return Err("tool arguments must be a JSON object".to_string());
+    };
+    let required: &[&str] = match tool_name {
+        "paperclipGetAgent" => &["agentId"],
+        "paperclipGetIssue" | "paperclipGetHeartbeatContext" | "paperclipListComments"
+        | "paperclipListIssueApprovals" | "paperclipListDocuments" => &["issueId"],
+        "paperclipGetComment" => &["issueId", "commentId"],
+        "paperclipGetDocument" | "paperclipListDocumentRevisions" => &["issueId", "key"],
+        "paperclipGetProject" => &["projectId"],
+        "paperclipGetGoal" => &["goalId"],
+        "paperclipGetApproval" | "paperclipGetApprovalIssues" | "paperclipListApprovalComments" => &["approvalId"],
+        "paperclipCreateIssue" => &["title"],
+        "paperclipUpdateIssue" | "paperclipCheckoutIssue" | "paperclipReleaseIssue" => &["issueId"],
+        "paperclipAddComment" => &["issueId", "body"],
+        "paperclipUpsertIssueDocument" => &["issueId", "key", "body"],
+        "paperclipRestoreIssueDocumentRevision" => &["issueId", "key", "revisionId"],
+        "paperclipLinkIssueApproval" | "paperclipUnlinkIssueApproval" => &["issueId", "approvalId"],
+        "paperclipApprovalDecision" => &["approvalId", "action"],
+        "paperclipAddApprovalComment" => &["approvalId", "body"],
+        "paperclipApiRequest" => &["method", "path"],
+        _ => &[],
+    };
+    for key in required {
+        let present = object.get(*key).filter(|value| !value.is_null()).is_some();
+        if !present {
+            return Err(format!("{key} is required"));
+        }
+    }
+    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path"] {
+        if object.contains_key(key) && !object.get(key).is_some_and(Value::is_string) {
+            return Err(format!("{key} must be a string"));
+        }
+    }
+    if let Some(limit) = object.get("limit") {
+        if !limit.is_u64() || !(1..=500).contains(&limit.as_u64().unwrap_or_default()) {
+            return Err("limit must be an integer between 1 and 500".to_string());
+        }
+    }
+    if let Some(order) = object.get("order").and_then(Value::as_str) {
+        if !matches!(order, "asc" | "desc") { return Err("order must be asc or desc".to_string()); }
+    }
+    if matches!(tool_name, "paperclipCreateApproval") {
+        if !object.get("type").is_some_and(Value::is_string) || !object.get("payload").is_some_and(Value::is_object) {
+            return Err("type and payload are required for approval creation".to_string());
+        }
+        if let Some(issue_ids) = object.get("issueIds") {
+            if !issue_ids.is_array() || issue_ids.as_array().is_some_and(|ids| ids.iter().any(|id| !id.is_string())) {
+                return Err("issueIds must be an array of strings".to_string());
+            }
+        }
+    }
+    if matches!(tool_name, "paperclipSuggestTasks" | "paperclipAskUserQuestions" | "paperclipRequestConfirmation" | "paperclipRequestCheckboxConfirmation")
+        && !object.get("payload").is_some_and(Value::is_object) {
+        return Err("payload must be an object".to_string());
+    }
+    if let Some(key) = object.get("key").and_then(Value::as_str) {
+        let valid = !key.trim().is_empty()
+            && key.len() <= 64
+            && key.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-');
+        if !valid {
+            return Err("key must contain only lowercase letters, numbers, '_' or '-' and be at most 64 characters".to_string());
+        }
+    }
+    if let Some(body) = object.get("body").and_then(Value::as_str) {
+        if body.is_empty() || body.len() > 524_288 {
+            return Err("body must contain between 1 and 524288 characters".to_string());
+        }
+    }
+    if tool_name == "paperclipApprovalDecision" {
+        let action = object.get("action").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(action, "approve" | "reject" | "requestRevision" | "resubmit") {
+            return Err("action must be approve, reject, requestRevision, or resubmit".to_string());
+        }
+        if action == "resubmit" {
+            let payload = object.get("payloadJson").and_then(Value::as_str).unwrap_or("{}");
+            serde_json::from_str::<Value>(payload).map_err(|error| format!("invalid payloadJson: {error}"))?;
+        }
+    }
+    if tool_name == "paperclipApiRequest" {
+        let method = object.get("method").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
+            return Err("method must be GET, POST, PUT, PATCH, or DELETE".to_string());
+        }
+        if let Some(json_body) = object.get("jsonBody").and_then(Value::as_str) {
+            serde_json::from_str::<Value>(json_body).map_err(|error| format!("invalid jsonBody: {error}"))?;
+        }
+    }
+    Ok(())
 }
 
 async fn mcp_stdio_request(command: &str, args: &[String], method: &str, params: Value) -> Result<Value, String> {
@@ -206,57 +533,236 @@ async fn revoke_gateway_session(
     }
 }
 
+async fn mcp_session_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = bearer_or_gateway_token(&headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Bearer token is required"})),
+        ).into_response();
+    };
+    let session = match load_gateway_session(&state, &token).await {
+        Ok(row) => row,
+        Err((status, Json(error))) => return (status, Json(error)).into_response(),
+    };
+    let session_id: Uuid = session.get("id");
+    if let Some(request_session_id) = headers.get("mcp-session-id").and_then(|value| value.to_str().ok()) {
+        if request_session_id != session_id.to_string() {
+            return mcp_error(StatusCode::BAD_REQUEST, Value::Null, -32600, "Mcp-Session-Id does not match the gateway session", Some(session_id));
+        }
+    }
+    if headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').any(|item| item.trim() == "text/event-stream"))
+        .unwrap_or(false)
+    {
+        let stream = futures::stream::once(async move {
+            Ok::<Event, Infallible>(Event::default().event("message").data(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/ready",
+                    "params": {"sessionId": session_id},
+                })
+                .to_string(),
+            ))
+        });
+        let mut response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+        if let Ok(value) = HeaderValue::from_str(&session_id.to_string()) {
+            response.headers_mut().insert("mcp-session-id", value);
+        }
+        return response;
+    }
+    (StatusCode::OK, Json(serde_json::json!({
+        "transport": "streamable_http",
+        "authentication": "bearer",
+        "sessionId": session_id,
+        "runId": session.get::<Uuid, _>("run_id"),
+    }))).into_response()
+}
+
+async fn close_mcp_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(token) = bearer_or_gateway_token(&headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Bearer token is required"})),
+        );
+    };
+    let session_id = headers.get("mcp-session-id").and_then(|value| value.to_str().ok());
+    if session_id.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Mcp-Session-Id is required"})),
+        );
+    }
+    let updated = sqlx::query(
+        "UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW()
+         WHERE token_hash = $1 AND ($2::text IS NULL OR id::text = $2) AND revoked_at IS NULL RETURNING id, revoked_at",
+    )
+    .bind(hash_gateway_token(&token))
+    .bind(session_id)
+    .fetch_optional(&state.pool)
+    .await;
+    match updated {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "sessionId": row.get::<Uuid, _>("id"),
+                "revokedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("revoked_at"),
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "MCP session not found"})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        ),
+    }
+}
+
+fn mcp_response(status: StatusCode, body: Value, session_id: Option<Uuid>) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response.headers_mut().insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static("2025-03-26"),
+    );
+    if let Some(session_id) = session_id {
+        if let Ok(value) = HeaderValue::from_str(&session_id.to_string()) {
+            response.headers_mut().insert("mcp-session-id", value);
+        }
+    }
+    response
+}
+
+fn mcp_error(status: StatusCode, id: Value, code: i64, message: impl Into<String>, session_id: Option<Uuid>) -> Response {
+    mcp_response(status, serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message.into()},
+    }), session_id)
+}
+
 async fn mcp_session_protocol(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let body: Value = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(error) => return mcp_error(StatusCode::BAD_REQUEST, Value::Null, -32700, format!("Parse error: {error}"), None),
+    };
+    let wants_sse = headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').any(|item| item.trim() == "text/event-stream"))
+        .unwrap_or(false);
+    let response = mcp_session_protocol_json(State(state), headers, Json(body)).await;
+    if !wants_sse || response.status() == StatusCode::ACCEPTED {
+        return response;
+    }
+    let status = response.status();
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let bytes = match to_bytes(response.into_body(), usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(_) => return mcp_error(StatusCode::INTERNAL_SERVER_ERROR, Value::Null, -32603, "failed to encode MCP SSE response", None),
+    };
+    let data = String::from_utf8_lossy(&bytes).to_string();
+    let stream = futures::stream::once(async move { Ok::<Event, Infallible>(Event::default().event("message").data(data)) });
+    let mut sse_response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    *sse_response.status_mut() = status;
+    if let Some(session_id) = session_id.and_then(|value| HeaderValue::from_str(&value).ok()) {
+        sse_response.headers_mut().insert("mcp-session-id", session_id);
+    }
+    sse_response
+}
+
+async fn mcp_session_protocol_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> impl IntoResponse {
+) -> Response {
     let Some(token) = bearer_or_gateway_token(&headers) else {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+        return mcp_response(StatusCode::UNAUTHORIZED, serde_json::json!({
             "jsonrpc": "2.0", "id": body.get("id").cloned().unwrap_or(Value::Null),
             "error": {"code": -32001, "message": "Bearer token is required"}
-        })));
+        }), None);
     };
-    if let Err(response) = load_gateway_session(&state, &token).await {
-        let (status, Json(error)) = response;
-        return (status, Json(serde_json::json!({
-            "jsonrpc": "2.0", "id": body.get("id").cloned().unwrap_or(Value::Null),
-            "error": {"code": -32001, "message": error.get("error").cloned().unwrap_or(Value::String("Invalid session".into()))}
-        })));
-    }
+    let session = match load_gateway_session(&state, &token).await {
+        Ok(row) => row,
+        Err((status, Json(error))) => {
+            return mcp_response(status, serde_json::json!({
+                "jsonrpc": "2.0", "id": body.get("id").cloned().unwrap_or(Value::Null),
+                "error": {"code": -32001, "message": error.get("error").cloned().unwrap_or(Value::String("Invalid session".into()))}
+            }), None);
+        }
+    };
+    let session_id: Uuid = session.get("id");
     let id = body.get("id").cloned().unwrap_or(Value::Null);
-    match body.get("method").and_then(Value::as_str) {
-        Some("initialize") => (StatusCode::OK, Json(serde_json::json!({
+    if body.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return mcp_error(StatusCode::BAD_REQUEST, id, -32600, "jsonrpc must be '2.0'", Some(session_id));
+    }
+    let request_session_id = headers.get("mcp-session-id").and_then(|value| value.to_str().ok());
+    if let Some(request_session_id) = request_session_id {
+        if request_session_id != session_id.to_string() {
+            return mcp_error(StatusCode::BAD_REQUEST, id, -32600, "Mcp-Session-Id does not match the gateway session", Some(session_id));
+        }
+    }
+    let Some(method) = body.get("method").and_then(Value::as_str) else {
+        return mcp_error(StatusCode::BAD_REQUEST, id, -32600, "method is required", Some(session_id));
+    };
+    if method == "initialize" && request_session_id.is_some() {
+        return mcp_error(StatusCode::BAD_REQUEST, id, -32600, "initialize must not include Mcp-Session-Id", Some(session_id));
+    }
+    if method != "initialize" && request_session_id.is_none() {
+        return mcp_error(StatusCode::BAD_REQUEST, id, -32600, "Mcp-Session-Id is required after initialize", Some(session_id));
+    }
+    let request_kind = request_kind(body.get("id").is_some());
+    if request_kind == McpRequestKind::Notification && method != "notifications/initialized" {
+        return mcp_error(StatusCode::BAD_REQUEST, Value::Null, -32600, "requests must include id", Some(session_id));
+    }
+    match method {
+        "initialize" => mcp_response(StatusCode::OK, serde_json::json!({
             "jsonrpc": "2.0", "id": id, "result": {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "Parrot Agent MCP Gateway", "version": env!("CARGO_PKG_VERSION")}
             }
-        }))),
-        Some("notifications/initialized") => (StatusCode::ACCEPTED, Json(Value::Null)),
-        Some("tools/list") => {
+        }), Some(session_id)),
+        "notifications/initialized" => (StatusCode::ACCEPTED, ()).into_response(),
+        "tools/list" => {
             let (status, Json(value)) = list_gateway_tools(State(state), headers).await;
             if !status.is_success() {
-                return (status, Json(serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Tool discovery failed"}})));
+                return mcp_response(status, serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Tool discovery failed"}}), Some(session_id));
             }
             let tools = match value { Value::Array(tools) => tools, _ => Vec::new() };
-            (StatusCode::OK, Json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools}})))
+            mcp_response(StatusCode::OK, serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools}}), Some(session_id))
         }
-        Some("tools/call") => {
+        "tools/call" => {
             let params = body.get("params").cloned().unwrap_or_else(|| serde_json::json!({}));
             let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
             if name.is_empty() {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"params.name is required"}})));
+                return mcp_response(StatusCode::BAD_REQUEST, serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"params.name is required"}}), Some(session_id));
             }
             let call_body = serde_json::json!({"tool":name,"parameters":params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}))});
             let (status, Json(value)) = call_gateway_tool(State(state), headers, Json(call_body)).await;
             if !status.is_success() {
-                return (status, Json(serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":value.get("error").cloned().unwrap_or(Value::String("Tool call failed".into())),"data":value}})));
+                return mcp_response(status, serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":value.get("error").cloned().unwrap_or(Value::String("Tool call failed".into())),"data":value}}), Some(session_id));
             }
             let result = value.get("result").cloned().unwrap_or(Value::Null);
-            (StatusCode::OK, Json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":result.to_string()}],"structuredContent":result,"isError":false}})))
+            mcp_response(StatusCode::OK, serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":result.to_string()}],"structuredContent":result,"isError":false}}), Some(session_id))
         }
-        Some(_) | None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}}))),
+        _ => mcp_error(StatusCode::OK, id, -32601, "Method not found", Some(session_id)),
     }
 }
 
@@ -317,6 +823,7 @@ async fn list_gateway_tools(
             }
         }
     }
+    tools.extend(paperclip_builtin_tools());
     let company_id: Uuid = session.get("company_id");
     let agent_id: Uuid = session.get("agent_id");
     let mut visible = Vec::with_capacity(tools.len());
@@ -362,8 +869,543 @@ async fn gateway_decision(
         Some("deny") | Some("block") => "deny".to_string(),
         Some("require_approval") | Some("approval") | Some("ask_first") => "require_approval".to_string(),
         Some("allow") => "allow".to_string(),
+        _ if tool_name.starts_with("paperclip") => "allow".to_string(),
         _ => "deny".to_string(),
     }
+}
+
+fn path_part(value: Option<&Value>, name: &str) -> Result<String, String> {
+    let value = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{name} is required"))?;
+    Ok(urlencoding::encode(value).into_owned())
+}
+
+fn query_string(parameters: &Value, omit: &[&str]) -> String {
+    let Some(object) = parameters.as_object() else {
+        return String::new();
+    };
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in object {
+        if omit.iter().any(|item| *item == key) || value.is_null() {
+            continue;
+        }
+        if let Some(values) = value.as_array() {
+            for value in values {
+                query.append_pair(key, &value.to_string().trim_matches('"').to_string());
+            }
+        } else if let Some(value) = value.as_str() {
+            query.append_pair(key, value);
+        } else {
+            query.append_pair(key, &value.to_string());
+        }
+    }
+    query.finish()
+}
+
+fn object_without(parameters: &Value, omitted: &[&str]) -> Value {
+    let Some(object) = parameters.as_object() else {
+        return parameters.clone();
+    };
+    Value::Object(
+        object
+            .iter()
+            .filter(|(key, _)| !omitted.iter().any(|omitted| omitted == key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+fn optional_query(parameters: &Value, key: &str) -> String {
+    parameters
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("{}={}", key, urlencoding::encode(value)))
+        .unwrap_or_default()
+}
+
+fn paperclip_api_url(path: &str) -> Result<String, String> {
+    validate_paperclip_api_path(path)?;
+    let path = path.strip_prefix("/api").unwrap_or(path);
+    let configured = std::env::var("PAPERCLIP_API_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3100/api".to_string());
+    let base = configured.trim_end_matches('/');
+    let base = if base.ends_with("/api") {
+        base.to_string()
+    } else {
+        format!("{base}/api")
+    };
+    Ok(format!("{base}{path}"))
+}
+
+fn validate_paperclip_api_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') || path.contains("..") {
+        return Err("path must start with / and must not contain '..'".to_string());
+    }
+    if path.starts_with("/tool-gateway/") || path.starts_with("/mcp/") {
+        return Err("paperclipApiRequest cannot call gateway/session endpoints".to_string());
+    }
+    Ok(())
+}
+
+async fn call_paperclip_builtin_tool(
+    token: &str,
+    company_id: Uuid,
+    agent_id: Uuid,
+    run_id: Uuid,
+    tool_name: &str,
+    parameters: &Value,
+) -> Result<Value, String> {
+    if tool_name == "paperclipWaitForIssueWorkspaceService" {
+        let issue_id = parameters.get("issueId").and_then(Value::as_str).ok_or("issueId is required")?;
+        let timeout_seconds = parameters
+            .get("timeoutSeconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(60)
+            .clamp(1, 300);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        loop {
+            let current = Box::pin(call_paperclip_builtin_tool(
+                token, company_id, agent_id, run_id, "paperclipGetIssueWorkspaceRuntime",
+                &serde_json::json!({"issueId": issue_id}),
+            )).await?;
+            let services = current.get("runtimeServices").and_then(Value::as_array).cloned().unwrap_or_default();
+            let selected = services.iter().find(|service| {
+                let id_matches = parameters.get("runtimeServiceId").and_then(Value::as_str)
+                    .map(|id| service.get("id").and_then(Value::as_str) == Some(id)).unwrap_or(false);
+                let name_matches = parameters.get("serviceName").and_then(Value::as_str)
+                    .map(|name| service.get("serviceName").and_then(Value::as_str) == Some(name)).unwrap_or(false);
+                (id_matches || name_matches || (parameters.get("runtimeServiceId").is_none() && parameters.get("serviceName").is_none()))
+                    && service.get("status").and_then(Value::as_str) == Some("running")
+                    && service.get("healthStatus").and_then(Value::as_str) != Some("unhealthy")
+            });
+            if let Some(service) = selected {
+                return Ok(serde_json::json!({"workspace": current.get("workspace"), "service": service}));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(serde_json::json!({
+                    "timedOut": true,
+                    "latestWorkspace": current.get("workspace"),
+                    "latestRuntimeServices": services,
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+    let parameters = if tool_name == "paperclipControlIssueWorkspaceServices"
+        && parameters.get("workspaceId").is_none()
+    {
+        let issue_id = parameters.get("issueId").and_then(Value::as_str).ok_or("issueId is required")?;
+        let runtime = Box::pin(call_paperclip_builtin_tool(
+            token, company_id, agent_id, run_id, "paperclipGetIssueWorkspaceRuntime",
+            &serde_json::json!({"issueId": issue_id}),
+        )).await?;
+        let workspace_id = runtime.get("workspace").and_then(|workspace| workspace.get("id"))
+            .and_then(Value::as_str).ok_or("Issue has no current execution workspace")?;
+        let mut enriched = parameters.clone();
+        enriched.as_object_mut().ok_or("tool arguments must be an object")?
+            .insert("workspaceId".to_string(), Value::String(workspace_id.to_string()));
+        enriched
+    } else {
+        parameters.clone()
+    };
+    let (method, path, body) = match tool_name {
+        "paperclipMe" => ("GET", "/agents/me".to_string(), None),
+        "paperclipInboxLite" => ("GET", "/agents/me/inbox-lite".to_string(), None),
+        "paperclipListAgents" => (
+            "GET",
+            format!("/companies/{}/agents", company_id),
+            None,
+        ),
+        "paperclipGetAgent" => (
+            "GET",
+            format!("/agents/{}{}", path_part(parameters.get("agentId"), "agentId")?, {
+                let company = optional_query(&parameters, "companyId");
+                if company.is_empty() { String::new() } else { format!("?{company}") }
+            }),
+            None,
+        ),
+        "paperclipListIssues" => {
+            let query = query_string(&parameters, &["companyId"]);
+            let path = if query.is_empty() {
+                format!("/companies/{company_id}/issues")
+            } else {
+                format!("/companies/{company_id}/issues?{query}")
+            };
+            ("GET", path, None)
+        }
+        "paperclipGetIssue" => (
+            "GET",
+            format!("/issues/{}", path_part(parameters.get("issueId"), "issueId")?),
+            None,
+        ),
+        "paperclipGetHeartbeatContext" => (
+            "GET",
+            format!(
+                "/issues/{}/heartbeat-context{}",
+                path_part(parameters.get("issueId"), "issueId")?
+                , if let Some(wake_comment_id) = parameters.get("wakeCommentId").and_then(Value::as_str) {
+                    format!("?wakeCommentId={}", urlencoding::encode(wake_comment_id))
+                } else { String::new() }
+            ),
+            None,
+        ),
+        "paperclipListComments" => (
+            "GET",
+            format!(
+                "/issues/{}/comments{}",
+                path_part(parameters.get("issueId"), "issueId")?,
+                {
+                    let query = query_string(&parameters, &["issueId"]);
+                    if query.is_empty() { String::new() } else { format!("?{query}") }
+                }
+            ),
+            None,
+        ),
+        "paperclipGetComment" => (
+            "GET",
+            format!(
+                "/issues/{}/comments/{}",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("commentId"), "commentId")?
+            ),
+            None,
+        ),
+        "paperclipListIssueApprovals" => (
+            "GET",
+            format!(
+                "/issues/{}/approvals",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            None,
+        ),
+        "paperclipListDocuments" => (
+            "GET",
+            format!(
+                "/issues/{}/documents",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            None,
+        ),
+        "paperclipGetDocument" => (
+            "GET",
+            format!(
+                "/issues/{}/documents/{}",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("key"), "key")?
+            ),
+            None,
+        ),
+        "paperclipListDocumentRevisions" => (
+            "GET",
+            format!(
+                "/issues/{}/documents/{}/revisions",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("key"), "key")?
+            ),
+            None,
+        ),
+        "paperclipListProjects" => ("GET", format!("/companies/{company_id}/projects"), None),
+        "paperclipGetProject" => (
+            "GET",
+            format!("/projects/{}{}", path_part(parameters.get("projectId"), "projectId")?, {
+                let company = optional_query(&parameters, "companyId");
+                if company.is_empty() { String::new() } else { format!("?{company}") }
+            }),
+            None,
+        ),
+        "paperclipListGoals" => ("GET", format!("/companies/{company_id}/goals"), None),
+        "paperclipGetGoal" => (
+            "GET",
+            format!("/goals/{}", path_part(parameters.get("goalId"), "goalId")?),
+            None,
+        ),
+        "paperclipListApprovals" => {
+            let status = optional_query(&parameters, "status");
+            let path = format!("/companies/{company_id}/approvals{}", if status.is_empty() { String::new() } else { format!("?{status}") });
+            ("GET", path, None)
+        }
+        "paperclipCreateApproval" => (
+            "POST",
+            format!("/companies/{company_id}/approvals"),
+            Some({
+                let payload = parameters.get("payload").cloned().unwrap_or_else(|| serde_json::json!({}));
+                serde_json::json!({
+                    "type": parameters.get("type").cloned().unwrap_or_else(|| serde_json::json!("create_resource")),
+                    "requestedByAgentId": parameters.get("requestedByAgentId").cloned().unwrap_or(Value::Null),
+                    "payload": payload,
+                    "issueIds": parameters.get("issueIds").cloned().unwrap_or_else(|| serde_json::json!([])),
+                })
+            }),
+        ),
+        "paperclipGetApproval" => (
+            "GET",
+            format!(
+                "/approvals/{}",
+                path_part(parameters.get("approvalId"), "approvalId")?
+            ),
+            None,
+        ),
+        "paperclipGetApprovalIssues" => (
+            "GET",
+            format!(
+                "/approvals/{}/issues",
+                path_part(parameters.get("approvalId"), "approvalId")?
+            ),
+            None,
+        ),
+        "paperclipListApprovalComments" => (
+            "GET",
+            format!(
+                "/approvals/{}/comments",
+                path_part(parameters.get("approvalId"), "approvalId")?
+            ),
+            None,
+        ),
+        "paperclipAddApprovalComment" => (
+            "POST",
+            format!(
+                "/approvals/{}/comments",
+                path_part(parameters.get("approvalId"), "approvalId")?
+            ),
+            Some(serde_json::json!({
+                "body": parameters.get("body").and_then(Value::as_str).ok_or("body is required")?
+            })),
+        ),
+        "paperclipApprovalDecision" => {
+            let approval_id = path_part(parameters.get("approvalId"), "approvalId")?;
+            let action = parameters
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or("action is required")?;
+            let suffix = match action {
+                "approve" => "approve",
+                "reject" => "reject",
+                "requestRevision" => "request-revision",
+                "resubmit" => "resubmit",
+                _ => return Err(format!("unsupported approval action: {action}")),
+            };
+            let body = if action == "resubmit" {
+                let payload = parameters.get("payloadJson").and_then(Value::as_str).unwrap_or("{}");
+                serde_json::json!({"payload": serde_json::from_str::<Value>(payload).map_err(|error| format!("invalid payloadJson: {error}"))?})
+            } else {
+                serde_json::json!({"decisionNote": parameters.get("decisionNote")})
+            };
+            ("POST", format!("/approvals/{approval_id}/{suffix}"), Some(body))
+        }
+        "paperclipCreateIssue" => (
+            "POST",
+            format!("/companies/{company_id}/issues"),
+            Some(object_without(&parameters, &["issueId"])),
+        ),
+        "paperclipUpdateIssue" => (
+            "PATCH",
+            format!(
+                "/issues/{}",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            Some(parameters.clone()),
+        ),
+        "paperclipCheckoutIssue" => (
+            "POST",
+            format!(
+                "/issues/{}/checkout",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            {
+                let requested_agent = parameters
+                    .get("agentId")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| agent_id.to_string());
+                Some(serde_json::json!({
+                    "agentId": requested_agent,
+                    "expectedStatuses": parameters.get("expectedStatuses").cloned().unwrap_or_else(|| serde_json::json!(["todo", "backlog", "blocked"])),
+                    "checkoutRunId": run_id
+                }))
+            },
+        ),
+        "paperclipReleaseIssue" => (
+            "POST",
+            format!(
+                "/issues/{}/release",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            Some(serde_json::json!({
+                "releaseRunId": run_id,
+                "result": parameters.get("result"),
+                "targetStatus": parameters.get("targetStatus")
+            })),
+        ),
+        "paperclipAddComment" => (
+            "POST",
+            format!(
+                "/issues/{}/comments",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+                Some({
+                    let mut body = object_without(&parameters, &["issueId", "authorType"]);
+                    if let Some(object) = body.as_object_mut() {
+                        object.insert("actor_type".to_string(), Value::String("agent".to_string()));
+                        object.insert("actor_id".to_string(), Value::String(agent_id.to_string()));
+                        object.insert("actor_run_id".to_string(), Value::String(run_id.to_string()));
+                    }
+                    body
+                }),
+        ),
+        "paperclipSuggestTasks"
+        | "paperclipAskUserQuestions"
+        | "paperclipRequestConfirmation"
+        | "paperclipRequestCheckboxConfirmation" => {
+            let kind = match tool_name {
+                "paperclipSuggestTasks" => "suggest_tasks",
+                "paperclipAskUserQuestions" => "ask_user_questions",
+                "paperclipRequestConfirmation" => "request_confirmation",
+                _ => "request_checkbox_confirmation",
+            };
+            (
+                "POST",
+                format!(
+                    "/issues/{}/interactions",
+                    path_part(parameters.get("issueId"), "issueId")?
+                ),
+                Some({
+                    let mut body = object_without(&parameters, &["issueId"]);
+                    if let Some(object) = body.as_object_mut() {
+                        object.insert("kind".to_string(), Value::String(kind.to_string()));
+                    }
+                    body
+                }),
+            )
+        }
+        "paperclipUpsertIssueDocument" => (
+            "PUT",
+            format!(
+                "/issues/{}/documents/{}",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("key"), "key")?
+            ),
+            Some(object_without(&parameters, &["issueId", "key"])),
+        ),
+        "paperclipRestoreIssueDocumentRevision" => (
+            "POST",
+            format!(
+                "/issues/{}/documents/{}/revisions/{}/restore",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("key"), "key")?,
+                path_part(parameters.get("revisionId"), "revisionId")?
+            ),
+            Some(serde_json::json!({})),
+        ),
+        "paperclipGetIssueWorkspaceRuntime" => (
+            "GET",
+            format!(
+                "/issues/{}/heartbeat-context",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            None,
+        ),
+        "paperclipControlIssueWorkspaceServices" => {
+            let workspace_id = path_part(parameters.get("workspaceId"), "workspaceId")?;
+            let action = path_part(parameters.get("action"), "action")?;
+            (
+                "POST",
+                format!("/execution-workspaces/{workspace_id}/runtime-services/{action}"),
+                Some(object_without(&parameters, &["issueId", "workspaceId", "action"])),
+            )
+        }
+        "paperclipWaitForIssueWorkspaceService" => (
+            "GET",
+            format!(
+                "/issues/{}/heartbeat-context",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            None,
+        ),
+        "paperclipLinkIssueApproval" => (
+            "POST",
+            format!(
+                "/issues/{}/approvals",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            Some(serde_json::json!({"approvalId": parameters.get("approvalId")})),
+        ),
+        "paperclipUnlinkIssueApproval" => (
+            "DELETE",
+            format!(
+                "/issues/{}/approvals/{}",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("approvalId"), "approvalId")?
+            ),
+            None,
+        ),
+        "paperclipApiRequest" => {
+            let method = parameters
+                .get("method")
+                .and_then(Value::as_str)
+                .ok_or("method is required")?;
+            if !matches!(method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
+                return Err(format!("unsupported HTTP method: {method}"));
+            }
+            let path = parameters
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or("path is required")?;
+            validate_paperclip_api_path(path)?;
+            let body = parameters
+                .get("jsonBody")
+                .and_then(Value::as_str)
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| format!("invalid jsonBody: {error}"))?;
+            (method, path.to_string(), body)
+        }
+        _ => return Err(format!("Unknown Paperclip tool: {tool_name}")),
+    };
+    let url = paperclip_api_url(&path)?;
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|error| format!("invalid HTTP method: {error}"))?;
+    let client = reqwest::Client::new();
+    let mut request = client
+        .request(method.clone(), &url)
+        .header("x-paperclip-tool-gateway-token", token)
+        .header("x-paperclip-run-id", run_id.to_string())
+        .header("accept", "application/json");
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    let value = if text.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()))
+    };
+    if !status.is_success() {
+        return Err(format!("{} {} failed with {}: {}", method, url, status, value));
+    }
+    if tool_name == "paperclipGetIssueWorkspaceRuntime" {
+        let workspace = value
+            .get("currentExecutionWorkspace")
+            .cloned()
+            .or_else(|| value.get("workspace").cloned())
+            .filter(|workspace| !workspace.is_null());
+        let runtime_services = workspace
+            .as_ref()
+            .and_then(|workspace| workspace.get("runtimeServices"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        return Ok(serde_json::json!({
+            "context": value,
+            "workspace": workspace,
+            "runtimeServices": runtime_services,
+        }));
+    }
+    Ok(value)
 }
 
 async fn call_gateway_tool(
@@ -385,6 +1427,155 @@ async fn call_gateway_tool(
     let company_id: Uuid = session.get("company_id");
     let agent_id: Uuid = session.get("agent_id");
     let run_id: Uuid = session.get("run_id");
+    let _invocation_context = McpInvocationContext {
+        session_id: session.get("id"),
+        company_id,
+        agent_id,
+        run_id,
+        issue_id: session.get("issue_id"),
+    };
+    if tool_name.starts_with("paperclip") {
+        let invocation_id = Uuid::new_v4();
+        let parameters = body
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !is_paperclip_builtin_tool(tool_name) {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": "Paperclip tool not found", "reasonCode": "tool_not_found",
+            })));
+        }
+        if let Err(error) = validate_paperclip_arguments(tool_name, &parameters) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": error, "reasonCode": "invalid_tool_arguments",
+            })));
+        }
+        let arguments_summary = serde_json::json!({
+            "valueType": "object",
+            "keys": parameters.as_object().map(|value| value.len()).unwrap_or(0)
+        });
+        let decision = gateway_decision(&state, company_id, agent_id, tool_name).await;
+        if decision == "deny" {
+            let _ = sqlx::query(
+                "INSERT INTO tool_invocations
+                 (id, company_id, actor_type, actor_id, agent_id, run_id, tool_name,
+                  arguments_summary, policy_decision, status, error_code, completed_at)
+                 VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,'deny','denied','policy_denied',NOW())",
+            )
+            .bind(invocation_id).bind(company_id).bind(agent_id.to_string()).bind(agent_id)
+            .bind(run_id).bind(tool_name).bind(&arguments_summary)
+            .execute(&state.pool).await;
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+                "error": "Tool call denied by policy", "reasonCode": "policy_denied",
+                "decision": "deny", "invocationId": invocation_id,
+            })));
+        }
+        if decision == "require_approval" {
+            let action_id = Uuid::new_v4();
+            let _ = sqlx::query(
+                "INSERT INTO tool_invocations
+                 (id, company_id, actor_type, actor_id, agent_id, run_id, tool_name,
+                  arguments_summary, policy_decision, status, started_at)
+                 VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,'require_approval','pending',NOW())",
+            )
+            .bind(invocation_id).bind(company_id).bind(agent_id.to_string()).bind(agent_id)
+            .bind(run_id).bind(tool_name).bind(&arguments_summary)
+            .execute(&state.pool).await;
+            let _ = sqlx::query(
+                "INSERT INTO tool_action_requests
+                 (id, company_id, invocation_id, issue_id, status,
+                  canonical_arguments_hash, canonical_arguments_summary, signed_arguments,
+                  preview_markdown, requested_by_agent_id)
+                 VALUES ($1,$2,$3,(SELECT issue_id FROM tool_gateway_sessions WHERE id=$4),
+                         'pending',$5,$6,$7,$8,$9)",
+            )
+            .bind(action_id).bind(company_id).bind(invocation_id).bind(session.get::<Uuid, _>("id"))
+            .bind(hash_gateway_token(&parameters.to_string())).bind(&arguments_summary)
+            .bind(parameters.to_string()).bind(format!("Tool call requires approval: {tool_name}"))
+            .bind(agent_id).execute(&state.pool).await;
+            return (StatusCode::OK, Json(serde_json::json!({
+                "decision": "require_approval", "invocationId": invocation_id,
+                "actionRequestId": action_id, "status": "pending",
+            })));
+        }
+        let _ = sqlx::query(
+            "INSERT INTO tool_invocations
+             (id, company_id, actor_type, actor_id, agent_id, run_id, tool_name,
+              arguments_summary, policy_decision, status, started_at)
+             VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,'allow','executing',NOW())",
+        )
+        .bind(invocation_id)
+        .bind(company_id)
+        .bind(agent_id.to_string())
+        .bind(agent_id)
+        .bind(run_id)
+        .bind(tool_name)
+        .bind(&arguments_summary)
+        .execute(&state.pool)
+        .await;
+        let result = call_paperclip_builtin_tool(
+            &token,
+            company_id,
+            agent_id,
+            run_id,
+            tool_name,
+            &parameters,
+        )
+        .await;
+        return match result {
+            Ok(value) => {
+                let _ = sqlx::query(
+                    "UPDATE tool_invocations SET status='succeeded', result_summary=$2,
+                     completed_at=NOW(), updated_at=NOW() WHERE id=$1",
+                )
+                .bind(invocation_id)
+                .bind(serde_json::json!({"valueType": "json"}))
+                .execute(&state.pool)
+                .await;
+                let _ = sqlx::query(
+                    "INSERT INTO tool_call_events
+                     (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,
+                      decision,outcome,invocation_id)
+                     VALUES ($1,'call_completed','agent',$2,$3,$4,$5,$6,'success',$7)",
+                )
+                .bind(company_id)
+                .bind(agent_id.to_string())
+                .bind(agent_id)
+                .bind(run_id)
+                .bind(tool_name)
+                .bind(&decision)
+                .bind(invocation_id)
+                .execute(&state.pool)
+                .await;
+                (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "decision": "allowed",
+                    "result": value,
+                    "invocationId": invocation_id
+                })),
+                )
+            }
+            Err(error) => {
+                let _ = sqlx::query(
+                    "UPDATE tool_invocations SET status='failed', error_message=$2,
+                     completed_at=NOW(), updated_at=NOW() WHERE id=$1",
+                )
+                .bind(invocation_id)
+                .bind(&error)
+                .execute(&state.pool)
+                .await;
+                (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": error,
+                    "reasonCode": "paperclip_tool_call_failed",
+                    "invocationId": invocation_id
+                })),
+                )
+            }
+        };
+    }
     let plugin = sqlx::query("SELECT id, manifest FROM plugins WHERE status = 'ready' AND EXISTS (SELECT 1 FROM jsonb_array_elements(manifest->'tools') item WHERE item->>'name' = $1)")
         .bind(tool_name).fetch_optional(&state.pool).await.unwrap_or(None);
     if plugin.is_none() && tool_name.starts_with("mcp.") {
@@ -904,9 +2095,14 @@ pub fn tool_routes() -> Router<AppState> {
         .route("/tool-gateway/sessions/:session_id/revoke", post(revoke_gateway_session))
         .route("/tool-gateway/tools", get(list_gateway_tools))
         .route("/tool-gateway/tools/call", post(call_gateway_tool))
-        .route("/tool-gateway/mcp", post(mcp_session_protocol))
-        .route("/mcp/gateways/:gateway_public_id", post(mcp_session_protocol).get(|| async { Json(serde_json::json!({"transport":"streamable_http","authentication":"bearer"})) }))
-        .route("/tool-gateway/gateways/:gateway_id/mcp", post(mcp_session_protocol).get(|| async { Json(serde_json::json!({"transport":"streamable_http","authentication":"bearer"})) }))
+        .route(
+            "/tool-gateway/mcp",
+            get(mcp_session_info)
+                .post(mcp_session_protocol)
+                .delete(close_mcp_session),
+        )
+        .route("/mcp/gateways/:gateway_public_id", get(mcp_session_info).post(mcp_session_protocol).delete(close_mcp_session))
+        .route("/tool-gateway/gateways/:gateway_id/mcp", get(mcp_session_info).post(mcp_session_protocol).delete(close_mcp_session))
         .route("/companies/:company_id/tools/gateways", get(list_named_gateways).post(create_named_gateway))
         .route("/tool-gateway/gateways/:gateway_id", axum::routing::patch(update_named_gateway))
         .route("/tool-gateway/gateways/:gateway_id/tokens", post(create_named_gateway_token))
@@ -923,4 +2119,68 @@ pub fn tool_routes() -> Router<AppState> {
             "/companies/:company_id/tools/profiles/effective/agents/:agent_id",
             get(effective_profiles_for_agent),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paperclip_builtin_registry_contains_core_tools() {
+        let tools = paperclip_builtin_tools();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<std::collections::HashSet<_>>();
+        for required in [
+            "paperclipMe",
+            "paperclipListIssues",
+            "paperclipGetIssue",
+            "paperclipCreateIssue",
+            "paperclipUpdateIssue",
+            "paperclipAddComment",
+            "paperclipGetDocument",
+            "paperclipUpsertIssueDocument",
+            "paperclipApprovalDecision",
+            "paperclipApiRequest",
+        ] {
+            assert!(names.contains(required), "missing MCP tool {required}");
+        }
+        assert_eq!(names.len(), tools.len(), "MCP tool names must be unique");
+        assert_eq!(tools.len(), 41, "Paperclip reference currently exposes 41 built-in tools");
+        assert!(tools.iter().all(|tool| tool
+            .get("inputSchema")
+            .and_then(|schema| schema.get("type"))
+            .is_some()));
+    }
+
+    #[test]
+    fn paperclip_api_url_normalizes_api_prefix_and_rejects_traversal() {
+        let without_prefix = paperclip_api_url("/issues/123").unwrap();
+        let with_prefix = paperclip_api_url("/api/issues/123").unwrap();
+        assert!(without_prefix.ends_with("/api/issues/123"));
+        assert_eq!(without_prefix, with_prefix);
+        assert!(paperclip_api_url("/../secrets").is_err());
+        assert!(paperclip_api_url("/tool-gateway/mcp").is_err());
+    }
+
+    #[test]
+    fn paperclip_argument_validation_covers_required_fields_and_sensitive_wrappers() {
+        assert!(validate_paperclip_arguments("paperclipGetIssue", &serde_json::json!({})).is_err());
+        assert!(validate_paperclip_arguments("paperclipGetIssue", &serde_json::json!({"issueId": "ABC-1"})).is_ok());
+        assert!(validate_paperclip_arguments("paperclipUpsertIssueDocument", &serde_json::json!({
+            "issueId": "ABC-1", "key": "Bad Key", "body": "content"
+        })).is_err());
+        assert!(validate_paperclip_arguments("paperclipApiRequest", &serde_json::json!({
+            "method": "POST", "path": "/issues/1", "jsonBody": "not-json"
+        })).is_err());
+    }
+
+    #[test]
+    fn object_without_removes_context_fields_before_rest_forwarding() {
+        assert_eq!(
+            object_without(&serde_json::json!({"issueId": "i", "title": "t"}), &["issueId"]),
+            serde_json::json!({"title": "t"})
+        );
+    }
 }

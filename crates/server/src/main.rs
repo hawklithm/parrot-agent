@@ -9,6 +9,7 @@ use axum::Router;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 use access::DefaultAccessService;
 use api::app_state::AppState;
@@ -115,6 +116,76 @@ use services::{
 };
 use services::event_listeners::{ApprovalApprovedToIssueUnblockListener, CompleteIssueServiceAdapter, RoutineTriggeredToIssueCreationListener};
 
+async fn ensure_local_trusted_principal(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    let configured_user_id = std::env::var("LOCAL_TRUSTED_USER_ID")
+        .ok()
+        .and_then(|value| Uuid::parse_str(&value).ok());
+    let user_exists = if let Some(user_id) = configured_user_id {
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM auth_users WHERE id = $1)")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?
+    } else {
+        false
+    };
+
+    let user_id = if user_exists {
+        configured_user_id.expect("configured local user id must be present when it exists")
+    } else {
+        let existing_user = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM auth_users ORDER BY created_at ASC, id ASC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        match existing_user {
+            Some(user_id) => user_id,
+            None => {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO auth_users (id, email, name, email_verified) VALUES ($1, $2, $3, true) RETURNING id",
+                )
+                .bind(Uuid::new_v4())
+                .bind("local@parrot-agent.local")
+                .bind("Board")
+                .fetch_one(pool)
+                .await?
+            }
+        }
+    };
+
+    let company_ids = sqlx::query_scalar::<_, Uuid>("SELECT id FROM companies ORDER BY created_at ASC, id ASC")
+        .fetch_all(pool)
+        .await?;
+    let company_id = std::env::var("LOCAL_TRUSTED_COMPANY_ID")
+        .ok()
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .filter(|company_id| company_ids.contains(company_id))
+        .or_else(|| company_ids.first().copied())
+        .unwrap_or_else(Uuid::nil);
+
+    sqlx::query(
+        "INSERT INTO instance_user_roles (user_id, role) VALUES ($1, 'instance_admin') ON CONFLICT (user_id, role) DO NOTHING",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+
+    for company_id in &company_ids {
+        sqlx::query(
+            "INSERT INTO company_memberships (company_id, principal_type, principal_id, status, membership_role) VALUES ($1, 'user'::principal_type, $2, 'active'::company_membership_status, 'owner'::membership_role) ON CONFLICT (company_id, principal_type, principal_id) DO NOTHING",
+        )
+        .bind(company_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    }
+
+    std::env::set_var("LOCAL_TRUSTED_USER_ID", user_id.to_string());
+    std::env::set_var("LOCAL_TRUSTED_COMPANY_ID", company_id.to_string());
+    tracing::info!(%user_id, %company_id, "local trusted board principal is ready");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 加载 .env 文件（优先级：环境变量 > .env）
@@ -138,6 +209,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("running migrations...");
     sqlx::migrate!("../../migrations").run(&pool).await?;
+
+    let deployment_mode = std::env::var("DEPLOYMENT_MODE").ok();
+    if deployment_mode.as_deref() == Some("local_trusted")
+        || (deployment_mode.is_none() && cfg!(debug_assertions))
+    {
+        ensure_local_trusted_principal(&pool).await?;
+    }
 
     let state = build_app_state(pool.clone()).await?;
 

@@ -179,6 +179,7 @@ impl MonitorSchedulerService for DefaultMonitorScheduler {
             goal_id: None,
             parent_id: None,
             work_mode: None,
+            search_query: None,
         };
 
         let pagination = models::Pagination {

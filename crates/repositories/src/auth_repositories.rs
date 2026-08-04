@@ -296,11 +296,21 @@ impl PgCompanyMembershipRepository {
     }
 }
 
+// The original local schema stores role/status as PostgreSQL enums and names
+// the role column `membership_role`.  Repositories expose the historical Rust
+// compatibility shape (`role`, `joined_at`, `archived_at`), so always select
+// an explicit projection instead of relying on SELECT *.
+const COMPANY_MEMBERSHIP_COLUMNS: &str =
+    "id, company_id, principal_type::text AS principal_type, principal_id,\
+     membership_role::text AS role, status::text AS status,\
+     created_at AS joined_at, NULL::timestamptz AS archived_at,\
+     created_at, updated_at";
+
 #[async_trait]
 impl CompanyMembershipRepository for PgCompanyMembershipRepository {
     async fn find_by_principal(&self, company_id: Uuid, principal_type: &str, principal_id: Uuid) -> RepositoryResult<Option<CompanyMembershipRow>> {
         let row = sqlx::query_as::<_, CompanyMembershipRow>(
-            "SELECT * FROM company_memberships WHERE company_id = $1 AND principal_type = $2 AND principal_id = $3"
+            &format!("SELECT {} FROM company_memberships WHERE company_id = $1 AND principal_type = $2::principal_type AND principal_id = $3", COMPANY_MEMBERSHIP_COLUMNS)
         )
         .bind(company_id).bind(principal_type).bind(principal_id)
         .fetch_optional(&self.pool)
@@ -310,7 +320,7 @@ impl CompanyMembershipRepository for PgCompanyMembershipRepository {
 
     async fn list_by_company(&self, company_id: Uuid) -> RepositoryResult<Vec<CompanyMembershipRow>> {
         let rows = sqlx::query_as::<_, CompanyMembershipRow>(
-            "SELECT * FROM company_memberships WHERE company_id = $1 AND status = 'active'"
+            &format!("SELECT {} FROM company_memberships WHERE company_id = $1 AND status = 'active'::company_membership_status", COMPANY_MEMBERSHIP_COLUMNS)
         )
         .bind(company_id)
         .fetch_all(&self.pool)
@@ -320,7 +330,7 @@ impl CompanyMembershipRepository for PgCompanyMembershipRepository {
 
     async fn list_by_principal(&self, principal_type: &str, principal_id: Uuid) -> RepositoryResult<Vec<CompanyMembershipRow>> {
         let rows = sqlx::query_as::<_, CompanyMembershipRow>(
-            "SELECT * FROM company_memberships WHERE principal_type = $1 AND principal_id = $2 AND status = 'active'"
+            &format!("SELECT {} FROM company_memberships WHERE principal_type = $1::principal_type AND principal_id = $2 AND status = 'active'::company_membership_status", COMPANY_MEMBERSHIP_COLUMNS)
         )
         .bind(principal_type).bind(principal_id)
         .fetch_all(&self.pool)
@@ -330,13 +340,13 @@ impl CompanyMembershipRepository for PgCompanyMembershipRepository {
 
     async fn create(&self, membership: CompanyMembershipRow) -> RepositoryResult<CompanyMembershipRow> {
         sqlx::query(
-            r#"INSERT INTO company_memberships (id, company_id, principal_type, principal_id, role, status,
-               joined_at, archived_at, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#
+            r#"INSERT INTO company_memberships
+               (id, company_id, principal_type, principal_id, membership_role, status, created_at, updated_at)
+               VALUES ($1, $2, $3::principal_type, $4, $5::membership_role,
+                       $6::company_membership_status, $7, $8)"#
         )
         .bind(membership.id).bind(membership.company_id).bind(&membership.principal_type)
         .bind(membership.principal_id).bind(&membership.role).bind(&membership.status)
-        .bind(membership.joined_at).bind(membership.archived_at)
         .bind(membership.created_at).bind(membership.updated_at)
         .execute(&self.pool)
         .await?;
@@ -344,7 +354,7 @@ impl CompanyMembershipRepository for PgCompanyMembershipRepository {
     }
 
     async fn update_role(&self, id: Uuid, new_role: String) -> RepositoryResult<()> {
-        sqlx::query("UPDATE company_memberships SET role = $2, updated_at = NOW() WHERE id = $1")
+        sqlx::query("UPDATE company_memberships SET membership_role = $2::membership_role, updated_at = NOW() WHERE id = $1")
             .bind(id).bind(new_role)
             .execute(&self.pool)
             .await?;
@@ -352,7 +362,7 @@ impl CompanyMembershipRepository for PgCompanyMembershipRepository {
     }
 
     async fn archive(&self, id: Uuid) -> RepositoryResult<()> {
-        sqlx::query("UPDATE company_memberships SET status = 'archived', archived_at = NOW(), updated_at = NOW() WHERE id = $1")
+        sqlx::query("UPDATE company_memberships SET status = 'inactive'::company_membership_status, updated_at = NOW() WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -360,7 +370,7 @@ impl CompanyMembershipRepository for PgCompanyMembershipRepository {
     }
 
     async fn restore(&self, id: Uuid) -> RepositoryResult<()> {
-        sqlx::query("UPDATE company_memberships SET status = 'active', archived_at = NULL, updated_at = NOW() WHERE id = $1")
+        sqlx::query("UPDATE company_memberships SET status = 'active'::company_membership_status, updated_at = NOW() WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;

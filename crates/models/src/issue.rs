@@ -446,6 +446,7 @@ pub struct IssueQueryFilter {
     pub goal_id: Option<Uuid>,
     pub parent_id: Option<Uuid>,
     pub work_mode: Option<IssueWorkMode>,
+    pub search_query: Option<String>,
 }
 
 #[cfg(test)]

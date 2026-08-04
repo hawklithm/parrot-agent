@@ -145,6 +145,106 @@ pub struct BearerTokenResolver {
     jwt_config: Arc<JwtConfig>,
 }
 
+/// Resolves the short-lived token issued for a local tool-gateway run.
+///
+/// MCP clients use this token to call the normal Paperclip REST contracts from
+/// inside a tool invocation. Keeping it in the common auth resolver means the
+/// migrated Paperclip MCP tools do not need to bypass the API authorization
+/// layer or manufacture a board/agent API key.
+pub struct ToolGatewayTokenResolver {
+    pool: Arc<PgPool>,
+}
+
+impl ToolGatewayTokenResolver {
+    pub fn new(pool: Arc<PgPool>) -> Self {
+        Self { pool }
+    }
+
+    fn extract_token(&self, headers: &HeaderMap) -> Option<String> {
+        headers
+            .get("x-paperclip-tool-gateway-token")
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| {
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.strip_prefix("Bearer "))
+            })
+            .map(str::trim)
+            .filter(|value| value.starts_with("ptg_") && !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+}
+
+#[async_trait]
+impl ActorResolver for ToolGatewayTokenResolver {
+    async fn resolve(&self, headers: &HeaderMap) -> AuthResult<Option<AuthorizationActor>> {
+        let Some(token) = self.extract_token(headers) else {
+            return Ok(None);
+        };
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let token_hash = hex::encode(hasher.finalize());
+        let row = sqlx::query(
+            "SELECT company_id, agent_id, run_id, expires_at, revoked_at
+             FROM tool_gateway_sessions WHERE token_hash = $1",
+        )
+        .bind(&token_hash)
+        .fetch_optional(&*self.pool)
+        .await
+        .map_err(|error| AuthError::Internal {
+            message: format!("Tool gateway token lookup failed: {error}"),
+        })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let expires_at: chrono::DateTime<chrono::Utc> = sqlx::Row::try_get(&row, "expires_at")
+            .map_err(|error| AuthError::Internal {
+                message: format!("Tool gateway session is malformed: {error}"),
+            })?;
+        let revoked_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::Row::try_get(&row, "revoked_at").map_err(|error| AuthError::Internal {
+                message: format!("Tool gateway session is malformed: {error}"),
+            })?;
+        if revoked_at.is_some() || expires_at <= chrono::Utc::now() {
+            return Ok(None);
+        }
+        let company_id: Uuid = sqlx::Row::try_get(&row, "company_id").map_err(|error| {
+            AuthError::Internal {
+                message: format!("Tool gateway session is malformed: {error}"),
+            }
+        })?;
+        let agent_id: Uuid = sqlx::Row::try_get(&row, "agent_id").map_err(|error| {
+            AuthError::Internal {
+                message: format!("Tool gateway session is malformed: {error}"),
+            }
+        })?;
+        let run_id: Uuid = sqlx::Row::try_get(&row, "run_id").map_err(|error| {
+            AuthError::Internal {
+                message: format!("Tool gateway session is malformed: {error}"),
+            }
+        })?;
+        let _ = sqlx::query(
+            "UPDATE tool_gateway_sessions SET last_used_at = NOW(), updated_at = NOW()
+             WHERE token_hash = $1",
+        )
+        .bind(token_hash)
+        .execute(&*self.pool)
+        .await;
+        Ok(Some(AuthorizationActor::agent_with_source(
+            agent_id,
+            company_id,
+            Some(run_id),
+            ActorSource::AgentJwt,
+        )))
+    }
+
+    fn priority(&self) -> u8 {
+        20
+    }
+}
+
 impl BearerTokenResolver {
     pub fn new(pool: Arc<PgPool>, jwt_config: Arc<JwtConfig>) -> Self {
         Self { pool, jwt_config }
@@ -883,6 +983,7 @@ pub fn middleware_from_env(pool: Arc<PgPool>) -> AuthMiddleware {
         )
     });
     let mut middleware = AuthMiddleware::new(mode)
+        .with_resolver(Arc::new(ToolGatewayTokenResolver::new(pool.clone())))
         .with_resolver(Arc::new(BearerTokenResolver::new(
             pool.clone(),
             Arc::new(jwt),

@@ -326,6 +326,7 @@ impl IssueService for DefaultIssueService {
             goal_id: filter.goal_id,
             parent_id: filter.parent_id,
             work_mode: None,
+            search_query: None,
         };
         let models_pagination = models::Pagination {
             limit: pagination.limit,
@@ -811,25 +812,27 @@ impl issue_service::IssueService for LegacyIssueService {
         })
     }
 
-    async fn get(&self, id: Uuid, _company_id: Uuid) -> Result<Option<Issue>, String> {
-        self.issue_repo.get_by_id(id).await.map_err(|e| e.to_string())
+    async fn get(&self, id: Uuid, company_id: Uuid) -> Result<Option<Issue>, String> {
+        let issue = self.issue_repo.get_by_id(id).await.map_err(|e| e.to_string())?;
+        Ok(issue.filter(|issue| issue.company_id == company_id))
     }
 
-    async fn list(&self, company_id: Uuid, _filter: &crate::issue_service::IssueQueryFilter, _pagination: &crate::issue_service::Pagination) -> Result<Vec<Issue>, String> {
+    async fn list(&self, company_id: Uuid, filter: &crate::issue_service::IssueQueryFilter, pagination: &crate::issue_service::Pagination) -> Result<Vec<Issue>, String> {
         // Use models:: types since the repository trait expects them
         let filter = models::IssueQueryFilter {
-            status: None,
-            priority: None,
-            assignee_agent_id: None,
-            assignee_user_id: None,
-            project_id: None,
-            parent_id: None,
-            goal_id: None,
+            status: filter.status.clone(),
+            priority: filter.priority.clone(),
+            assignee_agent_id: filter.assignee_agent_id,
+            assignee_user_id: filter.assignee_user_id,
+            project_id: filter.project_id,
+            parent_id: filter.parent_id,
+            goal_id: filter.goal_id,
             work_mode: None,
+            search_query: filter.search_query.clone(),
         };
         let pagination = models::Pagination {
-            limit: _pagination.limit,
-            offset: _pagination.offset,
+            limit: pagination.limit,
+            offset: pagination.offset,
             cursor: None,
         };
         self.issue_repo.list_by_company(company_id, &filter, &pagination).await.map_err(|e| e.to_string())

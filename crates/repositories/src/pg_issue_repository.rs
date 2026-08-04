@@ -93,6 +93,11 @@ impl IssueRepository for PgIssueRepository {
             query.push_str(&format!(" AND parent_id = ${}", param_count));
         }
 
+        if filter.search_query.as_deref().is_some_and(|query| !query.trim().is_empty()) {
+            param_count += 1;
+            query.push_str(&format!(" AND (title ILIKE '%' || ${} || '%' OR description ILIKE '%' || ${} || '%' OR identifier ILIKE '%' || ${} || '%')", param_count, param_count, param_count));
+        }
+
         if let Some(ref _work_mode) = filter.work_mode {
             param_count += 1;
             query.push_str(&format!(" AND work_mode = ${}", param_count));
@@ -141,6 +146,10 @@ impl IssueRepository for PgIssueRepository {
 
         if let Some(parent_id) = filter.parent_id {
             q = q.bind(parent_id);
+        }
+
+        if let Some(search_query) = filter.search_query.as_deref().filter(|query| !query.trim().is_empty()) {
+            q = q.bind(search_query.trim());
         }
 
         if let Some(ref work_mode) = filter.work_mode {
@@ -205,6 +214,11 @@ impl IssueRepository for PgIssueRepository {
             query.push_str(&format!(" AND parent_id = ${}", param_count));
         }
 
+        if filter.search_query.as_deref().is_some_and(|query| !query.trim().is_empty()) {
+            param_count += 1;
+            query.push_str(&format!(" AND (title ILIKE '%' || ${} || '%' OR description ILIKE '%' || ${} || '%' OR identifier ILIKE '%' || ${} || '%')", param_count, param_count, param_count));
+        }
+
         if let Some(ref _work_mode) = filter.work_mode {
             param_count += 1;
             query.push_str(&format!(" AND work_mode = ${}", param_count));
@@ -244,6 +258,10 @@ impl IssueRepository for PgIssueRepository {
 
         if let Some(parent_id) = filter.parent_id {
             q = q.bind(parent_id);
+        }
+
+        if let Some(search_query) = filter.search_query.as_deref().filter(|query| !query.trim().is_empty()) {
+            q = q.bind(search_query.trim());
         }
 
         if let Some(ref work_mode) = filter.work_mode {

@@ -47,7 +47,7 @@ pub use jwt::{JwtConfig, LocalAgentJwtClaims, verify_local_agent_jwt};
 pub use membership::{CompanyMembership, MembershipRole, MembershipStatus, PrincipalType};
 pub use middleware::{
     ActorResolver, AuthMiddleware, AuthMode, BearerTokenResolver, CloudTenantHeaderResolver,
-    SessionCookieResolver, auth_middleware_fn, authenticated_middleware, extract_actor,
+    SessionCookieResolver, ToolGatewayTokenResolver, auth_middleware_fn, authenticated_middleware, extract_actor,
     local_trusted_middleware, middleware_from_env, require_agent, require_board,
     auth_cookie_prefix, auth_trusted_origins,
 };
