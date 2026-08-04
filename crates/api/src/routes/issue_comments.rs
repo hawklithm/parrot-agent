@@ -205,6 +205,30 @@ pub async fn get_comment(
     Ok(Json(CommentResponse { comment }))
 }
 
+/// GET /issues/:issue_id/comments/:comment_id — Paperclip's issue-scoped
+/// comment contract. Keep the legacy /comments/:comment_id route for existing
+/// UI callers, but require the issue path for migrated MCP calls.
+pub async fn get_issue_comment(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, comment_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    assert_issue_company(&state, &actor, issue_id).await?;
+    let belongs_to_issue = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM issue_comments WHERE id = $1 AND issue_id = $2)",
+    )
+    .bind(comment_id)
+    .bind(issue_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    if !belongs_to_issue {
+        return Err(ApiError::NotFound(format!("Comment not found: {comment_id}")));
+    }
+    let comment = state.issue_comment_service.get_comment(comment_id).await?;
+    Ok(Json(CommentResponse { comment }))
+}
+
 async fn assert_issue_company(
     state: &AppState,
     actor: &AuthorizationActor,
@@ -255,6 +279,7 @@ pub fn issue_comment_routes() -> Router<AppState> {
     Router::new()
         .route("/issues/:issue_id/comments", post(add_comment))
         .route("/issues/:issue_id/comments", get(list_comments))
+        .route("/issues/:issue_id/comments/:comment_id", get(get_issue_comment))
         .route("/comments/:comment_id", get(get_comment))
         .route("/comments/:comment_id", put(update_comment))
         .route("/comments/:comment_id", delete(delete_comment))

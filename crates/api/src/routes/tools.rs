@@ -143,9 +143,15 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "includeLiveDescendantSummary": {"type": "boolean"}, "q": {"type": "string"}
                     }, "additionalProperties": false
                 }),
-                "paperclipGetIssue" | "paperclipGetHeartbeatContext" | "paperclipListIssueApprovals" | "paperclipListDocuments" => serde_json::json!({
+                "paperclipGetIssue" | "paperclipListIssueApprovals" | "paperclipListDocuments" => serde_json::json!({
                     "type": "object", "properties": {"issueId": {"type": "string"}},
                     "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipGetHeartbeatContext" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"},
+                        "wakeCommentId": {"type": "string", "format": "uuid"}
+                    }, "required": ["issueId"], "additionalProperties": false
                 }),
                 "paperclipListComments" => serde_json::json!({
                     "type": "object", "properties": {"issueId": {"type": "string"}, "after": {"type": "string", "format": "uuid"}, "order": {"type": "string", "enum": ["asc", "desc"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
