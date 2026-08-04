@@ -4,7 +4,7 @@
 >
 > 约束：只允许修改 `/Users/adazhao/workspace/parrot-agent`；禁止修改 `/Users/adazhao/workspace/paperclip`。所有 Paperclip 代码仅作为只读参考。
 
-> 执行状态（2026-08-04）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、基础 schema/参数校验、审计、MCP session 基础生命周期，以及本地 Claude 的真实 token/端口注入验证。仍未宣称完成全部 Paperclip 生产级 response/error 契约、完整 SSE 长连接、跨公司负向测试和 Claude/Codex 长流程 E2E。
+> 执行状态（2026-08-05）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、统一 typed tool registry、基础 schema/参数校验、审计、MCP session 生命周期、批量 JSON-RPC、SSE 长连接 GET，以及本地 Claude 的真实 token/端口注入验证。仍未宣称完成全部 Paperclip 生产级 response/error 契约、跨公司负向测试和 Claude/Codex 长流程 E2E。
 
 ## 1. 目标与非目标
 
@@ -15,15 +15,15 @@
 - [x] 保留当前 run 级别的工具网关 Token 隔离能力。
 - [x] 工具调用上下文绑定 `company_id`、`agent_id`、`run_id` 和关联 Issue。
 - [x] 保留工具策略、审批、调用记录和失败结果的基础链路。
-- [ ] 支持 MCP Streamable HTTP 所需的全部会话、批量、SSE 长连接生命周期。
+- [x] 支持 MCP Streamable HTTP 的 session、批量 JSON-RPC、Accept 协商、JSON/SSE 响应、SSE GET 长连接和 DELETE 关闭；服务端主动事件队列仍是后续增强项。
 - [ ] 为每个迁移工具提供生产级参数校验、错误映射和自动化测试；当前已有注册级和基础参数测试。
 
 ### 1.2 非目标
 
-- [ ] 不修改 Paperclip 源码、数据库或依赖。
-- [ ] 不把 Paperclip 的 TypeScript 代码在运行时作为 `parrot-agent` 的依赖。
-- [ ] 不绕过现有授权层直接暴露数据库查询。
-- [ ] 不把 `PAPERCLIP_TOOL_GATEWAY_TOKEN`、API Key 或其他密钥写入普通日志。
+- [x] 不修改 Paperclip 源码、数据库或依赖。
+- [x] 不把 Paperclip 的 TypeScript 代码在运行时作为 `parrot-agent` 的依赖。
+- [x] 不绕过现有授权层直接暴露数据库查询。
+- [x] 不把 `PAPERCLIP_TOOL_GATEWAY_TOKEN`、API Key 或其他密钥写入普通日志。
 
 ## 2. 当前现状
 
@@ -41,7 +41,7 @@
 - [x] 服务启动时会重新唤醒 `todo + assignee_agent_id` 的任务。
   - 参考：`crates/services/src/heartbeat_service.rs:611`
 - [x] 任务成功/失败后已生成并更新 `continuation-summary` Issue document；并发锁和完整 Paperclip outcome 仍需补强。
-- [ ] 当前执行结果主要依赖进程退出码，没有完整解析 Paperclip 的 run outcome、工具调用结果和 handoff 状态。
+- [x] 当前执行结果以进程退出码为基础，并已解析 Claude/Codex JSONL 的显式 error/result、tool call 和 handoff 记录；Paperclip 更丰富的 outcome 字段仍需继续持久化。
 
 ### 2.2 当前 Tool Gateway 实现
 
@@ -72,7 +72,7 @@
 - [x] 当前 `tools/call` 已开始分发 Paperclip 内置工具，并通过 gateway token 转发到 parrot-agent REST contract。
 - [ ] 内置工具已覆盖 Paperclip 当前 41 个名称和主要 schema，但所有 REST response/error contract 尚未逐项完成验收。
 - [x] 当前实现已增加 MCP session info、DELETE close 和 `Mcp-Session-Id` 响应头；三个 MCP 入口均接入同一处理器。
-- [ ] 当前实现仍没有完整的 SSE 生命周期和所有 Streamable HTTP 协议细节。
+- [x] 当前实现支持 JSON/SSE POST 响应、SSE GET 长连接、KeepAlive、`Mcp-Protocol-Version` 和批量 JSON-RPC；主动事件路由仍未接入。
 - [x] 当前实现已覆盖 `notifications/initialized`、未知 method、解析错误、会话错误、JSON-RPC 错误码和响应 envelope 的基础行为；仍需真实 Claude/Codex 客户端逐项验收。
 
 ### 2.3 当前 Token 设计
@@ -162,7 +162,7 @@
 - [x] `paperclipUpsertIssueDocument`
 - [x] `paperclipRestoreIssueDocumentRevision`
 - [x] 校验 document key：非空、最大 64 字符、限定为小写字母/数字/`_`/`-`。
-- [x] 校验 body 最大 524288 字符，format 目前只允许 markdown；`baseRevisionId` 冲突检查仍需补齐。
+- [x] 校验 body 最大 524288 字符，format 目前只允许 markdown，并按 `baseRevisionId` 做乐观并发冲突检查。
 
 ### 4.4 Project、Goal 与 Approval
 
@@ -203,7 +203,7 @@
 ### 5.1 工具注册层
 
 - [x] 新增独立模块 `crates/api/src/mcp/`，承载 `McpInvocationContext` 和 request/notification 类型；Axum 路由和旧 gateway 兼容逻辑暂仍在 `routes/tools.rs`，后续可继续拆分 registry/dispatcher。
-- [ ] 定义独立的统一工具结构（当前 `paperclip_builtin_tools()` 已作为单一注册表使用，但尚未抽成 `McpToolDefinition`）：
+- [x] 定义独立的统一工具结构 `McpToolDefinition`，由 typed registry 统一生成 `tools/list` wire representation：
 
 ```text
 McpToolDefinition {
@@ -243,23 +243,23 @@ McpInvocationContext {
 - [ ] 保留 `POST /api/tool-gateway/mcp`。
 - [ ] 增加 MCP session 建立和 `Mcp-Session-Id` 响应。
 - [x] 处理客户端带 session id 的后续请求，并确认 session 属于同一个 gateway token。
-- [ ] 按 MCP 客户端要求处理 `Accept: application/json, text/event-stream`。
-- [ ] 支持需要 SSE 的响应，不要强制所有响应为普通 JSON。
+- [x] 按 MCP 客户端要求处理 `Accept: application/json, text/event-stream`；明确拒绝不支持的媒体类型。
+- [x] 支持 JSON/SSE 响应；GET SSE 保持连接并发送 KeepAlive。
 - [x] 正确区分 request、notification 和 response；`notifications/initialized` 不返回普通 JSON-RPC response。
 - [x] 对未知 method 返回标准 JSON-RPC method-not-found error。
 - [ ] 对无效 JSON、缺少 jsonrpc、缺少 id、参数类型错误返回标准 JSON-RPC parse/invalid-params error。（缺少 jsonrpc、缺少 id、工具参数已覆盖；Axum 的无效 JSON extractor 仍需统一 envelope。）
-- [ ] 评估是否需要 `GET /api/tool-gateway/mcp` 和 `DELETE /api/tool-gateway/mcp` 关闭 session。
+- [x] 提供 `GET /api/tool-gateway/mcp` session info/SSE stream，并用 `DELETE /api/tool-gateway/mcp` 关闭 session。
 - [ ] 为 Claude 和 Codex 各自验证实际握手流程，不能只用手写 curl 验证。
 
 ### 5.4 鉴权与上下文
 
-- [ ] token 只保存 hash，响应和日志不输出明文。
-- [ ] gateway token 解析后生成受限 Agent actor，来源标记为临时 token。
-- [ ] token actor 的 `run_id` 必须来自数据库，不接受请求体覆盖。
-- [ ] 绑定关系至少包括 company、agent、run、issue。
-- [ ] run 完成、失败、取消和超时都要撤销 token/session。
-- [ ] 所有工具调用日志记录 session、run、agent、company、tool name、decision、outcome。
-- [ ] 工具参数日志只记录摘要，禁止记录 password、API key、Bearer token 和完整敏感内容。
+- [x] token 只保存 hash，响应和日志不输出明文。
+- [x] gateway token 解析后生成受限 Agent actor，来源标记为临时 token。
+- [x] token actor 的 `run_id` 必须来自数据库，不接受请求体覆盖。
+- [x] 绑定关系至少包括 company、agent、run、issue。
+- [x] run 完成、失败、取消和超时都要撤销 token/session。
+- [x] 所有工具调用日志记录 session、run、agent、company、tool name、decision、outcome。
+- [x] 工具参数日志只记录摘要，禁止记录 password、API key、Bearer token 和完整敏感内容。
 
 ## 6. 工具与现有 parrot-agent API 对照步骤
 
@@ -291,8 +291,8 @@ error mapping
 - [ ] 确认 `tool_invocations`、`tool_call_events`、`tool_action_requests` 可覆盖成功、失败、拒绝和审批状态。
 - [ ] 确认 `tool_connections`、`tool_profiles`、`tool_profile_entries`、`tool_policies` 的字段与查询一致。
 - [x] 明确复用现有 `tool_gateway_sessions` 作为 MCP session：其 id 是 `Mcp-Session-Id`，并更新 `last_used_at`；目前不额外引入独立 MCP session 表。
-- [ ] 确认旧数据库能够通过迁移启动，不使用破坏性删表重建。
-- [ ] 为每一条新增迁移使用 `IF NOT EXISTS` 或安全的数据回填策略。
+- [x] 确认旧 `parrot_agent_dev` 能通过迁移启动，不使用破坏性删表重建。
+- [x] 新增迁移使用 `IF NOT EXISTS` 或安全的数据回填策略；本地 PostgreSQL 启动已验证。
 
 ## 8. 测试计划
 
@@ -352,13 +352,17 @@ error mapping
 ### 9.1 已落地文件
 
 - [x] `crates/api/src/routes/tools.rs`：41 个 Paperclip 工具注册、参数校验、REST bridge、策略/审计、MCP session JSON-RPC 入口。
-- [x] `crates/api/src/mcp/mod.rs`：run-scoped `McpInvocationContext` 和 request/notification 分类。
+- [x] `crates/api/src/mcp/mod.rs`：`McpToolDefinition`、run-scoped `McpInvocationContext` 和 request/notification 分类。
 - [x] `crates/api/src/routes/issues.rs`：Issue document GET/PUT、revision list/restore、Paperclip interaction kinds、Issue 查询 status/priority/q。
 - [x] `crates/api/src/routes/approvals.rs`：审批 status 过滤、创建/关联多个 issue、approve/reject/revision/resubmit。
 - [x] `crates/services/src/heartbeat_service.rs`：真实 gateway token 注入、URL 注入、日志脱敏、continuation summary。
 - [x] `crates/services/src/auth/middleware.rs`：`ptg_` token hash 查询、过期/撤销校验和 Agent actor 解析。
 - [x] `migrations/20260804000001_complete_auth_users.sql`：旧数据库缺失 auth user 字段的兼容迁移。
 - [x] `migrations/20260804000002_complete_issue_interactions.sql`：Paperclip interaction kinds、payload、幂等键和 continuation policy。
+- [x] Issue comments 已按 Paperclip `comment_actor_type`/`actor_id`/`actor_run_id` 数据库契约显式投影，兼容旧模型字段，不再依赖错误的 `SELECT *`。
+- [x] MCP 已增加 JSON-RPC batch、Accept 406、`Mcp-Protocol-Version`、named gateway scope 校验和保持连接的 SSE GET。
+- [x] 文档 PUT 已支持 `baseRevisionId` 乐观并发检查，并把 gateway run 的 Agent 归属写入 revision provenance。
+- [x] adapter 已解析 Claude/Codex JSONL 的显式 result/error、tool call 和 handoff 记录；零退出码不再覆盖显式失败。
 
 ### 9.2 已执行验证
 
@@ -367,6 +371,7 @@ error mapping
 - [x] `cargo test -p api --lib` 通过，当前 55 个测试通过。
 - [x] gateway token 脱敏测试通过；真实 adapter argv 保留实际 token，普通日志只显示 `[PAPERCLIP_TOOL_GATEWAY_TOKEN]`。
 - [x] 本地 Claude adapter 真实启动成功，MCP URL 指向当前 parrot-agent 端口，并在 run 输出中加载 Paperclip 工具集合。
+- [x] MCP 协议手工验证覆盖 initialize、initialized notification、tools/list、tools/call、invalid args、unknown method、malformed JSON、JSON/SSE response；API 单元测试当前 57 个通过。
 - [x] heartbeat run 完成后可读取 `continuation-summary` 文档。
 - [x] `cargo test --workspace --no-fail-fast` 已执行：206 个测试通过，19 个既存 services 测试失败；失败集中在 `adapter_config_normalizer`、`codex_local_isolation`、`consistency_service` 等非本次 MCP 迁移路径，不能将 workspace 全绿作为当前完成证据。
 - [ ] 尚未完成 Codex 真实长流程、MCP 全部会话错误矩阵、跨公司负向测试和完整 SSE 长连接测试。

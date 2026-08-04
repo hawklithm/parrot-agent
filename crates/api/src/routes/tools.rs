@@ -21,9 +21,10 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use uuid::Uuid;
+use futures::StreamExt;
 
 use crate::app_state::AppState;
-use crate::mcp::{request_kind, McpInvocationContext, McpRequestKind};
+use crate::mcp::{request_kind, McpInvocationContext, McpRequestKind, McpToolDefinition};
 
 fn hash_gateway_token(token: &str) -> String {
     let mut hasher = Sha256::new();
@@ -68,7 +69,7 @@ async fn mcp_http_request(url: &str, method: &str, params: Value) -> Result<Valu
     Ok(body.get("result").cloned().unwrap_or(body))
 }
 
-fn paperclip_builtin_tools() -> Vec<Value> {
+fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
     const TOOLS: &[(&str, &str)] = &[
         ("paperclipMe", "Get the current authenticated Paperclip actor details"),
         ("paperclipInboxLite", "Get the current authenticated agent inbox-lite assignment list"),
@@ -283,13 +284,24 @@ fn paperclip_builtin_tools() -> Vec<Value> {
                     "type": "object", "properties": {}, "additionalProperties": false
                 }),
             };
-            serde_json::json!({
-                "name": name,
-                "description": description,
-                "inputSchema": input_schema,
-                "source": "paperclip_builtin"
-            })
+            McpToolDefinition {
+                name,
+                description,
+                input_schema,
+            }
         })
+        .collect()
+}
+
+fn paperclip_builtin_tools() -> Vec<Value> {
+    paperclip_builtin_tool_definitions()
+        .into_iter()
+        .map(|tool| serde_json::json!({
+            "name": tool.name,
+            "description": tool.description,
+            "inputSchema": tool.input_schema,
+            "source": "paperclip_builtin"
+        }))
         .collect()
 }
 
@@ -449,8 +461,11 @@ async fn load_gateway_session(
     token: &str,
 ) -> Result<sqlx::postgres::PgRow, (StatusCode, Json<Value>)> {
     let row = sqlx::query(
-        "SELECT id, company_id, agent_id, run_id, issue_id, expires_at, revoked_at
-           FROM tool_gateway_sessions WHERE token_hash = $1",
+        "SELECT s.id, s.company_id, s.agent_id, s.run_id, s.issue_id, s.expires_at, s.revoked_at,
+                r.status::text AS run_status
+           FROM tool_gateway_sessions s
+           JOIN heartbeat_runs r ON r.id = s.run_id
+          WHERE s.token_hash = $1",
     )
     .bind(hash_gateway_token(token))
     .fetch_optional(&state.pool)
@@ -463,6 +478,10 @@ async fn load_gateway_session(
     let expires_at: chrono::DateTime<chrono::Utc> = row.get("expires_at");
     if revoked_at.is_some() || expires_at <= chrono::Utc::now() {
         return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Tool gateway session is expired or revoked"}))));
+    }
+    let run_status: String = row.get("run_status");
+    if !matches!(run_status.as_str(), "queued" | "running") {
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Tool gateway run is no longer active"}))));
     }
     let _ = sqlx::query("UPDATE tool_gateway_sessions SET last_used_at = NOW(), updated_at = NOW() WHERE id = $1")
         .bind(row.get::<Uuid, _>("id"))
@@ -537,6 +556,46 @@ async fn mcp_session_info(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
+    mcp_session_info_for_gateway(state, headers, None).await
+}
+
+async fn gateway_matches_selector(state: &AppState, headers: &HeaderMap, selector: &str) -> Result<(), Response> {
+    let Some(token) = bearer_or_gateway_token(headers) else {
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Bearer token is required"
+        }))).into_response());
+    };
+    let matches = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+           SELECT 1 FROM tool_mcp_gateways g
+           JOIN tool_gateway_sessions s ON s.company_id = g.company_id
+          WHERE s.token_hash = $1
+            AND (g.gateway_public_id = $2 OR g.id::text = $2)
+            AND g.status <> 'archived'
+        )",
+    )
+    .bind(hash_gateway_token(&token))
+    .bind(selector)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(false);
+    if matches {
+        Ok(())
+    } else {
+        Err(mcp_error(StatusCode::NOT_FOUND, Value::Null, -32001, "MCP gateway is not available for this session", None))
+    }
+}
+
+async fn mcp_session_info_for_gateway(
+    state: AppState,
+    headers: HeaderMap,
+    selector: Option<String>,
+) -> Response {
+    if let Some(selector) = selector.as_deref() {
+        if let Err(response) = gateway_matches_selector(&state, &headers, selector).await {
+            return response;
+        }
+    }
     let Some(token) = bearer_or_gateway_token(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -559,7 +618,7 @@ async fn mcp_session_info(
         .map(|value| value.split(',').any(|item| item.trim() == "text/event-stream"))
         .unwrap_or(false)
     {
-        let stream = futures::stream::once(async move {
+        let initial_event = futures::stream::once(async move {
             Ok::<Event, Infallible>(Event::default().event("message").data(
                 serde_json::json!({
                     "jsonrpc": "2.0",
@@ -569,36 +628,69 @@ async fn mcp_session_info(
                 .to_string(),
             ))
         });
+        // Keep the server-to-client stream open. `KeepAlive` emits comment
+        // frames while the pending tail leaves room for future server events.
+        let stream = initial_event.chain(futures::stream::pending::<Result<Event, Infallible>>());
         let mut response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+        response.headers_mut().insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static("2025-03-26"),
+        );
         if let Ok(value) = HeaderValue::from_str(&session_id.to_string()) {
             response.headers_mut().insert("mcp-session-id", value);
         }
         return response;
     }
-    (StatusCode::OK, Json(serde_json::json!({
+    let mut response = (StatusCode::OK, Json(serde_json::json!({
         "transport": "streamable_http",
         "authentication": "bearer",
         "sessionId": session_id,
         "runId": session.get::<Uuid, _>("run_id"),
-    }))).into_response()
+    }))).into_response();
+    response.headers_mut().insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static("2025-03-26"),
+    );
+    response
+}
+
+async fn mcp_session_info_named(
+    Path(selector): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    mcp_session_info_for_gateway(state, headers, Some(selector)).await
 }
 
 async fn close_mcp_session(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    close_mcp_session_for_gateway(state, headers, None).await
+}
+
+async fn close_mcp_session_for_gateway(
+    state: AppState,
+    headers: HeaderMap,
+    selector: Option<String>,
+) -> Response {
+    if let Some(selector) = selector.as_deref() {
+        if let Err(response) = gateway_matches_selector(&state, &headers, selector).await {
+            return response;
+        }
+    }
     let Some(token) = bearer_or_gateway_token(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Bearer token is required"})),
-        );
+        ).into_response();
     };
     let session_id = headers.get("mcp-session-id").and_then(|value| value.to_str().ok());
     if session_id.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Mcp-Session-Id is required"})),
-        );
+        ).into_response();
     }
     let updated = sqlx::query(
         "UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW()
@@ -615,16 +707,24 @@ async fn close_mcp_session(
                 "sessionId": row.get::<Uuid, _>("id"),
                 "revokedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("revoked_at"),
             })),
-        ),
+        ).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "MCP session not found"})),
-        ),
+        ).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": error.to_string()})),
-        ),
+        ).into_response(),
     }
+}
+
+async fn close_mcp_session_named(
+    Path(selector): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    close_mcp_session_for_gateway(state, headers, Some(selector)).await
 }
 
 fn mcp_response(status: StatusCode, body: Value, session_id: Option<Uuid>) -> Response {
@@ -641,6 +741,27 @@ fn mcp_response(status: StatusCode, body: Value, session_id: Option<Uuid>) -> Re
     response
 }
 
+fn mcp_accepted(session_id: Option<Uuid>) -> Response {
+    mcp_response(StatusCode::ACCEPTED, Value::Null, session_id)
+}
+
+fn mcp_accepts_json_or_sse(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get("accept").and_then(|value| value.to_str().ok()) else {
+        return true;
+    };
+    value.split(',').map(str::trim).any(|item| {
+        item == "*/*" || item == "application/json" || item == "text/event-stream"
+    })
+}
+
+fn mcp_wants_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').any(|item| item.trim() == "text/event-stream"))
+        .unwrap_or(false)
+}
+
 fn mcp_error(status: StatusCode, id: Value, code: i64, message: impl Into<String>, session_id: Option<Uuid>) -> Response {
     mcp_response(status, serde_json::json!({
         "jsonrpc": "2.0",
@@ -654,15 +775,88 @@ async fn mcp_session_protocol(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    mcp_session_protocol_for_gateway(state, headers, body, None).await
+}
+
+async fn mcp_session_protocol_for_gateway(
+    state: AppState,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    selector: Option<String>,
+) -> Response {
+    if let Some(selector) = selector.as_deref() {
+        if let Err(response) = gateway_matches_selector(&state, &headers, selector).await {
+            return response;
+        }
+    }
     let body: Value = match serde_json::from_slice(&body) {
         Ok(body) => body,
         Err(error) => return mcp_error(StatusCode::BAD_REQUEST, Value::Null, -32700, format!("Parse error: {error}"), None),
     };
-    let wants_sse = headers
-        .get("accept")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.split(',').any(|item| item.trim() == "text/event-stream"))
-        .unwrap_or(false);
+    if !mcp_accepts_json_or_sse(&headers) {
+        return mcp_error(StatusCode::NOT_ACCEPTABLE, Value::Null, -32600, "Accept must include application/json or text/event-stream", None);
+    }
+    let wants_sse = mcp_wants_sse(&headers);
+
+    if let Value::Array(batch) = body {
+        if batch.is_empty() {
+            return mcp_error(StatusCode::BAD_REQUEST, Value::Null, -32600, "JSON-RPC batch must not be empty", None);
+        }
+        let mut responses = Vec::new();
+        let mut session_header = None;
+        let mut status = StatusCode::OK;
+        for item in batch {
+            let response = mcp_session_protocol_json(
+                State(state.clone()),
+                headers.clone(),
+                Json(item),
+            ).await;
+            status = if response.status() == StatusCode::ACCEPTED {
+                status
+            } else if response.status().is_client_error() || response.status().is_server_error() {
+                response.status()
+            } else {
+                status
+            };
+            if session_header.is_none() {
+                session_header = response.headers().get("mcp-session-id").cloned();
+            }
+            if response.status() == StatusCode::ACCEPTED {
+                continue;
+            }
+            let bytes = match to_bytes(response.into_body(), usize::MAX).await {
+                Ok(bytes) => bytes,
+                Err(_) => return mcp_error(StatusCode::INTERNAL_SERVER_ERROR, Value::Null, -32603, "failed to encode MCP batch response", None),
+            };
+            if !bytes.is_empty() {
+                match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(value) => responses.push(value),
+                    Err(_) => return mcp_error(StatusCode::INTERNAL_SERVER_ERROR, Value::Null, -32603, "MCP batch response was not JSON", None),
+                }
+            }
+        }
+        if responses.is_empty() {
+            return mcp_response(StatusCode::ACCEPTED, Value::Null, session_header.and_then(|value| value.to_str().ok()?.parse().ok()));
+        }
+        let response = mcp_response(status, Value::Array(responses), session_header.and_then(|value| value.to_str().ok()?.parse().ok()));
+        if !wants_sse {
+            return response;
+        }
+        let session_id = response.headers().get("mcp-session-id").cloned();
+        let bytes = match to_bytes(response.into_body(), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(_) => return mcp_error(StatusCode::INTERNAL_SERVER_ERROR, Value::Null, -32603, "failed to encode MCP batch SSE response", None),
+        };
+        let stream = futures::stream::once(async move {
+            Ok::<Event, Infallible>(Event::default().event("message").data(String::from_utf8_lossy(&bytes).to_string()))
+        });
+        let mut sse_response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+        *sse_response.status_mut() = status;
+        if let Some(session_id) = session_id {
+            sse_response.headers_mut().insert("mcp-session-id", session_id);
+        }
+        return sse_response;
+    }
     let response = mcp_session_protocol_json(State(state), headers, Json(body)).await;
     if !wants_sse || response.status() == StatusCode::ACCEPTED {
         return response;
@@ -685,6 +879,15 @@ async fn mcp_session_protocol(
         sse_response.headers_mut().insert("mcp-session-id", session_id);
     }
     sse_response
+}
+
+async fn mcp_session_protocol_named(
+    Path(selector): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    mcp_session_protocol_for_gateway(state, headers, body, Some(selector)).await
 }
 
 async fn mcp_session_protocol_json(
@@ -739,7 +942,7 @@ async fn mcp_session_protocol_json(
                 "serverInfo": {"name": "Parrot Agent MCP Gateway", "version": env!("CARGO_PKG_VERSION")}
             }
         }), Some(session_id)),
-        "notifications/initialized" => (StatusCode::ACCEPTED, ()).into_response(),
+        "notifications/initialized" => mcp_accepted(Some(session_id)),
         "tools/list" => {
             let (status, Json(value)) = list_gateway_tools(State(state), headers).await;
             if !status.is_success() {
@@ -2101,8 +2304,8 @@ pub fn tool_routes() -> Router<AppState> {
                 .post(mcp_session_protocol)
                 .delete(close_mcp_session),
         )
-        .route("/mcp/gateways/:gateway_public_id", get(mcp_session_info).post(mcp_session_protocol).delete(close_mcp_session))
-        .route("/tool-gateway/gateways/:gateway_id/mcp", get(mcp_session_info).post(mcp_session_protocol).delete(close_mcp_session))
+        .route("/mcp/gateways/:gateway_public_id", get(mcp_session_info_named).post(mcp_session_protocol_named).delete(close_mcp_session_named))
+        .route("/tool-gateway/gateways/:gateway_id/mcp", get(mcp_session_info_named).post(mcp_session_protocol_named).delete(close_mcp_session_named))
         .route("/companies/:company_id/tools/gateways", get(list_named_gateways).post(create_named_gateway))
         .route("/tool-gateway/gateways/:gateway_id", axum::routing::patch(update_named_gateway))
         .route("/tool-gateway/gateways/:gateway_id/tokens", post(create_named_gateway_token))
@@ -2174,6 +2377,26 @@ mod tests {
         assert!(validate_paperclip_arguments("paperclipApiRequest", &serde_json::json!({
             "method": "POST", "path": "/issues/1", "jsonBody": "not-json"
         })).is_err());
+    }
+
+    #[test]
+    fn mcp_accept_negotiation_is_fail_closed_for_unsupported_media() {
+        let mut headers = HeaderMap::new();
+        assert!(mcp_accepts_json_or_sse(&headers));
+        headers.insert("accept", HeaderValue::from_static("application/json, text/event-stream"));
+        assert!(mcp_accepts_json_or_sse(&headers));
+        headers.insert("accept", HeaderValue::from_static("text/plain"));
+        assert!(!mcp_accepts_json_or_sse(&headers));
+    }
+
+    #[test]
+    fn mcp_registry_uses_typed_definitions() {
+        let definitions = paperclip_builtin_tool_definitions();
+        assert_eq!(definitions.len(), 41);
+        assert!(definitions.iter().all(|definition| {
+            definition.name.starts_with("paperclip")
+                && definition.input_schema.get("type").is_some()
+        }));
     }
 
     #[test]

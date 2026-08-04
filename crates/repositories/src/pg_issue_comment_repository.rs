@@ -11,6 +11,8 @@ pub struct PgIssueCommentRepository {
     pool: PgPool,
 }
 
+pub const ISSUE_COMMENT_COLUMNS: &str = "id, company_id, issue_id, actor_type AS author_type, actor_id, CASE WHEN actor_type = 'agent'::comment_actor_type THEN actor_id ELSE NULL END AS author_agent_id, CASE WHEN actor_type = 'user'::comment_actor_type THEN actor_id ELSE NULL END AS author_user_id, actor_run_id AS created_by_run_id, body, NULL::jsonb AS presentation, metadata, NULL::timestamptz AS deleted_at, NULL::text AS deleted_by_type, NULL::uuid AS deleted_by_agent_id, NULL::uuid AS deleted_by_user_id, NULL::uuid AS deleted_by_run_id, false AS follow_up_requested, created_at, updated_at";
+
 impl PgIssueCommentRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -20,15 +22,9 @@ impl PgIssueCommentRepository {
 #[async_trait]
 impl IssueCommentRepository for PgIssueCommentRepository {
     async fn create(&self, input: CreateIssueCommentInput) -> Result<IssueComment, RepositoryError> {
-        let comment = sqlx::query_as::<_, IssueComment>(
-            r#"
-            INSERT INTO issue_comments (
-                company_id, issue_id, body, actor_type, actor_id, actor_run_id, metadata
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING *
-            "#,
-        )
+        let comment = sqlx::query_as::<_, IssueComment>(&format!(
+            "INSERT INTO issue_comments (company_id, issue_id, body, actor_type, actor_id, actor_run_id, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {ISSUE_COMMENT_COLUMNS}"
+        ))
         .bind(input.company_id)
         .bind(input.issue_id)
         .bind(&input.body)
@@ -44,11 +40,7 @@ impl IssueCommentRepository for PgIssueCommentRepository {
     }
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<IssueComment>, RepositoryError> {
-        let comment = sqlx::query_as::<_, IssueComment>(
-            r#"
-            SELECT * FROM issue_comments WHERE id = $1
-            "#,
-        )
+        let comment = sqlx::query_as::<_, IssueComment>(&format!("SELECT {ISSUE_COMMENT_COLUMNS} FROM issue_comments WHERE id = $1"))
         .bind(id)
         .fetch_optional(&self.pool)
         .await
@@ -58,14 +50,7 @@ impl IssueCommentRepository for PgIssueCommentRepository {
     }
 
     async fn list_by_issue(&self, issue_id: Uuid, pagination: &Pagination) -> Result<Vec<IssueComment>, RepositoryError> {
-        let comments = sqlx::query_as::<_, IssueComment>(
-            r#"
-            SELECT * FROM issue_comments
-            WHERE issue_id = $1
-            ORDER BY created_at ASC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
+        let comments = sqlx::query_as::<_, IssueComment>(&format!("SELECT {ISSUE_COMMENT_COLUMNS} FROM issue_comments WHERE issue_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3"))
         .bind(issue_id)
         .bind(pagination.limit)
         .bind(pagination.offset)
@@ -110,8 +95,9 @@ impl IssueCommentRepository for PgIssueCommentRepository {
         updates.push("updated_at = NOW()".to_string());
 
         let query = format!(
-            "UPDATE issue_comments SET {} WHERE id = $1 RETURNING *",
+            "UPDATE issue_comments SET {} WHERE id = $1 RETURNING {}",
             updates.join(", ")
+            , ISSUE_COMMENT_COLUMNS
         );
 
         let mut q = sqlx::query_as::<_, IssueComment>(&query).bind(id);

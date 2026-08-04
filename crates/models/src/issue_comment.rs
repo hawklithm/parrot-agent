@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 /// Issue comment author type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[sqlx(type_name = "comment_actor_type", rename_all = "lowercase")]
 pub enum IssueCommentAuthorType {
     Agent,
     User,
@@ -106,7 +106,7 @@ pub struct IssueComment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<sqlx::types::Json<IssueCommentPresentation>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<sqlx::types::Json<IssueCommentMetadata>>,
+    pub metadata: Option<sqlx::types::Json<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]

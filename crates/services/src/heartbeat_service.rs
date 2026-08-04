@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use models::Agent;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{PgPool, Row};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -60,6 +61,51 @@ pub struct AgentHeartbeatInfo {
     pub agent_id: Uuid,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub status: HeartbeatStatus,
+}
+
+#[derive(Debug, Default)]
+struct AdapterOutcome {
+    explicit_failure: bool,
+    failure_reason: Option<String>,
+    result_summary: Option<String>,
+    tool_call_count: usize,
+    handoff: Option<Value>,
+}
+
+/// Read the structured result records emitted by Claude/Codex JSONL modes.
+/// Exit status remains the process-level fallback, but an adapter can emit an
+/// explicit error/result record before exiting zero; treating that as success
+/// would incorrectly complete the Issue.
+fn parse_adapter_outcome(output: &str) -> AdapterOutcome {
+    let mut outcome = AdapterOutcome::default();
+    for line in output.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        if matches!(kind, "tool_use" | "tool_call") || value.get("tool_name").is_some() {
+            outcome.tool_call_count += 1;
+        }
+        if kind == "handoff" || value.get("handoff").is_some() {
+            outcome.handoff = value.get("handoff").cloned().or_else(|| Some(value.clone()));
+        }
+        let is_error = value.get("is_error").and_then(Value::as_bool).unwrap_or(false)
+            || value.get("isError").and_then(Value::as_bool).unwrap_or(false)
+            || matches!(value.get("subtype").and_then(Value::as_str), Some("error" | "failed"));
+        if is_error {
+            outcome.explicit_failure = true;
+            outcome.failure_reason = value
+                .get("error")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
+                .or_else(|| value.get("result").and_then(Value::as_str))
+                .map(ToOwned::to_owned);
+        }
+        if let Some(result) = value.get("result").and_then(Value::as_str) {
+            outcome.result_summary = Some(result.to_owned());
+        }
+    }
+    outcome
 }
 
 /// Heartbeat status
@@ -238,7 +284,12 @@ impl DefaultHeartbeatService {
     async fn execute_run(&self, run_id: Uuid, agent_id: Uuid, issue_id: Uuid, company_id: Uuid) {
         let result = self.run_command(run_id, agent_id, issue_id).await;
         let (status, exit_code, error, output) = match result {
-            Ok((code, out)) if code == 0 => ("succeeded", Some(code), None, out),
+            Ok((code, out)) if code == 0 && !parse_adapter_outcome(&out).explicit_failure => ("succeeded", Some(code), None, out),
+            Ok((code, out)) if code == 0 => {
+                let outcome = parse_adapter_outcome(&out);
+                let reason = outcome.failure_reason.unwrap_or_else(|| "adapter reported an explicit failure".to_string());
+                ("failed", Some(code), Some(format!("adapter reported failure: {reason}")), out)
+            }
             Ok((code, out)) => (
                 "failed",
                 Some(code),
@@ -253,9 +304,16 @@ impl DefaultHeartbeatService {
             ),
             Err(e) => ("failed", None, Some(e), String::new()),
         };
+        let outcome = parse_adapter_outcome(&output);
+        let result_json = serde_json::json!({
+            "toolCallCount": outcome.tool_call_count,
+            "resultSummary": outcome.result_summary,
+            "handoff": outcome.handoff,
+            "explicitFailure": outcome.explicit_failure,
+        });
         let _ = sqlx::query(
-            "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
-            .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output).execute(&self.pool).await;
+            "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, result_json = $6, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
+            .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output).bind(&result_json).execute(&self.pool).await;
         let issue_status = if status == "succeeded" { "done" } else { "todo" };
         let _ = sqlx::query(
             "UPDATE issues SET status = $2::issue_status, checkout_run_id = NULL, execution_run_id = NULL, execution_locked_at = NULL, execution_agent_name_key = NULL, completed_at = CASE WHEN $2 = 'done' THEN NOW() ELSE NULL END, updated_at = NOW() WHERE id = $1 AND company_id = $3 AND execution_run_id = $4",
@@ -739,6 +797,33 @@ impl DefaultHeartbeatService {
             pool: self.pool.clone(),
             children: self.children.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod adapter_outcome_tests {
+    use super::parse_adapter_outcome;
+
+    #[test]
+    fn explicit_structured_error_overrides_zero_exit() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"tool failed"}"#,
+        );
+        assert!(outcome.explicit_failure);
+        assert_eq!(outcome.failure_reason.as_deref(), Some("tool failed"));
+    }
+
+    #[test]
+    fn parses_tool_calls_and_handoff_metadata() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"tool_use","name":"paperclipGetIssue"}
+{"type":"handoff","handoff":{"issueId":"ABC-1"}}
+{"type":"result","subtype":"success","result":"done"}"#,
+        );
+        assert!(!outcome.explicit_failure);
+        assert_eq!(outcome.tool_call_count, 1);
+        assert_eq!(outcome.result_summary.as_deref(), Some("done"));
+        assert!(outcome.handoff.is_some());
     }
 }
 

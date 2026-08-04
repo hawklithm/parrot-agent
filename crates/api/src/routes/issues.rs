@@ -168,6 +168,7 @@ fn validate_issue_document_key(key: &str) -> Result<String, StatusCode> {
 async fn upsert_issue_document(
     State(state): State<AppState>,
     Path((issue_id, raw_key)): Path<(Uuid, String)>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let key = validate_issue_document_key(&raw_key)?;
@@ -180,22 +181,53 @@ async fn upsert_issue_document(
     let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let existing = sqlx::query("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2 FOR UPDATE")
         .bind(issue_id).bind(&key).fetch_optional(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let base_revision_id = payload
+        .get("baseRevisionId")
+        .and_then(|value| value.as_str())
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let (document_id, revision_number) = if let Some(row) = existing {
         let document_id: Uuid = row.get("document_id");
+        if let Some(base_revision_id) = base_revision_id {
+            let current_revision_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM document_revisions WHERE document_id=$1 ORDER BY revision_number DESC LIMIT 1",
+            )
+            .bind(document_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if current_revision_id != Some(base_revision_id) {
+                return Err(StatusCode::CONFLICT);
+            }
+        }
         let revision: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1")
             .bind(document_id).fetch_one(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         sqlx::query("UPDATE documents SET content=$2, content_type=$3, updated_at=NOW() WHERE id=$1")
             .bind(document_id).bind(content).bind(content_type).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         (document_id, revision)
     } else {
+        if base_revision_id.is_some() {
+            return Err(StatusCode::CONFLICT);
+        }
         let document_id: Uuid = sqlx::query_scalar("INSERT INTO documents (company_id, content, content_type) VALUES ($1,$2,$3) RETURNING id")
             .bind(company_id).bind(content).bind(content_type).fetch_one(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         sqlx::query("INSERT INTO issue_documents (company_id, issue_id, document_id, key) VALUES ($1,$2,$3,$4)")
             .bind(company_id).bind(issue_id).bind(document_id).bind(&key).execute(&mut *tx).await.map_err(|_| StatusCode::CONFLICT)?;
         (document_id, 1)
     };
-    sqlx::query("INSERT INTO document_revisions (document_id, revision_number, content) VALUES ($1,$2,$3)")
-        .bind(document_id).bind(revision_number).bind(content).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let run_id = headers
+        .get("x-paperclip-run-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok());
+    sqlx::query(
+        "INSERT INTO document_revisions
+           (document_id, revision_number, content, created_by_type, created_by_id)
+         VALUES ($1,$2,$3,CASE WHEN $4::uuid IS NULL THEN NULL ELSE 'agent' END,
+                 (SELECT agent_id FROM heartbeat_runs WHERE id=$4))",
+    )
+        .bind(document_id).bind(revision_number).bind(content).bind(run_id)
+        .execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::OK, Json(serde_json::json!({
         "id": document_id, "issueId": issue_id, "key": key, "content": content,
@@ -224,6 +256,7 @@ async fn list_issue_document_revisions(
 async fn restore_issue_document_revision(
     State(state): State<AppState>,
     Path((issue_id, raw_key, revision_id)): Path<(Uuid, String, Uuid)>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let key = validate_issue_document_key(&raw_key)?;
     let document_id: Uuid = sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
@@ -234,7 +267,18 @@ async fn restore_issue_document_revision(
         .bind(document_id).fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     sqlx::query("UPDATE documents SET content=$2, updated_at=NOW() WHERE id=$1").bind(document_id).bind(&content).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    sqlx::query("INSERT INTO document_revisions (document_id, revision_number, content) VALUES ($1,$2,$3)").bind(document_id).bind(revision).bind(&content).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let run_id = headers
+        .get("x-paperclip-run-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok());
+    sqlx::query(
+        "INSERT INTO document_revisions
+           (document_id, revision_number, content, created_by_type, created_by_id)
+         VALUES ($1,$2,$3,CASE WHEN $4::uuid IS NULL THEN NULL ELSE 'agent' END,
+                 (SELECT agent_id FROM heartbeat_runs WHERE id=$4))",
+    )
+        .bind(document_id).bind(revision).bind(&content).bind(run_id)
+        .execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({"restored": true, "issueId": issue_id, "key": key, "revisionId": revision_id, "revisionNumber": revision, "content": content, "body": content})))
 }
@@ -290,10 +334,20 @@ async fn list_issues(
 /// GET /issues/:id - Get issue by ID
 async fn get_issue(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(reference): Path<String>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = issue_company_id(&state, id).await?;
+    let company_id = actor.company_id().ok_or(StatusCode::FORBIDDEN)?;
+    let id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM issues WHERE company_id = $1 AND (id::text = $2 OR identifier = $2)",
+    )
+    .bind(company_id)
+    .bind(&reference)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
 
     service
         .get(id, company_id)

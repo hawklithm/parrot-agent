@@ -6,6 +6,17 @@
 
 use uuid::Uuid;
 
+/// The wire-level definition shared by MCP `tools/list` and dispatch.
+///
+/// Keeping this type in the MCP module makes it possible to add non-Paperclip
+/// tools without duplicating the registry contract in the route layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolDefinition {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McpInvocationContext {
     pub session_id: Uuid,

@@ -187,8 +187,11 @@ impl ActorResolver for ToolGatewayTokenResolver {
         hasher.update(token.as_bytes());
         let token_hash = hex::encode(hasher.finalize());
         let row = sqlx::query(
-            "SELECT company_id, agent_id, run_id, expires_at, revoked_at
-             FROM tool_gateway_sessions WHERE token_hash = $1",
+            "SELECT s.company_id, s.agent_id, s.run_id, s.expires_at, s.revoked_at,
+                    r.status::text AS run_status
+             FROM tool_gateway_sessions s
+             JOIN heartbeat_runs r ON r.id = s.run_id
+            WHERE s.token_hash = $1",
         )
         .bind(&token_hash)
         .fetch_optional(&*self.pool)
@@ -208,6 +211,12 @@ impl ActorResolver for ToolGatewayTokenResolver {
                 message: format!("Tool gateway session is malformed: {error}"),
             })?;
         if revoked_at.is_some() || expires_at <= chrono::Utc::now() {
+            return Ok(None);
+        }
+        let run_status: String = sqlx::Row::try_get(&row, "run_status").map_err(|error| AuthError::Internal {
+            message: format!("Tool gateway session is malformed: {error}"),
+        })?;
+        if !matches!(run_status.as_str(), "queued" | "running") {
             return Ok(None);
         }
         let company_id: Uuid = sqlx::Row::try_get(&row, "company_id").map_err(|error| {

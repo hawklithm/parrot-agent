@@ -12,6 +12,7 @@ use models::{IssueComment, CommentActorType};
 use services::CommentServiceError;
 use crate::errors::ApiError;
 use crate::app_state::AppState;
+use repositories::ISSUE_COMMENT_COLUMNS;
 
 /// Add comment request
 #[derive(Debug, Deserialize)]
@@ -122,11 +123,9 @@ pub async fn list_comments(
         };
 
         if order == "asc" {
-            sqlx::query_as::<_, models::IssueComment>(
-                "SELECT * FROM issue_comments
-                 WHERE issue_id = $1 AND (created_at > $2 OR (created_at = $2 AND id > $3))
-                 ORDER BY created_at ASC, id ASC LIMIT $4",
-            )
+            sqlx::query_as::<_, models::IssueComment>(&format!(
+                "SELECT {ISSUE_COMMENT_COLUMNS} FROM issue_comments WHERE issue_id = $1 AND (created_at > $2 OR (created_at = $2 AND id > $3)) ORDER BY created_at ASC, id ASC LIMIT $4"
+            ))
             .bind(issue_id)
             .bind(anchor_created_at)
             .bind(anchor_id)
@@ -134,11 +133,9 @@ pub async fn list_comments(
             .fetch_all(&state.pool)
             .await
         } else {
-            sqlx::query_as::<_, models::IssueComment>(
-                "SELECT * FROM issue_comments
-                 WHERE issue_id = $1 AND (created_at < $2 OR (created_at = $2 AND id < $3))
-                 ORDER BY created_at DESC, id DESC LIMIT $4",
-            )
+            sqlx::query_as::<_, models::IssueComment>(&format!(
+                "SELECT {ISSUE_COMMENT_COLUMNS} FROM issue_comments WHERE issue_id = $1 AND (created_at < $2 OR (created_at = $2 AND id < $3)) ORDER BY created_at DESC, id DESC LIMIT $4"
+            ))
             .bind(issue_id)
             .bind(anchor_created_at)
             .bind(anchor_id)
@@ -148,10 +145,9 @@ pub async fn list_comments(
         }
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?
     } else if order == "asc" {
-        sqlx::query_as::<_, models::IssueComment>(
-            "SELECT * FROM issue_comments WHERE issue_id = $1
-             ORDER BY created_at ASC, id ASC LIMIT $2 OFFSET $3",
-        )
+        sqlx::query_as::<_, models::IssueComment>(&format!(
+            "SELECT {ISSUE_COMMENT_COLUMNS} FROM issue_comments WHERE issue_id = $1 ORDER BY created_at ASC, id ASC LIMIT $2 OFFSET $3"
+        ))
         .bind(issue_id)
         .bind(limit)
         .bind(query.offset.unwrap_or(0).max(0))
@@ -159,10 +155,9 @@ pub async fn list_comments(
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?
     } else {
-        sqlx::query_as::<_, models::IssueComment>(
-            "SELECT * FROM issue_comments WHERE issue_id = $1
-             ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
-        )
+        sqlx::query_as::<_, models::IssueComment>(&format!(
+            "SELECT {ISSUE_COMMENT_COLUMNS} FROM issue_comments WHERE issue_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
+        ))
         .bind(issue_id)
         .bind(limit)
         .bind(query.offset.unwrap_or(0).max(0))

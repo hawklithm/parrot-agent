@@ -51,7 +51,7 @@ pub use pg_case_repository::{PgCaseRepository, PgCaseEventRepository};
 pub use case_issue_link_repository::{CaseIssueLinkRepository, CreateCaseIssueLinkInput};
 pub use pg_case_issue_link_repository::PgCaseIssueLinkRepository;
 pub use issue_comment_repository::{IssueCommentRepository, CreateIssueCommentInput, UpdateIssueCommentInput};
-pub use pg_issue_comment_repository::PgIssueCommentRepository;
+pub use pg_issue_comment_repository::{PgIssueCommentRepository, ISSUE_COMMENT_COLUMNS};
 pub use issue_tree_control_repository::{IssueTreeHoldRepository, CreateTreeHoldInput};
 pub use pg_issue_tree_control_repository::PgIssueTreeHoldRepository;
 pub use environment_repository::{EnvironmentRepository, PgEnvironmentRepository};
