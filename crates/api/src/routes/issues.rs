@@ -360,9 +360,11 @@ async fn get_issue(
 /// POST /companies/:companyId/issues - Create issue
 async fn create_issue(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(mut input): Json<CreateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
+    crate::routes::assert_company_access(&actor, company_id, false)?;
     // Paperclip takes the company scope from the URL. The body must not need
     // to repeat companyId, and the path is authoritative if it is supplied.
     input.company_id = company_id;
@@ -380,9 +382,11 @@ async fn create_issue(
 /// GET /companies/:companyId/issues - List issues for a company
 async fn list_company_issues(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Query(query): Query<ListIssuesQuery>,
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
+    crate::routes::assert_company_access(&actor, company_id, true)?;
     let filter = IssueQueryFilter {
         status: parse_issue_statuses(query.status.as_deref()),
         priority: parse_issue_priorities(query.priority.as_deref()),
@@ -410,23 +414,14 @@ async fn list_company_issues(
 /// PATCH /issues/:id - Update issue
 async fn update_issue(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     // Paperclip first loads the issue and uses its companyId for the mutation
     // authorization check. Do the same here instead of passing the placeholder
     // nil UUID used by the older route implementations.
-    let company_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT company_id FROM issues WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|error| {
-        tracing::error!(error = %error, issue_id = %id, "failed to resolve issue company");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
 
     let service = state.issue_service.clone();
 
@@ -494,11 +489,12 @@ async fn search_issues(
 /// POST /issues/:id/checkout - Checkout issue
 async fn checkout_issue(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(input): Json<CheckoutInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = issue_company_id(&state, id).await?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
 
     service
         .checkout(id, company_id, input)
@@ -510,11 +506,12 @@ async fn checkout_issue(
 /// POST /issues/:id/release - Release issue
 async fn release_issue(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(input): Json<ReleaseInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
-    let company_id = issue_company_id(&state, id).await?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
 
     service
         .release(id, company_id, input)
@@ -643,19 +640,21 @@ async fn submit_plan_decomposition(
 /// I8: GET /issues/:id/approvals
 async fn list_issue_approvals(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
     state.issue_service.get_approvals(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// I9: POST /issues/:id/approvals
 async fn create_issue_approval(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
     let result = state.issue_service.create_approval(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -663,9 +662,10 @@ async fn create_issue_approval(
 /// I10: DELETE /issues/:id/approvals/:approval_id
 async fn delete_issue_approval(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((id, approval_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
     state.issue_service.delete_approval(id, approval_id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
