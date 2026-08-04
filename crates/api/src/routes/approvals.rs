@@ -138,8 +138,16 @@ async fn create_approval(
 /// AP4: GET /approvals/:id/issues
 async fn get_approval_issues(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let approval = state
+        .approval_service
+        .get_by_id(id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    crate::routes::assert_company_access(&actor, approval.approval.company_id, true)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     let issues = sqlx::query_as::<_, models::Issue>(
         "SELECT i.* FROM issues i JOIN issue_approvals ia ON ia.issue_id=i.id JOIN approvals a ON a.id=ia.approval_id WHERE ia.approval_id=$1 AND i.company_id=a.company_id ORDER BY i.created_at ASC",
     )
@@ -161,6 +169,13 @@ async fn approve_approval(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use services::approval_service::*;
+    let approval = state
+        .approval_service
+        .get_by_id(id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    crate::routes::assert_company_access(&actor, approval.approval.company_id, false)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     let current_user_id = actor_user_id(&actor)?;
     let input = ReviewApprovalInput {
         approval_id: id,
@@ -187,6 +202,13 @@ async fn reject_approval(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use services::approval_service::*;
+    let approval = state
+        .approval_service
+        .get_by_id(id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    crate::routes::assert_company_access(&actor, approval.approval.company_id, false)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     let current_user_id = actor_user_id(&actor)?;
     let input = ReviewApprovalInput {
         approval_id: id,
@@ -213,6 +235,13 @@ async fn request_approval_revision(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use services::approval_service::*;
+    let approval = state
+        .approval_service
+        .get_by_id(id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    crate::routes::assert_company_access(&actor, approval.approval.company_id, false)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     let current_user_id = actor_user_id(&actor)?;
     let input = ReviewApprovalInput {
         approval_id: id,
