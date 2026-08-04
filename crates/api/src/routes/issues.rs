@@ -29,6 +29,11 @@ struct ListIssuesQuery {
     assignee_user_id: Option<Uuid>,
     project_id: Option<Uuid>,
     q: Option<String>,
+    participant_agent_id: Option<Uuid>,
+    label_id: Option<Uuid>,
+    execution_workspace_id: Option<Uuid>,
+    origin_kind: Option<String>,
+    origin_id: Option<String>,
 }
 
 fn parse_issue_statuses(value: Option<&str>) -> Option<Vec<IssueStatus>> {
@@ -316,6 +321,11 @@ async fn list_issues(
         parent_id: None,
         goal_id: None,
         search_query: query.q.clone().filter(|value| !value.trim().is_empty()),
+        participant_agent_id: query.participant_agent_id,
+        label_id: query.label_id,
+        execution_workspace_id: query.execution_workspace_id,
+        origin_kind: query.origin_kind.clone(),
+        origin_id: query.origin_id.clone(),
     };
     
     let pagination = Pagination {
@@ -396,6 +406,11 @@ async fn list_company_issues(
         parent_id: None,
         goal_id: None,
         search_query: query.q.clone().filter(|value| !value.trim().is_empty()),
+        participant_agent_id: query.participant_agent_id,
+        label_id: query.label_id,
+        execution_workspace_id: query.execution_workspace_id,
+        origin_kind: query.origin_kind.clone(),
+        origin_id: query.origin_id.clone(),
     };
     let pagination = Pagination {
         limit: query.limit.unwrap_or(50).clamp(1, 500),

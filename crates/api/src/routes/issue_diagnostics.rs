@@ -146,6 +146,7 @@ async fn get_subtree_diagnostics(
         goal_id: None,
         parent_id: Some(id),
         search_query: None,
+        ..Default::default()
     };
 
     let pagination = services::Pagination {

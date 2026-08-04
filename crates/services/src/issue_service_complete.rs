@@ -79,6 +79,11 @@ pub struct IssueQueryFilter {
     pub project_id: Option<Uuid>,
     pub goal_id: Option<Uuid>,
     pub parent_id: Option<Uuid>,
+    pub participant_agent_id: Option<Uuid>,
+    pub label_id: Option<Uuid>,
+    pub execution_workspace_id: Option<Uuid>,
+    pub origin_kind: Option<String>,
+    pub origin_id: Option<String>,
 }
 
 /// Pagination
@@ -327,6 +332,12 @@ impl IssueService for DefaultIssueService {
             parent_id: filter.parent_id,
             work_mode: None,
             search_query: None,
+            participant_agent_id: filter.participant_agent_id,
+            label_id: filter.label_id,
+            execution_workspace_id: filter.execution_workspace_id,
+            origin_kind: filter.origin_kind.clone(),
+            origin_id: filter.origin_id.clone(),
+            ..Default::default()
         };
         let models_pagination = models::Pagination {
             limit: pagination.limit,
@@ -829,6 +840,12 @@ impl issue_service::IssueService for LegacyIssueService {
             goal_id: filter.goal_id,
             work_mode: None,
             search_query: filter.search_query.clone(),
+            participant_agent_id: filter.participant_agent_id,
+            label_id: filter.label_id,
+            execution_workspace_id: filter.execution_workspace_id,
+            origin_kind: filter.origin_kind.clone(),
+            origin_id: filter.origin_id.clone(),
+            ..Default::default()
         };
         let pagination = models::Pagination {
             limit: pagination.limit,

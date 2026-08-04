@@ -447,6 +447,12 @@ pub struct IssueQueryFilter {
     pub parent_id: Option<Uuid>,
     pub work_mode: Option<IssueWorkMode>,
     pub search_query: Option<String>,
+    /// Paperclip listIssues filters retained at the persistence boundary.
+    pub participant_agent_id: Option<Uuid>,
+    pub label_id: Option<Uuid>,
+    pub execution_workspace_id: Option<Uuid>,
+    pub origin_kind: Option<String>,
+    pub origin_id: Option<String>,
 }
 
 #[cfg(test)]

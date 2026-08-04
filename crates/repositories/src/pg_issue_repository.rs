@@ -103,6 +103,33 @@ impl IssueRepository for PgIssueRepository {
             query.push_str(&format!(" AND work_mode = ${}", param_count));
         }
 
+        if let Some(_participant_agent_id) = filter.participant_agent_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM issue_comments participant_comments WHERE participant_comments.issue_id = issues.id AND participant_comments.actor_type = 'agent'::comment_actor_type AND participant_comments.actor_id = ${})",
+                param_count
+            ));
+        }
+        if let Some(_label_id) = filter.label_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM issue_labels issue_filter_labels WHERE issue_filter_labels.issue_id = issues.id AND issue_filter_labels.label_id = ${})",
+                param_count
+            ));
+        }
+        if let Some(_workspace_id) = filter.execution_workspace_id {
+            param_count += 1;
+            query.push_str(&format!(" AND execution_workspace_id = ${}", param_count));
+        }
+        if let Some(_origin_kind) = filter.origin_kind.as_deref().filter(|value| !value.is_empty()) {
+            param_count += 1;
+            query.push_str(&format!(" AND origin_kind = ${}", param_count));
+        }
+        if let Some(_origin_id) = filter.origin_id.as_deref().filter(|value| !value.is_empty()) {
+            param_count += 1;
+            query.push_str(&format!(" AND origin_id = ${}", param_count));
+        }
+
         // Add ordering and pagination
         query.push_str(" ORDER BY updated_at DESC");
         param_count += 1;
@@ -155,6 +182,22 @@ impl IssueRepository for PgIssueRepository {
         if let Some(ref work_mode) = filter.work_mode {
             let mode_str = issue_work_mode_to_db(work_mode);
             q = q.bind(mode_str);
+        }
+
+        if let Some(participant_agent_id) = filter.participant_agent_id {
+            q = q.bind(participant_agent_id);
+        }
+        if let Some(label_id) = filter.label_id {
+            q = q.bind(label_id);
+        }
+        if let Some(workspace_id) = filter.execution_workspace_id {
+            q = q.bind(workspace_id);
+        }
+        if let Some(origin_kind) = filter.origin_kind.as_deref().filter(|value| !value.is_empty()) {
+            q = q.bind(origin_kind);
+        }
+        if let Some(origin_id) = filter.origin_id.as_deref().filter(|value| !value.is_empty()) {
+            q = q.bind(origin_id);
         }
 
         q = q.bind(pagination.limit).bind(pagination.offset);
@@ -224,6 +267,33 @@ impl IssueRepository for PgIssueRepository {
             query.push_str(&format!(" AND work_mode = ${}", param_count));
         }
 
+        if let Some(_participant_agent_id) = filter.participant_agent_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM issue_comments participant_comments WHERE participant_comments.issue_id = issues.id AND participant_comments.actor_type = 'agent'::comment_actor_type AND participant_comments.actor_id = ${})",
+                param_count
+            ));
+        }
+        if let Some(_label_id) = filter.label_id {
+            param_count += 1;
+            query.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM issue_labels issue_filter_labels WHERE issue_filter_labels.issue_id = issues.id AND issue_filter_labels.label_id = ${})",
+                param_count
+            ));
+        }
+        if let Some(_workspace_id) = filter.execution_workspace_id {
+            param_count += 1;
+            query.push_str(&format!(" AND execution_workspace_id = ${}", param_count));
+        }
+        if let Some(_origin_kind) = filter.origin_kind.as_deref().filter(|value| !value.is_empty()) {
+            param_count += 1;
+            query.push_str(&format!(" AND origin_kind = ${}", param_count));
+        }
+        if let Some(_origin_id) = filter.origin_id.as_deref().filter(|value| !value.is_empty()) {
+            param_count += 1;
+            query.push_str(&format!(" AND origin_id = ${}", param_count));
+        }
+
         let mut q = sqlx::query_scalar::<_, i64>(&query).bind(company_id);
 
         if let Some(statuses) = &filter.status {
@@ -267,6 +337,22 @@ impl IssueRepository for PgIssueRepository {
         if let Some(ref work_mode) = filter.work_mode {
             let mode_str = issue_work_mode_to_db(work_mode);
             q = q.bind(mode_str);
+        }
+
+        if let Some(participant_agent_id) = filter.participant_agent_id {
+            q = q.bind(participant_agent_id);
+        }
+        if let Some(label_id) = filter.label_id {
+            q = q.bind(label_id);
+        }
+        if let Some(workspace_id) = filter.execution_workspace_id {
+            q = q.bind(workspace_id);
+        }
+        if let Some(origin_kind) = filter.origin_kind.as_deref().filter(|value| !value.is_empty()) {
+            q = q.bind(origin_kind);
+        }
+        if let Some(origin_id) = filter.origin_id.as_deref().filter(|value| !value.is_empty()) {
+            q = q.bind(origin_id);
         }
 
         let count = q.fetch_one(&self.pool)

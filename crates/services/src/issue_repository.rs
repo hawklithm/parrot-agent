@@ -30,6 +30,11 @@ pub struct IssueQueryFilter {
     pub project_id: Option<Uuid>,
     pub parent_id: Option<Uuid>,
     pub goal_id: Option<Uuid>,
+    pub participant_agent_id: Option<Uuid>,
+    pub label_id: Option<Uuid>,
+    pub execution_workspace_id: Option<Uuid>,
+    pub origin_kind: Option<String>,
+    pub origin_id: Option<String>,
     pub search_query: Option<String>,
 }
 
