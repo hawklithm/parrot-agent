@@ -120,6 +120,8 @@ const created = await expectSuccess("paperclipCreateIssue", {
   priority: "low",
   blockedByIssueIds: [issueId],
   watchdog: { agentId, instructions: "matrix watchdog" },
+  workMode: "skill_test",
+  harnessKind: "skill_test",
   executionPolicy: { maxRetries: 2, timeoutSeconds: 90, workspacePreference: "existing" },
   executionWorkspaceSettings: { mode: "persistent", strategy: "existing" },
 }, sessionId);
@@ -129,6 +131,9 @@ if (created.executionPolicy?.maxRetries !== 2 || created.executionWorkspaceSetti
 }
 if (created.blockedByIssueIds?.length !== 1 || created.blockedByIssueIds[0] !== issueId || created.watchdog?.watchdogAgentId !== agentId) {
   throw new Error(`create issue relations/watchdog were not persisted: ${JSON.stringify(created)}`);
+}
+if (created.workMode !== "skill_test" || created.harnessKind !== "skill_test") {
+  throw new Error(`create issue harness fields were not persisted: ${JSON.stringify(created)}`);
 }
 const label = await expectSuccess("paperclipApiRequest", {
   method: "POST",
@@ -145,10 +150,21 @@ const updated = await expectSuccess("paperclipUpdateIssue", {
 if (updated.labelIds?.length !== 1 || updated.labelIds[0] !== labelId) {
   throw new Error(`issue labels were not persisted on update: ${JSON.stringify(updated)}`);
 }
+await expectError("paperclipUpdateIssue", {
+  issueId,
+  blockedByIssueIds: [createdIssueId],
+}, sessionId);
 await expectError("paperclipCreateIssue", {
   title: "invalid matrix label",
   labelIds: ["00000000-0000-0000-0000-000000000000"],
 }, sessionId);
+const discovered = await expectSuccess("paperclipCreateIssue", {
+  title: "invalid watchdog discovery scope",
+  watchdogDiscovery: { kind: "product_bug", evidenceMarkdown: "matrix" },
+}, sessionId);
+if (discovered.originKind !== "task_watchdog_product_bug" || discovered.originId !== issueId) {
+  throw new Error(`watchdog discovery follow-up was not normalized: ${JSON.stringify(discovered)}`);
+}
 await expectSuccess("paperclipCheckoutIssue", { issueId: createdIssueId, expectedStatuses: ["todo"] }, sessionId);
 await expectSuccess("paperclipReleaseIssue", { issueId: createdIssueId, targetStatus: "done", result: "matrix complete" }, sessionId);
 const comment = await expectSuccess("paperclipAddComment", { issueId, body: "matrix comment" }, sessionId);
@@ -160,10 +176,17 @@ await expectSuccess("paperclipRequestCheckboxConfirmation", { issueId, continuat
 await expectSuccess("paperclipUpsertIssueDocument", { issueId, key: "matrix-smoke", body: "# matrix updated" }, sessionId);
 await expectSuccess("paperclipApiRequest", { method: "GET", path: `/issues/${issueId}` }, sessionId, (value) => value?.id === issueId);
 
+// Every registered tool must also have a deterministic invalid-arguments
+// path. This catches tools whose dispatcher accidentally accepts an empty or
+// unrelated payload instead of enforcing the Paperclip schema/contract.
+for (const tool of tools) {
+  await expectError(tool.name, { __invalid: true }, sessionId);
+}
+
 const listedNames = new Set(tools.map((tool) => tool.name));
 const missingInvocations = [...listedNames].filter((name) => !invokedTools.has(name));
 if (missingInvocations.length > 0 || invokedTools.size !== listedNames.size) {
   throw new Error(`not every Paperclip tool was invoked: missing=${JSON.stringify(missingInvocations)} invoked=${invokedTools.size}`);
 }
 
-console.log(JSON.stringify({ passed: true, listedToolCount: tools.length, invokedToolCount: invokedTools.size, issueId, createdIssueId, approvalId, expectedMissingResourceErrors: 3 }));
+console.log(JSON.stringify({ passed: true, listedToolCount: tools.length, invokedToolCount: invokedTools.size, invalidArgumentChecks: tools.length, issueId, createdIssueId, approvalId, expectedMissingResourceErrors: 3 }));

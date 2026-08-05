@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use sqlx::Row;
 use crate::app_state::AppState;
 use uuid::Uuid;
@@ -37,6 +38,160 @@ struct ListIssuesQuery {
     execution_workspace_id: Option<Uuid>,
     origin_kind: Option<String>,
     origin_id: Option<String>,
+}
+
+const TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND: &str = "task_watchdog_product_bug";
+
+fn issue_service_status(error: &str) -> StatusCode {
+    if error.starts_with("Not found:") {
+        StatusCode::NOT_FOUND
+    } else if error.starts_with("Invalid input:")
+        || error.starts_with("Validation error:")
+        || error.starts_with("Bad request:")
+    {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else if error.starts_with("Conflict:") {
+        StatusCode::CONFLICT
+    } else if error.starts_with("Forbidden:") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+struct WatchdogDiscoveryScope {
+    watchdog_id: Uuid,
+    watched_issue_id: Uuid,
+    watchdog_issue_id: Option<Uuid>,
+    stop_fingerprint: Option<String>,
+}
+
+fn context_string(context: Option<&Value>, key: &str) -> Option<String> {
+    context
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+async fn resolve_watchdog_discovery_scope(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    requested: bool,
+) -> Result<Option<WatchdogDiscoveryScope>, StatusCode> {
+    if !requested {
+        return Ok(None);
+    }
+    let (agent_id, run_id) = match actor {
+        AuthorizationActor::Agent {
+            agent_id,
+            run_id: Some(run_id),
+            company_id: actor_company_id,
+            ..
+        } if *actor_company_id == company_id => (*agent_id, *run_id),
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+
+    let run = sqlx::query(
+        "SELECT company_id, agent_id, context_snapshot FROM heartbeat_runs WHERE id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::FORBIDDEN)?;
+    let run_company_id: Uuid = run.try_get("company_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let run_agent_id: Uuid = run.try_get("agent_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if run_company_id != company_id || run_agent_id != agent_id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let context: Option<Value> = run.try_get("context_snapshot").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let task_watchdog = context
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("taskWatchdog"))
+        .and_then(Value::as_object);
+    let watched_issue_raw = task_watchdog
+        .and_then(|object| object.get("watchedIssueId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| context_string(context.as_ref(), "watchedIssueId"))
+        .or_else(|| context_string(context.as_ref(), "issueId"))
+        .or_else(|| context_string(context.as_ref(), "taskId"));
+    let watched_issue_id = watched_issue_raw
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(StatusCode::FORBIDDEN)?;
+    let stop_fingerprint = task_watchdog
+        .and_then(|object| object.get("stopFingerprint"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let stop_fingerprint = stop_fingerprint
+        .or_else(|| context_string(context.as_ref(), "stopFingerprint"));
+
+    let watchdog = sqlx::query(
+        "SELECT id, issue_id, watchdog_issue_id FROM issue_watchdogs
+         WHERE company_id = $1 AND watchdog_agent_id = $2 AND status = 'active'
+           AND (issue_id = $3 OR watchdog_issue_id = $3)",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(watched_issue_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::FORBIDDEN)?;
+    Ok(Some(WatchdogDiscoveryScope {
+        watchdog_id: watchdog.try_get("id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        watched_issue_id: watchdog.try_get("issue_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        watchdog_issue_id: watchdog.try_get("watchdog_issue_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        stop_fingerprint,
+    }))
+}
+
+fn append_watchdog_discovery_context(
+    description: Option<String>,
+    source_issue: &Issue,
+    watchdog_issue: Option<&Issue>,
+    evidence_markdown: Option<&str>,
+    stop_fingerprint: Option<&str>,
+    run_id: Uuid,
+) -> String {
+    let source_ref = source_issue
+        .identifier
+        .clone()
+        .unwrap_or_else(|| source_issue.id.to_string());
+    let mut lines = vec![
+        "## Watchdog Discovery".to_string(),
+        String::new(),
+        "Kind: `product_bug`".to_string(),
+        format!("Watched source issue: `{source_ref}`"),
+    ];
+    if let Some(issue) = watchdog_issue {
+        let reference = issue.identifier.clone().unwrap_or_else(|| issue.id.to_string());
+        lines.push(format!("Watchdog issue: `{reference}`"));
+    }
+    if let Some(fingerprint) = stop_fingerprint.filter(|value| !value.is_empty()) {
+        lines.push(format!("Stopped fingerprint: `{fingerprint}`"));
+    }
+    lines.push(format!("Watchdog run: `{run_id}`"));
+    if let Some(evidence) = evidence_markdown.filter(|value| !value.trim().is_empty()) {
+        lines.push(String::new());
+        lines.push("Evidence:".to_string());
+        lines.push(evidence.trim().to_string());
+    }
+    let context = lines.join("\n");
+    match description.filter(|value| !value.trim().is_empty()) {
+        Some(existing) => format!("{}\n\n{}", existing.trim(), context),
+        None => context,
+    }
 }
 
 fn parse_issue_statuses(value: Option<&str>) -> Option<Vec<IssueStatus>> {
@@ -381,12 +536,85 @@ async fn create_issue(
     Json(mut input): Json<CreateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     crate::routes::assert_company_access(&actor, company_id, false)?;
-    let requested_watchdog = input.watchdog.clone();
-    if input.watchdog_discovery.is_some() {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    let requested_discovery = input.watchdog_discovery.take();
+    if let Some(discovery) = requested_discovery.as_ref() {
+        let valid = discovery
+            .as_object()
+            .and_then(|object| object.get("kind"))
+            .and_then(Value::as_str)
+            == Some("product_bug");
+        if !valid {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
     }
-    if input.harness_kind.is_some() {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    let discovery_scope = resolve_watchdog_discovery_scope(
+        &state,
+        &actor,
+        company_id,
+        requested_discovery.is_some(),
+    )
+    .await?;
+    if let (Some(discovery), Some(scope)) = (requested_discovery.as_ref(), discovery_scope.as_ref()) {
+        let source_issue = state
+            .issue_service
+            .get(scope.watched_issue_id, company_id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let watchdog_issue = match scope.watchdog_issue_id {
+            Some(id) => state
+                .issue_service
+                .get(id, company_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            None => None,
+        };
+        let run_id = match actor {
+            AuthorizationActor::Agent { run_id: Some(run_id), .. } => run_id,
+            _ => return Err(StatusCode::FORBIDDEN),
+        };
+        input.parent_id = None;
+        if input.project_id.is_none() {
+            input.project_id = source_issue.project_id;
+        }
+        if input.goal_id.is_none() {
+            input.goal_id = source_issue.goal_id;
+        }
+        if input.billing_code.is_none() {
+            input.billing_code = source_issue.billing_code.clone();
+        }
+        input.description = Some(append_watchdog_discovery_context(
+            input.description.take(),
+            &source_issue,
+            watchdog_issue.as_ref(),
+            discovery
+                .get("evidenceMarkdown")
+                .and_then(Value::as_str),
+            scope.stop_fingerprint.as_deref(),
+            run_id,
+        ));
+        input.origin_kind = Some(TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND.to_string());
+        input.origin_id = Some(source_issue.id.to_string());
+        input.origin_run_id = Some(run_id);
+        input.origin_fingerprint = Some(format!(
+            "{}:{}:{}",
+            TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
+            source_issue.id,
+            run_id
+        ));
+    }
+    let requested_watchdog = input.watchdog.clone();
+    if let Some(harness_kind) = input.harness_kind.as_deref() {
+        if harness_kind != "skill_test" {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        if let Some(work_mode) = input.work_mode.as_ref() {
+            if !matches!(work_mode, models::IssueWorkMode::SkillTest) {
+                return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            }
+        } else {
+            input.work_mode = Some(models::IssueWorkMode::SkillTest);
+        }
     }
     let created_by_agent_id = input.created_by_agent_id;
     let created_by_user_id = input.created_by_user_id;
@@ -409,7 +637,7 @@ async fn create_issue(
         .await
         .map_err(|error| {
             tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
-            StatusCode::INTERNAL_SERVER_ERROR
+            issue_service_status(&error)
         })?;
     if let Some(watchdog) = requested_watchdog {
         state
@@ -436,6 +664,27 @@ async fn create_issue(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .unwrap_or(created.issue);
+    if let (Some(_discovery), Some(scope)) = (requested_discovery.as_ref(), discovery_scope.as_ref()) {
+        let actor_id = actor.principal_id().ok_or(StatusCode::FORBIDDEN)?;
+        sqlx::query(
+            "INSERT INTO activity_logs
+             (company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata)
+             VALUES ($1, 'issue.watchdog_discovery_created', 'agent', $2, 'issue', $3, $4)",
+        )
+        .bind(company_id)
+        .bind(actor_id)
+        .bind(response_issue.id)
+        .bind(serde_json::json!({
+            "kind": "product_bug",
+            "sourceIssueId": scope.watched_issue_id,
+            "watchdogIssueId": scope.watchdog_issue_id,
+            "watchdogId": scope.watchdog_id,
+            "stopFingerprint": scope.stop_fingerprint,
+        }))
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
     Ok(Json(response_issue))
 }
 
@@ -484,13 +733,27 @@ async fn update_issue(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-    Json(input): Json<UpdateIssueInput>,
+    Json(mut input): Json<UpdateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     // Paperclip first loads the issue and uses its companyId for the mutation
     // authorization check. Do the same here instead of passing the placeholder
     // nil UUID used by the older route implementations.
     let company_id = scoped_issue_company(&state, &actor, id).await?;
 
+    if let Some(harness_kind) = input.harness_kind.as_deref() {
+        if harness_kind != "skill_test" {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        if let Some(work_mode) = input.work_mode.as_ref() {
+            if !matches!(work_mode, models::IssueWorkMode::SkillTest) {
+                return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            }
+        } else {
+            input.work_mode = Some(models::IssueWorkMode::SkillTest);
+        }
+    } else if matches!(input.work_mode, Some(models::IssueWorkMode::SkillTest)) {
+        input.harness_kind = Some("skill_test".to_string());
+    }
     let service = state.issue_service.clone();
 
     service
@@ -504,7 +767,7 @@ async fn update_issue(
                 company_id = %company_id,
                 "issue update failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            issue_service_status(&error)
         })
 }
 

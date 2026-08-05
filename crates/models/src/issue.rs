@@ -273,6 +273,7 @@ pub struct Issue {
     pub description: Option<String>,
     pub status: IssueStatus,
     pub work_mode: IssueWorkMode,
+    pub harness_kind: Option<String>,
     pub priority: IssuePriority,
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
@@ -342,10 +343,12 @@ pub struct CreateIssueInput {
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
     pub work_mode: Option<IssueWorkMode>,
+    pub harness_kind: Option<String>,
     pub responsible_user_id: Option<Uuid>,
     pub origin_kind: Option<String>,
     pub origin_id: Option<String>,
     pub origin_run_id: Option<Uuid>,
+    pub origin_fingerprint: Option<String>,
     pub request_depth: Option<i32>,
     pub billing_code: Option<String>,
     pub execution_workspace_id: Option<Uuid>,
@@ -363,7 +366,6 @@ pub struct CreateIssueInput {
     pub blocked_by_issue_ids: Vec<Uuid>,
     pub watchdog: Option<CreateIssueWatchdogInput>,
     pub watchdog_discovery: Option<serde_json::Value>,
-    pub harness_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -384,6 +386,7 @@ pub struct UpdateIssueInput {
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
     pub work_mode: Option<IssueWorkMode>,
+    pub harness_kind: Option<String>,
     pub responsible_user_id: Option<Uuid>,
     pub source_trust: Option<String>,
     pub monitor_scheduled_by: Option<IssueMonitorScheduledBy>,

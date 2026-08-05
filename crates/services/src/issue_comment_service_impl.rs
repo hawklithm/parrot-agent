@@ -142,6 +142,7 @@ impl DefaultIssueCommentService {
                 execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            harness_kind: None,
             label_ids: None,
             blocked_by_issue_ids: None,
             };

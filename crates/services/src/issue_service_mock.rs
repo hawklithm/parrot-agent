@@ -25,6 +25,7 @@ impl MockIssueService {
             description: Some("Mock issue description".to_string()),
             status: IssueStatus::Todo,
             work_mode: IssueWorkMode::Standard,
+            harness_kind: None,
             priority: IssuePriority::Medium,
             assignee_agent_id: None,
             assignee_user_id: None,

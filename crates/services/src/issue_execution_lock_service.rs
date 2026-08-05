@@ -183,6 +183,7 @@ impl IssueExecutionLockService for DefaultIssueExecutionLockService {
             execution_state: None,
             execution_locked_at: Some(Utc::now()),
             execution_run_id: Some(execution_run_id),
+            harness_kind: None,
             label_ids: None,
             blocked_by_issue_ids: None,
         };
@@ -238,6 +239,7 @@ impl IssueExecutionLockService for DefaultIssueExecutionLockService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            harness_kind: None,
             label_ids: None,
             blocked_by_issue_ids: None,
         };
@@ -296,6 +298,7 @@ impl IssueExecutionLockService for DefaultIssueExecutionLockService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            harness_kind: None,
             label_ids: None,
             blocked_by_issue_ids: None,
         };
@@ -359,6 +362,7 @@ mod tests {
             description: None,
             status: models::IssueStatus::Todo,
             work_mode: models::IssueWorkMode::Normal,
+            harness_kind: None,
             priority: models::IssuePriority::Medium,
             assignee_agent_id: None,
             assignee_user_id: None,

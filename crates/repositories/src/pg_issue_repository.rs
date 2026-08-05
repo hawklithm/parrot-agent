@@ -125,6 +125,30 @@ impl PgIssueRepository {
             ));
         }
         for blocker_id in unique_blocker_ids {
+            let creates_cycle = sqlx::query_scalar::<_, bool>(
+                "WITH RECURSIVE reachable(issue_id) AS (
+                   SELECT related_issue_id
+                     FROM issue_relations
+                    WHERE company_id = $1 AND issue_id = $2 AND type = 'blocks'
+                   UNION
+                   SELECT relation.related_issue_id
+                     FROM issue_relations relation
+                     JOIN reachable ON reachable.issue_id = relation.issue_id
+                    WHERE relation.company_id = $1 AND relation.type = 'blocks'
+                 )
+                 SELECT EXISTS (SELECT 1 FROM reachable WHERE issue_id = $3)",
+            )
+            .bind(company_id)
+            .bind(issue_id)
+            .bind(blocker_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+            if creates_cycle {
+                return Err(RepositoryError::InvalidData(
+                    "blocked-by relation would create a cycle".to_string(),
+                ));
+            }
             sqlx::query(
                 "INSERT INTO issue_relations (company_id, issue_id, related_issue_id, type, created_by_agent_id, created_by_user_id) VALUES ($1, $2, $3, 'blocks', $4, $5)",
             )
@@ -624,23 +648,23 @@ impl IssueRepository for PgIssueRepository {
             r#"
             INSERT INTO issues (
                 company_id, project_id, project_workspace_id, goal_id, parent_id,
-                title, description, status, work_mode, priority,
+                title, description, status, work_mode, harness_kind, priority,
                 assignee_agent_id, assignee_user_id,
                 created_by_agent_id, created_by_user_id, responsible_user_id,
-                origin_kind, origin_id, origin_run_id, request_depth,
+                origin_kind, origin_id, origin_run_id, origin_fingerprint, request_depth,
                 billing_code, assignee_adapter_overrides,
                 execution_policy, execution_workspace_settings,
                 execution_workspace_id, execution_workspace_preference
             )
             VALUES (
                 $1, $2, $3, $4, $5,
-                $6, $7, $8, $9, $10,
-                $11, $12,
-                $13, $14, $15,
-                $16, $17, $18, $19,
-                $20, $21,
+                $6, $7, $8, $9, $10, $11,
+                $12, $13,
+                $14, $15, $16,
+                $17, $18, $19, $20, $21,
                 $22, $23,
-                $24, $25
+                $24, $25,
+                $26, $27
             )
             RETURNING *
             "#,
@@ -654,6 +678,7 @@ impl IssueRepository for PgIssueRepository {
         .bind(input.description.as_ref())
         .bind(input.status)
         .bind(input.work_mode.unwrap_or(models::IssueWorkMode::Standard))
+        .bind(input.harness_kind.as_deref())
         .bind(input.priority.unwrap_or(models::IssuePriority::Medium))
         .bind(input.assignee_agent_id)
         .bind(input.assignee_user_id)
@@ -666,6 +691,7 @@ impl IssueRepository for PgIssueRepository {
         .bind(input.origin_kind.as_deref().unwrap_or("manual"))
         .bind(input.origin_id.as_ref())
         .bind(input.origin_run_id)
+        .bind(input.origin_fingerprint.as_deref().unwrap_or("default"))
         .bind(input.request_depth.unwrap_or(0))
         .bind(input.billing_code.as_ref())
         .bind(&input.assignee_adapter_overrides)
@@ -717,6 +743,10 @@ impl IssueRepository for PgIssueRepository {
         if input.work_mode.is_some() {
             param_count += 1;
             updates.push(format!("work_mode = ${}", param_count));
+        }
+        if input.harness_kind.is_some() {
+            param_count += 1;
+            updates.push(format!("harness_kind = ${}", param_count));
         }
         if input.assignee_agent_id.is_some() {
             param_count += 1;
@@ -804,6 +834,9 @@ impl IssueRepository for PgIssueRepository {
         }
         if let Some(work_mode) = input.work_mode {
             q = q.bind(work_mode);
+        }
+        if let Some(ref harness_kind) = input.harness_kind {
+            q = q.bind(harness_kind);
         }
         if let Some(assignee_agent_id) = input.assignee_agent_id {
             q = q.bind(assignee_agent_id);

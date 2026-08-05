@@ -60,10 +60,12 @@ pub struct CreateIssueInput {
     pub goal_id: Option<Uuid>,
     pub project_workspace_id: Option<Uuid>,
     pub work_mode: Option<models::IssueWorkMode>,
+    pub harness_kind: Option<String>,
     pub responsible_user_id: Option<Uuid>,
     pub origin_kind: Option<String>,
     pub origin_id: Option<String>,
     pub origin_run_id: Option<Uuid>,
+    pub origin_fingerprint: Option<String>,
     pub request_depth: Option<i32>,
     pub billing_code: Option<String>,
     pub execution_workspace_id: Option<Uuid>,
@@ -103,8 +105,10 @@ pub struct UpdateIssueInput {
     pub assigned_to: Option<Uuid>,
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
+    pub work_mode: Option<models::IssueWorkMode>,
     pub label_ids: Option<Vec<Uuid>>,
     pub blocked_by_issue_ids: Option<Vec<Uuid>>,
+    pub harness_kind: Option<String>,
 }
 
 /// Issue query filter
@@ -343,10 +347,12 @@ impl IssueService for DefaultIssueService {
             assignee_agent_id: input.assignee_agent_id,
             assignee_user_id: input.assignee_user_id,
             work_mode: input.work_mode,
+            harness_kind: input.harness_kind,
             responsible_user_id: input.responsible_user_id,
             origin_kind: input.origin_kind,
             origin_id: input.origin_id,
             origin_run_id: input.origin_run_id,
+            origin_fingerprint: input.origin_fingerprint,
             request_depth: input.request_depth,
             billing_code: input.billing_code,
             execution_workspace_id: input.execution_workspace_id,
@@ -360,7 +366,6 @@ impl IssueService for DefaultIssueService {
             blocked_by_issue_ids: input.blocked_by_issue_ids,
             watchdog: None,
             watchdog_discovery: None,
-            harness_kind: None,
         };
         let created_issue = self.issue_repo
             .create(models_input)
@@ -446,7 +451,7 @@ impl IssueService for DefaultIssueService {
             priority: input.priority,
             assignee_agent_id: input.assignee_agent_id,
             assignee_user_id: input.assignee_user_id,
-            work_mode: None,
+            work_mode: input.work_mode,
             responsible_user_id: None,
             source_trust: None,
             monitor_scheduled_by: None,
@@ -458,6 +463,7 @@ impl IssueService for DefaultIssueService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            harness_kind: input.harness_kind,
             label_ids: input.label_ids,
             blocked_by_issue_ids: input.blocked_by_issue_ids,
         };
@@ -540,6 +546,7 @@ impl IssueService for DefaultIssueService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            harness_kind: None,
             label_ids: None,
             blocked_by_issue_ids: None,
         };
@@ -595,6 +602,7 @@ impl IssueService for DefaultIssueService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            harness_kind: None,
             label_ids: None,
             blocked_by_issue_ids: None,
         };
@@ -630,6 +638,7 @@ impl IssueService for DefaultIssueService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            harness_kind: None,
             label_ids: None,
             blocked_by_issue_ids: None,
         };
@@ -702,6 +711,7 @@ impl IssueService for DefaultIssueService {
                 execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            harness_kind: None,
             label_ids: None,
             blocked_by_issue_ids: None,
             };
@@ -888,10 +898,12 @@ impl issue_service::IssueService for LegacyIssueService {
             goal_id: input.goal_id,
             project_workspace_id: input.project_workspace_id,
             work_mode: input.work_mode,
+            harness_kind: input.harness_kind,
             responsible_user_id: input.responsible_user_id,
             origin_kind: input.origin_kind,
             origin_id: input.origin_id,
             origin_run_id: input.origin_run_id,
+            origin_fingerprint: input.origin_fingerprint,
             request_depth: input.request_depth,
             billing_code: input.billing_code,
             execution_workspace_id: input.execution_workspace_id,
@@ -929,10 +941,12 @@ impl issue_service::IssueService for LegacyIssueService {
             goal_id: input.goal_id,
             project_workspace_id: input.project_workspace_id,
             work_mode: input.work_mode,
+            harness_kind: input.harness_kind,
             responsible_user_id: input.responsible_user_id,
             origin_kind: input.origin_kind,
             origin_id: input.origin_id,
             origin_run_id: input.origin_run_id,
+            origin_fingerprint: input.origin_fingerprint,
             request_depth: input.request_depth,
             billing_code: input.billing_code,
             execution_workspace_id: input.execution_workspace_id,
@@ -999,6 +1013,8 @@ impl issue_service::IssueService for LegacyIssueService {
             assigned_to: input.assignee_agent_id.or(input.assignee_user_id),
             assignee_agent_id: input.assignee_agent_id,
             assignee_user_id: input.assignee_user_id,
+            work_mode: input.work_mode,
+            harness_kind: input.harness_kind,
             label_ids: input.label_ids,
             blocked_by_issue_ids: input.blocked_by_issue_ids,
         };

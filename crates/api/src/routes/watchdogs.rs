@@ -135,19 +135,19 @@ async fn update_watchdog_status(
 pub fn watchdog_routes() -> Router<Arc<dyn WatchdogService>> {
     Router::new()
         .route(
-            "/api/companies/:companyId/issues/:issueId/watchdog",
+            "/companies/:companyId/issues/:issueId/watchdog",
             get(get_watchdog).post(upsert_watchdog),
         )
         .route(
-            "/api/companies/:companyId/watchdogs/evaluate",
+            "/companies/:companyId/watchdogs/evaluate",
             post(evaluate_all_watchdogs),
         )
         .route(
-            "/api/companies/:companyId/issues/:issueId/watchdog/evaluate",
+            "/companies/:companyId/issues/:issueId/watchdog/evaluate",
             post(evaluate_watchdog),
         )
         .route(
-            "/api/companies/:companyId/watchdogs/:watchdogId/status",
+            "/companies/:companyId/watchdogs/:watchdogId/status",
             put(update_watchdog_status),
         )
 }
