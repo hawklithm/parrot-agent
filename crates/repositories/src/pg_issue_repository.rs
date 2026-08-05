@@ -263,7 +263,7 @@ impl IssueRepository for PgIssueRepository {
         if let Some(statuses) = &filter.status {
             if !statuses.is_empty() {
                 param_count += 1;
-                query.push_str(&format!(" AND status = ANY(${})", param_count));
+                query.push_str(&format!(" AND status::text = ANY(${})", param_count));
             }
         }
 
@@ -461,7 +461,7 @@ impl IssueRepository for PgIssueRepository {
         if let Some(statuses) = &filter.status {
             if !statuses.is_empty() {
                 param_count += 1;
-                query.push_str(&format!(" AND status = ANY(${})", param_count));
+                query.push_str(&format!(" AND status::text = ANY(${})", param_count));
             }
         }
 

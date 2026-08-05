@@ -31,8 +31,11 @@ struct ListIssuesQuery {
     project_id: Option<Uuid>,
     q: Option<String>,
     participant_agent_id: Option<Uuid>,
-    touched_by_user_id: Option<Uuid>,
-    inbox_archived_by_user_id: Option<Uuid>,
+    // Paperclip accepts the current-user sentinel `me` as well as a UUID for
+    // these filters. Keep the wire type as a string and resolve it only after
+    // authentication has supplied the current actor.
+    touched_by_user_id: Option<String>,
+    inbox_archived_by_user_id: Option<String>,
     unread_for_user_id: Option<Uuid>,
     label_id: Option<Uuid>,
     execution_workspace_id: Option<Uuid>,
@@ -57,6 +60,32 @@ fn issue_service_status(error: &str) -> StatusCode {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     }
+}
+
+fn resolve_user_filter(
+    value: Option<&str>,
+    actor: &AuthorizationActor,
+) -> Result<Option<Uuid>, StatusCode> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if value.eq_ignore_ascii_case("me") {
+        return match actor {
+            AuthorizationActor::Board { user_id, .. } => Ok(Some(*user_id)),
+            AuthorizationActor::Agent {
+                on_behalf_of_user_id: Some(user_id),
+                ..
+            } => Ok(Some(*user_id)),
+            AuthorizationActor::Agent { .. } | AuthorizationActor::None => {
+                Err(StatusCode::FORBIDDEN)
+            }
+        };
+    }
+
+    Uuid::parse_str(value)
+        .map(Some)
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 struct WatchdogDiscoveryScope {
@@ -469,6 +498,10 @@ async fn list_issues(
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
     let service = state.issue_service.clone();
     let company_id = actor.company_id().ok_or(StatusCode::FORBIDDEN)?;
+    let touched_by_user_id =
+        resolve_user_filter(query.touched_by_user_id.as_deref(), &actor)?;
+    let inbox_archived_by_user_id =
+        resolve_user_filter(query.inbox_archived_by_user_id.as_deref(), &actor)?;
     
     let filter = IssueQueryFilter {
         status: parse_issue_statuses(query.status.as_deref()),
@@ -480,8 +513,8 @@ async fn list_issues(
         goal_id: None,
         search_query: query.q.clone().filter(|value| !value.trim().is_empty()),
         participant_agent_id: query.participant_agent_id,
-        touched_by_user_id: query.touched_by_user_id,
-        inbox_archived_by_user_id: query.inbox_archived_by_user_id,
+        touched_by_user_id,
+        inbox_archived_by_user_id,
         unread_for_user_id: query.unread_for_user_id,
         label_id: query.label_id,
         execution_workspace_id: query.execution_workspace_id,
@@ -669,6 +702,10 @@ async fn list_company_issues(
     Query(query): Query<ListIssuesQuery>,
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
     crate::routes::assert_company_access(&actor, company_id, true)?;
+    let touched_by_user_id =
+        resolve_user_filter(query.touched_by_user_id.as_deref(), &actor)?;
+    let inbox_archived_by_user_id =
+        resolve_user_filter(query.inbox_archived_by_user_id.as_deref(), &actor)?;
     let filter = IssueQueryFilter {
         status: parse_issue_statuses(query.status.as_deref()),
         priority: parse_issue_priorities(query.priority.as_deref()),
@@ -679,8 +716,8 @@ async fn list_company_issues(
         goal_id: None,
         search_query: query.q.clone().filter(|value| !value.trim().is_empty()),
         participant_agent_id: query.participant_agent_id,
-        touched_by_user_id: query.touched_by_user_id,
-        inbox_archived_by_user_id: query.inbox_archived_by_user_id,
+        touched_by_user_id,
+        inbox_archived_by_user_id,
         unread_for_user_id: query.unread_for_user_id,
         label_id: query.label_id,
         execution_workspace_id: query.execution_workspace_id,
@@ -1381,4 +1418,38 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/interactions/:interaction_id/reject", post(reject_interaction))
         .route("/issues/:id/interactions/:interaction_id/respond", post(respond_interaction))
         .route("/issues/:id/interactions/:interaction_id/cancel", post(cancel_interaction))
+}
+
+#[cfg(test)]
+mod user_filter_tests {
+    use super::resolve_user_filter;
+    use axum::http::StatusCode;
+    use services::auth::AuthorizationActor;
+    use uuid::Uuid;
+
+    #[test]
+    fn resolves_me_to_board_user() {
+        let user_id = Uuid::new_v4();
+        let company_id = Uuid::new_v4();
+        let actor = AuthorizationActor::board(user_id, company_id);
+
+        assert_eq!(resolve_user_filter(Some("me"), &actor), Ok(Some(user_id)));
+        assert_eq!(resolve_user_filter(Some("ME"), &actor), Ok(Some(user_id)));
+    }
+
+    #[test]
+    fn accepts_uuid_and_rejects_invalid_user_filter() {
+        let actor = AuthorizationActor::board(Uuid::new_v4(), Uuid::new_v4());
+        let user_id = Uuid::new_v4();
+
+        assert_eq!(resolve_user_filter(Some(&user_id.to_string()), &actor), Ok(Some(user_id)));
+        assert_eq!(resolve_user_filter(Some("not-a-uuid"), &actor), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn rejects_me_for_agent_without_user_delegation() {
+        let actor = AuthorizationActor::agent(Uuid::new_v4(), Uuid::new_v4(), None);
+
+        assert_eq!(resolve_user_filter(Some("me"), &actor), Err(StatusCode::FORBIDDEN));
+    }
 }
