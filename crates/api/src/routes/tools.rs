@@ -22,6 +22,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use uuid::Uuid;
 use futures::StreamExt;
+use models::{CommentActorType, CreateIssueInput, UpdateIssueInput};
+use services::issue_service::{CheckoutInput, IssueQueryFilter, Pagination as IssuePagination, ReleaseInput};
 
 use crate::app_state::AppState;
 use crate::mcp::{request_kind, McpInvocationContext, McpRequestKind, McpToolDefinition};
@@ -134,6 +136,7 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                     "type": "object", "properties": {
                         "companyId": {"type": ["string", "null"], "format": "uuid"},
                         "status": {"type": "string"}, "projectId": {"type": "string", "format": "uuid"},
+                        "parentId": {"type": "string", "format": "uuid"}, "goalId": {"type": "string", "format": "uuid"},
                         "assigneeAgentId": {"type": "string", "format": "uuid"},
                         "participantAgentId": {"type": "string", "format": "uuid"},
                         "assigneeUserId": {"type": "string"}, "touchedByUserId": {"type": "string"},
@@ -142,7 +145,8 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "executionWorkspaceId": {"type": "string", "format": "uuid"},
                         "originKind": {"type": "string"}, "originId": {"type": "string"},
                         "includeRoutineExecutions": {"type": "boolean"},
-                        "includeLiveDescendantSummary": {"type": "boolean"}, "q": {"type": "string"}
+                        "includeLiveDescendantSummary": {"type": "boolean"}, "q": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 500}, "offset": {"type": "integer", "minimum": 0}
                     }, "additionalProperties": false
                 }),
                 "paperclipGetIssue" | "paperclipListIssueApprovals" | "paperclipListDocuments" => serde_json::json!({
@@ -344,6 +348,12 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
     let Some(object) = parameters.as_object() else {
         return Err("tool arguments must be a JSON object".to_string());
     };
+    let schema = paperclip_builtin_tool_definitions()
+        .into_iter()
+        .find(|definition| definition.name == tool_name)
+        .map(|definition| definition.input_schema)
+        .ok_or_else(|| format!("Unknown Paperclip tool: {tool_name}"))?;
+    validate_schema_value(parameters, &schema, "$")?;
     let required: &[&str] = match tool_name {
         "paperclipGetAgent" => &["agentId"],
         "paperclipGetIssue" | "paperclipGetHeartbeatContext" | "paperclipListComments"
@@ -557,6 +567,120 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
     Ok(())
 }
 
+fn validate_schema_value(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+    if let Some(constant) = schema.get("const") {
+        if value != constant {
+            return Err(format!("{path} must equal {constant}"));
+        }
+    }
+    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
+        if !enum_values.iter().any(|candidate| candidate == value) {
+            return Err(format!("{path} is not one of the allowed values"));
+        }
+    }
+
+    let matches_type = |type_name: &str| match type_name {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    };
+    if let Some(type_value) = schema.get("type") {
+        let valid = match type_value {
+            Value::String(type_name) => matches_type(type_name),
+            Value::Array(types) => types.iter().filter_map(Value::as_str).any(matches_type),
+            _ => false,
+        };
+        if !valid {
+            return Err(format!("{path} has an invalid type"));
+        }
+    }
+
+    if let Some(string) = value.as_str() {
+        if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64) {
+            if string.chars().count() < minimum as usize {
+                return Err(format!("{path} is shorter than the minimum length"));
+            }
+        }
+        if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64) {
+            if string.chars().count() > maximum as usize {
+                return Err(format!("{path} exceeds the maximum length"));
+            }
+        }
+        if let Some(format) = schema.get("format").and_then(Value::as_str) {
+            match format {
+                "uuid" => {
+                    Uuid::parse_str(string)
+                        .map_err(|_| format!("{path} must be a valid UUID"))?;
+                }
+                "date-time" => {
+                    chrono::DateTime::parse_from_rfc3339(string)
+                        .map_err(|_| format!("{path} must be a valid RFC3339 date-time"))?;
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+            if number < minimum {
+                return Err(format!("{path} is below the minimum"));
+            }
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+            if number > maximum {
+                return Err(format!("{path} is above the maximum"));
+            }
+        }
+    }
+    if let Some(array) = value.as_array() {
+        if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64) {
+            if array.len() < minimum as usize {
+                return Err(format!("{path} has fewer items than allowed"));
+            }
+        }
+        if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64) {
+            if array.len() > maximum as usize {
+                return Err(format!("{path} has more items than allowed"));
+            }
+        }
+        if let Some(item_schema) = schema.get("items") {
+            for (index, item) in array.iter().enumerate() {
+                validate_schema_value(item, item_schema, &format!("{path}[{index}]"))?;
+            }
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for name in required.iter().filter_map(Value::as_str) {
+                if object.get(name).is_none() || object.get(name).is_some_and(Value::is_null) {
+                    return Err(format!("{path}.{name} is required"));
+                }
+            }
+        }
+        let properties = schema.get("properties").and_then(Value::as_object);
+        if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+            for key in object.keys() {
+                if properties.is_none_or(|properties| !properties.contains_key(key)) {
+                    return Err(format!("{path}.{key} is not an allowed property"));
+                }
+            }
+        }
+        if let Some(properties) = properties {
+            for (key, child_schema) in properties {
+                if let Some(child) = object.get(key) {
+                    validate_schema_value(child, child_schema, &format!("{path}.{key}"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_text_field(value: Option<&Value>, name: &str) -> Result<(), String> {
     let value = value.and_then(Value::as_str).ok_or_else(|| format!("{name} must be a string"))?;
     if value.trim().is_empty() || value.len() > 4000 {
@@ -635,6 +759,234 @@ fn validate_interaction_payload(tool_name: &str, payload: &Value) -> Result<(), 
         }
     }
     Ok(())
+}
+
+fn parameters_have_only(parameters: &Value, allowed: &[&str]) -> bool {
+    parameters
+        .as_object()
+        .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+}
+
+fn optional_uuid_parameter(parameters: &Value, key: &str) -> Result<Option<Uuid>, String> {
+    parameters
+        .get(key)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| format!("{key} must be a UUID string"))
+                .and_then(|value| Uuid::parse_str(value).map_err(|_| format!("{key} must be a valid UUID")))
+        })
+        .transpose()
+}
+
+async fn direct_paperclip_service_call(
+    state: &AppState,
+    company_id: Uuid,
+    agent_id: Uuid,
+    run_id: Uuid,
+    tool_name: &str,
+    parameters: &Value,
+) -> Result<Option<Value>, String> {
+    let value = match tool_name {
+        "paperclipMe" => {
+            let agent = state
+                .agent_service
+                .get_by_id(agent_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if agent.company_id != company_id {
+                return Err("authenticated agent does not belong to the gateway company".to_string());
+            }
+            Some(serde_json::to_value(agent).map_err(|error| error.to_string())?)
+        }
+        "paperclipInboxLite" => Some(
+            state
+                .agent_service
+                .inbox_lite(agent_id)
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "paperclipListAgents" if parameters_have_only(parameters, &["companyId"]) => Some(
+            serde_json::to_value(
+                state
+                    .agent_service
+                    .list(company_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        "paperclipGetAgent"
+            if parameters_have_only(parameters, &["agentId", "companyId"])
+                && parameters
+                    .get("agentId")
+                    .and_then(Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .is_some() =>
+        {
+            let requested_id = Uuid::parse_str(parameters.get("agentId").and_then(Value::as_str).unwrap_or_default())
+                .map_err(|error| error.to_string())?;
+            let agent = state
+                .agent_service
+                .get_by_id(requested_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if agent.company_id != company_id {
+                return Err("agent does not belong to the gateway company".to_string());
+            }
+            Some(serde_json::to_value(agent).map_err(|error| error.to_string())?)
+        }
+        "paperclipGetIssue"
+            if parameters_have_only(parameters, &["issueId"])
+                && parameters
+                    .get("issueId")
+                    .and_then(Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .is_some() =>
+        {
+            let issue_id = Uuid::parse_str(parameters.get("issueId").and_then(Value::as_str).unwrap_or_default())
+                .map_err(|error| error.to_string())?;
+            state
+                .issue_service
+                .get(issue_id, company_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .map(|issue| serde_json::to_value(issue).map_err(|error| error.to_string()))
+                .transpose()?
+        }
+        "paperclipListIssues" if parameters_have_only(parameters, &[
+            "companyId", "status", "priority", "assigneeAgentId", "assigneeUserId",
+            "projectId", "parentId", "goalId", "participantAgentId", "touchedByUserId",
+            "inboxArchivedByUserId", "unreadForUserId", "labelId", "executionWorkspaceId",
+            "originKind", "originId", "q", "limit", "offset",
+        ]) => {
+            let statuses = parameters.get("status").and_then(Value::as_str).map(|status| {
+                status.split(',').map(|value| serde_json::from_value(Value::String(value.trim().to_string()))
+                    .map_err(|error| error.to_string())).collect::<Result<Vec<_>, _>>()
+            }).transpose()?;
+            let priorities = parameters.get("priority").and_then(Value::as_str).map(|priority| {
+                priority.split(',').map(|value| serde_json::from_value(Value::String(value.trim().to_string()))
+                    .map_err(|error| error.to_string())).collect::<Result<Vec<_>, _>>()
+            }).transpose()?;
+            let filter = IssueQueryFilter {
+                status: statuses,
+                priority: priorities,
+                assignee_agent_id: optional_uuid_parameter(parameters, "assigneeAgentId")?,
+                assignee_user_id: optional_uuid_parameter(parameters, "assigneeUserId")?,
+                project_id: optional_uuid_parameter(parameters, "projectId")?,
+                parent_id: optional_uuid_parameter(parameters, "parentId")?,
+                goal_id: optional_uuid_parameter(parameters, "goalId")?,
+                participant_agent_id: optional_uuid_parameter(parameters, "participantAgentId")?,
+                touched_by_user_id: optional_uuid_parameter(parameters, "touchedByUserId")?,
+                inbox_archived_by_user_id: optional_uuid_parameter(parameters, "inboxArchivedByUserId")?,
+                unread_for_user_id: optional_uuid_parameter(parameters, "unreadForUserId")?,
+                label_id: optional_uuid_parameter(parameters, "labelId")?,
+                execution_workspace_id: optional_uuid_parameter(parameters, "executionWorkspaceId")?,
+                origin_kind: parameters.get("originKind").and_then(Value::as_str).map(ToOwned::to_owned),
+                origin_id: parameters.get("originId").and_then(Value::as_str).map(ToOwned::to_owned),
+                search_query: parameters.get("q").and_then(Value::as_str).map(ToOwned::to_owned),
+            };
+            let pagination = IssuePagination {
+                limit: parameters.get("limit").and_then(Value::as_i64).unwrap_or(50).clamp(1, 500),
+                offset: parameters.get("offset").and_then(Value::as_i64).unwrap_or(0).max(0),
+                cursor: None,
+            };
+            Some(serde_json::to_value(
+                state.issue_service.list(company_id, &filter, &pagination).await
+                    .map_err(|error| error.to_string())?,
+            ).map_err(|error| error.to_string())?)
+        }
+        "paperclipCreateIssue" if parameters_have_only(parameters, &[
+            "companyId", "projectId", "goalId", "title", "description", "status",
+            "priority", "parentId", "assigneeAgentId", "assigneeUserId",
+        ]) => {
+            let mut input: CreateIssueInput = serde_json::from_value(object_without(parameters, &["companyId"]))
+                .map_err(|error| format!("invalid create issue input: {error}"))?;
+            input.company_id = company_id;
+            Some(serde_json::to_value(
+                state.issue_service.create(input).await.map_err(|error| error.to_string())?.issue,
+            ).map_err(|error| error.to_string())?)
+        }
+        "paperclipUpdateIssue" if parameters_have_only(parameters, &[
+            "issueId", "title", "description", "status", "priority", "assigneeAgentId", "assigneeUserId",
+        ]) && parameters.get("issueId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()).is_some() => {
+            let issue_id = Uuid::parse_str(parameters.get("issueId").and_then(Value::as_str).unwrap_or_default())
+                .map_err(|error| error.to_string())?;
+            let input: UpdateIssueInput = serde_json::from_value(object_without(parameters, &["issueId"]))
+                .map_err(|error| format!("invalid update issue input: {error}"))?;
+            Some(serde_json::to_value(
+                state.issue_service.update(issue_id, company_id, input).await
+                    .map_err(|error| error.to_string())?.issue,
+            ).map_err(|error| error.to_string())?)
+        }
+        "paperclipCheckoutIssue" if parameters_have_only(parameters, &["issueId", "agentId", "expectedStatuses"])
+            && parameters.get("issueId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()).is_some() => {
+            let issue_id = Uuid::parse_str(parameters.get("issueId").and_then(Value::as_str).unwrap_or_default())
+                .map_err(|error| error.to_string())?;
+            let requested_agent = optional_uuid_parameter(parameters, "agentId")?.unwrap_or(agent_id);
+            if requested_agent != agent_id {
+                return Err("checkout agentId must match the gateway agent".to_string());
+            }
+            let expected_statuses = parameters.get("expectedStatuses").and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect())
+                .unwrap_or_else(|| vec!["todo".to_string(), "backlog".to_string(), "blocked".to_string()]);
+            state.issue_service.checkout(issue_id, company_id, CheckoutInput {
+                agent_id: Some(agent_id), user_id: None, expected_statuses, checkout_run_id: run_id,
+            }).await.map_err(|error| error.to_string())?;
+            sqlx::query(
+                "UPDATE issues SET assignee_agent_id = $2, checkout_run_id = $3, execution_run_id = $3, updated_at = NOW() WHERE id = $1 AND company_id = $4",
+            )
+            .bind(issue_id)
+            .bind(agent_id)
+            .bind(run_id)
+            .bind(company_id)
+            .execute(&state.pool)
+            .await
+            .map_err(|error| error.to_string())?;
+            Some(serde_json::to_value(
+                state.issue_service.get(issue_id, company_id).await.map_err(|error| error.to_string())?
+                    .ok_or_else(|| "checked out issue disappeared".to_string())?,
+            ).map_err(|error| error.to_string())?)
+        }
+        "paperclipReleaseIssue" if parameters_have_only(parameters, &["issueId", "result", "targetStatus"])
+            && parameters.get("issueId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()).is_some() => {
+            let issue_id = Uuid::parse_str(parameters.get("issueId").and_then(Value::as_str).unwrap_or_default())
+                .map_err(|error| error.to_string())?;
+            state.issue_service.release(issue_id, company_id, ReleaseInput {
+                release_run_id: run_id,
+                result: parameters.get("result").and_then(Value::as_str).map(ToOwned::to_owned),
+                target_status: parameters.get("targetStatus").and_then(Value::as_str).map(ToOwned::to_owned),
+            }).await.map_err(|error| error.to_string())?;
+            sqlx::query(
+                "UPDATE issues SET checkout_run_id = NULL, execution_run_id = NULL, execution_locked_at = NULL, updated_at = NOW() WHERE id = $1 AND company_id = $2",
+            )
+            .bind(issue_id)
+            .bind(company_id)
+            .execute(&state.pool)
+            .await
+            .map_err(|error| error.to_string())?;
+            Some(serde_json::to_value(
+                state.issue_service.get(issue_id, company_id).await.map_err(|error| error.to_string())?
+                    .ok_or_else(|| "released issue disappeared".to_string())?,
+            ).map_err(|error| error.to_string())?)
+        }
+        "paperclipAddComment" if parameters_have_only(parameters, &["issueId", "body", "metadata"])
+            && parameters.get("issueId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()).is_some() => {
+            let issue_id = Uuid::parse_str(parameters.get("issueId").and_then(Value::as_str).unwrap_or_default())
+                .map_err(|error| error.to_string())?;
+            Some(serde_json::to_value(state.issue_comment_service.add_comment(
+                issue_id,
+                parameters.get("body").and_then(Value::as_str).unwrap_or_default().to_string(),
+                CommentActorType::Agent,
+                Some(agent_id),
+                Some(run_id),
+                parameters.get("metadata").filter(|value| !value.is_null()).cloned(),
+            ).await.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?)
+        }
+        _ => None,
+    };
+    Ok(value)
 }
 
 async fn mcp_stdio_request(command: &str, args: &[String], method: &str, params: Value) -> Result<Value, String> {
@@ -1390,6 +1742,7 @@ fn validate_paperclip_api_path(path: &str) -> Result<(), String> {
 }
 
 async fn call_paperclip_builtin_tool(
+    state: &AppState,
     token: &str,
     company_id: Uuid,
     agent_id: Uuid,
@@ -1407,6 +1760,7 @@ async fn call_paperclip_builtin_tool(
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
         loop {
             let current = Box::pin(call_paperclip_builtin_tool(
+                state,
                 token, company_id, agent_id, run_id, "paperclipGetIssueWorkspaceRuntime",
                 &serde_json::json!({"issueId": issue_id}),
             )).await?;
@@ -1438,6 +1792,7 @@ async fn call_paperclip_builtin_tool(
     {
         let issue_id = parameters.get("issueId").and_then(Value::as_str).ok_or("issueId is required")?;
         let runtime = Box::pin(call_paperclip_builtin_tool(
+            state,
             token, company_id, agent_id, run_id, "paperclipGetIssueWorkspaceRuntime",
             &serde_json::json!({"issueId": issue_id}),
         )).await?;
@@ -1450,6 +1805,18 @@ async fn call_paperclip_builtin_tool(
     } else {
         parameters.clone()
     };
+    if let Some(result) = direct_paperclip_service_call(
+        state,
+        company_id,
+        agent_id,
+        run_id,
+        tool_name,
+        &parameters,
+    )
+    .await?
+    {
+        return Ok(result);
+    }
     let (method, path, body) = match tool_name {
         "paperclipMe" => ("GET", "/agents/me".to_string(), None),
         "paperclipInboxLite" => ("GET", "/agents/me/inbox-lite".to_string(), None),
@@ -1936,6 +2303,7 @@ async fn call_gateway_tool(
         .execute(&state.pool)
         .await;
         let result = call_paperclip_builtin_tool(
+            &state,
             &token,
             company_id,
             agent_id,
@@ -2656,6 +3024,22 @@ mod tests {
         })).is_err());
         assert!(validate_paperclip_arguments("paperclipCreateIssue", &serde_json::json!({"title":"x", "priority":"invalid"})).is_err());
         assert!(validate_paperclip_arguments("paperclipCreateIssue", &serde_json::json!({"title":"x", "parentId":"not-a-uuid"})).is_err());
+        assert!(validate_paperclip_arguments("paperclipCreateIssue", &serde_json::json!({"title":"x", "unexpected":true})).is_err());
+        assert!(validate_paperclip_arguments("paperclipListComments", &serde_json::json!({"issueId":"ABC-1", "limit":501})).is_err());
+        assert!(validate_paperclip_arguments("paperclipListComments", &serde_json::json!({"issueId":"ABC-1", "order":"sideways"})).is_err());
+    }
+
+    #[test]
+    fn every_paperclip_schema_is_closed_and_runtime_validated() {
+        for definition in paperclip_builtin_tool_definitions() {
+            assert_eq!(definition.input_schema.get("type").and_then(Value::as_str), Some("object"), "{} must be an object schema", definition.name);
+            assert_eq!(definition.input_schema.get("additionalProperties").and_then(Value::as_bool), Some(false), "{} must reject unknown fields", definition.name);
+            assert!(definition.input_schema.get("properties").and_then(Value::as_object).is_some(), "{} must expose properties", definition.name);
+        }
+        assert!(validate_paperclip_arguments("paperclipCreateIssue", &serde_json::json!({"title":"valid", "status":"todo", "priority":"medium"})).is_ok());
+        assert!(validate_paperclip_arguments("paperclipCreateIssue", &serde_json::json!({"title":"valid", "status":"not-a-status"})).is_err());
+        assert!(validate_paperclip_arguments("paperclipGetGoal", &serde_json::json!({"goalId":"not-a-uuid"})).is_err());
+        assert!(validate_paperclip_arguments("paperclipUpsertIssueDocument", &serde_json::json!({"issueId":"ABC-1", "key":"ok", "body":"x", "format":"html"})).is_err());
     }
 
     #[test]

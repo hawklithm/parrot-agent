@@ -35,16 +35,18 @@ impl GoalRepository for PostgresGoalRepository {
     async fn create(&self, goal: Goal) -> RepositoryResult<Goal> {
         sqlx::query(
             r#"INSERT INTO goals
-               (id, company_id, title, description, level, status, parent_id,
+               (id, company_id, title, name, description, level, status, priority, parent_id,
                 owner_agent_id, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#
         )
         .bind(goal.id)
         .bind(goal.company_id)
         .bind(&goal.title)
+        .bind(&goal.name)
         .bind(&goal.description)
         .bind(&goal.level)
         .bind(&goal.status)
+        .bind(&goal.priority)
         .bind(goal.parent_id)
         .bind(goal.owner_agent_id)
         .bind(goal.created_at)
@@ -56,7 +58,7 @@ impl GoalRepository for PostgresGoalRepository {
 
     async fn get(&self, goal_id: Uuid) -> RepositoryResult<Option<Goal>> {
         let goal = sqlx::query_as::<_, Goal>(
-            r#"SELECT id, company_id, title, description, level, status, parent_id,
+            r#"SELECT id, company_id, title, name, description, level, status, priority, parent_id,
                       owner_agent_id, created_at, updated_at
                FROM goals WHERE id = $1"#
         )
@@ -68,7 +70,7 @@ impl GoalRepository for PostgresGoalRepository {
 
     async fn list_by_company(&self, company_id: Uuid) -> RepositoryResult<Vec<Goal>> {
         let goals = sqlx::query_as::<_, Goal>(
-            r#"SELECT id, company_id, title, description, level, status, parent_id,
+            r#"SELECT id, company_id, title, name, description, level, status, priority, parent_id,
                       owner_agent_id, created_at, updated_at
                FROM goals WHERE company_id = $1 ORDER BY created_at DESC"#
         )
@@ -80,7 +82,7 @@ impl GoalRepository for PostgresGoalRepository {
 
     async fn list_by_agent(&self, agent_id: Uuid) -> RepositoryResult<Vec<Goal>> {
         let goals = sqlx::query_as::<_, Goal>(
-            r#"SELECT id, company_id, title, description, level, status, parent_id,
+            r#"SELECT id, company_id, title, name, description, level, status, priority, parent_id,
                       owner_agent_id, created_at, updated_at
                FROM goals WHERE owner_agent_id = $1 ORDER BY created_at DESC"#
         )
@@ -92,7 +94,7 @@ impl GoalRepository for PostgresGoalRepository {
 
     async fn list_children(&self, parent_goal_id: Uuid) -> RepositoryResult<Vec<Goal>> {
         let goals = sqlx::query_as::<_, Goal>(
-            r#"SELECT id, company_id, title, description, level, status, parent_id,
+            r#"SELECT id, company_id, title, name, description, level, status, priority, parent_id,
                       owner_agent_id, created_at, updated_at
                FROM goals WHERE parent_id = $1 ORDER BY created_at DESC"#
         )
@@ -105,7 +107,7 @@ impl GoalRepository for PostgresGoalRepository {
     async fn update(&self, goal: Goal) -> RepositoryResult<Goal> {
         sqlx::query(
             r#"UPDATE goals
-               SET title = $2, description = $3, status = $4, level = $5,
+               SET title = $2, name = $2, description = $3, status = $4, level = $5,
                    owner_agent_id = $6, updated_at = $7
                WHERE id = $1"#
         )
@@ -150,7 +152,7 @@ impl GoalRepository for PostgresGoalRepository {
             visited.insert(current_id);
 
             let current: Option<Goal> = sqlx::query_as::<_, Goal>(
-                "SELECT id, company_id, title, description, level, status, parent_id,
+                "SELECT id, company_id, title, name, description, level, status, priority, parent_id,
                         owner_agent_id, created_at, updated_at
                  FROM goals WHERE id = $1"
             )
