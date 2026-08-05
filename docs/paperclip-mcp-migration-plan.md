@@ -4,7 +4,7 @@
 >
 > 约束：只允许修改 `/Users/adazhao/workspace/parrot-agent`；禁止修改 `/Users/adazhao/workspace/paperclip`。所有 Paperclip 代码仅作为只读参考。
 
-> 执行状态（2026-08-05）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、统一 typed tool registry、基础 schema/参数校验、审计、MCP session 生命周期、批量 JSON-RPC、SSE 长连接 GET，以及本地 Claude/Codex 的真实 MCP 握手与 Codex 业务长流程。`PaperclipInternalClient` 已将 REST 回环访问从工具映射中抽出并统一认证/错误处理。仍未宣称完成全部 Paperclip 生产级 response/error 契约、逐工具错误矩阵和 Claude 真实业务成功路径。
+> 执行状态（2026-08-05）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、统一 typed tool registry、基础 schema/参数校验、审计、MCP session 生命周期、批量 JSON-RPC、SSE 长连接 GET，以及本地 Claude/Codex 的真实 MCP 握手与 Codex 业务长流程。`PaperclipInternalClient` 已将 REST 回环访问从工具映射中抽出并统一认证/错误处理。仍未宣称完成全部 Paperclip 生产级 response/error 契约、逐工具错误矩阵、Claude 真实业务成功路径，以及 `CreateIssue` 高级字段的完整持久化。
 
 ## 1. 目标与非目标
 
@@ -286,7 +286,32 @@ error mapping
 - [x] 检查 Paperclip 对 404、400、401、403、409、422 的错误语义；矩阵及 security smoke 覆盖资源缺失、参数、鉴权、越权、冲突路径。
 - [x] 对缺失 endpoint 先补 API/service，再接入 MCP tool；Goal 旧库字段已补 migration，工具 dispatcher 不直接写业务重复 SQL。
 
-### 6.1 当前 41 个工具映射总表
+### 6.1 `paperclipCreateIssue` 高级字段迁移状态
+
+Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽。不能因为
+`tools/list` 的 JSON Schema 已声明字段，就认为字段已经被 REST/service/repository
+持久化；Rust `serde` 默认会忽略未知字段，这是当前接手时最容易漏掉的风险。
+
+| Paperclip 字段 | 当前状态 | 接手迁移要求 |
+|---|---|---|
+| `projectWorkspaceId`、`workMode`、`responsibleUserId`、`originKind`、`originId`、`originRunId`、`requestDepth`、`billingCode` | 已贯通 model/service/repository | 增加持久化断言和跨公司错误测试 |
+| `executionPolicy`、`executionWorkspaceId`、`executionWorkspacePreference`、`executionWorkspaceSettings`、`assigneeAdapterOverrides` | 已贯通 model/service/repository；execution policy/settings 已由矩阵验证 | 补齐 GET/更新/恢复后的 response projection，并验证旧库 migration |
+| `labelIds` | schema 已声明，查询已有单 label 过滤；创建链路尚未写入 `issue_labels` | 在同一数据库事务中校验所有 label 属于 session company，再插入关联；缺失 label 必须返回 404/422，禁止静默丢弃 |
+| `blockedByIssueIds` | schema 已声明，但当前没有等价的 Issue relation create 输入链路 | 先确认 Paperclip relation 表/API 契约；创建 Issue 与 relation 必须同事务，阻塞 Issue 必须同公司，重复/自引用要返回 409/422 |
+| `inheritExecutionWorkspaceFromIssueId` | schema 已声明，当前 Issues 表没有直接继承字段 | 创建时读取来源 Issue 的 workspace 配置，校验同公司和来源存在；持久化最终 workspace id/preference/settings，而不是只保存请求字段 |
+| `harnessKind` | schema 已声明，当前 Issues 表没有该列 | 先补安全 migration 和 model 字段，明确 `skill_test` 对 adapter/执行策略的影响，再开放写入；未完成前应显式拒绝，而不是静默忽略 |
+| `watchdogDiscovery`、`watchdog` | schema/数据库 watchdog 子系统分别存在，但 CreateIssue 尚未把输入连接到 `WatchdogService` | 先对照 Paperclip watchdog create/update contract，创建 Issue 成功后在同一业务流程建立 watchdog，校验 watchdog agent/company/run scope，并覆盖重复 upsert、禁用和恢复 |
+| `goalId`、`parentId` | 已有基础校验和持久化 | 补 company scope 校验；`parentId` 创建子任务后必须验证 wakeup/继承策略 |
+
+迁移顺序必须固定为：
+
+- [ ] 先为每个高级字段增加 model、service、repository 的显式类型，不允许继续依赖 `serde` 忽略未知字段。
+- [ ] 再补数据库事务和 company-scope 校验，确保 Issue 主记录与 labels/relations/watchdog 不会部分提交。
+- [ ] 为每个字段增加至少一个成功、一个缺失资源、一个跨公司或非法组合测试。
+- [ ] 更新 `paperclip-mcp-tool-matrix-smoke.mjs`，断言返回 Issue 中的实际持久化结果，而不是只断言请求成功。
+- [ ] 完成上述字段后，才能把 `paperclipCreateIssue` 从“主要字段已迁移”提升为“Paperclip schema 完整迁移”。
+
+### 6.2 当前 41 个工具映射总表
 
 下表是当前 Rust registry 与 `call_paperclip_builtin_tool` 的单一验收清单。`scope` 表示请求进入 REST bridge 前使用 session-derived company/agent/run；Issue 子资源还会在 REST handler 中再次检查 Issue 所属公司。`response` 是 bridge 原样返回的 API JSON（空响应转换为 `null`），错误统一转换为 MCP `isError=true` 的文本内容并保留 HTTP 状态和响应体摘要。
 
@@ -478,6 +503,7 @@ error mapping
 - [ ] 先实现一个完整 vertical slice：`paperclipGetIssue`、`paperclipAddComment`、`paperclipCreateIssue`。
 - [ ] 用真实 Claude CLI 验证 vertical slice 后，再批量迁移剩余工具。
 - [ ] 每完成一个工具，同时添加单元测试和 MCP JSON-RPC 集成测试。
+- [x] 已为 41 个工具建立统一矩阵脚本；剩余工作是把高级 CreateIssue 字段纳入该矩阵，而不是新增第二套 dispatcher。
 - [ ] 不要修改 `/Users/adazhao/workspace/paperclip`。
 
 ## 12. 完成判定
