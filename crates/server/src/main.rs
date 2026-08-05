@@ -156,12 +156,10 @@ async fn ensure_local_trusted_principal(pool: &PgPool) -> Result<(), Box<dyn std
     let company_ids = sqlx::query_scalar::<_, Uuid>("SELECT id FROM companies ORDER BY created_at ASC, id ASC")
         .fetch_all(pool)
         .await?;
-    let company_id = std::env::var("LOCAL_TRUSTED_COMPANY_ID")
-        .ok()
-        .and_then(|value| Uuid::parse_str(&value).ok())
-        .filter(|company_id| company_ids.contains(company_id))
-        .or_else(|| company_ids.first().copied())
-        .unwrap_or_else(Uuid::nil);
+    // Paperclip's local trusted actor is an instance-level Board principal;
+    // it is deliberately not bound to one company. Resource routes resolve
+    // the target company from their path or the resource itself.
+    let company_id = Uuid::nil();
 
     sqlx::query(
         "INSERT INTO instance_user_roles (user_id, role) VALUES ($1, 'instance_admin') ON CONFLICT (user_id, role) DO NOTHING",
@@ -480,7 +478,9 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         wakeup_repo,
         interaction_repo,
     ));
-    let heartbeat_coordinator = Arc::new(DefaultHeartbeatService::new(pool.clone()));
+    let heartbeat_coordinator = Arc::new(
+        DefaultHeartbeatService::new(pool.clone()).with_sse_service(sse_service.clone()),
+    );
     let heartbeat_service: Arc<dyn services::HeartbeatService> = heartbeat_coordinator.clone();
     // Label service
     let label_repo: Arc<repositories::label_repository::PgLabelRepository> = Arc::new(

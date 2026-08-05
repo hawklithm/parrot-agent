@@ -476,18 +476,12 @@ async fn scoped_issue_company(
     actor: &AuthorizationActor,
     issue_id: Uuid,
 ) -> Result<Uuid, StatusCode> {
-    let company_id = actor.company_id().ok_or(StatusCode::FORBIDDEN)?;
-    let belongs_to_company = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1 AND company_id = $2)",
-    )
-    .bind(issue_id)
-    .bind(company_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    belongs_to_company
-        .then_some(company_id)
-        .ok_or(StatusCode::NOT_FOUND)
+    // Paperclip resolves the resource first and authorizes against the
+    // resource's company. This is important for local-trusted Board actors:
+    // their company_id is an instance-level sentinel, not the issue's company.
+    let company_id = issue_company_id(state, issue_id).await?;
+    crate::routes::assert_company_access(actor, company_id, true)?;
+    Ok(company_id)
 }
 
 /// GET /issues - List all issues
@@ -543,18 +537,47 @@ async fn get_issue(
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
     let company_id = actor.company_id().ok_or(StatusCode::FORBIDDEN)?;
-    let id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM issues WHERE company_id = $1 AND (id::text = $2 OR identifier = $2)",
-    )
-    .bind(company_id)
-    .bind(&reference)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let local_instance_admin = matches!(
+        actor,
+        AuthorizationActor::Board {
+            source: services::auth::ActorSource::LocalImplicit,
+            is_instance_admin: true,
+            ..
+        }
+    );
+    let (query, bind_company_id) = if local_instance_admin {
+        (
+            "SELECT id FROM issues WHERE (id::text = $1 OR identifier = $1)",
+            None,
+        )
+    } else {
+        (
+            "SELECT id FROM issues WHERE company_id = $1 AND (id::text = $2 OR identifier = $2)",
+            Some(company_id),
+        )
+    };
+    let mut issue_query = sqlx::query_scalar::<_, Uuid>(query);
+    if let Some(company_id) = bind_company_id {
+        issue_query = issue_query.bind(company_id);
+    }
+    issue_query = issue_query.bind(&reference);
+    let id = issue_query
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let issue_company_id = if local_instance_admin {
+        sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM issues WHERE id = $1")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        company_id
+    };
 
     service
-        .get(id, company_id)
+        .get(id, issue_company_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
@@ -1004,14 +1027,90 @@ async fn get_issue_cases(
 /// I3: GET /issues/:id/active-run
 async fn get_issue_active_run(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    let run = state.issue_service.get_active_run(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match run {
-        Some(r) => Ok(Json(r)),
-        None => Err(StatusCode::NOT_FOUND),
-    }
+    crate::routes::assert_company_access(&actor, company_id, true)?;
+    let issue = sqlx::query(
+        "SELECT execution_run_id, assignee_agent_id, status::text AS status
+           FROM issues WHERE id = $1 AND company_id = $2",
+    )
+    .bind(id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let execution_run_id: Option<Uuid> = issue.try_get("execution_run_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let assignee_agent_id: Option<Uuid> = issue.try_get("assignee_agent_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let status: String = issue.try_get("status").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Paperclip first follows the issue's execution lock, then falls back to
+    // the assignee's live run for an in-progress issue. In both cases the run
+    // must still be queued/running and must point back to this issue.
+    let run = if let Some(run_id) = execution_run_id {
+        sqlx::query(
+            "SELECT hr.id, hr.status::text AS status, hr.invocation_source,
+                    hr.started_at, hr.finished_at, hr.created_at, hr.agent_id,
+                    a.name AS agent_name, a.adapter_type
+               FROM heartbeat_runs hr
+               JOIN agents a ON a.id = hr.agent_id
+              WHERE hr.id = $1 AND hr.company_id = $2
+                AND hr.status IN ('queued', 'running')
+                AND hr.context_snapshot->>'issueId' = $3",
+        )
+        .bind(run_id)
+        .bind(company_id)
+        .bind(id.to_string())
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        None
+    };
+    let run = if run.is_none() && status == "in_progress" {
+        if let Some(agent_id) = assignee_agent_id {
+            sqlx::query(
+                "SELECT hr.id, hr.status::text AS status, hr.invocation_source,
+                        hr.started_at, hr.finished_at, hr.created_at, hr.agent_id,
+                        a.name AS agent_name, a.adapter_type
+                   FROM heartbeat_runs hr
+                   JOIN agents a ON a.id = hr.agent_id
+                  WHERE hr.company_id = $1 AND hr.agent_id = $2
+                    AND hr.status IN ('queued', 'running')
+                    AND hr.context_snapshot->>'issueId' = $3
+                  ORDER BY hr.created_at DESC LIMIT 1",
+            )
+            .bind(company_id)
+            .bind(agent_id)
+            .bind(id.to_string())
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        } else {
+            None
+        }
+    } else {
+        run
+    };
+    // The Paperclip contract is 200 with JSON null when the issue exists but
+    // has no queued/running heartbeat run. 404 is reserved for a missing issue.
+    let Some(run) = run else {
+        return Ok(Json(serde_json::Value::Null));
+    };
+    Ok(Json(serde_json::json!({
+        "id": run.try_get::<Uuid, _>("id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        "status": run.try_get::<String, _>("status").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        "invocationSource": run.try_get::<String, _>("invocation_source").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        "startedAt": run.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        "finishedAt": run.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        "createdAt": run.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        "agentId": run.try_get::<Uuid, _>("agent_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        "agentName": run.try_get::<String, _>("agent_name").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        "adapterType": run.try_get::<String, _>("adapter_type").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        "issueId": id,
+        "outputSilence": null
+    })))
 }
 
 /// I4: GET /issues/:id/live-runs

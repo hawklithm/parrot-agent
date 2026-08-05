@@ -290,6 +290,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::secret_remote_import::secret_remote_import_routes())
         .merge(crate::routes::skills::skill_routes())
         .merge(crate::routes::sse::sse_routes())
+        .merge(crate::routes::websocket::websocket_routes())
         .merge(crate::routes::user_directory::user_directory_routes())
         .merge(crate::routes::user_secret_definitions::user_secret_definition_routes())
         // Routes with Arc<dyn X> state type (need wrapping)

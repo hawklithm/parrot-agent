@@ -399,7 +399,12 @@ async fn get_run_log(
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let offset = q.offset.unwrap_or(0).max(0) as usize;
     let limit = q.limit_bytes.unwrap_or(256 * 1024).clamp(1, 16 * 1024 * 1024) as usize;
-    let output: Option<String> = sqlx::query_scalar("SELECT output FROM heartbeat_runs WHERE id = $1")
+    // A run can exist before its adapter has emitted any output.  The
+    // database column is nullable in that state; treat it as an empty log
+    // instead of letting sqlx decode NULL into String and return a 500.
+    let output: Option<String> = sqlx::query_scalar(
+        "SELECT COALESCE(output, '') FROM heartbeat_runs WHERE id = $1",
+    )
         .bind(run_id).fetch_optional(&state.pool).await
         .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
     let output = output.ok_or(HeartbeatRunError::NotFound(run_id))?;

@@ -78,7 +78,14 @@ async fn get_approval(
         .map_err(|_| StatusCode::NOT_FOUND)?;
     crate::routes::assert_company_access(&actor, approval.approval.company_id, true)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(serde_json::to_value(approval).unwrap_or_default()))
+    // Paperclip's detail endpoint returns the approval itself.  The service
+    // wrapper also contains linked issue ids and the readiness flag for
+    // internal callers, but exposing that wrapper breaks the UI contract:
+    // ApprovalDetail reads `id`, `type`, `payload`, and `status` at the top
+    // level.
+    Ok(Json(
+        serde_json::to_value(approval.approval).unwrap_or_default(),
+    ))
 }
 
 /// AP3: POST /companies/:company_id/approvals

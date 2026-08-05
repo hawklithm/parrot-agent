@@ -1,12 +1,14 @@
 use async_trait::async_trait;
+use crate::sse_service::{InMemorySseService, SseService};
 use chrono::{DateTime, Utc};
-use models::Agent;
+use models::{Agent, SseEvent, SseEventType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -161,6 +163,34 @@ pub enum HeartbeatError {
 pub struct DefaultHeartbeatService {
     pool: PgPool,
     children: Arc<Mutex<HashMap<Uuid, Arc<Mutex<Child>>>>>,
+    sse_service: Arc<dyn SseService>,
+}
+
+async fn publish_live_event(
+    service: &Arc<dyn SseService>,
+    company_id: Uuid,
+    event_type: &str,
+    payload: Value,
+) {
+    let event = serde_json::json!({
+        "id": Uuid::new_v4(),
+        "companyId": company_id,
+        "type": event_type,
+        "createdAt": Utc::now(),
+        "payload": payload,
+    });
+    let _ = service
+        .publish(
+            company_id,
+            "events",
+            SseEvent {
+                event_type: SseEventType::Message,
+                channel: "events".to_string(),
+                payload: event,
+                timestamp: Utc::now(),
+            },
+        )
+        .await;
 }
 
 fn shell_quote(value: &str) -> String {
@@ -205,7 +235,13 @@ impl DefaultHeartbeatService {
         Self {
             pool,
             children: Arc::new(Mutex::new(HashMap::new())),
+            sse_service: InMemorySseService::new(),
         }
+    }
+
+    pub fn with_sse_service(mut self, sse_service: Arc<dyn SseService>) -> Self {
+        self.sse_service = sse_service;
+        self
     }
 
     async fn load_agent(&self, id: Uuid) -> Result<Agent, HeartbeatError> {
@@ -297,7 +333,7 @@ impl DefaultHeartbeatService {
     }
 
     async fn execute_run(&self, run_id: Uuid, agent_id: Uuid, issue_id: Uuid, company_id: Uuid) {
-        let result = self.run_command(run_id, agent_id, issue_id).await;
+        let result = self.run_command(run_id, agent_id, issue_id, company_id).await;
         let (status, exit_code, error, output) = match result {
             Ok((code, out)) if code == 0 && !parse_adapter_outcome(&out).explicit_failure => ("succeeded", Some(code), None, out),
             Ok((code, out)) if code == 0 => {
@@ -329,6 +365,19 @@ impl DefaultHeartbeatService {
         let _ = sqlx::query(
             "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, result_json = $6, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
             .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output).bind(&result_json).execute(&self.pool).await;
+        publish_live_event(
+            &self.sse_service,
+            company_id,
+            "heartbeat.run.status",
+            serde_json::json!({
+                "runId": run_id,
+                "agentId": agent_id,
+                "issueId": issue_id,
+                "status": status,
+                "exitCode": exit_code,
+                "error": error,
+            }),
+        ).await;
         let issue_status = if status == "succeeded" { "done" } else { "todo" };
         let _ = sqlx::query(
             "UPDATE issues SET status = $2::issue_status, checkout_run_id = NULL, execution_run_id = NULL, execution_locked_at = NULL, execution_agent_name_key = NULL, completed_at = CASE WHEN $2 = 'done' THEN NOW() ELSE NULL END, updated_at = NOW() WHERE id = $1 AND company_id = $3 AND execution_run_id = $4",
@@ -354,6 +403,7 @@ impl DefaultHeartbeatService {
         run_id: Uuid,
         agent_id: Uuid,
         issue_id: Uuid,
+        company_id: Uuid,
     ) -> Result<(i32, String), String> {
         let agent = self.load_agent(agent_id).await.map_err(|e| e.to_string())?;
         let issue = sqlx::query("SELECT title, description FROM issues WHERE id = $1")
@@ -705,6 +755,17 @@ impl DefaultHeartbeatService {
             .spawn()
             .map_err(|e| e.to_string())?;
         sqlx::query("UPDATE heartbeat_runs SET status = 'running', started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND status = 'queued'").bind(run_id).execute(&self.pool).await.map_err(|e| e.to_string())?;
+        publish_live_event(
+            &self.sse_service,
+            company_id,
+            "heartbeat.run.status",
+            serde_json::json!({
+                "runId": run_id,
+                "agentId": agent_id,
+                "issueId": issue_id,
+                "status": "running",
+            }),
+        ).await;
         let child_ref = Arc::new(Mutex::new(child));
         self.children.lock().await.insert(run_id, child_ref.clone());
         let mut child = child_ref.lock().await;
@@ -722,28 +783,85 @@ impl DefaultHeartbeatService {
         }
         let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
         let mut stderr = child.stderr.take().ok_or("stderr unavailable")?;
-        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let sequence = Arc::new(AtomicU64::new(0));
+        let stdout_service = self.sse_service.clone();
+        let stderr_service = self.sse_service.clone();
+        let stdout_sequence = sequence.clone();
+        let stderr_sequence = sequence.clone();
+        let stdout_reader = async move {
+            let mut captured = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = stdout.read(&mut buffer).await.map_err(|e| e.to_string())?;
+                if read == 0 { break; }
+                captured.extend_from_slice(&buffer[..read]);
+                let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let seq = stdout_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                publish_live_event(
+                    &stdout_service,
+                    company_id,
+                    "heartbeat.run.log",
+                    serde_json::json!({
+                        "runId": run_id,
+                        "agentId": agent_id,
+                        "issueId": issue_id,
+                        "seq": seq,
+                        "stream": "stdout",
+                        "chunk": chunk,
+                        "ts": Utc::now(),
+                    }),
+                ).await;
+            }
+            Ok::<Vec<u8>, String>(captured)
+        };
+        let stderr_reader = async move {
+            let mut captured = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = stderr.read(&mut buffer).await.map_err(|e| e.to_string())?;
+                if read == 0 { break; }
+                captured.extend_from_slice(&buffer[..read]);
+                let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let seq = stderr_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                publish_live_event(
+                    &stderr_service,
+                    company_id,
+                    "heartbeat.run.log",
+                    serde_json::json!({
+                        "runId": run_id,
+                        "agentId": agent_id,
+                        "issueId": issue_id,
+                        "seq": seq,
+                        "stream": "stderr",
+                        "chunk": chunk,
+                        "ts": Utc::now(),
+                    }),
+                ).await;
+            }
+            Ok::<Vec<u8>, String>(captured)
+        };
         let wait_result = timeout(
             timeout_sec.map(Duration::from_secs).unwrap_or(Duration::from_secs(u64::MAX)),
             async {
-                let (_stdout_result, _stderr_result) =
-                    tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
-                child.wait().await
+                let (stdout_result, stderr_result, status) =
+                    tokio::join!(stdout_reader, stderr_reader, child.wait());
+                Ok::<(Vec<u8>, Vec<u8>, std::process::ExitStatus), String>(
+                    (stdout_result?, stderr_result?, status.map_err(|e| e.to_string())?),
+                )
             },
         )
         .await;
         let status = match wait_result {
-            Ok(status) => status.map_err(|e| e.to_string())?,
+            Ok(status) => status?,
             Err(_) => {
                 let _ = child.kill().await;
                 return Err(format!(
-                    "adapter timed out after {} seconds\n{}\n{}",
+                    "adapter timed out after {} seconds",
                     timeout_sec.unwrap_or(0),
-                    String::from_utf8_lossy(&out),
-                    String::from_utf8_lossy(&err),
                 ));
             }
         };
+        let (out, err, status) = status;
         let mut output = String::from_utf8_lossy(&out).to_string();
         output.push_str(&String::from_utf8_lossy(&err));
         Ok((status.code().unwrap_or(-1), output))
@@ -773,6 +891,18 @@ impl HeartbeatService for DefaultHeartbeatService {
         }
         let run_id: Uuid = sqlx::query_scalar("INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot) VALUES ($1,$2,'on_demand','queued',$3) RETURNING id")
             .bind(company_id).bind(agent_id).bind(serde_json::json!({"issueId": issue_id})).fetch_one(&self.pool).await.map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        publish_live_event(
+            &self.sse_service,
+            company_id,
+            "heartbeat.run.queued",
+            serde_json::json!({
+                "runId": run_id,
+                "agentId": agent_id,
+                "issueId": issue_id,
+                "status": "queued",
+                "invocationSource": "on_demand",
+            }),
+        ).await;
         sqlx::query("INSERT INTO agent_wakeup_requests (company_id, agent_id, status, payload) VALUES ($1,$2,'dispatched',$3)")
             .bind(company_id).bind(agent_id).bind(serde_json::json!({"issueId": issue_id, "runId": run_id})).execute(&self.pool).await.map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
         sqlx::query("UPDATE issues SET assignee_agent_id = $2, assignee_user_id = NULL, status = CASE WHEN status IN ('todo','backlog') THEN 'in_progress'::issue_status ELSE status END, checkout_run_id = $3, execution_run_id = $3, started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND company_id = $4 AND (assignee_agent_id IS NULL OR assignee_agent_id = $2) AND status NOT IN ('done','cancelled')")
@@ -866,6 +996,7 @@ impl DefaultHeartbeatService {
         Self {
             pool: self.pool.clone(),
             children: self.children.clone(),
+            sse_service: self.sse_service.clone(),
         }
     }
 }

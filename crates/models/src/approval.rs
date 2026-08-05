@@ -32,6 +32,7 @@ pub enum ApprovalStatus {
 pub struct Approval {
     pub id: Uuid,
     pub company_id: Uuid,
+    #[serde(rename = "type")]
     pub approval_type: ApprovalType,
     pub requested_by_agent_id: Option<Uuid>,
     pub requested_by_user_id: Option<Uuid>,

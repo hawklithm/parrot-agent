@@ -10,7 +10,7 @@ access = { path = "../access" }
 repositories = { path = "../repositories" }
 adapters = { path = "../adapters" }
 
-axum = { workspace = true, features = ["multipart"] }
+axum = { workspace = true, features = ["multipart", "ws"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
 tokio = { workspace = true }

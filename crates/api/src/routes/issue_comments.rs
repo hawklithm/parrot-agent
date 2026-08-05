@@ -234,16 +234,19 @@ async fn assert_issue_company(
     actor: &AuthorizationActor,
     issue_id: Uuid,
 ) -> Result<(), ApiError> {
-    let company_id = actor.company_id().ok_or_else(|| ApiError::Forbidden("Missing company scope".into()))?;
-    let visible = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1 AND company_id = $2)",
-    )
-    .bind(issue_id)
-    .bind(company_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
-    if visible { Ok(()) } else { Err(ApiError::NotFound(format!("Issue not found: {issue_id}"))) }
+    // Match Paperclip: load the issue first, then authorize using its owning
+    // company. A local-trusted Board actor intentionally has no company
+    // scope, so comparing actor.company_id() to issue.company_id is invalid.
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {issue_id}")));
+    };
+    crate::routes::assert_company_access(actor, company_id, true)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))
 }
 
 /// PUT /comments/:comment_id - Update a comment

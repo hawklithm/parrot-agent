@@ -1008,8 +1008,8 @@ pub fn middleware_from_env(pool: Arc<PgPool>) -> AuthMiddleware {
             .ok()
             .and_then(|v| Uuid::parse_str(&v).ok())
             .unwrap_or_else(Uuid::nil);
-        middleware =
-            middleware.with_resolver(Arc::new(LocalTrustedResolver::new(user_id, company_id)));
+        middleware = middleware
+            .with_resolver(Arc::new(LocalTrustedResolver::new(user_id, company_id)));
     }
     middleware
 }
