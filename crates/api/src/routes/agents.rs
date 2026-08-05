@@ -362,6 +362,7 @@ async fn update_agent(
         name: payload.name,
         role: payload.role,
         status: payload.status,
+        adapter_type: payload.adapter_type,
         adapter_config: payload.adapter_config,
         runtime_config: payload.runtime_config,
         budget_monthly_cents: payload.budget_monthly_cents,

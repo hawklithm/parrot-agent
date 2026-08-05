@@ -54,6 +54,7 @@ pub struct UpdateAgentInput {
     pub name: Option<String>,
     pub role: Option<models::AgentRole>,
     pub status: Option<AgentStatus>,
+    pub adapter_type: Option<String>,
     pub adapter_config: Option<serde_json::Value>,
     pub runtime_config: Option<serde_json::Value>,
     pub budget_monthly_cents: Option<i32>,
@@ -618,6 +619,7 @@ where
 
         // 检测是否有配置变更（在应用更新之前）
         let has_config_change = input.adapter_config.is_some()
+            || input.adapter_type.is_some()
             || input.runtime_config.is_some()
             || input.budget_monthly_cents.is_some();
 
@@ -630,6 +632,9 @@ where
         }
         if let Some(status) = input.status {
             agent.status = status;
+        }
+        if let Some(adapter_type) = input.adapter_type {
+            agent.adapter_type = adapter_type;
         }
         if let Some(config) = input.adapter_config {
             agent.adapter_config = sqlx::types::Json(config);

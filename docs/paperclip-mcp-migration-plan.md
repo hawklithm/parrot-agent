@@ -435,6 +435,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] `crates/api/src/routes/issues.rs`：Issue document GET/PUT、revision list/restore、Paperclip interaction kinds、Issue 查询 status/priority/q。
 - [x] `crates/api/src/routes/approvals.rs`：审批 status 过滤、创建/关联多个 issue、approve/reject/revision/resubmit。
 - [x] `crates/services/src/heartbeat_service.rs`：真实 gateway token 注入、URL 注入、日志脱敏、continuation summary。
+- [x] `crates/api/src/routes/agents.rs`、`crates/services/src/agent_service.rs`：补齐 `UpdateAgentSchema.adapterType` 到 service/repository 的贯通，允许在真实 CLI/adapter 验证前后安全切换 adapter 类型并恢复配置。
 - [x] `crates/services/src/issue_service_complete.rs`：补齐 Paperclip `CreateIssue` 省略 `status` 时的默认值；未分配 Issue 为 `backlog`，已分配 Agent/User 的 Issue 为 `todo`，避免旧库在 `issues.status` 非空约束下写入 NULL。
 - [x] `crates/models/src/issue.rs`、`crates/repositories/src/pg_issue_repository.rs`：`CreateIssue` 的 `executionPolicy`、`executionWorkspaceSettings` 已贯通 model/service/repository，并由工具矩阵验证持久化返回值。
 - [x] `migrations/20260805000004_create_issue_relations.sql`、`crates/models/src/issue.rs`、`crates/repositories/src/pg_issue_repository.rs`：`labelIds`、`blockedByIssueIds` 已加入事务持久化和读取 projection；`inheritExecutionWorkspaceFromIssueId` 已在 service 层完成同公司来源配置继承。
@@ -503,8 +504,8 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 
 - [x] 阅读本文全部内容。
 - [x] 确认当前工作区是否存在其他未提交修改：`git status --short`；当前 parrot-agent 工作区干净，Paperclip 工作区保留既有用户修改且未触碰。
-- [ ] 阅读 `crates/api/src/routes/tools.rs` 全文件，而不是只修改 `mcp_session_protocol`。
-- [ ] 阅读 Paperclip 的 `packages/mcp-server/src/tools.ts` 全文件，记录工具总数和每个 schema。
+- [x] 阅读 `crates/api/src/routes/tools.rs` 全文件，而不是只修改 `mcp_session_protocol`；已逐段审阅 registry、schema validator、direct service path、REST bridge、session/SSE、policy/approval、plugin/MCP connection 和 run decisions。
+- [x] 阅读 Paperclip 的 `packages/mcp-server/src/tools.ts` 全文件，记录工具总数和每个 schema；当前参考实现注册 41 个工具，已逐项对照 schema、REST path、payload 默认值和 workspace runtime 行为。
 - [x] 建立工具映射表，先标记 `implemented`、`partial`、`missing`。
 - [x] 先实现一个完整 vertical slice：`paperclipGetIssue`、`paperclipAddComment`、`paperclipCreateIssue`。
 - [ ] 用真实 Claude CLI 验证 vertical slice 后，再批量迁移剩余工具。
