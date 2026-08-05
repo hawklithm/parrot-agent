@@ -430,6 +430,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] `crates/api/src/routes/tools.rs`：41 个 Paperclip 工具注册、参数校验、工具映射、策略/审计、MCP session JSON-RPC 入口。
 - [x] `crates/api/src/paperclip_internal.rs`：专用内部 REST contract bridge，统一 gateway token/run header、API URL 归一化、JSON body 和错误状态处理。
 - [x] `scripts/paperclip-mcp-tool-matrix-smoke.mjs`：逐项调用全部 41 个 Paperclip 工具，验证成功/结构化错误路径。
+- [x] `scripts/claude-mcp-vertical-slice-smoke.mjs`：启动真实 Claude CLI，使用 run-scoped gateway token，要求并断言 `paperclipGetIssue`、`paperclipAddComment`、`paperclipCreateIssue` 三个真实 tool use；模型代理拒绝时保留失败证据而不误报成功。
 - [x] `migrations/20260805000003_complete_goals_compatibility.sql`：补齐旧 goals 表的 `name`、`priority` 和 `achieved` 状态兼容字段。
 - [x] `crates/api/src/mcp/mod.rs`：`McpToolDefinition`、run-scoped `McpInvocationContext` 和 request/notification 分类。
 - [x] `crates/api/src/routes/issues.rs`：Issue document GET/PUT、revision list/restore、Paperclip interaction kinds、Issue 查询 status/priority/q。

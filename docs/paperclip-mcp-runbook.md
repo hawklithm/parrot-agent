@@ -36,6 +36,10 @@ BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' \
 BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' \
   node scripts/paperclip-mcp-business-smoke.mjs
 
+# 真实 Claude CLI vertical slice：要求 Claude 实际调用 GetIssue、AddComment、CreateIssue
+BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' ISSUE_ID='<issue>' \
+  node scripts/claude-mcp-vertical-slice-smoke.mjs
+
 BASE_URL=http://127.0.0.1:3102 TOKEN='<ptg_token>' \
 ISSUE_ID='<issue>' AGENT_ID='<agent>' \
   node scripts/paperclip-mcp-security-smoke.mjs
