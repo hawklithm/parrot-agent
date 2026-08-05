@@ -517,13 +517,13 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 
 - [x] Paperclip 工具清单中的每个工具都能在 `tools/list` 中找到；registry test 和 business smoke 均断言 41 个内置工具。
 - [x] 每个工具都有真实 input schema，而不是空 object；registry test 断言每项都有 `inputSchema.type`，并由 typed registry 提供字段 schema。
-- [ ] 每个工具都能执行成功路径和错误路径。
-- [ ] 所有写工具都正确携带并校验 run context。
-- [ ] 所有工具调用都经过 company/agent/run 权限检查。
-- [ ] 工具策略和审批行为与 Paperclip contract 一致。
+- [x] 每个工具都能执行成功路径和错误路径；最新矩阵对 41 个工具分别执行成功路径和 invalid-arguments 路径。
+- [x] 所有写工具都正确携带并校验 run context；gateway token/session、run header 和 security smoke 已覆盖。
+- [x] 所有工具调用都经过 company/agent/run 权限检查；跨公司、跨 Agent、跨 run 和过期/撤销 token 已由 security smoke 覆盖。
+- [x] 工具策略和审批行为与 Paperclip contract 一致；deny、require-approval、approval decline 和 Agent 禁止审批路径已验证。
 - [x] MCP session、JSON-RPC、Streamable HTTP 行为通过自动化测试；见 API 单测和 `scripts/mcp-gateway-contract-smoke.sh`。
 - [ ] Claude 和 Codex 本地 CLI 都能完成至少一次完整任务。
 - [x] 没有明文 token、API key 或敏感 prompt 泄露到日志；adapter shell command 使用脱敏占位符，子进程 argv 才保留真实值。
 - [x] 迁移后的数据库可以从旧 `parrot_agent_dev` 安全升级；本地数据库启动时 migrations 已成功执行，旧 auth/comment/interaction 字段兼容迁移已落地。
-- [ ] `cargo check`、相关测试和 `git diff --check` 全部通过。
-- [ ] 迁移结果已提交，并在提交信息中列出工具覆盖范围和已知限制。
+- [x] 迁移相关 `cargo check`、API/models 测试和 `git diff --check` 全部通过；workspace 仍有文档记录的 19 个既存 services 失败，不能宣称全量测试绿。
+- [x] 迁移结果已提交；提交 `c15a43b` 和后续文档提交信息列出工具覆盖范围与已知限制。
