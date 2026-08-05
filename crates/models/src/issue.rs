@@ -336,6 +336,8 @@ pub struct CreateIssueInput {
     pub billing_code: Option<String>,
     pub execution_workspace_id: Option<Uuid>,
     pub execution_workspace_preference: Option<String>,
+    pub execution_policy: Option<IssueExecutionPolicy>,
+    pub execution_workspace_settings: Option<serde_json::Value>,
     pub created_by_agent_id: Option<Uuid>,
     pub created_by_user_id: Option<Uuid>,
     pub assignee_adapter_overrides: Option<serde_json::Value>,

@@ -113,8 +113,18 @@ await expectSuccess("paperclipLinkIssueApproval", { issueId, approvalId }, sessi
 await expectSuccess("paperclipUnlinkIssueApproval", { issueId, approvalId }, sessionId);
 await expectError("paperclipApprovalDecision", { approvalId, action: "reject", decisionNote: "agent must not decide approvals" }, sessionId);
 
-const created = await expectSuccess("paperclipCreateIssue", { title: "tool matrix child", description: "matrix", status: "todo", priority: "low" }, sessionId);
+const created = await expectSuccess("paperclipCreateIssue", {
+  title: "tool matrix child",
+  description: "matrix",
+  status: "todo",
+  priority: "low",
+  executionPolicy: { maxRetries: 2, timeoutSeconds: 90, workspacePreference: "existing" },
+  executionWorkspaceSettings: { mode: "persistent", strategy: "existing" },
+}, sessionId);
 const createdIssueId = created.id;
+if (created.executionPolicy?.maxRetries !== 2 || created.executionWorkspaceSettings?.mode !== "persistent") {
+  throw new Error(`create issue execution fields were not persisted: ${JSON.stringify(created)}`);
+}
 await expectSuccess("paperclipUpdateIssue", { issueId: createdIssueId, title: "tool matrix child updated" }, sessionId);
 await expectSuccess("paperclipCheckoutIssue", { issueId: createdIssueId, expectedStatuses: ["todo"] }, sessionId);
 await expectSuccess("paperclipReleaseIssue", { issueId: createdIssueId, targetStatus: "done", result: "matrix complete" }, sessionId);

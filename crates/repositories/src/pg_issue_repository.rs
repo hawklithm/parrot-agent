@@ -423,6 +423,12 @@ impl IssueRepository for PgIssueRepository {
     }
 
     async fn create(&self, input: CreateIssueInput) -> Result<Issue, RepositoryError> {
+        let execution_policy = input
+            .execution_policy
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| RepositoryError::InvalidData(format!("invalid execution policy: {error}")))?;
         let issue = sqlx::query_as::<_, Issue>(
             r#"
             INSERT INTO issues (
@@ -432,6 +438,7 @@ impl IssueRepository for PgIssueRepository {
                 created_by_agent_id, created_by_user_id, responsible_user_id,
                 origin_kind, origin_id, origin_run_id, request_depth,
                 billing_code, assignee_adapter_overrides,
+                execution_policy, execution_workspace_settings,
                 execution_workspace_id, execution_workspace_preference
             )
             VALUES (
@@ -441,7 +448,8 @@ impl IssueRepository for PgIssueRepository {
                 $13, $14, $15,
                 $16, $17, $18, $19,
                 $20, $21,
-                $22, $23
+                $22, $23,
+                $24, $25
             )
             RETURNING *
             "#,
@@ -470,6 +478,8 @@ impl IssueRepository for PgIssueRepository {
         .bind(input.request_depth.unwrap_or(0))
         .bind(input.billing_code.as_ref())
         .bind(&input.assignee_adapter_overrides)
+        .bind(&execution_policy)
+        .bind(&input.execution_workspace_settings)
         .bind(input.execution_workspace_id)
         .bind(input.execution_workspace_preference.as_ref())
         .fetch_one(&self.pool)
