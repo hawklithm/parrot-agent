@@ -49,7 +49,11 @@ impl CodexLocalIsolation {
         }
 
         // 如果已经配置了 CODEX_HOME，不覆盖
-        if Self::codex_local_env_key_configured(existing_env.get("CODEX_HOME")) {
+        if existing_env
+            .get("CODEX_HOME")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
             return Value::Object(config);
         }
 

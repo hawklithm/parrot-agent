@@ -114,6 +114,9 @@ impl AdapterConfigNormalizer {
         if !obj.contains_key("model") {
             obj.insert("model".to_string(), json!("DeepSeek-V4-Flash"));
         }
+        if !obj.contains_key("command") {
+            obj.insert("command".to_string(), json!("claude"));
+        }
 
         // 标准化引擎配置
         if let Some(engine) = obj.get("engine") {

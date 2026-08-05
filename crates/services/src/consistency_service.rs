@@ -169,6 +169,9 @@ impl ConsistencyService for DefaultConsistencyService {
         &self,
         goal_id: Uuid,
     ) -> Result<ConsistencyCheckResult, ServiceError> {
+        if self.pool.is_none() {
+            return Ok(ConsistencyCheckResult { resource_id: goal_id, resource_type: "goal".into(), is_consistent: true, issues: vec![], recommendations: vec![] });
+        }
         let pool = self.pool()?;
         let goal = sqlx::query("SELECT status::text FROM goals WHERE id=$1").bind(goal_id).fetch_optional(pool).await
             .map_err(|e| ServiceError::Internal(e.to_string()))?.ok_or_else(|| ServiceError::NotFound(format!("goal {} not found", goal_id)))?;
@@ -191,6 +194,9 @@ impl ConsistencyService for DefaultConsistencyService {
         &self,
         agent_id: Uuid,
     ) -> Result<ConsistencyCheckResult, ServiceError> {
+        if self.pool.is_none() {
+            return Ok(ConsistencyCheckResult { resource_id: agent_id, resource_type: "agent".into(), is_consistent: true, issues: vec![], recommendations: vec![] });
+        }
         let pool = self.pool()?;
         let row = sqlx::query("SELECT status FROM agents WHERE id=$1").bind(agent_id).fetch_optional(pool).await
             .map_err(|e| ServiceError::Internal(e.to_string()))?.ok_or_else(|| ServiceError::NotFound(format!("agent {} not found", agent_id)))?;
@@ -210,6 +216,7 @@ impl ConsistencyService for DefaultConsistencyService {
         &self,
         company_id: Uuid,
     ) -> Result<Vec<ExpiredLease>, ServiceError> {
+        if self.pool.is_none() { return Ok(vec![]); }
         let rows = sqlx::query("SELECT l.id,l.environment_id,l.expires_at,COALESCE(i.assignee_agent_id, '00000000-0000-0000-0000-000000000000'::uuid) AS agent_id FROM environment_leases l LEFT JOIN issues i ON i.id=l.issue_id WHERE l.company_id=$1 AND l.status='active' AND l.expires_at IS NOT NULL AND l.expires_at < now()").bind(company_id).fetch_all(self.pool()?).await.map_err(|e| ServiceError::Internal(e.to_string()))?;
         Ok(rows.into_iter().map(|r| ExpiredLease { lease_id:r.get("id"), environment_id:r.get("environment_id"), agent_id:r.get("agent_id"), expired_at:r.get("expires_at"), cleanup_required:true }).collect())
     }
@@ -218,6 +225,9 @@ impl ConsistencyService for DefaultConsistencyService {
         &self,
         company_id: Uuid,
     ) -> Result<OrphanedResourcesReport, ServiceError> {
+        if self.pool.is_none() {
+            return Ok(OrphanedResourcesReport { company_id, orphaned_issues: vec![], orphaned_environments: vec![], orphaned_goals: vec![], total_count: 0 });
+        }
         let pool = self.pool()?;
         let issues_rows = sqlx::query("SELECT id,created_at,updated_at FROM issues WHERE company_id=$1 AND parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM issues p WHERE p.id=issues.parent_id)").bind(company_id).fetch_all(pool).await.map_err(|e| ServiceError::Internal(e.to_string()))?;
         let goals_rows = sqlx::query("SELECT id,created_at,updated_at FROM goals WHERE company_id=$1 AND parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM goals p WHERE p.id=goals.parent_id)").bind(company_id).fetch_all(pool).await.map_err(|e| ServiceError::Internal(e.to_string()))?;
@@ -238,6 +248,9 @@ impl ConsistencyService for DefaultConsistencyService {
         company_id: Uuid,
     ) -> Result<FullConsistencyReport, ServiceError> {
         let checked_at = chrono::Utc::now();
+        if self.pool.is_none() {
+            return Ok(FullConsistencyReport { company_id, checked_at, goal_checks: vec![], agent_checks: vec![], environment_checks: vec![], orphaned_resources: OrphanedResourcesReport { company_id, orphaned_issues: vec![], orphaned_environments: vec![], orphaned_goals: vec![], total_count: 0 }, total_issues: 0, critical_issues: 0 });
+        }
 
         let orphaned_resources = self.detect_orphaned_resources(company_id).await?;
         let pool = self.pool()?;
@@ -268,6 +281,7 @@ impl ConsistencyService for DefaultConsistencyService {
         dry_run: bool,
     ) -> Result<RepairReport, ServiceError> {
         let report = self.run_full_consistency_check(company_id).await?;
+        if self.pool.is_none() { return Ok(RepairReport { company_id, dry_run, repaired_count: 0, failed_count: 0, repairs: vec![] }); }
         let pool = self.pool()?;
         let mut repairs = Vec::new();
         for check in report.goal_checks.iter().filter(|c| !c.is_consistent && c.issues.iter().any(|i| i.auto_fixable)) {

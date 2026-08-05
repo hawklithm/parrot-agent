@@ -191,18 +191,19 @@ impl WorkspaceCommandAuthzService for DefaultCommandAuthzService {
     ) -> AuthorizationResult<AuthzDecision> {
         let command = request.command.trim();
 
-        // Check against denied patterns first
-        if Self::matches_any_pattern(command, &self.policy.denied_commands) {
-            return Ok(AuthzDecision::deny(format!(
-                "Command matches denied pattern: {}",
-                command
-            )));
-        }
-
         // Check for dangerous commands
         if Self::is_dangerous_command(command) {
             return Ok(AuthzDecision::deny(format!(
                 "Command is potentially dangerous: {}",
+                command
+            )));
+        }
+
+        // Check against denied patterns after the semantic danger check so
+        // callers receive the stronger reason for commands such as `rm -rf /`.
+        if Self::matches_any_pattern(command, &self.policy.denied_commands) {
+            return Ok(AuthzDecision::deny(format!(
+                "Command matches denied pattern: {}",
                 command
             )));
         }

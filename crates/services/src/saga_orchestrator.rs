@@ -485,7 +485,11 @@ mod tests {
                 "agent_hiring".to_string(),
                 Uuid::new_v4(),
                 Uuid::new_v4(),
-                serde_json::json!({"agent_id": "test"}),
+                serde_json::json!({
+                    "agent_id": Uuid::new_v4().to_string(),
+                    "environment_id": Uuid::new_v4().to_string(),
+                    "issue_id": Uuid::new_v4().to_string(),
+                }),
             )
             .await;
 

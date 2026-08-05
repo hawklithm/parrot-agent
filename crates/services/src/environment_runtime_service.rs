@@ -172,7 +172,30 @@ impl EnvironmentRuntimeService for DefaultEnvironmentRuntimeService {
         agent_id: Option<Uuid>,
         lease_metadata: JsonValue,
     ) -> Result<EnvironmentLease, EnvironmentRuntimeError> {
-        // 占位实现：创建一个临时租约
+        // The no-pool constructor is the local/test runtime. Keep it useful
+        // without pretending that a database-backed environment exists.
+        if self.pool.is_none() {
+            if environment_id != "env-local" {
+                return Err(EnvironmentRuntimeError::EnvironmentNotFound(environment_id.to_string()));
+            }
+            let now = chrono::Utc::now();
+            return Ok(EnvironmentLease {
+                id: Uuid::new_v4(),
+                environment_id: environment_id.to_string(),
+                agent_id,
+                issue_id: lease_metadata
+                    .get("issueId")
+                    .or_else(|| lease_metadata.get("issue_id"))
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| Uuid::parse_str(value).ok()),
+                status: LeaseStatus::Active,
+                acquired_at: now,
+                expires_at: Some(now + chrono::Duration::hours(1)),
+                released_at: None,
+                failure_reason: None,
+                metadata: lease_metadata,
+            });
+        }
         let pool = self.pool()?;
         let environment_id = Self::parse_id(environment_id, "environment_id")?;
         let env = sqlx::query("SELECT company_id,driver,status FROM environments WHERE id=$1")
@@ -193,6 +216,9 @@ impl EnvironmentRuntimeService for DefaultEnvironmentRuntimeService {
         lease_id: Uuid,
         status: LeaseStatus,
     ) -> Result<(), EnvironmentRuntimeError> {
+        if self.pool.is_none() {
+            return Ok(());
+        }
         // 占位实现：直接返回成功
         let status = match status { LeaseStatus::Released=>"released", LeaseStatus::Expired=>"expired", LeaseStatus::Failed=>"failed", LeaseStatus::Active=>"active" };
         let result=sqlx::query("UPDATE environment_leases SET status=$2,released_at=CASE WHEN $2 <> 'active' THEN COALESCE(released_at,now()) ELSE released_at END,cleanup_status=CASE WHEN $2 <> 'active' THEN 'pending' ELSE cleanup_status END,updated_at=now() WHERE id=$1").bind(lease_id).bind(status).execute(self.pool()?).await?;
@@ -217,6 +243,19 @@ impl EnvironmentRuntimeService for DefaultEnvironmentRuntimeService {
         environment_id: &str,
         adapter_type: &str,
     ) -> Result<ExecutionTargetResult, EnvironmentRuntimeError> {
+        if self.pool.is_none() {
+            if environment_id != "env-local" {
+                return Err(EnvironmentRuntimeError::EnvironmentNotFound(environment_id.to_string()));
+            }
+            let mut metadata = HashMap::new();
+            metadata.insert("environmentId".into(), serde_json::json!(environment_id));
+            metadata.insert("adapterType".into(), serde_json::json!(adapter_type));
+            return Ok(ExecutionTargetResult {
+                target_type: "local".into(),
+                connection_info: serde_json::json!({"environment_id": environment_id, "adapter_type": adapter_type}),
+                metadata,
+            });
+        }
         let id=Self::parse_id(environment_id,"environment_id")?;
         let row=sqlx::query("SELECT driver,config FROM environments WHERE id=$1 AND status <> 'archived'").bind(id).fetch_optional(self.pool()?).await?.ok_or_else(|| EnvironmentRuntimeError::EnvironmentNotFound(environment_id.into()))?;
         let driver:String=row.get("driver"); let config:JsonValue=row.get("config");

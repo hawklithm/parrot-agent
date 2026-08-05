@@ -5,6 +5,9 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 use uuid::Uuid;
 use sqlx::{PgPool, Row};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Error)]
 pub enum WorkspaceOperationError {
@@ -252,14 +255,15 @@ impl OperationRecorder {
 /// Default implementation of workspace operation service
 pub struct DefaultWorkspaceOperationService {
     pool: Option<PgPool>,
+    memory: Arc<Mutex<HashMap<Uuid, WorkspaceOperation>>>,
 }
 
 impl DefaultWorkspaceOperationService {
     pub fn new() -> Self {
-        Self { pool: None }
+        Self { pool: None, memory: Arc::new(Mutex::new(HashMap::new())) }
     }
     pub fn with_pool(pool: PgPool) -> Self {
-        Self { pool: Some(pool) }
+        Self { pool: Some(pool), memory: Arc::new(Mutex::new(HashMap::new())) }
     }
     fn pool(&self) -> WorkspaceOperationResult<&PgPool> {
         self.pool.as_ref().ok_or_else(|| WorkspaceOperationError::InternalError("database pool is not configured".into()))
@@ -294,6 +298,23 @@ impl WorkspaceOperationService for DefaultWorkspaceOperationService {
         &self,
         request: CreateOperationRequest,
     ) -> WorkspaceOperationResult<WorkspaceOperation> {
+        if self.pool.is_none() {
+            let operation = WorkspaceOperation {
+                id: Uuid::new_v4(),
+                company_id: request.company_id,
+                execution_workspace_id: request.execution_workspace_id,
+                phase: request.phase,
+                command: request.command,
+                status: OperationStatus::InProgress,
+                started_at: Utc::now(),
+                completed_at: None,
+                duration_ms: None,
+                metadata: request.metadata,
+                error_message: None,
+            };
+            self.memory.lock().await.insert(operation.id, operation.clone());
+            return Ok(operation);
+        }
         let pool = self.pool()?;
         let row = sqlx::query("INSERT INTO workspace_operations (company_id, execution_workspace_id, phase, command, metadata) VALUES ($1,$2,$3,$4,$5) RETURNING id, company_id, execution_workspace_id, phase, command, status, metadata, started_at, finished_at, stderr_excerpt").bind(request.company_id).bind(request.execution_workspace_id).bind(request.phase.to_string()).bind(request.command).bind(request.metadata).fetch_one(pool).await?;
         Self::from_row(&row)

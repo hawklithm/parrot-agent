@@ -672,7 +672,9 @@ mod tests {
             assignee_agent_id: None,
             assignee_user_id: None,
             origin_kind: origin_kind.map(|s| s.to_string()),
-            created_at: Some(Utc::now()),
+            // Keep classifier fixtures outside the first-run grace window;
+            // dedicated integration coverage exercises that guard separately.
+            created_at: Some(Utc::now() - chrono::Duration::seconds(60)),
             updated_at: Some(Utc::now()),
         }
     }
@@ -787,7 +789,7 @@ mod tests {
                 "stop:{}:{}:{}",
                 Uuid::nil(),
                 root_id,
-                format!("{}:done:::{}", leaf_id, format!("Issue {}", leaf_id))
+                format!("{}:done::::{}", leaf_id, format!("Issue {}", leaf_id))
             )),
             issues: vec![
                 make_issue(root_id, None, "todo", None),

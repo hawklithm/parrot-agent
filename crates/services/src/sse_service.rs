@@ -113,6 +113,8 @@ impl SseStreamEvent {
 /// Returns: (parsed_frames, remaining_buffer)
 pub fn parse_sse_frames(buffer: &str) -> (Vec<SseFrame>, String) {
     let normalized = buffer.replace("\r\n", "\n");
+    let complete_end = normalized.rfind("\n\n").map(|index| index + 2);
+    let complete_buffer = complete_end.map_or("", |end| &normalized[..end]);
     let mut frames = Vec::new();
     let mut current_frame = SseFrame {
         event: None,
@@ -121,10 +123,7 @@ pub fn parse_sse_frames(buffer: &str) -> (Vec<SseFrame>, String) {
         retry: None,
     };
     let mut data_lines = Vec::new();
-    let mut pos = 0;
-
-    for line in normalized.lines() {
-        pos += line.len() + 1; // +1 for newline
+    for line in complete_buffer.lines() {
 
         // Skip comments
         if line.starts_with(':') {
@@ -169,11 +168,9 @@ pub fn parse_sse_frames(buffer: &str) -> (Vec<SseFrame>, String) {
     }
 
     // Return remaining buffer (incomplete frame)
-    let remaining = if pos < normalized.len() {
-        normalized[pos..].to_string()
-    } else {
-        String::new()
-    };
+    let remaining = complete_end
+        .map(|end| normalized[end..].to_string())
+        .unwrap_or(normalized);
 
     (frames, remaining)
 }
