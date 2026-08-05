@@ -17,6 +17,7 @@ const headers = {
   "content-type": "application/json",
 };
 let sequence = 1;
+const invokedTools = new Set();
 async function post(body, sessionId) {
   const requestHeaders = { ...headers };
   if (sessionId) requestHeaders["mcp-session-id"] = sessionId;
@@ -27,6 +28,7 @@ async function post(body, sessionId) {
   return { status: response.status, value, sessionId: response.headers.get("mcp-session-id") ?? sessionId };
 }
 async function call(name, arguments_, sessionId) {
+  invokedTools.add(name);
   const response = await post({
     jsonrpc: "2.0", id: sequence++, method: "tools/call",
     params: { name, arguments: arguments_ },
@@ -82,6 +84,7 @@ if (!documentKey) {
 await expectSuccess("paperclipGetDocument", { issueId, key: documentKey }, sessionId);
 const revisions = await expectSuccess("paperclipListDocumentRevisions", { issueId, key: documentKey }, sessionId, Array.isArray);
 if (revisions[0]?.id) await expectSuccess("paperclipRestoreIssueDocumentRevision", { issueId, key: documentKey, revisionId: revisions[0].id }, sessionId);
+else await expectError("paperclipRestoreIssueDocumentRevision", { issueId, key: documentKey, revisionId: "00000000-0000-0000-0000-000000000000" }, sessionId);
 
 const projects = await expectSuccess("paperclipListProjects", {}, sessionId, Array.isArray);
 if (projects[0]?.id) await expectSuccess("paperclipGetProject", { projectId: projects[0].id }, sessionId);
@@ -124,4 +127,10 @@ await expectSuccess("paperclipRequestCheckboxConfirmation", { issueId, continuat
 await expectSuccess("paperclipUpsertIssueDocument", { issueId, key: "matrix-smoke", body: "# matrix updated" }, sessionId);
 await expectSuccess("paperclipApiRequest", { method: "GET", path: `/issues/${issueId}` }, sessionId, (value) => value?.id === issueId);
 
-console.log(JSON.stringify({ passed: true, invokedToolCount: tools.length, issueId, createdIssueId, approvalId, expectedMissingResourceErrors: 3 }));
+const listedNames = new Set(tools.map((tool) => tool.name));
+const missingInvocations = [...listedNames].filter((name) => !invokedTools.has(name));
+if (missingInvocations.length > 0 || invokedTools.size !== listedNames.size) {
+  throw new Error(`not every Paperclip tool was invoked: missing=${JSON.stringify(missingInvocations)} invoked=${invokedTools.size}`);
+}
+
+console.log(JSON.stringify({ passed: true, listedToolCount: tools.length, invokedToolCount: invokedTools.size, issueId, createdIssueId, approvalId, expectedMissingResourceErrors: 3 }));

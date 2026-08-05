@@ -410,6 +410,7 @@ error mapping
 - [x] `crates/api/src/routes/issues.rs`：Issue document GET/PUT、revision list/restore、Paperclip interaction kinds、Issue 查询 status/priority/q。
 - [x] `crates/api/src/routes/approvals.rs`：审批 status 过滤、创建/关联多个 issue、approve/reject/revision/resubmit。
 - [x] `crates/services/src/heartbeat_service.rs`：真实 gateway token 注入、URL 注入、日志脱敏、continuation summary。
+- [x] `crates/services/src/issue_service_complete.rs`：补齐 Paperclip `CreateIssue` 省略 `status` 时的默认值；未分配 Issue 为 `backlog`，已分配 Agent/User 的 Issue 为 `todo`，避免旧库在 `issues.status` 非空约束下写入 NULL。
 - [x] `crates/services/src/auth/middleware.rs`：`ptg_` token hash 查询、过期/撤销校验和 Agent actor 解析。
 - [x] `migrations/20260804000001_complete_auth_users.sql`：旧数据库缺失 auth user 字段的兼容迁移。
 - [x] `migrations/20260804000002_complete_issue_interactions.sql`：Paperclip interaction kinds、payload、幂等键和 continuation policy。
@@ -432,9 +433,11 @@ error mapping
 - [x] 本地 Claude adapter 真实启动成功，MCP URL 指向当前 parrot-agent 端口，并在 run 输出中加载 Paperclip 工具集合。
 - [x] MCP 协议手工验证覆盖 initialize、initialized notification、tools/list、tools/call、invalid args、unknown method、malformed JSON、JSON/SSE response；API 单元测试当前 60 个通过。
 - [x] `scripts/paperclip-mcp-business-smoke.mjs` 已完成 41 个内置工具集合检查，并实际执行 Issue、Comment、Document、Interaction、Approval、Heartbeat、workspace runtime 和 `paperclipApiRequest` 成功路径；内部 bridge 重构后再次通过。
+- [x] `scripts/paperclip-mcp-tool-matrix-smoke.mjs` 已在保持 heartbeat run 活跃的本地 adapter 下通过：`listedToolCount=41`、`invokedToolCount=41`，成功路径与预期错误路径均已执行。
 - [x] `scripts/paperclip-mcp-checkout-release-smoke.mjs` 已验证 checkout/release 的执行锁、run 绑定、状态转换和字段清理。
 - [x] `scripts/mcp-gateway-contract-smoke.sh` 已验证 Streamable HTTP 的 JSON-RPC、批量、Accept 协商、SSE GET/KeepAlive 和 DELETE 生命周期。
 - [x] `scripts/paperclip-mcp-security-smoke.mjs` 已验证跨 Agent checkout、危险 API path、错误 MCP session id、错误 token、跨公司、跨 run、deny、require-approval 和 approval decline；过期 token 测试支持 `TEST_EXPIRY=1` 长耗时模式。
+- [x] `scripts/paperclip-mcp-tool-matrix-smoke.mjs` 现在在结束时断言 41 个 registry 工具全部至少被调用一次；资源缺失和 Agent 审批决策工具使用预期错误路径。
 - [x] heartbeat run 完成后可读取 `continuation-summary` 文档。
 - [x] `cargo test --workspace --no-fail-fast` 已执行：208 个测试通过，19 个既存 services 测试失败，另有 1 个 board API timing-sensitive 测试失败；失败集中在 `adapter_config_normalizer`、`codex_local_isolation`、`consistency_service`、授权策略和常量时间比较等非本次 MCP 迁移路径，不能将 workspace 全绿作为当前完成证据。
 - [ ] 尚未完成真实 Claude 业务成功路径：本地 `deepseek-v4-flash` 两次 run 均正常退出并加载 41 个工具，但返回“检测到敏感内容”且 `toolCallCount=0`（run `3a87620d-021b-4d1e-acd9-7de202e0c404`、`8b113e05-0647-4119-8de9-302e931e1853`）。因此 `paperclipGetIssue`、`paperclipAddComment` 和创建子任务的 Claude 端到端 checkbox 仍保持未完成；41 工具逐项矩阵、核心 AppState service 路径、Goal 旧库兼容 migration、Codex 业务长流程、跨公司/跨 run 负向测试、checkout/release 矩阵、策略 deny/approval 矩阵和专用内部 REST bridge 已通过；协议 SSE 长连接已由 `scripts/mcp-gateway-contract-smoke.sh` 验证。

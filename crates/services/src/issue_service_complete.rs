@@ -59,6 +59,22 @@ pub struct CreateIssueInput {
     pub goal_id: Option<Uuid>,
 }
 
+/// Match Paperclip's create-issue defaulting contract.
+///
+/// Assigned issues are immediately runnable and therefore default to `todo`;
+/// unassigned issues remain in the backlog.  The REST/MCP boundary may omit
+/// status, so this must be resolved before the repository INSERT rather than
+/// relying on a nullable database bind.
+fn resolve_create_issue_status(input: &CreateIssueInput) -> IssueStatus {
+    input.status.unwrap_or_else(|| {
+        if input.assignee_agent_id.is_some() || input.assignee_user_id.is_some() {
+            IssueStatus::Todo
+        } else {
+            IssueStatus::Backlog
+        }
+    })
+}
+
 /// Update issue input
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateIssueInput {
@@ -261,6 +277,7 @@ impl IssueService for DefaultIssueService {
             }
         }
 
+        let status = resolve_create_issue_status(&input);
         let models_input = models::issue::CreateIssueInput {
             company_id: input.company_id,
             project_id: input.project_id,
@@ -268,7 +285,7 @@ impl IssueService for DefaultIssueService {
             goal_id: input.goal_id,
             title: input.title,
             description: input.description,
-            status: input.status,
+            status: Some(status),
             priority: input.priority,
             parent_id: input.parent_id,
             assignee_agent_id: input.assignee_agent_id,
@@ -1122,5 +1139,31 @@ mod tests {
         assert!(service.validate_status_transition(&IssueStatus::Done, &IssueStatus::Todo).is_err());
         assert!(service.validate_status_transition(&IssueStatus::Todo, &IssueStatus::Done).is_err());
         assert!(service.validate_status_transition(&IssueStatus::Cancelled, &IssueStatus::InProgress).is_err());
+    }
+
+    #[test]
+    fn test_create_issue_status_matches_paperclip_defaults() {
+        let base = CreateIssueInput {
+            company_id: Uuid::nil(),
+            project_id: None,
+            title: "issue".to_string(),
+            description: None,
+            status: None,
+            priority: None,
+            assigned_to: None,
+            assignee_agent_id: None,
+            assignee_user_id: None,
+            parent_id: None,
+            goal_id: None,
+        };
+        assert_eq!(resolve_create_issue_status(&base), IssueStatus::Backlog);
+
+        let mut assigned = base.clone();
+        assigned.assignee_agent_id = Some(Uuid::new_v4());
+        assert_eq!(resolve_create_issue_status(&assigned), IssueStatus::Todo);
+
+        let mut explicit = base;
+        explicit.status = Some(IssueStatus::Blocked);
+        assert_eq!(resolve_create_issue_status(&explicit), IssueStatus::Blocked);
     }
 }
