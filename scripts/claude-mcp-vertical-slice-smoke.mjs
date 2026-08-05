@@ -14,6 +14,7 @@ const token = process.env.TOKEN;
 const issueId = process.env.ISSUE_ID;
 const model = process.env.CLAUDE_MODEL ?? "deepseek-v4-flash";
 const claudeBin = process.env.CLAUDE_BIN ?? "claude";
+const systemPrompt = process.env.CLAUDE_SYSTEM_PROMPT;
 
 if (!token) throw new Error("TOKEN is required");
 if (!issueId) throw new Error("ISSUE_ID is required");
@@ -36,9 +37,7 @@ const prompt = [
   "Do not call any other tools. Report the returned IDs after the calls.",
 ].join("\n");
 
-const child = spawn(
-  claudeBin,
-  [
+const args = [
     "--mcp-config", mcpConfig,
     "--model", model,
     "--print", "-",
@@ -46,7 +45,12 @@ const child = spawn(
     "--verbose",
     "--dangerously-skip-permissions",
     "--max-turns", "10",
-  ],
+  ];
+if (systemPrompt) args.push("--system-prompt", systemPrompt);
+
+const child = spawn(
+  claudeBin,
+  args,
   { stdio: ["pipe", "pipe", "pipe"] },
 );
 

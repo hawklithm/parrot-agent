@@ -88,7 +88,10 @@ if (process.env.CROSS_COMPANY_ISSUE_ID) {
     params: { name: "paperclipListIssues", arguments: { companyId: process.env.CROSS_COMPANY_ID } },
   }, sessionId);
   if (foreignList.status >= 400 || foreignList.value.error) throw new Error(`companyId filter request failed unexpectedly: ${JSON.stringify(foreignList)}`);
-  const listedIssues = foreignList.value.result?.structuredContent;
+  const listedIssues = foreignList.value.result?.structuredContent ?? (() => {
+    const text = foreignList.value.result?.content?.find((item) => item.type === "text")?.text;
+    try { return text === undefined ? undefined : JSON.parse(text); } catch { return text; }
+  })();
   if (Array.isArray(listedIssues) && listedIssues.some((item) => item.id === process.env.CROSS_COMPANY_ISSUE_ID)) {
     throw new Error("cross-company issue appeared in session-scoped list");
   }

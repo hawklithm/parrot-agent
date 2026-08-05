@@ -34,9 +34,13 @@ async function call(name, arguments_, sessionId) {
     params: { name, arguments: arguments_ },
   }, sessionId);
   const result = response.value.result;
+  const structuredContent = result?.structuredContent ?? (() => {
+    const text = result?.content?.find((item) => item.type === "text")?.text;
+    try { return text === undefined ? undefined : JSON.parse(text); } catch { return text; }
+  })();
   return {
     ok: response.status < 400 && !response.value.error && !result?.isError,
-    value: result?.structuredContent,
+    value: structuredContent,
     response,
   };
 }

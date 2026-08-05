@@ -43,7 +43,10 @@ async function call(name, arguments_, sessionId) {
   }, sessionId);
   if (result.value.error) throw new Error(`${name}: ${JSON.stringify(result.value.error)}`);
   if (result.value.result?.isError) throw new Error(`${name}: tool returned isError`);
-  return result.value.result?.structuredContent;
+  const resultValue = result.value.result;
+  if (resultValue?.structuredContent !== undefined) return resultValue.structuredContent;
+  const text = resultValue?.content?.find((item) => item.type === "text")?.text;
+  try { return text === undefined ? undefined : JSON.parse(text); } catch { return text; }
 }
 
 const initialized = await post({

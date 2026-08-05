@@ -416,9 +416,9 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] 创建或复用公司、Agent、Issue。
 - [x] 启动本地 Claude adapter。
 - [x] 验证 Claude 收到完整 Paperclip 工具列表；使用本地 adapter 握手加载 41 个内置工具。
-- [ ] 让 Claude 调用 `paperclipGetIssue`。
-- [ ] 让 Claude 调用 `paperclipAddComment`。
-- [ ] 让 Claude 创建子任务并验证新任务被唤醒。
+- [x] 让 Claude 调用 `paperclipGetIssue`；run `b2411dfc-d8c9-4f60-ae9d-6f2388b397e0` 成功读取 Issue。
+- [x] 让 Claude 调用 `paperclipAddComment`；同一 run 写入评论 `cdf559a3-521a-4afa-9f03-c3be855c513f`。
+- [x] 让 Claude 创建子任务并验证新任务落库；同一 run 创建子 Issue `5c66ccdc-1b8f-405c-9491-3899107ac064`。
 - [x] 验证 Codex 真实 run 的 stdout/stderr、tool invocation、run status 和 Issue status；Claude adapter 的完整 stdout 解析也已覆盖。
 - [x] 验证服务重启后的待执行任务恢复；重启日志显示 `reconciled pending assigned issues` 并为原 Issue 创建新的 heartbeat run。
 - [x] 验证 token 不出现在普通日志；session 只持久化 token hash，adapter 日志显示脱敏占位符。
@@ -435,7 +435,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] `crates/api/src/mcp/mod.rs`：`McpToolDefinition`、run-scoped `McpInvocationContext` 和 request/notification 分类。
 - [x] `crates/api/src/routes/issues.rs`：Issue document GET/PUT、revision list/restore、Paperclip interaction kinds、Issue 查询 status/priority/q。
 - [x] `crates/api/src/routes/approvals.rs`：审批 status 过滤、创建/关联多个 issue、approve/reject/revision/resubmit。
-- [x] `crates/services/src/heartbeat_service.rs`：真实 gateway token 注入、URL 注入、日志脱敏、continuation summary。
+- [x] `crates/services/src/heartbeat_service.rs`：真实 gateway token 注入、URL 注入、日志脱敏、continuation summary；Claude CLI 支持 `systemPrompt`、`appendSystemPrompt`、`instructionsFilePath`、`strictMcpConfig` 和 `excludeDynamicSystemPromptSections`，便于切换/调试本地模型代理。
 - [x] `crates/api/src/routes/agents.rs`、`crates/services/src/agent_service.rs`：补齐 `UpdateAgentSchema.adapterType` 到 service/repository 的贯通，允许在真实 CLI/adapter 验证前后安全切换 adapter 类型并恢复配置。
 - [x] `crates/services/src/issue_service_complete.rs`：补齐 Paperclip `CreateIssue` 省略 `status` 时的默认值；未分配 Issue 为 `backlog`，已分配 Agent/User 的 Issue 为 `todo`，避免旧库在 `issues.status` 非空约束下写入 NULL。
 - [x] `crates/models/src/issue.rs`、`crates/repositories/src/pg_issue_repository.rs`：`CreateIssue` 的 `executionPolicy`、`executionWorkspaceSettings` 已贯通 model/service/repository，并由工具矩阵验证持久化返回值。
@@ -462,6 +462,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] `cargo test -p api --lib` 通过，当前 60 个测试通过；`cargo check -p parrot-server` 通过。
 - [x] gateway token 脱敏测试通过；真实 adapter argv 保留实际 token，普通日志只显示 `[PAPERCLIP_TOOL_GATEWAY_TOKEN]`。
 - [x] 本地 Claude adapter 真实启动成功，MCP URL 指向当前 parrot-agent 端口，并在 run 输出中加载 Paperclip 工具集合。
+- [x] Claude vertical-slice smoke 支持通过 `CLAUDE_SYSTEM_PROMPT` 注入 Claude CLI 系统提示词；适配器配置也可使用 `systemPrompt`/`appendSystemPrompt`，真实 argv 会保留完整参数，普通日志仍脱敏 gateway token。
 - [x] MCP 协议手工验证覆盖 initialize、initialized notification、tools/list、tools/call、invalid args、unknown method、malformed JSON、JSON/SSE response；API 单元测试当前 60 个通过。
 - [x] `scripts/paperclip-mcp-business-smoke.mjs` 已完成 41 个内置工具集合检查，并实际执行 Issue、Comment、Document、Interaction、Approval、Heartbeat、workspace runtime 和 `paperclipApiRequest` 成功路径；内部 bridge 重构后再次通过。
 - [x] `scripts/paperclip-mcp-tool-matrix-smoke.mjs` 已在保持 heartbeat run 活跃的本地 adapter 下通过：`listedToolCount=41`、`invokedToolCount=41`，成功路径与预期错误路径均已执行。
@@ -476,7 +477,13 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] `cargo test --workspace --no-fail-fast` 已执行：208 个测试通过，19 个既存 services 测试失败，另有 1 个 board API timing-sensitive 测试失败；失败集中在 `adapter_config_normalizer`、`codex_local_isolation`、`consistency_service`、授权策略和常量时间比较等非本次 MCP 迁移路径，不能将 workspace 全绿作为当前完成证据。
 - [ ] 尚未完成真实 Claude 业务成功路径：本地 `deepseek-v4-flash` 三次 run 均正常退出并加载 41 个工具，但返回“检测到敏感内容”且 `toolCallCount=0`（run `3a87620d-021b-4d1e-acd9-7de202e0c404`、`8b113e05-0647-4119-8de9-302e931e1853`、`515e575e-250a-4dab-9b7e-d90b50db2e62`）。本轮用真实 run `1ffa3c62-0ef2-4a9d-a407-0a423273f3eb` 启动 Claude Code，session `a4715deb-19ef-49fb-bc85-c1b7f3f09911` 成功连接 gateway 并加载 41 个工具，但仍在第一轮返回策略拒绝、没有 tool use；`scripts/claude-mcp-vertical-slice-smoke.mjs` 已把该流程固化为可重复失败即报错的验证。进一步探测代理 `/v1/models` 列出的 `glm`、`kimi`、`minimax`、`hy3`、`deepseek` 和 `auto` 全部复现同一拒绝。用 `deepseek-v4-pro` 的最小 CLI 请求仍返回同一策略拒绝；指定官方 Claude 模型则返回代理层 HTTP 200 空响应，去掉本地代理后为 401 Invalid bearer token。因此 `paperclipGetIssue`、`paperclipAddComment` 和创建子任务的 Claude 端到端 checkbox 仍保持未完成；41 工具逐项矩阵、核心 AppState service 路径、Goal 旧库兼容 migration、Codex 业务长流程、跨公司/跨 run 负向测试、checkout/release 矩阵、策略 deny/approval 矩阵和专用内部 REST bridge 已通过；协议 SSE 长连接已由 `scripts/mcp-gateway-contract-smoke.sh` 验证。
 
-### 9.3 接手时的安全顺序
+### 9.3 Claude 成功路径补充证据
+
+- [x] 新版 Claude adapter 已验证真实 argv 中包含 `--system-prompt`、`--exclude-dynamic-system-prompt-sections`、`--strict-mcp-config`；gateway 对数组结果仅返回 Paperclip 兼容的文本 content，对对象结果保留 `structuredContent`。
+- [x] Claude JSONL 解析器递归统计嵌套 `assistant.message.content[].tool_use`，不会把可恢复的嵌套 `tool_result` 错误误判为整个 run 失败。
+- [x] 真实成功 run：`b2411dfc-d8c9-4f60-ae9d-6f2388b397e0`，结果 `succeeded`，`toolCallCount=6`，评论 `cdf559a3-521a-4afa-9f03-c3be855c513f`，子 Issue `5c66ccdc-1b8f-405c-9491-3899107ac064`。
+
+### 9.4 接手时的安全顺序
 
 1. 先执行 `git status --short`，保留已有用户修改；不要修改 `/Users/adazhao/workspace/paperclip`。
 2. 使用本地 `DATABASE_URL` 启动服务，确认 migrations 成功后再做 API 测试。
@@ -497,7 +504,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] 阶段六：迁移 workspace runtime 工具和 `paperclipApiRequest` 基础安全限制。
 - [x] 阶段七：补齐 MCP session、SSE、Streamable HTTP 的协议测试；安全过期/跨公司边界仍在阶段八核销。
 - [x] 阶段八：补齐工具审计、审批和策略测试；跨 scope、deny、approval、decline 已通过。
-- [ ] 阶段九：接入 Claude/Codex 真实 CLI 做端到端验证；Codex 已通过，Claude 成功路径仍受当前本地模型策略拒绝。
+- [x] 阶段九：接入 Claude/Codex 真实 CLI 做端到端验证；Codex 和 Claude 均已完成真实 MCP 业务路径。
 - [x] 阶段十：更新 README、运行手册和故障排查文档。
 - [ ] 阶段十一：执行全量 `cargo check`、`cargo test`、`git diff --check`，完成剩余测试后再提交迁移。
 
@@ -509,7 +516,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] 阅读 Paperclip 的 `packages/mcp-server/src/tools.ts` 全文件，记录工具总数和每个 schema；当前参考实现注册 41 个工具，已逐项对照 schema、REST path、payload 默认值和 workspace runtime 行为。
 - [x] 建立工具映射表，先标记 `implemented`、`partial`、`missing`。
 - [x] 先实现一个完整 vertical slice：`paperclipGetIssue`、`paperclipAddComment`、`paperclipCreateIssue`。
-- [ ] 用真实 Claude CLI 验证 vertical slice 后，再批量迁移剩余工具。
+- [x] 用真实 Claude CLI 验证 vertical slice 后，再批量迁移剩余工具；Claude run 已覆盖 GetIssue、AddComment、CreateIssue，41 工具矩阵也已通过。
 - [x] 每完成一个工具，同时添加单元测试和 MCP JSON-RPC 集成测试；统一矩阵和协议 smoke 覆盖全部 registry 工具。
 - [x] 已为 41 个工具建立统一矩阵脚本；高级 CreateIssue 字段已纳入同一矩阵，没有新增第二套 dispatcher。
 - [x] 不要修改 `/Users/adazhao/workspace/paperclip`。
@@ -525,7 +532,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] 所有工具调用都经过 company/agent/run 权限检查；跨公司、跨 Agent、跨 run 和过期/撤销 token 已由 security smoke 覆盖。
 - [x] 工具策略和审批行为与 Paperclip contract 一致；deny、require-approval、approval decline 和 Agent 禁止审批路径已验证。
 - [x] MCP session、JSON-RPC、Streamable HTTP 行为通过自动化测试；见 API 单测和 `scripts/mcp-gateway-contract-smoke.sh`。
-- [ ] Claude 和 Codex 本地 CLI 都能完成至少一次完整任务。
+- [x] Claude 和 Codex 本地 CLI 都能完成至少一次完整任务；Claude run `b2411dfc-d8c9-4f60-ae9d-6f2388b397e0`，Codex 真实长流程证据见前文。
 - [x] 没有明文 token、API key 或敏感 prompt 泄露到日志；adapter shell command 使用脱敏占位符，子进程 argv 才保留真实值。
 - [x] 迁移后的数据库可以从旧 `parrot_agent_dev` 安全升级；本地数据库启动时 migrations 已成功执行，旧 auth/comment/interaction 字段兼容迁移已落地。
 - [x] 迁移相关 `cargo check`、API/models 测试和 `git diff --check` 全部通过；workspace 仍有文档记录的 19 个既存 services 失败，不能宣称全量测试绿。

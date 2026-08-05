@@ -82,30 +82,45 @@ fn parse_adapter_outcome(output: &str) -> AdapterOutcome {
         let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
-        if matches!(kind, "tool_use" | "tool_call") || value.get("tool_name").is_some() {
-            outcome.tool_call_count += 1;
-        }
-        if kind == "handoff" || value.get("handoff").is_some() {
-            outcome.handoff = value.get("handoff").cloned().or_else(|| Some(value.clone()));
-        }
-        let is_error = value.get("is_error").and_then(Value::as_bool).unwrap_or(false)
-            || value.get("isError").and_then(Value::as_bool).unwrap_or(false)
-            || matches!(value.get("subtype").and_then(Value::as_str), Some("error" | "failed"));
-        if is_error {
-            outcome.explicit_failure = true;
-            outcome.failure_reason = value
-                .get("error")
-                .and_then(Value::as_str)
-                .or_else(|| value.get("message").and_then(Value::as_str))
-                .or_else(|| value.get("result").and_then(Value::as_str))
-                .map(ToOwned::to_owned);
-        }
-        if let Some(result) = value.get("result").and_then(Value::as_str) {
-            outcome.result_summary = Some(result.to_owned());
-        }
+        visit_adapter_event(&value, &mut outcome, true);
     }
     outcome
+}
+
+fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: bool) {
+    let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+    if matches!(kind, "tool_use" | "tool_call") || value.get("tool_name").is_some() {
+        outcome.tool_call_count += 1;
+    }
+    if kind == "handoff" || value.get("handoff").is_some() {
+        outcome.handoff = value.get("handoff").cloned().or_else(|| Some(value.clone()));
+    }
+
+    // Claude Code nests tool_use records inside assistant.message.content. Only
+    // top-level adapter/result records can determine the process outcome: a
+    // recoverable tool_result error must not turn an otherwise successful run
+    // into a failed heartbeat.
+    let is_error = top_level
+        && (value.get("is_error").and_then(Value::as_bool).unwrap_or(false)
+            || value.get("isError").and_then(Value::as_bool).unwrap_or(false)
+            || matches!(value.get("subtype").and_then(Value::as_str), Some("error" | "failed")));
+    if is_error {
+        outcome.explicit_failure = true;
+        outcome.failure_reason = value
+            .get("error")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("message").and_then(Value::as_str))
+            .or_else(|| value.get("result").and_then(Value::as_str))
+            .map(ToOwned::to_owned);
+    }
+    if let Some(result) = value.get("result").and_then(Value::as_str) {
+        outcome.result_summary = Some(result.to_owned());
+    }
+    match value {
+        Value::Array(values) => values.iter().for_each(|item| visit_adapter_event(item, outcome, false)),
+        Value::Object(values) => values.values().for_each(|item| visit_adapter_event(item, outcome, false)),
+        _ => {}
+    }
 }
 
 /// Heartbeat status
@@ -490,6 +505,38 @@ impl DefaultHeartbeatService {
             {
                 args.extend(["--append-system-prompt-file".into(), instructions_path.to_owned()]);
             }
+            if let Some(system_prompt) = cfg
+                .get("systemPrompt")
+                .or_else(|| cfg.get("system_prompt"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            {
+                args.extend(["--system-prompt".into(), system_prompt.to_owned()]);
+            }
+            if let Some(append_system_prompt) = cfg
+                .get("appendSystemPrompt")
+                .or_else(|| cfg.get("append_system_prompt"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            {
+                args.extend(["--append-system-prompt".into(), append_system_prompt.to_owned()]);
+            }
+            if cfg
+                .get("excludeDynamicSystemPromptSections")
+                .or_else(|| cfg.get("exclude_dynamic_system_prompt_sections"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                args.push("--exclude-dynamic-system-prompt-sections".into());
+            }
+            if cfg
+                .get("strictMcpConfig")
+                .or_else(|| cfg.get("strict_mcp_config"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                args.push("--strict-mcp-config".into());
+            }
             if let Some(extra_args) = cfg.get("extraArgs").or_else(|| cfg.get("extra_args")) {
                 if let Some(extra_args) = extra_args.as_array() {
                     args.extend(extra_args.iter().filter_map(|value| value.as_str().map(str::to_owned)));
@@ -847,6 +894,18 @@ mod adapter_outcome_tests {
         assert_eq!(outcome.tool_call_count, 1);
         assert_eq!(outcome.result_summary.as_deref(), Some("done"));
         assert!(outcome.handoff.is_some());
+    }
+
+    #[test]
+    fn parses_nested_claude_tool_use_without_promoting_tool_error_to_run_failure() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"paperclipGetIssue"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","is_error":true}]}}
+{"type":"result","subtype":"success","result":"done"}"#,
+        );
+        assert_eq!(outcome.tool_call_count, 1);
+        assert!(!outcome.explicit_failure);
+        assert_eq!(outcome.result_summary.as_deref(), Some("done"));
     }
 }
 

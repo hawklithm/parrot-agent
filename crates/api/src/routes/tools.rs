@@ -1564,7 +1564,19 @@ async fn mcp_session_protocol_json(
             // because there is no upstream result yet. Preserve that envelope
             // so MCP clients can receive and display `actionRequestId`.
             let result = value.get("result").cloned().unwrap_or_else(|| value.clone());
-            mcp_response(StatusCode::OK, serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":result.to_string()}],"structuredContent":result,"isError":false}}), Some(session_id))
+            // Paperclip's MCP server returns text content. Keep structuredContent
+            // only for object-shaped values: Claude Code validates structured
+            // content as a record, while list tools legitimately return arrays.
+            // Arrays remain fully available as JSON text and match Paperclip's
+            // wire contract instead of causing an SDK schema error.
+            let mut tool_result = serde_json::json!({
+                "content": [{"type":"text","text":result.to_string()}],
+                "isError":false
+            });
+            if result.is_object() {
+                tool_result["structuredContent"] = result;
+            }
+            mcp_response(StatusCode::OK, serde_json::json!({"jsonrpc":"2.0","id":id,"result":tool_result}), Some(session_id))
         }
         _ => mcp_error(StatusCode::OK, id, -32601, "Method not found", Some(session_id)),
     }
