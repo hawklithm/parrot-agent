@@ -616,8 +616,6 @@ async fn create_issue(
             input.work_mode = Some(models::IssueWorkMode::SkillTest);
         }
     }
-    let created_by_agent_id = input.created_by_agent_id;
-    let created_by_user_id = input.created_by_user_id;
     if let Some(watchdog) = &requested_watchdog {
         let watchdog_agent = state
             .agent_service
@@ -628,6 +626,10 @@ async fn create_issue(
             return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
     }
+    input.watchdog_created_by_run_id = match &actor {
+        AuthorizationActor::Agent { run_id, .. } => *run_id,
+        _ => None,
+    };
     // Paperclip takes the company scope from the URL. The body must not need
     // to repeat companyId, and the path is authoritative if it is supplied.
     input.company_id = company_id;
@@ -639,21 +641,6 @@ async fn create_issue(
             tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
             issue_service_status(&error)
         })?;
-    if let Some(watchdog) = requested_watchdog {
-        state
-            .watchdog_service
-            .upsert_watchdog(
-                company_id,
-                created.issue.id,
-                watchdog.agent_id,
-                watchdog.instructions,
-                created_by_agent_id,
-                created_by_user_id.map(|id| id.to_string()),
-                None,
-            )
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
     // Re-read so the response includes the persisted watchdog projection.
     let response_issue = state
         .issue_service

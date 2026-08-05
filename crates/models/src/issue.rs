@@ -366,6 +366,9 @@ pub struct CreateIssueInput {
     pub blocked_by_issue_ids: Vec<Uuid>,
     pub watchdog: Option<CreateIssueWatchdogInput>,
     pub watchdog_discovery: Option<serde_json::Value>,
+    /// Internal run provenance; excluded from the public JSON contract.
+    #[serde(skip)]
+    pub watchdog_created_by_run_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

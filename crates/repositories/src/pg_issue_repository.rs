@@ -713,6 +713,40 @@ impl IssueRepository for PgIssueRepository {
             input.created_by_user_id,
         )
         .await?;
+        if let Some(watchdog) = input.watchdog.as_ref() {
+            let created_by_user_id = input.created_by_user_id.map(|id| id.to_string());
+            let watchdog_row = sqlx::query_as::<_, models::task_watchdog::IssueWatchdog>(
+                r#"INSERT INTO issue_watchdogs
+                   (company_id, issue_id, watchdog_agent_id, instructions,
+                    created_by_agent_id, created_by_user_id, created_by_run_id,
+                    updated_by_agent_id, updated_by_user_id, updated_by_run_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $5, $6, $7)
+                   ON CONFLICT (company_id, issue_id) DO UPDATE
+                     SET watchdog_agent_id = EXCLUDED.watchdog_agent_id,
+                         instructions = EXCLUDED.instructions,
+                         updated_by_agent_id = EXCLUDED.updated_by_agent_id,
+                         updated_by_user_id = EXCLUDED.updated_by_user_id,
+                         updated_by_run_id = EXCLUDED.updated_by_run_id,
+                         updated_at = NOW()
+                   RETURNING id, company_id, issue_id, watchdog_agent_id, instructions, status,
+                             watchdog_issue_id, last_observed_fingerprint, last_reviewed_fingerprint,
+                             last_triggered_at, last_completed_at, trigger_count,
+                             created_by_agent_id, created_by_user_id, created_by_run_id,
+                             updated_by_agent_id, updated_by_user_id, updated_by_run_id,
+                             created_at, updated_at"#,
+            )
+            .bind(input.company_id)
+            .bind(issue.id)
+            .bind(watchdog.agent_id)
+            .bind(watchdog.instructions.as_deref())
+            .bind(input.created_by_agent_id)
+            .bind(created_by_user_id.as_deref())
+            .bind(input.watchdog_created_by_run_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+            issue.watchdog = Some(watchdog_row);
+        }
         issue.label_ids = input.label_ids;
         issue.blocked_by_issue_ids = input.blocked_by_issue_ids;
         tx.commit().await.map_err(RepositoryError::DatabaseError)?;
