@@ -536,4 +536,4 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] 没有明文 token、API key 或敏感 prompt 泄露到日志；adapter shell command 使用脱敏占位符，子进程 argv 才保留真实值。
 - [x] 迁移后的数据库可以从旧 `parrot_agent_dev` 安全升级；本地数据库启动时 migrations 已成功执行，旧 auth/comment/interaction 字段兼容迁移已落地。
 - [x] 迁移相关 `cargo check`、API/models 测试、workspace 全量测试和 `git diff --check` 全部通过；workspace 结果为 376 passed、3 ignored、0 failed。
-- [x] 迁移结果已提交；提交 `c15a43b` 和后续文档提交信息列出工具覆盖范围与已知限制。
+- [x] 迁移结果已提交；`dc8577b` 完成 Claude MCP vertical slice，`d81157c` 使 workspace 全量测试 gate 通过，提交记录列出工具覆盖范围、运行证据和已知限制。
