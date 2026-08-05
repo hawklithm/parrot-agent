@@ -84,6 +84,7 @@ pub enum IssueWatchdogStatus {
 
 /// One watchdog per (company, watched issue).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct IssueWatchdog {
     pub id: Uuid,
     pub company_id: Uuid,

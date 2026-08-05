@@ -15,6 +15,185 @@ impl PgIssueRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    async fn load_label_ids(&self, issue_id: Uuid) -> Result<Vec<Uuid>, RepositoryError> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT label_id FROM issue_labels WHERE issue_id = $1 ORDER BY label_id",
+        )
+        .bind(issue_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)
+    }
+
+    async fn load_blocked_by_issue_ids(&self, issue_id: Uuid) -> Result<Vec<Uuid>, RepositoryError> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT issue_id FROM issue_relations WHERE related_issue_id = $1 AND type = 'blocks' ORDER BY issue_id",
+        )
+        .bind(issue_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)
+    }
+
+    async fn load_watchdog(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+    ) -> Result<Option<models::task_watchdog::IssueWatchdog>, RepositoryError> {
+        sqlx::query_as::<_, models::task_watchdog::IssueWatchdog>(
+            "SELECT * FROM issue_watchdogs WHERE company_id = $1 AND issue_id = $2",
+        )
+        .bind(company_id)
+        .bind(issue_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)
+    }
+
+    async fn attach_labels(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        company_id: Uuid,
+        issue_id: Uuid,
+        label_ids: &[Uuid],
+    ) -> Result<(), RepositoryError> {
+        let mut unique_label_ids = label_ids.to_vec();
+        unique_label_ids.sort_unstable();
+        unique_label_ids.dedup();
+        if unique_label_ids.is_empty() {
+            return Ok(());
+        }
+
+        let found = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM labels WHERE company_id = $1 AND id = ANY($2)",
+        )
+        .bind(company_id)
+        .bind(&unique_label_ids)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+        if found != unique_label_ids.len() as i64 {
+            return Err(RepositoryError::InvalidData(
+                "one or more labels do not belong to the issue company".to_string(),
+            ));
+        }
+
+        for label_id in unique_label_ids {
+            sqlx::query(
+                "INSERT INTO issue_labels (company_id, issue_id, label_id) VALUES ($1, $2, $3)",
+            )
+            .bind(company_id)
+            .bind(issue_id)
+            .bind(label_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+        }
+        Ok(())
+    }
+
+    async fn attach_blockers(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        company_id: Uuid,
+        issue_id: Uuid,
+        blocker_ids: &[Uuid],
+        created_by_agent_id: Option<Uuid>,
+        created_by_user_id: Option<Uuid>,
+    ) -> Result<(), RepositoryError> {
+        let mut unique_blocker_ids = blocker_ids.to_vec();
+        unique_blocker_ids.sort_unstable();
+        unique_blocker_ids.dedup();
+        if unique_blocker_ids.is_empty() {
+            return Ok(());
+        }
+        if unique_blocker_ids.contains(&issue_id) {
+            return Err(RepositoryError::InvalidData(
+                "an issue cannot be blocked by itself".to_string(),
+            ));
+        }
+        let found = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM issues WHERE company_id = $1 AND id = ANY($2)",
+        )
+        .bind(company_id)
+        .bind(&unique_blocker_ids)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+        if found != unique_blocker_ids.len() as i64 {
+            return Err(RepositoryError::InvalidData(
+                "blocked-by issues must belong to the issue company".to_string(),
+            ));
+        }
+        for blocker_id in unique_blocker_ids {
+            sqlx::query(
+                "INSERT INTO issue_relations (company_id, issue_id, related_issue_id, type, created_by_agent_id, created_by_user_id) VALUES ($1, $2, $3, 'blocks', $4, $5)",
+            )
+            .bind(company_id)
+            .bind(blocker_id)
+            .bind(issue_id)
+            .bind(created_by_agent_id)
+            .bind(created_by_user_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+        }
+        Ok(())
+    }
+
+    async fn load_issue_projections(&self, issue: &mut Issue) -> Result<(), RepositoryError> {
+        issue.label_ids = self.load_label_ids(issue.id).await?;
+        issue.blocked_by_issue_ids = self.load_blocked_by_issue_ids(issue.id).await?;
+        issue.watchdog = self.load_watchdog(issue.company_id, issue.id).await?;
+        Ok(())
+    }
+
+    async fn sync_issue_associations(
+        &self,
+        issue_id: Uuid,
+        label_ids: Option<&[Uuid]>,
+        blocked_by_issue_ids: Option<&[Uuid]>,
+    ) -> Result<(), RepositoryError> {
+        if label_ids.is_none() && blocked_by_issue_ids.is_none() {
+            return Ok(());
+        }
+        let company_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT company_id FROM issues WHERE id = $1",
+        )
+        .bind(issue_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+        let mut tx = self.pool.begin().await.map_err(RepositoryError::DatabaseError)?;
+        if let Some(label_ids) = label_ids {
+            sqlx::query("DELETE FROM issue_labels WHERE company_id = $1 AND issue_id = $2")
+                .bind(company_id)
+                .bind(issue_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(RepositoryError::DatabaseError)?;
+            Self::attach_labels(&mut tx, company_id, issue_id, label_ids).await?;
+        }
+        if let Some(blocked_by_issue_ids) = blocked_by_issue_ids {
+            sqlx::query(
+                "DELETE FROM issue_relations WHERE company_id = $1 AND related_issue_id = $2 AND type = 'blocks'",
+            )
+            .bind(company_id)
+            .bind(issue_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+            Self::attach_blockers(
+                &mut tx,
+                company_id,
+                issue_id,
+                blocked_by_issue_ids,
+                None,
+                None,
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(RepositoryError::DatabaseError)
+    }
 }
 
 /// Convert an IssueStatus to its database text representation.
@@ -31,7 +210,7 @@ fn issue_work_mode_to_db(wm: &IssueWorkMode) -> String {
 #[async_trait]
 impl IssueRepository for PgIssueRepository {
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Issue>, RepositoryError> {
-        let issue = sqlx::query_as::<_, Issue>(
+        let mut issue = sqlx::query_as::<_, Issue>(
             r#"
             SELECT * FROM issues WHERE id = $1
             "#,
@@ -41,6 +220,9 @@ impl IssueRepository for PgIssueRepository {
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
+        if let Some(issue) = issue.as_mut() {
+            self.load_issue_projections(issue).await?;
+        }
         Ok(issue)
     }
 
@@ -232,9 +414,13 @@ impl IssueRepository for PgIssueRepository {
 
         q = q.bind(pagination.limit).bind(pagination.offset);
 
-        let issues = q.fetch_all(&self.pool)
+        let mut issues = q.fetch_all(&self.pool)
             .await
             .map_err(RepositoryError::DatabaseError)?;
+
+        for issue in &mut issues {
+            self.load_issue_projections(issue).await?;
+        }
 
         Ok(issues)
     }
@@ -429,7 +615,12 @@ impl IssueRepository for PgIssueRepository {
             .map(serde_json::to_value)
             .transpose()
             .map_err(|error| RepositoryError::InvalidData(format!("invalid execution policy: {error}")))?;
-        let issue = sqlx::query_as::<_, Issue>(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+        let mut issue = sqlx::query_as::<_, Issue>(
             r#"
             INSERT INTO issues (
                 company_id, project_id, project_workspace_id, goal_id, parent_id,
@@ -482,10 +673,23 @@ impl IssueRepository for PgIssueRepository {
         .bind(&input.execution_workspace_settings)
         .bind(input.execution_workspace_id)
         .bind(input.execution_workspace_preference.as_ref())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
+        Self::attach_labels(&mut tx, input.company_id, issue.id, &input.label_ids).await?;
+        Self::attach_blockers(
+            &mut tx,
+            input.company_id,
+            issue.id,
+            &input.blocked_by_issue_ids,
+            input.created_by_agent_id,
+            input.created_by_user_id,
+        )
+        .await?;
+        issue.label_ids = input.label_ids;
+        issue.blocked_by_issue_ids = input.blocked_by_issue_ids;
+        tx.commit().await.map_err(RepositoryError::DatabaseError)?;
         Ok(issue)
     }
 
@@ -560,6 +764,18 @@ impl IssueRepository for PgIssueRepository {
         }
 
         if updates.is_empty() {
+            if input.label_ids.is_some() || input.blocked_by_issue_ids.is_some() {
+                let issue = self.get_by_id(id).await?.ok_or(RepositoryError::NotFound(id))?;
+                self.sync_issue_associations(
+                    id,
+                    input.label_ids.as_deref(),
+                    input.blocked_by_issue_ids.as_deref(),
+                )
+                .await?;
+                let mut issue = issue;
+                self.load_issue_projections(&mut issue).await?;
+                return Ok(issue);
+            }
             // No fields to update, just return the existing issue
             return self.get_by_id(id).await?.ok_or_else(|| RepositoryError::NotFound(id));
         }
@@ -623,10 +839,17 @@ impl IssueRepository for PgIssueRepository {
             q = q.bind(source_trust);
         }
 
-        let issue = q.fetch_one(&self.pool)
+        let mut issue = q.fetch_one(&self.pool)
             .await
             .map_err(RepositoryError::DatabaseError)?;
 
+        self.sync_issue_associations(
+            id,
+            input.label_ids.as_deref(),
+            input.blocked_by_issue_ids.as_deref(),
+        )
+        .await?;
+        self.load_issue_projections(&mut issue).await?;
         Ok(issue)
     }
 
@@ -652,7 +875,7 @@ impl IssueRepository for PgIssueRepository {
         query: &str,
         pagination: &Pagination,
     ) -> Result<Vec<Issue>, RepositoryError> {
-        let issues = sqlx::query_as::<_, Issue>(
+        let mut issues = sqlx::query_as::<_, Issue>(
             r#"
             SELECT * FROM issues
             WHERE company_id = $1
@@ -673,11 +896,14 @@ impl IssueRepository for PgIssueRepository {
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
+        for issue in &mut issues {
+            self.load_issue_projections(issue).await?;
+        }
         Ok(issues)
     }
 
     async fn get_by_identifier(&self, identifier: &str) -> Result<Option<Issue>, RepositoryError> {
-        let issue = sqlx::query_as::<_, Issue>(
+        let mut issue = sqlx::query_as::<_, Issue>(
             r#"
             SELECT * FROM issues WHERE identifier = $1
             "#,
@@ -687,6 +913,9 @@ impl IssueRepository for PgIssueRepository {
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
+        if let Some(issue) = issue.as_mut() {
+            self.load_issue_projections(issue).await?;
+        }
         Ok(issue)
     }
 
@@ -695,7 +924,7 @@ impl IssueRepository for PgIssueRepository {
         parent_id: Uuid,
         pagination: &Pagination,
     ) -> Result<Vec<Issue>, RepositoryError> {
-        let issues = sqlx::query_as::<_, Issue>(
+        let mut issues = sqlx::query_as::<_, Issue>(
             r#"
             SELECT * FROM issues
             WHERE parent_id = $1
@@ -710,6 +939,9 @@ impl IssueRepository for PgIssueRepository {
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
+        for issue in &mut issues {
+            self.load_issue_projections(issue).await?;
+        }
         Ok(issues)
     }
 
@@ -718,7 +950,7 @@ impl IssueRepository for PgIssueRepository {
             return Ok(Vec::new());
         }
 
-        let issues = sqlx::query_as::<_, Issue>(
+        let mut issues = sqlx::query_as::<_, Issue>(
             r#"
             SELECT * FROM issues WHERE id = ANY($1)
             "#,
@@ -728,11 +960,14 @@ impl IssueRepository for PgIssueRepository {
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
+        for issue in &mut issues {
+            self.load_issue_projections(issue).await?;
+        }
         Ok(issues)
     }
 
     async fn list_ancestors(&self, issue_id: Uuid) -> Result<Vec<Issue>, RepositoryError> {
-        let issues = sqlx::query_as::<_, Issue>(
+        let mut issues = sqlx::query_as::<_, Issue>(
             r#"WITH RECURSIVE ancestors AS (
                  SELECT id, company_id, project_id, project_workspace_id, goal_id, parent_id,
                         title, name, description, status, priority, work_mode,
@@ -765,6 +1000,9 @@ impl IssueRepository for PgIssueRepository {
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
+        for issue in &mut issues {
+            self.load_issue_projections(issue).await?;
+        }
         Ok(issues)
     }
 }

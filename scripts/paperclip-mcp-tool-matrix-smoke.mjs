@@ -118,6 +118,8 @@ const created = await expectSuccess("paperclipCreateIssue", {
   description: "matrix",
   status: "todo",
   priority: "low",
+  blockedByIssueIds: [issueId],
+  watchdog: { agentId, instructions: "matrix watchdog" },
   executionPolicy: { maxRetries: 2, timeoutSeconds: 90, workspacePreference: "existing" },
   executionWorkspaceSettings: { mode: "persistent", strategy: "existing" },
 }, sessionId);
@@ -125,7 +127,28 @@ const createdIssueId = created.id;
 if (created.executionPolicy?.maxRetries !== 2 || created.executionWorkspaceSettings?.mode !== "persistent") {
   throw new Error(`create issue execution fields were not persisted: ${JSON.stringify(created)}`);
 }
-await expectSuccess("paperclipUpdateIssue", { issueId: createdIssueId, title: "tool matrix child updated" }, sessionId);
+if (created.blockedByIssueIds?.length !== 1 || created.blockedByIssueIds[0] !== issueId || created.watchdog?.watchdogAgentId !== agentId) {
+  throw new Error(`create issue relations/watchdog were not persisted: ${JSON.stringify(created)}`);
+}
+const label = await expectSuccess("paperclipApiRequest", {
+  method: "POST",
+  path: `/companies/${me.companyId}/labels`,
+  jsonBody: JSON.stringify({ name: `matrix-${Date.now()}`, color: "#123456" }),
+}, sessionId);
+const labelId = label?.id;
+if (!labelId) throw new Error(`label creation returned no id: ${JSON.stringify(label)}`);
+const updated = await expectSuccess("paperclipUpdateIssue", {
+  issueId: createdIssueId,
+  title: "tool matrix child updated",
+  labelIds: [labelId],
+}, sessionId);
+if (updated.labelIds?.length !== 1 || updated.labelIds[0] !== labelId) {
+  throw new Error(`issue labels were not persisted on update: ${JSON.stringify(updated)}`);
+}
+await expectError("paperclipCreateIssue", {
+  title: "invalid matrix label",
+  labelIds: ["00000000-0000-0000-0000-000000000000"],
+}, sessionId);
 await expectSuccess("paperclipCheckoutIssue", { issueId: createdIssueId, expectedStatuses: ["todo"] }, sessionId);
 await expectSuccess("paperclipReleaseIssue", { issueId: createdIssueId, targetStatus: "done", result: "matrix complete" }, sessionId);
 const comment = await expectSuccess("paperclipAddComment", { issueId, body: "matrix comment" }, sessionId);

@@ -58,6 +58,9 @@ impl MockIssueService {
             cancelled_at: None,
             hidden_at: None,
             source_trust: None,
+            label_ids: Vec::new(),
+            blocked_by_issue_ids: Vec::new(),
+            watchdog: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

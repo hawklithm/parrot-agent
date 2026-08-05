@@ -296,19 +296,19 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 |---|---|---|
 | `projectWorkspaceId`、`workMode`、`responsibleUserId`、`originKind`、`originId`、`originRunId`、`requestDepth`、`billingCode` | 已贯通 model/service/repository | 增加持久化断言和跨公司错误测试 |
 | `executionPolicy`、`executionWorkspaceId`、`executionWorkspacePreference`、`executionWorkspaceSettings`、`assigneeAdapterOverrides` | 已贯通 model/service/repository；execution policy/settings 已由矩阵验证 | 补齐 GET/更新/恢复后的 response projection，并验证旧库 migration |
-| `labelIds` | schema 已声明，查询已有单 label 过滤；创建链路尚未写入 `issue_labels` | 在同一数据库事务中校验所有 label 属于 session company，再插入关联；缺失 label 必须返回 404/422，禁止静默丢弃 |
-| `blockedByIssueIds` | schema 已声明，但当前没有等价的 Issue relation create 输入链路 | 先确认 Paperclip relation 表/API 契约；创建 Issue 与 relation 必须同事务，阻塞 Issue 必须同公司，重复/自引用要返回 409/422 |
-| `inheritExecutionWorkspaceFromIssueId` | schema 已声明，当前 Issues 表没有直接继承字段 | 创建时读取来源 Issue 的 workspace 配置，校验同公司和来源存在；持久化最终 workspace id/preference/settings，而不是只保存请求字段 |
-| `harnessKind` | schema 已声明，当前 Issues 表没有该列 | 先补安全 migration 和 model 字段，明确 `skill_test` 对 adapter/执行策略的影响，再开放写入；未完成前应显式拒绝，而不是静默忽略 |
-| `watchdogDiscovery`、`watchdog` | schema/数据库 watchdog 子系统分别存在，但 CreateIssue 尚未把输入连接到 `WatchdogService` | 先对照 Paperclip watchdog create/update contract，创建 Issue 成功后在同一业务流程建立 watchdog，校验 watchdog agent/company/run scope，并覆盖重复 upsert、禁用和恢复 |
+| `labelIds` | 已贯通 model/service/repository；创建和更新均在事务中校验并写入 `issue_labels`，GET/list 会回填 `labelIds` | 继续补 REST 422 错误 envelope；矩阵已验证创建、更新和缺失 label 错误路径 |
+| `blockedByIssueIds` | 已新增 `issue_relations` migration；创建和更新均在事务中校验同 company、去重、自引用，GET/list 会回填 blocker IDs | 继续补 Paperclip 的环检测和 blocker 状态派生字段；矩阵已验证创建与更新成功路径 |
+| `inheritExecutionWorkspaceFromIssueId` | 已在 service 层读取来源 Issue，并继承 project/workspace/preference/settings；显式目标字段优先 | 补 workspace source 的跨公司/不存在错误矩阵，以及真实 execution workspace runtime 验证 |
+| `harnessKind` | schema 已声明，当前 Issues 表没有该列 | 当前 REST CreateIssue 已显式返回 422，避免未知字段被静默丢弃；仍需补安全 migration 和 model 字段，明确 `skill_test` 对 adapter/执行策略的影响后再开放写入 |
+| `watchdogDiscovery`、`watchdog` | `watchdog` 已接入 REST CreateIssue：校验 watchdog agent company scope，调用 `WatchdogService` upsert，并在 Issue projection 回填；`watchdogDiscovery` 仍未迁移 | 对照 Paperclip 的 discovery follow-up/product-bug 语义，补 discovery 的 origin、description、watchdog review issue 和审计事件；矩阵已验证 watchdog 成功路径 |
 | `goalId`、`parentId` | 已有基础校验和持久化 | 补 company scope 校验；`parentId` 创建子任务后必须验证 wakeup/继承策略 |
 
 迁移顺序必须固定为：
 
-- [ ] 先为每个高级字段增加 model、service、repository 的显式类型，不允许继续依赖 `serde` 忽略未知字段。
-- [ ] 再补数据库事务和 company-scope 校验，确保 Issue 主记录与 labels/relations/watchdog 不会部分提交。
+- [x] 已为 labels、blocker relations、workspace inheritance、watchdog 增加 model/service/repository 或 route 的显式类型；`watchdogDiscovery`、harnessKind 已改为显式拒绝，不能被静默视为已迁移。
+- [x] labels、blocker relations 和 Issue 主记录已使用数据库事务；watchdog 目前是主 Issue 创建后调用 service，仍需合并为跨表原子业务事务。
 - [ ] 为每个字段增加至少一个成功、一个缺失资源、一个跨公司或非法组合测试。
-- [ ] 更新 `paperclip-mcp-tool-matrix-smoke.mjs`，断言返回 Issue 中的实际持久化结果，而不是只断言请求成功。
+- [x] 已更新 `paperclip-mcp-tool-matrix-smoke.mjs`，断言 execution fields、labels、blocker relations、watchdog 的实际返回投影，并执行缺失 label 错误路径。
 - [ ] 完成上述字段后，才能把 `paperclipCreateIssue` 从“主要字段已迁移”提升为“Paperclip schema 完整迁移”。
 
 ### 6.2 当前 41 个工具映射总表
@@ -437,6 +437,8 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] `crates/services/src/heartbeat_service.rs`：真实 gateway token 注入、URL 注入、日志脱敏、continuation summary。
 - [x] `crates/services/src/issue_service_complete.rs`：补齐 Paperclip `CreateIssue` 省略 `status` 时的默认值；未分配 Issue 为 `backlog`，已分配 Agent/User 的 Issue 为 `todo`，避免旧库在 `issues.status` 非空约束下写入 NULL。
 - [x] `crates/models/src/issue.rs`、`crates/repositories/src/pg_issue_repository.rs`：`CreateIssue` 的 `executionPolicy`、`executionWorkspaceSettings` 已贯通 model/service/repository，并由工具矩阵验证持久化返回值。
+- [x] `migrations/20260805000004_create_issue_relations.sql`、`crates/models/src/issue.rs`、`crates/repositories/src/pg_issue_repository.rs`：`labelIds`、`blockedByIssueIds` 已加入事务持久化和读取 projection；`inheritExecutionWorkspaceFromIssueId` 已在 service 层完成同公司来源配置继承。
+- [x] `crates/api/src/routes/issues.rs`、`crates/services/src/task_watchdog.rs`：`CreateIssue.watchdog` 已校验 watchdog agent company scope、调用 WatchdogService upsert，并在 Issue 响应中返回 watchdog projection；`watchdogDiscovery` 仍是明确缺口。
 - [x] `crates/services/src/auth/middleware.rs`：`ptg_` token hash 查询、过期/撤销校验和 Agent actor 解析。
 - [x] `migrations/20260804000001_complete_auth_users.sql`：旧数据库缺失 auth user 字段的兼容迁移。
 - [x] `migrations/20260804000002_complete_issue_interactions.sql`：Paperclip interaction kinds、payload、幂等键和 continuation policy。
@@ -464,6 +466,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] `scripts/mcp-gateway-contract-smoke.sh` 已验证 Streamable HTTP 的 JSON-RPC、批量、Accept 协商、SSE GET/KeepAlive 和 DELETE 生命周期。
 - [x] `scripts/paperclip-mcp-security-smoke.mjs` 已验证跨 Agent checkout、危险 API path、错误 MCP session id、错误 token、跨公司、跨 run、deny、require-approval 和 approval decline；过期 token 测试支持 `TEST_EXPIRY=1` 长耗时模式。
 - [x] `scripts/paperclip-mcp-tool-matrix-smoke.mjs` 现在在结束时断言 41 个 registry 工具全部至少被调用一次；资源缺失和 Agent 审批决策工具使用预期错误路径。
+- [x] 最新矩阵再次覆盖 41 个工具，并额外断言 CreateIssue 的 `labelIds`、`blockedByIssueIds`、`watchdog`、execution fields，UpdateIssue 的 label replacement，以及缺失 label 错误路径：`listedToolCount=41`、`invokedToolCount=41`、created issue `05611505-5604-4b7e-a713-7abd06ac57e6`。
 - [x] heartbeat run 完成后可读取 `continuation-summary` 文档。
 - [x] `cargo test --workspace --no-fail-fast` 已执行：208 个测试通过，19 个既存 services 测试失败，另有 1 个 board API timing-sensitive 测试失败；失败集中在 `adapter_config_normalizer`、`codex_local_isolation`、`consistency_service`、授权策略和常量时间比较等非本次 MCP 迁移路径，不能将 workspace 全绿作为当前完成证据。
 - [ ] 尚未完成真实 Claude 业务成功路径：本地 `deepseek-v4-flash` 三次 run 均正常退出并加载 41 个工具，但返回“检测到敏感内容”且 `toolCallCount=0`（run `3a87620d-021b-4d1e-acd9-7de202e0c404`、`8b113e05-0647-4119-8de9-302e931e1853`、`515e575e-250a-4dab-9b7e-d90b50db2e62`）。直接运行 Claude CLI 也复现同一结果；切换 `gpt-5.6-luna` 则返回代理层 HTTP 200 空响应。因此 `paperclipGetIssue`、`paperclipAddComment` 和创建子任务的 Claude 端到端 checkbox 仍保持未完成；41 工具逐项矩阵、核心 AppState service 路径、Goal 旧库兼容 migration、Codex 业务长流程、跨公司/跨 run 负向测试、checkout/release 矩阵、策略 deny/approval 矩阵和专用内部 REST bridge 已通过；协议 SSE 长连接已由 `scripts/mcp-gateway-contract-smoke.sh` 验证。

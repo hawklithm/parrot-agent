@@ -56,6 +56,7 @@ pub struct CreateIssueInput {
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
     pub parent_id: Option<Uuid>,
+    pub inherit_execution_workspace_from_issue_id: Option<Uuid>,
     pub goal_id: Option<Uuid>,
     pub project_workspace_id: Option<Uuid>,
     pub work_mode: Option<models::IssueWorkMode>,
@@ -72,6 +73,8 @@ pub struct CreateIssueInput {
     pub assignee_adapter_overrides: Option<serde_json::Value>,
     pub created_by_agent_id: Option<Uuid>,
     pub created_by_user_id: Option<Uuid>,
+    pub label_ids: Vec<Uuid>,
+    pub blocked_by_issue_ids: Vec<Uuid>,
 }
 
 /// Match Paperclip's create-issue defaulting contract.
@@ -100,6 +103,8 @@ pub struct UpdateIssueInput {
     pub assigned_to: Option<Uuid>,
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
+    pub label_ids: Option<Vec<Uuid>>,
+    pub blocked_by_issue_ids: Option<Vec<Uuid>>,
 }
 
 /// Issue query filter
@@ -279,7 +284,7 @@ impl DefaultIssueService {
 
 #[async_trait]
 impl IssueService for DefaultIssueService {
-    async fn create(&self, input: CreateIssueInput) -> Result<IssueMutationResult, ServiceError> {
+    async fn create(&self, mut input: CreateIssueInput) -> Result<IssueMutationResult, ServiceError> {
         // Validate parent exists if specified
         if let Some(parent_id) = input.parent_id {
             let parent = self.issue_repo
@@ -289,6 +294,37 @@ impl IssueService for DefaultIssueService {
 
             if parent.is_none() {
                 return Err(ServiceError::NotFound(format!("Parent issue {} not found", parent_id)));
+            }
+        }
+
+        if let Some(source_issue_id) = input.inherit_execution_workspace_from_issue_id {
+            let source = self
+                .issue_repo
+                .get_by_id(source_issue_id)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("Failed to verify workspace source: {e}")))?
+                .ok_or_else(|| ServiceError::NotFound(format!("Workspace source issue {source_issue_id} not found")))?;
+            if source.company_id != input.company_id {
+                return Err(ServiceError::NotFound(format!(
+                    "Workspace source issue {source_issue_id} not found"
+                )));
+            }
+            if input.project_id.is_none() {
+                input.project_id = source.project_id;
+            }
+            if input.project_workspace_id.is_none() {
+                input.project_workspace_id = source.project_workspace_id;
+            }
+            if input.execution_workspace_id.is_none() {
+                input.execution_workspace_id = source.execution_workspace_id;
+            }
+            if input.execution_workspace_preference.is_none() {
+                input.execution_workspace_preference = source.execution_workspace_preference;
+            }
+            if input.execution_workspace_settings.is_none() {
+                input.execution_workspace_settings = source
+                    .execution_workspace_settings
+                    .map(|settings| settings.0);
             }
         }
 
@@ -303,6 +339,7 @@ impl IssueService for DefaultIssueService {
             status: Some(status),
             priority: input.priority,
             parent_id: input.parent_id,
+            inherit_execution_workspace_from_issue_id: None,
             assignee_agent_id: input.assignee_agent_id,
             assignee_user_id: input.assignee_user_id,
             work_mode: input.work_mode,
@@ -319,11 +356,19 @@ impl IssueService for DefaultIssueService {
             assignee_adapter_overrides: input.assignee_adapter_overrides,
             created_by_agent_id: input.created_by_agent_id,
             created_by_user_id: input.created_by_user_id,
+            label_ids: input.label_ids,
+            blocked_by_issue_ids: input.blocked_by_issue_ids,
+            watchdog: None,
+            watchdog_discovery: None,
+            harness_kind: None,
         };
         let created_issue = self.issue_repo
             .create(models_input)
             .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to create issue: {}", e)))?;
+            .map_err(|error| match error {
+                repositories::RepositoryError::InvalidData(message) => ServiceError::InvalidInput(message),
+                other => ServiceError::Internal(format!("Failed to create issue: {other}")),
+            })?;
 
         Ok(IssueMutationResult {
             changed: true,
@@ -413,6 +458,8 @@ impl IssueService for DefaultIssueService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: input.label_ids,
+            blocked_by_issue_ids: input.blocked_by_issue_ids,
         };
 
         let change_kind = if status_changed {
@@ -493,6 +540,8 @@ impl IssueService for DefaultIssueService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
         };
 
         let updated_issue = self.issue_repo
@@ -546,6 +595,8 @@ impl IssueService for DefaultIssueService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
         };
 
         let updated_issue = self.issue_repo
@@ -579,6 +630,8 @@ impl IssueService for DefaultIssueService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
         };
 
         self.issue_repo
@@ -649,6 +702,8 @@ impl IssueService for DefaultIssueService {
                 execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
             };
 
             let updated = self.issue_repo
@@ -829,6 +884,7 @@ impl issue_service::IssueService for LegacyIssueService {
             assignee_agent_id: input.assignee_agent_id,
             assignee_user_id: input.assignee_user_id,
             parent_id: input.parent_id,
+            inherit_execution_workspace_from_issue_id: input.inherit_execution_workspace_from_issue_id,
             goal_id: input.goal_id,
             project_workspace_id: input.project_workspace_id,
             work_mode: input.work_mode,
@@ -845,6 +901,8 @@ impl issue_service::IssueService for LegacyIssueService {
             assignee_adapter_overrides: input.assignee_adapter_overrides,
             created_by_agent_id: input.created_by_agent_id,
             created_by_user_id: input.created_by_user_id,
+            label_ids: input.label_ids,
+            blocked_by_issue_ids: input.blocked_by_issue_ids,
         };
         let result = self.inner.create(compat_input).await.map_err(|e| e.to_string())?;
         self.wake_assigned_issue(&result.issue);
@@ -867,6 +925,7 @@ impl issue_service::IssueService for LegacyIssueService {
             assignee_agent_id: input.assignee_agent_id,
             assignee_user_id: input.assignee_user_id,
             parent_id: input.parent_id,
+            inherit_execution_workspace_from_issue_id: input.inherit_execution_workspace_from_issue_id,
             goal_id: input.goal_id,
             project_workspace_id: input.project_workspace_id,
             work_mode: input.work_mode,
@@ -883,6 +942,8 @@ impl issue_service::IssueService for LegacyIssueService {
             assignee_adapter_overrides: input.assignee_adapter_overrides,
             created_by_agent_id: input.created_by_agent_id,
             created_by_user_id: input.created_by_user_id,
+            label_ids: input.label_ids,
+            blocked_by_issue_ids: input.blocked_by_issue_ids,
         };
         let result = self.inner.create_child(parent_id, compat_input).await.map_err(|e| e.to_string())?;
         self.wake_assigned_issue(&result.issue);
@@ -938,6 +999,8 @@ impl issue_service::IssueService for LegacyIssueService {
             assigned_to: input.assignee_agent_id.or(input.assignee_user_id),
             assignee_agent_id: input.assignee_agent_id,
             assignee_user_id: input.assignee_user_id,
+            label_ids: input.label_ids,
+            blocked_by_issue_ids: input.blocked_by_issue_ids,
         };
         let previous = self.issue_repo.get_by_id(id).await.map_err(|e| e.to_string())?;
         let result = self.inner.update(id, company_id, compat_input).await.map_err(|e| e.to_string())?;

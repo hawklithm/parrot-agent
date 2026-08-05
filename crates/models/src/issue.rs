@@ -306,6 +306,19 @@ pub struct Issue {
     pub cancelled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub hidden_at: Option<chrono::DateTime<chrono::Utc>>,
     pub source_trust: Option<sqlx::types::Json<serde_json::Value>>,
+    /// Denormalized Paperclip response projection. Labels live in the
+    /// issue_labels junction table and are loaded by the repository.
+    #[sqlx(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub label_ids: Vec<Uuid>,
+    /// IDs of issues that must be resolved before this issue can proceed.
+    /// Relations are stored in `issue_relations` and loaded by the repository.
+    #[sqlx(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by_issue_ids: Vec<Uuid>,
+    #[sqlx(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog: Option<crate::task_watchdog::IssueWatchdog>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -325,6 +338,7 @@ pub struct CreateIssueInput {
     pub status: Option<IssueStatus>,
     pub priority: Option<IssuePriority>,
     pub parent_id: Option<Uuid>,
+    pub inherit_execution_workspace_from_issue_id: Option<Uuid>,
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
     pub work_mode: Option<IssueWorkMode>,
@@ -341,6 +355,22 @@ pub struct CreateIssueInput {
     pub created_by_agent_id: Option<Uuid>,
     pub created_by_user_id: Option<Uuid>,
     pub assignee_adapter_overrides: Option<serde_json::Value>,
+    /// Labels are persisted together with the issue in the repository
+    /// transaction after company-scope validation.
+    #[serde(default)]
+    pub label_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub blocked_by_issue_ids: Vec<Uuid>,
+    pub watchdog: Option<CreateIssueWatchdogInput>,
+    pub watchdog_discovery: Option<serde_json::Value>,
+    pub harness_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateIssueWatchdogInput {
+    pub agent_id: Uuid,
+    pub instructions: Option<String>,
 }
 
 /// Update issue input
@@ -368,6 +398,8 @@ pub struct UpdateIssueInput {
     pub execution_state: Option<IssueExecutionState>,
     pub execution_locked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub execution_run_id: Option<Uuid>,
+    pub label_ids: Option<Vec<Uuid>>,
+    pub blocked_by_issue_ids: Option<Vec<Uuid>>,
 }
 
 /// Create document input

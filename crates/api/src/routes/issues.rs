@@ -381,18 +381,62 @@ async fn create_issue(
     Json(mut input): Json<CreateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     crate::routes::assert_company_access(&actor, company_id, false)?;
+    let requested_watchdog = input.watchdog.clone();
+    if input.watchdog_discovery.is_some() {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if input.harness_kind.is_some() {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let created_by_agent_id = input.created_by_agent_id;
+    let created_by_user_id = input.created_by_user_id;
+    if let Some(watchdog) = &requested_watchdog {
+        let watchdog_agent = state
+            .agent_service
+            .get_by_id(watchdog.agent_id)
+            .await
+            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+        if watchdog_agent.company_id != company_id {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
     // Paperclip takes the company scope from the URL. The body must not need
     // to repeat companyId, and the path is authoritative if it is supplied.
     input.company_id = company_id;
     let service = state.issue_service.clone();
-    service
+    let created = service
         .create(input)
         .await
-        .map(|result| Json(result.issue))
         .map_err(|error| {
             tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
             StatusCode::INTERNAL_SERVER_ERROR
-        })
+        })?;
+    if let Some(watchdog) = requested_watchdog {
+        state
+            .watchdog_service
+            .upsert_watchdog(
+                company_id,
+                created.issue.id,
+                watchdog.agent_id,
+                watchdog.instructions,
+                created_by_agent_id,
+                created_by_user_id.map(|id| id.to_string()),
+                None,
+            )
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    // Re-read so the response includes the persisted watchdog projection.
+    let response_issue = state
+        .issue_service
+        .get(created.issue.id, company_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .unwrap_or(created.issue);
+    Ok(Json(response_issue))
 }
 
 /// GET /companies/:companyId/issues - List issues for a company

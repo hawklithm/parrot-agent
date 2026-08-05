@@ -248,6 +248,8 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
             execution_policy: None, execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
         };
 
         match self.issue_repo.update(issue_id, update_input).await {
@@ -324,6 +326,8 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
             execution_policy: None, execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
         };
 
         let updated_issue = self.issue_repo
@@ -367,6 +371,8 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
             execution_policy: None, execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
         };
 
         let updated_issue = self.issue_repo

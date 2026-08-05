@@ -194,9 +194,9 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "assigneeUserId": {"type": ["string", "null"]}, "requestDepth": {"type": "integer", "minimum": 0},
                         "billingCode": {"type": ["string", "null"]}, "assigneeAdapterOverrides": {"type": ["object", "null"]},
                         "createdByUserId": {"type": ["string", "null"]}, "responsibleUserId": {"type": ["string", "null"]},
-                        "watchdog": {"type": ["object", "null"]}, "executionPolicy": {"type": ["object", "null"]}, "executionWorkspaceId": {"type": ["string", "null"], "format": "uuid"},
+                        "watchdog": {"type": ["object", "null"], "properties": {"agentId": {"type": "string", "format": "uuid"}, "instructions": {"type": ["string", "null"]}}, "required": ["agentId"], "additionalProperties": false}, "executionPolicy": {"type": ["object", "null"]}, "executionWorkspaceId": {"type": ["string", "null"], "format": "uuid"},
                         "executionWorkspacePreference": {"type": ["string", "null"]}, "executionWorkspaceSettings": {"type": ["object", "null"]},
-                        "labelIds": {"type": "array", "items": {"type": "string", "format": "uuid"}}, "watchdogDiscovery": {"type": ["object", "null"]}
+                        "labelIds": {"type": "array", "items": {"type": "string", "format": "uuid"}}, "watchdogDiscovery": {"type": ["object", "null"], "properties": {"kind": {"type": "string", "enum": ["product_bug"]}, "evidenceMarkdown": {"type": ["string", "null"]}}, "required": ["kind"], "additionalProperties": false}
                     }, "required": ["title"], "additionalProperties": false
                 }),
                 "paperclipUpdateIssue" => serde_json::json!({

@@ -183,6 +183,8 @@ impl IssueExecutionLockService for DefaultIssueExecutionLockService {
             execution_state: None,
             execution_locked_at: Some(Utc::now()),
             execution_run_id: Some(execution_run_id),
+            label_ids: None,
+            blocked_by_issue_ids: None,
         };
 
         let updated_issue = self.issue_repo
@@ -236,6 +238,8 @@ impl IssueExecutionLockService for DefaultIssueExecutionLockService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
         };
 
         self.issue_repo
@@ -292,6 +296,8 @@ impl IssueExecutionLockService for DefaultIssueExecutionLockService {
             execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
         };
 
         self.issue_repo

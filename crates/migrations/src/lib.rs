@@ -20,6 +20,7 @@ pub const MIGRATION_041: &str = include_str!("../../../migrations/20260728000002
 pub const MIGRATION_013: &str = include_str!("../../../migrations/20260712000003_create_issue_watchdogs.sql");
 pub const MIGRATION_014: &str = include_str!("../../../migrations/20260712000004_create_agent_wakeup_requests.sql");
 pub const MIGRATION_015: &str = include_str!("../../../migrations/20260712000005_create_issue_thread_interactions.sql");
+pub const MIGRATION_016: &str = include_str!("../../../migrations/20260805000004_create_issue_relations.sql");
 
 /// Ordered list of all migrations (ascending by migration number).
 pub const ALL_MIGRATIONS: &[(&str, &str)] = &[
@@ -35,6 +36,7 @@ pub const ALL_MIGRATIONS: &[(&str, &str)] = &[
     ("013_create_issue_watchdogs", MIGRATION_013),
     ("014_create_agent_wakeup_requests", MIGRATION_014),
     ("015_create_issue_thread_interactions", MIGRATION_015),
+    ("016_create_issue_relations", MIGRATION_016),
     ("039_add_heartbeat_run_output", MIGRATION_039),
     ("040_create_tool_invocation_audit", MIGRATION_040),
     ("041_create_named_mcp_gateways", MIGRATION_041),

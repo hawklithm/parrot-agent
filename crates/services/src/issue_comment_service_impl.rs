@@ -142,6 +142,8 @@ impl DefaultIssueCommentService {
                 execution_state: None,
             execution_locked_at: None,
             execution_run_id: None,
+            label_ids: None,
+            blocked_by_issue_ids: None,
             };
 
             self.issue_repo
@@ -153,4 +155,3 @@ impl DefaultIssueCommentService {
         Ok(())
     }
 }
-
