@@ -602,6 +602,13 @@ async fn create_issue(
             source_issue.id,
             run_id
         ));
+        input.watchdog_discovery_audit = Some(models::WatchdogDiscoveryAuditInput {
+            actor_id: actor.principal_id().ok_or(StatusCode::FORBIDDEN)?,
+            source_issue_id: scope.watched_issue_id,
+            watchdog_issue_id: scope.watchdog_issue_id,
+            watchdog_id: scope.watchdog_id,
+            stop_fingerprint: scope.stop_fingerprint.clone(),
+        });
     }
     let requested_watchdog = input.watchdog.clone();
     if let Some(harness_kind) = input.harness_kind.as_deref() {
@@ -651,27 +658,6 @@ async fn create_issue(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .unwrap_or(created.issue);
-    if let (Some(_discovery), Some(scope)) = (requested_discovery.as_ref(), discovery_scope.as_ref()) {
-        let actor_id = actor.principal_id().ok_or(StatusCode::FORBIDDEN)?;
-        sqlx::query(
-            "INSERT INTO activity_logs
-             (company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata)
-             VALUES ($1, 'issue.watchdog_discovery_created', 'agent', $2, 'issue', $3, $4)",
-        )
-        .bind(company_id)
-        .bind(actor_id)
-        .bind(response_issue.id)
-        .bind(serde_json::json!({
-            "kind": "product_bug",
-            "sourceIssueId": scope.watched_issue_id,
-            "watchdogIssueId": scope.watchdog_issue_id,
-            "watchdogId": scope.watchdog_id,
-            "stopFingerprint": scope.stop_fingerprint,
-        }))
-        .execute(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
     Ok(Json(response_issue))
 }
 

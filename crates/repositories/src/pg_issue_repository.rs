@@ -747,6 +747,26 @@ impl IssueRepository for PgIssueRepository {
             .map_err(RepositoryError::DatabaseError)?;
             issue.watchdog = Some(watchdog_row);
         }
+        if let Some(audit) = input.watchdog_discovery_audit.as_ref() {
+            sqlx::query(
+                "INSERT INTO activity_logs
+                 (company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata)
+                 VALUES ($1, 'issue.watchdog_discovery_created', 'agent', $2, 'issue', $3, $4)",
+            )
+            .bind(input.company_id)
+            .bind(audit.actor_id)
+            .bind(issue.id)
+            .bind(serde_json::json!({
+                "kind": "product_bug",
+                "sourceIssueId": audit.source_issue_id,
+                "watchdogIssueId": audit.watchdog_issue_id,
+                "watchdogId": audit.watchdog_id,
+                "stopFingerprint": audit.stop_fingerprint,
+            }))
+            .execute(&mut *tx)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+        }
         issue.label_ids = input.label_ids;
         issue.blocked_by_issue_ids = input.blocked_by_issue_ids;
         tx.commit().await.map_err(RepositoryError::DatabaseError)?;

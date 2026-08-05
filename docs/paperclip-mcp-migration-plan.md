@@ -4,7 +4,7 @@
 >
 > 约束：只允许修改 `/Users/adazhao/workspace/parrot-agent`；禁止修改 `/Users/adazhao/workspace/paperclip`。所有 Paperclip 代码仅作为只读参考。
 
-> 执行状态（2026-08-05）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、统一 typed tool registry、schema/参数校验、审计、MCP session 生命周期、批量 JSON-RPC、SSE 长连接 GET，以及本地 Claude/Codex 的真实 MCP 握手与 Codex 业务长流程。`PaperclipInternalClient` 已将 REST 回环访问从工具映射中抽出并统一认证/错误处理。`CreateIssue` 的 labels、blocker relations/环检测、workspace inheritance、watchdog、watchdogDiscovery 和 harnessKind 已落地并由运行态矩阵覆盖；普通 `watchdog` 创建已并入 Issue/labels/blockers 的 repository transaction，`watchdogDiscovery` 的 activity audit 仍是独立写入；真实 Claude 业务成功路径和 workspace 中既存的非迁移测试失败仍未宣称完成。
+> 执行状态（2026-08-05）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、统一 typed tool registry、schema/参数校验、审计、MCP session 生命周期、批量 JSON-RPC、SSE 长连接 GET，以及本地 Claude/Codex 的真实 MCP 握手与 Codex 业务长流程。`PaperclipInternalClient` 已将 REST 回环访问从工具映射中抽出并统一认证/错误处理。`CreateIssue` 的 labels、blocker relations/环检测、workspace inheritance、watchdog、watchdogDiscovery 和 harnessKind 已落地并由运行态矩阵覆盖；Issue、labels、blockers、watchdog 和 watchdogDiscovery activity audit 已统一进入 repository transaction；真实 Claude 业务成功路径和 workspace 中既存的非迁移测试失败仍未宣称完成。
 
 ## 1. 目标与非目标
 
@@ -300,7 +300,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 | `blockedByIssueIds` | 已新增 `issue_relations` migration；创建和更新均在事务中校验同 company、去重、自引用，GET/list 会回填 blocker IDs | 继续补 Paperclip 的环检测和 blocker 状态派生字段；矩阵已验证创建与更新成功路径 |
 | `inheritExecutionWorkspaceFromIssueId` | 已在 service 层读取来源 Issue，并继承 project/workspace/preference/settings；显式目标字段优先 | 补 workspace source 的跨公司/不存在错误矩阵，以及真实 execution workspace runtime 验证 |
 | `harnessKind` | 已新增 `issues.harness_kind` migration，并贯通 model/service/repository；`skill_test` 会与 `workMode=skill_test` 双向归一化，非法值/冲突组合返回 422 | 继续补真实 skill-test adapter 执行策略和旧库升级验证 |
-| `watchdogDiscovery`、`watchdog` | `watchdog` 已接入 REST CreateIssue 和专用 watchdog route；`watchdogDiscovery=product_bug` 已校验 active watchdog run，继承来源上下文，写入 origin/description/audit projection | 普通 watchdog upsert 已与 Issue 主记录合并为 repository transaction；discovery 的 activity audit 仍需合并进同一事务，并继续补 discovery 的跨公司/伪造 run 负向矩阵 |
+| `watchdogDiscovery`、`watchdog` | `watchdog` 已接入 REST CreateIssue 和专用 watchdog route；`watchdogDiscovery=product_bug` 已校验 active watchdog run，继承来源上下文，写入 origin/description/audit projection | Issue、watchdog 和 discovery activity audit 已合并为 repository transaction；仍需继续补 discovery 的跨公司/伪造 run 负向矩阵 |
 | `goalId`、`parentId` | 已有基础校验和持久化 | 补 company scope 校验；`parentId` 创建子任务后必须验证 wakeup/继承策略 |
 
 迁移顺序必须固定为：
@@ -309,7 +309,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] labels、blocker relations、harnessKind、watchdog 和 Issue 主记录已使用同一 repository 数据库事务；watchdog route 的独立 upsert 仍保留给已存在 Issue 的更新场景。
 - [x] 已覆盖 labels 缺失、watchdog agent company scope、harnessKind 非法/冲突、watchdogDiscovery 非 agent run、active watchdog discovery 成功等成功/错误组合；跨公司和伪造 run 仍需在 security smoke 中继续细化。
 - [x] 已更新 `paperclip-mcp-tool-matrix-smoke.mjs`，断言 execution fields、labels、blocker relations、watchdog 的实际返回投影，并执行缺失 label 错误路径。
-- [x] `paperclipCreateIssue` 的高级字段已具备显式 model、持久化或明确运行时契约；当前剩余限制（watchdogDiscovery activity audit 的跨表原子性、skill-test 执行策略）已在本节列明。
+- [x] `paperclipCreateIssue` 的高级字段已具备显式 model、持久化或明确运行时契约；当前剩余限制（skill-test 执行策略）已在本节列明。
 
 ### 6.2 当前 41 个工具映射总表
 
@@ -439,7 +439,7 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 - [x] `crates/models/src/issue.rs`、`crates/repositories/src/pg_issue_repository.rs`：`CreateIssue` 的 `executionPolicy`、`executionWorkspaceSettings` 已贯通 model/service/repository，并由工具矩阵验证持久化返回值。
 - [x] `migrations/20260805000004_create_issue_relations.sql`、`crates/models/src/issue.rs`、`crates/repositories/src/pg_issue_repository.rs`：`labelIds`、`blockedByIssueIds` 已加入事务持久化和读取 projection；`inheritExecutionWorkspaceFromIssueId` 已在 service 层完成同公司来源配置继承。
 - [x] `migrations/20260805000005_add_issue_harness_kind.sql`、`crates/models/src/issue.rs`、`crates/repositories/src/pg_issue_repository.rs`：`harnessKind=skill_test` 已独立持久化，并与 `workMode` 归一化。
-- [x] `crates/api/src/routes/issues.rs`、`crates/api/src/routes/watchdogs.rs`、`crates/services/src/task_watchdog.rs`、`crates/repositories/src/pg_issue_repository.rs`：`CreateIssue.watchdog` 已校验 watchdog agent company scope，并在 Issue repository transaction 内写入 watchdog projection；`watchdogDiscovery=product_bug` 已实现 active run scope、来源继承、origin fingerprint、description context 和 activity audit（activity audit 的跨表原子性仍是已知限制）。
+- [x] `crates/api/src/routes/issues.rs`、`crates/api/src/routes/watchdogs.rs`、`crates/services/src/task_watchdog.rs`、`crates/repositories/src/pg_issue_repository.rs`：`CreateIssue.watchdog` 已校验 watchdog agent company scope，并在 Issue repository transaction 内写入 watchdog projection；`watchdogDiscovery=product_bug` 已实现 active run scope、来源继承、origin fingerprint、description context 和 activity audit，且 activity audit 与 Issue 位于同一 transaction。
 - [x] `crates/services/src/auth/middleware.rs`：`ptg_` token hash 查询、过期/撤销校验和 Agent actor 解析。
 - [x] `migrations/20260804000001_complete_auth_users.sql`：旧数据库缺失 auth user 字段的兼容迁移。
 - [x] `migrations/20260804000002_complete_issue_interactions.sql`：Paperclip interaction kinds、payload、幂等键和 continuation policy。

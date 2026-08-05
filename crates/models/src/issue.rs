@@ -369,6 +369,8 @@ pub struct CreateIssueInput {
     /// Internal run provenance; excluded from the public JSON contract.
     #[serde(skip)]
     pub watchdog_created_by_run_id: Option<Uuid>,
+    #[serde(skip)]
+    pub watchdog_discovery_audit: Option<WatchdogDiscoveryAuditInput>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -376,6 +378,18 @@ pub struct CreateIssueInput {
 pub struct CreateIssueWatchdogInput {
     pub agent_id: Uuid,
     pub instructions: Option<String>,
+}
+
+/// Internal audit data for a watchdog discovery issue. It is populated only
+/// after the gateway has validated the active run and is never accepted from
+/// the public CreateIssue JSON contract.
+#[derive(Debug, Clone)]
+pub struct WatchdogDiscoveryAuditInput {
+    pub actor_id: Uuid,
+    pub source_issue_id: Uuid,
+    pub watchdog_issue_id: Option<Uuid>,
+    pub watchdog_id: Uuid,
+    pub stop_fingerprint: Option<String>,
 }
 
 /// Update issue input

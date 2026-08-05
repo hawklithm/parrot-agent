@@ -79,6 +79,8 @@ pub struct CreateIssueInput {
     pub blocked_by_issue_ids: Vec<Uuid>,
     pub watchdog: Option<models::CreateIssueWatchdogInput>,
     pub watchdog_created_by_run_id: Option<Uuid>,
+    #[serde(skip)]
+    pub watchdog_discovery_audit: Option<models::WatchdogDiscoveryAuditInput>,
 }
 
 /// Match Paperclip's create-issue defaulting contract.
@@ -369,6 +371,7 @@ impl IssueService for DefaultIssueService {
             watchdog: input.watchdog,
             watchdog_discovery: None,
             watchdog_created_by_run_id: input.watchdog_created_by_run_id,
+            watchdog_discovery_audit: input.watchdog_discovery_audit,
         };
         let created_issue = self.issue_repo
             .create(models_input)
@@ -920,6 +923,7 @@ impl issue_service::IssueService for LegacyIssueService {
             blocked_by_issue_ids: input.blocked_by_issue_ids,
             watchdog: input.watchdog,
             watchdog_created_by_run_id: input.watchdog_created_by_run_id,
+            watchdog_discovery_audit: input.watchdog_discovery_audit,
         };
         let result = self.inner.create(compat_input).await.map_err(|e| e.to_string())?;
         self.wake_assigned_issue(&result.issue);
@@ -965,6 +969,7 @@ impl issue_service::IssueService for LegacyIssueService {
             blocked_by_issue_ids: input.blocked_by_issue_ids,
             watchdog: input.watchdog,
             watchdog_created_by_run_id: input.watchdog_created_by_run_id,
+            watchdog_discovery_audit: input.watchdog_discovery_audit,
         };
         let result = self.inner.create_child(parent_id, compat_input).await.map_err(|e| e.to_string())?;
         self.wake_assigned_issue(&result.issue);
