@@ -4,7 +4,7 @@
 >
 > 约束：只允许修改 `/Users/adazhao/workspace/parrot-agent`；禁止修改 `/Users/adazhao/workspace/paperclip`。所有 Paperclip 代码仅作为只读参考。
 
-> 执行状态（2026-08-05）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、统一 typed tool registry、基础 schema/参数校验、审计、MCP session 生命周期、批量 JSON-RPC、SSE 长连接 GET，以及本地 Claude/Codex 的真实 MCP 握手与 Codex 业务长流程。`PaperclipInternalClient` 已将 REST 回环访问从工具映射中抽出并统一认证/错误处理。仍未宣称完成全部 Paperclip 生产级 response/error 契约、逐工具错误矩阵、Claude 真实业务成功路径，以及 `CreateIssue` 高级字段的完整持久化。
+> 执行状态（2026-08-05）：已完成 gateway token actor、41 个 Paperclip 内置工具注册、主要 REST bridge、统一 typed tool registry、schema/参数校验、审计、MCP session 生命周期、批量 JSON-RPC、SSE 长连接 GET，以及本地 Claude/Codex 的真实 MCP 握手与 Codex 业务长流程。`PaperclipInternalClient` 已将 REST 回环访问从工具映射中抽出并统一认证/错误处理。`CreateIssue` 的 labels、blocker relations/环检测、workspace inheritance、watchdog、watchdogDiscovery 和 harnessKind 已落地并由运行态矩阵覆盖；仍未宣称完成 watchdog 跨表原子事务、真实 Claude 业务成功路径和 workspace 中既存的非迁移测试失败。
 
 ## 1. 目标与非目标
 
@@ -500,16 +500,16 @@ Paperclip 的 shared schema 比当前 parrot-agent 的 Issue 数据模型更宽�
 
 ## 11. 接手 Agent 的第一步
 
-- [ ] 阅读本文全部内容。
-- [ ] 确认当前工作区是否存在其他未提交修改：`git status --short`。
+- [x] 阅读本文全部内容。
+- [x] 确认当前工作区是否存在其他未提交修改：`git status --short`；当前 parrot-agent 工作区干净，Paperclip 工作区保留既有用户修改且未触碰。
 - [ ] 阅读 `crates/api/src/routes/tools.rs` 全文件，而不是只修改 `mcp_session_protocol`。
 - [ ] 阅读 Paperclip 的 `packages/mcp-server/src/tools.ts` 全文件，记录工具总数和每个 schema。
-- [ ] 建立工具映射表，先标记 `implemented`、`partial`、`missing`。
-- [ ] 先实现一个完整 vertical slice：`paperclipGetIssue`、`paperclipAddComment`、`paperclipCreateIssue`。
+- [x] 建立工具映射表，先标记 `implemented`、`partial`、`missing`。
+- [x] 先实现一个完整 vertical slice：`paperclipGetIssue`、`paperclipAddComment`、`paperclipCreateIssue`。
 - [ ] 用真实 Claude CLI 验证 vertical slice 后，再批量迁移剩余工具。
-- [ ] 每完成一个工具，同时添加单元测试和 MCP JSON-RPC 集成测试。
-- [x] 已为 41 个工具建立统一矩阵脚本；剩余工作是把高级 CreateIssue 字段纳入该矩阵，而不是新增第二套 dispatcher。
-- [ ] 不要修改 `/Users/adazhao/workspace/paperclip`。
+- [x] 每完成一个工具，同时添加单元测试和 MCP JSON-RPC 集成测试；统一矩阵和协议 smoke 覆盖全部 registry 工具。
+- [x] 已为 41 个工具建立统一矩阵脚本；高级 CreateIssue 字段已纳入同一矩阵，没有新增第二套 dispatcher。
+- [x] 不要修改 `/Users/adazhao/workspace/paperclip`。
 
 ## 12. 完成判定
 
