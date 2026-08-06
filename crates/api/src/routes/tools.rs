@@ -124,6 +124,11 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
         ("paperclipGetRoutine", "Get a single routine by id"),
         ("paperclipCreateRoutine", "Create a new routine"),
         ("paperclipUpdateRoutine", "Update a routine"),
+        ("paperclipListIssueDocumentAnnotations", "List issue document annotations"),
+        ("paperclipGetIssueDocumentAnnotationThread", "Get issue document annotation thread"),
+        ("paperclipCreateIssueDocumentAnnotation", "Create issue document annotation"),
+        ("paperclipReplyIssueDocumentAnnotation", "Reply to issue document annotation"),
+        ("paperclipUpdateIssueDocumentAnnotation", "Update issue document annotation thread"),
     ];
     TOOLS
         .iter()
@@ -386,6 +391,46 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "env": {"type": ["object", "null"]}
                     }, "required": ["routineId"], "additionalProperties": false
                 }),
+                "paperclipListIssueDocumentAnnotations" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"},
+                        "key": {"type": "string", "minLength": 1, "maxLength": 64}
+                    }, "required": ["issueId", "key"], "additionalProperties": false
+                }),
+                "paperclipGetIssueDocumentAnnotationThread" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"},
+                        "key": {"type": "string", "minLength": 1, "maxLength": 64},
+                        "threadId": {"type": "string", "format": "uuid"}
+                    }, "required": ["issueId", "key", "threadId"], "additionalProperties": false
+                }),
+                "paperclipCreateIssueDocumentAnnotation" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"},
+                        "key": {"type": "string", "minLength": 1, "maxLength": 64},
+                        "body": {"type": "string", "minLength": 1},
+                        "selectedText": {"type": "string"},
+                        "anchorSelector": {"type": ["object", "null"]},
+                        "selector": {"type": ["object", "null"]},
+                        "resolved": {"type": "boolean"}
+                    }, "required": ["issueId", "key", "body"], "additionalProperties": false
+                }),
+                "paperclipReplyIssueDocumentAnnotation" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"},
+                        "key": {"type": "string", "minLength": 1, "maxLength": 64},
+                        "threadId": {"type": "string", "format": "uuid"},
+                        "body": {"type": "string", "minLength": 1}
+                    }, "required": ["issueId", "key", "threadId", "body"], "additionalProperties": false
+                }),
+                "paperclipUpdateIssueDocumentAnnotation" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string"},
+                        "key": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "threadId": {"type": "string", "format": "uuid"},
+                        "resolved": {"type": "boolean"}
+                    }, "required": ["issueId", "key", "threadId"], "additionalProperties": false
+                }),
                 "paperclipApiRequest" => serde_json::json!({
                     "type": "object", "properties": {"method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]}, "path": {"type": "string"}, "jsonBody": {"type": "string"}},
                     "required": ["method", "path"], "additionalProperties": false
@@ -454,6 +499,9 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
         "paperclipGetRoutine" => &["routineId"],
         "paperclipCreateRoutine" => &["title"],
         "paperclipUpdateRoutine" => &["routineId"],
+        "paperclipListIssueDocumentAnnotations" | "paperclipCreateIssueDocumentAnnotation" => &["issueId", "key"],
+        "paperclipGetIssueDocumentAnnotationThread" | "paperclipReplyIssueDocumentAnnotation"
+        | "paperclipUpdateIssueDocumentAnnotation" => &["issueId", "key", "threadId"],
         "paperclipApiRequest" => &["method", "path"],
         _ => &[],
     };
@@ -463,7 +511,7 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             return Err(format!("{key} is required"));
         }
     }
-    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path", "caseId", "caseType", "routineId"] {
+    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path", "caseId", "caseType", "routineId", "threadId"] {
         if object.contains_key(key) && !object.get(key).is_some_and(Value::is_string) {
             return Err(format!("{key} must be a string"));
         }
@@ -2293,6 +2341,76 @@ async fn call_paperclip_builtin_tool(
                         if let Some(value) = parameters.get(key).filter(|v| !v.is_null()) {
                             obj.insert(key.to_string(), value.clone());
                         }
+                    }
+                }
+                body
+            }),
+        ),
+        "paperclipListIssueDocumentAnnotations" => (
+            "GET",
+            format!(
+                "/issues/{}/documents/{}/annotations",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("key"), "key")?
+            ),
+            None,
+        ),
+        "paperclipGetIssueDocumentAnnotationThread" => (
+            "GET",
+            format!(
+                "/issues/{}/documents/{}/annotations/{}",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("key"), "key")?,
+                path_part(parameters.get("threadId"), "threadId")?
+            ),
+            None,
+        ),
+        "paperclipCreateIssueDocumentAnnotation" => (
+            "POST",
+            format!(
+                "/issues/{}/documents/{}/annotations",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("key"), "key")?
+            ),
+            Some({
+                let mut body = serde_json::json!({
+                    "body": parameters.get("body").cloned().ok_or("body is required")?
+                });
+                if let Some(obj) = body.as_object_mut() {
+                    for key in ["selectedText", "anchorSelector", "selector", "resolved"] {
+                        if let Some(value) = parameters.get(key).filter(|v| !v.is_null()) {
+                            obj.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                body
+            }),
+        ),
+        "paperclipReplyIssueDocumentAnnotation" => (
+            "POST",
+            format!(
+                "/issues/{}/documents/{}/annotations/{}/reply",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("key"), "key")?,
+                path_part(parameters.get("threadId"), "threadId")?
+            ),
+            Some(serde_json::json!({
+                "body": parameters.get("body").cloned().ok_or("body is required")?
+            })),
+        ),
+        "paperclipUpdateIssueDocumentAnnotation" => (
+            "PATCH",
+            format!(
+                "/issues/{}/documents/{}/annotations/{}",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("key"), "key")?,
+                path_part(parameters.get("threadId"), "threadId")?
+            ),
+            Some({
+                let mut body = serde_json::json!({});
+                if let Some(obj) = body.as_object_mut() {
+                    if let Some(value) = parameters.get("resolved").filter(|v| !v.is_null()) {
+                        obj.insert("resolved".to_string(), value.clone());
                     }
                 }
                 body

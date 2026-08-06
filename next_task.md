@@ -164,24 +164,22 @@ paperclip 中存在 Routines REST API（`server/src/routes/routines.ts`），但
 ### 1.3 Issue Document Annotations（Issue文档标注）- 5个工具
 REST API 已在前一个会话添加到 parrot-agent（`crates/api/src/routes/issues.rs:459-823`），但 **MCP 工具层缺失**。
 
-- [ ] **paperclipListIssueDocumentAnnotations** - 列出Issue文档标注
+- [x] **paperclipListIssueDocumentAnnotations** - 列出Issue文档标注
   - 参考：parrot-agent `GET /api/issues/:id/documents/:key/annotations`
   - 实现位置：`crates/api/src/routes/tools.rs`
 
-- [ ] **paperclipGetIssueDocumentAnnotationThread** - 获取标注线程详情
+- [x] **paperclipGetIssueDocumentAnnotationThread** - 获取标注线程详情
   - 参考：parrot-agent `GET /api/issues/:id/documents/:key/annotations/:thread_id`
 
-- [ ] **paperclipCreateIssueDocumentAnnotation** - 创建Issue文档标注
+- [x] **paperclipCreateIssueDocumentAnnotation** - 创建Issue文档标注
   - 参考：parrot-agent `POST /api/issues/:id/documents/:key/annotations`
   - Schema需包含：body, anchorJson, resolved 等
 
-- [ ] **paperclipReplyIssueDocumentAnnotation** - 回复标注评论
+- [x] **paperclipReplyIssueDocumentAnnotation** - 回复标注评论
   - 参考：parrot-agent `POST /api/issues/:id/documents/:key/annotations/:thread_id/reply`
 
-- [ ] **paperclipUpdateIssueDocumentAnnotation** - 更新标注线程状态
+- [x] **paperclipUpdateIssueDocumentAnnotation** - 更新标注线程状态
   - 参考：parrot-agent `PATCH /api/issues/:id/documents/:key/annotations/:thread_id`
-
----
 
 ### 1.4 Labels（标签管理）- 3个工具
 paperclip 中存在 Labels REST API（`server/src/routes/issues.ts`），但 **MCP 工具层缺失**。
