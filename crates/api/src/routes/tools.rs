@@ -141,6 +141,7 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
         ("paperclipCreateCaseLink", "Create case link"),
         ("paperclipGetIssueCases", "Get issue cases"),
         ("paperclipListIssueAttachments", "List issue attachments"),
+        ("paperclipCreateIssueAttachment", "Create issue attachment"),
         ("paperclipGetAttachmentContent", "Get attachment content"),
         ("paperclipDeleteAttachment", "Delete attachment"),
         ("paperclipListCaseDocuments", "List case documents"),
@@ -496,6 +497,14 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                 "paperclipGetAttachmentContent" | "paperclipDeleteAttachment" => serde_json::json!({
                     "type": "object", "properties": {"attachmentId": {"type": "string", "format": "uuid"}}, "required": ["attachmentId"], "additionalProperties": false
                 }),
+                "paperclipCreateIssueAttachment" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string", "format": "uuid"},
+                        "filename": {"type": "string"},
+                        "contentType": {"type": "string"},
+                        "base64Content": {"type": "string"}
+                    }, "required": ["issueId", "filename", "contentType", "base64Content"], "additionalProperties": false
+                }),
                 "paperclipListCaseDocuments" | "paperclipGetCaseEvents" => serde_json::json!({
                     "type": "object", "properties": {"caseId": {"type": "string"}}, "required": ["caseId"], "additionalProperties": false
                 }),
@@ -608,6 +617,7 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
         "paperclipListIssueExternalObjects" | "paperclipRefreshIssueExternalObjects" 
         | "paperclipListIssueFileResources" | "paperclipResolveIssueFileResource" 
         | "paperclipGetIssueFileResourceContent" | "paperclipListIssueAttachments" => &["issueId"],
+        "paperclipCreateIssueAttachment" => &["issueId", "filename", "contentType", "base64Content"],
         "paperclipGetCaseChildren" => &["caseId"],
         "paperclipCreateCaseLink" => &["caseId", "issueId", "role"],
         "paperclipGetIssueCases" => &["issueId"],
@@ -635,7 +645,7 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             return Err(format!("{key} is required"));
         }
     }
-    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path", "caseId", "caseType", "routineId", "threadId", "labelId", "name", "color", "role", "attachmentId", "triggerId"] {
+    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path", "caseId", "caseType", "routineId", "threadId", "labelId", "name", "color", "role", "attachmentId", "triggerId", "filename", "contentType", "base64Content"] {
         if object.contains_key(key) && !object.get(key).is_some_and(Value::is_string) {
             return Err(format!("{key} must be a string"));
         }
@@ -2574,6 +2584,15 @@ async fn call_paperclip_builtin_tool(
         ),
         "paperclipGetIssueCases" => ("GET", format!("/issues/{}/cases", path_part(parameters.get("issueId"), "issueId")?), None),
         "paperclipListIssueAttachments" => ("GET", format!("/issues/{}/attachments", path_part(parameters.get("issueId"), "issueId")?), None),
+        "paperclipCreateIssueAttachment" => (
+            "POST",
+            format!("/companies/{company_id}/issues/{}/attachments", path_part(parameters.get("issueId"), "issueId")?),
+            Some(serde_json::json!({
+                "filename": parameters.get("filename").cloned().ok_or("filename is required")?,
+                "contentType": parameters.get("contentType").cloned().ok_or("contentType is required")?,
+                "base64Content": parameters.get("base64Content").cloned().ok_or("base64Content is required")?
+            })),
+        ),
         "paperclipGetAttachmentContent" => ("GET", format!("/attachments/{}/content", path_part(parameters.get("attachmentId"), "attachmentId")?), None),
         "paperclipDeleteAttachment" => ("DELETE", format!("/attachments/{}", path_part(parameters.get("attachmentId"), "attachmentId")?), None),
         "paperclipListCaseDocuments" => ("GET", format!("/cases/{}/documents", path_part(parameters.get("caseId"), "caseId")?), None),
