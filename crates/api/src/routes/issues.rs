@@ -456,6 +456,382 @@ async fn restore_issue_document_revision(
     Ok(Json(serde_json::json!({"restored": true, "issueId": issue_id, "key": key, "revisionId": revision_id, "revisionNumber": revision, "content": content, "body": content})))
 }
 
+/// GET /issues/:id/documents/:key/annotations
+async fn get_issue_document_annotations(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, key)): Path<(Uuid, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    
+    let status = params.get("status").map(|s| s.as_str()).unwrap_or("all");
+    let include_comments = params.get("includeComments").map(|s| s == "true").unwrap_or(true);
+    
+    let mut query = "SELECT id, status, anchor_state, selected_text, anchor_selector, anchor_confidence, \
+                     prefix_text, suffix_text, normalized_start, normalized_end, markdown_start, markdown_end, \
+                     original_revision_number, current_revision_number, created_at, updated_at \
+                     FROM document_annotation_threads \
+                     WHERE issue_id=$1 AND document_id=$2".to_string();
+    
+    if status != "all" {
+        query.push_str(&format!(" AND status='{}'", status));
+    }
+    query.push_str(" ORDER BY updated_at DESC");
+    
+    let rows = sqlx::query(&query)
+        .bind(issue_id)
+        .bind(document_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        let thread_id: Uuid = row.get("id");
+        let mut thread_json = serde_json::json!({
+            "id": thread_id,
+            "threadId": thread_id,
+            "issueId": issue_id,
+            "documentKey": key,
+            "status": row.get::<String, _>("status"),
+            "anchorState": row.get::<String, _>("anchor_state"),
+            "anchorConfidence": row.get::<String, _>("anchor_confidence"),
+            "selectedText": row.get::<String, _>("selected_text"),
+            "anchorSelector": row.get::<serde_json::Value, _>("anchor_selector"),
+            "prefixText": row.get::<String, _>("prefix_text"),
+            "suffixText": row.get::<String, _>("suffix_text"),
+            "normalizedStart": row.get::<i32, _>("normalized_start"),
+            "normalizedEnd": row.get::<i32, _>("normalized_end"),
+            "markdownStart": row.get::<i32, _>("markdown_start"),
+            "markdownEnd": row.get::<i32, _>("markdown_end"),
+            "originalRevisionNumber": row.get::<i32, _>("original_revision_number"),
+            "currentRevisionNumber": row.get::<i32, _>("current_revision_number"),
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+        });
+        
+        if include_comments {
+            let comments = sqlx::query(
+                "SELECT id, body, author_type, author_agent_id, author_user_id, created_at, updated_at \
+                 FROM document_annotation_comments WHERE thread_id=$1 ORDER BY created_at ASC"
+            )
+            .bind(thread_id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            
+            let comments_json: Vec<serde_json::Value> = comments
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.get::<Uuid, _>("id"),
+                        "body": c.get::<String, _>("body"),
+                        "authorType": c.get::<String, _>("author_type"),
+                        "authorAgentId": c.get::<Option<Uuid>, _>("author_agent_id"),
+                        "authorUserId": c.get::<Option<String>, _>("author_user_id"),
+                        "createdAt": c.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                        "updatedAt": c.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                    })
+                })
+                .collect();
+            
+            thread_json["comments"] = serde_json::json!(comments_json);
+        }
+        
+        result.push(thread_json);
+    }
+    
+    Ok(Json(result))
+}
+
+/// GET /issues/:id/documents/:key/annotations/:thread_id
+async fn get_issue_document_annotation_thread(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, key, thread_id)): Path<(Uuid, String, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    
+    let row = sqlx::query(
+        "SELECT id, status, anchor_state, selected_text, anchor_selector, anchor_confidence, \
+         prefix_text, suffix_text, normalized_start, normalized_end, markdown_start, markdown_end, \
+         original_revision_number, current_revision_number, created_at, updated_at \
+         FROM document_annotation_threads \
+         WHERE id=$1 AND issue_id=$2 AND document_id=$3"
+    )
+    .bind(thread_id)
+    .bind(issue_id)
+    .bind(document_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+       let comments = sqlx::query(
+        "SELECT id, body, author_type, author_agent_id, author_user_id, created_at, updated_at \
+         FROM document_annotation_comments WHERE thread_id=$1 ORDER BY created_at ASC"
+    )
+    .bind(thread_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    let comments_json: Vec<serde_json::Value> = comments
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.get::<Uuid, _>("id"),
+                "body": c.get::<String, _>("body"),
+                "authorType": c.get::<String, _>("author_type"),
+                "authorAgentId": c.get::<Option<Uuid>, _>("author_agent_id"),
+                "authorUserId": c.get::<Option<String>, _>("author_user_id"),
+                "createdAt": c.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                "updatedAt": c.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+            })
+        })
+        .collect();
+    
+    Ok(Json(serde_json::json!({
+        "id": thread_id,
+        "threadId": thread_id,
+        "issueId": issue_id,
+        "documentKey": key,
+        "status": row.get::<String, _>("status"),
+        "anchorState": row.get::<String, _>("anchor_state"),
+        "anchorConfidence": row.get::<String, _>("anchor_confidence"),
+        "selectedText": row.get::<String, _>("selected_text"),
+        "anchorSelector": row.get::<serde_json::Value, _>("anchor_selector"),
+        "prefixText": row.get::<String, _>("prefix_text"),
+        "suffixText": row.get::<String, _>("suffix_text"),
+        "normalizedStart": row.get::<i32, _>("normalized_start"),
+        "normalizedEnd": row.get::<i32, _>("normalized_end"),
+        "markdownStart": row.get::<i32, _>("markdown_start"),
+        "markdownEnd": row.get::<i32, _>("markdown_end"),
+        "originalRevisionNumber": row.get::<i32, _>("original_revision_number"),
+        "currentRevisionNumber": row.get::<i32, _>("current_revision_number"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+        "comments": comments_json,
+    })))
+}
+
+/// POST /issues/:id/documents/:key/annotations
+async fn create_issue_document_annotation(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, key)): Path<(Uuid, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    
+    let selected_text = payload.get("selectedText").and_then(|v| v.as_str()).unwrap_or_default();
+    let selector = payload.get("anchorSelector").or_else(|| payload.get("selector")).cloned().unwrap_or_else(|| serde_json::json!({}));
+    let body = payload.get("body").and_then(|v| v.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
+    
+    // 获取当前 revision number
+    let revision_number: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(revision_number), 0) FROM document_revisions WHERE document_id=$1"
+    )
+    .bind(document_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    let thread_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO document_annotation_threads \
+         (company_id, issue_id, document_id, document_key, selected_text, anchor_selector, \
+          original_revision_number, current_revision_number, normalized_start, normalized_end, \
+          markdown_start, markdown_end, prefix_text, suffix_text) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 0, 0, 0, 0, '', '') \
+         RETURNING id"
+    )
+    .bind(company_id)
+    .bind(issue_id)
+    .bind(document_id)
+    .bind(&key)
+    .bind(selected_text)
+    .bind(&selector)
+    .bind(revision_number)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    let author_user_id = match &actor {
+        AuthorizationActor::Board { user_id, .. } => Some(*user_id),
+        _ => None,
+    };
+    
+    let comment_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO document_annotation_comments \
+         (company_id, thread_id, issue_id, document_id, body, author_type, author_user_id) \
+         VALUES ($1, $2, $3, $4, $5, 'user', $6) \
+         RETURNING id"
+    )
+    .bind(company_id)
+    .bind(thread_id)
+    .bind(issue_id)
+    .bind(document_id)
+    .bind(body)
+    .bind(author_user_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "threadId": thread_id,
+            "id": thread_id,
+            "issueId": issue_id,
+            "documentKey": key,
+            "status": "open",
+            "selectedText": selected_text,
+            "anchorSelector": selector,
+            "comments": [{
+                "id": comment_id,
+                "body": body,
+                "authorType": "user",
+                "authorUserId": author_user_id,
+            }],
+        })),
+    ))
+}
+
+/// POST /issues/:id/documents/:key/annotations/:thread_id/reply
+async fn reply_issue_document_annotation(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, key, thread_id)): Path<(Uuid, String, Uuid)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    
+    let body = payload.get("body").and_then(|v| v.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
+    
+    let author_user_id = match &actor {
+        AuthorizationActor::Board { user_id, .. } => Some(*user_id),
+        _ => None,
+    };
+    
+    let comment_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO document_annotation_comments \
+         (company_id, thread_id, issue_id, document_id, body, author_type, author_user_id) \
+         SELECT $1, $2, $3, $4, $5, 'user', $6 \
+         WHERE EXISTS (SELECT 1 FROM document_annotation_threads WHERE id=$2 AND issue_id=$3 AND document_id=$4) \
+         RETURNING id"
+    )
+    .bind(company_id)
+    .bind(thread_id)
+    .bind(issue_id)
+    .bind(document_id)
+    .bind(body)
+    .bind(author_user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    
+    sqlx::query("UPDATE document_annotation_threads SET updated_at=NOW() WHERE id=$1")
+        .bind(thread_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": comment_id,
+            "threadId": thread_id,
+            "issueId": issue_id,
+            "documentKey": key,
+            "body": body,
+        })),
+    ))
+}
+
+/// PATCH /issues/:id/documents/:key/annotations/:thread_id
+async fn update_issue_document_annotation(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, key, thread_id)): Path<(Uuid, String, Uuid)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    
+    let status = payload.get("status").and_then(|v| v.as_str()).unwrap_or("open");
+    if !matches!(status, "open" | "resolved") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    
+    let updated = sqlx::query(
+        "UPDATE document_annotation_threads \
+         SET status=$1, resolved_at=CASE WHEN $1='resolved' THEN NOW() ELSE NULL END, updated_at=NOW() \
+         WHERE id=$2 AND issue_id=$3 AND document_id=$4 \
+         RETURNING id, status, updated_at"
+    )
+    .bind(status)
+    .bind(thread_id)
+    .bind(issue_id)
+    .bind(document_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    
+    Ok(Json(serde_json::json!({
+        "threadId": updated.get::<Uuid, _>("id"),
+        "issueId": issue_id,
+        "documentKey": key,
+        "status": updated.get::<String, _>("status"),
+        "updatedAt": updated.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchQuery {
@@ -1505,6 +1881,9 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/documents/:key", get(get_issue_document).put(upsert_issue_document))
         .route("/issues/:id/documents/:key/revisions", get(list_issue_document_revisions))
         .route("/issues/:id/documents/:key/revisions/:revision_id/restore", post(restore_issue_document_revision))
+        .route("/issues/:id/documents/:key/annotations", get(get_issue_document_annotations).post(create_issue_document_annotation))
+        .route("/issues/:id/documents/:key/annotations/:thread_id", get(get_issue_document_annotation_thread).patch(update_issue_document_annotation))
+        .route("/issues/:id/documents/:key/annotations/:thread_id/reply", post(reply_issue_document_annotation))
         .route("/issues/:id/file-resources/list", get(list_file_resources))
         .route("/issues/:id/file-resources/resolve", get(resolve_file_resource))
         .route("/issues/:id/file-resources/content", get(get_file_resource_content))

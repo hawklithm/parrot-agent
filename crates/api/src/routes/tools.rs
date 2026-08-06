@@ -116,6 +116,14 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
         ("paperclipApprovalDecision", "Approve, reject, revise, or resubmit an approval"),
         ("paperclipAddApprovalComment", "Add a comment to an approval"),
         ("paperclipApiRequest", "Make a JSON request to an existing /api endpoint"),
+        ("paperclipListCases", "List cases in a company with optional filters"),
+        ("paperclipGetCase", "Get a single case by id"),
+        ("paperclipCreateCase", "Create a new case"),
+        ("paperclipUpdateCase", "Update a case"),
+        ("paperclipListRoutines", "List routines in a company"),
+        ("paperclipGetRoutine", "Get a single routine by id"),
+        ("paperclipCreateRoutine", "Create a new routine"),
+        ("paperclipUpdateRoutine", "Update a routine"),
     ];
     TOOLS
         .iter()
@@ -309,6 +317,75 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "companyId": {"type": ["string", "null"], "format": "uuid"}, "status": {"type": "string"}
                     }, "additionalProperties": false
                 }),
+                "paperclipListCases" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "companyId": {"type": ["string", "null"], "format": "uuid"},
+                        "type": {"type": "string"}, "types": {"type": "array", "items": {"type": "string"}},
+                        "status": {"type": "string"}, "statuses": {"type": "array", "items": {"type": "string"}},
+                        "project": {"type": "string", "format": "uuid"}, "projectId": {"type": "string", "format": "uuid"},
+                        "projectIds": {"type": "array", "items": {"type": "string", "format": "uuid"}},
+                        "includeNoProject": {"type": "boolean"}, "label": {"type": "string", "format": "uuid"},
+                        "labelId": {"type": "string", "format": "uuid"}, "parent": {"type": "string", "format": "uuid"},
+                        "q": {"type": "string", "maxLength": 200}, "includeAncestors": {"type": "boolean"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+                    }, "additionalProperties": false
+                }),
+                "paperclipGetCase" => serde_json::json!({
+                    "type": "object", "properties": {"caseId": {"type": "string"}},
+                    "required": ["caseId"], "additionalProperties": false
+                }),
+                "paperclipCreateCase" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "companyId": {"type": ["string", "null"], "format": "uuid"},
+                        "projectId": {"type": ["string", "null"], "format": "uuid"},
+                        "caseType": {"type": "string", "minLength": 1, "maxLength": 120},
+                        "key": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+                        "title": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "summary": {"type": ["string", "null"], "maxLength": 8000},
+                        "status": {"type": "string", "enum": ["draft", "in_progress", "in_review", "approved", "done", "cancelled"]},
+                        "fields": {"type": ["object", "null"]},
+                        "parentCaseId": {"type": ["string", "null"], "format": "uuid"}
+                    }, "required": ["caseType", "title"], "additionalProperties": false
+                }),
+                "paperclipUpdateCase" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "caseId": {"type": "string"},
+                        "projectId": {"type": ["string", "null"], "format": "uuid"},
+                        "title": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "summary": {"type": ["string", "null"], "maxLength": 8000},
+                        "status": {"type": "string", "enum": ["draft", "in_progress", "in_review", "approved", "done", "cancelled"]},
+                        "fields": {"type": ["object", "null"]},
+                        "parentCaseId": {"type": ["string", "null"], "format": "uuid"},
+                        "labelIds": {"type": "array", "items": {"type": "string", "format": "uuid"}, "maxItems": 100}
+                    }, "required": ["caseId"], "additionalProperties": false
+                }),
+                "paperclipListRoutines" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "companyId": {"type": ["string", "null"], "format": "uuid"}
+                    }, "additionalProperties": false
+                }),
+                "paperclipGetRoutine" => serde_json::json!({
+                    "type": "object", "properties": {"routineId": {"type": "string"}},
+                    "required": ["routineId"], "additionalProperties": false
+                }),
+                "paperclipCreateRoutine" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "companyId": {"type": ["string", "null"], "format": "uuid"},
+                        "assigneeAgentId": {"type": ["string", "null"], "format": "uuid"},
+                        "title": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "description": {"type": ["string", "null"], "maxLength": 200000},
+                        "env": {"type": ["object", "null"]}
+                    }, "required": ["title"], "additionalProperties": false
+                }),
+                "paperclipUpdateRoutine" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "routineId": {"type": "string"},
+                        "assigneeAgentId": {"type": ["string", "null"], "format": "uuid"},
+                        "title": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "description": {"type": ["string", "null"], "maxLength": 200000},
+                        "env": {"type": ["object", "null"]}
+                    }, "required": ["routineId"], "additionalProperties": false
+                }),
                 "paperclipApiRequest" => serde_json::json!({
                     "type": "object", "properties": {"method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]}, "path": {"type": "string"}, "jsonBody": {"type": "string"}},
                     "required": ["method", "path"], "additionalProperties": false
@@ -371,6 +448,12 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
         "paperclipLinkIssueApproval" | "paperclipUnlinkIssueApproval" => &["issueId", "approvalId"],
         "paperclipApprovalDecision" => &["approvalId", "action"],
         "paperclipAddApprovalComment" => &["approvalId", "body"],
+        "paperclipGetCase" => &["caseId"],
+        "paperclipCreateCase" => &["caseType", "title"],
+        "paperclipUpdateCase" => &["caseId"],
+        "paperclipGetRoutine" => &["routineId"],
+        "paperclipCreateRoutine" => &["title"],
+        "paperclipUpdateRoutine" => &["routineId"],
         "paperclipApiRequest" => &["method", "path"],
         _ => &[],
     };
@@ -380,7 +463,7 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             return Err(format!("{key} is required"));
         }
     }
-    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path"] {
+    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path", "caseId", "caseType", "routineId"] {
         if object.contains_key(key) && !object.get(key).is_some_and(Value::is_string) {
             return Err(format!("{key} must be a string"));
         }
@@ -388,7 +471,7 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
     for key in [
         "companyId", "projectId", "projectWorkspaceId", "goalId", "parentId",
         "inheritExecutionWorkspaceFromIssueId", "assigneeAgentId", "executionWorkspaceId",
-        "sourceCommentId", "sourceRunId", "baseRevisionId", "requestedByAgentId",
+        "sourceCommentId", "sourceRunId", "baseRevisionId", "requestedByAgentId", "parentCaseId",
     ] {
         if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
             let raw = value.as_str().ok_or_else(|| format!("{key} must be a UUID string"))?;
@@ -2158,6 +2241,95 @@ async fn call_paperclip_builtin_tool(
                 path_part(parameters.get("approvalId"), "approvalId")?
             ),
             None,
+        ),
+        "paperclipListCases" => {
+            let query = query_string(&parameters, &["companyId"]);
+            let path = if query.is_empty() {
+                format!("/companies/{company_id}/cases")
+            } else {
+                format!("/companies/{company_id}/cases?{query}")
+            };
+            ("GET", path, None)
+        }
+        "paperclipGetCase" => (
+            "GET",
+            format!("/cases/{}", path_part(parameters.get("caseId"), "caseId")?),
+            None,
+        ),
+        "paperclipListRoutines" => (
+            "GET",
+            format!("/companies/{company_id}/routines"),
+            None,
+        ),
+        "paperclipGetRoutine" => (
+            "GET",
+            format!("/routines/{}", path_part(parameters.get("routineId"), "routineId")?),
+            None,
+        ),
+        "paperclipCreateRoutine" => (
+            "POST",
+            format!("/companies/{company_id}/routines"),
+            Some({
+                let mut body = serde_json::json!({
+                    "title": parameters.get("title").cloned().ok_or("title is required")?
+                });
+                if let Some(obj) = body.as_object_mut() {
+                    for key in ["assigneeAgentId", "description", "env"] {
+                        if let Some(value) = parameters.get(key).filter(|v| !v.is_null()) {
+                            obj.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                body
+            }),
+        ),
+        "paperclipUpdateRoutine" => (
+            "PATCH",
+            format!("/routines/{}", path_part(parameters.get("routineId"), "routineId")?),
+            Some({
+                let mut body = serde_json::json!({});
+                if let Some(obj) = body.as_object_mut() {
+                    for key in ["assigneeAgentId", "title", "description", "env"] {
+                        if let Some(value) = parameters.get(key).filter(|v| !v.is_null()) {
+                            obj.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                body
+            }),
+        ),
+        "paperclipCreateCase" => (
+            "POST",
+            format!("/companies/{company_id}/cases"),
+            Some({
+                let mut body = serde_json::json!({
+                    "caseType": parameters.get("caseType").cloned().ok_or("caseType is required")?,
+                    "title": parameters.get("title").cloned().ok_or("title is required")?
+                });
+                if let Some(obj) = body.as_object_mut() {
+                    for key in ["projectId", "key", "summary", "status", "fields", "parentCaseId"] {
+                        if let Some(value) = parameters.get(key).filter(|v| !v.is_null()) {
+                            obj.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                body
+            }),
+        ),
+        "paperclipUpdateCase" => (
+            "PATCH",
+            format!("/cases/{}", path_part(parameters.get("caseId"), "caseId")?),
+            Some({
+                let mut body = serde_json::json!({});
+                if let Some(obj) = body.as_object_mut() {
+                    for key in ["projectId", "title", "summary", "status", "fields", "parentCaseId", "labelIds"] {
+                        if let Some(value) = parameters.get(key).filter(|v| !v.is_null()) {
+                            obj.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                body
+            }),
         ),
         "paperclipApiRequest" => {
             let method = parameters

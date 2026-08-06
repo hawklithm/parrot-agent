@@ -945,6 +945,23 @@ impl DefaultHeartbeatService {
             .chain(args.iter().cloned())
             .map(|value| redact_gateway_token(&value, &gateway_token))
             .collect::<Vec<_>>();
+        // 构造包含所有环境变量的完整 shell 命令
+        let mut full_cmd_with_env = String::new();
+        full_cmd_with_env.push_str(&format!("PAPERCLIP_RUN_ID={} ", shell_quote(&run_id.to_string())));
+        full_cmd_with_env.push_str(&format!("PAPERCLIP_AGENT_ID={} ", shell_quote(&agent_id.to_string())));
+        full_cmd_with_env.push_str(&format!("PAPERCLIP_TOOL_GATEWAY_URL={} ", shell_quote(&gateway_url)));
+        full_cmd_with_env.push_str(&format!("PAPERCLIP_TOOL_GATEWAY_TOKEN={} ", shell_quote(&gateway_token)));
+        full_cmd_with_env.push_str(&format!("PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION={} ", shell_quote(&format!("Bearer {}", gateway_token))));
+        if let Some(env) = cfg.get("env").and_then(|v| v.as_object()) {
+            for (k, v) in env {
+                if let Some(s) = v.as_str() {
+                    let resolved_value = resolve_env_value(s);
+                    full_cmd_with_env.push_str(&format!("{}={} ", k, shell_quote(&resolved_value)));
+                }
+            }
+        }
+        full_cmd_with_env.push_str(&shell_command_text);
+        
         tracing::info!(
             run_id = %run_id,
             agent_id = %agent_id,
@@ -954,6 +971,7 @@ impl DefaultHeartbeatService {
             argv = ?logged_argv,
             working_dir = ?working_dir,
             configured_env_keys = ?configured_env_keys,
+            full_command_with_env = %full_cmd_with_env,
             stdin_prompt,
             prompt_bytes = prompt.len(),
             "starting local adapter process"
