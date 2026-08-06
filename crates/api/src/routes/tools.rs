@@ -143,6 +143,33 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
         ("paperclipListIssueAttachments", "List issue attachments"),
         ("paperclipGetAttachmentContent", "Get attachment content"),
         ("paperclipDeleteAttachment", "Delete attachment"),
+        ("paperclipListCaseDocuments", "List case documents"),
+        ("paperclipGetCaseDocument", "Get case document"),
+        ("paperclipUpsertCaseDocument", "Upsert case document"),
+        ("paperclipListCaseDocumentRevisions", "List case document revisions"),
+        ("paperclipRestoreCaseDocumentRevision", "Restore case document revision"),
+        ("paperclipDeleteCaseDocument", "Delete case document"),
+        ("paperclipLockCaseDocument", "Lock case document"),
+        ("paperclipUnlockCaseDocument", "Unlock case document"),
+        ("paperclipGetCaseEvents", "Get case events"),
+        ("paperclipListCaseDocumentAnnotations", "List case document annotations"),
+        ("paperclipGetCaseDocumentAnnotationThread", "Get case document annotation thread"),
+        ("paperclipCreateCaseDocumentAnnotation", "Create case document annotation"),
+        ("paperclipReplyCaseDocumentAnnotation", "Reply case document annotation"),
+        ("paperclipUpdateCaseDocumentAnnotation", "Update case document annotation"),
+        ("paperclipListRoutineRevisions", "List routine revisions"),
+        ("paperclipRestoreRoutineRevision", "Restore routine revision"),
+        ("paperclipListRoutineDescriptionAnnotations", "List routine description annotations"),
+        ("paperclipGetRoutineDescriptionAnnotationThread", "Get routine description annotation thread"),
+        ("paperclipCreateRoutineDescriptionAnnotation", "Create routine description annotation"),
+        ("paperclipReplyRoutineDescriptionAnnotation", "Reply routine description annotation"),
+        ("paperclipUpdateRoutineDescriptionAnnotation", "Update routine description annotation"),
+        ("paperclipCreateRoutineTrigger", "Create routine trigger"),
+        ("paperclipUpdateRoutineTrigger", "Update routine trigger"),
+        ("paperclipDeleteRoutineTrigger", "Delete routine trigger"),
+        ("paperclipRotateRoutineTriggerSecret", "Rotate routine trigger secret"),
+        ("paperclipListRoutineRuns", "List routine runs"),
+        ("paperclipRunRoutine", "Run routine"),
     ];
     TOOLS
         .iter()
@@ -469,6 +496,42 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                 "paperclipGetAttachmentContent" | "paperclipDeleteAttachment" => serde_json::json!({
                     "type": "object", "properties": {"attachmentId": {"type": "string", "format": "uuid"}}, "required": ["attachmentId"], "additionalProperties": false
                 }),
+                "paperclipListCaseDocuments" | "paperclipGetCaseEvents" => serde_json::json!({
+                    "type": "object", "properties": {"caseId": {"type": "string"}}, "required": ["caseId"], "additionalProperties": false
+                }),
+                "paperclipGetCaseDocument" | "paperclipListCaseDocumentRevisions" | "paperclipDeleteCaseDocument" | "paperclipLockCaseDocument" | "paperclipUnlockCaseDocument" | "paperclipListCaseDocumentAnnotations" => serde_json::json!({
+                    "type": "object", "properties": {"caseId": {"type": "string"}, "key": {"type": "string"}}, "required": ["caseId", "key"], "additionalProperties": false
+                }),
+                "paperclipUpsertCaseDocument" | "paperclipCreateCaseDocumentAnnotation" => serde_json::json!({
+                    "type": "object", "properties": {"caseId": {"type": "string"}, "key": {"type": "string"}, "body": {"type": "string"}}, "required": ["caseId", "key", "body"], "additionalProperties": false
+                }),
+                "paperclipGetCaseDocumentAnnotationThread" | "paperclipUpdateCaseDocumentAnnotation" => serde_json::json!({
+                    "type": "object", "properties": {"caseId": {"type": "string"}, "key": {"type": "string"}, "threadId": {"type": "string", "format": "uuid"}}, "required": ["caseId", "key", "threadId"], "additionalProperties": false
+                }),
+                "paperclipRestoreCaseDocumentRevision" => serde_json::json!({
+                    "type": "object", "properties": {"caseId": {"type": "string"}, "key": {"type": "string"}, "revisionId": {"type": "string", "format": "uuid"}}, "required": ["caseId", "key", "revisionId"], "additionalProperties": false
+                }),
+                "paperclipReplyCaseDocumentAnnotation" => serde_json::json!({
+                    "type": "object", "properties": {"caseId": {"type": "string"}, "key": {"type": "string"}, "threadId": {"type": "string", "format": "uuid"}, "body": {"type": "string"}}, "required": ["caseId", "key", "threadId", "body"], "additionalProperties": false
+                }),
+                "paperclipListRoutineRevisions" | "paperclipListRoutineDescriptionAnnotations" | "paperclipCreateRoutineTrigger" | "paperclipListRoutineRuns" | "paperclipRunRoutine" => serde_json::json!({
+                    "type": "object", "properties": {"routineId": {"type": "string", "format": "uuid"}}, "required": ["routineId"], "additionalProperties": false
+                }),
+                "paperclipRestoreRoutineRevision" => serde_json::json!({
+                    "type": "object", "properties": {"routineId": {"type": "string", "format": "uuid"}, "revisionId": {"type": "string", "format": "uuid"}}, "required": ["routineId", "revisionId"], "additionalProperties": false
+                }),
+                "paperclipGetRoutineDescriptionAnnotationThread" | "paperclipUpdateRoutineDescriptionAnnotation" => serde_json::json!({
+                    "type": "object", "properties": {"routineId": {"type": "string", "format": "uuid"}, "threadId": {"type": "string", "format": "uuid"}}, "required": ["routineId", "threadId"], "additionalProperties": false
+                }),
+                "paperclipCreateRoutineDescriptionAnnotation" => serde_json::json!({
+                    "type": "object", "properties": {"routineId": {"type": "string", "format": "uuid"}, "body": {"type": "string"}}, "required": ["routineId", "body"], "additionalProperties": false
+                }),
+                "paperclipReplyRoutineDescriptionAnnotation" => serde_json::json!({
+                    "type": "object", "properties": {"routineId": {"type": "string", "format": "uuid"}, "threadId": {"type": "string", "format": "uuid"}, "body": {"type": "string"}}, "required": ["routineId", "threadId", "body"], "additionalProperties": false
+                }),
+                "paperclipUpdateRoutineTrigger" | "paperclipDeleteRoutineTrigger" | "paperclipRotateRoutineTriggerSecret" => serde_json::json!({
+                    "type": "object", "properties": {"triggerId": {"type": "string", "format": "uuid"}}, "required": ["triggerId"], "additionalProperties": false
+                }),
                 "paperclipApiRequest" => serde_json::json!({
                     "type": "object", "properties": {"method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]}, "path": {"type": "string"}, "jsonBody": {"type": "string"}},
                     "required": ["method", "path"], "additionalProperties": false
@@ -549,6 +612,20 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
         "paperclipCreateCaseLink" => &["caseId", "issueId", "role"],
         "paperclipGetIssueCases" => &["issueId"],
         "paperclipGetAttachmentContent" | "paperclipDeleteAttachment" => &["attachmentId"],
+        "paperclipListCaseDocuments" | "paperclipGetCaseEvents" => &["caseId"],
+        "paperclipGetCaseDocument" | "paperclipListCaseDocumentRevisions" | "paperclipDeleteCaseDocument" 
+        | "paperclipLockCaseDocument" | "paperclipUnlockCaseDocument" | "paperclipListCaseDocumentAnnotations" => &["caseId", "key"],
+        "paperclipUpsertCaseDocument" | "paperclipCreateCaseDocumentAnnotation" => &["caseId", "key", "body"],
+        "paperclipGetCaseDocumentAnnotationThread" | "paperclipUpdateCaseDocumentAnnotation" => &["caseId", "key", "threadId"],
+        "paperclipRestoreCaseDocumentRevision" => &["caseId", "key", "revisionId"],
+        "paperclipReplyCaseDocumentAnnotation" => &["caseId", "key", "threadId", "body"],
+        "paperclipListRoutineRevisions" | "paperclipListRoutineDescriptionAnnotations" | "paperclipCreateRoutineTrigger" 
+        | "paperclipListRoutineRuns" | "paperclipRunRoutine" => &["routineId"],
+        "paperclipRestoreRoutineRevision" => &["routineId", "revisionId"],
+        "paperclipGetRoutineDescriptionAnnotationThread" | "paperclipUpdateRoutineDescriptionAnnotation" => &["routineId", "threadId"],
+        "paperclipCreateRoutineDescriptionAnnotation" => &["routineId", "body"],
+        "paperclipReplyRoutineDescriptionAnnotation" => &["routineId", "threadId", "body"],
+        "paperclipUpdateRoutineTrigger" | "paperclipDeleteRoutineTrigger" | "paperclipRotateRoutineTriggerSecret" => &["triggerId"],
         "paperclipApiRequest" => &["method", "path"],
         _ => &[],
     };
@@ -558,7 +635,7 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             return Err(format!("{key} is required"));
         }
     }
-    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path", "caseId", "caseType", "routineId", "threadId", "labelId", "name", "color", "role", "attachmentId"] {
+    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path", "caseId", "caseType", "routineId", "threadId", "labelId", "name", "color", "role", "attachmentId", "triggerId"] {
         if object.contains_key(key) && !object.get(key).is_some_and(Value::is_string) {
             return Err(format!("{key} must be a string"));
         }
@@ -2499,6 +2576,101 @@ async fn call_paperclip_builtin_tool(
         "paperclipListIssueAttachments" => ("GET", format!("/issues/{}/attachments", path_part(parameters.get("issueId"), "issueId")?), None),
         "paperclipGetAttachmentContent" => ("GET", format!("/attachments/{}/content", path_part(parameters.get("attachmentId"), "attachmentId")?), None),
         "paperclipDeleteAttachment" => ("DELETE", format!("/attachments/{}", path_part(parameters.get("attachmentId"), "attachmentId")?), None),
+        "paperclipListCaseDocuments" => ("GET", format!("/cases/{}/documents", path_part(parameters.get("caseId"), "caseId")?), None),
+        "paperclipGetCaseDocument" => ("GET", format!("/cases/{}/documents/{}", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?), None),
+        "paperclipUpsertCaseDocument" => (
+            "PUT",
+            format!("/cases/{}/documents/{}", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?),
+            Some(serde_json::json!({"body": parameters.get("body").cloned().ok_or("body is required")?})),
+        ),
+        "paperclipListCaseDocumentRevisions" => ("GET", format!("/cases/{}/documents/{}/revisions", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?), None),
+        "paperclipRestoreCaseDocumentRevision" => (
+            "POST",
+            format!("/cases/{}/documents/{}/revisions/{}/restore", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?, path_part(parameters.get("revisionId"), "revisionId")?),
+            Some(serde_json::json!({})),
+        ),
+        "paperclipDeleteCaseDocument" => ("DELETE", format!("/cases/{}/documents/{}", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?), None),
+        "paperclipLockCaseDocument" => ("POST", format!("/cases/{}/documents/{}/lock", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?), Some(serde_json::json!({}))),
+        "paperclipUnlockCaseDocument" => ("POST", format!("/cases/{}/documents/{}/unlock", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?), Some(serde_json::json!({}))),
+        "paperclipGetCaseEvents" => ("GET", format!("/cases/{}/events", path_part(parameters.get("caseId"), "caseId")?), None),
+        "paperclipListCaseDocumentAnnotations" => ("GET", format!("/cases/{}/documents/{}/annotations", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?), None),
+        "paperclipGetCaseDocumentAnnotationThread" => ("GET", format!("/cases/{}/documents/{}/annotations/{}", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?, path_part(parameters.get("threadId"), "threadId")?), None),
+        "paperclipCreateCaseDocumentAnnotation" => (
+            "POST",
+            format!("/cases/{}/documents/{}/annotations", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?),
+            Some(serde_json::json!({"body": parameters.get("body").cloned().ok_or("body is required")?})),
+        ),
+        "paperclipReplyCaseDocumentAnnotation" => (
+            "POST",
+            format!("/cases/{}/documents/{}/annotations/{}/reply", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?, path_part(parameters.get("threadId"), "threadId")?),
+            Some(serde_json::json!({"body": parameters.get("body").cloned().ok_or("body is required")?})),
+        ),
+        "paperclipUpdateCaseDocumentAnnotation" => (
+            "PATCH",
+            format!("/cases/{}/documents/{}/annotations/{}", path_part(parameters.get("caseId"), "caseId")?, path_part(parameters.get("key"), "key")?, path_part(parameters.get("threadId"), "threadId")?),
+            Some({
+                let mut body = serde_json::json!({});
+                if let Some(obj) = body.as_object_mut() {
+                    if let Some(value) = parameters.get("resolved").filter(|v| !v.is_null()) {
+                        obj.insert("resolved".to_string(), value.clone());
+                    }
+                }
+                body
+            }),
+        ),
+        "paperclipListRoutineRevisions" => ("GET", format!("/routines/{}/revisions", path_part(parameters.get("routineId"), "routineId")?), None),
+        "paperclipRestoreRoutineRevision" => (
+            "POST",
+            format!("/routines/{}/revisions/{}/restore", path_part(parameters.get("routineId"), "routineId")?, path_part(parameters.get("revisionId"), "revisionId")?),
+            Some(serde_json::json!({})),
+        ),
+        "paperclipListRoutineDescriptionAnnotations" => ("GET", format!("/routines/{}/description/annotations", path_part(parameters.get("routineId"), "routineId")?), None),
+        "paperclipGetRoutineDescriptionAnnotationThread" => ("GET", format!("/routines/{}/description/annotations/{}", path_part(parameters.get("routineId"), "routineId")?, path_part(parameters.get("threadId"), "threadId")?), None),
+        "paperclipCreateRoutineDescriptionAnnotation" => (
+            "POST",
+            format!("/routines/{}/description/annotations", path_part(parameters.get("routineId"), "routineId")?),
+            Some(serde_json::json!({"body": parameters.get("body").cloned().ok_or("body is required")?})),
+        ),
+        "paperclipReplyRoutineDescriptionAnnotation" => (
+            "POST",
+            format!("/routines/{}/description/annotations/{}/reply", path_part(parameters.get("routineId"), "routineId")?, path_part(parameters.get("threadId"), "threadId")?),
+            Some(serde_json::json!({"body": parameters.get("body").cloned().ok_or("body is required")?})),
+        ),
+        "paperclipUpdateRoutineDescriptionAnnotation" => (
+            "PATCH",
+            format!("/routines/{}/description/annotations/{}", path_part(parameters.get("routineId"), "routineId")?, path_part(parameters.get("threadId"), "threadId")?),
+            Some({
+                let mut body = serde_json::json!({});
+                if let Some(obj) = body.as_object_mut() {
+                    if let Some(value) = parameters.get("resolved").filter(|v| !v.is_null()) {
+                        obj.insert("resolved".to_string(), value.clone());
+                    }
+                }
+                body
+            }),
+        ),
+        "paperclipCreateRoutineTrigger" => (
+            "POST",
+            format!("/routines/{}/triggers", path_part(parameters.get("routineId"), "routineId")?),
+            Some(serde_json::json!({})),
+        ),
+        "paperclipUpdateRoutineTrigger" => (
+            "PATCH",
+            format!("/routine-triggers/{}", path_part(parameters.get("triggerId"), "triggerId")?),
+            Some(serde_json::json!({})),
+        ),
+        "paperclipDeleteRoutineTrigger" => ("DELETE", format!("/routine-triggers/{}", path_part(parameters.get("triggerId"), "triggerId")?), None),
+        "paperclipRotateRoutineTriggerSecret" => (
+            "POST",
+            format!("/routine-triggers/{}/rotate-secret", path_part(parameters.get("triggerId"), "triggerId")?),
+            Some(serde_json::json!({})),
+        ),
+        "paperclipListRoutineRuns" => ("GET", format!("/routines/{}/runs", path_part(parameters.get("routineId"), "routineId")?), None),
+        "paperclipRunRoutine" => (
+            "POST",
+            format!("/routines/{}/run", path_part(parameters.get("routineId"), "routineId")?),
+            Some(serde_json::json!({})),
+        ),
         "paperclipCreateCase" => (
             "POST",
             format!("/companies/{company_id}/cases"),
