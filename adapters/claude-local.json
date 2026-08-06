@@ -1,0 +1,16 @@
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL": "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL": "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "ANTHROPIC_DEFAULT_OPUS_MODEL"
+  },
+  "command": "claude",
+  "dangerouslySkipPermissions": true,
+  "maxTurnsPerRun": 20,
+  "effort": "high",
+  "timeoutSec": 1800,
+  "promptTemplate": "Task: {{issue.title}}\n\n{{issue.description}}\n\nPlease complete this task step by step and report the final results."
+}

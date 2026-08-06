@@ -79,6 +79,86 @@ fn resolve_env_value(configured_value: &str) -> String {
     configured_value.to_string()
 }
 
+/// 从 adapters 目录加载默认配置
+/// 文件名规则：adapter_type 的下划线转横线，如 "claude_local" → "claude-local.json"
+fn load_default_adapter_config(adapter_type: &str) -> Option<serde_json::Value> {
+    let file_name = adapter_type.replace('_', "-");
+    let config_path = format!("adapters/{}.json", file_name);
+    
+    match std::fs::read_to_string(&config_path) {
+        Ok(content) => {
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(config) => {
+                    tracing::debug!(
+                        adapter_type = %adapter_type,
+                        config_path = %config_path,
+                        "loaded default adapter config from file"
+                    );
+                    Some(config)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        adapter_type = %adapter_type,
+                        config_path = %config_path,
+                        error = %e,
+                        "failed to parse default adapter config"
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                adapter_type = %adapter_type,
+                config_path = %config_path,
+                error = %e,
+                "no default adapter config file found"
+            );
+            None
+        }
+    }
+}
+
+/// 合并配置：数据库配置优先，默认配置填充缺失字段
+/// 
+/// 合并规则：
+/// - 如果数据库配置中某个字段存在，使用数据库的值
+/// - 如果数据库配置中某个字段不存在，使用默认配置的值
+/// - 特别处理 "env" 字段：如果数据库没有，从默认配置补充
+fn merge_adapter_config(
+    db_config: serde_json::Value,
+    default_config: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let Some(default) = default_config else {
+        return db_config;
+    };
+    
+    // 如果数据库配置不是对象，直接返回
+    let Some(db_obj) = db_config.as_object() else {
+        return db_config;
+    };
+    
+    // 如果默认配置不是对象，返回数据库配置
+    let Some(default_obj) = default.as_object() else {
+        return db_config;
+    };
+    
+    // 合并：从默认配置开始，用数据库配置覆盖
+    let mut merged = default_obj.clone();
+    for (key, value) in db_obj {
+        merged.insert(key.clone(), value.clone());
+    }
+    
+    tracing::debug!(
+        db_keys = ?db_obj.keys().collect::<Vec<_>>(),
+        default_keys = ?default_obj.keys().collect::<Vec<_>>(),
+        merged_keys = ?merged.keys().collect::<Vec<_>>(),
+        "merged adapter config: db + default"
+    );
+    
+    serde_json::Value::Object(merged)
+}
+
 
 /// Heartbeat service for managing agent wake/sleep lifecycle
 #[async_trait]
@@ -580,8 +660,13 @@ impl DefaultHeartbeatService {
             "Task: {title}\n{}\n\nReport the work performed and final result.",
             description.as_deref().unwrap_or_default()
         );
-        let cfg = agent.adapter_config.0;
+        // 获取数据库配置
+        let db_config = agent.adapter_config.0;
         let adapter = agent.adapter_type.as_str();
+        
+        // 加载默认配置并合并
+        let default_config = load_default_adapter_config(adapter);
+        let cfg = merge_adapter_config(db_config, default_config);
         let prompt = cfg
             .get("promptTemplate")
             .or_else(|| cfg.get("prompt_template"))
@@ -1477,6 +1562,61 @@ mod tests {
             "  some value with spaces  ",
             "非环境变量的值应该完全保留原样"
         );
+    }
+
+    #[test]
+    fn test_merge_adapter_config() {
+        // 测试1: 数据库配置覆盖默认配置
+        let db_config = serde_json::json!({
+            "command": "claude",
+            "maxTurnsPerRun": 10
+        });
+        let default_config = Some(serde_json::json!({
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN"
+            },
+            "command": "claude",
+            "maxTurnsPerRun": 20,
+            "effort": "high"
+        }));
+        
+        let merged = merge_adapter_config(db_config, default_config);
+        
+        assert_eq!(merged["command"], "claude");
+        assert_eq!(merged["maxTurnsPerRun"], 10); // 数据库值优先
+        assert_eq!(merged["effort"], "high"); // 从默认配置补充
+        assert!(merged.get("env").is_some()); // env 从默认配置补充
+        
+        // 测试2: 数据库配置为空对象，使用默认配置
+        let db_config = serde_json::json!({});
+        let default_config = Some(serde_json::json!({
+            "env": {"ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN"},
+            "command": "claude"
+        }));
+        
+        let merged = merge_adapter_config(db_config, default_config);
+        assert!(merged.get("env").is_some());
+        assert_eq!(merged["command"], "claude");
+        
+        // 测试3: 没有默认配置，返回数据库配置
+        let db_config = serde_json::json!({"command": "claude"});
+        let merged = merge_adapter_config(db_config.clone(), None);
+        assert_eq!(merged, db_config);
+    }
+    
+    #[test]
+    fn test_load_default_adapter_config() {
+        // 测试加载不存在的配置
+        let config = load_default_adapter_config("nonexistent_adapter");
+        assert!(config.is_none());
+        
+        // 测试文件名转换：下划线转横线
+        // claude_local → claude-local.json
+        let config = load_default_adapter_config("claude_local");
+        if config.is_some() {
+            let cfg = config.unwrap();
+            assert!(cfg.get("env").is_some());
+        }
     }
 
     #[tokio::test]

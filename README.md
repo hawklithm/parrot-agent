@@ -210,6 +210,131 @@ curl -X POST http://localhost:3100/api/agents \
   "adapter_type": "claude_local",
   "adapter_config": {
     "env": {
+
+### Adapter 默认配置目录
+
+`adapters/` 目录存放各个 adapter 的默认配置文件，作为数据库配置的回退（fallback）。
+
+#### 工作原理
+
+当 agent 执行任务时，系统会自动进行配置合并：
+
+```
+1. 从数据库读取 agent.adapter_config
+2. 检查是否缺少字段（如 env）
+3. 加载 adapters/{adapter_type}.json 作为默认配置
+4. 合并：数据库配置 + 默认配置（数据库优先）
+```
+
+#### 文件命名规则
+
+文件名必须与 `adapter_type` 匹配，下划线转横线：
+
+| adapter_type | 配置文件 |
+|--------------|---------|
+| `claude_local` | `adapters/claude-local.json` |
+| `codex_local` | `adapters/codex-local.json` |
+| `openai` | `adapters/openai.json` |
+
+#### 配置合并示例
+
+**数据库配置**（`adapter_config` 字段）：
+```json
+{
+  "command": "claude",
+  "maxTurnsPerRun": 10
+}
+```
+
+**默认配置**（`adapters/claude-local.json`）：
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN"
+  },
+  "command": "claude",
+  "maxTurnsPerRun": 20,
+  "effort": "high"
+}
+```
+
+**最终生效配置**：
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN"
+  },
+  "command": "claude",
+  "maxTurnsPerRun": 10,
+  "effort": "high"
+}
+```
+
+注意：
+- ✅ `env` 从默认配置补充（数据库没有）
+- ✅ `maxTurnsPerRun` 使用数据库值 10（数据库优先）
+- ✅ `effort` 从默认配置补充（数据库没有）
+
+#### 使用场景
+
+1. **简化 Agent 创建**
+   
+   创建 agent 时无需提供完整配置：
+   ```bash
+   curl -X POST http://localhost:3100/api/companies/$COMPANY_ID/agent-hires \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "my-agent",
+       "adapter_type": "claude_local",
+       "adapter_config": {}
+     }'
+   ```
+   系统会自动使用 `adapters/claude-local.json` 中的默认配置。
+
+2. **升级现有 Agent**
+   
+   数据库中的旧 agent 缺少 `env` 字段？无需手动更新数据库，系统会自动补充默认配置。
+
+3. **统一配置管理**
+   
+   修改 `adapters/claude-local.json` 可以统一影响所有使用默认配置的 agent。
+
+#### 添加新的 Adapter 配置
+
+1. 在 `adapters/` 目录创建新文件：
+   ```bash
+   cat > adapters/my-adapter.json << 'EOF'
+   {
+     "env": {
+       "MY_API_KEY": "MY_API_KEY"
+     },
+     "command": "my-cli",
+     "timeout": 300
+   }
+   EOF
+   ```
+
+2. 文件名规则：`adapter_type` 的下划线转横线
+   - `my_adapter` → `my-adapter.json`
+
+3. 创建使用该 adapter 的 agent
+
+#### 查看合并日志
+
+启动服务时开启 debug 日志可以看到配置合并过程：
+
+```bash
+RUST_LOG=services=debug cargo run --bin parrot-server
+```
+
+日志示例：
+```
+loaded default adapter config from file: adapters/claude-local.json
+merged adapter config: db + default, db_keys=["command"], default_keys=["env", "command", "effort"], merged_keys=["env", "command", "effort"]
+```
+
+详细说明请查看：[adapters/README.md](adapters/README.md)
+
       "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN",
       "ANTHROPIC_BASE_URL": "ANTHROPIC_BASE_URL",
       "ANTHROPIC_MODEL": "ANTHROPIC_MODEL"
