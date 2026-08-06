@@ -2,7 +2,7 @@
 
 ## 📊 完成状态概览
 
-**当前进度**: 13/66 个工具已完成 (19.7%)
+**当前进度**: 27/66 个工具已完成 (40.9%)
 **已提交**: 2次 git commit
 **编译状态**: ✅ 通过
 
@@ -118,13 +118,13 @@ paperclip 中存在完整的 Cases REST API（`server/src/routes/cases.ts`），
   - 参考：paperclip `PATCH /cases/:id/documents/:key/annotations/:threadId`
 
 #### 案例关联和子案例
-- [ ] **paperclipGetCaseChildren** - 获取子案例列表
-  - 参考：paperclip `GET ases/:caseId/children`
+- [x] **paperclipGetCaseChildren** - 获取子案例列表 ✅
+  - 参考：paperclip `GET /cases/:caseId/children`
 
-- [ ] **paperclipCreateCaseLink** - 创建案例与 Issue 的关联
+- [x] **paperclipCreateCaseLink** - 创建案例与 Issue 的关联 ✅
   - 参考：paperclip `POST /cases/:id/links`
 
-- [ ] **paperclipGetIssueCases** - 获取 Issue 关联的所有案例
+- [x] **paperclipGetIssueCases** - 获取 Issue 关联的所有案例 ✅
   - 参考：paperclip `GET /issues/:issueId/cases`
 
 ---
@@ -216,44 +216,55 @@ REST API 已在前一个会话添加到 parrot-agent（`crates/api/src/routes/is
 ### 1.4 Labels（标签管理）- 3个工具
 paperclip 中存在 Labels REST API（`server/src/routes/issues.ts`），但 **MCP 工具层缺失**。
 
-- [ ] **paperclipListLabels** - 列出公司的所有标签
+- [x] **paperclipListLabels** - 列出公司的所有标签 ✅
   - 参考：paperclip `GET /companies/:companyId/labels`
 
-- [ ] **paperclipCreateLabel** - 创建新标签
+- [x] **paperclipCreateLabel** - 创建新标签 ✅
   - 参考：paperclip `POST /companies/:companyId/labels`
   - Schema需包含：name, color, description
 
-- [ ] **paperclipDeleteLabel** - 删除标签
+- [x] **paperclipDeleteLabel** - 删除标签 ✅
   - 参考：paperclip `DELETE /labels/:labelId`
-
----
-
 ### 1.5 Attachments（附件管理）- 4个工具
 paperclip 中存在 Attachments REST API，但 **MCP 工具层缺失**。
 
-- [ ] **paperclipListIssueAttachments** - 列出Issue附件
+- [x] **paperclipListIssueAttachments** - 列出Issue附件 ✅
   - 参考：paperclip `GET /issues/:id/attachments`
 
 - [ ] **paperclipCreateIssueAttachment** - 上传Issue附件
   - 参考：paperclip `POST /companies/:companyId/issues/:issueId/attachments`
   - 注意：需处理文件上传
 
-- [ ] **paperclipGetAttachmentContent** - 获取附件内容
+- [x] **paperclipGetAttachmentContent** - 获取附件内容 ✅
   - 参考：paperclip `GET /attachments/:attachmentId/content`
 
-- [ ] **paperclipDeleteAttachment** - 删除附件
+- [x] **paperclipDeleteAttachment** - 删除附件 ✅
   - 参考：paperclip `DELETE /attachments/:attachmentId`
 
 ---
 
 ### 1.6 External Objects（外部对象）- 2个工具
-paperclip 中存在 External Objects REST API，但 **MCP 工具- [ ] **paperclipListIssueExternalObjects** - 列出Issue关联的外部对象
+paperclip 中存在 External Objects REST API，但 **MCP 工具层缺失**。
+
+- [x] **paperclipListIssueExternalObjects** - 列出Issue关联的外部对象 ✅
   - 参考：paperclip `GET /issues/:id/external-objects`
 
-- [ ] **paperclipRefreshIssueExternalObjects** - 刷新外部对象数据
+- [x] **paperclipRefreshIssueExternalObjects** - 刷新外部对象数据 ✅
   - 参考：paperclip `POST /issues/:id/external-objects/refresh`
 
 ---
+
+### 1.7 File Resources（文件资源）- 3个工具
+paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.ts`），但 **MCP 工具层缺失**。
+
+- [x] **paperclipListIssueFileResources** - 列出Issue文件资源 ✅
+  - 参考：paperclip `GET /issues/:issueId/file-resources/list`
+
+- [x] **paperclipResolveIssueFileResource** - 解析文件资源路径 ✅
+  - 参考：paperclip `GET /issues/:issueId/file-resources/resolve`
+
+- [x] **paperclipGetIssueFileResourceContent** - 获取文件资源内容 ✅
+  - 参考：paperclip `GET /issues/:issueId/file-resources/content`
 
 ### 1.7 File Resources（文件资源）- 3个工具
 paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.ts`），但 **MCP 工具层缺失**。

@@ -129,6 +129,20 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
         ("paperclipCreateIssueDocumentAnnotation", "Create issue document annotation"),
         ("paperclipReplyIssueDocumentAnnotation", "Reply to issue document annotation"),
         ("paperclipUpdateIssueDocumentAnnotation", "Update issue document annotation thread"),
+        ("paperclipListLabels", "List labels in a company"),
+        ("paperclipCreateLabel", "Create a new label"),
+        ("paperclipDeleteLabel", "Delete a label"),
+        ("paperclipListIssueExternalObjects", "List issue external objects"),
+        ("paperclipRefreshIssueExternalObjects", "Refresh issue external objects"),
+        ("paperclipListIssueFileResources", "List issue file resources"),
+        ("paperclipResolveIssueFileResource", "Resolve issue file resource path"),
+        ("paperclipGetIssueFileResourceContent", "Get issue file resource content"),
+        ("paperclipGetCaseChildren", "Get case children"),
+        ("paperclipCreateCaseLink", "Create case link"),
+        ("paperclipGetIssueCases", "Get issue cases"),
+        ("paperclipListIssueAttachments", "List issue attachments"),
+        ("paperclipGetAttachmentContent", "Get attachment content"),
+        ("paperclipDeleteAttachment", "Delete attachment"),
     ];
     TOOLS
         .iter()
@@ -431,6 +445,30 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "resolved": {"type": "boolean"}
                     }, "required": ["issueId", "key", "threadId"], "additionalProperties": false
                 }),
+                "paperclipListLabels" => serde_json::json!({
+                    "type": "object", "properties": {"companyId": {"type": ["string", "null"], "format": "uuid"}}, "additionalProperties": false
+                }),
+                "paperclipCreateLabel" => serde_json::json!({
+                    "type": "object", "properties": {"companyId": {"type": ["string", "null"], "format": "uuid"}, "name": {"type": "string", "minLength": 1}, "color": {"type": "string", "minLength": 1}, "description": {"type": ["string", "null"]}}, "required": ["name", "color"], "additionalProperties": false
+                }),
+                "paperclipDeleteLabel" => serde_json::json!({
+                    "type": "object", "properties": {"labelId": {"type": "string", "format": "uuid"}}, "required": ["labelId"], "additionalProperties": false
+                }),
+                "paperclipListIssueExternalObjects" | "paperclipRefreshIssueExternalObjects" | "paperclipListIssueFileResources" | "paperclipResolveIssueFileResource" | "paperclipGetIssueFileResourceContent" | "paperclipListIssueAttachments" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string"}}, "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipGetCaseChildren" => serde_json::json!({
+                    "type": "object", "properties": {"caseId": {"type": "string"}}, "required": ["caseId"], "additionalProperties": false
+                }),
+                "paperclipCreateCaseLink" => serde_json::json!({
+                    "type": "object", "properties": {"caseId": {"type": "string"}, "issueId": {"type": "string", "format": "uuid"}, "role": {"type": "string", "enum": ["origin", "work", "reference"]}}, "required": ["caseId", "issueId", "role"], "additionalProperties": false
+                }),
+                "paperclipGetIssueCases" => serde_json::json!({
+                    "type": "object", "properties": {"issueId": {"type": "string", "format": "uuid"}}, "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipGetAttachmentContent" | "paperclipDeleteAttachment" => serde_json::json!({
+                    "type": "object", "properties": {"attachmentId": {"type": "string", "format": "uuid"}}, "required": ["attachmentId"], "additionalProperties": false
+                }),
                 "paperclipApiRequest" => serde_json::json!({
                     "type": "object", "properties": {"method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]}, "path": {"type": "string"}, "jsonBody": {"type": "string"}},
                     "required": ["method", "path"], "additionalProperties": false
@@ -502,6 +540,15 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
         "paperclipListIssueDocumentAnnotations" | "paperclipCreateIssueDocumentAnnotation" => &["issueId", "key"],
         "paperclipGetIssueDocumentAnnotationThread" | "paperclipReplyIssueDocumentAnnotation"
         | "paperclipUpdateIssueDocumentAnnotation" => &["issueId", "key", "threadId"],
+        "paperclipCreateLabel" => &["name", "color"],
+        "paperclipDeleteLabel" => &["labelId"],
+        "paperclipListIssueExternalObjects" | "paperclipRefreshIssueExternalObjects" 
+        | "paperclipListIssueFileResources" | "paperclipResolveIssueFileResource" 
+        | "paperclipGetIssueFileResourceContent" | "paperclipListIssueAttachments" => &["issueId"],
+        "paperclipGetCaseChildren" => &["caseId"],
+        "paperclipCreateCaseLink" => &["caseId", "issueId", "role"],
+        "paperclipGetIssueCases" => &["issueId"],
+        "paperclipGetAttachmentContent" | "paperclipDeleteAttachment" => &["attachmentId"],
         "paperclipApiRequest" => &["method", "path"],
         _ => &[],
     };
@@ -511,7 +558,7 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             return Err(format!("{key} is required"));
         }
     }
-    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path", "caseId", "caseType", "routineId", "threadId"] {
+    for key in ["issueId", "agentId", "projectId", "goalId", "approvalId", "commentId", "revisionId", "key", "body", "title", "action", "method", "path", "caseId", "caseType", "routineId", "threadId", "labelId", "name", "color", "role", "attachmentId"] {
         if object.contains_key(key) && !object.get(key).is_some_and(Value::is_string) {
             return Err(format!("{key} must be a string"));
         }
@@ -2416,6 +2463,42 @@ async fn call_paperclip_builtin_tool(
                 body
             }),
         ),
+        "paperclipListLabels" => ("GET", format!("/companies/{company_id}/labels"), None),
+        "paperclipCreateLabel" => (
+            "POST",
+            format!("/companies/{company_id}/labels"),
+            Some({
+                let mut body = serde_json::json!({
+                    "name": parameters.get("name").cloned().ok_or("name is required")?,
+                    "color": parameters.get("color").cloned().ok_or("color is required")?
+                });
+                if let Some(obj) = body.as_object_mut() {
+                    if let Some(value) = parameters.get("description").filter(|v| !v.is_null()) {
+                        obj.insert("description".to_string(), value.clone());
+                    }
+                }
+                body
+            }),
+        ),
+        "paperclipDeleteLabel" => ("DELETE", format!("/labels/{}", path_part(parameters.get("labelId"), "labelId")?), None),
+        "paperclipListIssueExternalObjects" => ("GET", format!("/issues/{}/external-objects", path_part(parameters.get("issueId"), "issueId")?), None),
+        "paperclipRefreshIssueExternalObjects" => ("POST", format!("/issues/{}/external-objects/refresh", path_part(parameters.get("issueId"), "issueId")?), Some(serde_json::json!({}))),
+        "paperclipListIssueFileResources" => ("GET", format!("/issues/{}/file-resources/list", path_part(parameters.get("issueId"), "issueId")?), None),
+        "paperclipResolveIssueFileResource" => ("GET", format!("/issues/{}/file-resources/resolve", path_part(parameters.get("issueId"), "issueId")?), None),
+        "paperclipGetIssueFileResourceContent" => ("GET", format!("/issues/{}/file-resources/content", path_part(parameters.get("issueId"), "issueId")?), None),
+        "paperclipGetCaseChildren" => ("GET", format!("/cases/{}/children", path_part(parameters.get("caseId"), "caseId")?), None),
+        "paperclipCreateCaseLink" => (
+            "POST",
+            format!("/cases/{}/links", path_part(parameters.get("caseId"), "caseId")?),
+            Some(serde_json::json!({
+                "issueId": parameters.get("issueId").cloned().ok_or("issueId is required")?,
+                "role": parameters.get("role").cloned().ok_or("role is required")?
+            })),
+        ),
+        "paperclipGetIssueCases" => ("GET", format!("/issues/{}/cases", path_part(parameters.get("issueId"), "issueId")?), None),
+        "paperclipListIssueAttachments" => ("GET", format!("/issues/{}/attachments", path_part(parameters.get("issueId"), "issueId")?), None),
+        "paperclipGetAttachmentContent" => ("GET", format!("/attachments/{}/content", path_part(parameters.get("attachmentId"), "attachmentId")?), None),
+        "paperclipDeleteAttachment" => ("DELETE", format!("/attachments/{}", path_part(parameters.get("attachmentId"), "attachmentId")?), None),
         "paperclipCreateCase" => (
             "POST",
             format!("/companies/{company_id}/cases"),
