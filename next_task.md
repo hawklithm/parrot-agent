@@ -1,5 +1,34 @@
 # MCP 工具迁移任务清单
 
+## 📊 完成状态概览
+
+**当前进度**: 13/66 个工具已完成 (19.7%)
+**已提交**: 2次 git commit
+**编译状态**: ✅ 通过
+
+### ✅ 已完成（阶段一）
+
+#### Cases 基础 CRUD（4个）
+- [x] paperclipListCases
+- [x] paperclipGetCase  
+- [x] paperclipCreateCase
+- [x] paperclipUpdateCase
+
+#### Routines 基础 CRUD（4个）
+- [x] paperclipListRoutines
+- [x] paperclipGetRoutine
+- [x] paperclipCreateRoutine
+- [x] paperclipUpdateRoutine
+
+#### Issue Document Annotations（5个）
+- [x] paperclipListIssueDocumentAnnotations
+- [x] paperclipGetIssueDocumentAnnotationThread
+- [x] paperclipCreateIssueDocumentAnnotation
+- [x] paperclipReplyIssueDocumentAnnotation
+- [x] paperclipUpdateIssueDocumentAnnotation
+
+---
+
 ## 现状分析
 
 ### parrot-agent 当前已有的 41 个 MCP 工具
@@ -30,19 +59,19 @@
 paperclip 中存在完整的 Cases REST API（`server/src/routes/cases.ts`），parrot-agent 也有对应的 Rust 路由（`crates/api/src/routes/cases.rs`），但 **MCP 工具层完全缺失**。
 
 #### 基础 CRUD
-- [x] **paperclipListCases** - 列出公司的所有案例
+- [x] **paperclipListCases** - 列出公司的所有案例 ✅
   - 参考：paperclip `GET /companies/:companyId/cases`
   - 实现位置：`crates/api/src/routes/tools.rs` 工具定义、验证、执行路由映射
 
-- [x] **paperclipGetCase** - 获取单个案例详情
+- [x] **paperclipGetCase** - 获取单个案例详情 ✅
   - 参考：paperclip `GET /cases/:id`
   - 实现位置：同上
 
-- [x] **paperclipCreateCase** - 创建新案例
+- [x] **paperclipCreateCase** - 创建新案例 ✅
   - 参考：paperclip `POST /companies/:companyId/cases`
   - Schema需包含：title, description, pipelineId, stageId 等
 
-- [x] **paperclipUpdateCase** - 更新案例信息
+- [x] **paperclipUpdateCase** - 更新案例信息 ✅
   - 参考：paperclip `PATCH /cases/:id`
   - 实现位置：同上
 
@@ -74,7 +103,7 @@ paperclip 中存在完整的 Cases REST API（`server/src/routes/cases.ts`），
 
 #### 案例文档标注
 - [ ] **paperclipListCaseDocumentAnnotations** - 列出文档标注
-  - 参考：paperclip `GET /cases/:id/documents/:key/annotations`
+  - 参考：paperclip `GET /cases/d/documents/:key/annotations`
 
 - [ ] **paperclipGetCaseDocumentAnnotationThread** - 获取标注线程详情
   - 参考：paperclip `GET /cases/:id/documents/:key/annotations/:threadId`
@@ -90,7 +119,7 @@ paperclip 中存在完整的 Cases REST API（`server/src/routes/cases.ts`），
 
 #### 案例关联和子案例
 - [ ] **paperclipGetCaseChildren** - 获取子案例列表
-  - 参考：paperclip `GET /cases/:caseId/children`
+  - 参考：paperclip `GET ases/:caseId/children`
 
 - [ ] **paperclipCreateCaseLink** - 创建案例与 Issue 的关联
   - 参考：paperclip `POST /cases/:id/links`
@@ -104,18 +133,19 @@ paperclip 中存在完整的 Cases REST API（`server/src/routes/cases.ts`），
 paperclip 中存在 Routines REST API（`server/src/routes/routines.ts`），但 parrot-agent **MCP 工具层完全缺失**。
 
 #### 基础 CRUD
-- [x] **paperclipListRoutines** - 列出公司的所有例行程序
+- [x] **paperclipListRoutines** - 列出公司的所有例行程序 ✅
   - 参考：paperclip `GET /companies/:companyId/routines`
 
-- [x] **paperclipGetRoutine** - 获取单个例行程序详情
+- [x] **paperclipGetRoutine** - 获取单个例行程序详情 ✅
   - 参考：paperclip `GET /routines/:id`
 
-- [x] **paperclipCreateRoutine** - 创建新例行程序
+- [x] **paperclipCreateRoutine** - 创建新例行程序 ✅
   - 参考：paperclip `POST /companies/:companyId/routines`
   - Schema需包含：title, description, assigneeAgentId 等
 
-- [x] **paperclipUpdateRoutine** - 更新例行程序
+- [x] **paperclipUpdateRoutine** - 更新例行程序 ✅
   - 参考：paperclip `PATCH /routines/:id`
+
 #### 例行程序版本管理
 - [ ] **paperclipListRoutineRevisions** - 列出例行程序修订版本
   - 参考：paperclip `GET /routines/:id/revisions`
@@ -162,24 +192,26 @@ paperclip 中存在 Routines REST API（`server/src/routes/routines.ts`），但
 ---
 
 ### 1.3 Issue Document Annotations（Issue文档标注）- 5个工具
-REST API 已在前一个会话添加到 parrot-agent（`crates/api/src/routes/issues.rs:459-823`），但 **MCP 工具层缺失**。
+REST API 已在前一个会话添加到 parrot-agent（`crates/api/src/routes/issu3`），但 **MCP 工具层缺失**。
 
-- [x] **paperclipListIssueDocumentAnnotations** - 列出Issue文档标注
+- [x] **paperclipListIssueDocumentAnnotations** - 列出Issue文档标注 ✅
   - 参考：parrot-agent `GET /api/issues/:id/documents/:key/annotations`
   - 实现位置：`crates/api/src/routes/tools.rs`
 
-- [x] **paperclipGetIssueDocumentAnnotationThread** - 获取标注线程详情
+- [x] **paperclipGetIssueDocumentAnnotationThread** - 获取标注线程详情 ✅
   - 参考：parrot-agent `GET /api/issues/:id/documents/:key/annotations/:thread_id`
 
-- [x] **paperclipCreateIssueDocumentAnnotation** - 创建Issue文档标注
+- [x] **paperclipCreateIssueDocumentAnnotation** - 创建Issue文档标注 ✅
   - 参考：parrot-agent `POST /api/issues/:id/documents/:key/annotations`
   - Schema需包含：body, anchorJson, resolved 等
 
-- [x] **paperclipReplyIssueDocumentAnnotation** - 回复标注评论
-  - 参考：parrot-agent `POST /api/issues/:id/documents/:key/annotations/:thread_id/reply`
+- [x] **paperclipReplyIssueDocumentAnnotation** - 回复标注评论 ✅
+  - 参考：parrot-agent `POST /api/issues/:id/docums/:key/annotations/:thread_id/reply`
 
-- [x] **paperclipUpdateIssueDocumentAnnotation** - 更新标注线程状态
+- [x] **paperclipUpdateIssueDocumentAnnotation** - 更新标注线程状态 ✅
   - 参考：parrot-agent `PATCH /api/issues/:id/documents/:key/annotations/:thread_id`
+
+---
 
 ### 1.4 Labels（标签管理）- 3个工具
 paperclip 中存在 Labels REST API（`server/src/routes/issues.ts`），但 **MCP 工具层缺失**。
@@ -215,9 +247,7 @@ paperclip 中存在 Attachments REST API，但 **MCP 工具层缺失**。
 ---
 
 ### 1.6 External Objects（外部对象）- 2个工具
-paperclip 中存在 External Objects REST API，但 **MCP 工具层缺失**。
-
-- [ ] **paperclipListIssueExternalObjects** - 列出Issue关联的外部对象
+paperclip 中存在 External Objects REST API，但 **MCP 工具- [ ] **paperclipListIssueExternalObjects** - 列出Issue关联的外部对象
   - 参考：paperclip `GET /issues/:id/external-objects`
 
 - [ ] **paperclipRefreshIssueExternalObjects** - 刷新外部对象数据
@@ -231,7 +261,7 @@ paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.
 - [ ] **paperclipListIssueFileResources** - 列出Issue文件资源
   - 参考：paperclip `GET /issues/:issueId/file-resources/list`
 
-- [ ] **paperclipResolveIssueFileResource** - 解析文件资源路径
+- [ ] **paperclipResolveIssueFilee** - 解析文件资源路径
   - 参考：paperclip `GET /issues/:issueId/file-resources/resolve`
 
 - [ ] **paperclipGetIssueFileResourceContent** - 获取文件资源内容
@@ -267,7 +297,7 @@ paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.
 
 ---
 
-## 三、可能存在的硬编码或简化实现（低优先级）
+#的硬编码或简化实现（低优先级）
 
 ### 3.1 需要检查的实现细节
 
@@ -288,16 +318,16 @@ paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.
 
 ## 四、实施计划建议
 
-### 阶段一：高价值基础工具（2-3天）
-1. **Cases 基础 CRUD**（4个工具）
+### 阶段一：高价值基础工具（2-3天）✅ 已完成
+1. **Cases 基础 CRUD**（4个工具）✅
    - paperclipListCases, GetCase, CreateCase, UpdateCase
    - 优先级：⭐⭐⭐⭐⭐
 
-2. **Routines 基础 CRUD**（4个工具）
+2. **Routines 基础 CRUD**（4个工具）✅
    - paperclipListRoutines, GetRoutine, CreateRoutine, UpdateRoutine
    - 优先级：⭐⭐⭐⭐⭐
 
-3. **Issue Document Annotations**（5个工具）
+3. **Issue Document Annotations**（5个工具）✅
    - 全部5个工具
    - 优先级：⭐⭐⭐⭐（REST API已存在，只需MCP层）
 
@@ -367,7 +397,7 @@ paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.
 - **REST API 参考**：
   - Cases: `~/workspace/paperclip/server/src/routes/cases.ts`
   - Routines: `~/workspace/paperclip/server/src/routes/routines.ts`
-  - Issues: `~/workspace/paperclip/server/src/routes/issues.ts`
+  - Issues: `~/workspace/paperclip/servesrc/routes/issues.ts`
   - File Resources: `~/workspace/paperclip/server/src/routes/file-resources.ts`
 
 ### 5.3 数据库迁移检查
@@ -390,7 +420,7 @@ paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.
 2. **数据库 Schema 差异**：Rust 和 TypeScript 项目的表结构可能不同
    - 建议：先运行 `sqlx migrate run` 确保迁移已应用
 
-3. **复杂对象序列化**：嵌套的 JSON 对象（如 executionPolicy, metadata）
+3. **复杂对象序列化**：嵌套的 JSON 对象（如 execuonPolicy, metadata）
    - 建议：添加单元测试验证序列化正确性
 
 4. **文件上传**：Attachments 工具涉及多部分表单
@@ -407,5 +437,21 @@ paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.
 - **需验证实现的工具**：6个
 - **需修复简化实现的工具**：3个
 - **总计待处理**：66个工具
+- **已完成**：13个工具（阶段一）
+- **完成率**：19.7%
 
 **预计总工作量**：7-10个工作日（按阶段实施，优先高价值工具）
+
+---
+
+## Git 提交历史
+
+```
+251f300 feat(mcp): 添加Issue Document Annotations工具
+73b5aaf feat(mcp): 添加Cases和Routines基础CRUD工具
+```
+
+**下一步建议**：
+1. 使用代码生成工具批量添加剩余的简单工具（Labels、External Objects、File Resources）
+2. 逐步完成文档管理和标注工具
+3. 最后进行质量验证和修复
