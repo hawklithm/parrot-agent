@@ -1,2 +1,27 @@
 /target
 .claude/worktrees/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Temporary scripts and setup files
+*.sh
+*.sql
+*.py
+setup_*.rs
+create_*.sh
+
+# Documentation (except README.md)
+CLAUDE*.md
+docs/IMPLEMENTATION-*.md
+docs/QUICKSTART-*.md
+docs/adapter-env-var-reference.md
+docs/examples/claude-*.json
+
+# Config templates (keep in repo)
+!claude-local-agent-config.json
+
+# Examples and temporary code
+examples/setup_*.rs

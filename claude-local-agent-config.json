@@ -1,0 +1,62 @@
+{
+  "name": "claude-local-agent",
+  "role": "general",
+  "status": "idle",
+  "adapter_type": "claude_local",
+  "adapter_config": {
+    "comment": "Claude Local Agent - 完整配置示例",
+    
+    "_section_1": "=== 环境变量配置（使用智能引用）===",
+    "env": {
+      "_comment": "这些值会自动从宿主环境变量中读取",
+      "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_BASE_URL": "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_MODEL": "ANTHROPIC_MODEL",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL": "ANTHROPIC_DEFAULT_OPUS_MODEL"
+    },
+    
+    "_section_2": "=== CLI 配置 ===",
+    "command": "claude",
+    "dangerouslySkipPermissions": true,
+    
+    "_section_3": "=== 模型和执行配置 ===",
+    "model": "claude-3-5-sonnet-20241022",
+    "maxTurnsPerRun": 20,
+    "effort": "high",
+    "timeoutSec": 1800,
+    
+    "_section_4": "=== 提示词配置 ===",
+    "promptTemplate": "Task: {{issue.title}}\n\n{{issue.description}}\n\nPlease complete this task step by step and report the final results.",
+    "systemPrompt": "You are a helpful AI assistant working in a development environment. Follow best practices and provide clear explanations.",
+    
+    "_section_5": "=== 可选功能 ===",
+    "chrome": false,
+    "cwd": "/Users/adazhao/workspace/parrot-agent",
+    
+    "_section_6": "=== 高级配置（可选）===",
+    "instructionsFilePath": null,
+    "appendSystemPrompt": null,
+    "excludeDynamicSystemPromptSections": false,
+    "strictMcpConfig": false,
+    "extraArgs": []
+  },
+  "runtime_config": {
+    "enabled": true,
+    "auto_wake": false
+  },
+  "permissions": {
+    "can_create_agents": false,
+    "can_create_skills": false,
+    "trust_preset": "standard",
+    "authorization_policy": "manual"
+  },
+  "metadata": {
+    "description": "Claude local agent with environment variable reference",
+    "created_by": "admin",
+    "environment": "development",
+    "notes": "使用环境变量引用功能，避免硬编码敏感信息"
+  },
+  "budget_monthly_cents": 50000
+}

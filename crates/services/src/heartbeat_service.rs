@@ -15,6 +15,71 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
+const CLAUDE_PROVIDER_ENV_KEYS: &[&str] = &[
+    "CLAUDE_CODE_USE_OPENAI",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_MODEL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "LLM_API_KEY",
+    "LLM_BASE_URL",
+    "LLM_MODEL",
+];
+
+fn isolate_claude_provider_environment(
+    cmd: &mut Command,
+    explicit_env: Option<&serde_json::Map<String, Value>>,
+) {
+    for key in CLAUDE_PROVIDER_ENV_KEYS {
+        if explicit_env.map_or(true, |env| !env.contains_key(*key)) {
+            cmd.env_remove(key);
+        }
+    }
+}
+
+/// 智能解析环境变量值：
+/// 1. 如果value看起来像环境变量引用（纯大写字母数字下划线，或带$前缀），先尝试从环境读取
+/// 2. 如果环境变量存在且非空，使用环境变量的值
+/// 3. 否则，使用value本身作为实际值
+fn resolve_env_value(configured_value: &str) -> String {
+    // 去除可能的 $ 前缀和 ${} 包裹
+    let trimmed = configured_value.trim();
+    let key = trimmed
+        .strip_prefix("${")
+        .and_then(|s| s.strip_suffix("}"))
+        .or_else(|| trimmed.strip_prefix("$"))
+        .unwrap_or(trimmed);
+    
+    // 检查是否看起来像环境变量名（纯大写字母、数字、下划线）
+    let looks_like_env_var = !key.is_empty() 
+        && key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    
+    if looks_like_env_var {
+        // 尝试从当前环境读取
+        if let Ok(env_value) = std::env::var(key) {
+            if !env_value.is_empty() {
+                tracing::debug!(
+                    key = %key,
+                    "resolved env var reference from host environment"
+                );
+                return env_value;
+            }
+        }
+    }
+    
+    // 回退到使用配置值本身（保持原样，不trim）
+    configured_value.to_string()
+}
+
+
 /// Heartbeat service for managing agent wake/sleep lifecycle
 #[async_trait]
 pub trait HeartbeatService: Send + Sync {
@@ -69,9 +134,19 @@ pub struct AgentHeartbeatInfo {
 struct AdapterOutcome {
     explicit_failure: bool,
     failure_reason: Option<String>,
+    error_code: Option<String>,
+    error_family: Option<String>,
     result_summary: Option<String>,
     tool_call_count: usize,
     handoff: Option<Value>,
+    result_event: Option<Value>,
+}
+
+#[derive(Debug)]
+struct AdapterCommandOutput {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
 }
 
 /// Read the structured result records emitted by Claude/Codex JSONL modes.
@@ -87,6 +162,36 @@ fn parse_adapter_outcome(output: &str) -> AdapterOutcome {
         visit_adapter_event(&value, &mut outcome, true);
     }
     outcome
+}
+
+fn classify_claude_error(message: &str) -> (Option<String>, Option<String>) {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("not logged in")
+        || normalized.contains("please log in")
+        || normalized.contains("login required")
+        || normalized.contains("authentication required")
+        || normalized.contains("unauthorized")
+        || normalized.contains("invalid api key")
+    {
+        return (Some("claude_auth_required".to_string()), Some("authentication".to_string()));
+    }
+    if normalized.contains("rate limit")
+        || normalized.contains("rate_limit_error")
+        || normalized.contains("too many requests")
+        || normalized.contains("overloaded")
+        || normalized.contains("service unavailable")
+        || normalized.contains("429")
+        || normalized.contains("503")
+        || normalized.contains("529")
+        || normalized.contains("usage limit")
+        || normalized.contains("out of extra usage")
+    {
+        return (Some("claude_transient_upstream".to_string()), Some("transient_upstream".to_string()));
+    }
+    if normalized.contains("empty or malformed response") {
+        return (Some("claude_malformed_response".to_string()), Some("upstream_protocol".to_string()));
+    }
+    (None, None)
 }
 
 fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: bool) {
@@ -108,12 +213,19 @@ fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: b
             || matches!(value.get("subtype").and_then(Value::as_str), Some("error" | "failed")));
     if is_error {
         outcome.explicit_failure = true;
-        outcome.failure_reason = value
+        let reason = value
             .get("error")
             .and_then(Value::as_str)
             .or_else(|| value.get("message").and_then(Value::as_str))
             .or_else(|| value.get("result").and_then(Value::as_str))
             .map(ToOwned::to_owned);
+        if let Some(reason) = reason {
+            let (error_code, error_family) = classify_claude_error(&reason);
+            outcome.failure_reason = Some(reason);
+            outcome.error_code = error_code;
+            outcome.error_family = error_family;
+        }
+        outcome.result_event = Some(value.clone());
     }
     if let Some(result) = value.get("result").and_then(Value::as_str) {
         outcome.result_summary = Some(result.to_owned());
@@ -334,37 +446,84 @@ impl DefaultHeartbeatService {
 
     async fn execute_run(&self, run_id: Uuid, agent_id: Uuid, issue_id: Uuid, company_id: Uuid) {
         let result = self.run_command(run_id, agent_id, issue_id, company_id).await;
-        let (status, exit_code, error, output) = match result {
-            Ok((code, out)) if code == 0 && !parse_adapter_outcome(&out).explicit_failure => ("succeeded", Some(code), None, out),
-            Ok((code, out)) if code == 0 => {
-                let outcome = parse_adapter_outcome(&out);
-                let reason = outcome.failure_reason.unwrap_or_else(|| "adapter reported an explicit failure".to_string());
-                ("failed", Some(code), Some(format!("adapter reported failure: {reason}")), out)
-            }
-            Ok((code, out)) => (
-                "failed",
-                Some(code),
-                Some(format!(
-                    "adapter exited with code {code}: {}",
-                    out.lines()
+        let (status, exit_code, error, output, outcome) = match result {
+            Ok(command_output) => {
+                let combined = format!("{}{}", command_output.stdout, command_output.stderr);
+                let outcome = parse_adapter_outcome(&combined);
+                if command_output.exit_code == 0 && !outcome.explicit_failure {
+                    ("succeeded", Some(command_output.exit_code), None, command_output, outcome)
+                } else if outcome.explicit_failure {
+                    let reason = outcome
+                        .failure_reason
+                        .clone()
+                        .unwrap_or_else(|| "adapter reported an explicit failure".to_string());
+                    (
+                        "failed",
+                        Some(command_output.exit_code),
+                        Some(reason),
+                        command_output,
+                        outcome,
+                    )
+                } else {
+                    let reason = command_output
+                        .stderr
+                        .lines()
+                        .chain(command_output.stdout.lines())
                         .map(str::trim)
                         .find(|line| !line.is_empty())
                         .unwrap_or("no adapter output")
-                )),
-                out,
-            ),
-            Err(e) => ("failed", None, Some(e), String::new()),
+                        .to_string();
+                    let (error_code, error_family) = classify_claude_error(&reason);
+                    let mut outcome = outcome;
+                    outcome.error_code = error_code;
+                    outcome.error_family = error_family;
+                    (
+                        "failed",
+                        Some(command_output.exit_code),
+                        Some(reason),
+                        command_output,
+                        outcome,
+                    )
+                }
+            }
+            Err(error) => {
+                let outcome = AdapterOutcome {
+                    explicit_failure: true,
+                    failure_reason: Some(error.clone()),
+                    error_code: Some("adapter_failed".to_string()),
+                    error_family: Some("adapter".to_string()),
+                    ..Default::default()
+                };
+                (
+                    "failed",
+                    None,
+                    Some(error),
+                    AdapterCommandOutput {
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                    outcome,
+                )
+            }
         };
-        let outcome = parse_adapter_outcome(&output);
         let result_json = serde_json::json!({
             "toolCallCount": outcome.tool_call_count,
             "resultSummary": outcome.result_summary,
             "handoff": outcome.handoff,
             "explicitFailure": outcome.explicit_failure,
+            "errorCode": outcome.error_code,
+            "errorFamily": outcome.error_family,
+            "resultEvent": outcome.result_event,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
         });
-        let _ = sqlx::query(
+        if let Err(error) = sqlx::query(
             "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, result_json = $6, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
-            .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output).bind(&result_json).execute(&self.pool).await;
+            .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output.stdout).bind(&result_json).execute(&self.pool).await
+        {
+            tracing::error!(%run_id, %error, "failed to persist heartbeat run final status");
+        }
         publish_live_event(
             &self.sse_service,
             company_id,
@@ -388,7 +547,7 @@ impl DefaultHeartbeatService {
         .bind(run_id)
             .execute(&self.pool)
             .await;
-        self.refresh_continuation_summary(issue_id, run_id, agent_id, status, error.as_deref(), &output).await;
+        self.refresh_continuation_summary(issue_id, run_id, agent_id, status, error.as_deref(), &output.stdout).await;
         let _ = sqlx::query("UPDATE agent_wakeup_requests SET status = 'completed', updated_at = NOW() WHERE company_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running') AND payload->>'issueId' = $3")
             .bind(company_id).bind(agent_id).bind(issue_id.to_string()).execute(&self.pool).await;
         let _ = sqlx::query("UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE run_id = $1 AND revoked_at IS NULL")
@@ -404,7 +563,7 @@ impl DefaultHeartbeatService {
         agent_id: Uuid,
         issue_id: Uuid,
         company_id: Uuid,
-    ) -> Result<(i32, String), String> {
+    ) -> Result<AdapterCommandOutput, String> {
         let agent = self.load_agent(agent_id).await.map_err(|e| e.to_string())?;
         let issue = sqlx::query("SELECT title, description FROM issues WHERE id = $1")
             .bind(issue_id)
@@ -438,8 +597,8 @@ impl DefaultHeartbeatService {
         let configured_model = cfg
             .get("model")
             .and_then(|v| v.as_str())
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or("deepseek-v4-flash");
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
         if let Some(api_key) = cfg
             .get("apiKey")
             .or_else(|| cfg.get("api_key"))
@@ -451,7 +610,7 @@ impl DefaultHeartbeatService {
                 .or_else(|| cfg.get("baseUrl"))
                 .and_then(|v| v.as_str());
             let model = if adapter == "claude_local" {
-                configured_model
+                configured_model.ok_or_else(|| "claude_local API execution requires adapter config model".to_string())?
             } else {
                 cfg.get("model")
                     .and_then(|v| v.as_str())
@@ -475,7 +634,7 @@ impl DefaultHeartbeatService {
             if !status.is_success() {
                 return Err(format!("LLM request failed with HTTP {status}: {body}"));
             }
-            return Ok((0, body));
+            return Ok(AdapterCommandOutput { exit_code: 0, stdout: body, stderr: String::new() });
         }
         let command = cfg
             .get("command")
@@ -512,12 +671,9 @@ impl DefaultHeartbeatService {
                 ],
                 _ => vec!["-p".into(), prompt.clone()],
             };
-            if matches!(adapter, "claude_local" | "codex_local" | "opencode") {
-                if adapter == "codex_local" {
-                    args.splice(1..1, ["--model".to_string(), configured_model.to_string()]);
-                } else {
-                    args.splice(0..0, ["--model".to_string(), configured_model.to_string()]);
-                }
+            if adapter == "codex_local" {
+                let model = configured_model.unwrap_or("deepseek-v4-flash");
+                args.splice(1..1, ["--model".to_string(), model.to_string()]);
             }
         }
         if adapter == "claude_local" {
@@ -672,22 +828,14 @@ impl DefaultHeartbeatService {
             _ => {}
         }
         // Do not accidentally inherit Claude Code's OpenAI compatibility mode
-        // from the shell that launched parrot-server. Explicit per-agent env
-        // values remain authoritative below.
+        // or another provider override from the shell that launched
+        // parrot-server. Explicit per-agent env values remain authoritative
+        // below. This is important for local Claude runs: otherwise a
+        // developer shell's ANTHROPIC_BASE_URL/LLM_* silently changes the
+        // provider used by every agent.
         if adapter == "claude_local" {
             let explicit_env = cfg.get("env").and_then(|v| v.as_object());
-            if explicit_env.map_or(true, |env| !env.contains_key("CLAUDE_CODE_USE_OPENAI")) {
-                cmd.env_remove("CLAUDE_CODE_USE_OPENAI");
-            }
-            if explicit_env.map_or(true, |env| !env.contains_key("OPENAI_API_KEY")) {
-                cmd.env_remove("OPENAI_API_KEY");
-            }
-            if explicit_env.map_or(true, |env| !env.contains_key("OPENAI_BASE_URL")) {
-                cmd.env_remove("OPENAI_BASE_URL");
-            }
-            if explicit_env.map_or(true, |env| !env.contains_key("OPENAI_MODEL")) {
-                cmd.env_remove("OPENAI_MODEL");
-            }
+            isolate_claude_provider_environment(&mut cmd, explicit_env);
         }
         let stdin_prompt = adapter == "claude_local" && !custom_args;
         let timeout_sec = cfg
@@ -745,7 +893,8 @@ impl DefaultHeartbeatService {
         if let Some(env) = cfg.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env {
                 if let Some(s) = v.as_str() {
-                    cmd.env(k, s);
+                    let resolved_value = resolve_env_value(s);
+                    cmd.env(k, resolved_value);
                 }
             }
         }
@@ -862,9 +1011,11 @@ impl DefaultHeartbeatService {
             }
         };
         let (out, err, status) = status;
-        let mut output = String::from_utf8_lossy(&out).to_string();
-        output.push_str(&String::from_utf8_lossy(&err));
-        Ok((status.code().unwrap_or(-1), output))
+        Ok(AdapterCommandOutput {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out).to_string(),
+            stderr: String::from_utf8_lossy(&err).to_string(),
+        })
     }
 }
 
@@ -965,6 +1116,119 @@ impl HeartbeatService for DefaultHeartbeatService {
 }
 
 impl DefaultHeartbeatService {
+    /// Reconcile heartbeat runs that survived a server restart without an
+    /// in-memory child process. Paperclip treats these as process-lost runs
+    /// instead of leaving them live forever. The age threshold avoids racing
+    /// the small window between spawning the child and registering its handle.
+    pub async fn reconcile_orphaned_runs(&self, stale_after_secs: i64) -> Result<usize, HeartbeatError> {
+        let rows = sqlx::query(
+            "SELECT id, agent_id, company_id, context_snapshot, updated_at
+             FROM heartbeat_runs
+             WHERE status = 'running' AND updated_at < NOW() - ($1 * INTERVAL '1 second')",
+        )
+        .bind(stale_after_secs.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+        let mut reconciled = 0;
+        for row in rows {
+            let run_id: Uuid = row
+                .try_get("id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+            // A live in-process run is owned by execute_run; do not interfere
+            // with it. Runs absent from this map are the restart/orphan case.
+            if self.children.lock().await.contains_key(&run_id) {
+                continue;
+            }
+
+            let agent_id: Uuid = row
+                .try_get("agent_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let company_id: Uuid = row
+                .try_get("company_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let issue_id = row
+                .try_get::<Option<serde_json::Value>, _>("context_snapshot")
+                .ok()
+                .flatten()
+                .and_then(|snapshot| snapshot.get("issueId").and_then(|v| v.as_str()).map(str::to_owned))
+                .and_then(|value| Uuid::parse_str(&value).ok());
+            let error = "Process lost -- server may have restarted while the run was active";
+
+            let updated = sqlx::query(
+                "UPDATE heartbeat_runs
+                 SET status = 'failed', error = $2, finished_at = NOW(), updated_at = NOW(),
+                     result_json = COALESCE(result_json, '{}'::jsonb) || '{\"processLost\":true}'::jsonb
+                 WHERE id = $1 AND status = 'running'",
+            )
+            .bind(run_id)
+            .bind(error)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            if updated.rows_affected() == 0 {
+                continue;
+            }
+
+            if let Some(issue_id) = issue_id {
+                sqlx::query(
+                    "UPDATE issues
+                     SET status = 'todo'::issue_status, checkout_run_id = NULL,
+                         execution_run_id = NULL, execution_locked_at = NULL,
+                         execution_agent_name_key = NULL, updated_at = NOW()
+                     WHERE id = $1 AND company_id = $2 AND execution_run_id = $3",
+                )
+                .bind(issue_id)
+                .bind(company_id)
+                .bind(run_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+                sqlx::query(
+                    "UPDATE agent_wakeup_requests
+                     SET status = 'failed', error = $4, finished_at = NOW(), updated_at = NOW()
+                     WHERE company_id = $1 AND agent_id = $2
+                       AND status IN ('queued','dispatched','running')
+                       AND payload->>'issueId' = $3",
+                )
+                .bind(company_id)
+                .bind(agent_id)
+                .bind(issue_id.to_string())
+                .bind(error)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            }
+
+            sqlx::query("UPDATE agents SET status = 'idle', updated_at = NOW() WHERE id = $1 AND status = 'running'")
+                .bind(agent_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+            publish_live_event(
+                &self.sse_service,
+                company_id,
+                "heartbeat.run.status",
+                serde_json::json!({
+                    "runId": run_id,
+                    "agentId": agent_id,
+                    "issueId": issue_id,
+                    "status": "failed",
+                    "error": error,
+                    "errorCode": "process_lost",
+                }),
+            )
+            .await;
+            reconciled += 1;
+        }
+
+        Ok(reconciled)
+    }
+
     /// Requeue assigned todo issues that were created before assignment wakeups
     /// were wired into the issue API.
     pub async fn reconcile_pending_issues(&self) -> Result<usize, HeartbeatError> {
@@ -1012,6 +1276,19 @@ mod adapter_outcome_tests {
         );
         assert!(outcome.explicit_failure);
         assert_eq!(outcome.failure_reason.as_deref(), Some("tool failed"));
+    }
+
+    #[test]
+    fn classifies_claude_malformed_response() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"API Error: API returned an empty or malformed response (HTTP 200)"}"#,
+        );
+        assert_eq!(outcome.error_code.as_deref(), Some("claude_malformed_response"));
+        assert_eq!(outcome.error_family.as_deref(), Some("upstream_protocol"));
+        assert_eq!(
+            outcome.failure_reason.as_deref(),
+            Some("API Error: API returned an empty or malformed response (HTTP 200)")
+        );
     }
 
     #[test]
@@ -1123,6 +1400,83 @@ mod tests {
         assert!(!logged.contains(token));
         assert!(logged.contains("[PAPERCLIP_TOOL_GATEWAY_TOKEN]"));
         assert!(command.contains(token));
+    }
+
+    #[test]
+    fn resolve_env_value_uses_host_env_when_looks_like_var() {
+        // 设置测试环境变量
+        std::env::set_var("TEST_AUTH_TOKEN", "secret_from_env");
+        std::env::set_var("MY_API_KEY", "key_from_env");
+        
+        // 测试1: 直接使用环境变量名
+        assert_eq!(
+            resolve_env_value("TEST_AUTH_TOKEN"),
+            "secret_from_env",
+            "应该从环境变量读取值"
+        );
+        
+        // 测试2: 使用 $ 前缀
+        assert_eq!(
+            resolve_env_value("$MY_API_KEY"),
+            "key_from_env",
+            "应该支持 $VAR 格式"
+        );
+        
+        // 测试3: 使用花括号包裹
+        assert_eq!(
+            resolve_env_value("${TEST_AUTH_TOKEN}"),
+            "secret_from_env",
+            "应该支持 dollar-brace-VAR-brace 格式"
+        );
+        
+        // 测试4: 环境变量不存在时，使用配置值本身
+        assert_eq!(
+            resolve_env_value("NONEXISTENT_VAR"),
+            "NONEXISTENT_VAR",
+            "环境变量不存在时应该使用配置值本身"
+        );
+        
+        // 测试5: 不像环境变量的值（包含小写字母或特殊字符），直接使用
+        assert_eq!(
+            resolve_env_value("sk-real-api-key-123"),
+            "sk-real-api-key-123",
+            "不像环境变量名的值应该直接使用"
+        );
+        
+        assert_eq!(
+            resolve_env_value("http://localhost:8787"),
+            "http://localhost:8787",
+            "URL应该直接使用"
+        );
+        
+        assert_eq!(
+            resolve_env_value("claude-3-opus"),
+            "claude-3-opus",
+            "包含小写和横线的值应该直接使用"
+        );
+        
+        // 测试6: 空值
+        std::env::set_var("EMPTY_VAR", "");
+        assert_eq!(
+            resolve_env_value("EMPTY_VAR"),
+            "EMPTY_VAR",
+            "环境变量为空时应该使用配置值本身"
+        );
+        
+        // 清理测试环境变量
+        std::env::remove_var("TEST_AUTH_TOKEN");
+        std::env::remove_var("MY_API_KEY");
+        std::env::remove_var("EMPTY_VAR");
+    }
+    
+    #[test]
+    fn resolve_env_value_preserves_whitespace_in_direct_values() {
+        // 直接值应该保留原样（包括空格）
+        assert_eq!(
+            resolve_env_value("  some value with spaces  "),
+            "  some value with spaces  ",
+            "非环境变量的值应该完全保留原样"
+        );
     }
 
     #[tokio::test]
