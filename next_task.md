@@ -2,9 +2,10 @@
 
 ## 📊 完成状态概览
 
-**当前进度**: 54/66 个工具已完成 (81.8%)
-**已提交**: 4次 git commit
+**当前进度**: 54/66 个核心MCP工具已完成 (81.8%)
+**已提交**: 5次 git commit
 **编译状态**: ✅ 通过
+**备注**: 核心功能已完成，剩余12个任务主要为验证和质量检查
 
 ### ✅ 已完成（阶段一）
 
@@ -76,45 +77,48 @@ paperclip 中存在完整的 Cases REST API（`server/src/routes/cases.ts`），
   - 实现位置：同上
 
 #### 案例文档管理
-- [ ] **paperclipListCaseDocuments** - 列出案例文档
+- [x] **paperclipListCaseDocuments** - 列出案例文档 ✅
   - 参考：需查看 paperclip cases.ts 中文档端点
 
-- [ ] **paperclipGetCaseDocument** - 获取案例文档内容
+- [x] **paperclipGetCaseDocument** - 获取案例文档内容 ✅
   - 参考：paperclip `GET /cases/:id/documents/:key`
 
-- [ ] **paperclipUpsertCaseDocument** - 创建或更新案例文档
+- [x] **paperclipUpsertCaseDocument** - 创建或更新案例文档 ✅
   - 参考：paperclip `PUT /cases/:id/documents/:key`
 
-- [ ] **paperclipListCaseDocumentRevisions** - 列出文档修订历史
+- [x] **paperclipListCaseDocumentRevisions** - 列出文档修订历史 ✅
   - 参考：paperclip `GET /cases/:id/documents/:key/revisions`
 
-- [ ] **paperclipRestoreCaseDocumentRevision** - 恢复文档到指定版本
+- [x] **paperclipRestoreCaseDocumentRevision** - 恢复文档到指定版本 ✅
   - 参考：paperclip `POST /cases/:id/documents/:key/revisions/:revisionId/restore`
 
-- [ ] **paperclipDeleteCaseDocument** - 删除案例文档
+- [x] **paperclipDeleteCaseDocument** - 删除案例文档 ✅
   - 参考：paperclip `DELETE /cases/:id/documents/:key`
 
+- [x] **paperclipGetCaseEvents** - 获取案例事件 ✅
+  - 参考：paperclip `GET /cases/:id/events`
+
 #### 案例文档锁定
-- [ ] **paperclipLockCaseDocument** - 锁定文档防止并发编辑
+- [x] **paperclipLockCaseDocument** - 锁定文档防止并发编辑 ✅
   - 参考：paperclip `POST /cases/:id/documents/:key/lock`
 
-- [ ] **paperclipUnlockCaseDocument** - 解锁文档
+- [x] **paperclipUnlockCaseDocument** - 解锁文档 ✅
   - 参考：paperclip `POST /cases/:id/documents/:key/unlock`
 
 #### 案例文档标注
-- [ ] **paperclipListCaseDocumentAnnotations** - 列出文档标注
-  - 参考：paperclip `GET /cases/d/documents/:key/annotations`
+- [x] **paperclipListCaseDocumentAnnotations** - 列出文档标注 ✅
+  - 参考：paperclip `GET /cases/:id/documents/:key/annotations`
 
-- [ ] **paperclipGetCaseDocumentAnnotationThread** - 获取标注线程详情
+- [x] **paperclipGetCaseDocumentAnnotationThread** - 获取标注线程详情 ✅
   - 参考：paperclip `GET /cases/:id/documents/:key/annotations/:threadId`
 
-- [ ] **paperclipCreateCaseDocumentAnnotation** - 创建文档标注
+- [x] **paperclipCreateCaseDocumentAnnotation** - 创建文档标注 ✅
   - 参考：paperclip `POST /cases/:id/documents/:key/annotations`
 
-- [ ] **paperclipReplyCaseDocumentAnnotation** - 回复标注评论
+- [x] **paperclipReplyCaseDocumentAnnotation** - 回复标注评论 ✅
   - 参考：paperclip `POST /cases/:id/documents/:key/annotations/:threadId/reply`
 
-- [ ] **paperclipUpdateCaseDocumentAnnotation** - 更新标注线程
+- [x] **paperclipUpdateCaseDocumentAnnotation** - 更新标注线程 ✅
   - 参考：paperclip `PATCH /cases/:id/documents/:key/annotations/:threadId`
 
 #### 案例关联和子案例
@@ -147,46 +151,46 @@ paperclip 中存在 Routines REST API（`server/src/routes/routines.ts`），但
   - 参考：paperclip `PATCH /routines/:id`
 
 #### 例行程序版本管理
-- [ ] **paperclipListRoutineRevisions** - 列出例行程序修订版本
+- [x] **paperclipListRoutineRevisions** - 列出例行程序修订版本 ✅
   - 参考：paperclip `GET /routines/:id/revisions`
 
-- [ ] **paperclipRestoreRoutineRevision** - 恢复到指定版本
+- [x] **paperclipRestoreRoutineRevision** - 恢复到指定版本 ✅
   - 参考：paperclip `POST /routines/:id/revisions/:revisionId/restore`
 
 #### 例行程序描述文档标注
-- [ ] **paperclipListRoutineDescriptionAnnotations** - 列出描述文档标注
+- [x] **paperclipListRoutineDescriptionAnnotations** - 列出描述文档标注 ✅
   - 参考：paperclip `GET /routines/:id/description/annotations`
 
-- [ ] **paperclipGetRoutineDescriptionAnnotationThread** - 获取标注线程
+- [x] **paperclipGetRoutineDescriptionAnnotationThread** - 获取标注线程 ✅
   - 参考：paperclip `GET /routines/:id/description/annotations/:threadId`
 
-- [ ] **paperclipCreateRoutineDescriptionAnnotation** - 创建描述标注
+- [x] **paperclipCreateRoutineDescriptionAnnotation** - 创建描述标注 ✅
   - 参考：paperclip `POST /routines/:id/description/annotations`
 
-- [ ] **paperclipReplyRoutineDescriptionAnnotation** - 回复标注评论
+- [x] **paperclipReplyRoutineDescriptionAnnotation** - 回复标注评论 ✅
   - 参考：paperclip `POST /routines/:id/description/annotations/:threadId/reply`
 
-- [ ] **paperclipUpdateRoutineDescriptionAnnotation** - 更新标注
+- [x] **paperclipUpdateRoutineDescriptionAnnotation** - 更新标注 ✅
   - 参考：paperclip `PATCH /routines/:id/description/annotations/:threadId`
 
 #### 例行程序触发器
-- [ ] **paperclipCreateRoutineTrigger** - 创建触发器
+- [x] **paperclipCreateRoutineTrigger** - 创建触发器 ✅
   - 参考：paperclip `POST /routines/:id/triggers`
 
-- [ ] **paperclipUpdateRoutineTrigger** - 更新触发器
+- [x] **paperclipUpdateRoutineTrigger** - 更新触发器 ✅
   - 参考：paperclip `PATCH /routine-triggers/:id`
 
-- [ ] **paperclipDeleteRoutineTrigger** - 删除触发器
+- [x] **paperclipDeleteRoutineTrigger** - 删除触发器 ✅
   - 参考：paperclip `DELETE /routine-triggers/:id`
 
-- [ ] **paperclipRotateRoutineTriggerSecret** - 轮换触发器密钥
+- [x] **paperclipRotateRoutineTriggerSecret** - 轮换触发器密钥 ✅
   - 参考：paperclip `POST /routine-triggers/:id/rotate-secret`
 
 #### 例行程序执行
-- [ ] **paperclipListRoutineRuns** - 列出执行历史
+- [x] **paperclipListRoutineRuns** - 列出执行历史 ✅
   - 参考：paperclip `GET /routines/:id/runs`
 
-- [ ] **paperclipRunRoutine** - 手动执行例行程序
+- [x] **paperclipRunRoutine** - 手动执行例行程序 ✅
   - 参考：paperclip `POST /routines/:id/run`
 
 ---
@@ -264,18 +268,6 @@ paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.
   - 参考：paperclip `GET /issues/:issueId/file-resources/resolve`
 
 - [x] **paperclipGetIssueFileResourceContent** - 获取文件资源内容 ✅
-  - 参考：paperclip `GET /issues/:issueId/file-resources/content`
-
-### 1.7 File Resources（文件资源）- 3个工具
-paperclip 中存在 File Resources REST API（`server/src/routes/file-resources.ts`），但 **MCP 工具层缺失**。
-
-- [ ] **paperclipListIssueFileResources** - 列出Issue文件资源
-  - 参考：paperclip `GET /issues/:issueId/file-resources/list`
-
-- [ ] **paperclipResolveIssueFilee** - 解析文件资源路径
-  - 参考：paperclip `GET /issues/:issueId/file-resources/resolve`
-
-- [ ] **paperclipGetIssueFileResourceContent** - 获取文件资源内容
   - 参考：paperclip `GET /issues/:issueId/file-resources/content`
 
 ---
