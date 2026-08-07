@@ -39,6 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 	urlencoding = "2.1"
 	ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 	pkcs8 = { version = "0.10", features = ["pem"] }
+nix = { version = "0.31.3", features = ["signal"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

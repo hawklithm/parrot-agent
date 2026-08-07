@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use crate::sse_service::{InMemorySseService, SseService};
 use chrono::{DateTime, Utc};
-use models::{Agent, SseEvent, SseEventType};
+use models::{Agent, AgentStatus, SseEvent, SseEventType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -434,6 +434,209 @@ impl DefaultHeartbeatService {
     pub fn with_sse_service(mut self, sse_service: Arc<dyn SseService>) -> Self {
         self.sse_service = sse_service;
         self
+    }
+
+    /// 克隆 service 用于后台任务
+    fn clone_for_background(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            children: Arc::clone(&self.children),
+            sse_service: Arc::clone(&self.sse_service),
+        }
+    }
+
+    /// 优雅终止进程：先发送 SIGTERM，等待 grace period，然后 SIGKILL
+    async fn terminate_process_gracefully(
+        &self,
+        child: Arc<Mutex<Child>>,
+        grace_ms: u64,
+    ) -> Result<(), String> {
+        let pid = {
+            let child_guard = child.lock().await;
+            child_guard.id()
+        };
+        
+        if let Some(pid) = pid {
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                
+                // 1. 发送 SIGTERM
+                let unix_pid = Pid::from_raw(pid as i32);
+                if let Err(e) = kill(unix_pid, Signal::SIGTERM) {
+                    tracing::warn!(pid = %pid, error = %e, "failed to send SIGTERM, trying SIGKILL");
+                    let _ = kill(unix_pid, Signal::SIGKILL);
+                    return Ok(());
+                }
+                
+                tracing::debug!(pid = %pid, grace_ms = %grace_ms, "sent SIGTERM, waiting for graceful shutdown");
+                
+                // 2. 等待 grace period，检查进程是否已退出
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+                let check_interval = Duration::from_millis(100);
+                
+                while tokio::time::Instant::now() < deadline {
+                    // 检查进程是否还活着
+                    match kill(unix_pid, None) {
+                        Err(nix::errno::Errno::ESRCH) => {
+                            // 进程已退出
+                            tracing::debug!(pid = %pid, "process exited gracefully");
+                            return Ok(());
+                        }
+                        Ok(_) => {
+                            // 进程还活着，继续等待
+                            tokio::time::sleep(check_interval).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(pid = %pid, error = %e, "error checking process liveness");
+                            break;
+                        }
+                    }
+                }
+                
+                // 3. Grace period 超时，发送 SIGKILL
+                tracing::warn!(pid = %pid, "grace period expired, sending SIGKILL");
+                let _ = kill(unix_pid, Signal::SIGKILL);
+            }
+            
+            #[cfg(not(unix))]
+            {
+                // Windows: 直接 kill
+                let mut child_guard = child.lock().await;
+                let _ = child_guard.kill().await;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// 启动队列中的下一个 run（从 paperclip 迁移）
+    async fn start_next_queued_run_for_agent(&self, agent_id: Uuid) -> Result<Vec<Uuid>, String> {
+        // 1. 检查 agent 是否存在
+        let agent = self.load_agent(agent_id).await.map_err(|e| e.to_string())?;
+        
+        // 2. 检查 agent 是否可调用（不在暂停/删除状态）
+        if matches!(agent.status, AgentStatus::Paused | AgentStatus::Terminated) {
+            tracing::debug!(%agent_id, status = ?agent.status, "agent not invokable, skipping queue");
+            return Ok(vec![]);
+        }
+        
+        // 3. 获取 maxConcurrentRuns 配置（默认 1）
+        let max_concurrent_runs: i32 = agent
+            .adapter_config
+            .0
+            .get("maxConcurrentRuns")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32)
+            .unwrap_or(1)
+            .max(1)
+            .min(50);
+        
+        // 4. 查询当前正在运行的 run 数量
+        let running_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM heartbeat_runs WHERE agent_id = $1 AND status IN ('running', 'queued')"
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        
+        let available_slots = (max_concurrent_runs as i64 - running_count).max(0);
+        if available_slots <= 0 {
+            tracing::debug!(%agent_id, running_count, max_concurrent_runs, "no available slots for new runs");
+            return Ok(vec![]);
+        }
+        
+        // 5. 查询队列中的 runs，按优先级和创建时间排序
+        #[derive(sqlx::FromRow)]
+        struct QueuedRun {
+            id: Uuid,
+            issue_id: Option<String>,
+            priority: Option<i32>,
+            created_at: DateTime<Utc>,
+        }
+        
+        let queued_runs: Vec<QueuedRun> = sqlx::query_as(
+            "SELECT r.id, r.context_snapshot->>'issueId' as issue_id, i.priority, r.created_at
+             FROM heartbeat_runs r
+             LEFT JOIN issues i ON i.id = (r.context_snapshot->>'issueId')::uuid AND i.company_id = r.company_id
+             WHERE r.agent_id = $1 AND r.status = 'queued'
+             ORDER BY 
+                 CASE WHEN i.status = 'in_progress' THEN 0 ELSE 1 END,
+                 COALESCE(i.priority, 3),
+                 r.created_at ASC
+             LIMIT $2"
+        )
+        .bind(agent_id)
+        .bind(available_slots)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        
+        if queued_runs.is_empty() {
+            tracing::debug!(%agent_id, "no queued runs to start");
+            return Ok(vec![]);
+        }
+        
+        let mut started_runs = Vec::new();
+        
+        // 6. 启动每个排队的 run
+        for queued_run in queued_runs {
+            // 更新状态为 running
+            let result = sqlx::query(
+                "UPDATE heartbeat_runs 
+                 SET status = 'running', started_at = NOW(), updated_at = NOW() 
+                 WHERE id = $1 AND status = 'queued'"
+            )
+            .bind(queued_run.id)
+            .execute(&self.pool)
+            .await;
+            
+            if result.is_err() || result.unwrap().rows_affected() == 0 {
+                tracing::warn!(run_id = %queued_run.id, "failed to claim queued run, may be already claimed");
+                continue;
+            }
+            
+            // 获取 run 的详细信息并启动执行
+            if let Ok(Some(run_row)) = sqlx::query(
+                "SELECT id, agent_id, company_id, context_snapshot->>'issueId' as issue_id 
+                 FROM heartbeat_runs WHERE id = $1"
+            )
+            .bind(queued_run.id)
+            .fetch_optional(&self.pool)
+            .await
+            {
+                let issue_id_str: Option<String> = run_row.try_get("issue_id").ok();
+                if let Some(issue_id_str) = issue_id_str {
+                    if let Ok(issue_id) = Uuid::parse_str(&issue_id_str) {
+                        let company_id: Uuid = run_row.try_get("company_id").unwrap();
+                        
+                        // 异步执行 run
+                        let service = self.clone_for_background();
+                        let _agent_id_for_queue = agent_id;
+                        tokio::spawn(async move {
+                            service.execute_run(queued_run.id, agent_id, issue_id, company_id).await;
+                        });
+                        
+                        // 在外部启动下一批队列（递归调用）
+                        // 注意：这里不等待 execute_run 完成，而是立即尝试填充剩余槽位
+                        // execute_run 完成后会通过 wakeup 或其他机制再次触发队列检查
+                        
+                        started_runs.push(queued_run.id);
+                        
+                        tracing::info!(
+                            run_id = %queued_run.id,
+                            agent_id = %agent_id,
+                            issue_id = %issue_id,
+                            "started queued run"
+                        );
+                    }
+                }
+            }
+        }
+        
+        Ok(started_runs)
     }
 
     async fn load_agent(&self, id: Uuid) -> Result<Agent, HeartbeatError> {
@@ -1251,9 +1454,17 @@ impl HeartbeatService for DefaultHeartbeatService {
             .bind(company_id).bind(agent_id).bind(issue_id.to_string()).fetch_optional(&self.pool).await.map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
         
         if let Some(run_id) = run {
-            // 1. 终止子进程
+            // 1. 终止子进程（优雅终止）
             if let Some(child) = self.children.lock().await.remove(&run_id) {
-                let _ = child.lock().await.kill().await;
+                // 优雅终止：grace period 2000ms
+                let grace_ms = 2000;
+                if let Err(e) = self.terminate_process_gracefully(child, grace_ms).await {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "failed to terminate process gracefully"
+                    );
+                }
             }
             
             // 2. 更新 run 状态为 cancelled
@@ -1307,6 +1518,11 @@ impl HeartbeatService for DefaultHeartbeatService {
             .execute(&self.pool)
             .await
             .map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+        
+        // 6. 启动队列中的下一个 run
+        if let Err(e) = self.start_next_queued_run_for_agent(agent_id).await {
+            tracing::error!(%agent_id, error = %e, "failed to start next queued run after cancel");
+        }
         
         Ok(())
     }
