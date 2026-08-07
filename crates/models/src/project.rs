@@ -96,9 +96,9 @@ pub struct ProjectWorkspace {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkspaceInput {
-    pub project_id: Uuid,
-    pub name: String,
-    pub config: JsonValue,
+    pub name: Option<String>,
+    pub cwd: Option<String>,
+    pub config: Option<JsonValue>,
     pub is_primary: Option<bool>,
 }
 

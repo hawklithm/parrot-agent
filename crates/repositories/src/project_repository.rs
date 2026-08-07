@@ -162,20 +162,82 @@ impl ProjectRepository {
     }
 
     // Workspace operations
-    pub async fn create_workspace(&self, input: CreateWorkspaceInput) -> Result<ProjectWorkspace> {
-        sqlx::query_as::<_, ProjectWorkspace>(
+    pub async fn create_workspace(
+        &self,
+        project_id: Uuid,
+        input: CreateWorkspaceInput,
+    ) -> Result<ProjectWorkspace> {
+        // 1. 验证 project 存在
+        let project: Project = sqlx::query_as(
+            "SELECT * FROM projects WHERE id = $1"
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| sqlx::Error::RowNotFound)?;
+
+        // 2. 生成 workspace name（如果未提供）
+        let name = input.name.unwrap_or_else(|| {
+            if let Some(ref cwd) = input.cwd {
+                // 从 cwd 提取最后一个路径组件
+                std::path::Path::new(cwd)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("workspace")
+                    .to_string()
+            } else {
+                "workspace".to_string()
+            }
+        });
+
+        // 3. 检查现有 workspaces，决定是否设为 primary
+        let existing_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_workspaces WHERE project_id = $1"
+        )
+        .bind(project_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let should_be_primary = input.is_primary.unwrap_or(existing_count == 0);
+
+        // 4. 在事务中创建 workspace
+        let mut tx = self.pool.begin().await?;
+
+        // 如果需要设为 primary，先将其他 workspace 的 is_primary 设为 false
+        if should_be_primary {
+            sqlx::query(
+                "UPDATE project_workspaces 
+                 SET is_primary = false, updated_at = NOW() 
+                 WHERE company_id = $1 AND project_id = $2"
+            )
+            .bind(project.company_id)
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 5. 插入新 workspace
+        let config = input.config.unwrap_or(serde_json::json!({
+            "cwd": input.cwd
+        }));
+
+        let workspace = sqlx::query_as::<_, ProjectWorkspace>(
             r#"
             INSERT INTO project_workspaces (project_id, name, config, is_primary)
             VALUES ($1, $2, $3, $4)
             RETURNING *
             "#,
         )
-        .bind(input.project_id)
-        .bind(&input.name)
-        .bind(&input.config)
-        .bind(input.is_primary.unwrap_or(false))
-        .fetch_one(&self.pool)
-        .await
+        .bind(project_id)
+        .bind(&name)
+        .bind(&config)
+        .bind(should_be_primary)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(workspace)
     }
 
     pub async fn list_workspaces(&self, project_id: Uuid) -> Result<Vec<ProjectWorkspace>> {

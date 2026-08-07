@@ -47,9 +47,10 @@ impl ProjectService {
     // Workspace operations
     pub async fn create_workspace(
         &self,
+        project_id: Uuid,
         input: CreateWorkspaceInput,
     ) -> AppResult<ProjectWorkspace> {
-        Ok(self.project_repo.create_workspace(input).await?)
+        Ok(self.project_repo.create_workspace(project_id, input).await?)
     }
 
     pub async fn list_workspaces(&self, project_id: Uuid) -> AppResult<Vec<ProjectWorkspace>> {

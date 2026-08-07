@@ -183,12 +183,12 @@ async fn list_workspaces(
 /// POST /projects/:project_id/workspaces
 async fn create_workspace(
     State(state): State<AppState>,
-    Path(_project_id): Path<Uuid>,
+    Path(project_id): Path<Uuid>,
     Json(input): Json<CreateWorkspaceInput>,
 ) -> Result<(StatusCode, Json<ProjectWorkspace>), AppError> {
     let workspace = state
         .project_service
-        .create_workspace(input)
+        .create_workspace(project_id, input)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     Ok((StatusCode::CREATED, Json(workspace)))
