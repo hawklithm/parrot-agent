@@ -549,7 +549,11 @@ impl DefaultHeartbeatService {
         }
         
         // 5. 查询队列中的 runs，按优先级和创建时间排序
+        // 注意：issue_id, priority, created_at 字段当前仅用于 SQL 排序
+        // 保留这些字段是为了将来实现 paperclip 的完整依赖检查和复杂排序逻辑
+        // 详见 docs/QUEUE_MANAGEMENT_COMPARISON.md
         #[derive(sqlx::FromRow)]
+        #[allow(dead_code)]
         struct QueuedRun {
             id: Uuid,
             issue_id: Option<String>,
