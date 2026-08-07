@@ -661,7 +661,7 @@ impl DefaultHeartbeatService {
             description.as_deref().unwrap_or_default()
         );
         // 获取数据库配置
-        let db_config = agent.adapter_config.0;
+        let db_config = agent.adapter_config.0.clone();
         let adapter = agent.adapter_type.as_str();
         
         // 加载默认配置并合并
@@ -928,11 +928,72 @@ impl DefaultHeartbeatService {
             .or_else(|| cfg.get("timeout_sec"))
             .and_then(|v| v.as_u64())
             .filter(|value| *value > 0);
+        // 处理工作目录：如果未配置，则创建默认目录
         let working_dir = cfg.get("cwd").and_then(|value| value.as_str());
+        let effective_cwd = if let Some(cwd) = working_dir {
+            cwd.to_string()
+        } else {
+            // 查询 company name
+            let company_name: String = sqlx::query_scalar("SELECT name FROM companies WHERE id = $1")
+                .bind(company_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or_else(|_| company_id.to_string());
+            
+            // 创建默认工作目录: ~/.parrot-agent/<company_name>/
+            let home_dir = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            
+            // 规范化 company name 作为目录名（移除特殊字符）
+            let safe_company_name = company_name
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect::<String>();
+            
+            let default_dir = format!("{}/.parrot-agent/{}", home_dir, safe_company_name);
+            
+            // 创建目录（如果不存在）
+            if let Err(e) = std::fs::create_dir_all(&default_dir) {
+                tracing::error!(
+                    company_id = %company_id,
+                    company_name = %company_name,
+                    default_dir = %default_dir,
+                    error = %e,
+                    "failed to create default working directory"
+                );
+                return Err(format!("failed to create default working directory: {}", e));
+            }
+            
+            tracing::warn!(
+                run_id = %run_id,
+                agent_id = %agent_id,
+                company_id = %company_id,
+                company_name = %company_name,
+                default_dir = %default_dir,
+                "no working directory configured, using default directory ~/.parrot-agent/{}/",
+                safe_company_name
+            );
+            
+            // 更新 agent 配置中的 cwd（持久化到数据库）
+            let mut updated_config = agent.adapter_config.0.clone();
+            updated_config.as_object_mut().map(|obj| {
+                obj.insert("cwd".to_string(), serde_json::Value::String(default_dir.clone()));
+            });
+            
+            let _ = sqlx::query("UPDATE agents SET adapter_config = $1, updated_at = NOW() WHERE id = $2")
+                .bind(serde_json::to_value(&updated_config).unwrap_or(serde_json::json!({})))
+                .bind(agent_id)
+                .execute(&self.pool)
+                .await;
+            
+            default_dir
+        };
+        
         let shell_command_text = shell_command(
             command,
             &args,
-            working_dir,
+            Some(&effective_cwd),
             stdin_prompt.then_some(prompt.as_str()),
         );
         let configured_env_keys = cfg
@@ -969,7 +1030,7 @@ impl DefaultHeartbeatService {
             adapter,
             shell_command = %logged_shell_command,
             argv = ?logged_argv,
-            working_dir = ?working_dir,
+            working_dir = %effective_cwd,
             configured_env_keys = ?configured_env_keys,
             full_command_with_env = %full_cmd_with_env,
             stdin_prompt,
@@ -989,10 +1050,8 @@ impl DefaultHeartbeatService {
             .env(
                 "PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION",
                 format!("Bearer {gateway_token}"),
-            );
-        if let Some(cwd) = cfg.get("cwd").and_then(|v| v.as_str()) {
-            cmd.current_dir(cwd);
-        }
+            )
+            .current_dir(&effective_cwd);
         if let Some(env) = cfg.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env {
                 if let Some(s) = v.as_str() {
@@ -1190,13 +1249,65 @@ impl HeartbeatService for DefaultHeartbeatService {
     ) -> Result<(), HeartbeatError> {
         let run: Option<Uuid> = sqlx::query_scalar("SELECT id FROM heartbeat_runs WHERE company_id=$1 AND agent_id=$2 AND status IN ('queued','running') AND (context_snapshot->>'issueId'=$3 OR context_snapshot->>'taskId'=$3) ORDER BY created_at DESC LIMIT 1")
             .bind(company_id).bind(agent_id).bind(issue_id.to_string()).fetch_optional(&self.pool).await.map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+        
         if let Some(run_id) = run {
+            // 1. 终止子进程
             if let Some(child) = self.children.lock().await.remove(&run_id) {
                 let _ = child.lock().await.kill().await;
             }
-            sqlx::query("UPDATE heartbeat_runs SET status='cancelled', error=$2, finished_at=NOW(), updated_at=NOW() WHERE id=$1").bind(run_id).bind(reason).execute(&self.pool).await.map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+            
+            // 2. 更新 run 状态为 cancelled
+            sqlx::query("UPDATE heartbeat_runs SET status='cancelled', error=$2, finished_at=NOW(), updated_at=NOW() WHERE id=$1")
+                .bind(run_id)
+                .bind(reason)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+            
+            // 3. 释放 issue execution lock (关键修复！)
+            sqlx::query(
+                "UPDATE issues 
+                 SET checkout_run_id = NULL, 
+                     execution_run_id = NULL, 
+                     execution_locked_at = NULL, 
+                     execution_agent_name_key = NULL, 
+                     updated_at = NOW() 
+                 WHERE id = $1 
+                   AND company_id = $2 
+                   AND execution_run_id = $3"
+            )
+            .bind(issue_id)
+            .bind(company_id)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+            
+            // 4. 撤销 tool gateway session
+            let _ = sqlx::query("UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE run_id = $1 AND revoked_at IS NULL")
+                .bind(run_id)
+                .execute(&self.pool)
+                .await;
+            
+            tracing::info!(
+                run_id = %run_id,
+                agent_id = %agent_id,
+                issue_id = %issue_id,
+                company_id = %company_id,
+                reason = %reason,
+                "cancelled heartbeat run and released issue execution lock"
+            );
         }
-        sqlx::query("UPDATE agent_wakeup_requests SET status='cancelled', updated_at=NOW() WHERE company_id=$1 AND agent_id=$2 AND status IN ('queued','dispatched','running') AND payload->>'issueId'=$3").bind(company_id).bind(agent_id).bind(issue_id.to_string()).execute(&self.pool).await.map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+        
+        // 5. 取消相关的 wakeup requests
+        sqlx::query("UPDATE agent_wakeup_requests SET status='cancelled', updated_at=NOW() WHERE company_id=$1 AND agent_id=$2 AND status IN ('queued','dispatched','running') AND payload->>'issueId'=$3")
+            .bind(company_id)
+            .bind(agent_id)
+            .bind(issue_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+        
         Ok(())
     }
 
