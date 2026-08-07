@@ -176,19 +176,49 @@ impl ProjectRepository {
         .await?
         .ok_or_else(|| sqlx::Error::RowNotFound)?;
 
-        // 2. 生成 workspace name（如果未提供）
-        let name = input.name.unwrap_or_else(|| {
-            if let Some(ref cwd) = input.cwd {
-                // 从 cwd 提取最后一个路径组件
-                std::path::Path::new(cwd)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("workspace")
-                    .to_string()
+        // 2. 处理字段（从 paperclip 逻辑迁移）
+        let cwd = input.cwd.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
+        let repo_url = input.repo_url.as_deref().filter(|s| !s.is_empty());
+        
+        // 自动推断 source_type
+        let source_type = input.source_type.or_else(|| {
+            if repo_url.is_some() {
+                Some("git_repo".to_string())
+            } else if cwd.is_some() {
+                Some("local_path".to_string())
+            } else if input.remote_workspace_ref.is_some() {
+                Some("remote_managed".to_string())
             } else {
-                "workspace".to_string()
+                Some("remote_managed".to_string())
             }
         });
+
+        // 验证：remote_managed 需要 remote_workspace_ref 或 repo_url
+        if source_type.as_deref() == Some("remote_managed") {
+            if input.remote_workspace_ref.is_none() && repo_url.is_none() {
+                return Err(sqlx::Error::Protocol("remote_managed workspace requires remoteWorkspaceRef or repoUrl".into()));
+            }
+        } else if cwd.is_none() && repo_url.is_none() {
+            return Err(sqlx::Error::Protocol("workspace requires cwd or repoUrl".into()));
+        }
+
+        // 生成 workspace name
+        let name = input.name.or_else(|| {
+            if let Some(cwd_path) = cwd {
+                std::path::Path::new(cwd_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            } else if let Some(url) = repo_url {
+                // 从 repo URL 提取名称
+                url.trim_end_matches(".git")
+                    .split('/')
+                    .last()
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        }).unwrap_or_else(|| "workspace".to_string());
 
         // 3. 检查现有 workspaces，决定是否设为 primary
         let existing_count: i64 = sqlx::query_scalar(
@@ -216,21 +246,50 @@ impl ProjectRepository {
             .await?;
         }
 
-        // 5. 插入新 workspace
-        let config = input.config.unwrap_or(serde_json::json!({
-            "cwd": input.cwd
-        }));
+        // 5. 准备字段
+        let visibility = input.visibility.or_else(|| Some("default".to_string()));
+        let default_ref = input.default_ref.or_else(|| input.repo_ref.clone());
+        
+        // 处理 metadata (合并 runtimeConfig if provided)
+        let metadata = input.metadata;
 
+        // 保持 config 兼容性（如果前端还在用）
+        let config = input.config.unwrap_or_else(|| {
+            serde_json::json!({
+                "cwd": cwd
+            })
+        });
+
+        // 6. 插入新 workspace
         let workspace = sqlx::query_as::<_, ProjectWorkspace>(
             r#"
-            INSERT INTO project_workspaces (project_id, name, config, is_primary)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO project_workspaces (
+                company_id, project_id, name, source_type,
+                cwd, repo_url, repo_ref, default_ref,
+                visibility, setup_command, cleanup_command,
+                remote_provider, remote_workspace_ref, shared_workspace_key,
+                config, metadata, is_primary
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             RETURNING *
             "#,
         )
+        .bind(project.company_id)
         .bind(project_id)
         .bind(&name)
+        .bind(source_type)
+        .bind(cwd)
+        .bind(repo_url)
+        .bind(input.repo_ref)
+        .bind(default_ref)
+        .bind(visibility)
+        .bind(input.setup_command)
+        .bind(input.cleanup_command)
+        .bind(input.remote_provider)
+        .bind(input.remote_workspace_ref)
+        .bind(input.shared_workspace_key)
         .bind(&config)
+        .bind(metadata)
         .bind(should_be_primary)
         .fetch_one(&mut *tx)
         .await?;

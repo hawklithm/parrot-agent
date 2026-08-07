@@ -86,9 +86,22 @@ pub struct UpdateProjectInput {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectWorkspace {
     pub id: Uuid,
+    pub company_id: Uuid,
     pub project_id: Uuid,
     pub name: String,
+    pub source_type: Option<String>,
+    pub cwd: Option<String>,
+    pub repo_url: Option<String>,
+    pub repo_ref: Option<String>,
+    pub default_ref: Option<String>,
+    pub visibility: Option<String>,
+    pub setup_command: Option<String>,
+    pub cleanup_command: Option<String>,
+    pub remote_provider: Option<String>,
+    pub remote_workspace_ref: Option<String>,
+    pub shared_workspace_key: Option<String>,
     pub config: JsonValue,
+    pub metadata: Option<JsonValue>,
     pub is_primary: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -98,8 +111,19 @@ pub struct ProjectWorkspace {
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkspaceInput {
     pub name: Option<String>,
+    pub source_type: Option<String>,
     pub cwd: Option<String>,
+    pub repo_url: Option<String>,
+    pub repo_ref: Option<String>,
+    pub default_ref: Option<String>,
+    pub visibility: Option<String>,
+    pub setup_command: Option<String>,
+    pub cleanup_command: Option<String>,
+    pub remote_provider: Option<String>,
+    pub remote_workspace_ref: Option<String>,
+    pub shared_workspace_key: Option<String>,
     pub config: Option<JsonValue>,
+    pub metadata: Option<JsonValue>,
     pub is_primary: Option<bool>,
 }
 
