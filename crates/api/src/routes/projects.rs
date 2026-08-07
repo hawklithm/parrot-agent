@@ -84,6 +84,8 @@ async fn hydrate_project(
     state: &AppState,
     project: Project,
 ) -> Result<serde_json::Value, AppError> {
+    use models::project_url_key::derive_project_url_key;
+    
     // Query all fields from project_workspaces (aligned with paperclip)
     let workspaces: Vec<ProjectWorkspace> = sqlx::query_as(
         "SELECT * FROM project_workspaces WHERE project_id = $1 ORDER BY is_primary DESC, created_at ASC",
@@ -94,8 +96,16 @@ async fn hydrate_project(
     .map_err(|e| AppError::InternalServerError(format!("Failed to load project workspaces: {e}")))?;
     
     let primary = workspaces.iter().find(|w| w.is_primary).cloned();
+    
+    // Derive URL key from project name (aligned with paperclip)
+    let url_key = derive_project_url_key(Some(&project.name), Some(project.id));
+    
     let mut value = serde_json::to_value(project).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "urlKey".into(),
+            serde_json::Value::String(url_key),
+        );
         object.insert(
             "workspaces".into(),
             serde_json::to_value(&workspaces).unwrap_or_default(),
