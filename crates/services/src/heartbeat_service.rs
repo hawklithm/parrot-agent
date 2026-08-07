@@ -511,10 +511,13 @@ impl DefaultHeartbeatService {
         Ok(())
     }
 
-    /// 启动队列中的下一个 run（从 paperclip 迁移）
+    /// 启动队列中的下一个 run（从 paperclip 完整迁移）
+    /// Phase 2: 依赖就绪检查 + 4级排序
+    /// Phase 3: Claim验证（简化版，不包括预算和组织结构检查）
     async fn start_next_queued_run_for_agent(&self, agent_id: Uuid) -> Result<Vec<Uuid>, String> {
         // 1. 检查 agent 是否存在
         let agent = self.load_agent(agent_id).await.map_err(|e| e.to_string())?;
+        let company_id = agent.company_id;
         
         // 2. 检查 agent 是否可调用（不在暂停/删除状态）
         if matches!(agent.status, AgentStatus::Paused | AgentStatus::Terminated) {
@@ -548,12 +551,8 @@ impl DefaultHeartbeatService {
             return Ok(vec![]);
         }
         
-        // 5. 查询队列中的 runs，按优先级和创建时间排序
-        // 注意：issue_id, priority, created_at 字段当前仅用于 SQL 排序
-        // 保留这些字段是为了将来实现 paperclip 的完整依赖检查和复杂排序逻辑
-        // 详见 docs/QUEUE_MANAGEMENT_COMPARISON.md
-        #[derive(sqlx::FromRow)]
-        #[allow(dead_code)]
+        // 5. 查询队列中的所有 runs（不做 SQL 排序，在内存中排序）
+        #[derive(sqlx::FromRow, Debug)]
         struct QueuedRun {
             id: Uuid,
             issue_id: Option<String>,
@@ -566,14 +565,9 @@ impl DefaultHeartbeatService {
              FROM heartbeat_runs r
              LEFT JOIN issues i ON i.id = (r.context_snapshot->>'issueId')::uuid AND i.company_id = r.company_id
              WHERE r.agent_id = $1 AND r.status = 'queued'
-             ORDER BY 
-                 CASE WHEN i.status = 'in_progress' THEN 0 ELSE 1 END,
-                 COALESCE(i.priority, 3),
-                 r.created_at ASC
-             LIMIT $2"
+             ORDER BY r.created_at ASC"
         )
         .bind(agent_id)
-        .bind(available_slots)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -583,11 +577,233 @@ impl DefaultHeartbeatService {
             return Ok(vec![]);
         }
         
-        let mut started_runs = Vec::new();
+        tracing::debug!(
+            %agent_id,
+            queued_count = %queued_runs.len(),
+            available_slots = %available_slots,
+            "processing queued runs with dependency check"
+        );
         
-        // 6. 启动每个排队的 run
-        for queued_run in queued_runs {
-            // 更新状态为 running
+        // 6. Phase 2: 依赖就绪检查（从 paperclip 迁移）
+        let issue_ids: Vec<Uuid> = queued_runs
+            .iter()
+            .filter_map(|run| run.issue_id.as_ref().and_then(|id| Uuid::parse_str(id).ok()))
+            .collect();
+        
+        // 6.1 查询所有相关 issues 的状态
+        #[derive(sqlx::FromRow)]
+        #[allow(dead_code)]
+        struct IssueInfo {
+            id: Uuid,
+            status: String,
+            priority: Option<i32>,
+        }
+        
+        let issues: Vec<IssueInfo> = if !issue_ids.is_empty() {
+            sqlx::query_as(
+                "SELECT id, status::text, priority FROM issues WHERE id = ANY($1)"
+            )
+            .bind(&issue_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            vec![]
+        };
+        
+        // 6.2 查询依赖关系（blocker issues）
+        #[derive(sqlx::FromRow)]
+        struct BlockerRelation {
+            blocked_issue_id: Uuid,
+            blocker_issue_id: Uuid,
+        }
+        
+        let blocker_relations: Vec<BlockerRelation> = if !issue_ids.is_empty() {
+            sqlx::query_as(
+                "SELECT related_issue_id as blocked_issue_id, issue_id as blocker_issue_id
+                 FROM issue_relations 
+                 WHERE company_id = $1 
+                   AND related_issue_id = ANY($2) 
+                   AND type = 'blocks'"
+            )
+            .bind(company_id)
+            .bind(&issue_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            vec![]
+        };
+        
+        // 6.3 查询 blocker issues 的状态
+        let blocker_ids: Vec<Uuid> = blocker_relations.iter()
+            .map(|r| r.blocker_issue_id)
+            .collect();
+        
+        #[derive(sqlx::FromRow)]
+        struct BlockerStatus {
+            id: Uuid,
+            status: String,
+        }
+        
+        let blocker_statuses: Vec<BlockerStatus> = if !blocker_ids.is_empty() {
+            sqlx::query_as(
+                "SELECT id, status::text FROM issues WHERE id = ANY($1)"
+            )
+            .bind(&blocker_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            vec![]
+        };
+        
+        // 6.4 构建依赖就绪映射
+        use std::collections::HashMap;
+        
+        let issue_map: HashMap<Uuid, &IssueInfo> = 
+            issues.iter().map(|i| (i.id, i)).collect();
+        
+        let blocker_status_map: HashMap<Uuid, String> = 
+            blocker_statuses.into_iter().map(|b| (b.id, b.status)).collect();
+        
+        // 计算每个 issue 的依赖就绪状态
+        let mut issue_readiness: HashMap<Uuid, bool> = HashMap::new();
+        let mut issue_unresolved_blockers: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        
+        for issue_id in &issue_ids {
+            let blockers_for_issue: Vec<Uuid> = blocker_relations
+                .iter()
+                .filter(|r| r.blocked_issue_id == *issue_id)
+                .map(|r| r.blocker_issue_id)
+                .collect();
+            
+            if blockers_for_issue.is_empty() {
+                // 没有依赖，就绪
+                issue_readiness.insert(*issue_id, true);
+            } else {
+                // 检查所有 blocker 是否都是 done 状态
+                let unresolved: Vec<Uuid> = blockers_for_issue
+                    .iter()
+                    .filter(|blocker_id| {
+                        blocker_status_map.get(blocker_id)
+                            .map(|status| status != "done")
+                            .unwrap_or(true) // 找不到状态视为未解决
+                    })
+                    .copied()
+                    .collect();
+                
+                let is_ready = unresolved.is_empty();
+                issue_readiness.insert(*issue_id, is_ready);
+                
+                if !is_ready {
+                    issue_unresolved_blockers.insert(*issue_id, unresolved);
+                    
+                    tracing::debug!(
+                        %issue_id,
+                        unresolved_blockers = ?issue_unresolved_blockers.get(issue_id).unwrap(),
+                        "issue has unresolved blockers, not ready"
+                    );
+                }
+            }
+        }
+        
+        tracing::debug!(
+            %agent_id,
+            total_issues = %issue_ids.len(),
+            ready_count = %issue_readiness.values().filter(|&ready| *ready).count(),
+            blocked_count = %issue_readiness.values().filter(|&ready| !*ready).count(),
+            "dependency readiness check complete"
+        );
+        
+        // 7. Phase 2: 智能排序（从 paperclip 迁移的 4 级排序逻辑）
+        // Rank 0: 依赖就绪 + in_progress
+        // Rank 1: 依赖就绪 + 其他状态
+        // Rank 2: 非 issue 任务（heartbeat等）
+        // Rank 3: 依赖未就绪（blocked）
+        let mut sorted_runs = queued_runs;
+        sorted_runs.sort_by(|left, right| {
+            let left_issue_id = left.issue_id.as_ref().and_then(|id| Uuid::parse_str(id).ok());
+            let right_issue_id = right.issue_id.as_ref().and_then(|id| Uuid::parse_str(id).ok());
+            
+            let left_ready = left_issue_id
+                .and_then(|id| issue_readiness.get(&id).copied())
+                .unwrap_or(true); // 非 issue 任务视为就绪
+            let right_ready = right_issue_id
+                .and_then(|id| issue_readiness.get(&id).copied())
+                .unwrap_or(true);
+            
+            let left_issue = left_issue_id.and_then(|id| issue_map.get(&id));
+            let right_issue = right_issue_id.and_then(|id| issue_map.get(&id));
+            
+            let left_rank = if let Some(issue) = left_issue {
+                if left_ready {
+                    if issue.status == "in_progress" { 0 } else { 1 }
+                } else {
+                    3 // blocked
+                }
+            } else {
+                2 // non-issue task
+            };
+            
+            let right_rank = if let Some(issue) = right_issue {
+                if right_ready {
+                    if issue.status == "in_progress" { 0 } else { 1 }
+                } else {
+                    3 // blocked
+                }
+            } else {
+                2 // non-issue task
+            };
+            
+            // 首先按 rank 排序
+            if left_rank != right_rank {
+                return left_rank.cmp(&right_rank);
+            }
+            
+            // 然后按 priority 排序（数字越小优先级越高）
+            let left_priority = left.priority.unwrap_or(3);
+            let right_priority = right.priority.unwrap_or(3);
+            if left_priority != right_priority {
+                return left_priority.cmp(&right_priority);
+            }
+            
+            // 最后按创建时间排序
+            left.created_at.cmp(&right.created_at)
+        });
+        
+        // 8. Phase 3: Claim 验证并启动（简化版）
+        let mut started_runs = Vec::new();
+        let mut claimed_count = 0;
+        
+        for queued_run in sorted_runs.iter() {
+            if claimed_count >= available_slots {
+                break;
+            }
+            
+            // 8.1 Phase 3: Claim 前验证
+            let issue_id_opt = queued_run.issue_id.as_ref().and_then(|id| Uuid::parse_str(id).ok());
+            
+            // 验证：依赖未就绪的 issue 不应启动
+            if let Some(issue_id) = issue_id_opt {
+                if let Some(&is_ready) = issue_readiness.get(&issue_id) {
+                    if !is_ready {
+                        let unresolved = issue_unresolved_blockers.get(&issue_id)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        
+                        tracing::info!(
+                            run_id = %queued_run.id,
+                            %issue_id,
+                            unresolved_blockers = %unresolved,
+                            "skipping run: issue has unresolved blockers"
+                        );
+                        continue; // 跳过 blocked issue
+                    }
+                }
+            }
+            
+            // 8.2 更新状态为 running（atomic claim）
             let result = sqlx::query(
                 "UPDATE heartbeat_runs 
                  SET status = 'running', started_at = NOW(), updated_at = NOW() 
@@ -597,48 +813,54 @@ impl DefaultHeartbeatService {
             .execute(&self.pool)
             .await;
             
-            if result.is_err() || result.unwrap().rows_affected() == 0 {
-                tracing::warn!(run_id = %queued_run.id, "failed to claim queued run, may be already claimed");
-                continue;
-            }
-            
-            // 获取 run 的详细信息并启动执行
-            if let Ok(Some(run_row)) = sqlx::query(
-                "SELECT id, agent_id, company_id, context_snapshot->>'issueId' as issue_id 
-                 FROM heartbeat_runs WHERE id = $1"
-            )
-            .bind(queued_run.id)
-            .fetch_optional(&self.pool)
-            .await
-            {
-                let issue_id_str: Option<String> = run_row.try_get("issue_id").ok();
-                if let Some(issue_id_str) = issue_id_str {
-                    if let Ok(issue_id) = Uuid::parse_str(&issue_id_str) {
-                        let company_id: Uuid = run_row.try_get("company_id").unwrap();
-                        
-                        // 异步执行 run
+            match result {
+                Ok(result) if result.rows_affected() > 0 => {
+                    claimed_count += 1;
+                    
+                    // 8.3 启动执行
+                    if let Some(issue_id) = issue_id_opt {
+                        // 复制所有需要的值以满足 'static 生命周期
+                        let run_id = queued_run.id;
                         let service = self.clone_for_background();
-                        let _agent_id_for_queue = agent_id;
                         tokio::spawn(async move {
-                            service.execute_run(queued_run.id, agent_id, issue_id, company_id).await;
+                            service.execute_run(run_id, agent_id, issue_id, company_id).await;
                         });
                         
-                        // 在外部启动下一批队列（递归调用）
-                        // 注意：这里不等待 execute_run 完成，而是立即尝试填充剩余槽位
-                        // execute_run 完成后会通过 wakeup 或其他机制再次触发队列检查
-                        
-                        started_runs.push(queued_run.id);
+                        started_runs.push(run_id);
                         
                         tracing::info!(
-                            run_id = %queued_run.id,
-                            agent_id = %agent_id,
-                            issue_id = %issue_id,
-                            "started queued run"
+                            %run_id,
+                            %agent_id,
+                            %issue_id,
+                            claimed_count = %claimed_count,
+                            available_slots = %available_slots,
+                            "claimed and started queued run"
                         );
                     }
                 }
+                Ok(_) => {
+                    tracing::warn!(
+                        run_id = %queued_run.id,
+                        "failed to claim run: already claimed by another process"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        run_id = %queued_run.id,
+                        error = %e,
+                        "failed to claim run: database error"
+                    );
+                }
             }
         }
+        
+        tracing::info!(
+            %agent_id,
+            started_count = %started_runs.len(),
+            available_slots = %available_slots,
+            total_queued = %sorted_runs.len(),
+            "queue processing complete"
+        );
         
         Ok(started_runs)
     }
