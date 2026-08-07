@@ -103,6 +103,52 @@ async fn hydrate_project(
     // Derive codebase from primary workspace (aligned with paperclip: deriveProjectCodebase)
     let codebase = derive_codebase(&project, primary.as_ref(), &workspaces);
     
+    // Query goals associated with this project (aligned with paperclip: attachGoals)
+    let goals: Vec<(Uuid, String)> = sqlx::query_as(
+        r#"
+        SELECT g.id, g.title
+        FROM project_goals pg
+        INNER JOIN goals g ON pg.goal_id = g.id
+        WHERE pg.project_id = $1
+        ORDER BY g.created_at ASC
+        "#,
+    )
+    .bind(project.id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    
+    let goal_ids: Vec<Uuid> = goals.iter().map(|(id, _)| *id).collect();
+    let goal_refs: Vec<serde_json::Value> = goals
+        .into_iter()
+        .map(|(id, title)| serde_json::json!({ "id": id, "title": title }))
+        .collect();
+    
+    // Query plugin-managed resource info (aligned with paperclip: attachWorkspaces)
+    let managed_by_plugin: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"
+        SELECT jsonb_build_object(
+            'id', pmr.id,
+            'pluginId', pmr.plugin_id,
+            'pluginKey', pmr.plugin_key,
+            'pluginDisplayName', COALESCE(p.manifest_json->>'displayName', pmr.plugin_key),
+            'resourceKind', pmr.resource_kind,
+            'resourceKey', pmr.resource_key,
+            'defaultsJson', pmr.defaults_json,
+            'createdAt', pmr.created_at,
+            'updatedAt', pmr.updated_at
+        )
+        FROM plugin_managed_resources pmr
+        INNER JOIN plugins p ON pmr.plugin_id = p.id
+        WHERE pmr.resource_kind = 'project' AND pmr.resource_id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(project.id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    
     let mut value = serde_json::to_value(project).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -120,6 +166,18 @@ async fn hydrate_project(
         object.insert(
             "primaryWorkspace".into(),
             serde_json::to_value(primary).unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "goalIds".into(),
+            serde_json::to_value(&goal_ids).unwrap_or_default(),
+        );
+        object.insert(
+            "goals".into(),
+            serde_json::to_value(&goal_refs).unwrap_or_default(),
+        );
+        object.insert(
+            "managedByPlugin".into(),
+            managed_by_plugin.unwrap_or(serde_json::Value::Null),
         );
     }
     Ok(value)
