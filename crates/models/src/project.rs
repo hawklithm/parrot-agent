@@ -8,6 +8,7 @@ use uuid::Uuid;
 #[sqlx(type_name = "project_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectStatus {
+    Planned,
     Backlog,
     Todo,
     InProgress,
