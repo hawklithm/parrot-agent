@@ -1,5 +1,6 @@
 use models::{
-    AgentMembership, AppResult, CreateProjectInput, CreateWorkspaceInput, MembershipState, Project,
+    project_url_key::{derive_project_url_key, is_uuid_like, normalize_project_url_key},
+    AgentMembership, AppError, AppResult, CreateProjectInput, CreateWorkspaceInput, MembershipState, Project,
     ProjectMembership, ProjectWorkspace, ResourceMemberships, UpdateProjectInput,
 };
 use repositories::ProjectRepository;
@@ -26,6 +27,58 @@ impl ProjectService {
 
     pub async fn get_by_id(&self, id: Uuid) -> AppResult<Option<Project>> {
         Ok(self.project_repo.get_by_id(id).await?)
+    }
+    /// Resolve project by reference (UUID or URL key)
+    /// Migrated from paperclip: server/src/services/projects.ts:resolveByReference
+    pub async fn resolve_by_reference(
+        &self,
+        company_id: Uuid,
+        reference: &str,
+    ) -> AppResult<Option<Uuid>> {
+        let trimmed = reference.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        
+        // If it's a UUID, query directly
+        if is_uuid_like(trimmed) {
+            if let Ok(uuid) = Uuid::parse_str(trimmed) {
+                let project = self.project_repo.get_by_id(uuid).await?;
+                if let Some(p) = project {
+                    if p.company_id == company_id {
+                        return Ok(Some(p.id));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+        
+        // Otherwise, treat it as URL key
+        let url_key = match normalize_project_url_key(trimmed) {
+            Some(key) => key,
+            None => return Ok(None),
+        };
+        
+        // List all projects in company and match by derived URL key
+        let projects = self.project_repo.list_by_company(company_id).await?;
+        let matches: Vec<_> = projects
+            .iter()
+            .filter(|p| {
+                let derived = derive_project_url_key(Some(&p.name), Some(p.id));
+                derived == url_key
+            })
+            .collect();
+        
+        if matches.len() == 1 {
+            Ok(Some(matches[0].id))
+        } else if matches.len() > 1 {
+            // Ambiguous - multiple projects have same URL key
+            Err(AppError::Conflict(
+                "Project shortname is ambiguous in this company. Use the project ID.".to_string()
+            ))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn list_by_company(&self, company_id: Uuid) -> AppResult<Vec<Project>> {

@@ -30,6 +30,7 @@ pub mod org_chart;
 pub mod pipeline;
 pub mod plugin;
 pub mod project;
+pub mod project_url_key;
 pub mod realtime_environment;
 pub mod routine;
 pub mod routine_annotation;

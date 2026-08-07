@@ -18,6 +18,7 @@ futures = "0.3"
 
 # Random
 rand = "0.8"
+regex = "1"
 
 # Cryptography
 sha2 = "0.10"

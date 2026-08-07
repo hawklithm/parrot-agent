@@ -3,7 +3,7 @@
 //! 对应 Company/Org 模块任务 §1.2 ~ §1.3 + §10 API 路由层
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{get, patch, put},
     Json, Router,
@@ -126,17 +126,47 @@ async fn create_project(
     ))
 }
 
-/// GET /projects/:project_id
+/// GET /projects/:project_ref?companyId=xxx
+/// project_ref can be UUID or URL key (e.g., "test")
+/// Migrated from paperclip: server/src/routes/projects.ts (router.param + normalizeProjectReference)
 async fn get_project(
     State(state): State<AppState>,
-    Path(project_id): Path<Uuid>,
+    Path(project_ref): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // 1. Resolve company_id (from query param or fail)
+    let company_id = params
+        .get("companyId")
+        .and_then(|s| Uuid::parse_str(s.trim()).ok())
+        .ok_or_else(|| AppError::BadRequest("Missing or invalid companyId query parameter".into()))?;
+    
+    // 2. Resolve project_ref to UUID (supports both UUID and URL key)
+    let project_id = if let Ok(uuid) = Uuid::parse_str(&project_ref) {
+        // Direct UUID
+        uuid
+    } else {
+        // URL key - resolve via service
+        state
+            .project_service
+            .resolve_by_reference(company_id, &project_ref)
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", project_ref)))?
+    };
+    
+    // 3. Load and hydrate project
     let project = state
         .project_service
         .get_by_id(project_id)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?
         .ok_or_else(|| AppError::NotFound(format!("Project {} not found", project_id)))?;
+    
+    // 4. Verify company_id matches
+    if project.company_id != company_id {
+        return Err(AppError::NotFound(format!("Project {} not found in company {}", project_ref, company_id)));
+    }
+    
     Ok(Json(hydrate_project(&state, project).await?))
 }
 
