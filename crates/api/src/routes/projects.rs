@@ -100,11 +100,18 @@ async fn hydrate_project(
     // Derive URL key from project name (aligned with paperclip)
     let url_key = derive_project_url_key(Some(&project.name), Some(project.id));
     
+    // Derive codebase from primary workspace (aligned with paperclip: deriveProjectCodebase)
+    let codebase = derive_codebase(&project, primary.as_ref(), &workspaces);
+    
     let mut value = serde_json::to_value(project).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "urlKey".into(),
             serde_json::Value::String(url_key),
+        );
+        object.insert(
+            "codebase".into(),
+            codebase,
         );
         object.insert(
             "workspaces".into(),
@@ -116,6 +123,56 @@ async fn hydrate_project(
         );
     }
     Ok(value)
+}
+
+/// Derive project codebase from primary workspace
+/// Migrated from paperclip: server/src/services/projects.ts:deriveProjectCodebase
+fn derive_codebase(
+    project: &Project,
+    primary_workspace: Option<&ProjectWorkspace>,
+    fallback_workspaces: &[ProjectWorkspace],
+) -> serde_json::Value {
+    // Use primary workspace or fallback to first available
+    let workspace = primary_workspace.or_else(|| fallback_workspaces.first());
+    
+    let repo_url = workspace.and_then(|w| w.repo_url.as_deref());
+    let repo_name = repo_url.and_then(derive_repo_name_from_url);
+    let local_folder = workspace.and_then(|w| w.cwd.as_deref());
+    
+    // Managed folder: /data/workspaces/{company_id}/{project_id}/{repo_name}
+    let managed_folder = format!(
+        "/data/workspaces/{}/{}/{}",
+        project.company_id,
+        project.id,
+        repo_name.as_deref().unwrap_or("workspace")
+    );
+    
+    let effective_local_folder = local_folder.unwrap_or(&managed_folder);
+    let origin = if local_folder.is_some() { "local_folder" } else { "managed_checkout" };
+    
+    serde_json::json!({
+        "workspaceId": workspace.map(|w| w.id),
+        "repoUrl": repo_url,
+        "repoRef": workspace.and_then(|w| w.repo_ref.as_deref()),
+        "defaultRef": workspace.and_then(|w| w.default_ref.as_deref()),
+        "repoName": repo_name,
+        "localFolder": local_folder,
+        "managedFolder": managed_folder,
+        "effectiveLocalFolder": effective_local_folder,
+        "origin": origin,
+    })
+}
+
+/// Extract repository name from Git URL
+/// Examples:
+///   "https://github.com/user/repo.git" -> "repo"
+///   "git@github.com:user/repo.git" -> "repo"
+fn derive_repo_name_from_url(url: &str) -> Option<String> {
+    // Extract last path component, remove .git suffix
+    url.rsplit('/').next()
+        .or_else(|| url.rsplit(':').next())
+        .map(|s| s.trim_end_matches(".git").to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// POST /companies/:company_id/projects
