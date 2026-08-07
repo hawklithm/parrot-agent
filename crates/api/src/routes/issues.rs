@@ -463,7 +463,7 @@ async fn get_issue_document_annotations(
     Path((issue_id, key)): Path<(Uuid, String)>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let document_id: Uuid = sqlx::query_scalar(
         "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
     )
@@ -560,7 +560,7 @@ async fn get_issue_document_annotation_thread(
     Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, key, thread_id)): Path<(Uuid, String, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let document_id: Uuid = sqlx::query_scalar(
         "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
     )
@@ -792,7 +792,7 @@ async fn update_issue_document_annotation(
     Path((issue_id, key, thread_id)): Path<(Uuid, String, Uuid)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let document_id: Uuid = sqlx::query_scalar(
         "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
     )
