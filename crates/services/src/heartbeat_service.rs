@@ -1456,8 +1456,24 @@ impl HeartbeatService for DefaultHeartbeatService {
         if let Some(run_id) = run {
             // 1. 终止子进程（优雅终止）
             if let Some(child) = self.children.lock().await.remove(&run_id) {
-                // 优雅终止：grace period 2000ms
-                let grace_ms = 2000;
+                // 从 agent 配置读取 grace period（默认 2 秒）
+                let grace_sec = {
+                    let agent_result = self.load_agent(agent_id).await;
+                    agent_result.ok().and_then(|agent| {
+                        agent.adapter_config.0.get("graceSec")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v.max(1).min(30)) // 1-30秒范围
+                    }).unwrap_or(2) // 默认 2 秒
+                };
+                let grace_ms = grace_sec * 1000;
+                
+                tracing::debug!(
+                    run_id = %run_id,
+                    agent_id = %agent_id,
+                    grace_sec = %grace_sec,
+                    "terminating process with grace period"
+                );
+                
                 if let Err(e) = self.terminate_process_gracefully(child, grace_ms).await {
                     tracing::warn!(
                         run_id = %run_id,
