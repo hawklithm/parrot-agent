@@ -227,6 +227,24 @@ impl AuthorizationActor {
             _ => None,
         }
     }
+
+    /// Get actor type as string ("board", "agent", or "none")
+    pub fn actor_type_str(&self) -> &'static str {
+        match self {
+            Self::Board { .. } => "board",
+            Self::Agent { .. } => "agent",
+            Self::None => "none",
+        }
+    }
+
+    /// Get principal ID (user_id for board, agent_id for agent)
+    pub fn principal_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Board { user_id, .. } => Some(*user_id),
+            Self::Agent { agent_id, .. } => Some(*agent_id),
+            Self::None => None,
+        }
+    }
 }
 
 impl AuthorizationDecision {

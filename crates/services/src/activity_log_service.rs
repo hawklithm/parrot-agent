@@ -48,9 +48,16 @@ pub enum ActivityAction {
     BudgetExceeded,
 
     // Custom image actions
+    // Custom image actions
     CustomImageSetupStarted,
     CustomImageSetupCompleted,
     CustomImageSetupFailed,
+
+    // Resource membership actions
+    ResourceMembershipJoined,
+    ResourceMembershipLeft,
+    ResourceMembershipStarred,
+    ResourceMembershipUnstarred,
 }
 
 /// 资源类型

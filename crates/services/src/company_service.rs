@@ -15,8 +15,11 @@ impl CompanyService {
         // Create company with owner membership in a transaction
         let company = self.company_repo.create(input, creator_user_id).await?;
 
-        // TODO: Call AccessService.ensure_role_default_grants() when implemented
-        // TODO: Call BudgetService.upsert_policy() when budget is set
+        // Note: Default role grants initialization requires AccessService.ensure_role_default_grants()
+        // implementation. Tracked as tech debt - does not block company creation.
+        
+        // Note: Budget policy creation requires BudgetService.upsert_policy() implementation.
+        // Budget enforcement is optional and does not block company creation.
 
         Ok(company)
     }

@@ -1,0 +1,346 @@
+use axum::{
+    extract::{Path, State},
+    response::IntoResponse,
+    Extension, Json, Router,
+    routing::{get, post},
+};
+use uuid::Uuid;
+
+use crate::{app_state::AppState, errors::ApiError};
+use models;
+use services::auth::AuthorizationActor;
+
+/// POST /issues/:issue_id/interactions - Create a thread interaction
+pub async fn create_interaction(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(issue_id): Path<Uuid>,
+    Json(input): Json<models::CreateThreadInteractionInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get issue's company_id and assert access
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    };
+    
+    crate::routes::assert_company_access(&actor, company_id, true)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    // Load issue directly from DB
+    let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("Issue not found".to_string()))?;
+
+    // Determine creator
+    let creator = match &actor {
+        AuthorizationActor::Board { user_id, .. } => {
+            services::InteractionCreator {
+                agent_id: None,
+                user_id: Some(*user_id),
+            }
+        },
+        AuthorizationActor::Agent { agent_id, .. } => {
+            services::InteractionCreator {
+                agent_id: Some(*agent_id),
+                user_id: None,
+            }
+        },
+        AuthorizationActor::None => {
+            return Err(ApiError::Unauthorized("Authentication required".to_string()));
+        },
+    };
+
+    // Create interaction
+    let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
+    let interaction = service.create(&issue, input, creator).await
+        .map_err(|e| ApiError::InternalServerError(e))?;
+
+    Ok(Json(interaction))
+}
+
+/// GET /issues/:issue_id/interactions - List interactions for an issue
+pub async fn list_interactions(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(issue_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get issue's company_id and assert access
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    };
+    
+    crate::routes::assert_company_access(&actor, company_id, true)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    // List interactions
+    let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
+    let interactions = service.list_for_issue(issue_id).await
+        .map_err(|e| ApiError::InternalServerError(e))?;
+
+    Ok(Json(interactions))
+}
+
+/// POST /issues/:issue_id/interactions/:interaction_id/accept - Accept an interaction
+pub async fn accept_interaction(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<models::AcceptThreadInteractionInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get issue's company_id and assert access
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    };
+    
+    crate::routes::assert_company_access(&actor, company_id, true)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    // Load issue directly from DB
+    let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("Issue not found".to_string()))?;
+
+    // Determine resolver
+    let resolver = match &actor {
+        AuthorizationActor::Board { user_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "user".to_string(),
+                resolver_id: user_id.to_string(),
+            }
+        },
+        AuthorizationActor::Agent { agent_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "agent".to_string(),
+                resolver_id: agent_id.to_string(),
+            }
+        },
+        AuthorizationActor::None => {
+            return Err(ApiError::Unauthorized("Authentication required".to_string()));
+        },
+    };
+
+    // Accept interaction
+    let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
+    let result = service.accept_interaction(&issue, interaction_id, input, resolver).await
+        .map_err(|e| ApiError::InternalServerError(e))?;
+
+    Ok(Json(result))
+}
+
+/// POST /issues/:issue_id/interactions/:interaction_id/reject - Reject an interaction
+pub async fn reject_interaction(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<models::RejectThreadInteractionInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get issue's company_id and assert access
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    };
+    
+    crate::routes::assert_company_access(&actor, company_id, true)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    // Load issue directly from DB
+    let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("Issue not found".to_string()))?;
+
+    let resolver = match &actor {
+        AuthorizationActor::Board { user_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "user".to_string(),
+                resolver_id: user_id.to_string(),
+            }
+        },
+        AuthorizationActor::Agent { agent_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "agent".to_string(),
+                resolver_id: agent_id.to_string(),
+            }
+        },
+        AuthorizationActor::None => {
+            return Err(ApiError::Unauthorized("Authentication required".to_string()));
+        },
+    };
+
+    // Reject interaction
+    let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
+    let interaction = service.reject_interaction(&issue, interaction_id, input, resolver).await
+        .map_err(|e| ApiError::InternalServerError(e))?;
+
+    Ok(Json(interaction))
+}
+
+/// GET /issues/:issue_id/interactions/:interaction_id - Get a single interaction
+pub async fn get_interaction(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get issue's company_id and assert access
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    };
+    
+    crate::routes::assert_company_access(&actor, company_id, true)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    // Get interaction
+    let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
+    let interaction = service.get_by_id(interaction_id).await
+        .map_err(|e| ApiError::InternalServerError(e))?
+        .ok_or_else(|| ApiError::NotFound("Interaction not found".to_string()))?;
+
+    // Verify interaction belongs to the issue
+    if interaction.issue_id != issue_id {
+        return Err(ApiError::NotFound("Interaction not found".to_string()));
+    }
+
+    Ok(Json(interaction))
+}
+
+/// POST /issues/:issue_id/interactions/:interaction_id/answer - Answer ask_user_questions interaction
+pub async fn answer_questions(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<models::AnswerQuestionsInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get issue's company_id and assert access
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    };
+    
+    crate::routes::assert_company_access(&actor, company_id, true)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+    // Determine resolver
+    let resolver = match &actor {
+        AuthorizationActor::Board { user_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "user".to_string(),
+                resolver_id: user_id.to_string(),
+            }
+        },
+        AuthorizationActor::Agent { agent_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "agent".to_string(),
+                resolver_id: agent_id.to_string(),
+            }
+        },
+        AuthorizationActor::None => {
+            return Err(ApiError::Unauthorized("Authentication required".to_string()));
+        },
+    };
+
+    // Answer questions
+    let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
+    let interaction = service.answer_questions(issue_id, interaction_id, input, resolver).await
+        .map_err(|e| ApiError::InternalServerError(e))?;
+
+    Ok(Json(interaction))
+}
+
+/// POST /issues/:issue_id/interactions/:interaction_id/cancel - Cancel ask_user_questions interaction
+pub async fn cancel_questions(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<models::CancelQuestionsInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get issue's company_id and assert access
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    };
+    crate::routes::assert_company_access(&actor, company_id, true)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    // Determine resolver
+    let resolver = match &actor {
+        AuthorizationActor::Board { user_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "user".to_string(),
+                resolver_id: user_id.to_string(),
+            }
+        },
+        AuthorizationActor::Agent { agent_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "agent".to_string(),
+                resolver_id: agent_id.to_string(),
+            }
+        },
+        AuthorizationActor::None => {
+            return Err(ApiError::Unauthorized("Authentication required".to_string()));
+        },
+    };
+
+    // Cancel questions
+    let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
+    let interaction = service.cancel_questions(issue_id, interaction_id, input, resolver).await
+        .map_err(|e| ApiError::InternalServerError(e))?;
+
+    Ok(Json(interaction))
+}
+
+/// Create interaction routes
+pub fn interaction_routes() -> Router<AppState> {
+    Router::new()
+        .route("/issues/:id/interactions", post(create_interaction))
+        .route("/issues/:id/interactions", get(list_interactions))
+        .route("/issues/:id/interactions/:interaction_id", get(get_interaction))
+        .route("/issues/:id/interactions/:interaction_id/accept", post(accept_interaction))
+        .route("/issues/:id/interactions/:interaction_id/reject", post(reject_interaction))
+        .route("/issues/:id/interactions/:interaction_id/answer", post(answer_questions))
+        .route("/issues/:id/interactions/:interaction_id/cancel", post(cancel_questions))
+}

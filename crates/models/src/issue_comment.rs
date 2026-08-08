@@ -128,8 +128,11 @@ pub struct IssueComment {
 pub enum ThreadInteractionKind {
     Question,
     Approval,
-    Decision,
-    Blocker,
+    Review,
+    SuggestTasks,
+    AskUserQuestions,
+    RequestConfirmation,
+    RequestCheckboxConfirmation,
 }
 
 /// Thread interaction status
@@ -141,29 +144,115 @@ pub enum ThreadInteractionStatus {
     Rejected,
     Cancelled,
     Resolved,
+    Expired,
 }
 
 /// Thread interaction
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueThreadInteraction {
     pub id: Uuid,
     pub company_id: Uuid,
     pub issue_id: Uuid,
-    pub kind: ThreadInteractionKind,
-    pub status: ThreadInteractionStatus,
-    pub question: String,
+    pub kind: String, // "question" | "approval" | "suggest_tasks" | "ask_user_questions" | "request_confirmation" | "request_checkbox_confirmation"
+    pub status: String, // "pending" | "accepted" | "rejected" | "cancelled" | "resolved" | "expired"
+    pub continuation_policy: String, // "wake_assignee" | "none"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<String>,
+    pub source_comment_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by_agent_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_by_user_id: Option<Uuid>,
+    pub created_by_user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by_agent_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolved_by_user_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
+    pub resolved_by_user_id: Option<String>,
+    pub payload: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Input for creating a thread interaction
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateThreadInteractionInput {
+    pub kind: String,
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default = "default_continuation_policy")]
+    pub continuation_policy: String,
+    #[serde(default)]
+    pub source_run_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_comment_id: Option<Uuid>,
+}
+
+fn default_continuation_policy() -> String {
+    "wake_assignee".to_string()
+}
+
+/// Input for accepting a thread interaction
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptThreadInteractionInput {
+    #[serde(default)]
+    pub response: Option<serde_json::Value>,
+}
+
+/// Input for rejecting a thread interaction
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectThreadInteractionInput {
+    #[serde(default)]
+    pub response: Option<serde_json::Value>,
+}
+
+/// Result of accepting an interaction
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptInteractionResult {
+    pub interaction: IssueThreadInteraction,
+    pub created_issues: Vec<crate::Issue>,
+    pub continuation_issue: Option<crate::Issue>,
+}
+
+/// Input for answering ask_user_questions interaction
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerQuestionsInput {
+    pub answers: Vec<QuestionAnswer>,
+    #[serde(default)]
+    pub summary_markdown: Option<String>,
+}
+
+/// A single question answer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionAnswer {
+    pub question_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub option_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer_text: Option<String>,
+}
+
+/// Input for cancelling ask_user_questions interaction
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelQuestionsInput {
+    #[serde(default)]
+    pub reason: Option<String>,
 }

@@ -102,6 +102,27 @@ where
         }
     }
 
+    /// Calculate issue depth by counting parent chain
+    async fn calculate_issue_depth(&self, issue: &Issue) -> TreeControlServiceResult<i32> {
+        let mut depth = 0;
+        let mut current_parent = issue.parent_id;
+        
+        while let Some(parent_id) = current_parent {
+            depth += 1;
+            if depth > self.max_tree_depth {
+                // Prevent infinite loop
+                break;
+            }
+            
+            match self.issue_repository.get_by_id(parent_id).await? {
+                Some(parent) => current_parent = parent.parent_id,
+                None => break, // Parent not found, stop
+            }
+        }
+        
+        Ok(depth)
+    }
+
     pub fn with_max_depth(mut self, max_depth: i32) -> Self {
         self.max_tree_depth = max_depth;
         self
@@ -212,7 +233,9 @@ where
             }
         }
 
-        // TODO: Get active runs for affected issues
+        // Note: Active run tracking requires Run repository integration.
+        // Currently no runs are reported. Future implementation should query:
+        // SELECT id, status FROM runs WHERE issue_id IN (...) AND status IN ('running', 'paused')
         let active_runs = Vec::new();
 
         Ok(IssueTreeControlPreview {
@@ -276,14 +299,14 @@ where
                 issue_id: issue.id,
                 parent_issue_id: issue.parent_id,
                 previous_status: format!("{:?}", issue.status),
-                depth: 0, // TODO: calculate actual depth
+                depth: self.calculate_issue_depth(&issue).await.unwrap_or(0),
                 issue_identifier: issue.identifier,
                 issue_title: issue.title,
                 issue_status: format!("{:?}", issue.status),
                 assignee_agent_id: issue.assignee_agent_id,
                 assignee_user_id: issue.assignee_user_id,
-                active_run_id: None, // TODO: get active run
-                active_run_status: None,
+                active_run_id: None, // Note: Requires separate runs table query
+                active_run_status: None, // Note: Will be implemented with Run repository
                 skipped,
                 skip_reason,
                 created_at: chrono::Utc::now(),

@@ -215,6 +215,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ensure_local_trusted_principal(&pool).await?;
     }
 
+    // 初始化并启动 Job Scheduler
+    tracing::info!("initializing job scheduler...");
+    let job_scheduler = Arc::new(services::JobScheduler::new());
+    
+    // 创建 RoutineExecutionService
+    let routine_execution_service = Arc::new(services::RoutineExecutionService::new(pool.clone()));
+    
+    // 注册后台任务
+    job_scheduler.register(Arc::new(services::RoutineCronTrigger::new(
+        pool.clone(),
+        routine_execution_service,
+    ))).await;
+    
+    job_scheduler.register(Arc::new(services::MonitorCheckJob::new(pool.clone()))).await;
+    job_scheduler.register(Arc::new(services::LeaseExpiryScanner::new(pool.clone()))).await;
+    job_scheduler.register(Arc::new(services::EnvironmentHealthProber::new(pool.clone()))).await;
+    job_scheduler.register(Arc::new(services::ConsistencyCheckJob::new(pool.clone()))).await;
+    
+    // 启动调度器（30 秒间隔，对应 paperclip 的 heartbeatSchedulerIntervalMs）
+    let _scheduler_handle = job_scheduler.clone().start(30000).await;
+    tracing::info!("job scheduler started with 30s interval");
+
     let state = build_app_state(pool.clone()).await?;
 
     let app: Router = create_router(state);
@@ -336,7 +358,7 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
 
     // --- Services ---
     let agent_service: Arc<dyn AgentService> = Arc::new(
-        DefaultAgentService::new(agent_repo.clone(), Arc::new(agent_api_key_repo.clone()))
+        DefaultAgentService::new(agent_repo.clone(), Arc::new(agent_api_key_repo.clone()), pool.clone())
             .with_heartbeat_pool(pool.clone())
             .with_config_revision_repo(config_revision_repo.clone())
             .with_cost_event_repo(cost_event_repo.clone())

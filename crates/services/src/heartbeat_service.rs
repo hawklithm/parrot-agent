@@ -1997,6 +1997,7 @@ pub mod mock {
     pub struct MockHeartbeatService {
         wakeup_count: AtomicI64,
         cancel_count: AtomicI64,
+        should_fail: std::sync::atomic::AtomicBool,
     }
 
     impl MockHeartbeatService {
@@ -2004,6 +2005,7 @@ pub mod mock {
             Self {
                 wakeup_count: AtomicI64::new(0),
                 cancel_count: AtomicI64::new(0),
+                should_fail: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -2013,6 +2015,14 @@ pub mod mock {
 
         pub fn cancel_call_count(&self) -> i64 {
             self.cancel_count.load(Ordering::Relaxed)
+        }
+
+        pub fn wakeup_count(&self) -> i64 {
+            self.wakeup_call_count()
+        }
+
+        pub fn set_should_fail(&self, should_fail: bool) {
+            self.should_fail.store(should_fail, Ordering::Relaxed);
         }
     }
 
@@ -2024,6 +2034,9 @@ pub mod mock {
             _issue_id: Uuid,
             _company_id: Uuid,
         ) -> Result<(), HeartbeatError> {
+            if self.should_fail.load(Ordering::Relaxed) {
+                return Err(HeartbeatError::Internal("Mock failure".to_string()));
+            }
             self.wakeup_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }

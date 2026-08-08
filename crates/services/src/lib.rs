@@ -26,6 +26,9 @@ pub mod case_service;
 pub mod environment_driver;
 pub mod file_resource_service;
 pub mod issue_comment_service;
+pub mod issue_plan_decomposition_service;
+pub mod issue_thread_interaction_service;
+pub mod issue_workspace_validation;
 pub mod issue_service;
 pub mod issue_tree_control_service;
 pub mod lease_service;
@@ -114,6 +117,9 @@ pub use issue_tree_control_service::{
     IssueTreeControlService, IssueTreeControlServiceImpl, TreeControlServiceError,
     TreeControlServiceResult,
 };
+pub use issue_thread_interaction_service::{
+    IssueThreadInteractionService, InteractionCreator, InteractionResolver,
+};
 pub use mock_environment_services::{
     MockEnvironmentLeaseService, MockEnvironmentService, MockExecutionWorkspaceService,
 };
@@ -187,9 +193,10 @@ pub use work_product_service::WorkProductService;
 pub use work_product_service::*;
 pub mod company_service;
 pub use company_service::*;
+pub mod resource_membership_service;
+pub use resource_membership_service::ResourceMembershipService;
 pub mod project_service;
-pub use activity_log_service::*;
-pub use project_service::*;
+pub use project_service::ProjectService;
 pub mod authorization_service_complete;
 pub mod invite_service_complete;
 pub use invite_service_complete::*;
@@ -209,6 +216,8 @@ pub use plan_decomposition_service::*;
 pub mod issue_diagnostics_service;
 pub use issue_diagnostics_service::*;
 pub mod heartbeat_service;
+pub mod issue_assignment_wakeup;
+pub use issue_assignment_wakeup::*;
 pub mod low_trust_service;
 pub use heartbeat_service::*;
 pub mod task_watchdog;
@@ -234,8 +243,29 @@ pub use cost_service::{
 };
 pub mod retry;
 pub use retry::*;
+pub mod routine_execution_service;
+pub use routine_execution_service::{RoutineExecutionService, DispatchRoutineRunInput, RoutineRun, RoutineRunSource};
+pub mod routine_variable_service;
+pub use routine_variable_service::{
+    RoutineVariableValue, get_builtin_routine_variable_values, 
+    resolve_routine_variable_values, ResolveVariableInput,
+    assert_routine_variable_definitions, sanitize_routine_variable_inputs,
+};
+pub mod routine_template;
+pub use routine_template::{
+    extract_routine_variable_names,
+    interpolate_routine_template,
+    sync_routine_variables_with_template,
+    is_valid_routine_variable_name,
+    is_routine_date_variable_name,
+    unescape_routine_variable_name,
+};
 pub mod job_scheduler;
-pub use job_scheduler::*;
+pub use job_scheduler::{
+    JobScheduler, ScheduledJob, JobSchedule, JobStatus, JobExecutionRecord,
+    RoutineCronTrigger, MonitorCheckJob, LeaseExpiryScanner, 
+    EnvironmentHealthProber, ConsistencyCheckJob
+};
 pub mod config;
 pub use config::*;
 pub mod adapter_plugin;

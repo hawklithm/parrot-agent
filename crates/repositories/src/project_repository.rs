@@ -477,7 +477,7 @@ impl ProjectRepository {
         company_id: Uuid,
         user_id: Uuid,
     ) -> Result<ResourceMemberships> {
-        // Fetch project memberships separately
+        // Fetch project memberships
         let memberships = sqlx::query_as::<_, ProjectMembership>(
             r#"
             SELECT *
@@ -501,7 +501,7 @@ impl ProjectRepository {
             }
         }
 
-        // Fetch agent memberships separately
+        // Fetch agent memberships
         let agent_memberships_raw = sqlx::query_as::<_, AgentMembership>(
             r#"
             SELECT *
@@ -544,11 +544,26 @@ impl ProjectRepository {
             .map(|am| am.membership.agent_id)
             .collect();
 
+        // Build membership state maps
+        let project_membership_map = project_memberships
+            .iter()
+            .map(|pm| (pm.membership.project_id.to_string(), pm.membership.state))
+            .collect();
+
+        let agent_membership_map = agent_memberships
+            .iter()
+            .map(|am| (am.membership.agent_id.to_string(), am.membership.state))
+            .collect();
+
         Ok(ResourceMemberships {
-            project_memberships,
-            agent_memberships,
+            project_memberships: project_membership_map,
+            agent_memberships: agent_membership_map,
             starred_project_ids,
             starred_agent_ids,
+            project_starred_at: None,
+            agent_starred_at: None,
+            updated_at: None,
         })
     }
+
 }

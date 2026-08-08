@@ -164,10 +164,15 @@ pub struct AgentMembership {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceMemberships {
-    pub project_memberships: Vec<ProjectMembershipWithProject>,
-    pub agent_memberships: Vec<AgentMembershipWithAgent>,
+    pub project_memberships: std::collections::HashMap<String, MembershipState>,
+    pub agent_memberships: std::collections::HashMap<String, MembershipState>,
     pub starred_project_ids: Vec<Uuid>,
     pub starred_agent_ids: Vec<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_starred_at: Option<std::collections::HashMap<String, DateTime<Utc>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_starred_at: Option<std::collections::HashMap<String, DateTime<Utc>>>,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -356,6 +356,7 @@ where
     config_revision_repo: Option<Arc<C>>,
     cost_event_repo: Option<Arc<E>>,
     activity_log_repo: Option<Arc<A>>,
+    pool: PgPool,
     heartbeat_pool: Option<PgPool>,
 }
 
@@ -367,13 +368,14 @@ where
     E: CostEventRepository,
     A: ActivityLogRepository,
 {
-    pub fn new(repository: R, api_key_repo: Arc<K>) -> Self {
+    pub fn new(repository: R, api_key_repo: Arc<K>, pool: PgPool) -> Self {
         Self {
             repository,
             api_key_repo,
             config_revision_repo: None,
             cost_event_repo: None,
             activity_log_repo: None,
+            pool,
             heartbeat_pool: None,
         }
     }
@@ -437,7 +439,10 @@ where
             .await;
 
             if snapshot_result.is_none() {
-                // TODO: 记录日志警告
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    "Failed to capture agent config snapshot"
+                );
             }
         }
     }
@@ -1138,11 +1143,123 @@ where
     }
 
     async fn inbox_lite(&self, agent_id: Uuid) -> Result<serde_json::Value, ServiceError> {
-        let _agent = self.repository.get_by_id(agent_id).await?;
+        let agent = self.repository.get_by_id(agent_id).await?;
+        
+        // Query issues assigned to this agent with status todo/in_progress/blocked
+        let issues = sqlx::query(
+            r#"
+            SELECT 
+                i.id,
+                i.identifier,
+                i.title,
+                i.status,
+                i.priority,
+                i.project_id,
+                i.goal_id,
+                i.parent_id,
+                i.updated_at
+            FROM issues i
+            WHERE i.company_id = $1 
+              AND i.assignee_agent_id = $2
+              AND i.status IN ('todo', 'in_progress', 'blocked')
+            ORDER BY i.updated_at DESC
+            LIMIT 100
+            "#
+        )
+        .bind(agent.company_id)
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to query issues: {e}")))?;
+
+        let issue_ids: Vec<Uuid> = issues.iter().filter_map(|row| row.try_get("id").ok()).collect();
+
+        // Calculate dependency readiness for each issue
+        let mut dependency_readiness = std::collections::HashMap::new();
+        if !issue_ids.is_empty() {
+            // Query blocker relationships
+            let blockers = sqlx::query(
+                r#"
+                SELECT 
+                    ir.related_issue_id as issue_id,
+                    ir.issue_id as blocker_issue_id,
+                    bi.status as blocker_status
+                FROM issue_relations ir
+                INNER JOIN issues bi ON bi.id = ir.issue_id
+                WHERE ir.company_id = $1
+                  AND ir.type = 'blocks'
+                  AND ir.related_issue_id = ANY($2)
+                "#
+            )
+            .bind(agent.company_id)
+            .bind(&issue_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to query blockers: {e}")))?;
+
+            for issue_id in &issue_ids {
+                let issue_blockers: Vec<_> = blockers
+                    .iter()
+                    .filter(|b| {
+                        let bid: Uuid = b.try_get("issue_id").unwrap_or_default();
+                        bid == *issue_id
+                    })
+                    .collect();
+
+                let unresolved_blockers: Vec<Uuid> = issue_blockers
+                    .iter()
+                    .filter_map(|b| {
+                        let blocker_id: Uuid = b.try_get("blocker_issue_id").ok()?;
+                        let status: String = b.try_get("blocker_status").ok()?;
+                        if status != "done" {
+                            Some(blocker_id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let dependency_ready = unresolved_blockers.is_empty();
+                
+                dependency_readiness.insert(*issue_id, (
+                    dependency_ready,
+                    unresolved_blockers.len(),
+                    unresolved_blockers,
+                ));
+            }
+        }
+
+
+        let items: Vec<serde_json::Value> = issues
+            .iter()
+            .filter_map(|issue| {
+                let id: Uuid = issue.try_get("id").ok()?;
+                let (dep_ready, unresolved_count, unresolved_ids) = 
+                    dependency_readiness.get(&id)
+                        .cloned()
+                        .unwrap_or((true, 0, vec![]));
+
+                Some(serde_json::json!({
+                    "id": id,
+                    "identifier": issue.try_get::<String, _>("identifier").ok()?,
+                    "title": issue.try_get::<String, _>("title").ok()?,
+                    "status": issue.try_get::<String, _>("status").ok()?,
+                    "priority": issue.try_get::<String, _>("priority").ok(),
+                    "projectId": issue.try_get::<Uuid, _>("project_id").ok(),
+                    "goalId": issue.try_get::<Uuid, _>("goal_id").ok(),
+                    "parentId": issue.try_get::<Uuid, _>("parent_id").ok(),
+                    "updatedAt": issue.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").ok(),
+                    "dependencyReady": dep_ready,
+                    "unresolvedBlockerCount": unresolved_count,
+                    "unresolvedBlockerIssueIds": unresolved_ids,
+                }))
+            })
+            .collect();
+
         Ok(serde_json::json!({
             "agentId": agent_id,
-            "total": 0,
-            "items": [],
+            "total": items.len(),
+            "items": items,
         }))
     }
 

@@ -91,6 +91,10 @@ pub fn company_routes() -> Router<AppState> {
             "/companies/:company_id/teams-catalog",
             get(get_teams_catalog),
         )
+        .route(
+            "/companies/:company_id/issues/external-object-summaries",
+            post(get_external_object_summaries),
+        )
         .layer(axum::middleware::from_fn(
             crate::routes::require_company_access,
         ))
@@ -725,6 +729,70 @@ async fn list_company_feedback_traces(
         "sharedWithLabs": row.get::<bool, _>("shared_with_labs"), "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
         "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
     })).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExternalObjectSummariesRequest {
+    #[serde(rename = "issueIds")]
+    pub issue_ids: Vec<String>,
+}
+
+/// POST /companies/:company_id/issues/external-object-summaries - Batch query external object summaries
+async fn get_external_object_summaries(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+    Json(payload): Json<ExternalObjectSummariesRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Verify company access
+    if actor.company_id() != Some(company_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    
+    let issue_ids: Vec<Uuid> = payload.issue_ids
+        .iter()
+        .filter_map(|s| Uuid::parse_str(s).ok())
+        .collect();
+    
+    if issue_ids.is_empty() {
+        return Ok(Json(serde_json::json!({ "summaries": {} })));
+    }
+    
+    // Query external object summaries for each issue
+    let mut summaries = std::collections::HashMap::new();
+    
+    for issue_id in issue_ids {
+        // Verify issue belongs to company
+        let issue = sqlx::query("SELECT id FROM issues WHERE id = $1 AND company_id = $2")
+            .bind(issue_id)
+            .bind(company_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        
+        if issue.is_some() {
+            // Get external objects for this issue
+            let objects = sqlx::query("SELECT id, object_type, object_id, summary, created_at, updated_at FROM issue_external_objects WHERE issue_id = $1")
+                .bind(issue_id)
+                .fetch_all(&state.pool)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let object_summaries: Vec<serde_json::Value> = objects.into_iter().map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "objectType": row.get::<String, _>("object_type"),
+                    "objectId": row.get::<String, _>("object_id"),
+                    "summary": row.get::<Option<serde_json::Value>, _>("summary"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+                })
+            }).collect();
+            
+            summaries.insert(issue_id.to_string(), serde_json::json!(object_summaries));
+        }
+    }
+    
+    Ok(Json(serde_json::json!({ "summaries": summaries })))
 }
 
 /// CM17: POST /companies/:company_id/imports/preview

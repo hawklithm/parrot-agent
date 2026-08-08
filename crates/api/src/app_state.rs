@@ -264,12 +264,13 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::issues::issue_routes())
         .merge(crate::routes::cases::case_routes())
         .merge(crate::routes::issue_comments::issue_comment_routes())
-        .merge(crate::routes::issue_tree_control::issue_tree_control_routes())
+        .merge(crate::routes::interactions::interaction_routes())
         .merge(crate::routes::issue_diagnostics::issue_diagnostics_routes())
         .merge(crate::routes::low_trust::low_trust_routes())
         // Phase 3: Company/Org routes
         .merge(crate::routes::companies::company_routes())
         .merge(crate::routes::projects::project_routes())
+        .merge(crate::routes::resource_memberships::resource_membership_routes())
         .merge(crate::routes::tools::tool_routes())
         // Company secrets + secret providers (SE5, SE14-SE20)
         .merge(crate::routes::secrets::secret_routes())
@@ -320,6 +321,7 @@ pub fn create_router(state: AppState) -> Router {
         // P2: Execution workspace + heartbeat-run routes (X1-X18)
         .merge(crate::routes::execution_workspaces::execution_workspace_routes())
         .merge(crate::routes::heartbeat_runs::heartbeat_run_routes())
+        .merge(crate::routes::feedback_traces::feedback_trace_routes())
         .layer(axum::middleware::from_fn_with_state(
             auth_middleware,
             services::auth::auth_middleware_fn,

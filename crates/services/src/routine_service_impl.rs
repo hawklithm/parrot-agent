@@ -586,9 +586,10 @@ impl RoutineService for DefaultRoutineService {
             // Validate default value type matches variable type
             if let Some(ref default_value) = var.default_value {
                 let value_matches_type = match var.var_type {
-                    RoutineVariableType::Text => default_value.is_string(),
+                    RoutineVariableType::Text | RoutineVariableType::Textarea => default_value.is_string(),
                     RoutineVariableType::Number => default_value.is_number(),
                     RoutineVariableType::Boolean => default_value.is_boolean(),
+                    RoutineVariableType::Date => default_value.is_string(),
                     RoutineVariableType::Select => {
                         if let Some(ref options) = var.options {
                             default_value.is_string() && options.iter().any(|opt| {

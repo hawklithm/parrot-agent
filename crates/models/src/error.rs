@@ -15,6 +15,9 @@ pub enum AppError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    #[error("Unprocessable entity: {0}")]
+    Unprocessable(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 

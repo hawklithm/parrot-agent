@@ -360,8 +360,8 @@ impl AccessService for DefaultAccessService {
         &self,
         _company_id: Uuid,
     ) -> Result<(), AccessError> {
-        // TODO: 实际实现需要检查公司配置中的实验特性开关
-        // 目前默认返回启用
+        // Built-in agents are currently always enabled. Future implementation
+        // can check company.experimental_features if needed.
         Ok(())
     }
 

@@ -9,18 +9,20 @@ pub mod companies;
 pub mod config_revisions;
 pub mod custom_image_setup;
 pub mod environment_diagnostics;
+pub mod feedback_traces;
 pub mod environments;
 pub mod goals;
 pub mod heartbeats;
 pub mod invite_resources;
 pub mod invites;
+pub mod interactions;
 pub mod issue_comments;
-pub mod issue_tree_control;
 pub mod issues;
 pub mod openclaw;
 pub mod org_chart;
 pub mod pipelines;
 pub mod projects;
+pub mod resource_memberships;
 pub mod routine_annotations;
 pub mod routines;
 pub mod secret_provider_configs;
@@ -246,6 +248,7 @@ pub mod issue_diagnostics;
 pub use issue_diagnostics::issue_diagnostics_routes;
 pub mod low_trust;
 pub use low_trust::low_trust_routes;
+pub use feedback_traces::feedback_trace_routes;
 pub mod watchdogs;
 pub use companies::company_routes;
 pub use goals::goal_routes;
@@ -256,7 +259,7 @@ pub use watchdogs::watchdog_routes;
 // P2: New domain routes
 pub use approvals::approval_routes;
 pub use costs::cost_routes;
-pub use plugins::plugin_routes;
+pub use resource_memberships::resource_membership_routes;
 
 #[cfg(test)]
 mod tests {

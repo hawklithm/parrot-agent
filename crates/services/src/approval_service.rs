@@ -458,8 +458,36 @@ impl ApprovalService for DefaultApprovalService {
 
         // If approved, publish event to unblock linked issues
         if input.decision == ApprovalDecision::Approve {
-            // TODO: Publish ApprovalApproved event to EventBus
-            // This will trigger the listener to unblock issues
+            if let Some(ref event_bus) = self.event_bus {
+                let linked_issue_ids = self
+                    .approval_repo
+                    .find_linked_issues(updated_approval.id)
+                    .await
+                    .unwrap_or_default();
+
+                let issue_id = linked_issue_ids.first().copied();
+
+                let approval_event = ApprovalEvent::Approved {
+                    approval_id: updated_approval.id,
+                    company_id: updated_approval.company_id,
+                    approver_id: updated_approval.decided_by_user_id.unwrap_or(Uuid::nil()),
+                    issue_id,
+                };
+
+                let system_event = SystemEvent::new(
+                    EventMetadata {
+                        event_id: Uuid::new_v4(),
+                        correlation_id: None,
+                        causation_id: None,
+                        actor_type: "user".to_string(),
+                        actor_id: updated_approval.decided_by_user_id.unwrap_or(Uuid::nil()),
+                        company_id: updated_approval.company_id,
+                    },
+                    SystemEventPayload::Approval(approval_event),
+                );
+
+                let _ = event_bus.publish(Box::new(system_event)).await;
+            }
         }
 
         Ok(updated_approval)

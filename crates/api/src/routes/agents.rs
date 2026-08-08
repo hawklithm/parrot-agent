@@ -406,6 +406,8 @@ async fn delete_agent(
 ///
 /// 从 Authorization: Bearer <agent_key> 头中提取 Agent API Key，
 /// 验证 key 有效性并返回对应的 Agent 信息。
+/// GET /agents/me - 获取当前认证的 Agent 详细信息
+/// 验证 key 有效性并返回对应的 Agent 信息，包含 chainOfCommand 和 access。
 async fn get_current_agent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -421,7 +423,65 @@ async fn get_current_agent(
 
     let agent = state.agent_service.get_me(agent_key).await?;
 
-    Ok(Json(agent))
+    // Build chain of command
+    let mut chain_of_command = Vec::new();
+    let mut current_id = agent.reports_to;
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(agent.id);
+
+    while let Some(id) = current_id {
+        if visited.contains(&id) || chain_of_command.len() >= 50 {
+            break;
+        }
+        visited.insert(id);
+
+        match state.agent_service.get_by_id(id).await {
+            Ok(mgr) => {
+                // Try to extract title from metadata if it exists
+                let title: Option<String> = serde_json::to_value(&mgr.metadata.0)
+                    .ok()
+                    .and_then(|v| v.get("title").and_then(|t| t.as_str()).map(|s| s.to_string()));
+
+                chain_of_command.push(serde_json::json!({
+                    "id": mgr.id,
+                    "name": mgr.name,
+                    "role": mgr.role,
+                    "title": title
+                }));
+                current_id = mgr.reports_to;
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Build access state
+    let can_create_agents = agent.permissions.0.can_create_agents;
+    let can_assign_tasks = matches!(agent.role, models::AgentRole::Ceo) || can_create_agents;
+    let task_assign_source = if matches!(agent.role, models::AgentRole::Ceo) {
+        "ceo_role"
+    } else if can_create_agents {
+        "agent_creator"
+    } else if can_assign_tasks {
+        "simple_default"
+    } else {
+        "none"
+    };
+
+    let access = serde_json::json!({
+        "canAssignTasks": can_assign_tasks,
+        "taskAssignSource": task_assign_source,
+    });
+
+    // Combine agent data with chain of command and access
+    let mut agent_json = serde_json::to_value(&agent)
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    
+    if let Some(obj) = agent_json.as_object_mut() {
+        obj.insert("chainOfCommand".to_string(), serde_json::json!(chain_of_command));
+        obj.insert("access".to_string(), access);
+    }
+
+    Ok(Json(agent_json))
 }
 
 /// GET /agents/:id/configuration - 获取Agent的脱敏配置

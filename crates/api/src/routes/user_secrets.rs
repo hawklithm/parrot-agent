@@ -103,7 +103,6 @@ pub async fn create_definition(
     Extension(actor): Extension<AuthorizationActor>,
     Json(req): Json<CreateDefinitionRequest>,
 ) -> Result<Json<UserSecretDefinition>, StatusCode> {
-    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
     let current_user_id = current_user_id(&actor)?;
 
     let definition = service
@@ -169,7 +168,6 @@ pub async fn list_user_secrets(
     State(service): State<Arc<dyn UserSecretService>>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<UserSecretResponse>>, StatusCode> {
-    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
     let current_user_id = current_user_id(&actor)?;
 
     let secrets = service
@@ -188,7 +186,6 @@ pub async fn set_user_secret(
     Extension(actor): Extension<AuthorizationActor>,
     Json(req): Json<SetUserSecretRequest>,
 ) -> Result<Json<UserSecretResponse>, StatusCode> {
-    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
     let current_user_id = current_user_id(&actor)?;
 
     let secret = service
@@ -205,7 +202,6 @@ pub async fn get_user_secret(
     State(service): State<Arc<dyn UserSecretService>>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<UserSecretResponse>, StatusCode> {
-    // TODO: 从 AuthorizationActor 提取当前用户 ID（需要路由挂载 AuthMiddleware）
     let current_user_id = current_user_id(&actor)?;
 
     let secret = service

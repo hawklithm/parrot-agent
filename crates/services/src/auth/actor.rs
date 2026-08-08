@@ -202,6 +202,15 @@ impl AuthorizationActor {
     pub fn is_anonymous(&self) -> bool {
         matches!(self, Self::None)
     }
+
+    /// 获取 Actor 类型字符串（用于日志和审计）
+    pub fn actor_type(&self) -> &'static str {
+        match self {
+            Self::Board { .. } => "user",
+            Self::Agent { .. } => "agent",
+            Self::None => "system",
+        }
+    }
 }
 
 /// 主体身份来源 - 标识Actor的认证方式

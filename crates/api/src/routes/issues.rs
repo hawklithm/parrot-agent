@@ -832,6 +832,101 @@ async fn update_issue_document_annotation(
     })))
 }
 
+/// POST /issues/:id/documents/:key/lock - Lock issue document
+async fn lock_issue_document(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, key)): Path<(Uuid, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    scoped_issue_company(&state, &actor, issue_id).await?;
+    
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    
+    sqlx::query(
+        "UPDATE documents SET locked_by_type=$2, locked_by_id=$3, locked_at=NOW(), locked_run_id=$4 \
+         WHERE id=$1 AND locked_at IS NULL"
+    )
+    .bind(document_id)
+    .bind(payload.get("actorType").and_then(|v| v.as_str()).unwrap_or("user"))
+    .bind(payload.get("actorId").and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok()))
+    .bind(payload.get("runId").and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok()))
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::CONFLICT)?;
+    
+    Ok(Json(serde_json::json!({
+        "issueId": issue_id,
+        "key": key,
+        "locked": true,
+        "lockedBy": payload
+    })))
+}
+
+/// POST /issues/:id/documents/:key/unlock - Unlock issue document
+async fn unlock_issue_document(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, key)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    scoped_issue_company(&state, &actor, issue_id).await?;
+    
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    
+    sqlx::query(
+        "UPDATE documents SET locked_by_type=NULL, locked_by_id=NULL, locked_at=NULL, locked_run_id=NULL \
+         WHERE id=$1"
+    )
+    .bind(document_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(serde_json::json!({
+        "issueId": issue_id,
+        "key": key,
+        "unlocked": true
+    })))
+}
+
+/// DELETE /issues/:id/documents/:key - Delete issue document
+async fn delete_issue_document(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, key)): Path<(Uuid, String)>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    
+    sqlx::query(
+        "DELETE FROM issue_documents WHERE issue_id=$1 AND key=$2 AND EXISTS \
+         (SELECT 1 FROM issues WHERE id=$1 AND company_id=$3)"
+    )
+    .bind(issue_id)
+    .bind(key)
+    .bind(company_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchQuery {
@@ -1080,6 +1175,39 @@ async fn create_issue(
             tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
             issue_service_status(&error)
         })?;
+
+    // Queue issue assignment wakeup (matches paperclip: routes/issues.ts:7054-7062)
+    // Skip if no assignee or backlog status
+    if let Some(assignee_agent_id) = created.issue.assignee_agent_id {
+        if !matches!(created.issue.status, models::IssueStatus::Backlog) {
+            let wakeup_service = services::IssueAssignmentWakeupService::new(
+                state.heartbeat_service.clone()
+            );
+            
+            let wakeup_input = services::issue_assignment_wakeup::QueueWakeupInput {
+                company_id,
+                issue_id: created.issue.id,
+                assignee_agent_id: Some(assignee_agent_id),
+                status: format!("{}", created.issue.status),
+                reason: "issue_assigned".to_string(),
+                mutation: "create".to_string(),
+                context_source: "issue.create".to_string(),
+                requested_by_actor_type: Some(actor.actor_type().to_string()),
+                requested_by_actor_id: actor.principal_id(),
+                rethrow_on_error: false, // Swallow error to avoid blocking response
+            };
+            
+            if let Err(e) = wakeup_service.queue_wakeup(wakeup_input).await {
+                tracing::warn!(
+                    error = %e,
+                    issue_id = %created.issue.id,
+                    assignee_agent_id = %assignee_agent_id,
+                    "Failed to wake assignee on issue creation"
+                );
+            }
+        }
+    }
+
     // Re-read so the response includes the persisted watchdog projection.
     let response_issue = state
         .issue_service
@@ -1554,6 +1682,7 @@ async fn delete_issue_approval(
 /// I11: POST /issues/:id/children
 async fn create_child_issue(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(parent_id): Path<Uuid>,
     Json(input): Json<CreateIssueInput>,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -1563,6 +1692,40 @@ async fn create_child_issue(
         ..input
     };
     let result = service.create(input_with_parent).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    // Queue issue assignment wakeup (matches Paperclip: issues.ts:7221-7229)
+    if let Some(assignee_agent_id) = result.issue.assignee_agent_id {
+        // Only wake if not backlog status
+        if !matches!(result.issue.status, models::IssueStatus::Backlog) {
+            let wakeup_service = services::IssueAssignmentWakeupService::new(
+                state.heartbeat_service.clone()
+            );
+            
+            let wakeup_input = services::issue_assignment_wakeup::QueueWakeupInput {
+                company_id: result.issue.company_id,
+                issue_id: result.issue.id,
+                assignee_agent_id: Some(assignee_agent_id),
+                status: format!("{}", result.issue.status),
+                reason: "issue_assigned".to_string(),
+                mutation: "create".to_string(),
+                context_source: "issue.child_create".to_string(),
+                requested_by_actor_type: Some(actor.actor_type().to_string()),
+                requested_by_actor_id: actor.principal_id(),
+                rethrow_on_error: false, // Don't block child creation on wakeup failure
+            };
+            
+            if let Err(e) = wakeup_service.queue_wakeup(wakeup_input).await {
+                tracing::warn!(
+                    error = %e,
+                    issue_id = %result.issue.id,
+                    parent_id = %parent_id,
+                    assignee_agent_id = %assignee_agent_id,
+                    "Failed to wake assignee on child issue creation"
+                );
+            }
+        }
+    }
+    
     Ok((StatusCode::CREATED, Json(result.issue)))
 }
 
@@ -1759,92 +1922,6 @@ async fn resolve_recovery_action(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// I29: GET /issues/:id/interactions
-async fn list_interactions(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1").bind(id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
-    let rows = sqlx::query("SELECT id, company_id, issue_id, kind, status::text, source_run_id, source_comment_id, idempotency_key, continuation_policy, question, payload, response, resolved_by_type, resolved_by_id, created_at, updated_at FROM issue_thread_interactions WHERE issue_id = $1 AND company_id = $2 ORDER BY created_at ASC").bind(id).bind(company_id).fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    use sqlx::Row;
-    Ok(Json(rows.into_iter().map(|r| serde_json::json!({"id": r.get::<Uuid,_>("id"), "companyId": r.get::<Uuid,_>("company_id"), "issueId": r.get::<Uuid,_>("issue_id"), "kind": r.get::<String,_>("kind"), "status": r.get::<String,_>("status"), "sourceRunId": r.get::<Option<Uuid>,_>("source_run_id"), "sourceCommentId": r.get::<Option<Uuid>,_>("source_comment_id"), "idempotencyKey": r.get::<Option<String>,_>("idempotency_key"), "continuationPolicy": r.get::<String,_>("continuation_policy"), "question": r.get::<Option<String>,_>("question"), "payload": r.get::<Option<serde_json::Value>,_>("payload"), "response": r.get::<Option<serde_json::Value>,_>("response"), "resolvedByType": r.get::<Option<String>,_>("resolved_by_type"), "resolvedById": r.get::<Option<String>,_>("resolved_by_id"), "createdAt": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at"), "updatedAt": r.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")})).collect()))
-}
-
-/// I30: POST /issues/:id/interactions
-async fn create_interaction(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<impl IntoResponse, StatusCode> {
-    use sqlx::Row;
-    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1").bind(id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
-    let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("question");
-    if !matches!(kind, "question" | "approval" | "review" | "suggest_tasks" | "ask_user_questions" | "request_confirmation" | "request_checkbox_confirmation") { return Err(StatusCode::BAD_REQUEST); }
-    let question = payload.get("question")
-        .or_else(|| payload.pointer("/payload/prompt"))
-        .or_else(|| payload.get("summary"))
-        .or_else(|| payload.get("body"))
-        .and_then(|v| v.as_str());
-    let source_run_id = payload.get("sourceRunId").and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok());
-    let source_comment_id = payload.get("sourceCommentId").and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok());
-    let idempotency_key = payload.get("idempotencyKey").and_then(|v| v.as_str()).map(str::to_owned);
-    let continuation_policy = payload.get("continuationPolicy").and_then(|v| v.as_str()).unwrap_or(if matches!(kind, "request_confirmation") { "none" } else { "wake_assignee" });
-    let row = sqlx::query("INSERT INTO issue_thread_interactions (company_id, issue_id, kind, source_run_id, source_comment_id, idempotency_key, continuation_policy, question, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (issue_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO UPDATE SET updated_at=NOW() RETURNING id, company_id, issue_id, kind, status::text, source_run_id, source_comment_id, idempotency_key, continuation_policy, question, payload, response, resolved_by_type, resolved_by_id, created_at, updated_at")
-        .bind(company_id).bind(id).bind(kind).bind(source_run_id).bind(source_comment_id).bind(&idempotency_key).bind(continuation_policy).bind(question).bind(payload.get("payload").cloned().unwrap_or_else(|| payload.clone()))
-        .fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if continuation_policy != "none" {
-        if let Some(agent_id) = sqlx::query_scalar::<_, Option<Uuid>>("SELECT assignee_agent_id FROM issues WHERE id=$1").bind(id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.flatten() {
-            let _ = state.heartbeat_service.wakeup(agent_id, id, company_id).await;
-        }
-    }
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "id": row.get::<Uuid,_>("id"), "companyId": row.get::<Uuid,_>("company_id"), "issueId": id,
-        "kind": row.get::<String,_>("kind"), "status": row.get::<String,_>("status"),
-        "sourceRunId": row.get::<Option<Uuid>,_>("source_run_id"), "sourceCommentId": row.get::<Option<Uuid>,_>("source_comment_id"),
-        "idempotencyKey": row.get::<Option<String>,_>("idempotency_key"), "continuationPolicy": row.get::<String,_>("continuation_policy"),
-        "question": row.get::<Option<String>,_>("question"), "payload": row.get::<Option<serde_json::Value>,_>("payload"),
-        "createdAt": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"), "updatedAt": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")
-    }))))
-}
-
-/// I31: POST /issues/:id/interactions/:interaction_id/accept
-async fn accept_interaction(
-    State(state): State<AppState>,
-    Path((id, interaction_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    transition_interaction(&state, id, interaction_id, "resolved", None).await
-}
-
-/// I32: POST /issues/:id/interactions/:interaction_id/reject
-async fn reject_interaction(
-    State(state): State<AppState>,
-    Path((id, interaction_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    transition_interaction(&state, id, interaction_id, "resolved", None).await
-}
-
-/// I33: POST /issues/:id/interactions/:interaction_id/respond
-async fn respond_interaction(
-    State(state): State<AppState>,
-    Path((id, interaction_id)): Path<(Uuid, Uuid)>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    transition_interaction(&state, id, interaction_id, "resolved", Some(payload)).await
-}
-
-/// I34: POST /issues/:id/interactions/:interaction_id/cancel
-async fn cancel_interaction(
-    State(state): State<AppState>,
-    Path((id, interaction_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    transition_interaction(&state, id, interaction_id, "cancelled", None).await
-}
-
-async fn transition_interaction(state: &AppState, issue_id: Uuid, interaction_id: Uuid, status: &str, response: Option<serde_json::Value>) -> Result<Json<serde_json::Value>, StatusCode> {
-    use sqlx::Row;
-    let row = sqlx::query("UPDATE issue_thread_interactions SET status = $3::issue_thread_interaction_status, response = COALESCE($4, response), resolved_by_type = 'user', updated_at = NOW() WHERE id = $1 AND issue_id = $2 RETURNING id, status::text, response, updated_at").bind(interaction_id).bind(issue_id).bind(status).bind(response).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(serde_json::json!({"issueId": issue_id, "interactionId": row.get::<Uuid,_>("id"), "status": row.get::<String,_>("status"), "response": row.get::<Option<serde_json::Value>,_>("response"), "updatedAt": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")})))
-}
 
 /// Create issue routes
 pub fn issue_routes() -> Router<AppState> {
@@ -1878,12 +1955,14 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/external-object-summary", get(get_external_object_summary))
         .route("/issues/:id/external-objects/refresh", post(refresh_external_objects))
         .route("/issues/:id/documents", get(list_issue_documents))
-        .route("/issues/:id/documents/:key", get(get_issue_document).put(upsert_issue_document))
+        .route("/issues/:id/documents/:key", get(get_issue_document).put(upsert_issue_document).delete(delete_issue_document))
         .route("/issues/:id/documents/:key/revisions", get(list_issue_document_revisions))
         .route("/issues/:id/documents/:key/revisions/:revision_id/restore", post(restore_issue_document_revision))
         .route("/issues/:id/documents/:key/annotations", get(get_issue_document_annotations).post(create_issue_document_annotation))
         .route("/issues/:id/documents/:key/annotations/:thread_id", get(get_issue_document_annotation_thread).patch(update_issue_document_annotation))
         .route("/issues/:id/documents/:key/annotations/:thread_id/reply", post(reply_issue_document_annotation))
+        .route("/issues/:id/documents/:key/lock", post(lock_issue_document))
+        .route("/issues/:id/documents/:key/unlock", post(unlock_issue_document))
         .route("/issues/:id/file-resources/list", get(list_file_resources))
         .route("/issues/:id/file-resources/resolve", get(resolve_file_resource))
         .route("/issues/:id/file-resources/content", get(get_file_resource_content))
@@ -1891,11 +1970,6 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/feedback-traces", get(list_feedback_traces))
         .route("/issues/:id/recovery-actions", get(list_recovery_actions))
         .route("/issues/:id/recovery-actions/resolve", post(resolve_recovery_action))
-        .route("/issues/:id/interactions", get(list_interactions).post(create_interaction))
-        .route("/issues/:id/interactions/:interaction_id/accept", post(accept_interaction))
-        .route("/issues/:id/interactions/:interaction_id/reject", post(reject_interaction))
-        .route("/issues/:id/interactions/:interaction_id/respond", post(respond_interaction))
-        .route("/issues/:id/interactions/:interaction_id/cancel", post(cancel_interaction))
 }
 
 #[cfg(test)]

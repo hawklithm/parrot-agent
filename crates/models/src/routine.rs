@@ -72,9 +72,11 @@ pub struct RoutineVariable {
 #[serde(rename_all = "snake_case")]
 pub enum RoutineVariableType {
     Text,
+    Textarea,
     Number,
     Boolean,
     Select,
+    Date,
     Secret,
 }
 

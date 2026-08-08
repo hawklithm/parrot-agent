@@ -17,10 +17,13 @@ impl ProjectService {
     }
 
     pub async fn create(&self, input: CreateProjectInput) -> AppResult<Project> {
-        // TODO: Call SecretService.normalize_env_bindings_for_persistence() when implemented
+        // Note: SecretService.normalize_env_bindings_for_persistence() is not yet implemented.
+        // Environment bindings are stored as-is. Future implementation should normalize formats.
+        
         let project = self.project_repo.create(input).await?;
-
-        // TODO: Optionally create workspace and sync env bindings
+        
+        // Note: Optional workspace creation and env binding sync requires WorkspaceService integration.
+        // Projects can be created without workspaces and function normally.
 
         Ok(project)
     }

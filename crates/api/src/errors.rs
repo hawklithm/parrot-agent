@@ -23,6 +23,9 @@ pub enum AppError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
     #[error("Conflict: {0}")]
     Conflict(String),
 
@@ -41,6 +44,20 @@ pub enum AppError {
 
 /// ApiError type alias for backwards compatibility
 pub type ApiError = AppError;
+
+impl From<models::AppError> for AppError {
+    fn from(err: models::AppError) -> Self {
+        match err {
+            models::AppError::NotFound(msg) => AppError::NotFound(msg),
+            models::AppError::Forbidden(msg) => AppError::Forbidden(msg),
+            models::AppError::Conflict(msg) => AppError::Conflict(msg),
+            models::AppError::BadRequest(msg) => AppError::BadRequest(msg),
+            models::AppError::Internal(msg) => AppError::InternalServerError(msg),
+            models::AppError::Database(err) => AppError::InternalServerError(err.to_string()),
+            models::AppError::Unprocessable(msg) => AppError::BadRequest(msg),
+        }
+    }
+}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -80,6 +97,9 @@ impl IntoResponse for AppError {
             }
             AppError::Forbidden(msg) => {
                 (StatusCode::FORBIDDEN, msg)
+            }
+            AppError::Unauthorized(msg) => {
+                (StatusCode::UNAUTHORIZED, msg)
             }
             AppError::Conflict(msg) => {
                 (StatusCode::CONFLICT, msg)

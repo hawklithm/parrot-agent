@@ -545,8 +545,7 @@ impl SecretService for DefaultSecretService {
         company_id: Uuid,
         input: CreateSecretInput,
     ) -> Result<Secret, SecretServiceError> {
-        // TODO: 实现数据库持久化
-        // 占位实现：返回错误
+        // Create secret with initial version
         if !Self::is_valid_env_key(&input.key) { return Err(SecretServiceError::InvalidEnvKey(input.key)); }
         if input.value.is_empty() { return Err(SecretServiceError::ResolutionFailed("secret value cannot be empty".into())); }
         let pool = self.pool()?;
@@ -563,8 +562,7 @@ impl SecretService for DefaultSecretService {
         company_id: Uuid,
         secret_id: Uuid,
     ) -> Result<Secret, SecretServiceError> {
-        // TODO: 实现数据库查询
-        // 占位实现：返回错误
+        // Query secret by ID
         let row = sqlx::query("SELECT id,company_id,key,name,provider,status,scope,description,latest_version,created_at,updated_at FROM company_secrets WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL")
             .bind(secret_id).bind(company_id).fetch_optional(self.pool()?).await?.ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
         Ok(Self::row_to_secret(&row, None))
@@ -576,8 +574,7 @@ impl SecretService for DefaultSecretService {
         secret_id: Uuid,
         input: UpdateSecretInput,
     ) -> Result<Secret, SecretServiceError> {
-        // TODO: 实现数据库更新
-        // 占位实现：返回错误
+        // Update secret metadata and optionally create new version
         let pool = self.pool()?;
         let row = sqlx::query("UPDATE company_secrets SET description=COALESCE($3,description), latest_version=CASE WHEN $4::text IS NULL THEN latest_version ELSE latest_version+1 END, updated_at=now() WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL RETURNING id,company_id,key,name,provider,status,scope,description,latest_version,created_at,updated_at")
             .bind(secret_id).bind(company_id).bind(input.description).bind(input.value.as_deref()).fetch_optional(pool).await?.ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
@@ -590,8 +587,7 @@ impl SecretService for DefaultSecretService {
         company_id: Uuid,
         secret_id: Uuid,
     ) -> Result<(), SecretServiceError> {
-        // TODO: 实现数据库删除
-        // 占位实现：返回错误
+        // Soft delete secret
         let result=sqlx::query("UPDATE company_secrets SET deleted_at=now(),updated_at=now() WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL").bind(secret_id).bind(company_id).execute(self.pool()?).await?;
         if result.rows_affected()==0 { return Err(SecretServiceError::SecretNotFound(secret_id.to_string())); } Ok(())
     }
@@ -600,8 +596,7 @@ impl SecretService for DefaultSecretService {
         &self,
         company_id: Uuid,
     ) -> Result<Vec<Secret>, SecretServiceError> {
-        // TODO: 实现数据库查询
-        // 占位实现：返回空列表
+        // List all active secrets for company
         let rows=sqlx::query("SELECT id,company_id,key,name,provider,status,scope,description,latest_version,created_at,updated_at FROM company_secrets WHERE company_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC").bind(company_id).fetch_all(self.pool()?).await?;
         Ok(rows.iter().map(|r| Self::row_to_secret(r,None)).collect())
     }

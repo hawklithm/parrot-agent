@@ -86,14 +86,37 @@ pub async fn add_comment(
 ) -> Result<impl IntoResponse, ApiError> {
     assert_issue_company(&state, &actor, issue_id).await?;
     let service = state.issue_comment_service.clone();
+    
+    // Save actor_type before moving req
+    let actor_type = req.actor_type;
+    let actor_id = req.actor_id;
+    
     let comment = service.add_comment(
         issue_id,
         req.body,
-        req.actor_type,
-        req.actor_id,
+        actor_type.clone(),
+        actor_id,
         req.actor_run_id,
         req.metadata,
     ).await?;
+
+    // Expire superseded interactions when a user comments
+    if actor_type == CommentActorType::User {
+        let interaction_service = services::IssueThreadInteractionService::new(state.pool.clone());
+        let resolver = services::InteractionResolver {
+            resolver_type: "system".to_string(),
+            resolver_id: "comment_supersede".to_string(),
+        };
+        
+        let user_id = actor_id.map(|id| id.to_string());
+        let _ = interaction_service.expire_request_confirmations_superseded_by_comment(
+            issue_id,
+            comment.created_at,
+            user_id,
+            resolver,
+        ).await;
+        // We don't fail the comment creation if interaction expiration fails
+    }
 
     Ok((StatusCode::CREATED, Json(CommentResponse { comment })))
 }

@@ -3,9 +3,9 @@
 //! 对应 Company/Org 模块任务 §1.2 ~ §1.3 + §10 API 路由层
 
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, patch, put},
+    routing::{get, patch},
     Json, Router,
 };
 use uuid::Uuid;
@@ -13,10 +13,8 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use models::{
-    CreateProjectInput, CreateWorkspaceInput, MembershipState, Project, ProjectMembership,
-    ProjectWorkspace, ResourceMemberships, UpdateProjectInput,
+    CreateProjectInput, CreateWorkspaceInput, Project, ProjectWorkspace, UpdateProjectInput,
 };
-use services::auth::AuthorizationActor;
 
 pub fn project_routes() -> Router<AppState> {
     Router::new()
@@ -45,19 +43,6 @@ pub fn project_routes() -> Router<AppState> {
         .route(
             "/projects/:project_id/external-object-summary",
             get(get_external_object_summary),
-        )
-        // Resource memberships
-        .route(
-            "/companies/:company_id/resource-memberships/me",
-            get(list_my_memberships),
-        )
-        .route(
-            "/companies/:company_id/resource-memberships/me/projects/:project_id",
-            put(update_project_membership),
-        )
-        .route(
-            "/companies/:company_id/resource-memberships/me/agents/:agent_id",
-            put(update_agent_membership),
         )
 }
 
@@ -400,99 +385,4 @@ async fn get_external_object_summary(
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     Ok(Json(summary))
-}
-
-// ===== Resource membership endpoints =====
-
-/// GET /companies/:company_id/resource-memberships/me
-async fn list_my_memberships(
-    State(state): State<AppState>,
-    Extension(actor): Extension<AuthorizationActor>,
-    Path(company_id): Path<Uuid>,
-) -> Result<Json<ResourceMemberships>, AppError> {
-    crate::routes::assert_company_access(&actor, company_id, true)
-        .map_err(|e| AppError::Forbidden(e.to_string()))?;
-    let user_id = board_user_id(&actor)?;
-    let memberships = state
-        .project_service
-        .list_memberships_for_user(company_id, user_id)
-        .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(memberships))
-}
-
-/// PUT /companies/:company_id/resource-memberships/me/projects/:project_id
-async fn update_project_membership(
-    State(state): State<AppState>,
-    Extension(actor): Extension<AuthorizationActor>,
-    Path((company_id, project_id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<ProjectMembership>, AppError> {
-    crate::routes::assert_company_access(&actor, company_id, false)
-        .map_err(|e| AppError::Forbidden(e.to_string()))?;
-    let user_id = board_user_id(&actor)?;
-    let state_val = body
-        .get("state")
-        .and_then(|v| v.as_str())
-        .unwrap_or("joined");
-    let membership_state = match state_val {
-        "left" => MembershipState::Left,
-        _ => MembershipState::Joined,
-    };
-
-    let membership = state
-        .project_service
-        .update_project_membership(company_id, project_id, user_id, membership_state)
-        .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(membership))
-}
-
-/// PUT /companies/:company_id/resource-memberships/me/agents/:agent_id
-///
-/// Mirrors Paperclip `resourceMembershipRoutes` -> `svc.updateAgent`. The
-/// response shape drops the internal `changed/changeKind/policySource` fields
-/// and returns `{ resourceType, resourceId, state, starredAt, updatedAt }`.
-async fn update_agent_membership(
-    State(state): State<AppState>,
-    Extension(actor): Extension<AuthorizationActor>,
-    Path((company_id, agent_id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    crate::routes::assert_company_access(&actor, company_id, false)
-        .map_err(|e| AppError::Forbidden(e.to_string()))?;
-    let user_id = board_user_id(&actor)?;
-    let state_val = body
-        .get("state")
-        .and_then(|v| v.as_str())
-        .unwrap_or("joined");
-    let membership_state = match state_val {
-        "left" => MembershipState::Left,
-        _ => MembershipState::Joined,
-    };
-    let starred = body.get("starred").and_then(|v| v.as_bool());
-
-    let membership = state
-        .project_service
-        .update_agent_membership(company_id, agent_id, user_id, membership_state, starred)
-        .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-
-    // Project to the Paperclip response shape (camelCase, stripped internals).
-    Ok(Json(serde_json::json!({
-        "resourceType": "agent",
-        "resourceId": membership.agent_id,
-        "state": membership.state,
-        "starredAt": membership.starred_at,
-        "updatedAt": membership.updated_at,
-    })))
-}
-
-fn board_user_id(actor: &AuthorizationActor) -> Result<Uuid, AppError> {
-    match actor {
-        AuthorizationActor::Board { user_id, .. } => Ok(*user_id),
-        AuthorizationActor::Agent { .. } | AuthorizationActor::None => Err(AppError::Forbidden(
-            "A board user is required for resource membership changes".to_string(),
-        )),
-    }
 }
