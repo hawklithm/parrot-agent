@@ -385,13 +385,21 @@ mod tests {
         let adapter = ProcessAdapter::new();
 
         assert_eq!(adapter.adapter_type(), AdapterType::Process);
-        assert_eq!(adapter.label(), "Local Process");
+        assert_eq!(adapter.label(), "Process");
 
         let models = adapter.list_models(&serde_json::json!({})).await.unwrap();
         assert_eq!(models.len(), 0);
 
-        let result = adapter.test_environment(&serde_json::json!({})).await.unwrap();
-        assert!(result.ok);
+        let ctx = AdapterEnvironmentTestContext {
+            company_id: "test-company".to_string(),
+            adapter_type: "process".to_string(),
+            config: serde_json::json!({}),
+            execution_target: None,
+            environment_name: None,
+            deployment: None,
+        };
+        let result = adapter.test_environment(&ctx).await.unwrap();
+        assert_eq!(result.status, "pass");
 
         let bundle_support = adapter.supports_instructions_bundle();
         assert!(bundle_support.supported);
