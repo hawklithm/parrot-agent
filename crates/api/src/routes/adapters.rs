@@ -377,35 +377,147 @@ async fn test_environment(
 async fn list_global_adapters(
     State(state): State<AdapterAppState>,
 ) -> Result<impl IntoResponse, AppError> {
+    use crate::schemas::{AdapterCapabilities, GlobalAdapterInfo};
+    use services::builtin_adapter_types::is_builtin_adapter_type;
+
     let all_adapters = state.adapter_registry.adapters();
-    let adapters: Vec<serde_json::Value> = all_adapters
+    let registry_state = &state.adapter_registry_state;
+    
+    // 构建外部插件记录映射
+    let external_records: std::collections::HashMap<String, _> = registry_state
+        .list_external_plugins()
+        .into_iter()
+        .map(|r| (r.adapter_type.clone(), r))
+        .collect();
+    
+    // 构建适配器信息列表
+    let mut adapters: Vec<GlobalAdapterInfo> = all_adapters
         .iter()
         .map(|&adapter| {
-            serde_json::json!({
-                "adapterType": adapter.adapter_type().to_string(),
-                "label": adapter.label(),
-                "supportsInstructionsBundle": adapter.supports_instructions_bundle().supported,
-            })
+            let adapter_type_str = adapter.adapter_type().to_string();
+            let external_record = external_records.get(&adapter_type_str);
+            let is_builtin = is_builtin_adapter_type(&adapter_type_str);
+            let is_disabled = registry_state.is_disabled(&adapter_type_str);
+            let is_override_paused = registry_state.is_override_paused(&adapter_type_str);
+            
+            // 构建能力集合
+            let capabilities = AdapterCapabilities {
+                supports_instructions_bundle: adapter.supports_instructions_bundle().supported,
+                supports_skills: false, // TODO: 需要 adapter 实现 listSkills/syncSkills
+                supports_local_agent_jwt: false, // TODO: 需要 adapter 实现
+                requires_materialized_runtime_skills: false, // TODO: 需要 adapter 实现
+                supports_model_profiles: false, // TODO: 需要 adapter 实现
+                supports_acp: false, // TODO: 需要 adapter 实现 ACP
+            };
+            
+            GlobalAdapterInfo {
+                adapter_type: adapter_type_str.clone(),
+                label: adapter.label().to_string(),
+                source: if external_record.is_some() { "external" } else { "builtin" }.to_string(),
+                models_count: adapter.models().len(),
+                loaded: true, // 如果在注册表中，就是已加载
+                disabled: is_disabled,
+                capabilities,
+                overridden_builtin: if external_record.is_some() && is_builtin {
+                    Some(true)
+                } else {
+                    None
+                },
+                override_paused: if is_builtin {
+                    Some(is_override_paused)
+                } else {
+                    None
+                },
+                version: external_record.and_then(|r| r.version.clone()),
+                package_name: external_record.map(|r| r.package_name.clone()),
+                is_local_path: external_record.and_then(|r| {
+                    r.local_path.as_ref().map(|_| true)
+                }),
+            }
         })
         .collect();
+    
+    // 按适配器类型排序（对齐 Paperclip）
+    adapters.sort_by(|a, b| a.adapter_type.cmp(&b.adapter_type));
+    
     Ok(Json(adapters))
 }
-
 /// E2: POST /adapters/install - 安装适配器
+///
+/// 请求体:
+/// - packageName: npm 包名或本地路径
+/// - isLocalPath: 是否为本地路径（默认 false）
+/// - version: 目标版本（可选）
 async fn install_adapter(
-    State(_state): State<AdapterAppState>,
+    State(state): State<AdapterAppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    let adapter_type = payload
-        .get("adapterType")
+    use services::adapter_package_loader::AdapterPackageLoader;
+    use services::npm_manager::NpmManager;
+    
+    // 1. 解析请求参数
+    let package_name = payload
+        .get("packageName")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+        .ok_or_else(|| AppError::BadRequest("packageName is required".to_string()))?;
+    
+    let is_local_path = payload
+        .get("isLocalPath")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    
+    let version = payload
+        .get("version")
+        .and_then(|v| v.as_str());
+    
+    // 2. 处理版本后缀（如 "pkg@1.2.3"）
+    let (canonical_name, explicit_version) = if !is_local_path && package_name.contains('@') {
+        let (name, ver) = NpmManager::parse_package_spec(package_name);
+        (name, ver.or(version))
+    } else {
+        (package_name, version)
+    };
+    
+    tracing::info!(
+        package_name = canonical_name,
+        is_local_path = is_local_path,
+        version = ?explicit_version,
+        "Installing adapter package"
+    );
+    
+    // 3. 安装或加载适配器包
+    let loader = AdapterPackageLoader::with_default_config();
+    
+    let plugin_record = if is_local_path {
+        // 本地路径安装
+        loader.load_local_adapter(canonical_name)
+            .map_err(|e| AppError::BadRequest(format!("Failed to load local adapter: {}", e)))?
+    } else {
+        // npm 安装
+        loader.install_npm_adapter(canonical_name, explicit_version)
+            .map_err(|e| AppError::BadRequest(format!("Failed to install npm adapter: {}", e)))?
+    };
+    
+    // 4. 注册到适配器状态管理
+    state.adapter_registry_state.add_external_plugin(plugin_record.clone());
+    
+    // 5. TODO: 动态加载并注册到 AdapterRegistry
+    // 这需要实现动态加载 .so/.dylib/.dll 的机制
+    tracing::warn!(
+        adapter_type = %plugin_record.adapter_type,
+        "Adapter installed to registry state, but dynamic loading not yet implemented"
+    );
+    
+    // 6. 返回成功响应
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
-            "adapterType": adapter_type,
+            "type": plugin_record.adapter_type,
+            "packageName": plugin_record.package_name,
+            "version": plugin_record.version,
+            "isLocalPath": plugin_record.local_path.is_some(),
             "installed": true,
-            "message": format!("Adapter '{}' installation initiated", adapter_type),
+            "message": format!("Adapter '{}' installed successfully", plugin_record.adapter_type),
         })),
     ))
 }
@@ -432,29 +544,50 @@ async fn get_global_adapter_info(
     })))
 }
 
-/// E4: PATCH /adapters/:adapter_type - 更新适配器配置
+/// E4: PATCH /adapters/:adapter_type - 更新适配器配置（启用/禁用）
+///
+/// 请求体:
+/// - disabled: boolean (是否禁用)
 async fn update_adapter_config(
-    State(_state): State<AdapterAppState>,
+    State(state): State<AdapterAppState>,
     Path(adapter_type_str): Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
+    // 1. 解析请求参数
+    let disabled = payload
+        .get("disabled")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| AppError::BadRequest("disabled (boolean) is required".to_string()))?;
+    
+    // 2. 检查适配器是否存在
+    let adapter_type = adapter_type_str.parse::<services::server_adapter::AdapterType>()
+        .map_err(|_| AppError::NotFound(format!("Adapter \"{}\" not found", adapter_type_str)))?;
+    
+    if !state.adapter_registry.has_adapter(adapter_type) {
+        return Err(AppError::NotFound(format!(
+            "Adapter \"{}\" is not registered",
+            adapter_type_str
+        )));
+    }
+    
+    // 3. 更新禁用状态
+    let was_disabled = state.adapter_registry_state.is_disabled(&adapter_type_str);
+    state.adapter_registry_state.set_disabled(&adapter_type_str, disabled);
+    let changed = was_disabled != disabled;
+    
+    if changed {
+        tracing::info!(
+            adapter_type = %adapter_type_str,
+            disabled = disabled,
+            "Adapter enabled/disabled"
+        );
+    }
+    
+    // 4. 返回结果
     Ok(Json(serde_json::json!({
-        "adapterType": adapter_type_str,
-        "config": payload,
-        "updated": true,
-    })))
-}
-
-/// E5: PATCH /adapters/:adapter_type/override - 覆盖适配器配置
-async fn override_adapter_config(
-    State(_state): State<AdapterAppState>,
-    Path(adapter_type_str): Path<String>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<impl IntoResponse, AppError> {
-    Ok(Json(serde_json::json!({
-        "adapterType": adapter_type_str,
-        "override": payload,
-        "overridden": true,
+        "type": adapter_type_str,
+        "disabled": disabled,
+        "changed": changed,
     })))
 }
 
@@ -463,43 +596,108 @@ async fn delete_adapter(
     State(_state): State<AdapterAppState>,
     Path(_adapter_type_str): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    // TODO: 实现完整的删除逻辑
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// E7: POST /adapters/:adapter_type/reload - 重新加载适配器
+/// E7: POST /adapters/:adapter_type/reload - 重载外部适配器
 async fn reload_adapter(
-    State(_state): State<AdapterAppState>,
+    State(state): State<AdapterAppState>,
     Path(adapter_type_str): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    use services::builtin_adapter_types::is_builtin_adapter_type;
+    
+    // 1. 内置适配器不能重载（除非被外部覆盖）
+    let is_builtin = is_builtin_adapter_type(&adapter_type_str);
+    let external_record = state.adapter_registry_state.get_external_plugin(&adapter_type_str);
+    
+    if is_builtin && external_record.is_none() {
+        return Err(AppError::BadRequest("Cannot reload built-in adapter".to_string()));
+    }
+    
+    // 2. 检查是否为外部安装的适配器
+    let record = external_record.ok_or_else(|| {
+        AppError::NotFound(format!(
+            "Adapter \"{}\" is not an externally installed adapter",
+            adapter_type_str
+        ))
+    })?;
+    
+    // 3. TODO: 实现动态重载逻辑
+    tracing::warn!(
+        adapter_type = %adapter_type_str,
+        "Adapter reload requested, but dynamic reloading not yet implemented"
+    );
+    
+    // 4. 返回结果（目前只是模拟）
     Ok(Json(serde_json::json!({
-        "adapterType": adapter_type_str,
-        "reloaded": true,
+        "type": adapter_type_str,
+        "version": record.version,
+        "reloaded": false,
+        "message": "Dynamic reloading not yet implemented",
     })))
 }
 
 /// E8: POST /adapters/:adapter_type/reinstall - 重新安装适配器
-async fn reinstall_adapter(
-    State(_state): State<AdapterAppState>,
+/// E5: PATCH /adapters/:adapter_type/override - 暂停/恢复外部适配器覆盖
+///
+/// 请求体:
+/// - paused: boolean (是否暂停外部覆盖)
+async fn override_adapter_config(
+    State(state): State<AdapterAppState>,
     Path(adapter_type_str): Path<String>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
+    use services::builtin_adapter_types::is_builtin_adapter_type;
+    
+    // 1. 解析请求参数
+    let paused = payload
+        .get("paused")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| AppError::BadRequest("paused (boolean) is required".to_string()))?;
+    
+    // 2. 检查是否为内置适配器类型
+    if !is_builtin_adapter_type(&adapter_type_str) {
+        return Err(AppError::BadRequest(format!(
+            "Type \"{}\" is not a builtin adapter",
+            adapter_type_str
+        )));
+    }
+    
+    // 3. 更新覆盖暂停状态
+    let was_paused = state.adapter_registry_state.is_override_paused(&adapter_type_str);
+    state.adapter_registry_state.set_override_paused(&adapter_type_str, paused);
+    let changed = was_paused != paused;
+    
+    if changed {
+        tracing::info!(
+            adapter_type = %adapter_type_str,
+            paused = paused,
+            "Adapter override toggle"
+        );
+    }
+    
+    
+    // 4. 返回结果
     Ok(Json(serde_json::json!({
-        "adapterType": adapter_type_str,
-        "reinstalled": true,
+        "type": adapter_type_str,
+        "paused": paused,
+        "changed": changed,
     })))
 }
 
-/// E9: GET /adapters/:adapter_type/config-schema - 获取配置 Schema
+/// E9: GET /adapters/:adapter_type/config-schema - 获取配置 schema
 async fn get_adapter_config_schema(
     State(state): State<AdapterAppState>,
     Path(adapter_type_str): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
-        Ok(t) => t,
-        Err(_) => return Err(AppError::NotFound(format!("Adapter \"{}\" is not registered", adapter_type_str))),
-    };
+    let adapter_type = adapter_type_str.parse::<services::server_adapter::AdapterType>()
+        .map_err(|_| AppError::NotFound(format!("Adapter \"{}\" not found", adapter_type_str)))?;
+    
     let adapter = state.adapter_registry
         .find_adapter(adapter_type)
         .map_err(|_| AppError::NotFound(format!("Adapter \"{}\" is not registered", adapter_type_str)))?;
+    
     Ok(Json(serde_json::json!({
         "adapterType": adapter_type_str,
         "schema": adapter.get_config_schema(),
@@ -511,27 +709,18 @@ async fn get_adapter_ui_parser(
     State(_state): State<AdapterAppState>,
     Path(adapter_type_str): Path<String>,
 ) -> Result<axum::response::Response, AppError> {
-    // ServerAdapterModule intentionally exposes no executable UI parser. A
-    // 404 matches Paperclip's behavior when an adapter package does not ship
-    // its optional ./ui-parser entry; returning JavaScript that says it is
-    // unavailable causes clients to treat the asset as valid.
     Err(AppError::NotFound(format!("UI parser not found for adapter {}", adapter_type_str)))
 }
 
-/// 将模型层的适配器环境测试状态映射到 API 响应枚举
-fn map_adapter_test_status(
-    status: models::AdapterEnvironmentTestStatus,
-) -> crate::schemas::AdapterEnvironmentTestStatus {
-    match status {
-        models::AdapterEnvironmentTestStatus::Pass => {
-            crate::schemas::AdapterEnvironmentTestStatus::Pass
-        }
-        models::AdapterEnvironmentTestStatus::Fail => {
-            crate::schemas::AdapterEnvironmentTestStatus::Fail
-        }
-        models::AdapterEnvironmentTestStatus::Warn
-        | models::AdapterEnvironmentTestStatus::Warning => {
-            crate::schemas::AdapterEnvironmentTestStatus::Warning
-        }
-    }
+/// E8: POST /adapters/:adapter_type/reinstall - 重新安装适配器
+async fn reinstall_adapter(
+    State(_state): State<AdapterAppState>,
+    Path(adapter_type_str): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    // TODO: 实现重新安装逻辑
+    Ok(Json(serde_json::json!({
+        "type": adapter_type_str,
+        "reinstalled": false,
+        "message": "Reinstall not yet implemented",
+    })))
 }

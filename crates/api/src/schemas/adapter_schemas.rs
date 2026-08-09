@@ -156,6 +156,77 @@ pub struct ListAdaptersResponse {
     pub adapters: Vec<AdapterInfoResponse>,
 }
 
+/// 全局适配器信息响应（对齐 Paperclip 的 AdapterInfo）
+/// 用于 GET /adapters 端点
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalAdapterInfo {
+    /// 适配器类型
+    #[serde(rename = "type")]
+    pub adapter_type: String,
+
+    /// 显示标签
+    pub label: String,
+
+    /// 来源：builtin 或 external
+    pub source: String,
+
+    /// 模型数量
+    pub models_count: usize,
+
+    /// 是否已加载
+    pub loaded: bool,
+
+    /// 是否被禁用
+    pub disabled: bool,
+
+    /// 能力集合
+    pub capabilities: AdapterCapabilities,
+
+    /// 是否为被外部覆盖的内置适配器
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overridden_builtin: Option<bool>,
+
+    /// 内置适配器的外部覆盖是否被暂停
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_paused: Option<bool>,
+
+    /// 版本号
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+
+    /// npm 包名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+
+    /// 是否为本地路径安装
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_local_path: Option<bool>,
+}
+
+/// 适配器能力集合
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterCapabilities {
+    /// 支持指令包
+    pub supports_instructions_bundle: bool,
+
+    /// 支持技能
+    pub supports_skills: bool,
+
+    /// 支持本地 Agent JWT
+    pub supports_local_agent_jwt: bool,
+
+    /// 需要物化的运行时技能
+    pub requires_materialized_runtime_skills: bool,
+
+    /// 支持模型配置文件
+    pub supports_model_profiles: bool,
+
+    /// 支持 ACP (Agent Control Protocol)
+    pub supports_acp: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
