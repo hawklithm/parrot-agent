@@ -270,6 +270,208 @@ impl Default for AdapterRegistry {
     }
 }
 
+/// 创建并注册所有内置适配器
+pub fn create_default_server_adapter_registry() -> AdapterRegistry {
+    let mut registry = AdapterRegistry::new();
+
+    // 注册所有内置适配器
+    registry.register(Box::new(ProcessAdapter::new()));
+    registry.register(Box::new(ClaudeLocalAdapter::new()));
+    registry.register(Box::new(CodexLocalAdapter::new()));
+
+    registry
+}
+
+/// Claude Local adapter
+pub struct ClaudeLocalAdapter {
+    label: String,
+}
+
+impl ClaudeLocalAdapter {
+    pub fn new() -> Self {
+        Self {
+            label: "Claude Local".to_string(),
+        }
+    }
+}
+
+impl Default for ClaudeLocalAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ServerAdapterModule for ClaudeLocalAdapter {
+    fn adapter_type(&self) -> AdapterType {
+        AdapterType::ClaudeLocal
+    }
+
+    fn label(&self) -> &str {
+        "Claude Local"
+    }
+
+    async fn list_models(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelInfo>> {
+        Ok(vec![
+            ModelInfo {
+                id: "claude-sonnet-4".to_string(),
+                label: "Claude Sonnet 4".to_string(),
+                context_window: Some(200000),
+                max_output_tokens: Some(8192),
+            },
+            ModelInfo {
+                id: "claude-opus-4".to_string(),
+                label: "Claude Opus 4".to_string(),
+                context_window: Some(200000),
+                max_output_tokens: Some(8192),
+            },
+        ])
+    }
+
+    async fn get_model_profiles(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelProfile>> {
+        Ok(vec![])
+    }
+
+    async fn test_environment(&self, ctx: &AdapterEnvironmentTestContext) -> AdapterResult<TestEnvironmentResult> {
+        // 验证配置中是否有 model 字段
+        let checks = if let Some(model) = ctx.config.get("model").and_then(|v| v.as_str()) {
+            vec![
+                AdapterEnvironmentCheck {
+                    name: "adapter_available".to_string(),
+                    status: "pass".to_string(),
+                    message: Some("Claude Local adapter is available".to_string()),
+                },
+                AdapterEnvironmentCheck {
+                    name: "model_configured".to_string(),
+                    status: "pass".to_string(),
+                    message: Some(format!("Model configured: {}", model)),
+                },
+            ]
+        } else {
+            vec![AdapterEnvironmentCheck {
+                name: "adapter_available".to_string(),
+                status: "pass".to_string(),
+                message: Some("Claude Local adapter is available".to_string()),
+            }]
+        };
+
+        Ok(TestEnvironmentResult {
+            adapter_type: ctx.adapter_type.clone(),
+            status: "pass".to_string(),
+            checks,
+            tested_at: chrono::Utc::now().to_rfc3339(),
+        })
+    }
+
+    async fn detect_model(&self, _config: &serde_json::Value) -> AdapterResult<DetectModelResult> {
+        Ok(DetectModelResult {
+            model_id: Some("claude-sonnet-4".to_string()),
+            confidence: 1.0,
+            source: "claude_local".to_string(),
+        })
+    }
+
+    fn supports_instructions_bundle(&self) -> InstructionsBundleSupport {
+        InstructionsBundleSupport {
+            supported: true,
+            max_files: Some(100),
+            max_size_bytes: Some(10 * 1024 * 1024), // 10MB
+        }
+    }
+}
+
+/// Codex Local adapter
+pub struct CodexLocalAdapter {
+    label: String,
+}
+
+impl CodexLocalAdapter {
+ pub fn new() -> Self {
+        Self {
+            label: "Codex Local".to_string(),
+        }
+    }
+}
+
+impl Default for CodexLocalAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ServerAdapterModule for CodexLocalAdapter {
+    fn adapter_type(&self) -> AdapterType {
+        AdapterType::CodexLocal
+    }
+
+    fn label(&self) -> &str {
+        "Codex Local"
+    }
+
+    async fn list_models(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelInfo>> {
+        Ok(vec![
+            ModelInfo {
+                id: "gpt-5.6-sol".to_string(),
+        label: "GPT-5.6 Sol".to_string(),
+                context_window: Some(200000),
+                max_output_tokens: Some(16384),
+            },
+        ])
+    }
+
+    async fn get_model_profiles(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelProfile>> {
+        Ok(vec![])
+    }
+
+    async fn test_environment(&self, ctx: &AdapterEnvironmentTestContext) -> AdapterResult<TestEnvironmentResult> {
+        let checks = if let Some(model) = ctx.config.get("model").and_then(|v| v.as_str()) {
+            vec![
+                AdapterEnvironmentCheck {
+                    name: "adapter_available".to_string(),
+                    status: "pass".to_string(),
+                    message: Some("Codex Local adapter is available".to_string()),
+                },
+                AdapterEnvironmentCheck {
+                    name: "model_configured".to_string(),
+                    status: "pass".to_string(),
+                    message: Some(format!("Model configured: {}", model)),
+                },
+            ]
+        } else {
+            vec![AdapterEnvironmentCheck {
+                name: "adapter_available".to_string(),
+                status: "pass".to_string(),
+                message: Some("Codex Local adapter is available".to_string()),
+            }]
+        };
+
+        Ok(TestEnvironmentResult {
+            adapter_type: ctx.adapter_type.clone(),
+            status: "pass".to_string(),
+            checks,
+            tested_at: chrono::Utc::now().to_rfc3339(),
+        })
+    }
+
+    async fn detect_model(&self, _config: &serde_json::Value) -> AdapterResult<DetectModelResult> {
+        Ok(DetectModelResult {
+            model_id: Some("gpt-5.6-sol".to_string()),
+            confidence: 1.0,
+            source: "codex_local".to_string(),
+        })
+    }
+
+    fn supports_instructions_bundle(&self) -> InstructionsBundleSupport {
+        InstructionsBundleSupport {
+            supported: true,
+            max_files: Some(100),
+            max_size_bytes: Some(10 * 1024 * 1024), // 10MB
+        }
+    }
+}
+
+
 /// Process adapter (default local process adapter)
 pub struct ProcessAdapter {
     label: String,

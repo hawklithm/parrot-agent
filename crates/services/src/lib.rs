@@ -308,7 +308,7 @@ pub use adapter_plugin::{
     ModelProfileRequestSource,
 };
 pub use adapter_registry::create_default_adapter_registry;
-pub use server_adapter::{AdapterRegistry, ServerAdapterModule};
+pub use server_adapter::{AdapterRegistry, ServerAdapterModule, create_default_server_adapter_registry};
 pub use adapter_registry_state::AdapterRegistryState;
 pub use adapter_executor::*;
 pub mod issue_execution_lock_service;

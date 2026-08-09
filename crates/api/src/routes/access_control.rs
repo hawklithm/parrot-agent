@@ -466,10 +466,15 @@ async fn revoke_board_api_key(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateInviteRequest {
+    #[serde(default = "default_invite_type")]
     invite_type: String,
     email: Option<String>,
     allowed_join_types: Option<String>,
     ttl_hours: Option<i64>,
+}
+
+fn default_invite_type() -> String {
+    "company_join".to_string()
 }
 
 /// POST /api/companies/:company_id/invites
@@ -510,18 +515,26 @@ async fn create_invite(
     let now = Utc::now();
     let expires_at = now + chrono::Duration::hours(payload.ttl_hours.unwrap_or(72));
 
+    // Agent invites 不需要 email；human invites 需要 email
+    let invited_email = if allowed_join_types == "agent" {
+        None
+    } else {
+        payload.email.as_ref().or(Some(&"".to_string())).cloned()
+    };
+
     // Store invite in database using raw SQL
+    // 注意：invite_type 和 allowed_join_types 是数据库枚举类型，需要显式转换
     let invite_id = Uuid::new_v4();
     sqlx::query(
         r#"INSERT INTO invites (id, company_id, invite_type, invited_by_user_id, invited_email, token,
            allowed_join_types, expires_at, accepted, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9)"#
+           VALUES ($1, $2, $3::invite_type, $4, $5, $6, $7::allowed_join_types, $8, false, $9)"#
     )
     .bind(invite_id)
     .bind(company_id)
     .bind(invite_type)
     .bind(user_id)
-    .bind(&payload.email)
+    .bind(invited_email)
     .bind(&token)
     .bind(allowed_join_types)
     .bind(expires_at)
