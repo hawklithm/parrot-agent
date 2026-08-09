@@ -1,4 +1,5 @@
 pub mod access_control;
+pub mod health;
 pub mod adapters;
 pub mod agents;
 pub mod attachments;
