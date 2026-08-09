@@ -1164,6 +1164,35 @@ async fn create_issue(
         AuthorizationActor::Agent { run_id, .. } => *run_id,
         _ => None,
     };
+    
+    // ✅ Paperclip pattern: Force override creator fields from actor (issues.ts:6963-6968)
+    // Sanitize: strip any createdByUserId if actor is Agent (prevents spoofing)
+    if matches!(actor, AuthorizationActor::Agent { .. }) {
+        input.created_by_user_id = None;
+    }
+    
+    // Force set creator fields based on actor type
+    match &actor {
+        AuthorizationActor::Agent { agent_id, run_id, .. } => {
+            input.created_by_agent_id = Some(*agent_id);
+            input.origin_run_id = *run_id;
+            // Set origin_kind only if not already set by watchdog discovery
+            if input.origin_kind.is_none() {
+                input.origin_kind = Some("agent".to_string());
+            }
+        }
+        AuthorizationActor::Board { user_id, .. } => {
+            input.created_by_user_id = Some(*user_id);
+            // Set origin_kind only if not already set
+            if input.origin_kind.is_none() {
+                input.origin_kind = Some("manual".to_string());
+            }
+        }
+        AuthorizationActor::None => {
+            // Anonymous actor - should not reach here due to auth middleware
+        }
+    }
+    
     // Paperclip takes the company scope from the URL. The body must not need
     // to repeat companyId, and the path is authoritative if it is supplied.
     input.company_id = company_id;
@@ -1684,9 +1713,38 @@ async fn create_child_issue(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(parent_id): Path<Uuid>,
-    Json(input): Json<CreateIssueInput>,
+    Json(mut input): Json<CreateIssueInput>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let service = state.issue_service.clone();
+    
+    // ✅ Paperclip pattern: Force override creator fields from actor (issues.ts:7139-7146)
+    // Sanitize: strip any createdByUserId if actor is Agent (prevents spoofing)
+    if matches!(actor, AuthorizationActor::Agent { .. }) {
+        input.created_by_user_id = None;
+    }
+    
+    // Force set creator fields based on actor type
+    match &actor {
+        AuthorizationActor::Agent { agent_id, run_id, .. } => {
+            input.created_by_agent_id = Some(*agent_id);
+            input.origin_run_id = *run_id;
+            // Set origin_kind only if not already set
+            if input.origin_kind.is_none() {
+                input.origin_kind = Some("agent".to_string());
+            }
+        }
+        AuthorizationActor::Board { user_id, .. } => {
+            input.created_by_user_id = Some(*user_id);
+            // Set origin_kind only if not already set
+            if input.origin_kind.is_none() {
+                input.origin_kind = Some("manual".to_string());
+            }
+        }
+        AuthorizationActor::None => {
+            // Anonymous actor - should not reach here due to auth middleware
+        }
+    }
+    
     let input_with_parent = CreateIssueInput {
         parent_id: Some(parent_id),
         ..input

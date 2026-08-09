@@ -90,14 +90,38 @@ pub struct ModelPricing {
     pub currency: String,
 }
 
-/// Test environment result
+/// Test environment check
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterEnvironmentCheck {
+    pub name: String,
+    pub status: String, // "pass" | "fail" | "warn"
+    pub message: Option<String>,
+}
+
+/// Test environment result (aligned with Paperclip's AdapterEnvironmentTestResult)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestEnvironmentResult {
-    pub ok: bool,
+    #[serde(rename = "adapterType")]
     pub adapter_type: String,
-    pub summary: String,
-    pub details: HashMap<String, serde_json::Value>,
-    pub detected_model: Option<String>,
+    pub status: String, // "pass" | "fail" | "partial"
+    pub checks: Vec<AdapterEnvironmentCheck>,
+    #[serde(rename = "testedAt")]
+    pub tested_at: String, // ISO 8601 timestamp
+}
+
+/// Test environment context (aligned with Paperclip's AdapterEnvironmentTestContext)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterEnvironmentTestContext {
+    #[serde(rename = "companyId")]
+    pub company_id: String,
+    #[serde(rename = "adapterType")]
+    pub adapter_type: String,
+    pub config: serde_json::Value,
+    #[serde(rename = "executionTarget")]
+    pub execution_target: Option<serde_json::Value>,
+    #[serde(rename = "environmentName")]
+    pub environment_name: Option<String>,
+    pub deployment: Option<serde_json::Value>,
 }
 
 /// Detect model result
@@ -132,13 +156,34 @@ pub trait ServerAdapterModule: Send + Sync {
     async fn get_model_profiles(&self, config: &serde_json::Value) -> AdapterResult<Vec<ModelProfile>>;
 
     /// Test environment connectivity and configuration
-    async fn test_environment(&self, config: &serde_json::Value) -> AdapterResult<TestEnvironmentResult>;
+    async fn test_environment(&self, ctx: &AdapterEnvironmentTestContext) -> AdapterResult<TestEnvironmentResult>;
 
     /// Detect available model from configuration
     async fn detect_model(&self, config: &serde_json::Value) -> AdapterResult<DetectModelResult>;
 
     /// Check if adapter supports instructions bundle
+    /// Check if adapter supports instructions bundle
     fn supports_instructions_bundle(&self) -> InstructionsBundleSupport;
+
+    /// Get agent configuration documentation (optional)
+    fn agent_configuration_doc(&self) -> Option<&str> {
+        None
+    }
+
+    /// Get instructions path key (config key for instructions file path)
+    fn instructions_path_key(&self) -> &str {
+        "instructionsFilePath"
+    }
+
+    /// Get static model list (optional, prefer list_models for dynamic)
+    fn models(&self) -> &[ModelInfo] {
+        &[]
+    }
+
+    /// Get config schema (optional)
+    fn get_config_schema(&self) -> Option<serde_json::Value> {
+        None
+    }
 
     /// Normalize adapter configuration for persistence
     fn normalize_config(&self, config: serde_json::Value) -> AdapterResult<serde_json::Value> {
@@ -154,6 +199,16 @@ pub trait ServerAdapterModule: Send + Sync {
     /// default keeps adapters without a quota API out of the aggregate result.
     async fn get_quota_windows(&self) -> AdapterResult<Vec<crate::cost_service::QuotaWindow>> {
         Ok(Vec::new())
+    }
+
+    /// Optional lifecycle hook when an agent is approved/hired
+    async fn on_hire_approved(
+        &self,
+        _payload: serde_json::Value,
+        _adapter_config: &serde_json::Value,
+    ) -> AdapterResult<serde_json::Value> {
+        // Default: no-op, return empty success
+        Ok(serde_json::json!({}))
     }
 }
 
@@ -196,6 +251,17 @@ impl AdapterRegistry {
     pub fn has_adapter(&self, adapter_type: AdapterType) -> bool {
         self.adapters.contains_key(&adapter_type)
     }
+
+    /// List all model profiles from all registered adapters
+    pub async fn list_adapter_model_profiles(&self) -> Vec<ModelProfile> {
+        let mut profiles = Vec::new();
+        for adapter in self.adapters.values() {
+            if let Ok(adapter_profiles) = adapter.get_model_profiles(&serde_json::json!({})).await {
+                profiles.extend(adapter_profiles);
+            }
+        }
+        profiles
+    }
 }
 
 impl Default for AdapterRegistry {
@@ -223,6 +289,8 @@ impl Default for ProcessAdapter {
     }
 }
 
+
+
 #[async_trait]
 impl ServerAdapterModule for ProcessAdapter {
     fn adapter_type(&self) -> AdapterType {
@@ -230,30 +298,31 @@ impl ServerAdapterModule for ProcessAdapter {
     }
 
     fn label(&self) -> &str {
-        &self.label
+        "Process"
     }
 
     async fn list_models(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelInfo>> {
-        // Process adapter doesn't have specific models
         Ok(vec![])
     }
 
     async fn get_model_profiles(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelProfile>> {
         Ok(vec![])
     }
-
-    async fn test_environment(&self, _config: &serde_json::Value) -> AdapterResult<TestEnvironmentResult> {
+    async fn test_environment(&self, ctx: &AdapterEnvironmentTestContext) -> AdapterResult<TestEnvironmentResult> {
         // TODO: Integrate with EnvironmentRuntimeService
         // - acquire_run_lease()
         // - test basic connectivity
         // - release_run_lease()
 
         Ok(TestEnvironmentResult {
-            ok: true,
-            adapter_type: self.adapter_type().to_string(),
-            summary: "Process adapter is available".to_string(),
-            details: HashMap::new(),
-            detected_model: None,
+            adapter_type: ctx.adapter_type.clone(),
+            status: "pass".to_string(),
+            checks: vec![AdapterEnvironmentCheck {
+                name: "adapter_available".to_string(),
+                status: "pass".to_string(),
+                message: Some("Process adapter is available".to_string()),
+            }],
+            tested_at: chrono::Utc::now().to_rfc3339(),
         })
     }
 

@@ -612,81 +612,121 @@ async fn get_company_timeline(
     Path(company_id): Path<Uuid>,
     Query(query): Query<TimelineQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    const MAX_WINDOW_MS: i64 = 31 * 24 * 3600 * 1000;
+    
+    let now = chrono::Utc::now();
+    let from = query.from.unwrap_or_else(|| now - chrono::Duration::days(7));
+    let to = query.to.unwrap_or(now);
+    
+    let duration_ms = (to - from).num_milliseconds();
+    let (actual_from, actual_to, capped) = if duration_ms > MAX_WINDOW_MS {
+        (to - chrono::Duration::milliseconds(MAX_WINDOW_MS), to, true)
+    } else {
+        (from, to, false)
+    };
+    
     let wq = services::work_timeline_service::WorkTimelineQuery {
         company_id,
         issue_id: query.issue_id,
         user_id: query.user_id,
         goal_id: query.goal_id,
         project_id: query.project_id,
+        from: Some(actual_from),
+        to: Some(actual_to),
+        limit: query.limit,
+        offset: query.offset,
     };
-    let raw_events = state
+    
+    let mut issue_ids = state
         .work_timeline_service
-        .load_events(&wq)
+        .collect_issue_ids(&wq, actual_from, actual_to)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    let now = chrono::Utc::now();
-    let from = query
-        .from
-        .unwrap_or_else(|| now - chrono::Duration::days(7));
-    let to = query.to.unwrap_or(now);
-
-    let mut actors = Vec::new();
-    let mut events = Vec::new();
-    for event in raw_events {
-        let actor_id = event
-            .get("actorId")
-            .and_then(|value| value.as_str())
-            .map(|id| format!("system:{id}"))
-            .unwrap_or_else(|| "system:system".to_string());
-        if !actors
-            .iter()
-            .any(|actor: &serde_json::Value| actor["id"] == actor_id)
-        {
-            actors.push(serde_json::json!({
-                "id": actor_id,
-                "type": "system",
-                "name": "System",
-                "avatar": null
-            }));
-        }
-        let issue_id = event
-            .get("resourceId")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let at = event
-            .get("createdAt")
-            .cloned()
-            .unwrap_or(serde_json::json!(to));
-        let kind = match event.get("eventType").and_then(|value| value.as_str()) {
-            Some(value) if value.contains("comment") => "commented",
-            Some(value) if value.contains("assign") => "assigned",
-            Some(value) if value.contains("approv") => "approved",
-            Some(value) if value.contains("delegat") => "delegated",
-            _ => "created",
-        };
-        events.push(serde_json::json!({
-            "actorId": actor_id,
-            "kind": kind,
-            "issueId": issue_id,
-            "at": at
-        }));
+    
+    if let Some(user_id) = query.user_id {
+        issue_ids = state
+            .work_timeline_service
+            .apply_user_lens(company_id, user_id, issue_ids, actual_from, actual_to)
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     }
-
+    
+    let total_issues = issue_ids.len();
+    let offset = query.offset.unwrap_or(0).max(0) as usize;
+    let limit = query.limit.unwrap_or(200).min(500).max(1) as usize;
+    let has_more = offset + limit < total_issues;
+    
+    let paged_issue_ids: Vec<Uuid> = issue_ids
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect();
+    
+    if paged_issue_ids.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "actors": [],
+            "spans": [],
+            "events": [],
+            "edges": [],
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "totalIssues": total_issues,
+                "hasMore": has_more
+            },
+            "window": {
+                "from": actual_from.to_rfc3339(),
+                "to": actual_to.to_rfc3339(),
+                "capped": capped
+            }
+        })));
+    }
+    
+    let (spans, comment_events, approval_events, edges) = tokio::try_join!(
+        state.work_timeline_service.load_heartbeat_runs(company_id, &paged_issue_ids, actual_from, actual_to),
+        state.work_timeline_service.load_issue_comments(company_id, &paged_issue_ids, actual_from, actual_to),
+        state.work_timeline_service.load_approvals(company_id, &paged_issue_ids, actual_from, actual_to),
+        state.work_timeline_service.extract_edges(company_id, &paged_issue_ids),
+    )
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    
+    let mut events = comment_events;
+    events.extend(approval_events);
+    
+    let mut actor_ids = std::collections::HashSet::new();
+    for span in &spans {
+        actor_ids.insert(span.actor_id.clone());
+    }
+    for event in &events {
+        actor_ids.insert(event.actor_id.clone());
+    }
+    for edge in &edges {
+        actor_ids.insert(edge.from_actor_id.clone());
+        actor_ids.insert(edge.to_actor_id.clone());
+    }
+    
+    let actor_ids_vec: Vec<String> = actor_ids.into_iter().collect();
+    let actors = state
+        .work_timeline_service
+        .load_actors(&actor_ids_vec)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    
     Ok(Json(serde_json::json!({
         "actors": actors,
-        "spans": [],
+        "spans": spans,
         "events": events,
-        "edges": [],
+        "edges": edges,
         "pagination": {
-            "limit": 200,
-            "offset": 0,
-            "totalIssues": events.len(),
-            "hasMore": false
+            "limit": limit,
+            "offset": offset,
+            "totalIssues": total_issues,
+            "hasMore": has_more
         },
         "window": {
-            "from": from,
-            "to": to,
-            "capped": false
+            "from": actual_from.to_rfc3339(),
+            "to": actual_to.to_rfc3339(),
+            "capped": capped
         }
     })))
 }

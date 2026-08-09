@@ -69,32 +69,30 @@ pub fn adapter_routes() -> Router<AdapterAppState> {
 /// GET /companies/:company_id/adapters - 列出所有可用适配器
 async fn list_adapters(
     State(state): State<AdapterAppState>,
-    CompanyIdOrShortname(_company_id): CompanyIdOrShortname,
+    Path(_company_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let all_adapters = state.adapter_registry.list_all();
+    let all_adapters = state.adapter_registry.adapters();
 
     let adapters: Vec<AdapterInfoResponse> = all_adapters
-        .iter()
+        .into_iter()
         .map(|adapter| {
             let models: Vec<AdapterModelResponse> = adapter
                 .models()
-                .into_iter()
+                .iter()
                 .map(|m| AdapterModelResponse {
-                    id: m.id,
-                    label: m.label,
+                    id: m.id.clone(),
+                    label: m.label.clone(),
                 })
                 .collect();
 
             AdapterInfoResponse {
-                adapter_type: adapter.adapter_type().as_str().to_string(),
+                adapter_type: adapter.adapter_type().to_string(),
                 label: adapter.label().to_string(),
                 models,
-                config_schema: Some(
-                    serde_json::to_value(adapter.get_config_schema()).unwrap_or_default(),
-                ),
-                supports_instructions_bundle: adapter.supports_instructions_bundle(),
-                instructions_path_key: adapter.instructions_path_key().map(String::from),
-                agent_configuration_doc: Some(adapter.agent_configuration_doc().to_string()),
+                config_schema: adapter.get_config_schema(),
+                supports_instructions_bundle: adapter.supports_instructions_bundle().supported,
+                instructions_path_key: Some(adapter.instructions_path_key().to_string()),
+                agent_configuration_doc: adapter.agent_configuration_doc().map(String::from),
             }
         })
         .collect();
@@ -107,28 +105,32 @@ async fn get_adapter_info(
     State(state): State<AdapterAppState>,
     Path((_company_id, adapter_type_str)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
+    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
+        Ok(t) => t,
+        Err(_) => return Err(AppError::NotFound("Adapter not found".to_string())),
+    };
     let adapter = state
         .adapter_registry
-        .find_server_adapter(&adapter_type_str)
-        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
+        .find_adapter(adapter_type)
+        .map_err(|_| AppError::NotFound("Adapter not found".to_string()))?;
 
     let models: Vec<AdapterModelResponse> = adapter
         .models()
-        .into_iter()
+        .iter()
         .map(|m| AdapterModelResponse {
-            id: m.id,
-            label: m.label,
+            id: m.id.clone(),
+            label: m.label.clone(),
         })
         .collect();
 
     let response = AdapterInfoResponse {
-        adapter_type: adapter.adapter_type().as_str().to_string(),
+        adapter_type: adapter.adapter_type().to_string(),
         label: adapter.label().to_string(),
         models,
-        config_schema: Some(serde_json::to_value(adapter.get_config_schema()).unwrap_or_default()),
-        supports_instructions_bundle: adapter.supports_instructions_bundle(),
-        instructions_path_key: adapter.instructions_path_key().map(String::from),
-        agent_configuration_doc: Some(adapter.agent_configuration_doc().to_string()),
+        config_schema: adapter.get_config_schema(),
+        supports_instructions_bundle: adapter.supports_instructions_bundle().supported,
+        instructions_path_key: Some(adapter.instructions_path_key().to_string()),
+        agent_configuration_doc: adapter.agent_configuration_doc().map(String::from),
     };
 
     Ok(Json(response))
@@ -139,14 +141,19 @@ async fn list_models(
     State(state): State<AdapterAppState>,
     Path((_company_id, adapter_type_str)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
+    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
+        Ok(t) => t,
+        Err(_) => return Err(AppError::NotFound("Adapter not found".to_string())),
+    };
     let adapter = state
         .adapter_registry
-        .find_server_adapter(&adapter_type_str)
-        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
+        .find_adapter(adapter_type)
+        .map_err(|_| AppError::NotFound("Adapter not found".to_string()))?;
 
     let models: Vec<AdapterModelResponse> = adapter
-        .list_models()
+        .list_models(&serde_json::json!({}))
         .await
+        .unwrap_or_default()
         .into_iter()
         .map(|m| AdapterModelResponse {
             id: m.id,
@@ -165,10 +172,14 @@ async fn detect_model(
     Path((_company_id, adapter_type_str)): Path<(String, String)>,
     Json(payload): Json<DetectModelRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
+        Ok(t) => t,
+        Err(_) => return Err(AppError::NotFound("Adapter not found".to_string())),
+    };
     let _adapter = state
         .adapter_registry
-        .find_server_adapter(&adapter_type_str)
-        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
+        .find_adapter(adapter_type)
+        .map_err(|_| AppError::NotFound("Adapter not found".to_string()))?;
 
     // 尝试从配置中检测模型
     // 注意：这里需要 ServerAdapterModule trait 支持 detect_model 方法
@@ -202,10 +213,14 @@ async fn detect_model_get(
     State(state): State<AdapterAppState>,
     Path((_company_id, adapter_type_str)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
+        Ok(t) => t,
+        Err(_) => return Err(AppError::NotFound("Adapter not found".to_string())),
+    };
     state
         .adapter_registry
-        .find_server_adapter(&adapter_type_str)
-        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
+        .find_adapter(adapter_type)
+        .map_err(|_| AppError::NotFound("Adapter not found".to_string()))?;
 
     // A local adapter can only report a detected runtime model when its
     // executable is available. Returning null matches Paperclip's contract
@@ -219,16 +234,18 @@ async fn list_model_profiles(
     State(state): State<AdapterAppState>,
     Path((_company_id, adapter_type_str)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    state
+    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
+        Ok(t) => t,
+        Err(_) => return Err(AppError::NotFound("Adapter not found".to_string())),
+    };
+    let adapter = state
         .adapter_registry
-        .find_server_adapter(&adapter_type_str)
-        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
-    Ok(Json(
-        state
-            .adapter_registry
-            .list_adapter_model_profiles(&adapter_type_str)
-            .await,
-    ))
+        .find_adapter(adapter_type)
+        .map_err(|_| AppError::NotFound("Adapter not found".to_string()))?;
+    
+    let profiles = adapter.get_model_profiles(&serde_json::json!({})).await
+        .unwrap_or_default();
+    Ok(Json(profiles))
 }
 
 /// POST /companies/:company_id/adapters/:adapter_type/test-environment - 测试适配器环境
@@ -239,10 +256,14 @@ async fn test_environment(
 ) -> Result<impl IntoResponse, AppError> {
     let company_id = Uuid::parse_str(&company_id_str)
         .map_err(|_| AppError::BadRequest("Invalid company ID parameter".to_string()))?;
+    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
+        Ok(t) => t,
+        Err(_) => return Err(AppError::NotFound("Adapter not found".to_string())),
+    };
     let adapter = state
         .adapter_registry
-        .find_server_adapter(&adapter_type_str)
-        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
+        .find_adapter(adapter_type)
+        .map_err(|_| AppError::NotFound("Adapter not found".to_string()))?;
 
     // 如果需要租约，先获取租约
     let _lease_guard = if payload.with_lease {
@@ -291,11 +312,13 @@ async fn test_environment(
         .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         .unwrap_or_default();
 
-    let test_context = models::TestEnvironmentContext {
-        company_id,
-        agent_id: None,
-        adapter_config: adapter_config_map,
-        runtime_config: std::collections::HashMap::new(),
+    let test_context = services::server_adapter::AdapterEnvironmentTestContext {
+        company_id: company_id.to_string(),
+        adapter_type: adapter_type_str,
+        config: serde_json::to_value(adapter_config_map).unwrap_or_default(),
+        execution_target: None,
+        environment_name: None,
+        deployment: None,
     };
 
     // 执行环境测试
@@ -308,21 +331,34 @@ async fn test_environment(
     // 这确保即使测试失败，租约也会被正确释放
 
     // 转换为响应格式
+    // 解析 status 字符串为 enum
+    let status = match test_result.status.as_str() {
+        "pass" => crate::schemas::AdapterEnvironmentTestStatus::Pass,
+        "fail" => crate::schemas::AdapterEnvironmentTestStatus::Fail,
+        "warn" | "warning" => crate::schemas::AdapterEnvironmentTestStatus::Warning,
+        _ => crate::schemas::AdapterEnvironmentTestStatus::Pass,
+    };
+
     let response = TestAdapterEnvironmentResponse {
         adapter_type: test_result.adapter_type,
-        status: map_adapter_test_status(test_result.status),
+        status,
         tested_at: test_result.tested_at,
         checks: test_result
             .checks
             .into_iter()
-            .map(|check| crate::schemas::AdapterEnvironmentCheck {
-                name: check.name.unwrap_or_default(),
-                status: check
-                    .status
-                    .map(map_adapter_test_status)
-                    .unwrap_or(crate::schemas::AdapterEnvironmentTestStatus::Pass),
-                message: check.message,
-                details: check.details.map(serde_json::Value::String),
+            .map(|check| {
+                let check_status = match check.status.as_str() {
+                    "pass" => crate::schemas::AdapterEnvironmentTestStatus::Pass,
+                    "fail" => crate::schemas::AdapterEnvironmentTestStatus::Fail,
+                    "warn" | "warning" => crate::schemas::AdapterEnvironmentTestStatus::Warning,
+                    _ => crate::schemas::AdapterEnvironmentTestStatus::Pass,
+                };
+                crate::schemas::AdapterEnvironmentCheck {
+                    name: check.name,
+                    status: check_status,
+                    message: check.message.unwrap_or_default(),
+                    details: None,
+                }
             })
             .collect(),
     };
@@ -341,14 +377,14 @@ async fn test_environment(
 async fn list_global_adapters(
     State(state): State<AdapterAppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let all_adapters = state.adapter_registry.list_all();
+    let all_adapters = state.adapter_registry.adapters();
     let adapters: Vec<serde_json::Value> = all_adapters
         .iter()
-        .map(|a| {
+        .map(|&adapter| {
             serde_json::json!({
-                "adapterType": a.adapter_type().as_str(),
-                "label": a.label(),
-                "supportsInstructionsBundle": a.supports_instructions_bundle(),
+                "adapterType": adapter.adapter_type().to_string(),
+                "label": adapter.label(),
+                "supportsInstructionsBundle": adapter.supports_instructions_bundle().supported,
             })
         })
         .collect();
@@ -379,15 +415,19 @@ async fn get_global_adapter_info(
     State(state): State<AdapterAppState>,
     Path(adapter_type_str): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
+        Ok(t) => t,
+        Err(_) => return Err(AppError::NotFound("Adapter not found".to_string())),
+    };
     let adapter = state
         .adapter_registry
-        .find_server_adapter(&adapter_type_str)
-        .ok_or_else(|| AppError::NotFound("Adapter not found".to_string()))?;
+        .find_adapter(adapter_type)
+        .map_err(|_| AppError::NotFound("Adapter not found".to_string()))?;
 
     Ok(Json(serde_json::json!({
-        "adapterType": adapter.adapter_type().as_str(),
+        "adapterType": adapter.adapter_type().to_string(),
         "label": adapter.label(),
-        "supportsInstructionsBundle": adapter.supports_instructions_bundle(),
+        "supportsInstructionsBundle": adapter.supports_instructions_bundle().supported,
         "configSchema": null,
     })))
 }
@@ -453,9 +493,13 @@ async fn get_adapter_config_schema(
     State(state): State<AdapterAppState>,
     Path(adapter_type_str): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
+        Ok(t) => t,
+        Err(_) => return Err(AppError::NotFound(format!("Adapter \"{}\" is not registered", adapter_type_str))),
+    };
     let adapter = state.adapter_registry
-        .find_server_adapter(&adapter_type_str)
-        .ok_or_else(|| AppError::NotFound(format!("Adapter \"{}\" is not registered", adapter_type_str)))?;
+        .find_adapter(adapter_type)
+        .map_err(|_| AppError::NotFound(format!("Adapter \"{}\" is not registered", adapter_type_str)))?;
     Ok(Json(serde_json::json!({
         "adapterType": adapter_type_str,
         "schema": adapter.get_config_schema(),
@@ -471,7 +515,7 @@ async fn get_adapter_ui_parser(
     // 404 matches Paperclip's behavior when an adapter package does not ship
     // its optional ./ui-parser entry; returning JavaScript that says it is
     // unavailable causes clients to treat the asset as valid.
-    Err(AppError::NotFound(format!("No UI parser available for adapter \"{}\"", adapter_type_str)))
+    Err(AppError::NotFound(format!("UI parser not found for adapter {}", adapter_type_str)))
 }
 
 /// 将模型层的适配器环境测试状态映射到 API 响应枚举

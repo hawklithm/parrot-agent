@@ -1,4 +1,7 @@
 use async_trait::async_trait;
+use crate::approval_execution::ApprovalExecutor;
+use crate::agent_hire_hook::{NotifyHireApprovedInput, notify_hire_approved};
+use crate::server_adapter::AdapterRegistry;
 use chrono::Utc;
 use repositories::{ApprovalRepository, IssueRepository};
 use serde::{Deserialize, Serialize};
@@ -82,12 +85,13 @@ pub trait ApprovalService: Send + Sync {
     /// Get approvals for issue
     async fn get_by_issue_id(&self, issue_id: Uuid) -> Result<Vec<Approval>, ServiceError>;
 }
-
 /// Default Approval Service Implementation
 pub struct DefaultApprovalService {
     approval_repo: Arc<dyn ApprovalRepository>,
     issue_repo: Arc<dyn IssueRepository>,
     event_bus: Option<Arc<dyn EventBus>>,
+    approval_executor: Option<Arc<dyn ApprovalExecutor>>,
+    adapter_registry: Option<Arc<AdapterRegistry>>,
 }
 
 impl DefaultApprovalService {
@@ -99,11 +103,23 @@ impl DefaultApprovalService {
             approval_repo,
             issue_repo,
             event_bus: None,
+            approval_executor: None,
+            adapter_registry: None,
         }
     }
 
     pub fn with_event_bus(mut self, event_bus: Arc<dyn EventBus>) -> Self {
         self.event_bus = Some(event_bus);
+        self
+    }
+
+    pub fn with_approval_executor(mut self, executor: Arc<dyn ApprovalExecutor>) -> Self {
+        self.approval_executor = Some(executor);
+        self
+    }
+
+    pub fn with_adapter_registry(mut self, registry: Arc<AdapterRegistry>) -> Self {
+        self.adapter_registry = Some(registry);
         self
     }
 
@@ -416,79 +432,88 @@ impl ApprovalService for DefaultApprovalService {
         let mut approval = self
             .approval_repo
             .find_by_id(input.approval_id)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to find approval: {}", e)))?
+            .await?
             .ok_or_else(|| ServiceError::NotFound("Approval not found".to_string()))?;
 
-        // Check if approval is still pending
+        // Validate current status
         if approval.status != ApprovalStatus::Pending {
             return Err(ServiceError::InvalidInput(format!(
-                "Approval is already {}, cannot review",
-                match approval.status {
-                    ApprovalStatus::Approved => "approved",
-                    ApprovalStatus::Rejected => "rejected",
-                    ApprovalStatus::RevisionRequested => "in revision",
-                    ApprovalStatus::Pending => "pending",
-                }
+                "Approval is not pending (current status: {:?})",
+                approval.status
             )));
         }
 
-        // Update approval based on decision
-        approval.status = match input.decision {
+        // Update status based on decision
+        let new_status = match input.decision {
             ApprovalDecision::Approve => ApprovalStatus::Approved,
             ApprovalDecision::Reject => ApprovalStatus::Rejected,
             ApprovalDecision::RequestRevision => ApprovalStatus::RevisionRequested,
         };
 
-        approval.decided_by_user_id = Some(input.decided_by_user_id);
-        approval.decided_at = Some(Utc::now());
-        approval.decision_note = input.decision_note;
-        approval.updated_at = Utc::now();
+        // Update approval in database
+        let mut updated_approval = approval.clone();
+        updated_approval.status = new_status;
+        updated_approval.decided_by_user_id = Some(input.decided_by_user_id);
+        updated_approval.decision_note = input.decision_note.clone();
+        updated_approval.decided_at = Some(Utc::now());
+        updated_approval.updated_at = Utc::now();
 
-        // Update approval
-        let updated_approval = self
-            .approval_repo
-            .update(approval)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to update approval: {}", e)))?;
+        let updated_approval = self.approval_repo.update(updated_approval).await?;
 
-        // Send notification
-        self.notify_approval_change(&updated_approval, Some(input.decision))
-            .await?;
+        // **新增：审批通过后自动执行**
+        if input.decision == ApprovalDecision::Approve 
+            && updated_approval.approval_type == ApprovalType::HireAgent 
+        {
+            // 执行 hire agent
+            if let Some(executor) = &self.approval_executor {
+                match executor.execute_hire_agent(&updated_approval, input.decided_by_user_id).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            approval_id = %updated_approval.id,
+                            agent_id = %result.agent_id,
+                            budget_created = result.budget_created,
+                            "Approval executed successfully"
+                        );
 
-        // If approved, publish event to unblock linked issues
-        if input.decision == ApprovalDecision::Approve {
-            if let Some(ref event_bus) = self.event_bus {
-                let linked_issue_ids = self
-                    .approval_repo
-                    .find_linked_issues(updated_approval.id)
-                    .await
-                    .unwrap_or_default();
-
-                let issue_id = linked_issue_ids.first().copied();
-
-                let approval_event = ApprovalEvent::Approved {
-                    approval_id: updated_approval.id,
-                    company_id: updated_approval.company_id,
-                    approver_id: updated_approval.decided_by_user_id.unwrap_or(Uuid::nil()),
-                    issue_id,
-                };
-
-                let system_event = SystemEvent::new(
-                    EventMetadata {
-                        event_id: Uuid::new_v4(),
-                        correlation_id: None,
-                        causation_id: None,
-                        actor_type: "user".to_string(),
-                        actor_id: updated_approval.decided_by_user_id.unwrap_or(Uuid::nil()),
-                        company_id: updated_approval.company_id,
-                    },
-                    SystemEventPayload::Approval(approval_event),
+                        // 调用 hire hook（非阻塞）
+                        if let Some(registry) = &self.adapter_registry {
+                            let input = NotifyHireApprovedInput {
+                                company_id: updated_approval.company_id,
+                                agent_id: result.agent_id,
+                                source: "approval".to_string(),
+                                source_id: updated_approval.id,
+                                approved_at: Some(Utc::now()),
+                            };
+                            // TODO: 传递正确的 repositories
+                            // let registry_clone = registry.clone();
+                            // tokio::spawn(async move {
+                            //     if let Err(e) = notify_hire_approved(
+                            //         agent_repo, activity_repo, registry_clone, input
+                            //     ).await {
+                            //         tracing::error!(error = ?e, "Failed to notify hire approved");
+                            //     }
+                            // });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = ?e,
+                            approval_id = %updated_approval.id,
+                            "Failed to execute approval"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    approval_id = %updated_approval.id,
+                    "No approval executor configured"
                 );
-
-                let _ = event_bus.publish(Box::new(system_event)).await;
             }
         }
+
+        // Publish event
+        self.notify_approval_change(&updated_approval, Some(input.decision))
+            .await?;
 
         Ok(updated_approval)
     }

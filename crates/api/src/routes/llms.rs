@@ -47,8 +47,9 @@ pub fn llm_routes() -> Router<AppState> {
 async fn get_agent_config_txt(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let mut adapters: Vec<_> = state.adapter_registry.list_all();
-    adapters.sort_by(|a, b| a.adapter_type().as_str().cmp(b.adapter_type().as_str()));
+    let mut adapters: Vec<_> = state.adapter_registry.adapters();
+    adapters.sort_by(|a, b| a.adapter_type().to_string().cmp(&b.adapter_type().to_string()));
+
 
     let mut lines = vec![
         "# Paperclip Agent Configuration Index".to_string(),
@@ -59,8 +60,8 @@ async fn get_agent_config_txt(
     for adapter in &adapters {
         lines.push(format!(
             "- {}: /llms/agent-configuration/{}.txt",
-            adapter.adapter_type().as_str(),
-            adapter.adapter_type().as_str()
+            adapter.adapter_type().to_string(),
+            adapter.adapter_type().to_string()
         ));
     }
 
@@ -103,22 +104,36 @@ async fn get_agent_icons_txt() -> impl IntoResponse {
 
 /// GET /llms/agent-configuration/:adapter_type.txt
 /// 返回对应 adapter 的配置文档。
-/// 对应 Paperclip: llmRoutes -> GET /llms/agent-configuration/:adapterType.txt
 async fn get_adapter_config_txt(
     State(state): State<AppState>,
-    Path(adapter_type): Path<String>,
+    Path(adapter_type_str): Path<String>,
 ) -> impl IntoResponse {
-    let adapter = state.adapter_registry.find_server_adapter(&adapter_type);
-
-    match adapter {
-        Some(adapter) => {
-            let doc = adapter.agent_configuration_doc();
-            (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], doc.to_string())
+    // Parse adapter type string
+    let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
+        Ok(t) => t,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                [("content-type", "text/plain; charset=utf-8")],
+                format!("Unknown adapter type: {}", adapter_type_str),
+            )
         }
-        None => (
+    };
+
+    match state.adapter_registry.find_adapter(adapter_type) {
+        Ok(adapter) => {
+            let doc = adapter.agent_configuration_doc()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!(
+                    "# {} agent configuration\n\nNo adapter-specific documentation registered.", 
+                    adapter_type_str
+                ));
+            (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], doc)
+        }
+        Err(_) => (
             StatusCode::NOT_FOUND,
             [("content-type", "text/plain; charset=utf-8")],
-            format!("Unknown adapter type: {}", adapter_type),
+            format!("Unknown adapter type: {}", adapter_type_str),
         ),
     }
 }

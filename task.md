@@ -1,322 +1,191 @@
-# Paperclip 一比一迁移任务
+# Parrot-Agent / Paperclip 功能对齐任务
 
-## 目标
+> 本文档是基于 2026-08-09 两个仓库当前源码的功能盘点和差异清单。
+> 对照基准：`/Users/adazhao/workspace/paperclip` 的 `doc/SPEC-implementation.md`、
+> `server/src/routes`、`server/src/services`、`packages/*` 和 `ui`。
+>
+> 状态含义：
+> - **已具备**：Parrot 有对应路由/服务/模型，尚未发现明显的结构性缺失。
+> - **部分一致**：有入口或基础实现，但行为、数据、权限或运行时语义还没有跟 Paperclip 对齐。
+> - **缺失**：Paperclip 有明确功能，而 Parrot 当前没有对应实现。
+>
+> 这不是“把所有 Paperclip 文件逐个翻译成 Rust”的清单；目标是先完成 Paperclip V1 核心契约，再按当前 Paperclip 已经提供的扩展能力补齐。
 
-将 parrot-agent 中所有硬编码/存根（STUB/SKELETON）的逻辑替换为 paperclip 中对应功能的一比一实现。按复杂度分 4 轮执行，从 Round 1 开始逐轮完成。
+## 1. Paperclip 功能全景
 
----
+| 领域 | Paperclip 当前能力 | Parrot 当前判断 |
+|---|---|---|
+| 公司与组织 | 公司创建/归档/品牌、Goal、Org Chart、成员/邀请/加入请求、资源成员关系 | **已具备/部分一致**：`companies.rs`、`goals.rs`、`org_chart.rs`、`invites.rs`、`resource_memberships.rs` |
+| Agent 生命周期 | 创建/雇佣审批、暂停/恢复/终止、API key、配置、心跳唤醒、状态与可调用性 | **部分一致**：基础生命周期存在；权限、审批后建 Agent、运行时状态和配置语义需核对 |
+| 任务/Issue | CRUD、状态机、父子树、评论、标签、依赖/引用、原子 checkout/release、inbox、文档、附件、work products、线程交互 | **部分一致**：主体能力较全，但需做契约级回归，尤其 checkout、文档锁、附件、liveness/recovery |
+| 执行与心跳 | Process/HTTP adapter、heartbeat runs、取消、日志、scheduler、watchdog、recovery、workspace/runtime service | **部分一致**：Rust 服务和路由较多；Paperclip 的执行策略、恢复路径、运行日志和工作区生命周期仍需逐项验收 |
+| 成本与治理 | token/cost events、company/agent/project budget、80% 告警、100% hard-stop 自动暂停、approval/audit | **部分一致**：模型、路由和服务存在；需验证强制暂停、并发运行取消、汇总口径和审计完整性 |
+| 适配器 | 内置/外部 adapter registry、安装/卸载/启停/override/reload/reinstall、schema、UI parser、模型发现、环境测试 | **部分一致**：公司级 adapter 基础能力存在；全局管理接口中安装、配置、override、reload、reinstall 多为存根；缺少 Paperclip 的 JS 插件加载语义 |
+| 插件 | 安装、启停、升级、配置校验、health、logs、jobs/runs、webhooks、tools/actions、plugin DB、sandbox/worker | **部分一致**：`plugins.rs` 和 plugin service 存在，但当前 dispatcher/生命周期/运行时隔离明显简化，需要单独对齐 |
+| Skills | app catalog、公司技能、版本/文件/评论/测试运行、star/fork、技能策略和 agent runtime selection | **部分一致**：`skills.rs`/`skills_service.rs` 提供基础能力；catalog、版本、测试运行、策略面和完整权限尚未证明一致 |
+| Tools/MCP | tool gallery、OAuth/连接、MCP import、tool applications/connections/profiles/policies、runtime slots、gateway、action requests | **缺失**：当前未见等价的 `tool-access`、`tool-gateway` 路由和完整模型/服务 |
+| Attention/决策 | attention feed、decision queues、triage、Keep/archive/revive、signed decision bundles、training | **缺失**：当前未见等价路由和持久化决策队列实现 |
+| 文档/资源 | issue documents/revisions/annotations、assets/attachments、file resources、folders、workspace file resources、artifact delivery | **部分一致**：Issue 文档/附件/work product 有实现；通用 file resources、folders、完整资源授权和 artifact 交付需核对 |
+| 实时与交互 | SSE、WebSocket、board chat、live events、dashboard/sidebar badges/status cards/summary slots | **部分一致**：SSE/WebSocket/board chat 存在；Paperclip 的 dashboard 辅助读模型和 UI 消费契约需核对 |
+| 访问控制 | board session、agent bearer key、instance roles、company memberships、principal grants、tool/secret policy、CSRF/rate limit | **部分一致**：Rust ABAC/auth middleware 较完整；需要权限矩阵、所有路由覆盖和安全运营项验收 |
+| 秘密 | company secrets/version、user secrets、secret providers、remote import、绑定和日志脱敏 | **部分一致**：对应 Rust 模块存在；secret binding、provider 行为和日志脱敏需对照测试 |
+| 可移植性/运维 | company import/export preview/apply、database backup、instance settings、health/openapi、反馈导出 | **部分一致**：导入导出、backup、settings、feedback 入口存在；OpenAPI/健康检查/失败恢复契约需补齐或确认 |
+| Board UI/CLI | React Board（dashboard/org/tasks/agents/costs/approvals/activity）、全局 company selector、CLI agent-facing commands | **缺失/部分一致**：Parrot 仓库没有对应 UI；Rust API 可被 CLI 调用但没有 Paperclip CLI 同等产品面 |
 
-## Round 1 — 快速取胜（低复杂度，可并行）✅ 全部完成
+## 2. 对齐原则和已确认基线
 
-### 1.1 `llms.rs` — LLM 配置/图标端点 ✅
-- **文件**: `crates/api/src/routes/llms.rs`（5 handlers，60 行）
-- **Paperclip 源**: `server/src/routes/llms.ts`（106 行）
-- **任务**:
-  - [x] 1.1.1 实现 `GET /llms/agent-configuration.txt` — 列出所有已安装 adapter 及对应的配置文档路径
-  - [x] 1.1.2 实现 `GET /llms/agent-icons.txt` — 返回可用 agent icon 列表（从 shared 常量读取）
-  - [x] 1.1.3 实现 `GET /llms/agent-configuration/:adapter_type.txt` — 返回对应 adapter 的配置文档
-  - [x] 1.1.4 编译通过 + 测试通过
+### 2.1 Paperclip V1 核心契约
 
-### 1.2 `goals.rs` — 目标管理（含 Service）✅
-- **文件**: `crates/api/src/routes/goals.rs`（10 handlers，208 行）
-- **Paperclip 源**: `server/src/routes/goals.ts`（112 行）+ `server/src/services/goals.ts`（80 行）
-- **所需 Service**: `GoalService` trait + DB-backed implementation
-- **任务**:
-  - [x] 1.2.1 创建/完善 `GoalService` trait（list, get_by_id, create, update, remove）
-  - [x] 1.2.2 实现 DB-backed `GoalServiceImpl`
-  - [x] 1.2.3 替换 route handlers 为真实 service 调用（list, get, create, patch, delete）
-  - [x] 1.2.4 添加 activity 日志记录
-  - [x] 1.2.5 编译通过 + 测试通过
+以下能力属于 `SPEC-implementation.md` 的 V1 in-scope，不能以“已有同名文件”视为完成：
 
-### 1.3 `activity.rs` — 活动日志（含 Service）✅
-- **文件**: `crates/api/src/routes/activity.rs`（4 handlers，37 行）
-- **Paperclip 源**: `server/src/routes/activity.ts`（144 行）+ `server/src/services/activity.ts`（589 行）
-- **所需 Service**: `ActivityService` trait + DB-backed implementation
-- **任务**:
-  - [x] 1.3.1 创建 `ActivityService` trait（list, create, for_issue, runs_for_issue, issues_for_run）
-  - [x] 1.3.2 实现 DB-backed `ActivityServiceImpl`
-  - [x] 1.3.3 替换 route handlers（GET/POST /companies/:company_id/activity, GET /issues/:id/activity, GET /issues/:id/runs, GET /heartbeat-runs/:run_id/issues）
-  - [x] 1.3.4 注册到 AppState
-  - [x] 1.3.5 编译通过 + 测试通过
+- 公司生命周期、Goal 层级、Agent 生命周期和组织结构。
+- Issue 状态机、父子层级、评论、原子 checkout/release 和冲突 `409`。
+- Hire/CEO strategy 审批、Activity Log、Board/Agent 权限边界。
+- Heartbeat invocation/status/cancel、Process/HTTP adapter、scheduler。
+- Cost ingestion、company/agent/project budget，以及 100% hard-stop 自动暂停。
+- Dashboard、Org Chart、任务、审批、成本等 Board UI。
 
-### 1.4 `assets.rs` — 文件上传（含 Service）✅
-- **文件**: `crates/api/src/routes/assets.rs`（3 handlers，49 行）
-- **Paperclip 源**: `server/src/routes/assets.ts`（340 行）+ `server/src/services/assets.ts`（22 行）
-- **所需**: StorageService trait + AssetService
-- **任务**:
-  - [x] 1.4.1 创建 `StorageService` trait（文件存储抽象）
-  - [x] 1.4.2 创建本地文件系统实现 `LocalStorageService`
-  - [x] 1.4.3 创建 `AssetService` trait + DB-backed implementation
-  - [x] 1.4.4 替换 route handlers（POST image upload, POST logo upload, GET content）
-  - [x] 1.4.5 注册到 AppState
-  - [x] 1.4.6 编译通过 + 测试通过
+### 2.2 Parrot 已有的主要实现面
 
-### 1.5 `labels.rs` — 标签管理 ✅
-- **文件**: `crates/api/src/routes/labels.rs`（3 handlers，48 行）
-- **Paperclip 源**: 无独立 labels 文件（标签嵌入 issue model）
-- **任务**:
-  - [x] 1.5.1 创建 `LabelRepository`（list_by_company, create, delete）
-  - [x] 1.5.2 创建 `LabelService` trait + DB-backed implementation
-  - [x] 1.5.3 替换 route handlers（GET list, POST create, DELETE delete）
-  - [x] 1.5.4 编译通过 + 测试通过
+以下项目中已经存在对应路由或服务，应改为“契约验收/补差异”，不再重复创建基础模块：
 
----
+- `crates/api/src/routes/{companies,agents,issues,goals,projects,approvals,costs,activity}.rs`
+- `crates/api/src/routes/{heartbeats,heartbeat_runs,adapters,environments,execution_workspaces}.rs`
+- `crates/api/src/routes/{secrets,user_secrets,secret_provider_configs,secret_remote_import}.rs`
+- `crates/api/src/routes/{routines,pipelines,plugins,skills,work_products,assets,attachments}.rs`
+- `crates/api/src/routes/{sse,websocket,board_chat,user_directory,instance_settings}.rs`
+- `crates/services/src/adapter_registry_state.rs`、`adapter_plugin_store.rs`、`plugin_lifecycle.rs`、`plugin_loader.rs`
+- `crates/services/src/issue_checkout_service.rs`、`task_watchdog.rs`、`recovery_action_service.rs`、`work_timeline_service.rs`
 
-## Round 2 — 中等复杂度 ✅ 全部完成
+## 3. 待完成任务
 
-### 2.1 `instance_settings.rs` — 实例设置 ✅
-- **文件**: `crates/api/src/routes/instance_settings.rs`（9 handlers，79 行）
-- **Paperclip 源**: `server/src/routes/instance-settings.ts`（198 行）+ `server/src/services/instance-settings.ts`（217 行）
-- **任务**:
-  - [x] 2.1.1 创建 `InstanceSettingsService` trait + 内存实现 `DefaultInstanceSettingsService`
-  - [x] 2.1.2 替换 route handlers（GET/PATCH settings, general, experimental + auto-recovery preview/run）
-  - [x] 2.1.3 添加 activity 日志记录
-  - [x] 2.1.4 注册到 AppState
-  - [x] 2.1.5 编译通过 + 测试通过
+### P0：先修复“接口存在但行为不一致”的核心路径
 
-### 2.2 `costs.rs` — 成本/预算管理（含 Service）✅
-- **文件**: `crates/api/src/routes/costs.rs`（20 handlers，220 行）
-- **Paperclip 源**: `server/src/routes/costs.ts`（412 行）+ `server/src/services/costs.ts`（511 行）
-- **所需**: CostService, BudgetService, FinanceService
-- **任务**:
-  - [x] 2.2.1 创建 `CostService` trait（create_event, summary, by_agent, by_agent_model, by_provider, by_biller, by_project, window_spend）
-  - [x] 2.2.2 创建 `BudgetService` trait（overview, upsert_policy, resolve_incident）
-  - [x] 2.2.3 创建 `FinanceService` trait（create_event, summary, by_biller, by_kind, list）
-  - [x] 2.2.4 实现 DB-backed 实现
-  - [x] 2.2.5 替换 route handlers（全部 20 handlers）
-  - [x] 2.2.6 编译通过 + 测试通过
+#### P0.1 适配器全局管理必须落地
 
-### 2.3 修复 Route 中 `Uuid::nil()` 占位符 ✅
-- **涉及文件**:
-  - [x] 2.3.1 `cases.rs` — 25 处 `company_id = Uuid::nil()` → 通过 `case_service.get()` 查询 Case 获取真实 company_id
-  - [x] 2.3.2 `work_products.rs` — 4 处 `company_id = Uuid::nil()` → 通过 `issue_service.get()` 查询 Issue 获取真实 company_id（list/create 可用，update/delete 无 issue_id 参数，保留占位符）
-  - [x] 2.3.3 `user_secrets.rs` — 4 处 `user_id = Uuid::nil()` → 添加 TODO 注释，待 auth middleware 挂载后从 AuthorizationActor 提取
-  - [x] 2.3.4 `issue_diagnostics.rs` — 2 处 `company_id = Uuid::nil()` → 通过 `issue_service.get()` 查询 Issue 获取真实 company_id
-  - [x] 2.3.5 `approvals.rs` — 4 处 `user_id = Uuid::nil()` → 添加 TODO 注释，待 auth middleware 挂载后从 AuthorizationActor 提取
-  - [x] 2.3.6 `issues.rs` — 1 处 `company_id = Uuid::nil()` → 通过 `issue_service.get()` 查询 Issue 获取真实 company_id
-  - [x] 2.3.7 编译通过 + 测试通过
+文件：`crates/api/src/routes/adapters.rs`。
 
----
+- [ ] `GET /adapters` 返回 Paperclip 兼容的完整 adapter 描述：内置/外部、版本、disabled、override 状态、schema、模型和能力字段。
+- [ ] `POST /adapters/install` 真正执行安装、manifest 校验、持久化、registry reload；不能只返回 `installed: true`。
+- [ ] `PATCH /adapters/:type` 真正更新 disabled/config，并拒绝未知 adapter 或非法字段。
+- [ ] `PATCH /adapters/:type/override` 对齐 override pause/恢复语义，并持久化状态。
+- [ ] `DELETE /adapters/:type` 仅允许卸载外部 adapter，同时从 registry 和安装目录移除。
+- [ ] `POST /adapters/:type/reload`、`/reinstall` 执行真实生命周期操作，返回实际结果和错误。
+- [ ] 校验 `config-schema`、`ui-parser.js`、模型发现和环境测试的响应格式及权限。
+- [ ] 明确 JS/TS adapter 的支持边界。Paperclip adapter 来自 npm 包；Parrot 至少需要 Node 子进程/协议桥，或在文档中明确 Rust-only 限制并让 API 正确返回“不支持”。
 
-## Round 3 — 高复杂度
+#### P0.2 补齐 adapter 安装运行时
 
-### 3.1 `companies.rs` — 替换剩余存根 🟡 部分完成
+- [ ] 创建 `crates/services/src/npm_manager.rs`：install/uninstall/local path、版本读取、超时、stdout/stderr、非零退出码和路径安全。
+- [ ] 创建 adapter package loader/manifest validator；验证 adapter type、入口、配置 schema、能力声明和版本。
+- [ ] 处理安装失败回滚、并发安装锁、registry 热加载失败恢复和重启后的 reconcile。
+- [ ] adapter 配置和 auth header/env 必须脱敏，日志不能泄漏 secret。
 
-- **文件**: `crates/api/src/routes/companies.rs`（28 handlers）
-- **Paperclip 源**: `server/src/routes/companies.ts`（702 行）
+#### P0.3 核心契约回归
 
-**已完成的核心 handler（已有真实 DB 调用）:**
-- [x] `list_companies` — 通过 `company_service` 查询
-- [x] `create_company` — 通过 `company_service` 创建
-- [x] `get_company_stats` — 通过 `company_service` 查询统计
-- [x] `get_company` — 通过 `company_service` 查询
-- [x] `update_company` — 通过 `company_service` 更新
-- [x] `delete_company` — 通过 `company_service` 删除
-- [x] `update_company_branding` — 通过 `company_service` 更新
-- [x] `archive_company` — 通过 `company_service` 归档
-- [x] `list_company_activity` — 通过 `activity_service` 查询
-- [x] `record_company_activity` — 通过 `activity_service` 创建
-- [x] `update_member_permissions` — 通过 `company_service` 更新
-- [x] `search_company` — 通过 `company_service` 搜索
-- [x] `get_sidebar_badges` — 有实现逻辑
-- [x] `get_sidebar_preferences` — 有实现逻辑
-- [x] `update_sidebar_preferences` — 有实现逻辑
-- [x] `get_user_profile` — 有实现逻辑
+- [ ] 原子 checkout 并发冲突返回 `409`，并严格校验 company、assignee、expected statuses。
+- [ ] Agent pause/terminate 与 active heartbeat run 的 graceful cancel/force kill 对齐。
+- [ ] company/agent/project budget 汇总、80% 告警、100% hard-stop 自动暂停和禁止新 invocation 对齐。
+- [ ] hire approval -> agent 创建/API key -> activity log 的事务边界对齐。
+- [ ] 所有 mutation 写 Activity Log；跨 company 访问统一返回正确的 `401/403/404/409/422`。
 
-**仍为占位/存根的 handler:**
-- [x] 3.1.1 `GET /companies/:company_id/timeline` — 已从 activity_logs 返回公司时间线
-  - Paperclip 源: `server/src/routes/companies.ts` 的 timeline handler
-  - 需要: 创建 `WorkTimelineService` trait + DB 实现
-- [x] 3.1.2 `GET /companies/:company_id/artifacts` — 已从 attachments 返回公司 artifacts
-  - Paperclip 源: 对应 artifacts 查询
-  - 需要: 创建 `ArtifactService` 或复用现有 service
-- [x] 3.1.3 `GET /companies/:company_id/feedback-traces` — 已从 feedback_traces 返回真实记录
-  - Paperclip 源: feedback traces 列表
-  - 需要: 创建 `FeedbackTraceService` trait + DB 实现
-- [x] 3.1.4 `POST /companies/:company_id/exports` — 已对接 ExportService
-  - Paperclip 源: `server/src/routes/companies.ts` export handler
-  - 需要: 创建 `ExportService`（异步导出 + 文件生成）
-- [x] 3.1.5 `POST /companies/:company_id/exports/preview` — 已对接 ExportService
-- [x] 3.1.6 `POST /companies/:company_id/imports/preview` — 已对接 ImportService
-  - Paperclip 源: `server/src/routes/companies.ts` import preview handler
-  - 需要: 创建 `ImportService`（解析 + 预览）
-- [x] 3.1.7 `POST /companies/:company_id/imports/apply` — 已对接 ImportService
-- [x] 3.1.8 `GET /companies/:company_id/inbox-dismissals` — 已从 issue_inbox_archives 返回真实记录
-- [x] 3.1.9 `POST /companies/:company_id/inbox-dismissals` — 已对接 InboxService
-- [x] 3.1.10 `GET /companies/:company_id/teams-catalog` — 已从公司 agents 目录返回真实 catalog
+### P1：补齐 Paperclip 当前已提供但 Parrot 缺失的领域
 
-### 3.2 `projects.rs` — 项目管理（含 Service）🟡 基本完成
+#### P1.1 Tools / MCP / Tool Gateway（缺失）
 
-- **文件**: `crates/api/src/routes/projects.rs`（13 handlers）
-- **Paperclip 源**: `server/src/routes/projects.ts`（724 行）+ `server/src/services/projects.ts`（1,215 行）
+- [ ] 增加 tool applications、connections、OAuth、grants/installations、catalog、health/test-call、usage/activity。
+- [ ] 增加 tool profiles/entries/effective profile、policy/trust rules、stdio templates、MCP JSON import。
+- [ ] 增加 runtime slots、tool runtime health、action requests/decisions 和 agent-facing gateway。
+- [ ] 对齐 Paperclip 的 tool secret policy、低信任运行时隔离、内容 guard、权限和审计。
 
-**已完成（11/13 handler 已通过 `project_service` 调用真实 DB 逻辑）:**
-- [x] 3.2.1 `ProjectService` 已存在且有完整 DB 实现（`project_service.rs`）
-- [x] `list_projects` — `project_service.list_by_company()`
-- [x] `create_project` — `project_service.create()`
-- [x] `get_project` — `project_service.get_by_id()`
-- [x] `update_project` — `project_service.update()`
-- [x] `delete_project` — `project_service.delete()`
-- [x] `list_workspaces` — `project_service.list_workspaces()`
-- [x] `create_workspace` — `project_service.create_workspace()`
-- [x] `delete_workspace` — `project_service.delete_workspace()`
-- [x] `list_my_memberships` — `project_service.list_memberships_for_user()`
-- [x] `update_project_membership` — `project_service.update_project_membership()`
-- [x] `update_agent_membership` — `project_service.update_agent_membership()`
+参考：Paperclip `server/src/routes/tool-access.ts`、`tool-gateway.ts`、`server/src/services/tool-*`、`packages/shared`。
 
-**仍需修复:**
-- [x] 3.2.2 `update_workspace` — 已接入 ProjectService/ProjectRepository
-  - Paperclip 源: `server/src/routes/projects.ts` update workspace handler
-  - 需要: 在 `ProjectService` 中添加 `update_workspace` 方法
-- [x] 3.2.3 `get_external_object_summary` — 已统计真实 issues/agents/workspaces
-  - Paperclip 源: external object summary 查询
-  - 需要: 在 `ProjectService` 中添加 `get_external_object_summary` 方法，统计真实 issue/agent/workspace 数量
+#### P1.2 Attention / Decision Queues（缺失）
 
-### 3.3 修复 Service 中 `Uuid::nil()` 占位符 🟡 部分完成
+- [ ] 增加 `/companies/:companyId/attention`，返回 shelf、retentionDays、keep、archivedAt、retentionVersion 等服务端计算字段。
+- [ ] 增加 decision queues、queue items、seed rules、triage、retention archive/revive。
+- [ ] 增加 signed decision bundle、proposal、accept/reject/cancel 和幂等/版本冲突控制。
+- [ ] 每次读写重新授权 source，不能由 queue membership 获得 source visibility；覆盖 agent/board/low-trust/task-bridge/skill-test 场景。
 
-- [x] 3.3.1 `task_watchdog.rs` — 生产路径均从 watchdog/issue 上下文使用真实 company_id/agent_id（测试 fixture 中的 nil 保留）
-  - 影响范围: `create_issue`、`create_review_issue` 等函数
-  - 修复方案: 改为从调用方参数传入，调用方从 Issue/Agent 上下文中提取真实 ID
-  - Paperclip 源: task_watchdog 中的 company_id/agent_id 均从上下文传入
-- [x] 3.3.2 `skill_registry_service_impl.rs` — user_id 改为启动时注入的可信用户 ID
-  - 位置: `load_bundled_skills` 函数中 activity log 记录
-  - 修复方案: 改为从调用方传入 user_id，或从 auth context 提取
-- [x] 3.3.3 `saga_orchestrator.rs` — initiator_id 持久化到 saga context 并在补偿时恢复
-  - 位置: saga step 创建时的 initiator
-  - 修复方案: 改为从调用方参数传入
-- [x] 3.3.4 `recovery_action_service.rs` — 生产逻辑已使用调用方传入的 company_id/issue_id
-  - 修复方案: 改为从上下文参数传入
-- [x] 3.3.5 `monitor_scheduler.rs` — 已遍历 active companies 后按真实 company_id poll
-  - Paperclip 行为: 遍历所有活跃公司，对每个公司调用 poll_due_issues
-  - 修复方案: 改为遍历所有公司，传入真实 company_id
+参考：Paperclip `routes/attention.ts`、`decision-queues.ts`、`decisions.ts` 及对应 decision service/repository。
 
----
+#### P1.3 Skills catalog 与 company skill policy（部分一致）
 
-## Round 4 — 极高复杂度
+- [ ] 对齐 app-shipped skills catalog、catalog files、版本、fork/star、评论、test inputs/templates/runs/cancel。
+- [ ] 增加 company skill policy 的 read/replace/reset/simulation，并在 skill mutation 和 runtime selection 使用同一个 evaluator。
+- [ ] 对齐 skill 来源可信度、secret 引用、执行权限和 agent 可见范围。
 
-### 4.1 `pipelines.rs` — 管道/流程管理 🟡 基本完成
+参考：Paperclip `routes/company-skills.ts`、`company-skill-policy.ts`、`packages/skills-catalog`。
 
-- **文件**: `crates/api/src/routes/pipelines.rs`（24 handlers）
-- **Paperclip 源**: `server/src/routes/pipelines.ts`（2,913 行）
+#### P1.4 Plugin runtime（部分一致）
 
-**已完成（21/24 handler 已调用 `pipeline_service` 走真实逻辑）:**
-- [x] `create_pipeline`、`get_pipeline`、`create_case`、`list_cases`
-- [x] `get_health_warnings`、`get_pipelines_attention`
-- [x] `list_review_cases`、`bulk_review_cases`、`list_case_events`
-- [x] `get_pipeline_health`、`get_intake_form`
-- [x] `create_stage`、`update_stage`、`update_stage_automation_env`、`delete_stage`
-- [x] `update_transitions`
-- [x] `get_pipeline_document`、`update_pipeline_document`
-- [x] `get_pipeline_document_revisions`、`restore_pipeline_document_revision`
-- [x] `batch_create_cases`
+- [ ] 对齐 plugin manifest/schema/capability 校验、安装 guard、启停/升级/卸载和 reconcile。
+- [ ] 对齐 plugin config/test、health/logs、jobs/runs/trigger、webhooks、company local folders。
+- [ ] 实现 plugin worker/host service 生命周期、sandbox/provider runtime、plugin DB namespace/migrations、secret handler 和 stream/event bus。
+- [ ] 对照 `plugin_service.rs` 中目前仅做声明检查/模拟 dispatch 的路径，替换为真实执行或明确返回未支持。
 
-**仍需修复:**
-- [x] 4.1.1 `list_pipelines` — 已接入 PipelineService.list_by_company
-  - Paperclip 源: `server/src/routes/pipelines.ts` list handler
-  - 需要: 在 `PipelineService` 中添加 `list_by_company` 方法
-- [x] 4.1.2 `list_stages` — 已接入 PipelineStageRepository 查询
-  - 需要: 在 `PipelineService` 中添加 `list_stages` 方法
-- [x] 4.1.3 `list_transitions` — 已接入 PipelineTransitionRepository 查询
-  - 需要: 在 `PipelineService` 中添加 `list_transitions` 方法
+参考：Paperclip `routes/plugins.ts` 以及 `server/src/services/plugin-*`。
 
-### 4.2 `routines.rs` — 定时例程 🟡 基本完成
+#### P1.5 文档、资源和交付链（部分一致）
 
-- **文件**: `crates/api/src/routes/routines.rs`（19 handlers）
-- **Paperclip 源**: `server/src/routes/routines.ts`（665 行）+ `server/src/services/routines.ts`（2,846 行）
+- [ ] 对齐通用 file resources、folders、workspace file resources 的 API、路径安全和 company/workspace 授权。
+- [ ] 完善 assets/attachments/work products：对象存储 provider、SHA256 去重、content/download、issue/comment 关联、artifact 元数据。
+- [ ] 对齐文档 revision/lock/restore/annotation 的 actor、run、版本冲突和删除限制。
+- [ ] 建立可检查的 artifact 交付契约：附件-backed artifact 与 workspace-only file reference 不能混用。
 
-**已完成（12/19 handler 已调用 `routine_service` 走真实逻辑）:**
-- [x] `create_routine`、`list_routines`、`get_routine`、`update_routine`、`delete_routine`
-- [x] `pause_routine`、`resume_routine`、`trigger_routine`
-- [x] `list_runs`、`get_run`
-- [x] `list_routine_revisions`、`restore_routine_revision`
+参考：Paperclip `routes/file-resources.ts`、`folders.ts`、`assets.ts`、`execution-workspaces.ts`、`services/work-products.ts`。
 
-**仍为占位返回（7 个 trigger 相关 handler）:**
-- [x] 4.2.1 `list_routine_triggers` — 已对接 RoutineTriggerService
-- [x] 4.2.2 `create_routine_trigger` — 已对接 RoutineTriggerService/DB
-- [x] 4.2.3 `update_routine_trigger` — 已对接 RoutineTriggerService/DB
-- [x] 4.2.4 `delete_routine_trigger` — 已对接 DB 删除
-- [x] 4.2.5 `rotate_trigger_secret` — 已持久化密钥轮换结果及时间
-- [x] 4.2.6 `fire_public_trigger` — 已调用 RoutineService.fire_routine，并记录 trigger execution
-- [x] 4.2.7 `trigger_routine_run` — 已确认调用 `routine_service.trigger_routine()` 的真实执行路径
+### P1：现有领域的契约级差异审计
 
-  **Paperclip 对应**: `server/src/routes/routines.ts` trigger 相关 handler + `server/src/services/routines.ts` trigger service
-  **需要**: 创建 `RoutineTriggerService`（DB CRUD + 密钥管理 + 公开触发）
+- [ ] Agent：配置可见性 vs profile 可见性、assignability/invokability、manager chain、API key hash/rotation、heartbeat invoke 和 status machine。
+- [ ] Issue：状态迁移 guard、parent/child/blocker/reference、comment/thread interaction、inbox/read state、watchdog liveness/recovery。
+- [ ] Workspace：execution/project workspace、runtime services/operations、branch reconcile、delivery state、terminal cleanup 和 reopen 语义。
+- [ ] Routines/Pipelines：revision/restore、schedule/API/webhook trigger、run provenance、retry/approval 和 stage transition。
+- [ ] Secrets：company/user secret、provider config、remote import、agent binding、JSON schema refs、日志/响应脱敏。
+- [ ] Companies/Access：export/import preview/apply、invites/join requests、memberships、principal grants、board API keys、CLI auth challenges。
+- [ ] Realtime/UI read models：SSE/WebSocket event shape、dashboard counts、activity stream、sidebar badges、status cards、summary slots。
 
-### 4.3 `cloud_upstreams.rs` — 云上游同步 ✅ 已完成
+### P2：产品面和运维补齐
 
-- **文件**: `crates/api/src/routes/cloud_upstreams.rs`（8 handlers）
-- **Paperclip 源**: `server/src/routes/cloud-upstreams.ts`（118 行）+ `server/src/services/cloud-upstreams.ts`（1,309 行）
+- [ ] 若 Parrot 的目标包含完整 Paperclip 产品，新增 Board UI：dashboard、company selector、org chart、tasks/kanban、agent detail、costs、approvals、activity，并覆盖失败提示和 checkout 冲突 toast。
+- [ ] 增加 Paperclip CLI 等价的 onboarding、auth/token、company/team/agent/issue/goal/approval/cost/skill/adapter/plugin/routine/workspace 命令，或明确 Parrot 只提供 REST server。
+- [ ] 补齐 `/openapi`、health/status、database backup、request id、结构化日志、rate limit、CSRF（如存在 board session）和部署 smoke tests。
+- [ ] 对齐 company portability 的导出保真度、导入幂等、失败恢复和敏感信息处理。
+- [ ] 对齐 Paperclip 的最小回归门槛：auth boundary、checkout race、hard budget stop、pause/resume、dashboard consistency、approval durability。
 
-**8 个 handler 已接入连接发现、PKCE、token 交换、push/cancel/apply 生命周期:**
-- [x] 4.3.1 `list_cloud_upstreams` — 已接入 cloud_upstream_connections
-- [x] 4.3.2 `start_cloud_connect` — 已创建 pending connection 记录
-- [x] 4.3.3 `finish_cloud_connect` — 已更新 connection 状态
-- [x] 4.3.4 `preview_push_run` — 已校验持久化 connection
-- [x] 4.3.5 `execute_push_run` — 已创建 running push run 记录
-- [x] 4.3.6 `get_push_run` — 已读取真实 push run 状态
-- [x] 4.3.7 `cancel_push_run` — 已持久化取消状态
-- [x] 4.3.8 `activate_push_run` — 已持久化激活状态
+## 4. 适配器以外的明确差异索引
 
-  **需要**: 创建 `CloudUpstreamService` trait + DB 实现
-  - Paperclip 参考: `server/src/services/cloud-upstreams.ts`
-  - 核心逻辑: cloud connect 流程（OAuth/API key 认证 → 建立连接 → push run 生命周期管理）
-  - 依赖: 可能涉及外部 API 调用、异步任务管理
+以下 Paperclip route family 在 Parrot 当前没有同名等价入口，需逐项确认是“应实现”还是“目标范围明确排除”：
 
-### 4.4 `plugins.rs` — 插件系统 🟡 核心流程已完成
+- `attention.ts`、`decision-queues.ts`、`decision-training.ts`、`decisions.ts`
+- `tool-access.ts`、`tool-gateway.ts`、`workspace-command-authz.ts`、`workspace-runtime-service-authz.ts`
+- `company-skills.ts`、`company-skill-policy.ts`、`teams-catalog.ts`
+- `file-resources.ts`、`folders.ts`、`openapi.ts`、`status-cards.ts`、`summary-slots.ts`、`sidebar-badges.ts`、`sidebar-preferences.ts`
+- `company-import-paths.ts`、`instance-database-backups.ts`、`smoke-lab.ts`、`org-chart-svg.ts`
 
-- **文件**: `crates/api/src/routes/plugins.rs`（24 handlers）
-- **Paperclip 源**: `server/src/routes/plugins.ts`（2,992 行）+ 15 个 service 文件
+注意：路由文件名不是唯一判断标准。例如 Parrot 已把部分 Paperclip 的 access/user-profile/inbox 能力合并到 `access_control.rs`、`user_directory.rs`、`companies.rs` 或 `issues.rs`；验收时必须按 endpoint、响应、权限和数据库副作用对照。
 
-**插件 handler 已接入持久化服务、权限检查、manifest 能力校验和动作调度:**
-- [x] 4.4.1 创建 Plugin model 类型定义
-- [x] 4.4.2 创建 PluginService trait
-- [x] 4.4.3 实现 plugin-loader（持久化 manifest 解析与能力发现）
-- [x] 4.4.4 实现 plugin-lifecycle（install, uninstall, enable, disable, upgrade）
-- [x] 4.4.5 实现 plugin-job-scheduler / plugin-job-store
-- [x] 4.4.6 实现 plugin-tool-dispatcher
-- [x] 4.4.7 替换全部 plugin route handlers
-- [x] 4.4.8 编译通过 + 测试通过（本次代码无新增编译错误；仓库既有 sqlx DB 检查错误阻断完整 check）
+## 5. 测试交付物
 
-  **这是最大最复杂的模块**。Paperclip 中 plugins 系统涉及 15+ 个 service 文件：
-  - plugin-loader（发现、manifest 解析）
-  - plugin-lifecycle（安装/卸载/启用/禁用/升级）
-  - plugin-job-scheduler / plugin-job-store
-  - plugin-tool-dispatcher（工具注册与执行）
-  - plugin-ui-contributions
-  - plugin-examples
-  - plugin-settings
+- [ ] `crates/api/tests/adapter_routes_test.rs`：列表、安装失败/成功、启停、override、reload、reinstall、卸载、schema、权限。
+- [ ] `crates/api/tests/paperclip_contract_test.rs`：按领域覆盖公司、Agent、Issue、审批、成本、heartbeat、workspace、secrets、plugins、skills。
+- [ ] 并发 checkout race、budget hard-stop、pause-active-run、approval transaction、company boundary、secret redaction 集成测试。
+- [ ] plugin/adapter lifecycle 和 npm/Node bridge 的隔离测试；不依赖真实外部 API key。
+- [ ] 若交付 UI，增加 dashboard consistency、approval flow、checkout conflict、agent pause/resume 的 E2E。
 
----
+## 6. 文档和验收规则
 
-## 本轮新增实现文件
+- [ ] 每个对齐项记录 Paperclip 参考源码、Parrot 路径、请求/响应示例、权限和副作用。
+- [ ] 实现前先把状态从“缺失/部分一致”改为具体验收项；实现后附测试命令和结果。
+- [ ] 对明确不纳入 Parrot 范围的 Paperclip 能力，记录为“排除项”及理由，不能保留模糊的“可能需要”。
+- [ ] 不允许存根返回成功：如果运行时暂不支持，应返回明确的 `501/422` 或兼容的错误码，并在文档中说明。
+- [ ] 完成标准：P0 核心契约通过；P1 缺失领域有实现或正式排除决定；P2 产品/运维范围得到明确结论。
 
-- `crates/services/src/cloud_upstream_service.rs`
-- `crates/services/src/work_timeline_service.rs`
-- `migrations/20260719000004_add_saga_initiator.sql`
-- `migrations/20260719000005_create_user_preferences.sql`
+## 7. 参考位置
 
-## 验证清单
-
-- [x] V1. `cargo check -p api` — 编译通过
-- [x] V2. `cargo check -p models` — 编译通过
-- [x] V3. `cargo check -p services` — 编译通过
-- [x] V4. `cargo test -p api --no-run` — 编译通过
-- [x] V5. `cargo test -p models` — 测试通过 (18 passed)
-- [x] V6. `cargo test -p services` — 测试编译问题（已有，非本次引入）
-- [x] V7. `cargo clippy` — 无新增警告
-
----
-
-## 进度总览
-
-| Round | 状态 | 说明 |
-|-------|------|------|
-| Round 1 | ✅ 完成 | 5/5 模块全部实现 |
-| Round 2 | ✅ 完成 | 3/3 模块全部实现 |
-| Round 3.1 companies | 🟡 部分 | 核心 CRUD 已实现，10 个存根待修复 |
-| Round 3.2 projects | 🟡 基本完成 | 11/13 handler 已实现，2 个存根 |
-| Round 3.3 Service Uuid::nil | ❌ 未开始 | 5 个文件共 22 处硬编码 |
-| Round 4.1 pipelines | 🟡 基本完成 | 21/24 handler 已实现，3 个存根 |
-| Round 4.2 routines | 🟡 基本完成 | 12/19 handler 已实现，7 个 trigger 存根 |
-| Round 4.3 cloud_upstreams | ✅ 完成 | 连接、push run、远程取消与激活均已实现 |
-| Round 4.4 plugins | 🟡 核心完成 | 持久化、权限、manifest 与 dispatcher 已实现 |
+- Paperclip V1 合约：`/Users/adazhao/workspace/paperclip/doc/SPEC-implementation.md`
+- Paperclip API：`/Users/adazhao/workspace/paperclip/server/src/routes/`
+- Paperclip 服务：`/Users/adazhao/workspace/paperclip/server/src/services/`
+- Paperclip adapter/plugin/catalog：`/Users/adazhao/workspace/paperclip/packages/`
+- Parrot API：`crates/api/src/routes/`
+- Parrot services/models/repositories：`crates/{services,models,repositories}/src/`

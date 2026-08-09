@@ -58,7 +58,6 @@ use services::{
     openclaw_service::OpenClawServiceImpl,
     user_secret_definition_service::UserSecretDefinitionServiceImpl,
     // Traits (re-exported from crate root)
-    AdapterRegistry,
     AgentService,
     ApprovalService,
     AttachmentService,
@@ -372,8 +371,8 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
     let built_in_agent_service: Arc<dyn BuiltInAgentService> = Arc::new(
         DefaultBuiltInAgentService::new(Arc::new(agent_repo.clone())),
     );
-    let adapter_registry: Arc<AdapterRegistry> =
-        Arc::new(services::create_default_adapter_registry());
+    let adapter_registry: Arc<services::server_adapter::AdapterRegistry> =
+        Arc::new(services::server_adapter::AdapterRegistry::new());
     let server_adapter_registry = Arc::new(services::server_adapter::AdapterRegistry::new());
     let environment_runtime_service: Arc<dyn EnvironmentRuntimeService> =
         Arc::new(DefaultEnvironmentRuntimeService::with_pool(pool.clone()));
@@ -539,12 +538,20 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
     let company_portability_service = Arc::new(services::DefaultCompanyPortabilityService::new(
         pool.clone(),
     ));
+
+    // 初始化适配器注册状态管理
+    let adapter_registry_state = Arc::new(
+        services::AdapterRegistryState::new()
+            .map_err(|e| format!("Failed to initialize adapter registry state: {}", e))?
+    );
+
     Ok(AppState::new(
         agent_service,
         access_service,
         config_revision_service,
         built_in_agent_service,
         adapter_registry,
+        adapter_registry_state,
         environment_runtime_service,
         issue_service,
         case_service,

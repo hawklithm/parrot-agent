@@ -1533,6 +1533,7 @@ dependencies = [
  "access",
  "api",
  "axum",
+ "chrono",
  "dotenvy",
  "models",
  "repositories",
@@ -2137,6 +2138,7 @@ dependencies = [
  "jwt",
  "models",
  "nix",
+ "parking_lot",
  "pkcs8",
  "rand 0.8.6",
  "regex",
@@ -2150,6 +2152,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "urlencoding",
  "uuid",
 ]

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use crate::text_utils::truncate_suffix_chars;
 use crate::sse_service::{InMemorySseService, SseService};
 use chrono::{DateTime, Utc};
 use models::{Agent, AgentStatus, SseEvent, SseEventType};
@@ -904,7 +905,8 @@ impl DefaultHeartbeatService {
         let agent_name: String = agent.as_ref().and_then(|row| row.try_get("name").ok()).unwrap_or_else(|| "unknown".to_string());
         let adapter_type: String = agent.as_ref().and_then(|row| row.try_get("adapter_type").ok()).unwrap_or_else(|| "unknown".to_string());
         let output_excerpt = output.trim();
-        let output_excerpt = if output_excerpt.len() > 1_200 { &output_excerpt[output_excerpt.len() - 1_200..] } else { output_excerpt };
+        // 使用 text_utils 安全地截取最后 1200 个字符（而不是字节）
+        let output_excerpt = truncate_suffix_chars(output_excerpt, 1_200);
         let objective = description.as_deref().unwrap_or("No objective captured.").trim();
         let next_action = if status == "done" {
             "Review the completed issue output and close any remaining follow-up comments."

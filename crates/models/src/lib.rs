@@ -47,6 +47,7 @@ pub mod task_watchdog;
 pub mod user_directory;
 pub mod user_secret;
 pub mod user_secret_definition;
+pub mod work_timeline;
 pub mod websocket;
 
 // ===== 显式导出：消除 glob re-export 歧义 =====
@@ -121,3 +122,4 @@ pub use state_machine::*;
 pub use user_directory::*;
 pub use user_secret_definition::*;
 pub use websocket::*;
+pub use work_timeline::*;

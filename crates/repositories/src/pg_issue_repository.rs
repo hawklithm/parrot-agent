@@ -644,6 +644,38 @@ impl IssueRepository for PgIssueRepository {
             .begin()
             .await
             .map_err(RepositoryError::DatabaseError)?;
+        
+        // Generate unique origin_fingerprint to prevent duplicate issue creation
+        // Strategy:
+        //   - Agent-created issues: hash(run_id + title) - prevents duplicate calls in same run
+        //   - Manual issues: timestamp + UUID - allows multiple issues with same title
+        let origin_fingerprint = input.origin_fingerprint.clone().unwrap_or_else(|| {
+            if let Some(run_id) = input.origin_run_id {
+                // For agent-created issues: use run_id + title hash
+                // This ensures that if an agent calls create-issue multiple times
+                // with the same title in the same run, they get the same fingerprint
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                run_id.hash(&mut hasher);
+                input.title.hash(&mut hasher);
+                let content_hash = hasher.finish();
+                format!("agent:{}:{:x}", run_id, content_hash)
+            } else {
+                // For manual issues: timestamp + UUID
+                // This allows users to create multiple issues with the same title
+                let creator = input.created_by_user_id
+                    .map(|id| id.to_string())
+                    .or_else(|| input.created_by_agent_id.map(|id| id.to_string()))
+                    .unwrap_or_else(|| "system".to_string());
+                format!("manual:{}:{}:{}", 
+                    creator,
+                    chrono::Utc::now().timestamp_millis(),
+                    Uuid::new_v4()
+                )
+            }
+        });
+        
         let mut issue = sqlx::query_as::<_, Issue>(
             r#"
             INSERT INTO issues (
@@ -691,7 +723,7 @@ impl IssueRepository for PgIssueRepository {
         .bind(input.origin_kind.as_deref().unwrap_or("manual"))
         .bind(input.origin_id.as_ref())
         .bind(input.origin_run_id)
-        .bind(input.origin_fingerprint.as_deref().unwrap_or("default"))
+        .bind(&origin_fingerprint)  // Use generated unique fingerprint
         .bind(input.request_depth.unwrap_or(0))
         .bind(input.billing_code.as_ref())
         .bind(&input.assignee_adapter_overrides)

@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 // Re-export services
 pub use services::{
-    AdapterRegistry, AgentService, ApprovalService, AttachmentService, BudgetService,
+    AdapterRegistry, AdapterRegistryState, AgentService, ApprovalService, AttachmentService, BudgetService,
     BuiltInAgentService, CaseService, CloudUpstreamService, CompanyService, ConfigRevisionService,
     CostService, CustomImageSetupService, EnvironmentDiagnosticsService,
-    EnvironmentRuntimeService, EnvironmentService, ExportService, FinanceService, GoalService,
-    ImportService, InboxService, InstanceSettingsService, InviteResourceService, InviteService,
+    EnvironmentRuntimeService, EnvironmentService, ExportService, ImportService, InboxService,
+    FinanceService, GoalService, InstanceSettingsService, InviteResourceService, InviteService,
     IssueCommentService, IssueService, IssueTreeControlService, LabelService, LowTrustService,
     OpenClawService, OrgChartService, PipelineService, PluginService, ProjectService,
     RoutineAnnotationService, RoutineService, SecretProviderConfigService,
@@ -41,6 +41,7 @@ pub struct AppState {
 
     // Adapter subsystem
     pub adapter_registry: Arc<AdapterRegistry>,
+    pub adapter_registry_state: Arc<AdapterRegistryState>,
     pub environment_runtime_service: Arc<dyn EnvironmentRuntimeService>,
 
     // Phase 2: Issue/Case Management
@@ -134,6 +135,7 @@ impl AppState {
         config_revision_service: Arc<dyn ConfigRevisionService>,
         built_in_agent_service: Arc<dyn BuiltInAgentService>,
         adapter_registry: Arc<AdapterRegistry>,
+        adapter_registry_state: Arc<AdapterRegistryState>,
         environment_runtime_service: Arc<dyn EnvironmentRuntimeService>,
         issue_service: Arc<dyn IssueService>,
         case_service: Arc<dyn CaseService>,
@@ -189,6 +191,7 @@ impl AppState {
             config_revision_service,
             built_in_agent_service,
             adapter_registry,
+            adapter_registry_state,
             environment_runtime_service,
             issue_service,
             case_service,

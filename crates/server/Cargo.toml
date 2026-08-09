@@ -2,6 +2,7 @@
 name = "parrot-server"
 version = "0.1.0"
 edition = "2021"
+default-run = "parrot-server"
 
 [[bin]]
 name = "parrot-server"
@@ -17,7 +18,8 @@ access = { path = "../access" }
 axum = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }
-	uuid = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
 dotenvy = "0.15"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

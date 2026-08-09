@@ -2,12 +2,15 @@ pub mod access;
 pub mod activity_log;
 pub mod adapter_config_normalizer;
 pub mod adapter_registry;
+pub mod builtin_adapter_types;
+pub mod adapter_plugin_store;
+pub mod adapter_registry_state;
+pub mod server_adapter;
 pub mod adapters;
 pub mod agent_service;
 pub mod config_revision_service;
 pub mod config_revision_service_impl;
-pub mod consistency;
-pub mod database_secret_service;
+pub mod adapter_executor;
 pub mod environment_runtime_service;
 pub mod errors;
 pub mod saga;
@@ -18,6 +21,15 @@ pub mod websocket_service;
 pub use sse_service::{InMemorySseService, SseService};
 pub mod access_service;
 pub mod asset_service;
+pub mod approval_execution;
+pub mod agent_hire_hook;
+pub use approval_execution::{
+    ApprovalExecutionResult, ApprovalExecutor, DefaultApprovalExecutor, HireAgentPayload,
+};
+pub use agent_hire_hook::{
+    AdapterHireHook, HireApprovedPayload, HireHookResult, NotifyHireApprovedInput,
+    notify_hire_approved,
+};
 pub mod auth;
 pub mod authorization_service;
 pub mod built_in_agent_service;
@@ -37,7 +49,6 @@ pub mod org_chart_service;
 pub mod org_chart_service_impl;
 pub mod routine_service;
 pub mod secret_provider_service;
-pub mod server_adapter;
 pub mod user_secret_service;
 pub mod workspace_operation_service;
 pub mod workspace_service;
@@ -241,6 +252,8 @@ pub use cost_service::{
     DefaultCostService, DefaultFinanceService, FinanceEventDto, FinanceService, FinanceSummaryDto,
     FinanceSummaryRowDto, QuotaWindow, UpsertPolicyInput, WindowSpend, WindowSpendEntry,
 };
+pub mod text_utils;
+pub use text_utils::*;
 pub mod retry;
 pub use retry::*;
 pub mod routine_execution_service;
@@ -280,6 +293,9 @@ pub use cloud_upstream_service::{CloudUpstreamService, DefaultCloudUpstreamServi
 pub use work_timeline_service::{DefaultWorkTimelineService, WorkTimelineQuery, WorkTimelineService};
 pub use plugin_service::{DefaultPluginService, PluginService, PluginServiceError};
 pub mod company_portability_service;
+pub use company_portability_service::{
+    ExportService, ImportService, InboxService, DefaultCompanyPortabilityService,
+};
 pub use adapter_plugin::{
     resolve_model_profile_application, AdapterInstallRequest, AdapterModelProfileDefinition,
     AdapterPluginError, AdapterPluginLoader, AdapterPluginRecord, AdapterPluginResult,
@@ -287,13 +303,11 @@ pub use adapter_plugin::{
     DefaultAdapterPluginLoader, ModelProfileApplication, ModelProfileKey,
     ModelProfileRequestSource,
 };
-pub use company_portability_service::{
-    DefaultCompanyPortabilityService, ExportService, ImportService, InboxService,
-};
-pub mod adapter_executor;
+pub use adapter_registry::create_default_adapter_registry;
+pub use server_adapter::{AdapterRegistry, ServerAdapterModule};
+pub use adapter_registry_state::AdapterRegistryState;
 pub use adapter_executor::*;
 pub mod issue_execution_lock_service;
-pub use adapter_registry::*;
 pub use adapters::*;
 pub use issue_execution_lock_service::*;
 pub use label_service::*;
