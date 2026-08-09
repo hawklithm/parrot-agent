@@ -198,7 +198,7 @@ mod tests {
         );
         
         assert_eq!(
-            NpmManagpackage_spec("@scope/pkg@1.0.0"),
+            NpmManager::parse_package_spec("@scope/pkg@1.0.0"),
             ("@scope/pkg", Some("1.0.0"))
         );
         
