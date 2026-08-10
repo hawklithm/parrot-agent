@@ -1,6 +1,7 @@
 use axum::Router;
 use sqlx::PgPool;
 use std::sync::Arc;
+use crate::routes::health::health_check;
 
 // Re-export services
 pub use services::{
@@ -251,7 +252,12 @@ pub fn create_router(state: AppState) -> Router {
     let auth_middleware = std::sync::Arc::new(services::auth::middleware_from_env(
         std::sync::Arc::new(state.pool.clone()),
     ));
-    let api_routes = Router::new()
+    // Routes that don't require authentication
+    let public_routes = Router::new()
+        .route("/health", axum::routing::get(health_check));
+
+    // Routes that require authentication
+    let protected_routes = Router::new()
         // Phase 1: Agent Management routes
         .merge(crate::routes::agents::agent_routes())
         .merge(crate::routes::auth::auth_routes(state.clone()))
@@ -282,7 +288,6 @@ pub fn create_router(state: AppState) -> Router {
         // Routine/Goal routes
         .merge(crate::routes::routines::routine_routes())
         .merge(crate::routes::goals::goal_routes())
-        // Phase 4: Additional service routes (now all AppState compatible)
         .merge(crate::routes::attachments::attachment_routes())
         .merge(crate::routes::work_products::work_product_routes())
         .merge(crate::routes::custom_image_setup::custom_image_setup_routes())
@@ -297,7 +302,6 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::websocket::websocket_routes())
         .merge(crate::routes::user_directory::user_directory_routes())
         .merge(crate::routes::user_secret_definitions::user_secret_definition_routes())
-        // Routes with Arc<dyn X> state type (need wrapping)
         .merge(
             crate::routes::user_secrets::user_secret_routes()
                 .with_state(state.user_secret_service.clone()),
@@ -306,11 +310,9 @@ pub fn create_router(state: AppState) -> Router {
             crate::routes::invites::invite_subresource_routes()
                 .with_state(state.invite_service.clone()),
         )
-        // Task watchdog routes (Arc<dyn WatchdogService> state)
         .merge(
             crate::routes::watchdogs::watchdog_routes().with_state(state.watchdog_service.clone()),
         )
-        // P2: New domain routes
         .merge(crate::routes::approvals::approval_routes())
         .merge(crate::routes::costs::cost_routes())
         .merge(crate::routes::plugins::plugin_routes())
@@ -321,19 +323,21 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::instance_settings::instance_settings_routes())
         .merge(crate::routes::labels::label_routes())
         .merge(crate::routes::llms::llm_routes())
-        // P2: Execution workspace + heartbeat-run routes (X1-X18)
         .merge(crate::routes::execution_workspaces::execution_workspace_routes())
         .merge(crate::routes::heartbeat_runs::heartbeat_run_routes())
         .merge(crate::routes::feedback_traces::feedback_trace_routes())
         .layer(axum::middleware::from_fn_with_state(
             auth_middleware,
             services::auth::auth_middleware_fn,
-        ))
+        ));
+
+    // Combine public and protected routes
+    let api_routes = public_routes
+        .merge(protected_routes)
         .with_state(state);
 
     Router::new()
         // The Paperclip HTTP contract exposes all service routes below `/api`.
-        .route("/api/health", axum::routing::get(health_check))
         .nest("/api", api_routes)
         // Middleware layers
         .layer(axum::middleware::from_fn(
@@ -357,15 +361,3 @@ mod route_conflict_tests {
     }
 }
 
-/// Health check endpoint
-///
-/// Paperclip 前端期望返回 JSON 格式的健康状态，
-/// 而非纯文本 `"OK"`，否则前端 JSON 解析会报错：
-/// `Unexpected token 'O', "OK" is not valid JSON`
-#[allow(dead_code)]
-async fn health_check() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "status": "ok",
-        "message": "Service is healthy"
-    }))
-}

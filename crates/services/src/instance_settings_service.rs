@@ -183,19 +183,31 @@ impl DefaultInstanceSettingsService {
             .pool
             .as_ref()
             .ok_or_else(|| "instance settings persistence is not configured".to_string())?;
+        
+        // 尝试查询现有数据
         let row = sqlx::query(
             "SELECT instance_name,version,general,experimental FROM instance_settings WHERE id=1",
         )
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
-        Ok(InstanceSettings {
-            instance_name: row.get("instance_name"),
-            version: row.get("version"),
-            general: serde_json::from_value(row.get("general")).map_err(|e| e.to_string())?,
-            experimental: serde_json::from_value(row.get("experimental"))
-                .map_err(|e| e.to_string())?,
-        })
+        
+        if let Some(row) = row {
+            // 数据存在，直接返回
+            Ok(InstanceSettings {
+                instance_name: row.get("instance_name"),
+                version: row.get("version"),
+                general: serde_json::from_value(row.get("general")).map_err(|e| e.to_string())?,
+                experimental: serde_json::from_value(row.get("experimental"))
+                    .map_err(|e| e.to_string())?,
+            })
+        } else {
+            // 数据不存在，创建默认数据
+            tracing::info!("instance_settings row not found, creating default entry");
+            let default_settings = InstanceSettings::default();
+            self.persist(&default_settings).await?;
+            Ok(default_settings)
+        }
     }
 
     async fn persist(&self, settings: &InstanceSettings) -> Result<(), String> {
@@ -203,7 +215,26 @@ impl DefaultInstanceSettingsService {
             .pool
             .as_ref()
             .ok_or_else(|| "instance settings persistence is not configured".to_string())?;
-        sqlx::query("UPDATE instance_settings SET instance_name=$1,version=$2,general=$3,experimental=$4,updated_at=now() WHERE id=1").bind(&settings.instance_name).bind(&settings.version).bind(serde_json::to_value(&settings.general).map_err(|e|e.to_string())?).bind(serde_json::to_value(&settings.experimental).map_err(|e|e.to_string())?).execute(pool).await.map_err(|e|e.to_string())?;
+        
+        // 使用INSERT ... ON CONFLICT来处理初次插入和后续更新
+        sqlx::query(
+            "INSERT INTO instance_settings (id, instance_name, version, general, experimental) 
+             VALUES (1, $1, $2, $3, $4) 
+             ON CONFLICT (id) DO UPDATE SET 
+               instance_name = EXCLUDED.instance_name,
+               version = EXCLUDED.version,
+               general = EXCLUDED.general,
+               experimental = EXCLUDED.experimental,
+               updated_at = now()"
+        )
+        .bind(&settings.instance_name)
+        .bind(&settings.version)
+        .bind(serde_json::to_value(&settings.general).map_err(|e| e.to_string())?)
+        .bind(serde_json::to_value(&settings.experimental).map_err(|e| e.to_string())?)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        
         Ok(())
     }
 }

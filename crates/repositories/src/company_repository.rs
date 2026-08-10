@@ -13,6 +13,31 @@ impl CompanyRepository {
     }
 
     pub async fn create(&self, input: CreateCompanyInput, creator_user_id: Uuid) -> Result<Company> {
+        let base = Self::derive_issue_prefix_base(&input.name);
+        let mut suffix = 1;
+        
+        while suffix < 10000 {
+            let candidate = format!("{}{}", base, Self::suffix_for_attempt(suffix));
+            
+            match self.try_create_with_prefix(&input, creator_user_id, &candidate).await {
+                Ok(company) => return Ok(company),
+                Err(e) if Self::is_issue_prefix_conflict(&e) => {
+                    suffix += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        
+        Err(sqlx::Error::Protocol("Unable to allocate unique issue prefix after 10000 attempts".into()))
+    }
+
+    async fn try_create_with_prefix(
+        &self,
+        input: &CreateCompanyInput,
+        creator_user_id: Uuid,
+        issue_prefix: &str,
+    ) -> Result<Company> {
         let mut tx = self.pool.begin().await?;
 
         let company = sqlx::query_as::<_, Company>(
@@ -28,7 +53,7 @@ impl CompanyRepository {
         )
         .bind(&input.name)
         .bind(&input.description)
-        .bind(input.issue_prefix.as_deref().unwrap_or(&input.name.to_uppercase()))
+        .bind(issue_prefix)
         .bind(input.budget_monthly_cents)
         .bind(input.attachment_max_bytes.unwrap_or(10485760))
         .bind(input.default_responsible_user_id)
@@ -52,6 +77,40 @@ impl CompanyRepository {
 
         tx.commit().await?;
         Ok(company)
+    }
+
+    fn derive_issue_prefix_base(name: &str) -> String {
+        let normalized: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        
+        if normalized.len() >= 3 {
+            normalized[..3].to_string()
+        } else if !normalized.is_empty() {
+            normalized
+        } else {
+            "CMP".to_string()
+        }
+    }
+
+    fn suffix_for_attempt(attempt: u32) -> String {
+        if attempt <= 1 {
+            String::new()
+        } else {
+            "A".repeat((attempt - 1) as usize)
+        }
+    }
+
+    fn is_issue_prefix_conflict(error: &sqlx::Error) -> bool {
+        if let sqlx::Error::Database(db_err) = error {
+            let message = db_err.message();
+            // Check for PostgreSQL unique constraint violation on issue_prefix
+            return message.contains("companies_issue_prefix_key") 
+                || message.contains("duplicate key value");
+        }
+        false
     }
 
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<Company>> {

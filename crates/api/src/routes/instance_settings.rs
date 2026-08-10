@@ -46,7 +46,10 @@ async fn get_general_settings(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let settings = state.instance_settings_service.get_general_settings()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!("Failed to get general settings: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     Ok(Json(serde_json::to_value(settings).unwrap_or_default()))
 }
 
@@ -67,7 +70,10 @@ async fn get_experimental_settings(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let settings = state.instance_settings_service.get_experimental_settings()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!("Failed to get experimental settings: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     Ok(Json(serde_json::to_value(settings).unwrap_or_default()))
 }
 

@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
