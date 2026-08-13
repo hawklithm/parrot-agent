@@ -156,6 +156,8 @@ pub fn access_control_routes(state: AppState) -> Router<AppState> {
         .route("/companies/:company_id/invites", get(list_company_invites).post(create_invite))
         .route("/invites/:token", get(get_invite))
         .route("/invites/:token/accept", post(accept_invite))
+        .route("/invites/:invite_id/revoke", post(revoke_invite))
+        .route("/invites/:token/test-resolution", get(get_invite_test_resolution))
         // 阶段二：加入请求
         .route("/companies/:company_id/join-requests", get(list_join_requests))
         .route(
@@ -584,6 +586,195 @@ async fn list_company_invites(
         .collect();
 
     Ok(Json(items))
+}
+
+/// 邀请行的 Paperclip 风格 JSON 视图。
+fn invite_row_json(
+    r: &sqlx::postgres::PgRow,
+    company_id: Uuid,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    use sqlx::Row;
+    Ok(Json(json!({
+        "id": r.get::<Uuid, _>("id"),
+        "companyId": company_id,
+        "inviteType": r.get::<String, _>("invite_type"),
+        "invitedEmail": r.get::<Option<String>, _>("invited_email"),
+        "invitedByUserId": r.get::<Option<Uuid>, _>("invited_by_user_id"),
+        "allowedJoinTypes": r.get::<Option<String>, _>("allowed_join_types"),
+        "accepted": r.get::<bool, _>("accepted"),
+        "acceptedAt": r.get::<Option<chrono::DateTime<Utc>>, _>("accepted_at"),
+        "revokedAt": r.get::<Option<chrono::DateTime<Utc>>, _>("revoked_at"),
+        "expiresAt": r.get::<Option<chrono::DateTime<Utc>>, _>("expires_at"),
+        "createdAt": r.get::<chrono::DateTime<Utc>, _>("created_at"),
+    })))
+}
+
+/// POST /api/invites/:invite_id/revoke
+/// 撤销邀请（对齐 Paperclip `/invites/:inviteId/revoke`）。
+async fn revoke_invite(
+    Extension(actor): Extension<AuthorizationActor>,
+    State(state): State<AppState>,
+    Path(invite_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT id, company_id, invite_type::text, invited_email, invited_by_user_id, \
+         allowed_join_types::text, accepted, accepted_at, revoked_at, expires_at, created_at \
+         FROM invites WHERE id = $1",
+    )
+    .bind(invite_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| AuthError::internal(format!("Failed to find invite: {}", e)))?;
+    let Some(r) = row else {
+        return Err(AuthError::bad_request("Invite not found"));
+    };
+
+    let company_id: Uuid = r.get("company_id");
+    let invite_type: String = r.get("invite_type");
+    let accepted_at: Option<chrono::DateTime<Utc>> = r.get("accepted_at");
+    let revoked_at: Option<chrono::DateTime<Utc>> = r.get("revoked_at");
+
+    if invite_type == "bootstrap_ceo" {
+        assert_instance_admin(&actor)?;
+    } else {
+        let allowed = decide_access(
+            &state.pool,
+            &actor,
+            &AuthorizationAction::Permission { key: PermissionKey::new("users:invite") },
+            Some(company_id),
+        )
+        .await;
+        if !allowed {
+            return Err(AuthError::forbidden("Insufficient permissions"));
+        }
+    }
+    if accepted_at.is_some() {
+        return Err(AuthError::conflict("Invite already consumed"));
+    }
+    if revoked_at.is_some() {
+        // 幂等：已撤销直接返回当前状态
+        return invite_row_json(&r, company_id);
+    }
+
+    sqlx::query("UPDATE invites SET revoked_at = NOW() WHERE id = $1")
+        .bind(invite_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| AuthError::internal(format!("Failed to revoke invite: {}", e)))?;
+
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "invite.revoked",
+        &actor,
+        "invite",
+        invite_id,
+        json!({}),
+    )
+    .await;
+
+    let refreshed = sqlx::query(
+        "SELECT id, company_id, invite_type::text, invited_email, invited_by_user_id, \
+         allowed_join_types::text, accepted, accepted_at, revoked_at, expires_at, created_at \
+         FROM invites WHERE id = $1",
+    )
+    .bind(invite_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| AuthError::internal(format!("Failed to reload invite: {}", e)))?;
+    invite_row_json(&refreshed, company_id)
+}
+
+#[derive(Debug, Deserialize)]
+struct TestResolutionQuery {
+    url: Option<String>,
+    #[serde(rename = "timeoutMs")]
+    timeout_ms: Option<i64>,
+}
+
+struct InviteProbeResult {
+    ok: bool,
+    status_code: Option<u16>,
+    latency_ms: Option<u64>,
+    error: Option<String>,
+}
+
+async fn probe_invite_url(url: url::Url, timeout_ms: i64) -> InviteProbeResult {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms as u64))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return InviteProbeResult { ok: false, status_code: None, latency_ms: None, error: Some(e.to_string()) };
+        }
+    };
+    let start = std::time::Instant::now();
+    match client.get(url).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let latency = start.elapsed().as_millis() as u64;
+            InviteProbeResult {
+                ok: status < 500,
+                status_code: Some(status),
+                latency_ms: Some(latency),
+                error: None,
+            }
+        }
+        Err(e) => InviteProbeResult { ok: false, status_code: None, latency_ms: None, error: Some(e.to_string()) },
+    }
+}
+
+/// GET /api/invites/:token/test-resolution
+/// 探测邀请目标的解析可达性（对齐 Paperclip `/invites/:token/test-resolution`）。
+async fn get_invite_test_resolution(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Query(query): Query<TestResolutionQuery>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    use sqlx::Row;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(AuthError::bad_request("Invite not found"));
+    }
+    let row = sqlx::query("SELECT id, revoked_at, expires_at FROM invites WHERE token = $1")
+        .bind(&token)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| AuthError::internal(format!("Failed to find invite: {}", e)))?;
+    let Some(r) = row else {
+        return Err(AuthError::bad_request("Invite not found"));
+    };
+    let revoked_at: Option<chrono::DateTime<Utc>> = r.get("revoked_at");
+    let expires_at: Option<chrono::DateTime<Utc>> = r.get("expires_at");
+    if revoked_at.is_some() || expires_at.map(|e| Utc::now() > e).unwrap_or(false) {
+        return Err(AuthError::bad_request("Invite not found"));
+    }
+    let invite_id: Uuid = r.get("id");
+
+    let raw_url = query.url.clone().unwrap_or_default();
+    if raw_url.trim().is_empty() {
+        return Err(AuthError::bad_request("url query parameter is required"));
+    }
+    let url = url::Url::parse(raw_url.trim())
+        .map_err(|_| AuthError::bad_request("url must be an absolute http(s) URL"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(AuthError::bad_request("url must use http or https"));
+    }
+    let timeout_ms = query.timeout_ms.unwrap_or(5000).clamp(1000, 15000);
+
+    let probe = probe_invite_url(url.clone(), timeout_ms).await;
+    Ok(Json(json!({
+        "inviteId": invite_id,
+        "testResolutionPath": format!("/api/invites/{}/test-resolution", token),
+        "requestedUrl": url.to_string(),
+        "timeoutMs": timeout_ms,
+        "ok": probe.ok,
+        "statusCode": probe.status_code,
+        "latencyMs": probe.latency_ms,
+        "error": probe.error,
+    })))
 }
 
 /// POST /api/companies/:company_id/invites

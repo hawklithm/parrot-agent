@@ -29,6 +29,10 @@ pub enum AuthError {
         message: String,
         code: Option<String>,
     },
+    /// 冲突（409）：资源状态与请求不兼容（如已被消费/已撤销）。
+    Conflict {
+        message: String,
+    },
     /// 内部错误（500）
     Internal {
         message: String,
@@ -82,6 +86,11 @@ impl AuthError {
 
     pub fn unprocessable(message: impl Into<String>, code: impl Into<String>) -> Self {
         Self::Unprocessable { message: message.into(), code: Some(code.into()) }
+    }
+
+    /// 创建冲突错误（409）
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict { message: message.into() }
     }
 
     /// 创建内部错误
@@ -148,6 +157,7 @@ impl AuthError {
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Unprocessable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -161,6 +171,7 @@ impl AuthError {
             Self::BadRequest { .. } => "auth.bad_request",
             Self::Unprocessable { code: Some(code), .. } => return code.clone(),
             Self::Unprocessable { .. } => "auth.unprocessable",
+            Self::Conflict { .. } => "auth.conflict",
             Self::Internal { .. } => "auth.internal_error",
             Self::InvalidToken { .. } => "auth.invalid_token",
             Self::TokenExpired => "auth.token_expired",
@@ -177,6 +188,7 @@ impl AuthError {
             Self::Forbidden { reason, .. } => reason.clone(),
             Self::BadRequest { message } => message.clone(),
             Self::Unprocessable { message, .. } => message.clone(),
+            Self::Conflict { message } => message.clone(),
             Self::Internal { .. } => "Internal server error".to_string(),
             Self::InvalidToken { .. } => "Invalid authentication token".to_string(),
             Self::TokenExpired => "Authentication token has expired".to_string(),
