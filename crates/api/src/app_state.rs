@@ -13,7 +13,7 @@ pub use services::{
     IssueCommentService, IssueService, IssueTreeControlService, LabelService, LowTrustService,
     OpenClawService, OrgChartService, PipelineService, PluginService, ProjectService,
     RoutineAnnotationService, RoutineService, SecretProviderConfigService,
-    SecretRemoteImportService, SkillRegistryService, SseService, TermService,
+    SecretRemoteImportService, SkillPolicyService, SkillRegistryService, SseService, TermService,
     UserDirectoryService, UserSecretDefinitionService, UserSecretService, WatchdogService,
     WorkProductService, WorkTimelineService,
 };
@@ -77,6 +77,7 @@ pub struct AppState {
 
     // Skills
     pub skill_registry_service: Arc<dyn SkillRegistryService>,
+    pub skill_policy_service: Arc<dyn SkillPolicyService>,
 
     // Additional services for unmerged routes
     pub sse_service: Arc<dyn SseService>,
@@ -154,6 +155,7 @@ impl AppState {
         environment_service: Arc<dyn EnvironmentService>,
         pipeline_service: Arc<dyn PipelineService>,
         skill_registry_service: Arc<dyn SkillRegistryService>,
+        skill_policy_service: Arc<dyn SkillPolicyService>,
         sse_service: Arc<dyn SseService>,
         invite_service: Arc<dyn InviteService>,
         openclaw_service: Arc<dyn OpenClawService>,
@@ -208,6 +210,7 @@ impl AppState {
             environment_service,
             pipeline_service,
             skill_registry_service,
+            skill_policy_service,
             sse_service,
             invite_service,
             openclaw_service,
@@ -298,6 +301,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::secret_provider_configs::secret_provider_config_routes())
         .merge(crate::routes::secret_remote_import::secret_remote_import_routes())
         .merge(crate::routes::skills::skill_routes())
+        .merge(crate::routes::skill_policy::skill_policy_routes())
         .merge(crate::routes::sse::sse_routes())
         .merge(crate::routes::websocket::websocket_routes())
         .merge(crate::routes::user_directory::user_directory_routes())

@@ -420,6 +420,11 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
             Arc::new(PgSkillCommentRepository::new(pool.clone())),
             Arc::new(PgSkillFileRepository::new(pool.clone())),
         ));
+    // P1.3: 公司级 Skill 策略（平台安全层 + 公司策略层）
+    let skill_policy_service: Arc<dyn services::SkillPolicyService> =
+        Arc::new(services::DefaultSkillPolicyService::new(Arc::new(
+            repositories::PgCompanySkillPolicyRepository::new(pool.clone()),
+        )));
     let sse_service: Arc<dyn SseService> = InMemorySseService::new();
     let invite_service: Arc<dyn InviteService> =
         Arc::new(InviteServiceImpl::with_pool(pool.clone()));
@@ -584,6 +589,7 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         environment_service,
         pipeline_service,
         skill_registry_service,
+        skill_policy_service,
         sse_service,
         invite_service,
         openclaw_service,

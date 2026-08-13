@@ -98,6 +98,11 @@ pub use secret_provider_config_service::{
 pub use secret_remote_import_service::{MockSecretRemoteImportService, SecretRemoteImportService};
 pub use skill_registry_service::{MockSkillRegistryService, SkillRegistryService};
 pub use skill_registry_service_impl::DefaultSkillRegistryServiceImpl;
+pub mod skill_policy_service;
+pub use skill_policy_service::{
+    DefaultSkillPolicyService, DenialType, PolicyDecision, SkillPolicyError, SkillPolicyService,
+    SkillPolicyResult,
+};
 
 pub use agent_service::{
     AgentService, CreateAgentInput, DefaultAgentService, NormalizedAgentRow, ServiceError,

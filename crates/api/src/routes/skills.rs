@@ -343,11 +343,66 @@ async fn unstar_company_skill(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// P1.3: 公司 Skill 策略网关。
+///
+/// 在 skill 变更类操作（import / install / fork）前统一评估：
+/// - 平台安全层（受保护 skill）拒绝 → 403 Forbidden
+/// - 公司策略层拒绝 → 403 Forbidden
+async fn enforce_skill_policy(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    action: &str,
+    source: &str,
+    skill_key: &str,
+) -> Result<(), AppError> {
+    let role = actor_policy_role(actor, company_id);
+    let agent_id = if actor.is_agent() {
+        actor.principal_id()
+    } else {
+        None
+    };
+    let decision = state
+        .skill_policy_service
+        .evaluate(company_id, agent_id, &role, action, source, skill_key)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    if !decision.allowed {
+        return Err(AppError::Forbidden(decision.reason));
+    }
+    Ok(())
+}
+
+/// 从 Actor 推导策略评估用的 role 字符串。
+fn actor_policy_role(actor: &AuthorizationActor, company_id: Uuid) -> String {
+    if actor.is_instance_admin() {
+        return "instance_admin".to_string();
+    }
+    if actor.is_agent() {
+        return "agent".to_string();
+    }
+    match actor.role_in(company_id) {
+        Some(role) => format!("{:?}", role).to_ascii_lowercase(),
+        None => "anonymous".to_string(),
+    }
+}
+
 /// SK23: Fork
 async fn fork_company_skill(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    enforce_skill_policy(
+        &state,
+        &actor,
+        company_id,
+        "fork",
+        "company",
+        &skill_id.to_string(),
+    )
+    .await?;
     state
         .skill_registry_service
         .fork_skill(company_id, skill_id)
@@ -500,9 +555,20 @@ async fn delete_skill_files(
 /// SK35: Import
 async fn import_company_skill(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
+    // P1.3: 导入前评估公司 skill 策略（受保护 skill 一律拒绝）
+    let skill_key = payload
+        .get("skillKey")
+        .or_else(|| payload.get("key"))
+        .or_else(|| payload.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    enforce_skill_policy(&state, &actor, company_id, "import", "import", &skill_key).await?;
+
     let result = state
         .skill_registry_service
         .import_skill(company_id, payload)
@@ -514,8 +580,10 @@ async fn import_company_skill(
 /// SK36: Install catalog
 async fn install_skill_catalog(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    enforce_skill_policy(&state, &actor, company_id, "install", "catalog", "*").await?;
     state
         .skill_registry_service
         .install_catalog(company_id)
