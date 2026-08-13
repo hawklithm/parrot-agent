@@ -17,10 +17,22 @@ use crate::errors::AppError;
 use models::{Company, CreateCompanyInput, UpdateCompanyInput};
 use services::auth::AuthorizationActor;
 
+/// 对齐 Paperclip companies.ts:290：`/companies/issues` 缺 companyId 时的 400 守卫。
+async fn company_issues_guard() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "Missing companyId in path. Use /api/companies/{companyId}/issues."
+        })),
+    )
+}
+
 pub fn company_routes() -> Router<AppState> {
     Router::new()
         // Company list + create
         .route("/companies", get(list_companies).post(create_company))
+        // 对齐 Paperclip companies.ts:290：/companies/issues 缺 companyId 时的 400 守卫
+        .route("/companies/issues", get(company_issues_guard))
         // Company stats
         .route("/companies/stats", get(get_company_stats))
         // Single company operations
