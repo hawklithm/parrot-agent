@@ -300,16 +300,46 @@ mod tests {
     fn test_parse_hire_agent_payload_minimal() {
         let payload = serde_json::json!({
             "name": "Test Agent",
-            "role": "engineer",
-            "adapterType": "anthropic",
+            "role": "researcher",
+            "adapterType": "claude_local",
         });
 
-        let result = HireAgentPayload::from_json(&payload);
-        assert!(result.is_ok());
-
-        let parsed = result.unwrap();
+        let parsed = HireAgentPayload::from_json(&payload).expect("minimal payload should parse");
         assert_eq!(parsed.name, "Test Agent");
-        assert_eq!(parsed.adapter_type, "anthropic");
+        assert_eq!(parsed.role, models::AgentRole::Researcher);
+        assert_eq!(parsed.adapter_type, "claude_local");
         assert!(parsed.agent_id.is_none());
+        assert!(parsed.budget_monthly_cents.is_none());
+        assert_eq!(parsed.adapter_config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_parse_hire_agent_payload_rejects_invalid_role() {
+        let payload = serde_json::json!({
+            "name": "Test Agent",
+            "role": "engineer",
+            "adapterType": "claude_local",
+        });
+
+        let err = HireAgentPayload::from_json(&payload).expect_err("invalid role must fail");
+        assert!(matches!(err, ServiceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_parse_hire_agent_payload_accepts_snake_case_aliases() {
+        let agent_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "name": "Existing Agent",
+            "role": "manager",
+            "adapter_type": "process",
+            "agent_id": agent_id.to_string(),
+            "budget_monthly_cents": 12_345,
+        });
+
+        let parsed =
+            HireAgentPayload::from_json(&payload).expect("snake_case payload should parse");
+        assert_eq!(parsed.adapter_type, "process");
+        assert_eq!(parsed.agent_id, Some(agent_id));
+        assert_eq!(parsed.budget_monthly_cents, Some(12_345));
     }
 }

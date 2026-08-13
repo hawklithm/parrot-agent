@@ -96,7 +96,7 @@ pub fn company_routes() -> Router<AppState> {
             post(get_external_object_summaries),
         )
         .layer(axum::middleware::from_fn(
-            crate::routes::require_company_access,
+            crate::routes::require_company_access_middleware,
         ))
 }
 
