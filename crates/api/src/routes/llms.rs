@@ -150,13 +150,34 @@ async fn get_openapi_spec(
 }
 
 /// GET /stats — 系统统计
+///
+/// 对应 Paperclip: GET /stats。返回实例级聚合计数，均从数据库实时查询，
+/// 不再返回硬编码的零值。数据库连接失败或表缺失时对应字段回退为 0，
+/// 避免监控端点本身触发 500。
 async fn get_stats(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let agents: i64 = sqlx::query_scalar("SELECT count(*) FROM agents")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+    let issues: i64 = sqlx::query_scalar("SELECT count(*) FROM issues")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+    let companies: i64 = sqlx::query_scalar("SELECT count(*) FROM companies")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM heartbeat_runs")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+
     Ok(Json(serde_json::json!({
-        "agents": 0,
-        "issues": 0,
-        "runs": 0,
-        "companies": 0,
+        "agents": agents,
+        "issues": issues,
+        "runs": runs,
+        "companies": companies,
     })))
 }
