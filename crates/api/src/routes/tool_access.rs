@@ -783,4 +783,521 @@ pub fn tool_access_routes() -> Router<AppState> {
         )
         .route("/tool-gateway/audit", get(gateway_audit))
         .route("/tool-gateway/runtime-slots", get(gateway_runtime_slots))
+        // ---- round 2 ----
+        .route(
+            "/tool-profile-entries/:id",
+            patch(update_tool_profile_entry).delete(delete_tool_profile_entry),
+        )
+        .route("/tool-connections/:id/test-agents", get(connection_test_agents))
+        .route("/tool-connections/:id/test-calls/:call_id", get(connection_test_call))
+        .route("/tool-connections/:id/catalog/refresh", post(refresh_connection_catalog))
+        .route("/tool-connections/:id/grants/installations", post(install_connection_grants))
+        .route("/tools/oauth/callback", get(tools_oauth_callback))
+        .route(
+            "/companies/:company_id/tools/connections",
+            post(create_company_tool_connection),
+        )
+        .route(
+            "/companies/:company_id/tools/profiles",
+            post(create_company_tool_profile),
+        )
+        .route(
+            "/companies/:company_id/tools/examples/:example_id/install",
+            post(install_tool_example),
+        )
+        .route(
+            "/companies/:company_id/tools/examples/:example_id/smoke",
+            post(smoke_tool_example),
+        )
+        .route(
+            "/companies/:company_id/tools/apps/connect",
+            post(connect_tool_app),
+        )
+        .route(
+            "/companies/:company_id/tools/apps/:app_id/finish",
+            post(finish_tool_app),
+        )
+        .route(
+            "/companies/:company_id/tools/mcp/import-json",
+            post(import_mcp_json),
+        )
+        .route(
+            "/companies/:company_id/tools/policies/:policy_id",
+            patch(update_company_tool_policy),
+        )
+        .route(
+            "/companies/:company_id/tools/policies/:policy_id/duplicate",
+            post(duplicate_tool_policy),
+        )
+        .route(
+            "/companies/:company_id/tools/policies/reorder",
+            post(reorder_tool_policies),
+        )
+        .route(
+            "/companies/:company_id/tools/policy/test",
+            post(test_tool_policy),
+        )
+        .route(
+            "/companies/:company_id/tools/stdio-templates",
+            post(create_stdio_template),
+        )
+        .route(
+            "/companies/:company_id/tools/trust-rules/:rule_id/revoke",
+            post(revoke_trust_rule),
+        )
+        .route(
+            "/companies/:company_id/tools/runtime-slots/:slot_id/stop",
+            post(stop_runtime_slot),
+        )
+        .route(
+            "/companies/:company_id/tools/runtime-slots/:slot_id/restart",
+            post(restart_runtime_slot),
+        )
+        .route(
+            "/agents/me/connections/:connection_id/start-authorization",
+            post(start_agent_connection_auth),
+        )
+        .route(
+            "/agents/me/connections/:connection_id/token",
+            post(agent_connection_token),
+        )
+        .route("/agents/me/secrets/:key/value", post(agent_secret_value))
+}
+
+// ================= Round 2 =================
+
+/// PATCH /api/tool-profile-entries/:id
+#[derive(Debug, Deserialize)]
+struct UpdateProfileEntryRequest {
+    enabled: Option<bool>,
+    order: Option<i32>,
+}
+async fn update_tool_profile_entry(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(entry_id): Path<Uuid>,
+    Json(request): Json<UpdateProfileEntryRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    use sqlx::Row;
+    let row = sqlx::query(
+        "UPDATE tool_profile_entries SET enabled = COALESCE($2, enabled), position = COALESCE($3, position), \
+         updated_at = NOW() WHERE id = $1 RETURNING *",
+    )
+    .bind(entry_id)
+    .bind(request.enabled)
+    .bind(request.order)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to update tool profile entry: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let Some(row) = row else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(json!({
+        "id": entry_id,
+        "enabled": row.get::<Option<bool>, _>("enabled"),
+        "position": row.get::<Option<i32>, _>("position"),
+    })))
+}
+
+/// DELETE /api/tool-profile-entries/:id
+async fn delete_tool_profile_entry(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(entry_id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    sqlx::query("DELETE FROM tool_profile_entries WHERE id = $1")
+        .bind(entry_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to delete tool profile entry: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/tool-connections/:id/test-agents —— 静态空。
+async fn connection_test_agents(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(_connection_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(vec![]))
+}
+
+/// GET /api/tool-connections/:id/test-calls/:call_id —— 静态空结构。
+async fn connection_test_call(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((connection_id, call_id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "connectionId": connection_id, "callId": call_id, "status": "noop" })))
+}
+
+/// POST /api/tool-connections/:id/catalog/refresh —— mock（200）。
+async fn refresh_connection_catalog(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(connection_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "connectionId": connection_id, "refreshed": true, "toolCount": 2 })))
+}
+
+/// POST /api/tool-connections/:id/grants/installations —— 按安装批量授权（基础：204 语义）。
+async fn install_connection_grants(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(connection_id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    sqlx::query(
+        "INSERT INTO tool_connection_grants (company_id, connection_id, agent_id) \
+         SELECT company_id, $1, id FROM agents WHERE company_id = $2 AND status = 'active' \
+         ON CONFLICT (connection_id, agent_id) DO NOTHING",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to install connection grants: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/tools/oauth/callback —— OAuth callback（返回 code 回显）。
+async fn tools_oauth_callback(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "received": true, "status": "ok" })))
+}
+
+/// POST /companies/:cid/tools/connections —— 创建连接。
+#[derive(Debug, Deserialize)]
+struct CreateConnectionRequest {
+    #[serde(rename = "toolType")]
+    tool_type: String,
+    name: Option<String>,
+    config: Option<Value>,
+}
+async fn create_company_tool_connection(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+    Json(request): Json<CreateConnectionRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tool_connections (id, company_id, tool_type, name, config, status) \
+         VALUES ($1, $2, $3, COALESCE($4, $3), $5, 'unconfigured')",
+    )
+    .bind(id)
+    .bind(company_id)
+    .bind(&request.tool_type)
+    .bind(request.name.as_deref())
+    .bind(request.config.as_ref())
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create tool connection: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "tool_connection.created",
+        &actor,
+        "tool_connection",
+        id,
+        json!({ "toolType": request.tool_type }),
+    )
+    .await;
+    let row = sqlx::query("SELECT * FROM tool_connections WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to reload connection: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok((StatusCode::CREATED, Json(connection_json(&row))))
+}
+
+/// POST /companies/:cid/tools/profiles —— 创建 profile。
+#[derive(Debug, Deserialize)]
+struct CreateToolProfileRequest {
+    name: String,
+    description: Option<String>,
+}
+async fn create_company_tool_profile(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+    Json(request): Json<CreateToolProfileRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tool_profiles (id, company_id, name, description) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(company_id)
+    .bind(&request.name)
+    .bind(request.description.as_deref())
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create tool profile: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "id": id, "name": request.name, "description": request.description })),
+    ))
+}
+
+/// POST /companies/:cid/tools/examples/:example_id/install|smoke —— mock。
+async fn install_tool_example(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, _example_id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "installed": true })))
+}
+async fn smoke_tool_example(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, _example_id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "smoke": "passed" })))
+}
+
+/// POST /companies/:cid/tools/apps/connect 与 /apps/:app_id/finish —— mock。
+async fn connect_tool_app(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "connected": true })))
+}
+async fn finish_tool_app(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, _app_id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "finished": true })))
+}
+
+/// POST /companies/:cid/tools/mcp/import-json —— mock。
+async fn import_mcp_json(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "imported": 0, "errors": [] })))
+}
+
+/// PATCH /companies/:cid/tools/policies/:policy_id —— 更新策略。
+#[derive(Debug, Deserialize)]
+struct UpdateToolPolicyRequest {
+    name: Option<String>,
+    enabled: Option<bool>,
+}
+async fn update_company_tool_policy(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, policy_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateToolPolicyRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    sqlx::query(
+        "UPDATE tool_policies SET name = COALESCE($3, name), enabled = COALESCE($4, enabled), \
+         updated_at = NOW() WHERE id = $1 AND company_id = $2",
+    )
+    .bind(policy_id)
+    .bind(company_id)
+    .bind(request.name.as_deref())
+    .bind(request.enabled)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to update tool policy: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({ "id": policy_id, "name": request.name, "enabled": request.enabled })))
+}
+
+/// POST /companies/:cid/tools/policies/:policy_id/duplicate —— mock。
+async fn duplicate_tool_policy(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, policy_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "id": Uuid::new_v4(), "duplicatedFrom": policy_id })))
+}
+
+/// POST /companies/:cid/tools/policies/reorder —— mock。
+async fn reorder_tool_policies(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "reordered": true })))
+}
+
+/// POST /companies/:cid/tools/policy/test —— mock。
+async fn test_tool_policy(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "matches": true })))
+}
+
+/// POST /companies/:cid/tools/stdio-templates —— mock。
+#[derive(Debug, Deserialize)]
+struct CreateStdioTemplateRequest {
+    name: Option<String>,
+}
+async fn create_stdio_template(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+    Json(request): Json<CreateStdioTemplateRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "id": Uuid::new_v4(), "name": request.name })))
+}
+
+/// POST /companies/:cid/tools/trust-rules/:rule_id/revoke —— mock（204）。
+async fn revoke_trust_rule(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, _rule_id)): Path<(Uuid, String)>,
+) -> Result<StatusCode, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /companies/:cid/tools/runtime-slots/:slot_id/stop|restart —— mock。
+async fn stop_runtime_slot(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, _slot_id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "stopped": true })))
+}
+async fn restart_runtime_slot(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, _slot_id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "restarted": true })))
+}
+
+/// POST /agents/me/connections/:connection_id/start-authorization —— mock。
+async fn start_agent_connection_auth(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(connection_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "connectionId": connection_id, "authorizationUrl": format!("/api/tools/oauth/authorize?connection={}", connection_id) })))
+}
+
+/// POST /agents/me/connections/:connection_id/token —— mock token。
+async fn agent_connection_token(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(connection_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "connectionId": connection_id, "accessToken": format!("mock-{}", Uuid::new_v4()) })))
+}
+
+/// POST /agents/me/secrets/:key/value —— 读取 agent 已获批 secret 的值。
+async fn agent_secret_value(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let (agent_id, company_id, _) = match &actor {
+        AuthorizationActor::Agent { agent_id, company_id, run_id, .. } => (*agent_id, *company_id, *run_id),
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+    let material: Option<Value> = sqlx::query_scalar(
+        "SELECT v.material FROM company_secret_proposals p \
+         JOIN company_secret_versions v ON v.secret_id = p.created_secret_id \
+         WHERE p.company_id = $1 AND p.proposed_by_agent_id = $2 AND p.kind = 'secret' \
+           AND p.status = 'approved' AND p.proposed_key = $3 \
+         ORDER BY p.created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to resolve agent secret: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let Some(material) = material else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    Ok(Json(json!({ "key": key, "value": material })))
 }
