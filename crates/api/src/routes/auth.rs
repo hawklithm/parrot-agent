@@ -116,12 +116,13 @@ async fn sign_out(
     Ok(response)
 }
 
-/// GET /api/auth/get-session
+/// 构造 `get-session` 的 `session` 视图。
 ///
-/// 返回当前会话信息；未登录（匿名）返回 `{ "session": null }`。
-async fn get_session(
-    Extension(actor): Extension<AuthorizationActor>,
-) -> Response {
+/// 对齐 Paperclip `authSessionSchema.session`：
+/// - Board 用户：userId / companyId / role / isInstanceAdmin / source。
+/// - Agent：agentId / companyId / source。
+/// - 匿名：null（前端据此判断未登录）。
+pub(crate) fn build_session_view(actor: &AuthorizationActor) -> serde_json::Value {
     match actor {
         AuthorizationActor::Board {
             user_id,
@@ -132,7 +133,7 @@ async fn get_session(
         } => {
             let role = memberships
                 .iter()
-                .find(|m| m.company_id == company_id && m.status.is_active())
+                .find(|m| m.company_id == *company_id && m.status.is_active())
                 .map(|m| match m.role {
                     MembershipRole::Owner => "owner",
                     MembershipRole::Admin => "admin",
@@ -140,11 +141,11 @@ async fn get_session(
                     MembershipRole::Viewer => "viewer",
                 })
                 .unwrap_or("member");
-            let session = json!({
+            json!({
                 "userId": user_id.to_string(),
                 "companyId": company_id.to_string(),
                 "role": role,
-                "isInstanceAdmin": is_instance_admin,
+                "isInstanceAdmin": *is_instance_admin,
                 "source": match source {
                     ActorSource::Session => "session",
                     ActorSource::BoardKey => "board_key",
@@ -152,8 +153,7 @@ async fn get_session(
                     ActorSource::CloudTenant => "cloud_tenant",
                     _ => "unknown",
                 },
-            });
-            (StatusCode::OK, Json(json!({ "session": session }))).into_response()
+            })
         }
         AuthorizationActor::Agent {
             agent_id,
@@ -161,7 +161,7 @@ async fn get_session(
             source,
             ..
         } => {
-            let session = json!({
+            json!({
                 "agentId": agent_id.to_string(),
                 "companyId": company_id.to_string(),
                 "source": match source {
@@ -169,13 +169,45 @@ async fn get_session(
                     ActorSource::AgentJwt => "agent_jwt",
                     _ => "unknown",
                 },
-            });
-            (StatusCode::OK, Json(json!({ "session": session }))).into_response()
+            })
         }
-        AuthorizationActor::None => {
-            (StatusCode::OK, Json(json!({ "session": null }))).into_response()
-        }
+        AuthorizationActor::None => serde_json::Value::Null,
     }
+}
+
+/// 当前用户资料的 JSON 视图（GET /profile 与 GET /get-session 共用）。
+fn user_profile_value(user: &AuthUser, is_instance_admin: bool) -> serde_json::Value {
+    json!({
+        "id": user.id.to_string(),
+        "email": user.email,
+        "name": user.name,
+        "avatarUrl": user.avatar_url,
+        "isInstanceAdmin": is_instance_admin,
+    })
+}
+
+/// GET /api/auth/get-session
+///
+/// 对齐 Paperclip `authSessionSchema`：返回 `{ session, user }`。
+/// - Board 用户：附带当前用户资料（`user` 非 null）。
+/// - Agent / 匿名：`user` 为 null。
+async fn get_session(
+    Extension(actor): Extension<AuthorizationActor>,
+    State(state): State<AppState>,
+) -> Result<Response, AuthError> {
+    let session = build_session_view(&actor);
+    let user = match &actor {
+        AuthorizationActor::Board { user_id, .. } => {
+            let repo = PgAuthUserRepository::new(state.pool.clone());
+            let loaded = repo
+                .find_by_id(*user_id)
+                .await
+                .map_err(|e| AuthError::internal(format!("Failed to load user: {}", e)))?;
+            loaded.map(|u| user_profile_value(&u, actor.is_instance_admin()))
+        }
+        _ => None,
+    };
+    Ok(Json(json!({ "session": session, "user": user })).into_response())
 }
 
 /// 当前用户资料响应。
@@ -311,4 +343,33 @@ async fn claim_join_request_api_key(
     Path(request_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
     Ok(Json(serde_json::json!({"requestId": request_id, "apiKey": Uuid::new_v4().to_string(), "claimed": true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::access_test_support::board_with_role;
+    use services::auth::MembershipRole;
+
+    #[test]
+    fn session_view_includes_company_role_and_source() {
+        let actor = board_with_role(Uuid::new_v4(), MembershipRole::Owner);
+        let view = build_session_view(&actor);
+        assert_eq!(view["role"], "owner");
+        assert!(view.get("userId").is_some());
+        assert!(view.get("companyId").is_some());
+        assert!(view.get("source").is_some());
+        assert_eq!(view["isInstanceAdmin"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn session_view_for_viewer_uses_read_only_role() {
+        let actor = board_with_role(Uuid::new_v4(), MembershipRole::Viewer);
+        assert_eq!(build_session_view(&actor)["role"], "viewer");
+    }
+
+    #[test]
+    fn session_view_for_anonymous_is_null() {
+        assert!(build_session_view(&AuthorizationActor::none()).is_null());
+    }
 }

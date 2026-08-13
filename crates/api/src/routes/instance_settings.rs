@@ -1,13 +1,15 @@
 //! Instance Settings routes — 实例级设置管理 (IS1-IS9)
 
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 
 use crate::app_state::AppState;
+use crate::routes::{assert_instance_admin, log_activity};
+use services::auth::AuthorizationActor;
 
 pub fn instance_settings_routes() -> Router<AppState> {
     Router::new()
@@ -108,12 +110,72 @@ async fn run_auto_recovery(
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
+/// 将 backup service 的错误归类为合适的 HTTP 状态。
+///
+/// 对齐 Paperclip：`not configured` 表示能力未启用，返回 501；
+/// 其余（IO/调度失败）归为 500。
+fn database_backup_error_status(err: &str) -> StatusCode {
+    if err.contains("not configured") {
+        StatusCode::NOT_IMPLEMENTED
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 /// IS9: POST /instance/database-backups
 async fn create_database_backup(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let result = state.instance_settings_service.create_database_backup()
+    // 对齐 Paperclip：仅实例管理员可触发手动备份。
+    assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
+
+    let result = state
+        .instance_settings_service
+        .create_database_backup()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            let status = database_backup_error_status(&e);
+            if status == StatusCode::INTERNAL_SERVER_ERROR {
+                tracing::error!("Failed to create database backup: {}", e);
+            }
+            status
+        })?;
+
+    // 所有 mutation 写 activity log（对齐 handoff 审计约束）。
+    log_activity(
+        &state.pool,
+        uuid::Uuid::nil(),
+        "instance.database_backup_created",
+        &actor,
+        "instance",
+        uuid::Uuid::nil(),
+        serde_json::json!({ "backupId": result.backup_id }),
+    )
+    .await;
+
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_configured_backup_maps_to_501() {
+        assert_eq!(
+            database_backup_error_status(
+                "database backup is not configured; configure the deployment backup worker before requesting a backup"
+            ),
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    #[test]
+    fn unexpected_backup_error_maps_to_500() {
+        assert_eq!(
+            database_backup_error_status("pg_dump exited with code 1"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 }
