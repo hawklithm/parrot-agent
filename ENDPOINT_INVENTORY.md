@@ -9,11 +9,11 @@
 - **Limitation**：状态为结构性判定；`partial` 语义、`by-design-candidate` 最终清单需人工复核。
 
 - Paperclip endpoints: **597**
-- Parrot endpoints: **631**
-- implemented: **460**
+- Parrot endpoints: **634**
+- implemented: **463**
 - partial: **7**
-- by-design-candidate: **24**
-- missing: **106**
+- by-design-candidate: **22**
+- missing: **105**
 - Parrot-only (extension): **171**
 
 ## 1. Implemented
@@ -29,6 +29,7 @@
 | `DELETE /api/cases/:param/documents/:param` | `routes/cases.ts:1209` |
 | `DELETE /api/cases/:param/issue-links/:param` | `routes/pipelines.ts:2123` |
 | `DELETE /api/companies/:param` | `routes/companies.ts:747` |
+| `DELETE /api/companies/:param/inbox-dismissals/:param` | `routes/inbox-dismissals.ts:98` |
 | `DELETE /api/companies/:param/me/user-secrets/:param` | `routes/secrets.ts:866` |
 | `DELETE /api/companies/:param/skill-policy` | `routes/company-skill-policy.ts:99` |
 | `DELETE /api/companies/:param/skill-test-run-templates/:param` | `routes/company-skills.ts:530` |
@@ -293,6 +294,7 @@
 | `GET /api/secret-provider-configs/:param` | `routes/secrets.ts:472` |
 | `GET /api/secrets/:param/access-events` | `routes/secrets.ts:1098` |
 | `GET /api/secrets/:param/usage` | `routes/secrets.ts:1083` |
+| `GET /api/sidebar-preferences/me` | `routes/sidebar-preferences.ts:21` |
 | `GET /api/skills/:param` | `routes/access.ts:3273` |
 | `GET /api/skills/available` | `routes/access.ts:3247` |
 | `GET /api/skills/catalog` | `routes/company-skills.ts:285` |
@@ -480,6 +482,7 @@
 | `PUT /api/pipelines/:param/documents/:param` | `routes/pipelines.ts:1288` |
 | `PUT /api/pipelines/:param/transitions` | `routes/pipelines.ts:1256` |
 | `PUT /api/plugins/:param/companies/:param/local-folders/:param` | `routes/plugins.ts:2894` |
+| `PUT /api/sidebar-preferences/me` | `routes/sidebar-preferences.ts:27` |
 
 ## 2. Partial（路径存在、方法不同）
 
@@ -504,7 +507,6 @@
 | `GET /api/cli-auth/challenges/:param` | `routes/access.ts:2751` | Paperclip-only domain '/cli-auth' |
 | `GET /api/cloud/stacks` | `routes/cloud.ts:30` | Paperclip-only domain '/cloud' |
 | `GET /api/companies/:param/audit/agent-actions.csv` | `routes/activity.ts:274` | export artifact suffix |
-| `GET /api/sidebar-preferences/me` | `routes/sidebar-preferences.ts:21` | Paperclip-only domain '/sidebar-preferences' |
 | `GET /api/status-cards/:param` | `routes/status-cards.ts:170` | Paperclip-only domain '/status-cards' |
 | `GET /api/status-cards/:param/dry-run` | `routes/status-cards.ts:251` | Paperclip-only domain '/status-cards' |
 | `GET /api/status-cards/:param/summary-revisions` | `routes/status-cards.ts:216` | Paperclip-only domain '/status-cards' |
@@ -518,7 +520,6 @@
 | `POST /api/status-cards/:param/refresh` | `routes/status-cards.ts:236` | Paperclip-only domain '/status-cards' |
 | `POST /api/tool-gateway/runtime-slots/:param/restart` | `routes/tool-gateway.ts:609` | Paperclip-only domain '/tool-gateway' |
 | `POST /api/tool-gateway/runtime-slots/:param/stop` | `routes/tool-gateway.ts:582` | Paperclip-only domain '/tool-gateway' |
-| `PUT /api/sidebar-preferences/me` | `routes/sidebar-preferences.ts:27` | Paperclip-only domain '/sidebar-preferences' |
 | `PUT /api/status-cards/:param/query` | `routes/status-cards.ts:271` | Paperclip-only domain '/status-cards' |
 | `PUT /api/status-cards/:param/summary` | `routes/status-cards.ts:290` | Paperclip-only domain '/status-cards' |
 
@@ -529,7 +530,6 @@
 | `ALL /api/auth/{:param}` | `app.ts:321` |  |
 | `DELETE /api/agents/me/secret-proposals/:param` | `routes/secrets.ts:282` |  |
 | `DELETE /api/companies/:param/folders/:param` | `routes/folders.ts:149` |  |
-| `DELETE /api/companies/:param/inbox-dismissals/:param` | `routes/inbox-dismissals.ts:98` |  |
 | `DELETE /api/issues/:param/watchdog` | `routes/issues.ts:6113` |  |
 | `DELETE /api/tool-connections/:param` | `routes/tool-access.ts:783` |  |
 | `DELETE /api/tool-connections/:param/grants/:param` | `routes/tool-access.ts:601` |  |
