@@ -94,6 +94,35 @@ pub async fn add_annotation_comment(
     }
 }
 
+/// GET /routines/:id/description/annotations/:threadId - 获取单个 annotation thread
+/// 对齐 Paperclip `GET /routines/:id/description/annotations/:threadId`。
+pub async fn get_annotation_thread(
+    Path((routine_id, thread_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+) -> Response {
+    if !routine_access(&state, &actor, routine_id, true).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match state
+        .routine_annotation_service
+        .get_thread(routine_id, thread_id)
+        .await
+    {
+        Ok(Some(thread)) => (StatusCode::OK, Json(thread)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Annotation thread not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
 /// PATCH /routines/:id/description/annotations/:threadId - 更新thread状态
 pub async fn update_annotation_thread(
     Path((routine_id, thread_id)): Path<(Uuid, Uuid)>,
@@ -151,6 +180,7 @@ pub fn routine_annotation_routes() -> Router<AppState> {
         )
         .route(
             "/routines/:id/description/annotations/:threadId",
-            axum::routing::patch(update_annotation_thread),
+            // 对齐 Paperclip：GET 获取单线程 + PATCH 更新状态
+            axum::routing::get(get_annotation_thread).patch(update_annotation_thread),
         )
 }

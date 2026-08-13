@@ -7,6 +7,7 @@ use axum::{Router,
     Json,
 };
 use models::{OrgChartOptions, OrgChartStyle};
+use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize)]
@@ -80,6 +81,11 @@ pub fn org_chart_routes() -> Router<AppState> {
             "/companies/:companyId/org-chart.svg",
             axum::routing::get(generate_org_chart_svg),
         )
+        // 对齐 Paperclip `GET /companies/:companyId/org.svg`（同 handler 别名）
+        .route(
+            "/companies/:companyId/org.svg",
+            axum::routing::get(generate_org_chart_svg),
+        )
         .route(
             "/companies/:companyId/org.png",
             axum::routing::get(generate_org_png),
@@ -105,7 +111,17 @@ async fn generate_org_png(
         company_name: Some(company_name),
         stats: Some(format!("Agents: {agent_count}")),
     }).await.map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(([(header::CONTENT_TYPE, "image/svg+xml"), (header::CONTENT_DISPOSITION, "inline")], svg).into_response())
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_str(&svg, &options)
+        .map_err(|e| AppError::InternalServerError(format!("Invalid org chart SVG: {e}")))?;
+    let size = tree.size().to_int_size();
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
+        .ok_or_else(|| AppError::InternalServerError("Unable to allocate org chart image".to_string()))?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let png = pixmap
+        .encode_png()
+        .map_err(|e| AppError::InternalServerError(format!("Unable to encode org chart PNG: {e}")))?;
+    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CONTENT_DISPOSITION, "inline")], png).into_response())
 }
 
 #[cfg(test)]

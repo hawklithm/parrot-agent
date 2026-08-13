@@ -19,6 +19,13 @@ pub trait RoutineAnnotationService: Send + Sync {
         include_comments: bool,
     ) -> Result<Vec<RoutineAnnotationThreadWithComments>, String>;
 
+    /// GET /routines/:id/description/annotations/:threadId - 获取单个 annotation thread
+    async fn get_thread(
+        &self,
+        routine_id: Uuid,
+        thread_id: Uuid,
+    ) -> Result<Option<RoutineAnnotationThreadWithComments>, String>;
+
     /// POST /routines/:id/description/annotations - 创建新annotation thread
     async fn create_annotation_thread(
         &self,
@@ -86,6 +93,16 @@ impl RoutineAnnotationService for PgRoutineAnnotationService {
             result.push(RoutineAnnotationThreadWithComments { thread, comments });
         }
         Ok(result)
+    }
+    async fn get_thread(&self, routine_id: Uuid, thread_id: Uuid) -> Result<Option<RoutineAnnotationThreadWithComments>, String> {
+        let _ = self.document(routine_id).await?;
+        let row = sqlx::query("SELECT * FROM document_annotation_threads WHERE id = $1 AND routine_id = $2 AND document_key = 'description'")
+            .bind(thread_id).bind(routine_id)
+            .fetch_optional(&self.pool).await.map_err(|e| e.to_string())?;
+        let Some(row) = row else { return Ok(None) };
+        let thread = Self::thread(&row)?;
+        let comments = self.comments(routine_id, thread.id).await?;
+        Ok(Some(RoutineAnnotationThreadWithComments { thread, comments }))
     }
     async fn create_annotation_thread(&self, routine_id: Uuid, request: CreateRoutineAnnotationThreadRequest) -> Result<RoutineAnnotationThreadWithComments, String> {
         let (company_id, document_id) = self.document(routine_id).await?;
@@ -183,6 +200,15 @@ impl RoutineAnnotationService for MockRoutineAnnotationService {
         };
 
         Ok(vec![RoutineAnnotationThreadWithComments { thread, comments }])
+    }
+
+    async fn get_thread(
+        &self,
+        routine_id: Uuid,
+        _thread_id: Uuid,
+    ) -> Result<Option<RoutineAnnotationThreadWithComments>, String> {
+        // Mock 复用 list_annotations 的假数据，返回首条线程
+        Ok(self.list_annotations(routine_id, true).await.ok().and_then(|v| v.into_iter().next()))
     }
 
     async fn create_annotation_thread(
