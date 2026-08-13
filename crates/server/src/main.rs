@@ -488,9 +488,25 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         .subscribe(Box::new(RoutineTriggeredToIssueCreationListener::new(event_issue_adapter)))
         .await
         .map_err(|error| format!("failed to subscribe routine listener: {error}"))?;
+    // 创建 Approval Executor
+    let approval_executor: Arc<dyn services::approval_execution::ApprovalExecutor> = Arc::new(
+        services::approval_execution::DefaultApprovalExecutor::new(
+            pool.clone(),
+            agent_service.clone(),
+            Arc::new(agent_repo.clone()),
+            budget_policy_repo.clone(),
+        ),
+    );
+    
     let approval_service: Arc<dyn ApprovalService> = Arc::new(
         DefaultApprovalService::new(approval_repo.clone(), issue_repo.clone())
-            .with_event_bus(event_bus.clone()),
+            .with_event_bus(event_bus.clone())
+            .with_approval_executor(approval_executor)
+            .with_adapter_registry(adapter_registry.clone())
+            .with_agent_repository(Arc::new(PgAgentRepository::new(pool.clone())))
+            .with_activity_repository(Arc::new(
+                repositories::activity_log_repository::PgActivityLogRepository::new(pool.clone()),
+            )),
     );
     let watchdog_service: Arc<dyn WatchdogService> = Arc::new(DefaultWatchdogService::new(
         issue_repo.clone(),

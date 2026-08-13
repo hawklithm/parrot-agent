@@ -92,6 +92,8 @@ pub struct DefaultApprovalService {
     event_bus: Option<Arc<dyn EventBus>>,
     approval_executor: Option<Arc<dyn ApprovalExecutor>>,
     adapter_registry: Option<Arc<AdapterRegistry>>,
+    agent_repo: Option<Arc<dyn repositories::AgentRepository>>,
+    activity_repo: Option<Arc<dyn repositories::ActivityLogRepository>>,
 }
 
 impl DefaultApprovalService {
@@ -105,6 +107,8 @@ impl DefaultApprovalService {
             event_bus: None,
             approval_executor: None,
             adapter_registry: None,
+            agent_repo: None,
+            activity_repo: None,
         }
     }
 
@@ -120,6 +124,19 @@ impl DefaultApprovalService {
 
     pub fn with_adapter_registry(mut self, registry: Arc<AdapterRegistry>) -> Self {
         self.adapter_registry = Some(registry);
+        self
+    }
+
+    pub fn with_agent_repository(mut self, repo: Arc<dyn repositories::AgentRepository>) -> Self {
+        self.agent_repo = Some(repo);
+        self
+    }
+
+    pub fn with_activity_repository(
+        mut self,
+        repo: Arc<dyn repositories::ActivityLogRepository>,
+    ) -> Self {
+        self.activity_repo = Some(repo);
         self
     }
 
@@ -475,8 +492,12 @@ impl ApprovalService for DefaultApprovalService {
                             "Approval executed successfully"
                         );
 
-                        // 调用 hire hook（非阻塞）
-                        if let Some(registry) = &self.adapter_registry {
+                        // 调用 hire hook（非阻塞，失败仅记录日志，不阻塞审批流程）
+                        if let (Some(registry), Some(agent_repo), Some(activity_repo)) = (
+                            &self.adapter_registry,
+                            &self.agent_repo,
+                            &self.activity_repo,
+                        ) {
                             let input = NotifyHireApprovedInput {
                                 company_id: updated_approval.company_id,
                                 agent_id: result.agent_id,
@@ -484,15 +505,21 @@ impl ApprovalService for DefaultApprovalService {
                                 source_id: updated_approval.id,
                                 approved_at: Some(Utc::now()),
                             };
-                            // TODO: 传递正确的 repositories
-                            // let registry_clone = registry.clone();
-                            // tokio::spawn(async move {
-                            //     if let Err(e) = notify_hire_approved(
-                            //         agent_repo, activity_repo, registry_clone, input
-                            //     ).await {
-                            //         tracing::error!(error = ?e, "Failed to notify hire approved");
-                            //     }
-                            // });
+                            let registry_clone = registry.clone();
+                            let agent_repo_clone = agent_repo.clone();
+                            let activity_repo_clone = activity_repo.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = notify_hire_approved(
+                                    agent_repo_clone,
+                                    activity_repo_clone,
+                                    registry_clone,
+                                    input,
+                                )
+                                .await
+                                {
+                                    tracing::error!(error = ?e, "Failed to notify hire approved hook");
+                                }
+                            });
                         }
                     }
                     Err(e) => {

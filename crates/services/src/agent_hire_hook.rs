@@ -1,10 +1,13 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
+use crate::server_adapter::AdapterType;
 use crate::ServiceError;
+use repositories::activity_log_repository::{Activity, ActivityAction, ActorType, ResourceType};
 
 const HIRE_APPROVED_MESSAGE: &str = 
     "Tell your user that your hire was approved, now they should assign you a task in Paperclip or ask you to create issues.";
@@ -94,52 +97,211 @@ pub async fn notify_hire_approved(
     }
 
     let adapter_type = agent.adapter_type.clone();
-    
-    // 2. 查找 adapter（TODO: 需要实现 AdapterRegistry::find_adapter 方法）
-    // 目前 AdapterRegistry 还没有实现查找逻辑，暂时只记录日志
-    tracing::info!(
-        company_id = %input.company_id,
-        agent_id = %input.agent_id,
-        agent_name = %agent.name,
-        adapter_type = %adapter_type,
-        source = %input.source,
-        source_id = %input.source_id,
-        "hire hook: would call adapter.on_hire_approved (not yet implemented)"
-    );
 
-    // TODO: 完整实现
-    // let adapter = adapter_registry.find_adapter(&adapter_type)?;
-    // if let Some(hire_hook) = adapter.on_hire_approved {
-    //     let payload = HireApprovedPayload {
-    //         company_id: input.company_id.to_string(),
-    //         agent_id: input.agent_id.to_string(),
-    //         agent_name: agent.name.clone(),
-    //         adapter_type: adapter_type.clone(),
-    //         source: input.source.clone(),
-    //         source_id: input.source_id.to_string(),
-    //         approved_at: approved_at.to_rfc3339(),
-    //         message: HIRE_APPROVED_MESSAGE.to_string(),
-    //     };
-    //
-    //     let adapter_config = agent.adapter_config.unwrap_or_default();
-    //     
-    //     match hire_hook.on_hire_approved(&payload, &adapter_config).await {
-    //         Ok(result) if result.ok => {
-    //             // 记录成功
-    //             let _ = activity_repo.create(...).await;
-    //         }
-    //         Ok(result) => {
-    //             // 记录 adapter 返回的失败
-    //             tracing::warn!(...);
-    //             let _ = activity_repo.create(...).await;
-    //         }
-    //         Err(e) => {
-    //             // 记录异常
-    //             tracing::error!(...);
-    //             let _ = activity_repo.create(...).await;
-    //         }
-    //     }
-    // }
+    // 2. 解析 adapter type 并在 registry 中查找对应 adapter
+    let parsed_type = match AdapterType::from_str(&adapter_type) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                adapter_type = %adapter_type,
+                error = %e,
+                "hire hook: unrecognized adapter type, skipping adapter hook"
+            );
+            return Ok(());
+        }
+    };
+
+    let adapter = match adapter_registry.find_adapter(parsed_type) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(
+                adapter_type = %adapter_type,
+                error = ?e,
+                "hire hook: adapter not registered, skipping adapter hook"
+            );
+            return Ok(());
+        }
+    };
+
+    // 3. 构造 payload 并调用 adapter 的 on_hire_approved hook
+    let payload = HireApprovedPayload {
+        company_id: input.company_id.to_string(),
+        agent_id: input.agent_id.to_string(),
+        agent_name: agent.name.clone(),
+        adapter_type: adapter_type.clone(),
+        source: input.source.clone(),
+        source_id: input.source_id.to_string(),
+        approved_at: approved_at.to_rfc3339(),
+        message: HIRE_APPROVED_MESSAGE.to_string(),
+    };
+
+    let payload_value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, "hire hook: failed to serialize payload, skipping");
+            return Ok(());
+        }
+    };
+
+    match adapter
+        .on_hire_approved(payload_value, &agent.adapter_config)
+        .await
+    {
+        Ok(result) => {
+            tracing::info!(
+                agent_id = %input.agent_id,
+                result = ?result,
+                "hire hook: adapter on_hire_approved succeeded"
+            );
+            record_hire_hook_activity(
+                &activity_repo,
+                input.company_id,
+                input.agent_id,
+                "success",
+                Some(&result),
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                agent_id = %input.agent_id,
+                error = ?e,
+                "hire hook: adapter on_hire_approved returned an error"
+            );
+            record_hire_hook_activity(
+                &activity_repo,
+                input.company_id,
+                input.agent_id,
+                "error",
+                Some(&serde_json::json!({ "error": e.to_string() })),
+            )
+            .await;
+        }
+    }
 
     Ok(())
+}
+
+/// 写入一条 hire-approved hook 的 activity 记录（非致命：失败仅记录日志）。
+async fn record_hire_hook_activity(
+    activity_repo: &Arc<dyn repositories::ActivityLogRepository>,
+    company_id: Uuid,
+    agent_id: Uuid,
+    status: &str,
+    detail: Option<&serde_json::Value>,
+) {
+    let activity = Activity {
+        id: Uuid::new_v4(),
+        company_id,
+        actor_type: ActorType::System,
+        actor_id: agent_id,
+        action: ActivityAction::Update,
+        resource_type: ResourceType::Agent,
+        resource_id: agent_id,
+        metadata: Some(serde_json::json!({
+            "event": "hire_approved_hook",
+            "status": status,
+            "detail": detail,
+        })),
+        created_at: Utc::now(),
+    };
+
+    if let Err(e) = activity_repo.log_activity(&activity).await {
+        tracing::warn!(error = ?e, agent_id = %agent_id, "hire hook: failed to write activity log");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use repositories::activity_log_repository::ActivityLogFilter;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockActivityRepo {
+        logged: std::sync::Arc<Mutex<Vec<Activity>>>,
+    }
+
+    #[async_trait]
+    impl repositories::ActivityLogRepository for MockActivityRepo {
+        async fn log_activity(&self, activity: &Activity) -> repositories::RepositoryResult<()> {
+            self.logged.lock().unwrap().push(activity.clone());
+            Ok(())
+        }
+        async fn list_recent(
+            &self,
+            _: Uuid,
+            _: i64,
+            _: i64,
+        ) -> repositories::RepositoryResult<Vec<Activity>> {
+            Ok(vec![])
+        }
+        async fn list_by_resource(
+            &self,
+            _: Uuid,
+            _: ResourceType,
+            _: Uuid,
+        ) -> repositories::RepositoryResult<Vec<Activity>> {
+            Ok(vec![])
+        }
+        async fn list_by_actor(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: i64,
+            _: i64,
+        ) -> repositories::RepositoryResult<Vec<Activity>> {
+            Ok(vec![])
+        }
+        async fn list_by_time_range(
+            &self,
+            _: Uuid,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+        ) -> repositories::RepositoryResult<Vec<Activity>> {
+            Ok(vec![])
+        }
+        async fn list_with_filter(
+            &self,
+            _: ActivityLogFilter,
+        ) -> repositories::RepositoryResult<Vec<Activity>> {
+            Ok(vec![])
+        }
+        async fn delete_before(
+            &self,
+            _: Uuid,
+            _: DateTime<Utc>,
+        ) -> repositories::RepositoryResult<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn hire_hook_records_activity_with_event_and_status() {
+        let mock = std::sync::Arc::new(MockActivityRepo::default());
+        let repo: std::sync::Arc<dyn repositories::ActivityLogRepository> = mock.clone();
+        let company_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+
+        record_hire_hook_activity(
+            &repo,
+            company_id,
+            agent_id,
+            "success",
+            Some(&serde_json::json!({ "ok": true })),
+        )
+        .await;
+
+        let logged = mock.logged.lock().unwrap();
+        assert_eq!(logged.len(), 1);
+        let a = &logged[0];
+        assert_eq!(a.company_id, company_id);
+        assert_eq!(a.resource_id, agent_id);
+        assert!(matches!(a.action, ActivityAction::Update));
+        assert!(matches!(a.resource_type, ResourceType::Agent));
+        let meta = a.metadata.as_ref().expect("metadata should be set");
+        assert_eq!(meta["event"], "hire_approved_hook");
+        assert_eq!(meta["status"], "success");
+    }
 }
