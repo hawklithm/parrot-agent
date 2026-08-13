@@ -1,9 +1,11 @@
 //! Plugin management routes backed by the persistent plugin service.
 use crate::{app_state::AppState, errors::AppError};
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
-    routing::{get, post},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -35,6 +37,10 @@ pub fn plugin_routes() -> Router<AppState> {
             "/plugins/:plugin_id/bridge/action",
             post(bridge_plugin_action),
         )
+        .route(
+            "/plugins/:plugin_id/bridge/stream/:channel",
+            get(bridge_plugin_stream),
+        )
         .route("/plugins/:plugin_id/data/:key", post(store_plugin_data))
         .route(
             "/plugins/:plugin_id/actions/:key",
@@ -49,6 +55,35 @@ pub fn plugin_routes() -> Router<AppState> {
             "/plugins/:plugin_id/jobs/:job_id/trigger",
             post(trigger_plugin_job),
         )
+        .route(
+            "/plugins/:plugin_id/jobs/:job_id/runs/:run_id/cancel",
+            post(cancel_plugin_job_run),
+        )
+        .route(
+            "/plugins/:plugin_id/jobs/:job_id/runs/:run_id/retry",
+            post(retry_plugin_job_run),
+        )
+        .route(
+            "/plugins/:plugin_id/webhooks/:endpoint_key",
+            post(plugin_webhook),
+        )
+        .route(
+            "/plugins/:plugin_id/companies/:company_id/local-folders",
+            get(list_local_folders),
+        )
+        .route(
+            "/plugins/:plugin_id/companies/:company_id/local-folders/:folder_key/status",
+            get(get_local_folder_status),
+        )
+        .route(
+            "/plugins/:plugin_id/companies/:company_id/local-folders/:folder_key/validate",
+            post(validate_local_folder),
+        )
+        .route(
+            "/plugins/:plugin_id/companies/:company_id/local-folders/:folder_key",
+            put(update_local_folder),
+        )
+        .route("/plugins/:plugin_id/ui/*file_path", get(serve_plugin_ui_asset))
         .layer(axum::middleware::from_fn(crate::routes::require_plugin_access))
 }
 
@@ -292,5 +327,168 @@ async fn trigger_plugin_job(
 ) -> Result<Json<Value>, AppError> {
     Ok(Json(
         s.plugin_service.trigger_job(id, jid).await.map_err(err)?,
+    ))
+}
+
+// ============================================================================
+// P1.2: Plugin 扩展面 handlers
+// ============================================================================
+
+/// GET /plugins/:plugin_id/bridge/stream/:channel
+/// Plugin bridge SSE 流。仅当 manifest 声明 bridge.stream 时可用；否则返回 501。
+async fn bridge_plugin_stream(
+    State(s): State<AppState>,
+    Path((plugin_id, channel)): Path<(Uuid, String)>,
+) -> Result<Response, AppError> {
+    let supported = s
+        .plugin_service
+        .bridge_stream_supported(plugin_id)
+        .await
+        .map_err(AppError::from)?;
+    if !supported {
+        return Err(AppError::NotImplemented(
+            "plugin bridge stream is not enabled for this plugin".into(),
+        ));
+    }
+    // 已声明支持：返回最小 keepalive SSE 流（事件源由 plugin bridge runtime 提供）。
+    let body = format!("event: ready\ndata: {{\"channel\":\"{}\"}}\n\n", channel);
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok(resp)
+}
+
+/// POST /plugins/:plugin_id/webhooks/:endpoint_key
+/// Plugin webhook ingress（company-scoped）。
+async fn plugin_webhook(
+    State(s): State<AppState>,
+    Path((plugin_id, endpoint_key)): Path<(Uuid, String)>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let result = s
+        .plugin_service
+        .ingest_webhook(plugin_id, &endpoint_key, Uuid::nil(), payload)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+/// GET /plugins/:plugin_id/companies/:company_id/local-folders
+async fn list_local_folders(
+    State(s): State<AppState>,
+    Path((plugin_id, company_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<Value>>, AppError> {
+    Ok(Json(
+        s.plugin_service
+            .list_local_folders(plugin_id, company_id)
+            .await
+            .map_err(AppError::from)?,
+    ))
+}
+
+/// GET /plugins/:plugin_id/companies/:company_id/local-folders/:folder_key/status
+async fn get_local_folder_status(
+    State(s): State<AppState>,
+    Path((plugin_id, company_id, folder_key)): Path<(Uuid, Uuid, String)>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(
+        s.plugin_service
+            .get_local_folder_status(plugin_id, company_id, &folder_key)
+            .await
+            .map_err(AppError::from)?,
+    ))
+}
+
+/// POST /plugins/:plugin_id/companies/:company_id/local-folders/:folder_key/validate
+async fn validate_local_folder(
+    State(s): State<AppState>,
+    Path((plugin_id, company_id, folder_key)): Path<(Uuid, Uuid, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let path = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("missing 'path'".into()))?;
+    s.plugin_service
+        .validate_local_folder_path(path)
+        .await
+        .map_err(AppError::from)?;
+    // 校验通过后再更新状态
+    let updated = s
+        .plugin_service
+        .update_local_folder(plugin_id, company_id, &folder_key, json!({ "path": path, "status": "validated" }))
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(updated))
+}
+
+/// PUT /plugins/:plugin_id/companies/:company_id/local-folders/:folder_key
+async fn update_local_folder(
+    State(s): State<AppState>,
+    Path((plugin_id, company_id, folder_key)): Path<(Uuid, Uuid, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(
+        s.plugin_service
+            .update_local_folder(plugin_id, company_id, &folder_key, body)
+            .await
+            .map_err(AppError::from)?,
+    ))
+}
+
+/// GET /plugins/:plugin_id/ui/*file_path
+/// 安全提供 plugin UI 静态资源（防路径穿越）。
+async fn serve_plugin_ui_asset(
+    State(s): State<AppState>,
+    Path((plugin_id, file_path)): Path<(Uuid, String)>,
+) -> Result<Response, AppError> {
+    let bytes = s
+        .plugin_service
+        .serve_ui_asset(plugin_id, &file_path)
+        .await
+        .map_err(AppError::from)?;
+    let content_type = if file_path.ends_with(".js") {
+        "application/javascript"
+    } else if file_path.ends_with(".css") {
+        "text/css"
+    } else if file_path.ends_with(".html") {
+        "text/html"
+    } else {
+        "application/octet-stream"
+    };
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(bytes))
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok(resp)
+}
+
+/// POST /plugins/:plugin_id/jobs/:job_id/runs/:run_id/cancel
+async fn cancel_plugin_job_run(
+    State(s): State<AppState>,
+    Path((plugin_id, job_id, run_id)): Path<(Uuid, Uuid, Uuid)>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(
+        s.plugin_service
+            .cancel_job_run(plugin_id, job_id, run_id)
+            .await
+            .map_err(AppError::from)?,
+    ))
+}
+
+/// POST /plugins/:plugin_id/jobs/:job_id/runs/:run_id/retry
+async fn retry_plugin_job_run(
+    State(s): State<AppState>,
+    Path((plugin_id, job_id, run_id)): Path<(Uuid, Uuid, Uuid)>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(
+        s.plugin_service
+            .retry_job_run(plugin_id, job_id, run_id)
+            .await
+            .map_err(AppError::from)?,
     ))
 }

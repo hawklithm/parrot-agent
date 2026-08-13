@@ -116,6 +116,25 @@ impl From<models::AppError> for AppError {
     }
 }
 
+impl From<services::plugin_service::PluginServiceError> for AppError {
+    fn from(err: services::plugin_service::PluginServiceError) -> Self {
+        match err {
+            services::plugin_service::PluginServiceError::NotFound(id) => {
+                AppError::NotFound(format!("plugin not found: {}", id))
+            }
+            services::plugin_service::PluginServiceError::InvalidState(msg) => {
+                AppError::BadRequest(msg)
+            }
+            services::plugin_service::PluginServiceError::FeatureDisabled(msg) => {
+                AppError::NotImplemented(msg)
+            }
+            services::plugin_service::PluginServiceError::Database(e) => {
+                AppError::InternalServerError(e.to_string())
+            }
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {
@@ -227,5 +246,29 @@ mod tests {
     fn error_response_body_has_error_field() {
         let resp = AppError::Conflict("dup".into()).into_response();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+}
+
+#[cfg(test)]
+mod plugin_error_tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    fn status_of(err: AppError) -> StatusCode {
+        err.into_response().status()
+    }
+
+    #[test]
+    fn plugin_feature_disabled_maps_to_501() {
+        let err: AppError =
+            services::plugin_service::PluginServiceError::FeatureDisabled("nope".into()).into();
+        assert_eq!(status_of(err), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn plugin_invalid_state_maps_to_400() {
+        let err: AppError =
+            services::plugin_service::PluginServiceError::InvalidState("bad".into()).into();
+        assert_eq!(status_of(err), StatusCode::BAD_REQUEST);
     }
 }
