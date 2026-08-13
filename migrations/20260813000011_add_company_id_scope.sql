@@ -1,7 +1,7 @@
--- 对齐 Paperclip：为 10 张表补 company_id（含历史数据回填）。
+-- 对齐 Paperclip：为 8+2 张表补 company_id（含历史数据回填）。
 -- onDelete 策略按 PAPERCLIP_SCHEMA_BASELINE.md。
--- 注意：plugin_jobs/plugin_logs 的父表 plugins 尚无 company_id，暂保持
--- company_id NULLABLE + FK（plugins 自身 company scope 为独立待办）。
+-- 注意：Paperclip 的 plugins 为实例级（无 company_id）；plugin_job_runs /
+-- plugin_logs 的 company_id 为 nullable（实例级记录可选关联公司）。
 
 -- 1) agent_api_keys（restrict）← agents
 ALTER TABLE agent_api_keys ADD COLUMN IF NOT EXISTS company_id UUID;
@@ -107,17 +107,17 @@ DO $$ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS idx_pipeline_case_events_company ON pipeline_case_events(company_id);
 
--- 9) plugin_jobs（cascade）← plugins；plugins 暂无 company_id，保持 NULLABLE
-ALTER TABLE plugin_jobs ADD COLUMN IF NOT EXISTS company_id UUID;
+-- 9) plugin_job_runs（cascade，Paperclip nullable company_id）← 实例级运行记录
+ALTER TABLE plugin_job_runs ADD COLUMN IF NOT EXISTS company_id UUID;
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'plugin_jobs_company_id_fkey') THEN
-    ALTER TABLE plugin_jobs ADD CONSTRAINT plugin_jobs_company_id_fkey
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'plugin_job_runs_company_id_fkey') THEN
+    ALTER TABLE plugin_job_runs ADD CONSTRAINT plugin_job_runs_company_id_fkey
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE;
   END IF;
 END $$;
-CREATE INDEX IF NOT EXISTS idx_plugin_jobs_company ON plugin_jobs(company_id);
+CREATE INDEX IF NOT EXISTS idx_plugin_job_runs_company ON plugin_job_runs(company_id);
 
--- 10) plugin_logs（cascade）← plugins；同上 NULLABLE
+-- 10) plugin_logs（cascade，Paperclip nullable company_id）← 实例级日志
 ALTER TABLE plugin_logs ADD COLUMN IF NOT EXISTS company_id UUID;
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'plugin_logs_company_id_fkey') THEN
