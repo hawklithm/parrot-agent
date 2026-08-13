@@ -326,7 +326,30 @@ async fn get_agent(
         ));
     }
 
-    Ok(Json(agent))
+    // Paperclip exposes the management chain on the normal agent detail
+    // response (not only on /agents/me).  Keep it best-effort so a stale
+    // hierarchy reference does not hide an otherwise readable agent.
+    let chain_of_command = state
+        .agent_service
+        .get_chain_of_command(agent.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|manager| {
+            serde_json::json!({
+                "id": manager.id,
+                "name": manager.name,
+                "role": manager.role,
+                "title": serde_json::Value::Null,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut agent_json = serde_json::to_value(&agent)
+        .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+    if let Some(object) = agent_json.as_object_mut() {
+        object.insert("chainOfCommand".to_string(), serde_json::json!(chain_of_command));
+    }
+    Ok(Json(agent_json))
 }
 
 /// PATCH /agents/:id - 更新Agent
@@ -923,13 +946,26 @@ async fn approve_agent(
 /// POST /agents/:id/terminate - 终止 Agent
 async fn terminate_agent(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let agent = state
-        .agent_service
-        .set_status(id, AgentStatus::Terminated)
-        .await?;
-    Ok(Json(agent))
+    let agent = state.agent_service.get_by_id(id).await?;
+
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentDelete { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:delete permission".to_string(),
+        ));
+    }
+
+    let terminated = state.agent_service.terminate(id).await?;
+    Ok(Json(terminated))
 }
 
 /// POST /agents/:id/wakeup - 唤醒 Agent

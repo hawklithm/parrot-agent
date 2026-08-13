@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use chrono::{Datelike, Utc};
-use models::{Agent, AgentApiKey, AgentRuntimeState, AgentStatus, AgentTaskSession};
+use models::{Agent, AgentApiKey, AgentPermissions, AgentRuntimeState, AgentStatus, AgentTaskSession};
 use repositories::{
     ActivityLogRepository, AgentApiKeyRepository, AgentRepository, ConfigRevisionRepository,
-    CostEventRepository,
+    CostEventRepository, ListAgentsOptions,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -88,8 +88,14 @@ pub trait AgentService: Send + Sync {
     /// 更新 Agent
     async fn update(&self, id: Uuid, input: UpdateAgentInput) -> Result<Agent, ServiceError>;
 
-    /// 删除 Agent（软删除）
+    /// 删除 Agent（软删除 + 资源清理）
     async fn delete(&self, id: Uuid) -> Result<(), ServiceError>;
+
+    /// 终止 Agent：置为 Terminated 并执行资源清理（撤销 Key、重挂子节点、审计）。
+    ///
+    /// 语义对齐 Paperclip：`terminate` 与 `delete` 最终都进入 terminated 状态，
+    /// 并触发相同的资源清理策略。
+    async fn terminate(&self, id: Uuid) -> Result<Agent, ServiceError>;
 
     /// 检测汇报循环
     async fn detect_reporting_cycle(
@@ -100,6 +106,12 @@ pub trait AgentService: Send + Sync {
 
     /// 计算组织链健康度
     async fn get_agent_work_eligibility(&self, agent_id: Uuid) -> Result<f32, ServiceError>;
+
+    /// 获取公司的组织架构树
+    async fn org_for_company(&self, company_id: Uuid) -> Result<Vec<models::OrgNode>, ServiceError>;
+
+    /// 获取Agent的管理链（从直接上级到最高层级）
+    async fn get_chain_of_command(&self, agent_id: Uuid) -> Result<Vec<models::OrgNode>, ServiceError>;
 
     /// 回滚配置到指定版本
     async fn rollback_config_revision(
@@ -251,6 +263,31 @@ fn validate_bundle(bundle: &serde_json::Value) -> Result<(), ServiceError> {
     for (path, content) in files {
         normalize_bundle_path(path)?;
         if !content.is_string() { return Err(ServiceError::InvalidInput(format!("instruction file {path} must contain text"))); }
+    }
+    Ok(())
+}
+
+/// 校验 `reports_to` 分配是否合法（对齐 Paperclip `ensureManager` + 自引用检查）。
+///
+/// - 不能指向自身（自引用）。
+/// - 上级 Agent 必须与本 Agent 同属一个 company，否则跨公司越权。
+///
+/// 返回 `Ok(())` 或 `ServiceError::InvalidInput`（映射为 422，与 Paperclip `unprocessable` 一致）。
+fn validate_reports_to_assignment(
+    agent_id: Uuid,
+    agent_company_id: Uuid,
+    reports_to: Uuid,
+    manager_company_id: Uuid,
+) -> Result<(), ServiceError> {
+    if reports_to == agent_id {
+        return Err(ServiceError::InvalidInput(
+            "Agent cannot report to itself".to_string(),
+        ));
+    }
+    if manager_company_id != agent_company_id {
+        return Err(ServiceError::InvalidInput(
+            "Manager must belong to same company".to_string(),
+        ));
     }
     Ok(())
 }
@@ -446,6 +483,31 @@ where
             }
         }
     }
+
+    /// Agent 进入 terminated 状态时的资源清理策略（对齐 Paperclip `remove` 的安全子集）。
+    ///
+    /// 终止是软删除，不会物理删除业务记录，但必须：
+    /// 1. 重挂子节点：将 `reports_to` 指向本 Agent 的下级置空，避免已终止 Agent 继续担任 manager；
+    /// 2. 撤销全部 API Key：已终止 Agent 无法再鉴权，从而无法触发 heartbeat / 被新任务分配（P0.4 item 3）；
+    /// 3. 写入审计日志。
+    ///
+    /// instructions / skills / routines / workspace 等由各自服务的 terminated 状态守卫（P0.4 item 3）
+    /// 负责隔离，不在终止时硬删除，避免误删公司级共享资源。
+    async fn cleanup_terminated_resources(&self, id: Uuid, company_id: Uuid) {
+        // 1. 重挂子节点（best-effort，失败仅记录）
+        if let Err(e) = self.repository.clear_child_reports_to(id).await {
+            tracing::warn!(agent_id = %id, error = %e, "Failed to re-parent child agents on termination");
+        }
+
+        // 2. 撤销全部 API Key（best-effort）
+        if let Err(e) = self.api_key_repo.revoke_by_agent(id).await {
+            tracing::warn!(agent_id = %id, error = %e, "Failed to revoke agent API keys on termination");
+        }
+
+        // 3. 审计日志（best-effort）
+        self.log_activity_if_enabled(Uuid::new_v4(), company_id, id)
+            .await;
+    }
 }
 
 #[async_trait]
@@ -469,7 +531,9 @@ where
             runtime_config: sqlx::types::Json(
                 input.runtime_config.unwrap_or(serde_json::json!({})),
             ),
-            permissions: sqlx::types::Json(input.permissions.unwrap_or_default()),
+            permissions: sqlx::types::Json(
+                input.permissions.unwrap_or_else(|| AgentPermissions::for_role(input.role))
+            ),
             metadata: sqlx::types::Json(models::AgentMetadata {
                 is_built_in: None,
                 built_in_key: None,
@@ -482,8 +546,10 @@ where
             updated_at: Utc::now(),
         };
 
-        // 检查循环引用
+        // 检查循环引用与跨公司越权
         if let Some(reports_to) = input.reports_to {
+            let manager = self.repository.get_by_id(reports_to).await?;
+            validate_reports_to_assignment(agent.id, input.company_id, reports_to, manager.company_id)?;
             if self.detect_reporting_cycle(agent.id, reports_to).await? {
                 return Err(ServiceError::ReportingCycle);
             }
@@ -503,6 +569,109 @@ where
 
     async fn get_by_id(&self, id: Uuid) -> Result<Agent, ServiceError> {
         Ok(self.repository.get_by_id(id).await?)
+    }
+
+    async fn get_chain_of_command(
+        &self,
+        agent_id: Uuid,
+    ) -> Result<Vec<models::OrgNode>, ServiceError> {
+        let start = self.repository.get_by_id(agent_id).await?;
+        let mut chain = Vec::new();
+        let mut current_id = start.reports_to;
+        let mut visited = std::collections::HashSet::from([agent_id]);
+
+        while let Some(manager_id) = current_id {
+            if chain.len() >= 50 || !visited.insert(manager_id) {
+                break;
+            }
+            let manager = match self.repository.get_by_id(manager_id).await {
+                Ok(manager) => manager,
+                // Keep stale hierarchy links from breaking agent detail responses,
+                // matching Paperclip's best-effort chain traversal.
+                Err(_) => break,
+            };
+            current_id = manager.reports_to;
+            chain.push(models::OrgNode {
+                id: manager.id.to_string(),
+                name: manager.name,
+                role: match manager.role {
+                    models::AgentRole::Ceo => "CEO",
+                    models::AgentRole::Vp => "VP",
+                    models::AgentRole::Manager => "Manager",
+                    models::AgentRole::Researcher => "Researcher",
+                    models::AgentRole::General => "General Agent",
+                }
+                .to_string(),
+                status: match manager.status {
+                    models::AgentStatus::Idle => "idle",
+                    models::AgentStatus::Running => "running",
+                    models::AgentStatus::Paused => "paused",
+                    models::AgentStatus::PendingApproval => "pending_approval",
+                    models::AgentStatus::Terminated => "terminated",
+                }
+                .to_string(),
+                reports: Vec::new(),
+                collapsed_reports: None,
+            });
+        }
+        Ok(chain)
+    }
+
+    async fn org_for_company(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<models::OrgNode>, ServiceError> {
+        let agents = self
+            .repository
+            .list_by_company(company_id, ListAgentsOptions::default())
+            .await?;
+        let live_ids: std::collections::HashSet<Uuid> =
+            agents.iter().map(|agent| agent.id).collect();
+        let mut children: std::collections::HashMap<Option<Uuid>, Vec<models::OrgNode>> =
+            std::collections::HashMap::new();
+
+        for agent in agents {
+            let parent = agent
+                .reports_to
+                .filter(|manager_id| live_ids.contains(manager_id));
+            children.entry(parent).or_default().push(models::OrgNode {
+                id: agent.id.to_string(),
+                name: agent.name,
+                role: match agent.role {
+                    models::AgentRole::Ceo => "CEO",
+                    models::AgentRole::Vp => "VP",
+                    models::AgentRole::Manager => "Manager",
+                    models::AgentRole::Researcher => "Researcher",
+                    models::AgentRole::General => "General Agent",
+                }
+                .to_string(),
+                status: match agent.status {
+                    models::AgentStatus::Idle => "idle",
+                    models::AgentStatus::Running => "running",
+                    models::AgentStatus::Paused => "paused",
+                    models::AgentStatus::PendingApproval => "pending_approval",
+                    models::AgentStatus::Terminated => "terminated",
+                }
+                .to_string(),
+                reports: Vec::new(),
+                collapsed_reports: None,
+            });
+        }
+
+        fn build(
+            manager_id: Option<Uuid>,
+            children: &mut std::collections::HashMap<Option<Uuid>, Vec<models::OrgNode>>,
+        ) -> Vec<models::OrgNode> {
+            let mut nodes = children.remove(&manager_id).unwrap_or_default();
+            for node in &mut nodes {
+                if let Ok(id) = node.id.parse::<Uuid>() {
+                    node.reports = build(Some(id), children);
+                }
+            }
+            nodes
+        }
+
+        Ok(build(None, &mut children))
     }
 
     async fn get_me(&self, agent_key: &str) -> Result<Agent, ServiceError> {
@@ -651,7 +820,9 @@ where
             agent.budget_monthly_cents = budget;
         }
         if let Some(reports_to) = input.reports_to {
-            // 检查循环引用
+            // 检查跨公司越权与循环引用
+            let manager = self.repository.get_by_id(reports_to).await?;
+            validate_reports_to_assignment(id, agent.company_id, reports_to, manager.company_id)?;
             if self.detect_reporting_cycle(id, reports_to).await? {
                 return Err(ServiceError::ReportingCycle);
             }
@@ -679,14 +850,30 @@ where
         agent.status = AgentStatus::Terminated;
         agent.updated_at = Utc::now();
 
-        self.repository.update(agent).await?;
+        self.repository.update(agent.clone()).await?;
 
-        // TODO: 集成SessionManagementService清理会话
-        // if let Some(ref session_service) = self.session_service {
-        //     let _ = session_service.cleanup_session(id).await;
-        // }
+        self.cleanup_terminated_resources(agent.id, agent.company_id)
+            .await;
 
         Ok(())
+    }
+
+    async fn terminate(&self, id: Uuid) -> Result<Agent, ServiceError> {
+        let mut agent = self.repository.get_by_id(id).await?;
+
+        if agent.status == AgentStatus::Terminated {
+            return Ok(agent); // 已经终止，幂等操作
+        }
+
+        agent.status = AgentStatus::Terminated;
+        agent.updated_at = Utc::now();
+
+        let updated = self.repository.update(agent.clone()).await?;
+
+        self.cleanup_terminated_resources(updated.id, updated.company_id)
+            .await;
+
+        Ok(updated)
     }
 
     async fn detect_reporting_cycle(
@@ -1303,5 +1490,38 @@ where
             })
             .collect();
         Ok(configs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_reports_to_assignment;
+    use uuid::Uuid;
+
+    #[test]
+    fn reports_to_same_company_ok() {
+        let agent = Uuid::new_v4();
+        let manager = Uuid::new_v4();
+        let company = Uuid::new_v4();
+        assert!(validate_reports_to_assignment(agent, company, manager, company).is_ok());
+    }
+
+    #[test]
+    fn reports_to_cross_company_rejected() {
+        let agent = Uuid::new_v4();
+        let manager = Uuid::new_v4();
+        let agent_company = Uuid::new_v4();
+        let manager_company = Uuid::new_v4();
+        let err = validate_reports_to_assignment(agent, agent_company, manager, manager_company)
+            .unwrap_err();
+        assert!(format!("{err}").contains("same company"));
+    }
+
+    #[test]
+    fn reports_to_self_rejected() {
+        let agent = Uuid::new_v4();
+        let company = Uuid::new_v4();
+        let err = validate_reports_to_assignment(agent, company, agent, company).unwrap_err();
+        assert!(format!("{err}").contains("cannot report to itself"));
     }
 }

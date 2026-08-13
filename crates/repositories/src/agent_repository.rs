@@ -48,4 +48,9 @@ pub trait AgentRepository: Send + Sync {
 
     /// Get agents by status
     async fn list_by_status(&self, company_id: Uuid, status: AgentStatus) -> RepositoryResult<Vec<Agent>>;
+
+    /// Re-parent child agents: clear `reports_to` for any agent that reported to `id`.
+    ///
+    /// Invoked when an agent is terminated so it cannot remain a manager of others.
+    async fn clear_child_reports_to(&self, id: Uuid) -> RepositoryResult<u64>;
 }

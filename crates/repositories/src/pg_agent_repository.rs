@@ -189,6 +189,17 @@ impl AgentRepository for PgAgentRepository {
         let agents = rows.into_iter().map(map_agent_row).collect();
         Ok(agents)
     }
+
+    async fn clear_child_reports_to(&self, id: Uuid) -> RepositoryResult<u64> {
+        let result = sqlx::query(
+            "UPDATE agents SET reports_to = NULL, updated_at = NOW() WHERE reports_to = $1"
+        )
+        .bind(&id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]

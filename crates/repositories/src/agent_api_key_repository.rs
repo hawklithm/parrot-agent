@@ -20,6 +20,9 @@ pub trait AgentApiKeyRepository: Send + Sync {
 
     /// 列出 Agent 的所有 API Keys
     async fn list_by_agent(&self, agent_id: Uuid) -> Result<Vec<AgentApiKey>, RepoError>;
+
+    /// 撤销某个 Agent 的全部 API Key（用于 Agent 终止/删除时使其无法再鉴权）
+    async fn revoke_by_agent(&self, agent_id: Uuid) -> Result<u64, RepoError>;
 }
 
 /// PostgreSQL 实现
@@ -121,5 +124,21 @@ impl AgentApiKeyRepository for PgAgentApiKeyRepository {
         .map_err(RepoError::DatabaseError)?;
 
         Ok(results)
+    }
+
+    async fn revoke_by_agent(&self, agent_id: Uuid) -> Result<u64, RepoError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE agent_api_keys
+            SET revoked_at = NOW()
+            WHERE agent_id = $1 AND revoked_at IS NULL
+            "#,
+        )
+        .bind(agent_id)
+        .execute(&self.pool)
+        .await
+        .map_err(RepoError::DatabaseError)?;
+
+        Ok(result.rows_affected())
     }
 }
