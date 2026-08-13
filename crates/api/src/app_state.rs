@@ -344,6 +344,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::folders::folder_routes())
         .merge(crate::routes::secret_proposals::secret_proposal_routes())
         .merge(crate::routes::status_cards::status_card_routes())
+        .merge(crate::routes::summary_slots::summary_slot_routes())
         .merge(crate::routes::decisions::decision_routes())
         .layer(axum::middleware::from_fn_with_state(
             auth_middleware,
