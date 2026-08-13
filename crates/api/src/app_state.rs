@@ -359,6 +359,11 @@ pub fn create_router(state: AppState) -> Router {
         ))
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        // request-id 中间件放最外层：透传/生成 X-Request-Id，写入 extensions 并
+        // 以 tracing span 关联请求，handler 内结构化日志自动携带 request_id。
+        .layer(axum::middleware::from_fn(
+            crate::middleware::request_id::request_id_middleware,
+        ))
 }
 
 #[cfg(test)]
