@@ -339,6 +339,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::execution_workspaces::execution_workspace_routes())
         .merge(crate::routes::heartbeat_runs::heartbeat_run_routes())
         .merge(crate::routes::feedback_traces::feedback_trace_routes())
+        .merge(crate::routes::inbox_dismissals::inbox_dismissal_routes())
         .merge(crate::routes::decisions::decision_routes())
         .layer(axum::middleware::from_fn_with_state(
             auth_middleware,
