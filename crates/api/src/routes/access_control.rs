@@ -153,7 +153,7 @@ pub fn access_control_routes(state: AppState) -> Router<AppState> {
         .route("/board-api-keys", get(list_board_api_keys).post(create_board_api_key))
         .route("/board-api-keys/:key_id", delete(revoke_board_api_key))
         // 阶段二：邀请管理
-        .route("/companies/:company_id/invites", post(create_invite))
+        .route("/companies/:company_id/invites", get(list_company_invites).post(create_invite))
         .route("/invites/:token", get(get_invite))
         .route("/invites/:token/accept", post(accept_invite))
         // 阶段二：加入请求
@@ -498,6 +498,92 @@ struct CreateInviteRequest {
 
 fn default_invite_type() -> String {
     "company_join".to_string()
+}
+
+/// GET /api/companies/:company_id/invites
+/// 列出公司的邀请（对齐 Paperclip `listCompanyInvitesQuerySchema`）。
+#[derive(Debug, Deserialize)]
+struct ListCompanyInvitesQuery {
+    /// active | accepted | expired | revoked
+    #[serde(rename = "state")]
+    state: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// GET /api/companies/:company_id/invites
+/// 列出邀请；需 `users:invite` 权限（对齐 Paperclip assertCompanyPermission）。
+async fn list_company_invites(
+    Extension(actor): Extension<AuthorizationActor>,
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Query(query): Query<ListCompanyInvitesQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, AuthError> {
+    actor_user_id(&actor)?;
+
+    let allowed = decide_access(
+        &state.pool,
+        &actor,
+        &AuthorizationAction::Permission { key: PermissionKey::new("users:invite") },
+        Some(company_id),
+    ).await;
+    if !allowed {
+        return Err(AuthError::forbidden("Insufficient permissions"));
+    }
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let (state_sql, has_state) = match query.state.as_deref() {
+        Some("active") => (
+            "(accepted = false AND (expires_at IS NULL OR expires_at > NOW()))".to_string(),
+            true,
+        ),
+        Some("accepted") => ("accepted = true".to_string(), true),
+        Some("expired") => (
+            "(accepted = false AND expires_at IS NOT NULL AND expires_at <= NOW())".to_string(),
+            true,
+        ),
+        // Parrot invites 暂无 revoked 标记，按空集处理（对齐时补列后放开）。
+        Some("revoked") => ("(1 = 0)".to_string(), true),
+        Some(other) => return Err(AuthError::bad_request(format!("Invalid invite state: {}", other))),
+        None => (String::new(), false),
+    };
+
+    use sqlx::Row;
+    let sql = format!(
+        "SELECT id, company_id, invite_type::text, invited_email, invited_by_user_id, \
+         allowed_join_types::text, accepted, expires_at, created_at \
+         FROM invites WHERE company_id = $1 {} ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        if has_state { format!("AND {}", state_sql) } else { String::new() }
+    );
+    let rows = sqlx::query(&sql)
+        .bind(company_id)
+        .bind(limit + 1)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| AuthError::internal(format!("Failed to list invites: {}", e)))?;
+
+    let has_more = rows.len() as i64 > limit;
+    let visible = if has_more { &rows[..limit as usize] } else { &rows[..] };
+    let items: Vec<serde_json::Value> = visible
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<Uuid, _>("id"),
+                "companyId": company_id,
+                "inviteType": r.get::<String, _>("invite_type"),
+                "invitedEmail": r.get::<Option<String>, _>("invited_email"),
+                "invitedByUserId": r.get::<Option<Uuid>, _>("invited_by_user_id"),
+                "allowedJoinTypes": r.get::<Option<String>, _>("allowed_join_types"),
+                "accepted": r.get::<bool, _>("accepted"),
+                "expiresAt": r.get::<Option<chrono::DateTime<Utc>>, _>("expires_at"),
+                "createdAt": r.get::<chrono::DateTime<Utc>, _>("created_at"),
+            })
+        })
+        .collect();
+
+    Ok(Json(items))
 }
 
 /// POST /api/companies/:company_id/invites
