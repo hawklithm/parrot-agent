@@ -433,6 +433,17 @@ async fn create_board_api_key(
         AuthError::internal(format!("Failed to create API key: {}", e))
     })?;
 
+    crate::routes::log_activity(
+        &state.pool,
+        uuid::Uuid::nil(),
+        "auth.board_api_key_created",
+        &actor,
+        "board_api_key",
+        key.id,
+        json!({ "name": key.name }),
+    )
+    .await;
+
     Ok(Json(json!({
         "id": key.id,
         "name": key.name,
@@ -456,6 +467,18 @@ async fn revoke_board_api_key(
     repo.revoke(key_id, user_id).await.map_err(|e| {
         AuthError::internal(format!("Failed to revoke API key: {}", e))
     })?;
+
+    crate::routes::log_activity(
+        &state.pool,
+        uuid::Uuid::nil(),
+        "auth.board_api_key_revoked",
+        &actor,
+        "board_api_key",
+        key_id,
+        json!({}),
+    )
+    .await;
+
     Ok(Json(json!({ "status": "revoked" })))
 }
 
@@ -534,7 +557,7 @@ async fn create_invite(
     .bind(company_id)
     .bind(invite_type)
     .bind(user_id)
-    .bind(invited_email)
+    .bind(&invited_email)
     .bind(&token)
     .bind(allowed_join_types)
     .bind(expires_at)
@@ -542,6 +565,17 @@ async fn create_invite(
     .execute(&state.pool)
     .await
     .map_err(|e| AuthError::internal(format!("Failed to create invite: {}", e)))?;
+
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "company.invite_created",
+        &actor,
+        "invite",
+        invite_id,
+        json!({ "inviteType": invite_type, "email": invited_email }),
+    )
+    .await;
 
     Ok(Json(json!({
         "id": invite_id,
@@ -651,6 +685,17 @@ async fn accept_invite(
         .execute(&state.pool)
         .await
         .map_err(|e| AuthError::internal(format!("Failed to mark invite as used: {}", e)))?;
+
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "company.invite_accepted",
+        &actor,
+        "invite",
+        invite_id,
+        json!({ "joinRequestId": jr_id }),
+    )
+    .await;
 
     Ok(Json(json!({
         "status": "pending_approval",
@@ -788,6 +833,17 @@ async fn approve_join_request(
     .await
     .map_err(|e| AuthError::internal(format!("Failed to create membership: {}", e)))?;
 
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "company.join_request_approved",
+        &actor,
+        "join_request",
+        request_id,
+        json!({ "principalId": principal_id }),
+    )
+    .await;
+
     Ok(Json(json!({
         "status": "approved",
         "principalId": principal_id,
@@ -841,6 +897,17 @@ async fn reject_join_request(
     .execute(&state.pool)
     .await
     .map_err(|e| AuthError::internal(format!("Failed to reject join request: {}", e)))?;
+
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "company.join_request_rejected",
+        &actor,
+        "join_request",
+        request_id,
+        json!({ "reason": payload.reason }),
+    )
+    .await;
 
     Ok(Json(json!({ "status": "rejected" })))
 }
@@ -921,6 +988,17 @@ async fn update_member(
         .await
         .map_err(|e| AuthError::internal(format!("Failed to update member: {}", e)))?;
 
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "company.member_role_updated",
+        &actor,
+        "company_membership",
+        member_id,
+        json!({ "role": &payload.role }),
+    )
+    .await;
+
     Ok(Json(json!({ "status": "updated", "role": payload.role })))
 }
 
@@ -957,6 +1035,17 @@ async fn update_member_role_and_grants(
         .execute(&state.pool)
         .await
         .map_err(|e| AuthError::internal(format!("Failed to update member role: {}", e)))?;
+
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "company.member_role_and_grants_updated",
+        &actor,
+        "company_membership",
+        member_id,
+        json!({ "role": &payload.role }),
+    )
+    .await;
 
     Ok(Json(json!({ "status": "updated", "role": payload.role })))
 }
@@ -996,6 +1085,17 @@ async fn archive_member(
     .execute(&state.pool)
     .await
     .map_err(|e| AuthError::internal(format!("Failed to archive member: {}", e)))?;
+
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "company.member_archived",
+        &actor,
+        "company_membership",
+        member_id,
+        json!({}),
+    )
+    .await;
 
     Ok(Json(json!({ "status": "archived" })))
 }
