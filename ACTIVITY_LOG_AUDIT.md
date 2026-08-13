@@ -2,9 +2,9 @@
 
 自动生成：`scripts/audit_activity_log.py`。检查 production mutation handler（POST/PATCH/PUT/DELETE）是否调用 `log_activity`。
 
-- mutation handlers: **345**
-- covered: **28**
-- NO_LOG (缺 activity log): **317**
+- mutation handlers: **428**
+- covered: **55**
+- NO_LOG (缺 activity log): **373**
 - unparsed (需人工复核): **0**
 
 | File | Method | Route | Handler | Status |
@@ -19,6 +19,7 @@
 | `access_control.rs` | DELETE | `/board-api-keys/:key_id` | `revoke_board_api_key` | covered |
 | `access_control.rs` | POST | `/companies/:company_id/invites` | `create_invite` | covered |
 | `access_control.rs` | POST | `/invites/:token/accept` | `accept_invite` | covered |
+| `access_control.rs` | POST | `/invites/:invite_id/revoke` | `revoke_invite` | covered |
 | `access_control.rs` | POST | `/api/companies/:company_id/join-requests/:request_id/approve` | `approve_join_request` | covered |
 | `access_control.rs` | POST | `/api/companies/:company_id/join-requests/:request_id/reject` | `reject_join_request` | covered |
 | `access_control.rs` | PATCH | `/api/companies/:company_id/members/:member_id` | `update_member` | covered |
@@ -35,6 +36,7 @@
 | `adapters.rs` | DELETE | `/adapters/:adapter_type` | `delete_adapter` | NO_LOG |
 | `adapters.rs` | POST | `/adapters/:adapter_type/reload` | `reload_adapter` | NO_LOG |
 | `adapters.rs` | POST | `/adapters/:adapter_type/reinstall` | `reinstall_adapter` | NO_LOG |
+| `agents.rs` | POST | `/companies/:company_id/agents` | `create_agent` | NO_LOG |
 | `agents.rs` | POST | `/companies/:company_id/agent-hires` | `create_agent` | NO_LOG |
 | `agents.rs` | PATCH | `/agents/:id` | `update_agent` | NO_LOG |
 | `agents.rs` | DELETE | `/agents/:id` | `delete_agent` | NO_LOG |
@@ -76,6 +78,18 @@
 | `auth.rs` | POST | `/admin/users/:user_id/demote-instance-admin` | `demote_instance_admin` | NO_LOG |
 | `auth.rs` | PUT | `/admin/users/:user_id/company-access` | `update_user_company_access` | NO_LOG |
 | `auth.rs` | POST | `/join-requests/:request_id/claim-api-key` | `claim_join_request_api_key` | NO_LOG |
+| `automation_misc.rs` | PUT | `/issues/:id/watchdog` | `upsert_issue_watchdog` | covered |
+| `automation_misc.rs` | DELETE | `/issues/:id/watchdog` | `delete_issue_watchdog` | NO_LOG |
+| `automation_misc.rs` | DELETE | `/issues/:issue_id/comments/:comment_id` | `delete_issue_comment` | covered |
+| `automation_misc.rs` | POST | `/cases/:id/claim` | `claim_case` | NO_LOG |
+| `automation_misc.rs` | POST | `/cases/:id/release` | `release_case` | NO_LOG |
+| `automation_misc.rs` | POST | `/cases/:id/transition` | `transition_case` | NO_LOG |
+| `automation_misc.rs` | POST | `/companies/import/preview` | `preview_company_import` | NO_LOG |
+| `automation_misc.rs` | POST | `/board-claim/:token/claim` | `claim_board_token` | NO_LOG |
+| `automation_misc.rs` | POST | `/health/dev-server/restart` | `dev_server_restart` | NO_LOG |
+| `automation_misc.rs` | PATCH | `/pipelines/:pipeline_id` | `update_pipeline` | NO_LOG |
+| `automation_misc.rs` | POST | `/projects/:project_id/workspaces/:workspace_id/runtime-commands/:command_id` | `project_runtime_command` | NO_LOG |
+| `automation_misc.rs` | POST | `/projects/:project_id/workspaces/:workspace_id/runtime-services/:service_id` | `project_runtime_service` | NO_LOG |
 | `board_chat.rs` | POST | `/board/chat/stream` | `stream_board_chat` | NO_LOG |
 | `built_in_agents.rs` | POST | `/companies/:company_id/built-in-agents/:key/provision` | `provision_built_in_agent` | NO_LOG |
 | `built_in_agents.rs` | POST | `/companies/:company_id/built-in-agents/:key/reconcile` | `reconcile_built_in_agent` | NO_LOG |
@@ -123,13 +137,11 @@
 | `companies.rs` | PATCH | `/companies/:company_id/branding` | `update_company_branding` | NO_LOG |
 | `companies.rs` | POST | `/companies/:company_id/archive` | `archive_company` | NO_LOG |
 | `companies.rs` | PATCH | `/companies/:company_id/members/:member_id/permissions` | `update_member_permissions` | NO_LOG |
-| `companies.rs` | PUT | `/companies/:company_id/sidebar-preferences/me` | `update_sidebar_preferences` | NO_LOG |
 | `companies.rs` | POST | `/companies/:company_id/export` | `export_company` | NO_LOG |
 | `companies.rs` | POST | `/companies/:company_id/exports` | `export_company` | NO_LOG |
 | `companies.rs` | POST | `/companies/:company_id/exports/preview` | `preview_company_export` | NO_LOG |
 | `companies.rs` | POST | `/companies/:company_id/imports/preview` | `preview_company_import` | NO_LOG |
 | `companies.rs` | POST | `/companies/:company_id/imports/apply` | `apply_company_import` | NO_LOG |
-| `companies.rs` | POST | `/companies/:company_id/inbox-dismissals` | `dismiss_inbox_item` | NO_LOG |
 | `companies.rs` | POST | `/companies/:company_id/issues/external-object-summaries` | `get_external_object_summaries` | NO_LOG |
 | `costs.rs` | POST | `/companies/:company_id/cost-events` | `record_cost_event` | NO_LOG |
 | `costs.rs` | POST | `/companies/:company_id/finance-events` | `record_finance_event` | NO_LOG |
@@ -170,6 +182,12 @@
 | `execution_workspaces.rs` | POST | `/execution-workspaces/:id/reconcile-branch` | `reconcile_branch` | NO_LOG |
 | `execution_workspaces.rs` | POST | `/execution-workspaces/:id/runtime-services/:action` | `runtime_command` | NO_LOG |
 | `execution_workspaces.rs` | POST | `/execution-workspaces/:id/runtime-commands/:action` | `runtime_command` | NO_LOG |
+| `folders.rs` | POST | `/companies/:company_id/folders` | `create_folder` | covered |
+| `folders.rs` | POST | `/companies/:company_id/folders/ensure-my` | `ensure_my_folder` | covered |
+| `folders.rs` | POST | `/companies/:company_id/folders/items/move` | `move_folder_item` | covered |
+| `folders.rs` | PATCH | `/companies/:company_id/folders/:folder_id` | `update_folder` | covered |
+| `folders.rs` | DELETE | `/companies/:company_id/folders/:folder_id` | `delete_folder` | covered |
+| `folders.rs` | POST | `/companies/:company_id/folders/:folder_id/move` | `move_folder` | covered |
 | `goals.rs` | POST | `/companies/:company_id/goals` | `create_goal` | NO_LOG |
 | `goals.rs` | PATCH | `/goals/:goal_id` | `update_goal` | NO_LOG |
 | `goals.rs` | DELETE | `/goals/:goal_id` | `delete_goal` | NO_LOG |
@@ -177,6 +195,8 @@
 | `goals.rs` | POST | `/goals/:goal_id/abandon` | `abandon_goal` | NO_LOG |
 | `heartbeat_runs.rs` | POST | `/heartbeat-runs/:run_id/cancel` | `cancel_heartbeat_run` | NO_LOG |
 | `heartbeat_runs.rs` | POST | `/heartbeat-runs/:run_id/watchdog-decisions` | `submit_watchdog_decision` | NO_LOG |
+| `inbox_dismissals.rs` | POST | `/companies/:company_id/inbox-dismissals` | `create_inbox_dismissal` | covered |
+| `inbox_dismissals.rs` | DELETE | `/companies/:company_id/inbox-dismissals/:item_key` | `delete_inbox_dismissal` | covered |
 | `instance_settings.rs` | PATCH | `/instance/settings` | `update_instance_settings` | NO_LOG |
 | `instance_settings.rs` | PATCH | `/instance/settings/general` | `update_general_settings` | NO_LOG |
 | `instance_settings.rs` | PATCH | `/instance/settings/experimental` | `update_experimental_settings` | NO_LOG |
@@ -279,6 +299,10 @@
 | `routines.rs` | POST | `/routine-triggers/:trigger_id/rotate-secret` | `rotate_trigger_secret` | NO_LOG |
 | `routines.rs` | POST | `/routine-triggers/public/:public_id/fire` | `fire_public_trigger` | NO_LOG |
 | `routines.rs` | POST | `/routines/:routine_id/run` | `trigger_routine_run` | NO_LOG |
+| `secret_proposals.rs` | POST | `/agents/me/secret-proposals` | `create_agent_proposal` | NO_LOG |
+| `secret_proposals.rs` | DELETE | `/agents/me/secret-proposals/:id` | `withdraw_agent_proposal` | NO_LOG |
+| `secret_proposals.rs` | POST | `/companies/:company_id/secret-proposals/:id/approve` | `approve_proposal` | covered |
+| `secret_proposals.rs` | POST | `/companies/:company_id/secret-proposals/:id/reject` | `reject_proposal` | covered |
 | `secret_provider_configs.rs` | POST | `/companies/:companyId/secret-provider-configs` | `create_config` | NO_LOG |
 | `secret_provider_configs.rs` | POST | `/companies/:companyId/secret-provider-configs/discovery/preview` | `discovery_preview` | NO_LOG |
 | `secret_provider_configs.rs` | PATCH | `/secret-provider-configs/:id` | `update_config` | NO_LOG |
@@ -291,6 +315,8 @@
 | `secrets.rs` | PATCH | `/secrets/:id` | `update_secret` | NO_LOG |
 | `secrets.rs` | DELETE | `/secrets/:id` | `delete_secret` | NO_LOG |
 | `secrets.rs` | POST | `/secrets/:id/rotate` | `rotate_secret` | NO_LOG |
+| `sidebar_preferences.rs` | PUT | `/sidebar-preferences/me` | `put_user_sidebar_preferences` | NO_LOG |
+| `sidebar_preferences.rs` | PUT | `/companies/:company_id/sidebar-preferences/me` | `put_company_sidebar_preferences` | covered |
 | `skill_policy.rs` | DELETE | `/companies/:company_id/skill-policy` | `delete_skill_policy` | NO_LOG |
 | `skill_policy.rs` | POST | `/companies/:company_id/skill-policy` | `set_skill_policy` | NO_LOG |
 | `skill_policy.rs` | POST | `/companies/:company_id/skill-policy/simulate` | `simulate_skill_policy` | NO_LOG |
@@ -317,9 +343,66 @@
 | `skills.rs` | POST | `/companies/:company_id/skills/import` | `import_company_skill` | NO_LOG |
 | `skills.rs` | POST | `/companies/:company_id/skills/install-catalog` | `install_skill_catalog` | NO_LOG |
 | `skills.rs` | POST | `/companies/:company_id/skills/scan-projects` | `scan_skill_projects` | NO_LOG |
+| `smoke_lab.rs` | POST | `/companies/:company_id/smoke-lab/oauth/authorize` | `oauth_authorize` | NO_LOG |
+| `smoke_lab.rs` | POST | `/companies/:company_id/smoke-lab/oauth/token` | `oauth_token` | NO_LOG |
+| `smoke_lab.rs` | POST | `/companies/:company_id/smoke-lab/oauth/revoke` | `oauth_revoke` | NO_LOG |
+| `smoke_lab.rs` | POST | `/companies/:company_id/smoke-lab/services/start` | `smoke_service_start` | NO_LOG |
+| `smoke_lab.rs` | POST | `/companies/:company_id/smoke-lab/services/stop` | `smoke_service_stop` | NO_LOG |
+| `smoke_lab.rs` | POST | `/companies/:company_id/smoke-lab/install-fixtures` | `install_smoke_fixtures` | NO_LOG |
+| `smoke_lab.rs` | POST | `/companies/:company_id/smoke-lab/runs` | `create_smoke_run` | NO_LOG |
+| `smoke_lab.rs` | PATCH | `/companies/:company_id/smoke-lab/runs/:run_id` | `update_smoke_run` | NO_LOG |
+| `smoke_lab.rs` | POST | `/companies/:company_id/smoke-lab/runs/:run_id/steps` | `record_smoke_step` | NO_LOG |
+| `smoke_lab.rs` | POST | `/companies/:company_id/smoke-lab/reset` | `reset_smoke_lab` | NO_LOG |
 | `sse.rs` | POST | `/companies/:companyId/events/:channel` | `publish_event` | NO_LOG |
+| `status_cards.rs` | POST | `/companies/:company_id/status-cards` | `create_status_card` | covered |
+| `status_cards.rs` | PATCH | `/status-cards/:id` | `patch_status_card` | covered |
+| `status_cards.rs` | DELETE | `/status-cards/:id` | `delete_status_card` | covered |
+| `status_cards.rs` | POST | `/status-cards/:id/recompile` | `recompile_status_card` | covered |
+| `status_cards.rs` | POST | `/status-cards/:id/refresh` | `refresh_status_card` | covered |
+| `status_cards.rs` | PUT | `/status-cards/:id/query` | `write_status_card_query` | covered |
+| `status_cards.rs` | PUT | `/status-cards/:id/summary` | `write_status_card_summary` | NO_LOG |
+| `summary_slots.rs` | PUT | `/companies/:company_id/summary-slots/:scope_kind/:slot_key` | `write_summary_slot` | covered |
+| `summary_slots.rs` | POST | `/companies/:company_id/summary-slots/:scope_kind/:slot_key/generate` | `generate_summary_slot` | covered |
 | `teams_catalog.rs` | POST | `/companies/:company_id/teams/catalog/:catalog_id/preview` | `preview_catalog_team` | NO_LOG |
 | `teams_catalog.rs` | POST | `/companies/:company_id/teams/catalog/:catalog_id/install` | `install_catalog_team` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/applications` | `create_tool_application` | covered |
+| `tool_access.rs` | PATCH | `/tool-applications/:id` | `update_tool_application` | covered |
+| `tool_access.rs` | DELETE | `/tool-applications/:id` | `delete_tool_application` | NO_LOG |
+| `tool_access.rs` | PATCH | `/tool-connections/:id` | `update_tool_connection` | covered |
+| `tool_access.rs` | DELETE | `/tool-connections/:id` | `delete_tool_connection` | covered |
+| `tool_access.rs` | DELETE | `/tool-connections/:id/grants/:grant_id` | `delete_connection_grant` | NO_LOG |
+| `tool_access.rs` | PATCH | `/tool-profiles/:id` | `update_tool_profile` | NO_LOG |
+| `tool_access.rs` | DELETE | `/tool-profiles/:id` | `delete_tool_profile` | NO_LOG |
+| `tool_access.rs` | PATCH | `/tool-profile-entries/:id` | `update_tool_profile_entry` | NO_LOG |
+| `tool_access.rs` | DELETE | `/tool-profile-entries/:id` | `delete_tool_profile_entry` | NO_LOG |
+| `tool_access.rs` | POST | `/tool-connections/:id/catalog/refresh` | `refresh_connection_catalog` | NO_LOG |
+| `tool_access.rs` | POST | `/tool-connections/:id/grants/installations` | `install_connection_grants` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/connections` | `create_company_tool_connection` | covered |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/profiles` | `create_company_tool_profile` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/examples/:example_id/install` | `install_tool_example` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/examples/:example_id/smoke` | `smoke_tool_example` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/apps/connect` | `connect_tool_app` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/apps/:app_id/finish` | `finish_tool_app` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/mcp/import-json` | `import_mcp_json` | NO_LOG |
+| `tool_access.rs` | PATCH | `/companies/:company_id/tools/policies/:policy_id` | `update_company_tool_policy` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/policies/:policy_id/duplicate` | `duplicate_tool_policy` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/policies/reorder` | `reorder_tool_policies` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/policy/test` | `test_tool_policy` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/stdio-templates` | `create_stdio_template` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/trust-rules/:rule_id/revoke` | `revoke_trust_rule` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/runtime-slots/:slot_id/stop` | `stop_runtime_slot` | NO_LOG |
+| `tool_access.rs` | POST | `/companies/:company_id/tools/runtime-slots/:slot_id/restart` | `restart_runtime_slot` | NO_LOG |
+| `tool_access.rs` | POST | `/agents/me/connections/:connection_id/start-authorization` | `start_agent_connection_auth` | NO_LOG |
+| `tool_access.rs` | POST | `/agents/me/connections/:connection_id/token` | `agent_connection_token` | NO_LOG |
+| `tool_access.rs` | POST | `/agents/me/secrets/:key/value` | `agent_secret_value` | NO_LOG |
+| `tool_access.rs` | POST | `/tool-connections/:id/health-check` | `connection_health_check` | NO_LOG |
+| `tool_access.rs` | POST | `/tool-connections/:id/test-calls` | `create_connection_test_call` | NO_LOG |
+| `tool_access.rs` | POST | `/tool-profiles/:id/duplicate` | `duplicate_tool_profile` | NO_LOG |
+| `tool_access.rs` | POST | `/tool-profiles/:id/entries` | `create_tool_profile_entry` | NO_LOG |
+| `tool_access.rs` | POST | `/tool-profiles/:id/new-tools/review` | `review_profile_new_tools` | NO_LOG |
+| `tool_access.rs` | POST | `/tools/oauth/:provider/start` | `tools_oauth_start` | NO_LOG |
+| `tool_access.rs` | POST | `/tool-gateway/runtime-slots/:slot_id/stop` | `gateway_slot_stop` | NO_LOG |
+| `tool_access.rs` | POST | `/tool-gateway/runtime-slots/:slot_id/restart` | `gateway_slot_restart` | NO_LOG |
 | `tools.rs` | POST | `/tool-gateway/sessions` | `create_gateway_session` | NO_LOG |
 | `tools.rs` | POST | `/tool-gateway/sessions/:session_id/revoke` | `revoke_gateway_session` | NO_LOG |
 | `tools.rs` | POST | `/tool-gateway/tools/call` | `call_gateway_tool` | NO_LOG |
