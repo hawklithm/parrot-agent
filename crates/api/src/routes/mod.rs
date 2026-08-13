@@ -44,6 +44,7 @@ pub mod assets;
 pub mod board_chat;
 pub mod cloud_upstreams;
 pub mod costs;
+pub mod decisions;
 pub mod execution_workspaces;
 pub mod heartbeat_runs;
 pub mod instance_settings;
@@ -260,6 +261,7 @@ pub use watchdogs::watchdog_routes;
 // P2: New domain routes
 pub use approvals::approval_routes;
 pub use costs::cost_routes;
+pub use decisions::decision_routes;
 pub use resource_memberships::resource_membership_routes;
 
 #[cfg(test)]
