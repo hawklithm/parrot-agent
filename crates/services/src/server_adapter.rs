@@ -210,6 +210,31 @@ pub trait ServerAdapterModule: Send + Sync {
         // Default: no-op, return empty success
         Ok(serde_json::json!({}))
     }
+
+    /// Whether this adapter exposes the Skills API (list/sync skills).
+    fn supports_skills(&self) -> bool {
+        false
+    }
+
+    /// Whether this adapter can issue local-agent JWTs for agent authentication.
+    fn supports_local_agent_jwt(&self) -> bool {
+        false
+    }
+
+    /// Whether this adapter exposes model profiles.
+    fn supports_model_profiles(&self) -> bool {
+        false
+    }
+
+    /// Whether this adapter speaks the Agent Client Protocol (ACP).
+    fn supports_acp(&self) -> bool {
+        false
+    }
+
+    /// Whether runtime skills must be materialized on disk for this adapter.
+    fn requires_materialized_runtime_skills(&self) -> bool {
+        false
+    }
 }
 
 /// Adapter registry
@@ -378,6 +403,26 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
             max_size_bytes: Some(10 * 1024 * 1024), // 10MB
         }
     }
+
+    fn supports_skills(&self) -> bool {
+        true
+    }
+
+    fn supports_local_agent_jwt(&self) -> bool {
+        true
+    }
+
+    fn supports_model_profiles(&self) -> bool {
+        true
+    }
+
+    fn supports_acp(&self) -> bool {
+        true
+    }
+
+    fn requires_materialized_runtime_skills(&self) -> bool {
+        false
+    }
 }
 
 /// Codex Local adapter
@@ -469,6 +514,26 @@ impl ServerAdapterModule for CodexLocalAdapter {
             max_size_bytes: Some(10 * 1024 * 1024), // 10MB
         }
     }
+
+    fn supports_skills(&self) -> bool {
+        true
+    }
+
+    fn supports_local_agent_jwt(&self) -> bool {
+        true
+    }
+
+    fn supports_model_profiles(&self) -> bool {
+        true
+    }
+
+    fn supports_acp(&self) -> bool {
+        true
+    }
+
+    fn requires_materialized_runtime_skills(&self) -> bool {
+        false
+    }
 }
 
 
@@ -543,6 +608,26 @@ impl ServerAdapterModule for ProcessAdapter {
             max_size_bytes: Some(10 * 1024 * 1024), // 10MB
         }
     }
+
+    fn supports_skills(&self) -> bool {
+        false
+    }
+
+    fn supports_local_agent_jwt(&self) -> bool {
+        false
+    }
+
+    fn supports_model_profiles(&self) -> bool {
+        false
+    }
+
+    fn supports_acp(&self) -> bool {
+        false
+    }
+
+    fn requires_materialized_runtime_skills(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -605,5 +690,31 @@ mod tests {
 
         let bundle_support = adapter.supports_instructions_bundle();
         assert!(bundle_support.supported);
+    }
+
+    #[test]
+    fn test_adapter_capabilities_aligned_with_paperclip() {
+        let claude = ClaudeLocalAdapter::new();
+        // claude_local 支持 skills / local-agent JWT / model profiles / ACP，
+        // 但不要求物料化运行时 skills。
+        assert!(claude.supports_skills());
+        assert!(claude.supports_local_agent_jwt());
+        assert!(claude.supports_model_profiles());
+        assert!(claude.supports_acp());
+        assert!(!claude.requires_materialized_runtime_skills());
+
+        let codex = CodexLocalAdapter::new();
+        assert!(codex.supports_skills());
+        assert!(codex.supports_local_agent_jwt());
+        assert!(codex.supports_model_profiles());
+        assert!(codex.supports_acp());
+        assert!(!codex.requires_materialized_runtime_skills());
+
+        let process = ProcessAdapter::new();
+        assert!(!process.supports_skills());
+        assert!(!process.supports_local_agent_jwt());
+        assert!(!process.supports_model_profiles());
+        assert!(!process.supports_acp());
+        assert!(!process.requires_materialized_runtime_skills());
     }
 }

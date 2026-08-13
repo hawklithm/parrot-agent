@@ -1,11 +1,14 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, patch, post},
     Json, Router,
 };
 use uuid::Uuid;
+
+use services::adapter_package_loader::AdapterPackageLoader;
+use services::auth::AuthorizationActor;
 
 use crate::errors::AppError;
 use crate::extractors::CompanyIdOrShortname;
@@ -400,14 +403,14 @@ async fn list_global_adapters(
             let is_disabled = registry_state.is_disabled(&adapter_type_str);
             let is_override_paused = registry_state.is_override_paused(&adapter_type_str);
             
-            // 构建能力集合
+            // 构建能力集合（取自真实 adapter capability，而非硬编码 false）
             let capabilities = AdapterCapabilities {
                 supports_instructions_bundle: adapter.supports_instructions_bundle().supported,
-                supports_skills: false, // TODO: 需要 adapter 实现 listSkills/syncSkills
-                supports_local_agent_jwt: false, // TODO: 需要 adapter 实现
-                requires_materialized_runtime_skills: false, // TODO: 需要 adapter 实现
-                supports_model_profiles: false, // TODO: 需要 adapter 实现
-                supports_acp: false, // TODO: 需要 adapter 实现 ACP
+                supports_skills: adapter.supports_skills(),
+                supports_local_agent_jwt: adapter.supports_local_agent_jwt(),
+                requires_materialized_runtime_skills: adapter.requires_materialized_runtime_skills(),
+                supports_model_profiles: adapter.supports_model_profiles(),
+                supports_acp: adapter.supports_acp(),
             };
             
             GlobalAdapterInfo {
@@ -592,49 +595,123 @@ async fn update_adapter_config(
 }
 
 /// E6: DELETE /adapters/:adapter_type - 删除适配器
+///
+/// 真实删除流程：
+/// 1. 仅外部安装的适配器可删除（内置适配器不可删）。
+/// 2. 引用检查：仍有 agent 引用该 adapter_type 时拒绝删除（409）。
+/// 3. 卸载 npm 包（尽力而为）。
+/// 4. 移除持久化的外部插件记录并落盘。
 async fn delete_adapter(
-    State(_state): State<AdapterAppState>,
-    Path(_adapter_type_str): Path<String>,
+    State(state): State<AdapterAppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(adapter_type_str): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    // TODO: 实现完整的删除逻辑
+    use services::builtin_adapter_types::is_builtin_adapter_type;
+
+    crate::routes::assert_instance_admin(&actor).map_err(|_| {
+        AppError::Forbidden("Instance admin required to delete adapters".to_string())
+    })?;
+
+    // 1. 外部安装的适配器才有可删除的记录；内置适配器不可删除。
+    let record = match state.adapter_registry_state.get_external_plugin(&adapter_type_str) {
+        Some(r) => r,
+        None => {
+            if is_builtin_adapter_type(&adapter_type_str) {
+                return Err(AppError::BadRequest(format!(
+                    "Adapter \"{}\" is a built-in adapter and cannot be deleted",
+                    adapter_type_str
+                )));
+            }
+            return Err(AppError::NotFound(format!(
+                "Adapter \"{}\" is not an installed external adapter",
+                adapter_type_str
+            )));
+        }
+    };
+
+    // 2. 引用检查：仍有 agent 引用该 adapter_type 时拒绝删除。
+    let in_use: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agents WHERE adapter_type = $1",
+    )
+    .bind(&adapter_type_str)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    if in_use > 0 {
+        return Err(AppError::Conflict(format!(
+            "Cannot delete adapter \"{}\": {} agent(s) still reference it",
+            adapter_type_str, in_use
+        )));
+    }
+
+    // 3. 卸载 npm 包（尽力而为；即使失败也继续移除持久化记录）。
+    let loader = AdapterPackageLoader::with_default_config();
+    if let Err(e) = loader.uninstall_adapter(&record.package_name) {
+        tracing::warn!(
+            adapter_type = %adapter_type_str,
+            package = %record.package_name,
+            error = %e,
+            "npm uninstall failed during adapter deletion"
+        );
+    }
+
+    // 4. 移除持久化的外部插件记录。
+    state.adapter_registry_state.remove_external_plugin(&adapter_type_str);
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// E7: POST /adapters/:adapter_type/reload - 重载外部适配器
+///
+/// 真实重载：根据安装来源（本地路径或 npm 包）重新加载包元数据并刷新
+/// 持久化的插件记录。内置适配器（未被外部覆盖）不可重载。
 async fn reload_adapter(
     State(state): State<AdapterAppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(adapter_type_str): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     use services::builtin_adapter_types::is_builtin_adapter_type;
-    
-    // 1. 内置适配器不能重载（除非被外部覆盖）
+
+    crate::routes::assert_instance_admin(&actor).map_err(|_| {
+        AppError::Forbidden("Instance admin required to reload adapters".to_string())
+    })?;
+
+    // 1. 内置适配器不能重载（除非被外部覆盖）。
     let is_builtin = is_builtin_adapter_type(&adapter_type_str);
     let external_record = state.adapter_registry_state.get_external_plugin(&adapter_type_str);
-    
+
     if is_builtin && external_record.is_none() {
         return Err(AppError::BadRequest("Cannot reload built-in adapter".to_string()));
     }
-    
-    // 2. 检查是否为外部安装的适配器
+
     let record = external_record.ok_or_else(|| {
         AppError::NotFound(format!(
             "Adapter \"{}\" is not an externally installed adapter",
             adapter_type_str
         ))
     })?;
-    
-    // 3. TODO: 实现动态重载逻辑
-    tracing::warn!(
-        adapter_type = %adapter_type_str,
-        "Adapter reload requested, but dynamic reloading not yet implemented"
-    );
-    
-    // 4. 返回结果（目前只是模拟）
+
+    // 2. 真实重载：按来源重新加载包并刷新持久化记录。
+    let loader = AdapterPackageLoader::with_default_config();
+    let reloaded_record = if let Some(local_path) = &record.local_path {
+        loader
+            .load_local_adapter(local_path)
+            .map_err(|e| AppError::InternalServerError(format!("Failed to reload local adapter: {}", e)))?
+    } else {
+        loader
+            .install_npm_adapter(&record.package_name, record.version.as_deref())
+            .map_err(|e| AppError::InternalServerError(format!("Failed to reload npm adapter: {}", e)))?
+    };
+
+    // 3. 覆盖持久化状态（按 adapter_type 唯一）。
+    state.adapter_registry_state.add_external_plugin(reloaded_record.clone());
+
     Ok(Json(serde_json::json!({
         "type": adapter_type_str,
-        "version": record.version,
-        "reloaded": false,
-        "message": "Dynamic reloading not yet implemented",
+        "version": reloaded_record.version,
+        "reloaded": true,
+        "message": "Adapter reloaded",
     })))
 }
 
@@ -705,22 +782,94 @@ async fn get_adapter_config_schema(
 }
 
 /// E10: GET /adapters/:adapter_type/ui-parser.js - 获取 UI 解析器
+///
+/// 仅外部安装的适配器才可能随包提供 `ui-parser.js`。命中则返回
+/// `application/javascript` 内容；否则返回可区分的 404（带明确错误体）。
 async fn get_adapter_ui_parser(
-    State(_state): State<AdapterAppState>,
+    State(state): State<AdapterAppState>,
     Path(adapter_type_str): Path<String>,
 ) -> Result<axum::response::Response, AppError> {
-    Err(AppError::NotFound(format!("UI parser not found for adapter {}", adapter_type_str)))
+    let record = state.adapter_registry_state.get_external_plugin(&adapter_type_str);
+
+    let parser_path = match &record {
+        Some(r) => {
+            let loader = AdapterPackageLoader::with_default_config();
+            Some(loader.resolve_package_path(r).join("ui-parser.js"))
+        }
+        None => None,
+    };
+
+    match parser_path {
+        Some(path) if path.exists() => {
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                AppError::InternalServerError(format!("Failed to read ui-parser.js: {}", e))
+            })?;
+            let mut resp = axum::response::Response::new(axum::body::Body::from(content));
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/javascript; charset=utf-8"),
+            );
+            Ok(resp)
+        }
+        _ => Err(AppError::NotFound(format!(
+            "UI parser not found for adapter {}",
+            adapter_type_str
+        ))),
+    }
 }
 
 /// E8: POST /adapters/:adapter_type/reinstall - 重新安装适配器
+///
+/// 真实重新安装：本地路径适配器重新加载；npm 适配器先卸载再安装。
+/// 安装失败时回滚——恢复旧插件记录，保证适配器仍被系统认知。
 async fn reinstall_adapter(
-    State(_state): State<AdapterAppState>,
+    State(state): State<AdapterAppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(adapter_type_str): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    // TODO: 实现重新安装逻辑
+    crate::routes::assert_instance_admin(&actor).map_err(|_| {
+        AppError::Forbidden("Instance admin required to reinstall adapters".to_string())
+    })?;
+
+    let record = state.adapter_registry_state.get_external_plugin(&adapter_type_str).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "Adapter \"{}\" is not an externally installed adapter",
+            adapter_type_str
+        ))
+    })?;
+
+    let loader = AdapterPackageLoader::with_default_config();
+
+    let (reinstalled_record, message) = if let Some(local_path) = &record.local_path {
+        // 本地路径适配器：重新加载元数据即可。
+        let r = loader.load_local_adapter(local_path).map_err(|e| {
+            // 回滚：恢复旧记录。
+            state.adapter_registry_state.add_external_plugin(record.clone());
+            AppError::InternalServerError(format!("Failed to reload local adapter during reinstall: {}", e))
+        })?;
+        (r, "Adapter reinstalled from local path")
+    } else {
+        // npm 适配器：先卸载再安装（幂等重装）。
+        loader.uninstall_adapter(&record.package_name).map_err(|e| {
+            AppError::InternalServerError(format!("Failed to uninstall during reinstall: {}", e))
+        })?;
+        let r = loader
+            .install_npm_adapter(&record.package_name, record.version.as_deref())
+            .map_err(|e| {
+                // 回滚：恢复旧记录，保证适配器仍被系统认知。
+                state.adapter_registry_state.add_external_plugin(record.clone());
+                AppError::InternalServerError(format!("Failed to reinstall adapter: {}", e))
+            })?;
+        (r, "Adapter reinstalled")
+    };
+
+    // 覆盖持久化状态（按 adapter_type 唯一）。
+    state.adapter_registry_state.add_external_plugin(reinstalled_record.clone());
+
     Ok(Json(serde_json::json!({
         "type": adapter_type_str,
-        "reinstalled": false,
-        "message": "Reinstall not yet implemented",
+        "version": reinstalled_record.version,
+        "reinstalled": true,
+        "message": message,
     })))
 }
