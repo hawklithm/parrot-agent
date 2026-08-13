@@ -9,12 +9,12 @@
 - **Limitation**：状态为结构性判定；`partial` 语义、`by-design-candidate` 最终清单需人工复核。
 
 - Paperclip endpoints: **597**
-- Parrot endpoints: **634**
-- implemented: **463**
-- partial: **7**
+- Parrot endpoints: **641**
+- implemented: **469**
+- partial: **6**
 - by-design-candidate: **22**
-- missing: **105**
-- Parrot-only (extension): **171**
+- missing: **100**
+- Parrot-only (extension): **172**
 
 ## 1. Implemented
 
@@ -29,6 +29,7 @@
 | `DELETE /api/cases/:param/documents/:param` | `routes/cases.ts:1209` |
 | `DELETE /api/cases/:param/issue-links/:param` | `routes/pipelines.ts:2123` |
 | `DELETE /api/companies/:param` | `routes/companies.ts:747` |
+| `DELETE /api/companies/:param/folders/:param` | `routes/folders.ts:149` |
 | `DELETE /api/companies/:param/inbox-dismissals/:param` | `routes/inbox-dismissals.ts:98` |
 | `DELETE /api/companies/:param/me/user-secrets/:param` | `routes/secrets.ts:866` |
 | `DELETE /api/companies/:param/skill-policy` | `routes/company-skill-policy.ts:99` |
@@ -193,6 +194,7 @@
 | `GET /api/companies/:param/user-secret-definitions/:param/coverage` | `routes/secrets.ts:727` |
 | `GET /api/companies/:param/users/:param/profile` | `routes/user-profiles.ts:304` |
 | `GET /api/companies/:param/workspace-overview` | `routes/execution-workspaces.ts:92` |
+| `GET /api/companies/issues` | `routes/companies.ts:290` |
 | `GET /api/companies/stats` | `routes/companies.ts:275` |
 | `GET /api/decision-training/:param` | `routes/decision-training.ts:163` |
 | `GET /api/decisions/:param` | `routes/decisions.ts:174` |
@@ -319,6 +321,7 @@
 | `PATCH /api/companies/:param/branding` | `routes/companies.ts:710` |
 | `PATCH /api/companies/:param/budgets` | `routes/costs.ts:330` |
 | `PATCH /api/companies/:param/decision-queues/:param` | `routes/decision-queues.ts:95` |
+| `PATCH /api/companies/:param/folders/:param` | `routes/folders.ts:79` |
 | `PATCH /api/decision-training/:param` | `routes/decision-training.ts:187` |
 | `PATCH /api/environments/:param` | `routes/environments.ts:974` |
 | `PATCH /api/execution-workspaces/:param` | `routes/execution-workspaces.ts:582` |
@@ -389,6 +392,9 @@
 | `POST /api/companies/:param/exports` | `routes/companies.ts:522` |
 | `POST /api/companies/:param/exports/preview` | `routes/companies.ts:514` |
 | `POST /api/companies/:param/finance-events` | `routes/costs.ts:143` |
+| `POST /api/companies/:param/folders` | `routes/folders.ts:32` |
+| `POST /api/companies/:param/folders/:param/move` | `routes/folders.ts:124` |
+| `POST /api/companies/:param/folders/items/move` | `routes/folders.ts:104` |
 | `POST /api/companies/:param/goals` | `routes/goals.ts:28` |
 | `POST /api/companies/:param/imports/apply` | `routes/companies.ts:547` |
 | `POST /api/companies/:param/imports/preview` | `routes/companies.ts:530` |
@@ -493,7 +499,6 @@
 | `PATCH /api/companies/:param/tools/policies/:param` | `routes/tool-access.ts:1206` | path exists with method(s) ['DELETE'] |
 | `PATCH /api/pipelines/:param` | `routes/pipelines.ts:1171` | path exists with method(s) ['GET'] |
 | `POST /api/companies/:param/agents` | `routes/agents.ts:2702` | path exists with method(s) ['GET'] |
-| `POST /api/companies/:param/folders` | `routes/folders.ts:32` | path exists with method(s) ['GET'] |
 | `POST /api/companies/:param/tools/connections` | `routes/tool-access.ts:534` | path exists with method(s) ['GET'] |
 
 ## 3. By-design candidates（平台/UI 专属，需产品确认）
@@ -529,7 +534,6 @@
 |---|---|---|
 | `ALL /api/auth/{:param}` | `app.ts:321` |  |
 | `DELETE /api/agents/me/secret-proposals/:param` | `routes/secrets.ts:282` |  |
-| `DELETE /api/companies/:param/folders/:param` | `routes/folders.ts:149` |  |
 | `DELETE /api/issues/:param/watchdog` | `routes/issues.ts:6113` |  |
 | `DELETE /api/tool-connections/:param` | `routes/tool-access.ts:783` |  |
 | `DELETE /api/tool-connections/:param/grants/:param` | `routes/tool-access.ts:601` |  |
@@ -563,7 +567,6 @@
 | `GET /api/companies/:param/users/:param/inbox-agent-policy` | `routes/inbox-agent-policy.ts:84` |  |
 | `GET /api/companies/:param/users/me/inbox-agent-policy` | `routes/inbox-agent-policy.ts:68` |  |
 | `GET /api/companies/import/jobs/:param` | `routes/companies.ts:425` |  |
-| `GET /api/companies/issues` | `routes/companies.ts:290` |  |
 | `GET /api/environments/:param/leases` | `routes/environments.ts:951` |  |
 | `GET /api/environments/:param/secret-refs` | `routes/environments.ts:935` |  |
 | `GET /api/health` | `routes/health.ts:129` |  |
@@ -579,7 +582,6 @@
 | `GET /api/tool-connections/:param/usage` | `routes/tool-access.ts:618` |  |
 | `GET /api/tool-profiles/:param/new-tools` | `routes/tool-access.ts:874` |  |
 | `GET /api/tools/oauth/callback` | `routes/tool-access.ts:320` |  |
-| `PATCH /api/companies/:param/folders/:param` | `routes/folders.ts:79` |  |
 | `PATCH /api/companies/:param/smoke-lab/runs/:param` | `routes/smoke-lab.ts:226` |  |
 | `PATCH /api/tool-connections/:param` | `routes/tool-access.ts:740` |  |
 | `PATCH /api/tool-profile-entries/:param` | `routes/tool-access.ts:1011` |  |
@@ -591,8 +593,6 @@
 | `POST /api/cases/:param/claim` | `routes/pipelines.ts:1927` |  |
 | `POST /api/cases/:param/release` | `routes/pipelines.ts:1936` |  |
 | `POST /api/cases/:param/transition` | `routes/pipelines.ts:1944` |  |
-| `POST /api/companies/:param/folders/:param/move` | `routes/folders.ts:124` |  |
-| `POST /api/companies/:param/folders/items/move` | `routes/folders.ts:104` |  |
 | `POST /api/companies/:param/secret-proposals/:param/approve` | `routes/secrets.ts:303` |  |
 | `POST /api/companies/:param/secret-proposals/:param/reject` | `routes/secrets.ts:319` |  |
 | `POST /api/companies/:param/smoke-lab/install-fixtures` | `routes/smoke-lab.ts:164` |  |
@@ -745,6 +745,7 @@
 | `POST /api/companies/:param/decision-training/preview` | `decisions.rs` |
 | `POST /api/companies/:param/environments/probe-config` | `environments.rs` |
 | `POST /api/companies/:param/events/:param` | `sse.rs` |
+| `POST /api/companies/:param/folders/ensure-my` | `folders.rs` |
 | `POST /api/companies/:param/inbox-dismissals` | `companies.rs` |
 | `POST /api/companies/:param/invites` | `access_control.rs` |
 | `POST /api/companies/:param/issues/:param/watchdog` | `watchdogs.rs` |
