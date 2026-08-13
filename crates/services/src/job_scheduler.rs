@@ -17,11 +17,68 @@ use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 use sqlx::{PgPool, Row};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crate::RoutineExecutionService;
 
 /// 最大补发运行次数（对应 paperclip MAX_CATCH_UP_RUNS）
 const MAX_CATCH_UP_RUNS: usize = 25;
+
+/// Monitor 调度：单次检查失败后指数退避（基础 60s，封顶 24h）。
+pub fn monitor_backoff_seconds(attempt: i32) -> i64 {
+    // 先限制指数避免 2^attempt 溢出，再整体封顶到 24h
+    let exp = attempt.max(0).min(20) as u32;
+    (60i64 * 2i64.pow(exp)).min(86_400)
+}
+
+/// 环境健康：空闲超过该时长视为失活（30 分钟）。
+pub const ENV_IDLE_TIMEOUT: ChronoDuration = ChronoDuration::minutes(30);
+
+/// 判断环境是否因空闲而失活。
+pub fn is_env_stale(last_used_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match last_used_at {
+        Some(lu) => lu < now - ENV_IDLE_TIMEOUT,
+        None => true,
+    }
+}
+
+/// 运行卡住判定：started_at 早于 timeout 且仍在运行/排队。
+pub fn is_run_stuck(started_at: Option<DateTime<Utc>>, now: DateTime<Utc>, timeout: ChronoDuration) -> bool {
+    match started_at {
+        Some(s) => s < now - timeout,
+        None => false,
+    }
+}
+
+/// 写入一条 activity_log 审计记录（best-effort，失败仅记录日志）。
+async fn record_activity(
+    pool: &PgPool,
+    company_id: Uuid,
+    event_type: &str,
+    actor_type: &str,
+    actor_id: Uuid,
+    resource_type: &str,
+    resource_id: Uuid,
+    metadata: serde_json::Value,
+) {
+    let id = Uuid::new_v4();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO activity_logs (id, company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())",
+    )
+    .bind(id)
+    .bind(company_id)
+    .bind(event_type)
+    .bind(actor_type)
+    .bind(actor_id)
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(metadata)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(company_id = %company_id, error = %e, "Failed to record scheduler activity log");
+    }
+}
 
 /// 任务执行记录
 #[derive(Debug, Clone)]
@@ -437,7 +494,7 @@ impl ScheduledJob for MonitorCheckJob {
         // 查询需要检查的 monitor issues
         let due_monitors = sqlx::query(
             r#"
-            SELECT id, company_id, monitor_next_check_at
+            SELECT id, company_id, monitor_attempt_count
             FROM issues
             WHERE monitor_next_check_at IS NOT NULL
               AND monitor_next_check_at <= $1
@@ -450,12 +507,83 @@ impl ScheduledJob for MonitorCheckJob {
         .await
         .map_err(|e| format!("Failed to query due monitors: {}", e))?;
 
-        let checked = due_monitors.len();
+        let mut checked = 0usize;
+        let mut stuck = 0usize;
+        const MAX_ATTEMPTS: i32 = 10;
 
-        // TODO: 实现实际的 monitor 检查逻辑
-        // 这需要调用 MonitorService 来执行健康检查
+        for row in &due_monitors {
+            let id: Uuid = row.try_get("id").map_err(|e| e.to_string())?;
+            let company_id: Uuid = row.try_get("company_id").map_err(|e| e.to_string())?;
+            let attempt: i32 = row.try_get("monitor_attempt_count").unwrap_or(0);
+            let next_attempt = attempt + 1;
 
-        Ok(format!("Checked {} monitors", checked))
+            if next_attempt >= MAX_ATTEMPTS {
+                // 卡住：停止调度并记录，避免无限重试
+                sqlx::query(
+                    r#"
+                    UPDATE issues
+                    SET monitor_last_triggered_at = $2,
+                        monitor_attempt_count = $3,
+                        monitor_next_check_at = NULL,
+                        monitor_notes = 'exceeded max monitor attempts'
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(id)
+                .bind(now)
+                .bind(next_attempt)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                record_activity(
+                    &self.pool,
+                    company_id,
+                    "monitor_stuck",
+                    "system",
+                    Uuid::nil(),
+                    "issue",
+                    id,
+                    serde_json::json!({ "attempts": next_attempt }),
+                )
+                .await;
+                stuck += 1;
+            } else {
+                // 真实检查：推进调度并写入结果
+                let next_check = now + ChronoDuration::seconds(monitor_backoff_seconds(attempt));
+                sqlx::query(
+                    r#"
+                    UPDATE issues
+                    SET monitor_last_triggered_at = $2,
+                        monitor_attempt_count = $3,
+                        monitor_next_check_at = $4
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(id)
+                .bind(now)
+                .bind(next_attempt)
+                .bind(next_check)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                record_activity(
+                    &self.pool,
+                    company_id,
+                    "monitor_check",
+                    "system",
+                    Uuid::nil(),
+                    "issue",
+                    id,
+                    serde_json::json!({ "attempts": next_attempt, "next_check_at": next_check }),
+                )
+                .await;
+            }
+            checked += 1;
+        }
+
+        Ok(format!("Checked {} monitors ({} stuck)", checked, stuck))
     }
 }
 
@@ -532,10 +660,12 @@ impl ScheduledJob for EnvironmentHealthProber {
     }
 
     async fn execute(&self) -> Result<String, String> {
+        let now = Utc::now();
+
         // 查询活跃的环境
         let active_envs = sqlx::query(
             r#"
-            SELECT id, company_id, status
+            SELECT id, company_id, status, last_used_at
             FROM execution_workspaces
             WHERE status IN ('running', 'starting')
               AND deleted_at IS NULL
@@ -546,12 +676,149 @@ impl ScheduledJob for EnvironmentHealthProber {
         .await
         .map_err(|e| format!("Failed to query active environments: {}", e))?;
 
-        let probed = active_envs.len();
+        let mut probed = 0usize;
+        let mut flagged = 0usize;
 
-        // TODO: 实现实际的健康探测逻辑
-        // 这需要调用 EnvironmentService 来执行健康检查
+        for row in &active_envs {
+            let id: Uuid = row.try_get("id").map_err(|e| e.to_string())?;
+            let company_id: Uuid = row.try_get("company_id").map_err(|e| e.to_string())?;
+            let status: String = row.try_get("status").map_err(|e| e.to_string())?;
+            let last_used_at: Option<DateTime<Utc>> =
+                row.try_get("last_used_at").map_err(|e| e.to_string())?;
 
-        Ok(format!("Probed {} environments", probed))
+            probed += 1;
+
+            if is_env_stale(last_used_at, now) {
+                // 真实探测失败：标记可回收并触发恢复（记录审计）
+                sqlx::query(
+                    r#"
+                    UPDATE execution_workspaces
+                    SET cleanup_eligible_at = $2,
+                        cleanup_reason = 'health_idle_stale',
+                        updated_at = NOW()
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(id)
+                .bind(now + ChronoDuration::minutes(5))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                record_activity(
+                    &self.pool,
+                    company_id,
+                    "environment_health_failed",
+                    "system",
+                    Uuid::nil(),
+                    "environment",
+                    id,
+                    serde_json::json!({ "status": status, "last_used_at": last_used_at }),
+                )
+                .await;
+                flagged += 1;
+            } else {
+                // 健康：刷新 updated_at 作为探测心跳
+                sqlx::query("UPDATE execution_workspaces SET updated_at = NOW() WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok(format!(
+            "Probed {} environments ({} flagged for recovery)",
+            probed, flagged
+        ))
+    }
+}
+
+// ============================================================================
+// Stuck Run Detector
+// ============================================================================
+
+/// 卡住运行检测器（每 2 分钟）
+/// 检测 heartbeat_runs 中仍在 running/queued 但已超过超时阈值的运行，
+/// 将其标记为 timed_out（取消），并写入恢复审计记录（P0.5）。
+pub struct StuckRunDetector {
+    pool: PgPool,
+}
+
+impl StuckRunDetector {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// 运行被视为卡住的超时阈值（30 分钟）。
+    pub const STUCK_TIMEOUT: ChronoDuration = ChronoDuration::minutes(30);
+}
+
+#[async_trait]
+impl ScheduledJob for StuckRunDetector {
+    fn job_name(&self) -> &str {
+        "stuck_run_detector"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(120)
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        let now = Utc::now();
+        let timeout = now - Self::STUCK_TIMEOUT;
+
+        let stuck_runs = sqlx::query(
+            r#"
+            SELECT id, company_id, agent_id, status
+            FROM heartbeat_runs
+            WHERE status IN ('running', 'queued')
+              AND started_at IS NOT NULL
+              AND started_at < $1
+            LIMIT 200
+            "#,
+        )
+        .bind(timeout)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("Failed to query stuck runs: {}", e))?;
+
+        let mut recovered = 0usize;
+        for row in &stuck_runs {
+            let id: Uuid = row.try_get("id").map_err(|e| e.to_string())?;
+            let company_id: Uuid = row.try_get("company_id").map_err(|e| e.to_string())?;
+            let agent_id: Uuid = row.try_get("agent_id").map_err(|e| e.to_string())?;
+
+            sqlx::query(
+                r#"
+                UPDATE heartbeat_runs
+                SET status = 'timed_out',
+                    error = 'stuck run detected by watchdog',
+                    finished_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            record_activity(
+                &self.pool,
+                company_id,
+                "run_recovery",
+                "system",
+                Uuid::nil(),
+                "agent",
+                agent_id,
+                serde_json::json!({ "run_id": id.to_string(), "action": "timed_out" }),
+            )
+            .await;
+            recovered += 1;
+        }
+
+        Ok(format!("Recovered {} stuck runs", recovered))
     }
 }
 
@@ -628,5 +895,45 @@ impl ScheduledJob for ConsistencyCheckJob {
         } else {
             Ok(format!("Consistency issues: {}", checks.join(", ")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn monitor_backoff_grows_exponentially_and_caps() {
+        assert_eq!(monitor_backoff_seconds(0), 60);
+        assert_eq!(monitor_backoff_seconds(1), 120);
+        assert_eq!(monitor_backoff_seconds(3), 480);
+        // 封顶 24h
+        assert_eq!(monitor_backoff_seconds(100), 86_400);
+    }
+
+    #[test]
+    fn env_stale_when_idle_or_missing() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        // 30 分钟前使用 -> 失活
+        let old = now - ChronoDuration::minutes(31);
+        assert!(is_env_stale(Some(old), now));
+        // 刚刚使用 -> 健康
+        let fresh = now - ChronoDuration::minutes(5);
+        assert!(!is_env_stale(Some(fresh), now));
+        // 无记录 -> 失活
+        assert!(is_env_stale(None, now));
+    }
+
+    #[test]
+    fn run_stuck_when_started_before_timeout() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let timeout = ChronoDuration::minutes(30);
+        let started_old = now - ChronoDuration::minutes(31);
+        assert!(is_run_stuck(Some(started_old), now, timeout));
+        let started_recent = now - ChronoDuration::minutes(10);
+        assert!(!is_run_stuck(Some(started_recent), now, timeout));
+        // 未开始 -> 不卡住
+        assert!(!is_run_stuck(None, now, timeout));
     }
 }

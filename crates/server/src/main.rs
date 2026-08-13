@@ -230,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     job_scheduler.register(Arc::new(services::MonitorCheckJob::new(pool.clone()))).await;
     job_scheduler.register(Arc::new(services::LeaseExpiryScanner::new(pool.clone()))).await;
     job_scheduler.register(Arc::new(services::EnvironmentHealthProber::new(pool.clone()))).await;
+    job_scheduler.register(Arc::new(services::StuckRunDetector::new(pool.clone()))).await;
     job_scheduler.register(Arc::new(services::ConsistencyCheckJob::new(pool.clone()))).await;
     
     // 启动调度器（30 秒间隔，对应 paperclip 的 heartbeatSchedulerIntervalMs）
