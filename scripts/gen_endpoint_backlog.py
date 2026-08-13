@@ -118,7 +118,7 @@ def main():
             mp = re.search(r'\.route\(\s*"([^"]*)"', inner)
             if mp:
                 decl = mp.group(1)
-                full = "/api" + (decl if decl.startswith("/") else "/" + decl)
+                full = decl if decl.startswith("/api") else ("/api" + (decl if decl.startswith("/") else "/" + decl))
                 for method in re.findall(r"\b(get|post|patch|put|delete|options)\s*\(", inner):
                     pr_keys.add((method.upper(), normalize(full)))
             idx = j + 1

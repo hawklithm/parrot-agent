@@ -51,6 +51,7 @@ pub mod work_products;
 // P2: New domains
 pub mod activity;
 pub mod approvals;
+pub mod automation_misc;
 pub mod assets;
 pub mod board_chat;
 pub mod cloud_upstreams;
@@ -299,6 +300,7 @@ pub use adapters::adapter_routes;
 pub use agents::agent_routes;
 pub use attachments::attachment_routes;
 pub use auth::auth_routes;
+pub use automation_misc::automation_misc_routes;
 pub use built_in_agents::{
     built_in_agent_routes, list_built_in_agents, provision_built_in_agent, reconcile_built_in_agent,
 };

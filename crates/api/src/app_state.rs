@@ -331,6 +331,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::plugins::plugin_routes())
         .merge(crate::routes::activity::activity_routes())
         .merge(crate::routes::assets::asset_routes())
+        .merge(crate::routes::automation_misc::automation_misc_routes())
         .merge(crate::routes::board_chat::board_chat_routes())
         .merge(crate::routes::cloud_upstreams::cloud_upstream_routes())
         .merge(crate::routes::instance_settings::instance_settings_routes())

@@ -154,7 +154,7 @@ def parrot_endpoints() -> OrderedDict:
                 decl = mp.group(1)
                 methods = re.findall(r"\b(get|post|patch|put|delete|options)\s*\(", inner)
                 for method in set(methods):
-                    full = "/api" + (decl if decl.startswith("/") else "/" + decl)
+                    full = decl if decl.startswith("/api") else ("/api" + (decl if decl.startswith("/") else "/" + decl))
                     eps.setdefault((method.upper(), normalize(full)), []).append(
                         (decl, fn)
                     )
