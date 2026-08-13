@@ -178,8 +178,10 @@ pub fn decision_routes() -> Router<AppState> {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// Map a sqlx error to the correct HTTP status (404/409/400/500) instead of
+/// collapsing everything to 500. See `impl From<sqlx::Error> for AppError`.
 fn db_err(e: sqlx::Error) -> AppError {
-    AppError::InternalServerError(format!("database error: {e}"))
+    e.into()
 }
 
 fn forbid(msg: &str) -> AppError {

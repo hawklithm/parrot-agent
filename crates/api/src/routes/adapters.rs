@@ -636,7 +636,7 @@ async fn delete_adapter(
     .bind(&adapter_type_str)
     .fetch_one(&state.pool)
     .await
-    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    .map_err(AppError::from)?;
 
     if in_use > 0 {
         return Err(AppError::Conflict(format!(
