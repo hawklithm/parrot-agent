@@ -380,5 +380,15 @@ mod route_conflict_tests {
             .merge(crate::routes::activity::activity_routes())
             .merge(crate::routes::heartbeat_runs::heartbeat_run_routes());
     }
+
+    /// 回归测试：inbox-dismissals / sidebar-preferences 新域不得与 companies.rs
+    /// 预存在的同路径路由冲突（axum merge 冲突会在构建时 panic）。
+    #[test]
+    fn inbox_and_sidebar_routes_do_not_collide_with_companies() {
+        let _router = Router::<AppState>::new()
+            .merge(crate::routes::companies::company_routes())
+            .merge(crate::routes::inbox_dismissals::inbox_dismissal_routes())
+            .merge(crate::routes::sidebar_preferences::sidebar_preference_routes());
+    }
 }
 
