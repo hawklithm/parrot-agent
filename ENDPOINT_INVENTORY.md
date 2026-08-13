@@ -9,11 +9,11 @@
 - **Limitation**：状态为结构性判定；`partial` 语义、`by-design-candidate` 最终清单需人工复核。
 
 - Paperclip endpoints: **597**
-- Parrot endpoints: **641**
-- implemented: **469**
+- Parrot endpoints: **648**
+- implemented: **476**
 - partial: **6**
 - by-design-candidate: **22**
-- missing: **100**
+- missing: **93**
 - Parrot-only (extension): **172**
 
 ## 1. Implemented
@@ -24,6 +24,7 @@
 | `DELETE /api/agents/:param` | `routes/agents.ts:3478` |
 | `DELETE /api/agents/:param/instructions-bundle/file` | `routes/agents.ts:3079` |
 | `DELETE /api/agents/:param/keys/:param` | `routes/agents.ts:3542` |
+| `DELETE /api/agents/me/secret-proposals/:param` | `routes/secrets.ts:282` |
 | `DELETE /api/attachments/:param` | `routes/issues.ts:11923` |
 | `DELETE /api/board-api-keys/:param` | `routes/access.ts:2912` |
 | `DELETE /api/cases/:param/documents/:param` | `routes/cases.ts:1209` |
@@ -78,6 +79,8 @@
 | `GET /api/agents/me` | `routes/agents.ts:2265` |
 | `GET /api/agents/me/inbox-lite` | `routes/agents.ts:2299` |
 | `GET /api/agents/me/inbox/mine` | `routes/agents.ts:2348` |
+| `GET /api/agents/me/secret-proposals` | `routes/secrets.ts:267` |
+| `GET /api/agents/me/secrets` | `routes/secrets.ts:336` |
 | `GET /api/approvals/:param` | `routes/approvals.ts:216` |
 | `GET /api/approvals/:param/comments` | `routes/approvals.ts:501` |
 | `GET /api/approvals/:param/issues` | `routes/approvals.ts:279` |
@@ -162,6 +165,7 @@
 | `GET /api/companies/:param/review-cases` | `routes/pipelines.ts:934` |
 | `GET /api/companies/:param/routines` | `routes/routines.ts:149` |
 | `GET /api/companies/:param/search` | `routes/issues.ts:5229` |
+| `GET /api/companies/:param/secret-proposals` | `routes/secrets.ts:288` |
 | `GET /api/companies/:param/secret-provider-configs` | `routes/secrets.ts:395` |
 | `GET /api/companies/:param/secret-providers` | `routes/secrets.ts:380` |
 | `GET /api/companies/:param/secret-providers/health` | `routes/secrets.ts:387` |
@@ -350,6 +354,7 @@
 | `POST /api/agents/:param/runtime-state/reset-session` | `routes/agents.ts:2493` |
 | `POST /api/agents/:param/terminate` | `routes/agents.ts:3408` |
 | `POST /api/agents/:param/wakeup` | `routes/agents.ts:3650` |
+| `POST /api/agents/me/secret-proposals` | `routes/secrets.ts:243` |
 | `POST /api/approvals/:param/approve` | `routes/approvals.ts:288` |
 | `POST /api/approvals/:param/comments` | `routes/approvals.ts:509` |
 | `POST /api/approvals/:param/reject` | `routes/approvals.ts:404` |
@@ -407,6 +412,8 @@
 | `POST /api/companies/:param/projects` | `routes/projects.ts:153` |
 | `POST /api/companies/:param/review-cases/bulk` | `routes/pipelines.ts:942` |
 | `POST /api/companies/:param/routines` | `routes/routines.ts:157` |
+| `POST /api/companies/:param/secret-proposals/:param/approve` | `routes/secrets.ts:303` |
+| `POST /api/companies/:param/secret-proposals/:param/reject` | `routes/secrets.ts:319` |
 | `POST /api/companies/:param/secret-provider-configs` | `routes/secrets.ts:437` |
 | `POST /api/companies/:param/secrets` | `routes/secrets.ts:894` |
 | `POST /api/companies/:param/skills/:param/star` | `routes/company-skills.ts:783` |
@@ -533,19 +540,15 @@
 | Method+Path | Source | Note |
 |---|---|---|
 | `ALL /api/auth/{:param}` | `app.ts:321` |  |
-| `DELETE /api/agents/me/secret-proposals/:param` | `routes/secrets.ts:282` |  |
 | `DELETE /api/issues/:param/watchdog` | `routes/issues.ts:6113` |  |
 | `DELETE /api/tool-connections/:param` | `routes/tool-access.ts:783` |  |
 | `DELETE /api/tool-connections/:param/grants/:param` | `routes/tool-access.ts:601` |  |
 | `DELETE /api/tool-profile-entries/:param` | `routes/tool-access.ts:1027` |  |
 | `DELETE /api/tool-profiles/:param` | `routes/tool-access.ts:954` |  |
-| `GET /api/agents/me/secret-proposals` | `routes/secrets.ts:267` |  |
-| `GET /api/agents/me/secrets` | `routes/secrets.ts:336` |  |
 | `GET /api/companies/:param/audit/agent-actions` | `routes/activity.ts:238` |  |
 | `GET /api/companies/:param/export/fidelity` | `routes/companies.ts:410` |  |
 | `GET /api/companies/:param/recovery-observability` | `routes/dashboard.ts:34` |  |
 | `GET /api/companies/:param/search/extract` | `routes/issues.ts:5195` |  |
-| `GET /api/companies/:param/secret-proposals` | `routes/secrets.ts:288` |  |
 | `GET /api/companies/:param/smoke-lab/oauth/authorize` | `routes/smoke-lab.ts:58` |  |
 | `GET /api/companies/:param/smoke-lab/oauth/userinfo` | `routes/smoke-lab.ts:99` |  |
 | `GET /api/companies/:param/smoke-lab/runs` | `routes/smoke-lab.ts:191` |  |
@@ -588,13 +591,10 @@
 | `PATCH /api/tool-profiles/:param` | `routes/tool-access.ts:909` |  |
 | `POST /api/agents/me/connections/:param/start-authorization` | `routes/tool-access.ts:178` |  |
 | `POST /api/agents/me/connections/:param/token` | `routes/tool-access.ts:196` |  |
-| `POST /api/agents/me/secret-proposals` | `routes/secrets.ts:243` |  |
 | `POST /api/agents/me/secrets/:param/value` | `routes/secrets.ts:355` |  |
 | `POST /api/cases/:param/claim` | `routes/pipelines.ts:1927` |  |
 | `POST /api/cases/:param/release` | `routes/pipelines.ts:1936` |  |
 | `POST /api/cases/:param/transition` | `routes/pipelines.ts:1944` |  |
-| `POST /api/companies/:param/secret-proposals/:param/approve` | `routes/secrets.ts:303` |  |
-| `POST /api/companies/:param/secret-proposals/:param/reject` | `routes/secrets.ts:319` |  |
 | `POST /api/companies/:param/smoke-lab/install-fixtures` | `routes/smoke-lab.ts:164` |  |
 | `POST /api/companies/:param/smoke-lab/oauth/authorize` | `routes/smoke-lab.ts:72` |  |
 | `POST /api/companies/:param/smoke-lab/oauth/revoke` | `routes/smoke-lab.ts:107` |  |
