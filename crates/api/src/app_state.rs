@@ -280,6 +280,8 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::org_chart::org_chart_routes())
         // Phase 2: Issue/Case Management routes
         .merge(crate::routes::issues::issue_routes())
+        .merge(crate::routes::issue_tree_control::issue_tree_control_routes())
+        .merge(crate::routes::environments::environment_routes())
         .merge(crate::routes::cases::case_routes())
         .merge(crate::routes::issue_comments::issue_comment_routes())
         .merge(crate::routes::interactions::interaction_routes())

@@ -8,7 +8,7 @@ use axum::{
 };
 
 use crate::app_state::AppState;
-use crate::routes::{assert_instance_admin, log_activity};
+use crate::routes::{assert_board, assert_instance_admin, log_activity};
 use services::auth::AuthorizationActor;
 
 pub fn instance_settings_routes() -> Router<AppState> {
@@ -24,7 +24,10 @@ pub fn instance_settings_routes() -> Router<AppState> {
 /// IS1: GET /instance/settings
 async fn get_instance_settings(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // 对齐 Paperclip：读实例设置需要 board 访问。
+    assert_board(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
     let settings = state.instance_settings_service.get_settings()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -34,8 +37,11 @@ async fn get_instance_settings(
 /// IS2: PATCH /instance/settings
 async fn update_instance_settings(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // 对齐 Paperclip：写实例设置仅限实例管理员（或 local_implicit）。
+    assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
     let settings = state.instance_settings_service.update_settings(body)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -45,7 +51,9 @@ async fn update_instance_settings(
 /// IS3: GET /instance/settings/general
 async fn get_general_settings(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_board(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
     let settings = state.instance_settings_service.get_general_settings()
         .await
         .map_err(|e| {
@@ -58,8 +66,10 @@ async fn get_general_settings(
 /// IS4: PATCH /instance/settings/general
 async fn update_general_settings(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
     let settings = state.instance_settings_service.update_general_settings(body)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -69,7 +79,9 @@ async fn update_general_settings(
 /// IS5: GET /instance/settings/experimental
 async fn get_experimental_settings(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_board(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
     let settings = state.instance_settings_service.get_experimental_settings()
         .await
         .map_err(|e| {
@@ -82,8 +94,10 @@ async fn get_experimental_settings(
 /// IS6: PATCH /instance/settings/experimental
 async fn update_experimental_settings(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
     let settings = state.instance_settings_service.update_experimental_settings(body)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -93,7 +107,9 @@ async fn update_experimental_settings(
 /// IS7: POST /instance/settings/experimental/issue-graph-liveness-auto-recovery/preview
 async fn preview_auto_recovery(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
     let result = state.instance_settings_service.preview_auto_recovery()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -103,7 +119,9 @@ async fn preview_auto_recovery(
 /// IS8: POST /instance/settings/experimental/issue-graph-liveness-auto-recovery/run
 async fn run_auto_recovery(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
     let result = state.instance_settings_service.run_auto_recovery()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

@@ -303,46 +303,74 @@ async fn update_profile(
 // ============================================================================
 // P3: Admin Handlers (AU1-AU5)
 // ============================================================================
+//
+// 这些管理端点目前未实现真实语义。按对齐约束（handoff：不要用 mock、
+// 空数组或固定成功响应冒充生产能力），不再伪造成功，统一返回 501
+// feature-disabled 错误。
+
+/// 501 feature-disabled 响应。
+fn not_implemented(message: impl Into<String>) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({ "error": message.into() })),
+    )
+        .into_response()
+}
 
 /// AU1: POST /admin/users/:user_id/promote-instance-admin
 async fn promote_instance_admin(
     State(_state): State<AppState>,
     Path(user_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, AuthError> {
-    Ok(Json(serde_json::json!({"userId": user_id, "promoted": true})))
+) -> Result<Response, AuthError> {
+    Ok(not_implemented(format!(
+        "promote-instance-admin for user {} is not implemented; feature disabled",
+        user_id
+    )))
 }
 
 /// AU2: POST /admin/users/:user_id/demote-instance-admin
 async fn demote_instance_admin(
     State(_state): State<AppState>,
     Path(user_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, AuthError> {
-    Ok(Json(serde_json::json!({"userId": user_id, "demoted": true})))
+) -> Result<Response, AuthError> {
+    Ok(not_implemented(format!(
+        "demote-instance-admin for user {} is not implemented; feature disabled",
+        user_id
+    )))
 }
 
 /// AU3: GET /admin/users/:user_id/company-access
 async fn get_user_company_access(
     State(_state): State<AppState>,
-    Path(_user_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, AuthError> {
-    Ok(Json(vec![]))
+    Path(user_id): Path<Uuid>,
+) -> Result<Response, AuthError> {
+    Ok(not_implemented(format!(
+        "company-access lookup for user {} is not implemented; feature disabled",
+        user_id
+    )))
 }
 
 /// AU4: PUT /admin/users/:user_id/company-access
 async fn update_user_company_access(
     State(_state): State<AppState>,
     Path(user_id): Path<Uuid>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, AuthError> {
-    Ok(Json(serde_json::json!({"userId": user_id, "access": payload, "updated": true})))
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<Response, AuthError> {
+    Ok(not_implemented(format!(
+        "company-access update for user {} is not implemented; feature disabled",
+        user_id
+    )))
 }
 
 /// AU5: POST /join-requests/:request_id/claim-api-key
 async fn claim_join_request_api_key(
     State(_state): State<AppState>,
     Path(request_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, AuthError> {
-    Ok(Json(serde_json::json!({"requestId": request_id, "apiKey": Uuid::new_v4().to_string(), "claimed": true})))
+) -> Result<Response, AuthError> {
+    Ok(not_implemented(format!(
+        "claim-api-key for join request {} is not implemented; feature disabled",
+        request_id
+    )))
 }
 
 #[cfg(test)]
