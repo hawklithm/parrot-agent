@@ -65,7 +65,10 @@ pub fn company_routes() -> Router<AppState> {
             get(get_sidebar_badges),
         )
         .route(
-            "/companies/:company_id/sidebar-preferences/me",
+            // 原 CM9/CM10 占用了 Paperclip 契约路径 /sidebar-preferences/me；
+            // 该路径已由 sidebar_preferences.rs（Paperclip 语义）接管，本旧语义
+            // handler（user_preferences 表）迁移到非冲突路径保留。
+            "/companies/:company_id/preferences",
             get(get_sidebar_preferences).put(update_sidebar_preferences),
         )
         .route(
@@ -96,7 +99,10 @@ pub fn company_routes() -> Router<AppState> {
             post(apply_company_import),
         )
         .route(
-            "/companies/:company_id/inbox-dismissals",
+            // 原 CM19/CM20 占用了 Paperclip 契约路径 /inbox-dismissals；
+            // 该路径已由 inbox_dismissals.rs（Paperclip dismiss/snooze 语义）
+            // 接管，本 issue-inbox-archive 旧语义迁移到非冲突路径保留。
+            "/companies/:company_id/issues/inbox-archive",
             get(list_inbox_dismissals).post(dismiss_inbox_item),
         )
         .route(
