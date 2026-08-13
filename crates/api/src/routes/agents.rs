@@ -34,7 +34,7 @@ struct AgentReferenceQuery {
 /// 创建Agent路由
 pub fn agent_routes() -> Router<AppState> {
     Router::new()
-        .route("/companies/:company_id/agents", get(list_agents))
+        .route("/companies/:company_id/agents", get(list_agents).post(create_agent))
         .route("/companies/:company_id/agent-hires", post(create_agent))
         .route("/agents/:id", get(get_agent))
         .route("/agents/:id", patch(update_agent))

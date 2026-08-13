@@ -59,6 +59,66 @@ async fn get_issue_watchdog(
     })))
 }
 
+/// PUT /issues/:id/watchdog —— 创建/更新 issue watchdog。
+#[derive(Debug, Deserialize)]
+struct UpsertWatchdogRequest {
+    #[serde(rename = "watchdogAgentId")]
+    watchdog_agent_id: Uuid,
+    instructions: Option<String>,
+}
+async fn upsert_issue_watchdog(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(issue_id): Path<Uuid>,
+    Json(request): Json<UpsertWatchdogRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    let company_id = sqlx::query_scalar::<_, Option<Uuid>>("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to load issue: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let row = sqlx::query(
+        "INSERT INTO issue_watchdogs (company_id, issue_id, watchdog_agent_id, instructions, status) \
+         VALUES ($1, $2, $3, $4, 'active') \
+         ON CONFLICT (issue_id) DO UPDATE SET watchdog_agent_id = EXCLUDED.watchdog_agent_id, \
+         instructions = EXCLUDED.instructions, status = 'active' RETURNING *",
+    )
+    .bind(company_id)
+    .bind(issue_id)
+    .bind(request.watchdog_agent_id)
+    .bind(request.instructions.as_deref())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to upsert issue watchdog: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "issue.watchdog_created",
+        &actor,
+        "issue_watchdog",
+        row.get::<Uuid, _>("id"),
+        json!({}),
+    )
+    .await;
+    Ok(Json(json!({
+        "id": row.get::<Uuid, _>("id"),
+        "issueId": issue_id,
+        "watchdogAgentId": request.watchdog_agent_id,
+        "instructions": request.instructions,
+        "status": "active",
+    })))
+}
+
 /// DELETE /issues/:id/watchdog
 async fn delete_issue_watchdog(
     State(state): State<AppState>,
@@ -681,7 +741,7 @@ async fn plugin_ui_static(
 
 pub fn automation_misc_routes() -> Router<AppState> {
     Router::new()
-        .route("/issues/:id/watchdog", get(get_issue_watchdog).delete(delete_issue_watchdog))
+        .route("/issues/:id/watchdog", get(get_issue_watchdog).put(upsert_issue_watchdog).delete(delete_issue_watchdog))
         .route("/issues/:issue_id/comments/:comment_id", delete(delete_issue_comment))
         .route("/cases/:id/claim", post(claim_case))
         .route("/cases/:id/release", post(release_case))

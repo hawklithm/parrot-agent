@@ -862,6 +862,15 @@ pub fn tool_access_routes() -> Router<AppState> {
             post(agent_connection_token),
         )
         .route("/agents/me/secrets/:key/value", post(agent_secret_value))
+        // ---- round 3 ----
+        .route("/tool-connections/:id/health-check", post(connection_health_check))
+        .route("/tool-connections/:id/test-calls", post(create_connection_test_call))
+        .route("/tool-profiles/:id/duplicate", post(duplicate_tool_profile))
+        .route("/tool-profiles/:id/entries", post(create_tool_profile_entry))
+        .route("/tool-profiles/:id/new-tools/review", post(review_profile_new_tools))
+        .route("/tools/oauth/:provider/start", post(tools_oauth_start))
+        .route("/tool-gateway/runtime-slots/:slot_id/stop", post(gateway_slot_stop))
+        .route("/tool-gateway/runtime-slots/:slot_id/restart", post(gateway_slot_restart))
 }
 
 // ================= Round 2 =================
@@ -1300,4 +1309,132 @@ async fn agent_secret_value(
         return Err(StatusCode::FORBIDDEN);
     };
     Ok(Json(json!({ "key": key, "value": material })))
+}
+
+// ================= Round 3 =================
+
+/// POST /api/tool-connections/:id/health-check —— mock 健康检查。
+async fn connection_health_check(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(connection_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "connectionId": connection_id, "healthy": true, "latencyMs": 12 })))
+}
+
+/// POST /api/tool-connections/:id/test-calls —— mock。
+#[derive(Debug, Deserialize)]
+struct CreateTestCallRequest {
+    tool: Option<String>,
+}
+async fn create_connection_test_call(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(connection_id): Path<Uuid>,
+    Json(request): Json<CreateTestCallRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "id": Uuid::new_v4(), "connectionId": connection_id, "tool": request.tool, "status": "passed" })),
+    ))
+}
+
+/// POST /api/tool-profiles/:id/duplicate —— mock。
+async fn duplicate_tool_profile(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(profile_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "id": Uuid::new_v4(), "duplicatedFrom": profile_id })))
+}
+
+/// POST /api/tool-profiles/:id/entries —— 添加 profile entry。
+#[derive(Debug, Deserialize)]
+struct CreateProfileEntryRequest {
+    tool: String,
+    enabled: Option<bool>,
+}
+async fn create_tool_profile_entry(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(profile_id): Path<Uuid>,
+    Json(request): Json<CreateProfileEntryRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tool_profile_entries (id, profile_id, tool_name, enabled, position) \
+         VALUES ($1, $2, $3, COALESCE($4, true), 0)",
+    )
+    .bind(id)
+    .bind(profile_id)
+    .bind(&request.tool)
+    .bind(request.enabled)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create tool profile entry: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "id": id, "tool": request.tool, "enabled": request.enabled })),
+    ))
+}
+
+/// POST /api/tool-profiles/:id/new-tools/review —— mock。
+async fn review_profile_new_tools(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(profile_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "profileId": profile_id, "newTools": [], "reviewed": true })))
+}
+
+/// POST /api/tools/oauth/:provider/start —— mock。
+async fn tools_oauth_start(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(provider): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "provider": provider, "authorizationUrl": format!("/api/tools/oauth/{}", provider) })))
+}
+
+/// POST /api/tool-gateway/runtime-slots/:slot_id/stop|restart —— mock。
+async fn gateway_slot_stop(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(_slot_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "stopped": true })))
+}
+async fn gateway_slot_restart(
+    State(_state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(_slot_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(Json(json!({ "restarted": true })))
 }
