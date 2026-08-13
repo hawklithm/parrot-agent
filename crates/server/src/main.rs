@@ -425,6 +425,9 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         Arc::new(services::DefaultSkillPolicyService::new(Arc::new(
             repositories::PgCompanySkillPolicyRepository::new(pool.clone()),
         )));
+    // P1.4: Teams Catalog（文件系统 catalog + 事务性安装）
+    let teams_catalog_service: Arc<dyn services::TeamsCatalogService> =
+        Arc::new(services::DefaultTeamsCatalogService::new(pool.clone()));
     let sse_service: Arc<dyn SseService> = InMemorySseService::new();
     let invite_service: Arc<dyn InviteService> =
         Arc::new(InviteServiceImpl::with_pool(pool.clone()));
@@ -590,6 +593,7 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         pipeline_service,
         skill_registry_service,
         skill_policy_service,
+        teams_catalog_service,
         sse_service,
         invite_service,
         openclaw_service,

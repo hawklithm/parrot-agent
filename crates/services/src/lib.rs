@@ -103,6 +103,11 @@ pub use skill_policy_service::{
     DefaultSkillPolicyService, DenialType, PolicyDecision, SkillPolicyError, SkillPolicyService,
     SkillPolicyResult,
 };
+pub mod teams_catalog_service;
+pub use teams_catalog_service::{
+    CatalogTeam, CatalogTeamAgent, DefaultTeamsCatalogService, InstallActor, TeamsCatalogError,
+    TeamsCatalogResult, TeamsCatalogService,
+};
 
 pub use agent_service::{
     AgentService, CreateAgentInput, DefaultAgentService, NormalizedAgentRow, ServiceError,
