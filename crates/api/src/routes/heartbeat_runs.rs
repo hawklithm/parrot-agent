@@ -19,7 +19,7 @@
 //!   GET    /issues/:id/runs                             (X14)
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -31,6 +31,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use services::auth::AuthorizationActor;
 
 pub fn heartbeat_run_routes() -> Router<AppState> {
     Router::new()
@@ -501,34 +502,69 @@ async fn list_run_issues(
     Ok(Json(Value::Array(issues)))
 }
 
+/// Serialize a `heartbeat_run_watchdog_decisions` row to the Paperclip-shaped JSON.
+fn watchdog_decision_to_json(r: &sqlx::postgres::PgRow) -> Value {
+    json!({
+        "id": r.get::<Uuid, _>("id"),
+        "runId": r.get::<Uuid, _>("run_id"),
+        "decision": r.get::<String, _>("decision"),
+        "evaluationIssueId": r.get::<Option<Uuid>, _>("evaluation_issue_id"),
+        "reason": r.get::<Option<String>, _>("reason"),
+        "snoozedUntil": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("snoozed_until"),
+        "createdByType": r.get::<Option<String>, _>("created_by_type"),
+        "createdById": r.get::<Option<Uuid>, _>("created_by_id"),
+        "createdByRunId": r.get::<Option<Uuid>, _>("created_by_run_id"),
+        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+    })
+}
+
 /// X8: GET /heartbeat-runs/:run_id/watchdog-decisions
 async fn list_watchdog_decisions(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
-    // No dedicated watchdog-decisions table yet.
-    Ok(Json(json!({
-        "runId": run_id,
-        "decisions": [],
-    })))
+    let pool = &state.pool;
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM heartbeat_runs WHERE id = $1")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?
+        .ok_or(HeartbeatRunError::NotFound(run_id))?;
+    // Paperclip's getAccessibleResource returns 404 for inaccessible runs.
+    crate::routes::assert_company_access(&actor, company_id, true)
+        .map_err(|_| HeartbeatRunError::NotFound(run_id))?;
+
+    let rows = sqlx::query(
+        "SELECT id, run_id, decision, evaluation_issue_id, reason, snoozed_until, \
+         created_by_type, created_by_id, created_by_run_id, created_at \
+         FROM heartbeat_run_watchdog_decisions WHERE run_id = $1 ORDER BY created_at ASC",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+
+    let decisions: Vec<Value> = rows.iter().map(watchdog_decision_to_json).collect();
+    Ok(Json(json!({ "runId": run_id, "decisions": decisions })))
 }
 
 /// X9: POST /heartbeat-runs/:run_id/watchdog-decisions
 async fn submit_watchdog_decision(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(run_id): Path<Uuid>,
     Json(body): Json<WatchdogDecisionInput>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let pool = &state.pool;
-    // Verify the run exists.
-    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM heartbeat_runs WHERE id = $1")
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM heartbeat_runs WHERE id = $1")
         .bind(run_id)
         .fetch_optional(pool)
         .await
-        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
-    if exists.is_none() {
-        return Err(HeartbeatRunError::NotFound(run_id));
-    }
+        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?
+        .ok_or(HeartbeatRunError::NotFound(run_id))?;
+    crate::routes::assert_company_access(&actor, company_id, false)
+        .map_err(|_| HeartbeatRunError::NotFound(run_id))?;
 
     if !matches!(
         body.decision.as_str(),
@@ -539,16 +575,60 @@ async fn submit_watchdog_decision(
         ));
     }
 
-    let reason = body.reason.as_deref().map(|s| s.chars().take(4000).collect::<String>());
+    // snooze requires a future ISO datetime.
+    let snoozed_until: Option<chrono::DateTime<chrono::Utc>> = if body.decision == "snooze" {
+        let raw = body.snoozed_until.as_deref().ok_or_else(|| {
+            HeartbeatRunError::BadRequest("snoozedUntil is required for snooze".to_string())
+        })?;
+        let dt = chrono::DateTime::parse_from_rfc3339(raw).map_err(|_| {
+            HeartbeatRunError::BadRequest("snoozedUntil must be a valid ISO datetime".to_string())
+        })?;
+        if dt <= chrono::Utc::now() {
+            return Err(HeartbeatRunError::BadRequest(
+                "snoozedUntil must be a future ISO datetime".to_string(),
+            ));
+        }
+        Some(dt.with_timezone(&chrono::Utc))
+    } else {
+        None
+    };
 
-    Ok(Json(json!({
-        "runId": run_id,
-        "decision": body.decision,
-        "evaluationIssueId": body.evaluation_issue_id,
-        "reason": reason,
-        "snoozedUntil": body.snoozed_until,
-        "createdAt": chrono::Utc::now(),
-    })))
+    let reason = body
+        .reason
+        .as_deref()
+        .map(|s| s.chars().take(4000).collect::<String>());
+
+    let decision_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO heartbeat_run_watchdog_decisions \
+         (run_id, company_id, decision, evaluation_issue_id, reason, snoozed_until, \
+          created_by_type, created_by_id, created_by_run_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         RETURNING id",
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .bind(&body.decision)
+    .bind(body.evaluation_issue_id)
+    .bind(&reason)
+    .bind(snoozed_until)
+    .bind(actor.actor_type())
+    .bind(actor.principal_id())
+    .bind(None::<Uuid>)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+
+    let row = sqlx::query(
+        "SELECT id, run_id, decision, evaluation_issue_id, reason, snoozed_until, \
+         created_by_type, created_by_id, created_by_run_id, created_at \
+         FROM heartbeat_run_watchdog_decisions WHERE id = $1",
+    )
+    .bind(decision_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+
+    Ok(Json(watchdog_decision_to_json(&row)))
 }
 
 /// X10: GET /heartbeat-runs/:run_id/workspace-operations
