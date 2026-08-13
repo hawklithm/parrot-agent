@@ -9,11 +9,11 @@
 - **Limitation**：状态为结构性判定；`partial` 语义、`by-design-candidate` 最终清单需人工复核。
 
 - Paperclip endpoints: **597**
-- Parrot endpoints: **703**
-- implemented: **534**
-- partial: **8**
-- by-design-candidate: **6**
-- missing: **49**
+- Parrot endpoints: **765**
+- implemented: **596**
+- partial: **0**
+- by-design-candidate: **0**
+- missing: **1**
 - Parrot-only (extension): **169**
 
 ## 1. Implemented
@@ -48,9 +48,11 @@
 | `DELETE /api/goals/:param` | `routes/goals.ts:76` |
 | `DELETE /api/issues/:param` | `routes/issues.ts:9907` |
 | `DELETE /api/issues/:param/approvals/:param` | `routes/issues.ts:7580` |
+| `DELETE /api/issues/:param/comments/:param` | `routes/issues.ts:10741` |
 | `DELETE /api/issues/:param/documents/:param` | `routes/issues.ts:7014` |
 | `DELETE /api/issues/:param/inbox-archive` | `routes/issues.ts:7513` |
 | `DELETE /api/issues/:param/read` | `routes/issues.ts:7406` |
+| `DELETE /api/issues/:param/watchdog` | `routes/issues.ts:6113` |
 | `DELETE /api/labels/:param` | `routes/issues.ts:5673` |
 | `DELETE /api/pipelines/:param/stages/:param` | `routes/pipelines.ts:1240` |
 | `DELETE /api/plugins/:param` | `routes/plugins.ts:1969` |
@@ -63,8 +65,10 @@
 | `DELETE /api/tool-applications/:param` | `routes/tool-access.ts:511` |
 | `DELETE /api/tool-connections/:param` | `routes/tool-access.ts:783` |
 | `DELETE /api/tool-connections/:param/grants/:param` | `routes/tool-access.ts:601` |
+| `DELETE /api/tool-profile-entries/:param` | `routes/tool-access.ts:1027` |
 | `DELETE /api/tool-profiles/:param` | `routes/tool-access.ts:954` |
 | `DELETE /api/work-products/:param` | `routes/issues.ts:7339` |
+| `GET /api/_plugins/:param/ui/:param` | `routes/plugin-ui-static.ts:230` |
 | `GET /api/adapters` | `routes/adapters.ts:222` |
 | `GET /api/adapters/:param` | `routes/adapters.ts:375` |
 | `GET /api/adapters/:param/config-schema` | `routes/adapters.ts:663` |
@@ -96,6 +100,7 @@
 | `GET /api/board-api-keys` | `routes/access.ts:2859` |
 | `GET /api/board-claim/:param` | `routes/access.ts:2655` |
 | `GET /api/cases/:param` | `routes/cases.ts:1450` |
+| `GET /api/cases/:param/automation/retry-plan` | `routes/pipelines.ts:2217` |
 | `GET /api/cases/:param/children` | `routes/pipelines.ts:1894` |
 | `GET /api/cases/:param/children/tree` | `routes/pipelines.ts:2171` |
 | `GET /api/cases/:param/context-pack` | `routes/pipelines.ts:2183` |
@@ -109,6 +114,7 @@
 | `GET /api/cases/:param/rollup` | `routes/pipelines.ts:2177` |
 | `GET /api/cli-auth/challenges/:param` | `routes/access.ts:2751` |
 | `GET /api/cli-auth/me` | `routes/access.ts:2843` |
+| `GET /api/cloud/stacks` | `routes/cloud.ts:30` |
 | `GET /api/companies` | `routes/companies.ts:264` |
 | `GET /api/companies/:param` | `routes/companies.ts:359` |
 | `GET /api/companies/:param/activity` | `routes/activity.ts:222` |
@@ -120,6 +126,8 @@
 | `GET /api/companies/:param/approvals` | `routes/approvals.ts:207` |
 | `GET /api/companies/:param/artifacts` | `routes/companies.ts:296` |
 | `GET /api/companies/:param/attention` | `routes/attention.ts:18` |
+| `GET /api/companies/:param/audit/agent-actions` | `routes/activity.ts:238` |
+| `GET /api/companies/:param/audit/agent-actions.csv` | `routes/activity.ts:274` |
 | `GET /api/companies/:param/budgets/overview` | `routes/costs.ts:288` |
 | `GET /api/companies/:param/built-in-agents` | `routes/built-in-agents.ts:148` |
 | `GET /api/companies/:param/built-in-agents/:param/status` | `routes/built-in-agents.ts:156` |
@@ -149,6 +157,7 @@
 | `GET /api/companies/:param/environments` | `routes/environments.ts:592` |
 | `GET /api/companies/:param/environments/capabilities` | `routes/environments.ts:611` |
 | `GET /api/companies/:param/execution-workspaces` | `routes/execution-workspaces.ts:75` |
+| `GET /api/companies/:param/export/fidelity` | `routes/companies.ts:410` |
 | `GET /api/companies/:param/feedback-traces` | `routes/companies.ts:374` |
 | `GET /api/companies/:param/folders` | `routes/folders.ts:26` |
 | `GET /api/companies/:param/goals` | `routes/goals.ts:14` |
@@ -168,10 +177,12 @@
 | `GET /api/companies/:param/pipelines` | `routes/pipelines.ts:821` |
 | `GET /api/companies/:param/pipelines-attention` | `routes/pipelines.ts:870` |
 | `GET /api/companies/:param/projects` | `routes/projects.ts:129` |
+| `GET /api/companies/:param/recovery-observability` | `routes/dashboard.ts:34` |
 | `GET /api/companies/:param/resource-memberships/me` | `routes/resource-memberships.ts:60` |
 | `GET /api/companies/:param/review-cases` | `routes/pipelines.ts:934` |
 | `GET /api/companies/:param/routines` | `routes/routines.ts:149` |
 | `GET /api/companies/:param/search` | `routes/issues.ts:5229` |
+| `GET /api/companies/:param/search/extract` | `routes/issues.ts:5195` |
 | `GET /api/companies/:param/secret-proposals` | `routes/secrets.ts:288` |
 | `GET /api/companies/:param/secret-provider-configs` | `routes/secrets.ts:395` |
 | `GET /api/companies/:param/secret-providers` | `routes/secrets.ts:380` |
@@ -221,8 +232,11 @@
 | `GET /api/companies/:param/user-directory` | `routes/access.ts:4447` |
 | `GET /api/companies/:param/user-secret-definitions` | `routes/secrets.ts:609` |
 | `GET /api/companies/:param/user-secret-definitions/:param/coverage` | `routes/secrets.ts:727` |
+| `GET /api/companies/:param/users/:param/inbox-agent-policy` | `routes/inbox-agent-policy.ts:84` |
 | `GET /api/companies/:param/users/:param/profile` | `routes/user-profiles.ts:304` |
+| `GET /api/companies/:param/users/me/inbox-agent-policy` | `routes/inbox-agent-policy.ts:68` |
 | `GET /api/companies/:param/workspace-overview` | `routes/execution-workspaces.ts:92` |
+| `GET /api/companies/import/jobs/:param` | `routes/companies.ts:425` |
 | `GET /api/companies/issues` | `routes/companies.ts:290` |
 | `GET /api/companies/stats` | `routes/companies.ts:275` |
 | `GET /api/decision-training/:param` | `routes/decision-training.ts:163` |
@@ -232,12 +246,15 @@
 | `GET /api/environments/:param` | `routes/environments.ts:925` |
 | `GET /api/environments/:param/custom-image-template` | `routes/environments.ts:647` |
 | `GET /api/environments/:param/delete-blast-radius` | `routes/environments.ts:601` |
+| `GET /api/environments/:param/leases` | `routes/environments.ts:951` |
+| `GET /api/environments/:param/secret-refs` | `routes/environments.ts:935` |
 | `GET /api/execution-workspaces/:param` | `routes/execution-workspaces.ts:110` |
 | `GET /api/execution-workspaces/:param/close-readiness` | `routes/execution-workspaces.ts:118` |
 | `GET /api/execution-workspaces/:param/workspace-operations` | `routes/execution-workspaces.ts:131` |
 | `GET /api/feedback-traces/:param` | `routes/issues.ts:10932` |
 | `GET /api/feedback-traces/:param/bundle` | `routes/issues.ts:10947` |
 | `GET /api/goals/:param` | `routes/goals.ts:21` |
+| `GET /api/health` | `routes/health.ts:129` |
 | `GET /api/heartbeat-runs/:param` | `routes/agents.ts:3868` |
 | `GET /api/heartbeat-runs/:param/events` | `routes/agents.ts:3946` |
 | `GET /api/heartbeat-runs/:param/issues` | `routes/activity.ts:359` |
@@ -288,6 +305,7 @@
 | `GET /api/issues/:param/tree-control/state` | `routes/issue-tree-control.ts:301` |
 | `GET /api/issues/:param/tree-holds` | `routes/issue-tree-control.ts:310` |
 | `GET /api/issues/:param/tree-holds/:param` | `routes/issue-tree-control.ts:328` |
+| `GET /api/issues/:param/watchdog` | `routes/issues.ts:6064` |
 | `GET /api/issues/:param/work-products` | `routes/issues.ts:6351` |
 | `GET /api/llms/agent-configuration.txt` | `routes/llms.ts:33` |
 | `GET /api/llms/agent-configuration/:param.txt` | `routes/llms.ts:84` |
@@ -330,6 +348,7 @@
 | `GET /api/skills/available` | `routes/access.ts:3247` |
 | `GET /api/skills/catalog` | `routes/company-skills.ts:285` |
 | `GET /api/skills/catalog/:param` | `routes/company-skills.ts:302` |
+| `GET /api/skills/catalog/:param/files` | `routes/company-skills.ts:295` |
 | `GET /api/skills/index` | `routes/access.ts:3252` |
 | `GET /api/status-cards/:param` | `routes/status-cards.ts:170` |
 | `GET /api/status-cards/:param/dry-run` | `routes/status-cards.ts:251` |
@@ -343,12 +362,15 @@
 | `GET /api/tool-connections/:param/catalog` | `routes/tool-access.ts:849` |
 | `GET /api/tool-connections/:param/grants` | `routes/tool-access.ts:567` |
 | `GET /api/tool-connections/:param/installs` | `routes/tool-access.ts:628` |
+| `GET /api/tool-connections/:param/test-agents` | `routes/tool-access.ts:659` |
+| `GET /api/tool-connections/:param/test-calls/:param` | `routes/tool-access.ts:720` |
 | `GET /api/tool-connections/:param/usage` | `routes/tool-access.ts:618` |
 | `GET /api/tool-gateway/audit` | `routes/tool-gateway.ts:636` |
 | `GET /api/tool-gateway/gateways/:param/mcp` | `routes/tool-gateway.ts:375` |
 | `GET /api/tool-gateway/runtime-slots` | `routes/tool-gateway.ts:567` |
 | `GET /api/tool-gateway/tools` | `routes/tool-gateway.ts:469` |
 | `GET /api/tool-profiles/:param/new-tools` | `routes/tool-access.ts:874` |
+| `GET /api/tools/oauth/callback` | `routes/tool-access.ts:320` |
 | `GET /api/workspace-operations/:param/log` | `routes/agents.ts:3991` |
 | `PATCH /api/adapters/:param` | `routes/adapters.ts:398` |
 | `PATCH /api/adapters/:param/override` | `routes/adapters.ts:433` |
@@ -365,11 +387,13 @@
 | `PATCH /api/companies/:param/decision-queues/:param` | `routes/decision-queues.ts:95` |
 | `PATCH /api/companies/:param/folders/:param` | `routes/folders.ts:79` |
 | `PATCH /api/companies/:param/smoke-lab/runs/:param` | `routes/smoke-lab.ts:226` |
+| `PATCH /api/companies/:param/tools/policies/:param` | `routes/tool-access.ts:1206` |
 | `PATCH /api/decision-training/:param` | `routes/decision-training.ts:187` |
 | `PATCH /api/environments/:param` | `routes/environments.ts:974` |
 | `PATCH /api/execution-workspaces/:param` | `routes/execution-workspaces.ts:582` |
 | `PATCH /api/goals/:param` | `routes/goals.ts:51` |
 | `PATCH /api/issues/:param` | `routes/issues.ts:8420` |
+| `PATCH /api/pipelines/:param` | `routes/pipelines.ts:1171` |
 | `PATCH /api/pipelines/:param/stages/:param` | `routes/pipelines.ts:1211` |
 | `PATCH /api/pipelines/:param/stages/:param/automation-env` | `routes/pipelines.ts:1224` |
 | `PATCH /api/projects/:param` | `routes/projects.ts:221` |
@@ -381,6 +405,7 @@
 | `PATCH /api/tool-applications/:param` | `routes/tool-access.ts:491` |
 | `PATCH /api/tool-connections/:param` | `routes/tool-access.ts:740` |
 | `PATCH /api/tool-gateway/gateways/:param` | `routes/tool-gateway.ts:313` |
+| `PATCH /api/tool-profile-entries/:param` | `routes/tool-access.ts:1011` |
 | `PATCH /api/tool-profiles/:param` | `routes/tool-access.ts:909` |
 | `PATCH /api/work-products/:param` | `routes/issues.ts:7282` |
 | `POST /api/adapters/:param/reinstall` | `routes/adapters.ts:589` |
@@ -397,11 +422,15 @@
 | `POST /api/agents/:param/runtime-state/reset-session` | `routes/agents.ts:2493` |
 | `POST /api/agents/:param/terminate` | `routes/agents.ts:3408` |
 | `POST /api/agents/:param/wakeup` | `routes/agents.ts:3650` |
+| `POST /api/agents/me/connections/:param/start-authorization` | `routes/tool-access.ts:178` |
+| `POST /api/agents/me/connections/:param/token` | `routes/tool-access.ts:196` |
 | `POST /api/agents/me/secret-proposals` | `routes/secrets.ts:243` |
+| `POST /api/agents/me/secrets/:param/value` | `routes/secrets.ts:355` |
 | `POST /api/approvals/:param/approve` | `routes/approvals.ts:288` |
 | `POST /api/approvals/:param/comments` | `routes/approvals.ts:509` |
 | `POST /api/approvals/:param/reject` | `routes/approvals.ts:404` |
 | `POST /api/approvals/:param/resubmit` | `routes/approvals.ts:466` |
+| `POST /api/board-claim/:param/claim` | `routes/access.ts:2666` |
 | `POST /api/board/chat/stream` | `routes/board-chat.ts:97` |
 | `POST /api/bootstrap/claim` | `routes/access.ts:2703` |
 | `POST /api/cases/:param/acknowledge-drift` | `routes/pipelines.ts:1984` |
@@ -410,19 +439,23 @@
 | `POST /api/cases/:param/automation/retry` | `routes/pipelines.ts:2233` |
 | `POST /api/cases/:param/automations/:param/retry` | `routes/pipelines.ts:2257` |
 | `POST /api/cases/:param/breakdown` | `routes/pipelines.ts:1487` |
+| `POST /api/cases/:param/claim` | `routes/pipelines.ts:1927` |
 | `POST /api/cases/:param/documents/:param/lock` | `routes/cases.ts:1075` |
 | `POST /api/cases/:param/documents/:param/revisions/:param/restore` | `routes/cases.ts:1120` |
 | `POST /api/cases/:param/documents/:param/unlock` | `routes/cases.ts:1098` |
 | `POST /api/cases/:param/issue-links` | `routes/pipelines.ts:2092` |
 | `POST /api/cases/:param/links` | `routes/cases.ts:1230` |
 | `POST /api/cases/:param/open-conversation` | `routes/pipelines.ts:2010` |
+| `POST /api/cases/:param/release` | `routes/pipelines.ts:1936` |
 | `POST /api/cases/:param/resolve-suggestion` | `routes/pipelines.ts:1968` |
 | `POST /api/cases/:param/review` | `routes/pipelines.ts:1996` |
 | `POST /api/cases/:param/suggest-transition` | `routes/pipelines.ts:1961` |
+| `POST /api/cases/:param/transition` | `routes/pipelines.ts:1944` |
 | `POST /api/cli-auth/revoke-current` | `routes/access.ts:2948` |
 | `POST /api/companies` | `routes/companies.ts:584` |
 | `POST /api/companies/:param/activity` | `routes/activity.ts:329` |
 | `POST /api/companies/:param/agent-hires` | `routes/agents.ts:2519` |
+| `POST /api/companies/:param/agents` | `routes/agents.ts:2702` |
 | `POST /api/companies/:param/approvals` | `routes/approvals.ts:224` |
 | `POST /api/companies/:param/archive` | `routes/companies.ts:735` |
 | `POST /api/companies/:param/assets/images` | `routes/assets.ts:110` |
@@ -472,8 +505,23 @@
 | `POST /api/companies/:param/smoke-lab/services/stop` | `routes/smoke-lab.ts:143` |
 | `POST /api/companies/:param/status-cards` | `routes/status-cards.ts:150` |
 | `POST /api/companies/:param/tools/applications` | `routes/tool-access.ts:471` |
+| `POST /api/companies/:param/tools/apps/:param/finish` | `routes/tool-access.ts:364` |
+| `POST /api/companies/:param/tools/apps/connect` | `routes/tool-access.ts:255` |
+| `POST /api/companies/:param/tools/connections` | `routes/tool-access.ts:534` |
+| `POST /api/companies/:param/tools/examples/:param/install` | `routes/tool-access.ts:413` |
+| `POST /api/companies/:param/tools/examples/:param/smoke` | `routes/tool-access.ts:435` |
 | `POST /api/companies/:param/tools/gateways` | `routes/tool-gateway.ts:293` |
+| `POST /api/companies/:param/tools/mcp/import-json` | `routes/tool-access.ts:1347` |
 | `POST /api/companies/:param/tools/policies` | `routes/tool-access.ts:1156` |
+| `POST /api/companies/:param/tools/policies/:param/duplicate` | `routes/tool-access.ts:1176` |
+| `POST /api/companies/:param/tools/policies/reorder` | `routes/tool-access.ts:1137` |
+| `POST /api/companies/:param/tools/policy/test` | `routes/tool-access.ts:1364` |
+| `POST /api/companies/:param/tools/profiles` | `routes/tool-access.ts:882` |
+| `POST /api/companies/:param/tools/runtime-slots/:param/restart` | `routes/tool-access.ts:1101` |
+| `POST /api/companies/:param/tools/runtime-slots/:param/stop` | `routes/tool-access.ts:1095` |
+| `POST /api/companies/:param/tools/stdio-templates` | `routes/tool-access.ts:1305` |
+| `POST /api/companies/:param/tools/trust-rules/:param/revoke` | `routes/tool-access.ts:1278` |
+| `POST /api/companies/import/preview` | `routes/companies.ts:417` |
 | `POST /api/decisions/:param/cancel` | `routes/decisions.ts:193` |
 | `POST /api/decisions/:param/decide` | `routes/decisions.ts:181` |
 | `POST /api/decisions/:param/dismiss` | `routes/decisions.ts:187` |
@@ -482,6 +530,7 @@
 | `POST /api/execution-workspaces/:param/reconcile-branch` | `routes/execution-workspaces.ts:493` |
 | `POST /api/execution-workspaces/:param/runtime-commands/:param` | `routes/execution-workspaces.ts:491` |
 | `POST /api/execution-workspaces/:param/runtime-services/:param` | `routes/execution-workspaces.ts:490` |
+| `POST /api/health/dev-server/restart` | `routes/health.ts:95` |
 | `POST /api/heartbeat-runs/:param/cancel` | `routes/agents.ts:3884` |
 | `POST /api/heartbeat-runs/:param/watchdog-decisions` | `routes/agents.ts:3914` |
 | `POST /api/instance/database-backups` | `routes/instance-database-backups.ts:25` |
@@ -527,6 +576,8 @@
 | `POST /api/plugins/install` | `routes/plugins.ts:1126` |
 | `POST /api/plugins/tools/execute` | `routes/plugins.ts:997` |
 | `POST /api/projects/:param/workspaces` | `routes/projects.ts:285` |
+| `POST /api/projects/:param/workspaces/:param/runtime-commands/:param` | `routes/projects.ts:635` |
+| `POST /api/projects/:param/workspaces/:param/runtime-services/:param` | `routes/projects.ts:634` |
 | `POST /api/routine-triggers/public/:param/fire` | `routes/routines.ts:656` |
 | `POST /api/routines/:param/revisions/:param/restore` | `routes/routines.ts:421` |
 | `POST /api/routines/:param/run` | `routes/routines.ts:629` |
@@ -536,18 +587,29 @@
 | `POST /api/secrets/:param/rotate` | `routes/secrets.ts:999` |
 | `POST /api/status-cards/:param/recompile` | `routes/status-cards.ts:223` |
 | `POST /api/status-cards/:param/refresh` | `routes/status-cards.ts:236` |
+| `POST /api/tool-connections/:param/catalog/refresh` | `routes/tool-access.ts:843` |
+| `POST /api/tool-connections/:param/grants/installations` | `routes/tool-access.ts:575` |
+| `POST /api/tool-connections/:param/health-check` | `routes/tool-access.ts:812` |
+| `POST /api/tool-connections/:param/test-calls` | `routes/tool-access.ts:696` |
 | `POST /api/tool-gateway/action-requests/:param/approve` | `routes/tool-gateway.ts:517` |
 | `POST /api/tool-gateway/action-requests/:param/decline` | `routes/tool-gateway.ts:542` |
 | `POST /api/tool-gateway/gateway-tokens/:param/revoke` | `routes/tool-gateway.ts:360` |
 | `POST /api/tool-gateway/gateways/:param/mcp` | `routes/tool-gateway.ts:383` |
 | `POST /api/tool-gateway/gateways/:param/tokens` | `routes/tool-gateway.ts:334` |
+| `POST /api/tool-gateway/runtime-slots/:param/restart` | `routes/tool-gateway.ts:609` |
+| `POST /api/tool-gateway/runtime-slots/:param/stop` | `routes/tool-gateway.ts:582` |
 | `POST /api/tool-gateway/sessions` | `routes/tool-gateway.ts:387` |
 | `POST /api/tool-gateway/sessions/:param/revoke` | `routes/tool-gateway.ts:432` |
 | `POST /api/tool-gateway/tools/call` | `routes/tool-gateway.ts:483` |
+| `POST /api/tool-profiles/:param/duplicate` | `routes/tool-access.ts:929` |
+| `POST /api/tool-profiles/:param/entries` | `routes/tool-access.ts:995` |
+| `POST /api/tool-profiles/:param/new-tools/review` | `routes/tool-access.ts:975` |
+| `POST /api/tools/oauth/:param/start` | `routes/tool-access.ts:310` |
 | `PUT /api/agents/:param/instructions-bundle/file` | `routes/agents.ts:3032` |
 | `PUT /api/cases/:param/blockers` | `routes/pipelines.ts:2003` |
 | `PUT /api/cases/:param/documents/:param` | `routes/cases.ts:934` |
 | `PUT /api/issues/:param/documents/:param` | `routes/issues.ts:6659` |
+| `PUT /api/issues/:param/watchdog` | `routes/issues.ts:6072` |
 | `PUT /api/pipelines/:param/documents/:param` | `routes/pipelines.ts:1288` |
 | `PUT /api/pipelines/:param/transitions` | `routes/pipelines.ts:1256` |
 | `PUT /api/plugins/:param/companies/:param/local-folders/:param` | `routes/plugins.ts:2894` |
@@ -559,79 +621,17 @@
 
 | Method+Path | Source | Note |
 |---|---|---|
-| `DELETE /api/issues/:param/comments/:param` | `routes/issues.ts:10741` | path exists with method(s) ['GET'] |
-| `GET /api/cases/:param/automation/retry-plan` | `routes/pipelines.ts:2217` | path exists with method(s) ['POST'] |
-| `PATCH /api/companies/:param/tools/policies/:param` | `routes/tool-access.ts:1206` | path exists with method(s) ['DELETE'] |
-| `PATCH /api/pipelines/:param` | `routes/pipelines.ts:1171` | path exists with method(s) ['GET'] |
-| `POST /api/companies/:param/agents` | `routes/agents.ts:2702` | path exists with method(s) ['GET'] |
-| `POST /api/companies/:param/tools/connections` | `routes/tool-access.ts:534` | path exists with method(s) ['GET'] |
-| `POST /api/companies/:param/tools/profiles` | `routes/tool-access.ts:882` | path exists with method(s) ['GET'] |
-| `POST /api/companies/:param/tools/stdio-templates` | `routes/tool-access.ts:1305` | path exists with method(s) ['GET'] |
 
 ## 3. By-design candidates（平台/UI 专属，需产品确认）
 
 | Method+Path | Source | Note |
 |---|---|---|
-| `GET /api/_plugins/:param/ui/:param` | `routes/plugin-ui-static.ts:230` | Paperclip-only domain '/_plugins' |
-| `GET /api/cloud/stacks` | `routes/cloud.ts:30` | Paperclip-only domain '/cloud' |
-| `GET /api/companies/:param/audit/agent-actions.csv` | `routes/activity.ts:274` | export artifact suffix |
-| `POST /api/board-claim/:param/claim` | `routes/access.ts:2666` | Paperclip-only domain '/board-claim' |
-| `POST /api/tool-gateway/runtime-slots/:param/restart` | `routes/tool-gateway.ts:609` | Paperclip-only domain '/tool-gateway' |
-| `POST /api/tool-gateway/runtime-slots/:param/stop` | `routes/tool-gateway.ts:582` | Paperclip-only domain '/tool-gateway' |
 
 ## 4. Missing
 
 | Method+Path | Source | Note |
 |---|---|---|
 | `ALL /api/auth/{:param}` | `app.ts:321` |  |
-| `DELETE /api/issues/:param/watchdog` | `routes/issues.ts:6113` |  |
-| `DELETE /api/tool-profile-entries/:param` | `routes/tool-access.ts:1027` |  |
-| `GET /api/companies/:param/audit/agent-actions` | `routes/activity.ts:238` |  |
-| `GET /api/companies/:param/export/fidelity` | `routes/companies.ts:410` |  |
-| `GET /api/companies/:param/recovery-observability` | `routes/dashboard.ts:34` |  |
-| `GET /api/companies/:param/search/extract` | `routes/issues.ts:5195` |  |
-| `GET /api/companies/:param/users/:param/inbox-agent-policy` | `routes/inbox-agent-policy.ts:84` |  |
-| `GET /api/companies/:param/users/me/inbox-agent-policy` | `routes/inbox-agent-policy.ts:68` |  |
-| `GET /api/companies/import/jobs/:param` | `routes/companies.ts:425` |  |
-| `GET /api/environments/:param/leases` | `routes/environments.ts:951` |  |
-| `GET /api/environments/:param/secret-refs` | `routes/environments.ts:935` |  |
-| `GET /api/health` | `routes/health.ts:129` |  |
-| `GET /api/issues/:param/watchdog` | `routes/issues.ts:6064` |  |
-| `GET /api/skills/catalog/:param/files` | `routes/company-skills.ts:295` |  |
-| `GET /api/tool-connections/:param/test-agents` | `routes/tool-access.ts:659` |  |
-| `GET /api/tool-connections/:param/test-calls/:param` | `routes/tool-access.ts:720` |  |
-| `GET /api/tools/oauth/callback` | `routes/tool-access.ts:320` |  |
-| `PATCH /api/tool-profile-entries/:param` | `routes/tool-access.ts:1011` |  |
-| `POST /api/agents/me/connections/:param/start-authorization` | `routes/tool-access.ts:178` |  |
-| `POST /api/agents/me/connections/:param/token` | `routes/tool-access.ts:196` |  |
-| `POST /api/agents/me/secrets/:param/value` | `routes/secrets.ts:355` |  |
-| `POST /api/cases/:param/claim` | `routes/pipelines.ts:1927` |  |
-| `POST /api/cases/:param/release` | `routes/pipelines.ts:1936` |  |
-| `POST /api/cases/:param/transition` | `routes/pipelines.ts:1944` |  |
-| `POST /api/companies/:param/tools/apps/:param/finish` | `routes/tool-access.ts:364` |  |
-| `POST /api/companies/:param/tools/apps/connect` | `routes/tool-access.ts:255` |  |
-| `POST /api/companies/:param/tools/examples/:param/install` | `routes/tool-access.ts:413` |  |
-| `POST /api/companies/:param/tools/examples/:param/smoke` | `routes/tool-access.ts:435` |  |
-| `POST /api/companies/:param/tools/mcp/import-json` | `routes/tool-access.ts:1347` |  |
-| `POST /api/companies/:param/tools/policies/:param/duplicate` | `routes/tool-access.ts:1176` |  |
-| `POST /api/companies/:param/tools/policies/reorder` | `routes/tool-access.ts:1137` |  |
-| `POST /api/companies/:param/tools/policy/test` | `routes/tool-access.ts:1364` |  |
-| `POST /api/companies/:param/tools/runtime-slots/:param/restart` | `routes/tool-access.ts:1101` |  |
-| `POST /api/companies/:param/tools/runtime-slots/:param/stop` | `routes/tool-access.ts:1095` |  |
-| `POST /api/companies/:param/tools/trust-rules/:param/revoke` | `routes/tool-access.ts:1278` |  |
-| `POST /api/companies/import/preview` | `routes/companies.ts:417` |  |
-| `POST /api/health/dev-server/restart` | `routes/health.ts:95` |  |
-| `POST /api/projects/:param/workspaces/:param/runtime-commands/:param` | `routes/projects.ts:635` |  |
-| `POST /api/projects/:param/workspaces/:param/runtime-services/:param` | `routes/projects.ts:634` |  |
-| `POST /api/tool-connections/:param/catalog/refresh` | `routes/tool-access.ts:843` |  |
-| `POST /api/tool-connections/:param/grants/installations` | `routes/tool-access.ts:575` |  |
-| `POST /api/tool-connections/:param/health-check` | `routes/tool-access.ts:812` |  |
-| `POST /api/tool-connections/:param/test-calls` | `routes/tool-access.ts:696` |  |
-| `POST /api/tool-profiles/:param/duplicate` | `routes/tool-access.ts:929` |  |
-| `POST /api/tool-profiles/:param/entries` | `routes/tool-access.ts:995` |  |
-| `POST /api/tool-profiles/:param/new-tools/review` | `routes/tool-access.ts:975` |  |
-| `POST /api/tools/oauth/:param/start` | `routes/tool-access.ts:310` |  |
-| `PUT /api/issues/:param/watchdog` | `routes/issues.ts:6072` |  |
 
 ## 5. Parrot-only（Parrot 扩展端点）
 
