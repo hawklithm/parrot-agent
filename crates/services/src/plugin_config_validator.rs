@@ -7,3 +7,33 @@ pub fn validate_config(manifest: &Value, config: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn non_object_config_is_rejected() {
+        let err = validate_config(&json!({}), &json!([])).unwrap_err();
+        assert!(err.contains("JSON object"));
+    }
+
+    #[test]
+    fn missing_required_config_key_is_rejected() {
+        let manifest = json!({ "configSchema": { "required": ["apiKey"] } });
+        let err = validate_config(&manifest, &json!({ "other": 1 })).unwrap_err();
+        assert!(err.contains("apiKey"));
+    }
+
+    #[test]
+    fn valid_config_passes() {
+        let manifest = json!({ "configSchema": { "required": ["apiKey"] } });
+        assert!(validate_config(&manifest, &json!({ "apiKey": "k" })).is_ok());
+    }
+
+    #[test]
+    fn no_required_schema_passes() {
+        assert!(validate_config(&json!({}), &json!({ "x": 1 })).is_ok());
+    }
+}

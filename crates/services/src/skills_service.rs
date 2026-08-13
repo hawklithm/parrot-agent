@@ -31,7 +31,10 @@ impl SkillsServiceImpl {
         Self {}
     }
 
-    /// Load hardcoded available skills (placeholder implementation)
+    /// 内置 skills 目录（Parrot 扩展端点 `GET .../skills/available` 的数据源）。
+    ///
+    /// Paperclip 无同名端点；此为 Parrot 内置的静态种子目录，非占位。
+    /// 后续如接入 filesystem/marketplace registry，可在此扩展来源。
     fn load_available_skills(&self) -> Vec<AvailableSkill> {
         vec![
             AvailableSkill {

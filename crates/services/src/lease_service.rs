@@ -262,3 +262,90 @@ impl LeaseService for MockLeaseService {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn lease(
+        status: LeaseStatus,
+        expires_at: Option<chrono::DateTime<Utc>>,
+        last_used_at: Option<chrono::DateTime<Utc>>,
+    ) -> EnvironmentLease {
+        let now = Utc::now();
+        EnvironmentLease {
+            id: Uuid::new_v4(),
+            company_id: Uuid::new_v4(),
+            environment_id: Uuid::new_v4(),
+            execution_workspace_id: None,
+            issue_id: None,
+            heartbeat_run_id: None,
+            status,
+            lease_policy: Some(serde_json::json!({})),
+            provider: Some("test".to_string()),
+            provider_lease_id: None,
+            acquired_at: now,
+            last_used_at,
+            expires_at,
+            released_at: None,
+            failure_reason: None,
+            cleanup_status: None,
+        }
+    }
+
+    #[test]
+    fn active_can_transition_to_terminal_states() {
+        assert!(LeaseStateMachine::can_transition(&LeaseStatus::Active, &LeaseStatus::Released));
+        assert!(LeaseStateMachine::can_transition(&LeaseStatus::Active, &LeaseStatus::Expired));
+        assert!(LeaseStateMachine::can_transition(&LeaseStatus::Active, &LeaseStatus::Failed));
+        assert!(!LeaseStateMachine::can_transition(&LeaseStatus::Active, &LeaseStatus::Active));
+    }
+
+    #[test]
+    fn terminal_states_are_final() {
+        for terminal in [LeaseStatus::Released, LeaseStatus::Expired, LeaseStatus::Failed] {
+            assert!(!LeaseStateMachine::can_transition(&terminal, &LeaseStatus::Active));
+            assert!(!LeaseStateMachine::can_transition(&terminal, &LeaseStatus::Released));
+        }
+    }
+
+    #[test]
+    fn expired_by_expires_at() {
+        let now = Utc::now();
+        let past = lease(LeaseStatus::Active, Some(now - chrono::Duration::seconds(1)), None);
+        assert!(LeaseStateMachine::is_expired(&past, &LeasePolicy::default()));
+        let future = lease(LeaseStatus::Active, Some(now + chrono::Duration::hours(1)), None);
+        assert!(!LeaseStateMachine::is_expired(&future, &LeasePolicy::default()));
+    }
+
+    #[test]
+    fn stale_heartbeat_marks_expired() {
+        let now = Utc::now();
+        let stale = lease(LeaseStatus::Active, None, Some(now - chrono::Duration::minutes(5)));
+        assert!(LeaseStateMachine::is_expired(&stale, &LeasePolicy::default()));
+    }
+
+    #[test]
+    fn should_release_only_when_active_expired_and_auto() {
+        let now = Utc::now();
+        let auto = LeasePolicy {
+            auto_release_on_expire: true,
+            ..LeasePolicy::default()
+        };
+        let expired_active = lease(LeaseStatus::Active, Some(now - chrono::Duration::seconds(1)), None);
+        assert!(LeaseStateMachine::should_release(&expired_active, &auto));
+
+        let fresh = lease(LeaseStatus::Active, Some(now + chrono::Duration::hours(1)), None);
+        assert!(!LeaseStateMachine::should_release(&fresh, &auto));
+
+        let released_expired = lease(LeaseStatus::Released, Some(now - chrono::Duration::seconds(1)), None);
+        assert!(!LeaseStateMachine::should_release(&released_expired, &auto));
+
+        let no_auto = LeasePolicy {
+            auto_release_on_expire: false,
+            ..LeasePolicy::default()
+        };
+        assert!(!LeaseStateMachine::should_release(&expired_active, &no_auto));
+    }
+}
