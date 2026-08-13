@@ -9,11 +9,11 @@
 - **Limitation**：状态为结构性判定；`partial` 语义、`by-design-candidate` 最终清单需人工复核。
 
 - Paperclip endpoints: **597**
-- Parrot endpoints: **626**
-- implemented: **455**
-- partial: **9**
-- by-design-candidate: **25**
-- missing: **108**
+- Parrot endpoints: **631**
+- implemented: **460**
+- partial: **7**
+- by-design-candidate: **24**
+- missing: **106**
 - Parrot-only (extension): **171**
 
 ## 1. Implemented
@@ -142,6 +142,7 @@
 | `GET /api/companies/:param/goals` | `routes/goals.ts:14` |
 | `GET /api/companies/:param/heartbeat-runs` | `routes/agents.ts:3772` |
 | `GET /api/companies/:param/inbox-dismissals` | `routes/inbox-dismissals.ts:52` |
+| `GET /api/companies/:param/invites` | `routes/access.ts:4131` |
 | `GET /api/companies/:param/issues` | `routes/issues.ts:5271` |
 | `GET /api/companies/:param/issues/count` | `routes/issues.ts:5558` |
 | `GET /api/companies/:param/join-requests` | `routes/access.ts:4139` |
@@ -151,6 +152,7 @@
 | `GET /api/companies/:param/members` | `routes/access.ts:4434` |
 | `GET /api/companies/:param/org` | `routes/agents.ts:2226` |
 | `GET /api/companies/:param/org.png` | `routes/agents.ts:2246` |
+| `GET /api/companies/:param/org.svg` | `routes/agents.ts:2234` |
 | `GET /api/companies/:param/pipelines` | `routes/pipelines.ts:821` |
 | `GET /api/companies/:param/pipelines-attention` | `routes/pipelines.ts:870` |
 | `GET /api/companies/:param/projects` | `routes/projects.ts:129` |
@@ -219,6 +221,7 @@
 | `GET /api/invites/:param/onboarding.txt` | `routes/access.ts:3495` |
 | `GET /api/invites/:param/skills/:param` | `routes/access.ts:3540` |
 | `GET /api/invites/:param/skills/index` | `routes/access.ts:3518` |
+| `GET /api/invites/:param/test-resolution` | `routes/access.ts:3559` |
 | `GET /api/issues` | `routes/issues.ts:5189` |
 | `GET /api/issues/:param` | `routes/issues.ts:5978` |
 | `GET /api/issues/:param/accepted-plan-decompositions` | `routes/issues.ts:8043` |
@@ -284,6 +287,7 @@
 | `GET /api/projects/:param/workspaces` | `routes/projects.ts:277` |
 | `GET /api/routines/:param` | `routes/routines.ts:194` |
 | `GET /api/routines/:param/description/annotations` | `routes/routines.ts:210` |
+| `GET /api/routines/:param/description/annotations/:param` | `routes/routines.ts:224` |
 | `GET /api/routines/:param/revisions` | `routes/routines.ts:200` |
 | `GET /api/routines/:param/runs` | `routes/routines.ts:456` |
 | `GET /api/secret-provider-configs/:param` | `routes/secrets.ts:472` |
@@ -412,6 +416,7 @@
 | `POST /api/heartbeat-runs/:param/cancel` | `routes/agents.ts:3884` |
 | `POST /api/heartbeat-runs/:param/watchdog-decisions` | `routes/agents.ts:3914` |
 | `POST /api/instance/database-backups` | `routes/instance-database-backups.ts:25` |
+| `POST /api/invites/:param/revoke` | `routes/access.ts:4090` |
 | `POST /api/issues/:param/accepted-plan-decompositions` | `routes/issues.ts:8051` |
 | `POST /api/issues/:param/admin/force-release` | `routes/issues.ts:10063` |
 | `POST /api/issues/:param/approvals` | `routes/issues.ts:7549` |
@@ -482,8 +487,6 @@
 |---|---|---|
 | `DELETE /api/issues/:param/comments/:param` | `routes/issues.ts:10741` | path exists with method(s) ['GET'] |
 | `GET /api/cases/:param/automation/retry-plan` | `routes/pipelines.ts:2217` | path exists with method(s) ['POST'] |
-| `GET /api/companies/:param/invites` | `routes/access.ts:4131` | path exists with method(s) ['POST'] |
-| `GET /api/routines/:param/description/annotations/:param` | `routes/routines.ts:224` | path exists with method(s) ['PATCH'] |
 | `PATCH /api/companies/:param/tools/policies/:param` | `routes/tool-access.ts:1206` | path exists with method(s) ['DELETE'] |
 | `PATCH /api/pipelines/:param` | `routes/pipelines.ts:1171` | path exists with method(s) ['GET'] |
 | `POST /api/companies/:param/agents` | `routes/agents.ts:2702` | path exists with method(s) ['GET'] |
@@ -501,7 +504,6 @@
 | `GET /api/cli-auth/challenges/:param` | `routes/access.ts:2751` | Paperclip-only domain '/cli-auth' |
 | `GET /api/cloud/stacks` | `routes/cloud.ts:30` | Paperclip-only domain '/cloud' |
 | `GET /api/companies/:param/audit/agent-actions.csv` | `routes/activity.ts:274` | export artifact suffix |
-| `GET /api/companies/:param/org.svg` | `routes/agents.ts:2234` | export artifact suffix |
 | `GET /api/sidebar-preferences/me` | `routes/sidebar-preferences.ts:21` | Paperclip-only domain '/sidebar-preferences' |
 | `GET /api/status-cards/:param` | `routes/status-cards.ts:170` | Paperclip-only domain '/status-cards' |
 | `GET /api/status-cards/:param/dry-run` | `routes/status-cards.ts:251` | Paperclip-only domain '/status-cards' |
@@ -565,7 +567,6 @@
 | `GET /api/environments/:param/leases` | `routes/environments.ts:951` |  |
 | `GET /api/environments/:param/secret-refs` | `routes/environments.ts:935` |  |
 | `GET /api/health` | `routes/health.ts:129` |  |
-| `GET /api/invites/:param/test-resolution` | `routes/access.ts:3559` |  |
 | `GET /api/issues/:param/watchdog` | `routes/issues.ts:6064` |  |
 | `GET /api/skills/catalog/:param/files` | `routes/company-skills.ts:295` |  |
 | `GET /api/tool-connections/:param` | `routes/tool-access.ts:559` |  |
@@ -620,7 +621,6 @@
 | `POST /api/companies/:param/tools/trust-rules/:param/revoke` | `routes/tool-access.ts:1278` |  |
 | `POST /api/companies/import/preview` | `routes/companies.ts:417` |  |
 | `POST /api/health/dev-server/restart` | `routes/health.ts:95` |  |
-| `POST /api/invites/:param/revoke` | `routes/access.ts:4090` |  |
 | `POST /api/projects/:param/workspaces/:param/runtime-commands/:param` | `routes/projects.ts:635` |  |
 | `POST /api/projects/:param/workspaces/:param/runtime-services/:param` | `routes/projects.ts:634` |  |
 | `POST /api/tool-connections/:param/catalog/refresh` | `routes/tool-access.ts:843` |  |
