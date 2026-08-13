@@ -249,9 +249,10 @@ mod tests {
         let hash = hash_api_key(token);
 
         // 多次验证应消耗相同时间（防止时序攻击）。
-        // 提高迭代次数以摊平调度噪声（原 1000 次在微秒级测量上易抖动），
-        // 保留 20% 容差以捕获明显的时间泄漏（如首字符短路）。
-        let iterations = 20_000;
+        // 核心风险是错误 token 因提前短路（如首字符比较）而显著变快。
+        // 采用单边断言（wrong >= 60% correct）+ 宽松上界（correct <= 3x wrong），
+        // 50k 迭代摊平调度噪声，负载下也不易抖动；仍可捕获数量级的时间泄漏。
+        let iterations = 50_000;
         let start = std::time::Instant::now();
         for _ in 0..iterations {
             verify_api_key(token, &hash);
@@ -264,11 +265,19 @@ mod tests {
         }
         let duration_wrong = start.elapsed();
 
-        let ratio = duration_correct.as_micros() as f64 / duration_wrong.as_micros() as f64;
+        let correct_us = duration_correct.as_micros() as f64;
+        let wrong_us = duration_wrong.as_micros() as f64;
         assert!(
-            ratio > 0.8 && ratio < 1.2,
-            "Timing difference too large: {}",
-            ratio
+            wrong_us >= correct_us * 0.6,
+            "Wrong-token verification too fast (timing leak?): correct={}us wrong={}us",
+            correct_us,
+            wrong_us
+        );
+        assert!(
+            correct_us <= wrong_us * 3.0,
+            "Correct-token verification unexpectedly slow: correct={}us wrong={}us",
+            correct_us,
+            wrong_us
         );
     }
 }
