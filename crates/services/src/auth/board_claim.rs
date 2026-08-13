@@ -165,7 +165,7 @@ impl BoardClaimService {
         // 1. 归档 local-board 管理员在所有公司的成员关系
         sqlx::query(
             "UPDATE company_memberships SET status = 'archived', archived_at = NOW(), updated_at = NOW() \
-             WHERE principal_type = 'user' AND principal_id = $1",
+             WHERE principal_type = 'user'::principal_type AND principal_id = $1",
         )
         .bind(local_board_user_id)
         .execute(&mut *tx)

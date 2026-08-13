@@ -14,6 +14,10 @@ pub enum ServiceError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// 语义正确但无法处理的请求（文件超限、类型不受支持等），映射为 HTTP 422。
+    #[error("Unprocessable: {0}")]
+    Unprocessable(String),
+
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 

@@ -77,6 +77,18 @@ impl Default for AgentPermissions {
     }
 }
 
+impl AgentPermissions {
+    /// 根据角色创建默认权限
+    pub fn for_role(role: AgentRole) -> Self {
+        Self {
+            can_create_agents: matches!(role, AgentRole::Ceo),
+            can_create_skills: true,
+            trust_preset: TrustPreset::Standard,
+            authorization_policy: TrustAuthorizationPolicy::Manual,
+        }
+    }
+}
+
 /// Agent 元数据
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

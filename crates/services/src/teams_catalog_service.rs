@@ -1080,6 +1080,7 @@ impl TeamsCatalogService for DefaultTeamsCatalogService {
 
         // 记录安装（重装时更新）
         let agent_ids: Vec<Uuid> = created.values().copied().collect();
+        let install_id = Uuid::new_v4();
         sqlx::query(
             r#"
             INSERT INTO company_team_installs (
@@ -1095,7 +1096,7 @@ impl TeamsCatalogService for DefaultTeamsCatalogService {
                 updated_at = NOW()
             "#,
         )
-        .bind(Uuid::new_v4())
+        .bind(install_id)
         .bind(company_id)
         .bind(&team.id)
         .bind(&team.key)
@@ -1124,9 +1125,12 @@ impl TeamsCatalogService for DefaultTeamsCatalogService {
         } else {
             actor.actor_type.clone()
         })
-        .bind(actor.user_id.or(actor.agent_id))
-        .bind(&team.id)
+        // activity_logs.actor_id / resource_id 均为 UUID NOT NULL：
+        // 匿名 actor 落 nil UUID，resource_id 用本次安装记录 id，catalog id 放 metadata。
+        .bind(actor.user_id.or(actor.agent_id).unwrap_or_else(Uuid::nil))
+        .bind(install_id)
         .bind(json!({
+            "catalogId": team.id,
             "catalogKey": team.key,
             "contentHash": team.content_hash,
             "createdAgents": created_records.len(),

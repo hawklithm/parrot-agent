@@ -30,9 +30,9 @@ pub struct Company {
     pub feedback_data_sharing_enabled: bool,
     pub feedback_data_sharing_consent_at: Option<DateTime<Utc>>,
     pub feedback_data_sharing_consent_by_user_id: Option<Uuid>,
-    pub feedback_data_sharing_terms_version: Option<String>,
     pub brand_color: Option<String>,
     pub logo_asset_id: Option<Uuid>,
+    pub interaction_resolver_governance: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

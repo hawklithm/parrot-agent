@@ -17,6 +17,10 @@ pub enum AppError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// 语义正确但服务端无法处理（文件超限、类型不受支持等），映射为 HTTP 422。
+    #[error("Unprocessable entity: {0}")]
+    Unprocessable(String),
+
     #[error("Not found: {0}")]
     NotFound(String),
 
@@ -64,6 +68,9 @@ impl AppError {
     }
     pub fn bad_request(msg: impl Into<String>) -> Self {
         AppError::BadRequest(msg.into())
+    }
+    pub fn unprocessable(msg: impl Into<String>) -> Self {
+        AppError::Unprocessable(msg.into())
     }
     pub fn unauthorized(msg: impl Into<String>) -> Self {
         AppError::Unauthorized(msg.into())
@@ -116,6 +123,31 @@ impl From<models::AppError> for AppError {
     }
 }
 
+/// `services::errors::ServiceError` 是服务层的通用错误枚举（与
+/// `services::ServiceError`（= agent_service 专用）不是同一个类型）。
+/// 这里把它逐个变体映射到正确的 HTTP 语义，避免在 route 层塌缩成 500。
+impl From<services::errors::ServiceError> for AppError {
+    fn from(err: services::errors::ServiceError) -> Self {
+        use services::errors::ServiceError as SE;
+        match err {
+            SE::NotFound(msg) => AppError::NotFound(msg),
+            SE::Validation(msg) => AppError::Validation(msg),
+            SE::Unprocessable(msg) => AppError::Unprocessable(msg),
+            SE::InvalidInput(msg) => AppError::BadRequest(msg),
+            SE::BadRequest(msg) => AppError::BadRequest(msg),
+            SE::InvalidState(msg) => AppError::Conflict(msg),
+            SE::Conflict(msg) => AppError::Conflict(msg),
+            SE::Unauthorized(msg) => AppError::Unauthorized(msg),
+            SE::Forbidden(msg) => AppError::Forbidden(msg),
+            SE::NotImplemented(msg) => AppError::NotImplemented(msg),
+            SE::Timeout(msg) => AppError::InternalServerError(format!("Timeout: {msg}")),
+            SE::Repository(msg) => AppError::InternalServerError(msg),
+            SE::Internal(msg) => AppError::InternalServerError(msg),
+            SE::Database(e) => AppError::from(e),
+        }
+    }
+}
+
 impl From<services::plugin_service::PluginServiceError> for AppError {
     fn from(err: services::plugin_service::PluginServiceError) -> Self {
         match err {
@@ -150,6 +182,9 @@ impl IntoResponse for AppError {
             AppError::Service(services::ServiceError::Forbidden(msg)) => {
                 (StatusCode::FORBIDDEN, msg)
             }
+            AppError::Service(services::ServiceError::Conflict(msg)) => {
+                (StatusCode::CONFLICT, msg)
+            }
             AppError::Service(services::ServiceError::ReportingCycle) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "Reporting cycle detected".to_string())
             }
@@ -167,6 +202,9 @@ impl IntoResponse for AppError {
             }
             AppError::Validation(msg) => {
                 (StatusCode::BAD_REQUEST, msg)
+            }
+            AppError::Unprocessable(msg) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, msg)
             }
             AppError::NotFound(msg) => {
                 (StatusCode::NOT_FOUND, msg)
@@ -226,6 +264,39 @@ mod tests {
         assert_eq!(
             status_of(AppError::NotImplemented("x".into())),
             StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            status_of(AppError::Unprocessable("x".into())),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn generic_service_error_variants_map_to_correct_status() {
+        use services::errors::ServiceError as SE;
+        let cases: Vec<(SE, StatusCode)> = vec![
+            (SE::NotFound("gone".into()), StatusCode::NOT_FOUND),
+            (SE::Validation("bad".into()), StatusCode::BAD_REQUEST),
+            (SE::Unprocessable("too big".into()), StatusCode::UNPROCESSABLE_ENTITY),
+            (SE::InvalidInput("bad".into()), StatusCode::BAD_REQUEST),
+            (SE::BadRequest("bad".into()), StatusCode::BAD_REQUEST),
+            (SE::InvalidState("state".into()), StatusCode::CONFLICT),
+            (SE::Conflict("dup".into()), StatusCode::CONFLICT),
+            (SE::Unauthorized("no".into()), StatusCode::UNAUTHORIZED),
+            (SE::Forbidden("no".into()), StatusCode::FORBIDDEN),
+            (SE::NotImplemented("todo".into()), StatusCode::NOT_IMPLEMENTED),
+            (SE::Timeout("slow".into()), StatusCode::INTERNAL_SERVER_ERROR),
+            (SE::Repository("db".into()), StatusCode::INTERNAL_SERVER_ERROR),
+            (SE::Internal("boom".into()), StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+        for (err, expected) in cases {
+            let label = err.to_string();
+            assert_eq!(status_of(AppError::from(err)), expected, "case: {label}");
+        }
+        // Database(RowNotFound) 应该沿用 sqlx 映射走 404
+        assert_eq!(
+            status_of(AppError::from(SE::Database(sqlx::Error::RowNotFound))),
+            StatusCode::NOT_FOUND
         );
     }
 

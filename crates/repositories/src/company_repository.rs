@@ -135,9 +135,9 @@ impl CompanyRepository {
             r#"
             SELECT c.* FROM companies c
             INNER JOIN company_memberships cm ON c.id = cm.company_id
-            WHERE cm.principal_type = 'user'
+            WHERE cm.principal_type = 'user'::principal_type
               AND cm.principal_id = $1
-              AND cm.status = 'active'
+              AND cm.status = 'active'::company_membership_status
             ORDER BY c.created_at DESC
             "#,
         )
@@ -283,7 +283,7 @@ impl CompanyRepository {
         user_id: Uuid,
     ) -> Result<Option<CompanyMembership>> {
         sqlx::query_as::<_, CompanyMembership>(
-            "SELECT * FROM company_memberships WHERE company_id = $1 AND principal_type = 'user' AND principal_id = $2",
+            "SELECT * FROM company_memberships WHERE company_id = $1 AND principal_type = 'user'::principal_type AND principal_id = $2",
         )
         .bind(company_id)
         .bind(user_id)

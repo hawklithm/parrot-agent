@@ -77,6 +77,7 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
     const TOOLS: &[(&str, &str)] = &[
         ("paperclipMe", "Get the current authenticated Paperclip actor details"),
         ("paperclipInboxLite", "Get the current authenticated agent inbox-lite assignment list"),
+        ("paperclipHireAgent", "Request to hire a new agent (creates an approval request that requires board approval)"),
         ("paperclipListAgents", "List agents in a company"),
         ("paperclipGetAgent", "Get a single agent by id"),
         ("paperclipListIssues", "List issues for a company with optional filters"),
@@ -276,6 +277,30 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "type": {"type": "string", "enum": ["hire_agent", "approve_ceo_strategy", "budget_override_required", "request_board_approval"]}, "requestedByAgentId": {"type": ["string", "null"], "format": "uuid"},
                         "payload": {"type": "object"}, "issueIds": {"type": "array", "items": {"type": "string", "format": "uuid"}}
                     }, "required": ["type", "payload"], "additionalProperties": false
+                }),
+                "paperclipHireAgent" => serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "companyId": {"type": ["string", "null"], "format": "uuid"},
+                        "name": {"type": "string", "minLength": 1, "maxLength": 255, "description": "Agent name"},
+                        "role": {"type": "string", "enum": ["ceo", "vp", "manager", "researcher", "general"], "description": "Agent role"},
+                        "title": {"type": ["string", "null"], "maxLength": 255, "description": "Agent job title"},
+                        "icon": {"type": ["string", "null"], "description": "Agent icon"},
+                        "reportsTo": {"type": ["string", "null"], "format": "uuid", "description": "ID of the agent this agent reports to"},
+                        "capabilities": {"type": ["string", "null"], "description": "Agent capabilities description"},
+                        "adapterType": {"type": "string", "description": "Adapter type (e.g., claude_local, anthropic)"},
+                        "adapterConfig": {"type": ["object", "null"], "description": "Adapter-specific configuration"},
+                        "runtimeConfig": {"type": ["object", "null"], "description": "Runtime configuration"},
+                        "permissions": {"type": ["object", "null"], "description": "Agent permissions"},
+                        "budgetMonthlyCents": {"type": ["integer", "null"], "description": "Monthly budget in cents"},
+                        "defaultEnvironmentId": {"type": ["string", "null"], "format": "uuid", "description": "Default execution environment"},
+                        "metadata": {"type": ["object", "null"], "description": "Additional metadata"},
+                        "desiredSkills": {"type": ["array", "null"], "items": {"type": "string"}, "description": "List of desired skills"},
+                        "instructionsBundle": {"type": ["object", "null"], "description": "Instructions bundle"},
+                        "issueIds": {"type": ["array", "null"], "items": {"type": "string", "format": "uuid"}, "description": "Related issue IDs"}
+                    },
+                    "required": ["name", "role", "adapterType"],
+                    "additionalProperties": false
                 }),
                 "paperclipSuggestTasks" | "paperclipAskUserQuestions"
                 | "paperclipRequestConfirmation" | "paperclipRequestCheckboxConfirmation" => serde_json::json!({
@@ -2162,9 +2187,32 @@ async fn call_paperclip_builtin_tool(
                 let payload = parameters.get("payload").cloned().unwrap_or_else(|| serde_json::json!({}));
                 serde_json::json!({
                     "type": parameters.get("type").cloned().unwrap_or_else(|| serde_json::json!("create_resource")),
-                    "requestedByAgentId": parameters.get("requestedByAgentId").cloned().unwrap_or(Value::Null),
+                    "requestedByAgentId": agent_id,
                     "payload": payload,
                     "issueIds": parameters.get("issueIds").cloned().unwrap_or_else(|| serde_json::json!([])),
+                })
+            }),
+        ),
+        "paperclipHireAgent" => (
+            "POST",
+            format!("/companies/{company_id}/approvals"),
+            Some({
+                // 构建hire_agent的payload
+                let mut hire_payload = object_without(&parameters, &["companyId", "issueIds"]);
+                
+                // 如果没有adapterConfig，添加默认值
+                if let Some(obj) = hire_payload.as_object_mut() {
+                    if !obj.contains_key("adapterConfig") {
+                        obj.insert("adapterConfig".to_string(), serde_json::json!({}));
+                    }
+                }
+                
+                // 构建approval请求
+                serde_json::json!({
+                    "type": "hire_agent",
+                    "requestedByAgentId": agent_id,
+                    "payload": hire_payload,
+                    "issueIds": parameters.get("issueIds").cloned().unwrap_or_else(|| serde_json::json!([]))
                 })
             }),
         ),
@@ -3504,6 +3552,11 @@ pub fn tool_routes() -> Router<AppState> {
 mod tests {
     use super::*;
 
+    /// Paperclip `packages/mcp-server/src/tools.ts` 暴露的内置工具数量。
+    const PAPERCLIP_PARITY_TOOL_COUNT: usize = 41;
+    /// Parrot 在 Paperclip 基础上额外提供的工具：`paperclipHireAgent`（走 approval 流程）。
+    const PARROT_EXTRA_TOOL_COUNT: usize = 1;
+
     #[test]
     fn paperclip_builtin_registry_contains_core_tools() {
         let tools = paperclip_builtin_tools();
@@ -3526,7 +3579,12 @@ mod tests {
             assert!(names.contains(required), "missing MCP tool {required}");
         }
         assert_eq!(names.len(), tools.len(), "MCP tool names must be unique");
-        assert_eq!(tools.len(), 41, "Paperclip reference currently exposes 41 built-in tools");
+        assert_eq!(
+            tools.len(),
+            PAPERCLIP_PARITY_TOOL_COUNT + PARROT_EXTRA_TOOL_COUNT,
+            "MCP registry size drifted from the Paperclip reference"
+        );
+        assert!(names.contains("paperclipHireAgent"));
         assert!(tools.iter().all(|tool| tool
             .get("inputSchema")
             .and_then(|schema| schema.get("type"))
@@ -3628,7 +3686,10 @@ mod tests {
     #[test]
     fn mcp_registry_uses_typed_definitions() {
         let definitions = paperclip_builtin_tool_definitions();
-        assert_eq!(definitions.len(), 41);
+        assert_eq!(
+            definitions.len(),
+            PAPERCLIP_PARITY_TOOL_COUNT + PARROT_EXTRA_TOOL_COUNT
+        );
         assert!(definitions.iter().all(|definition| {
             definition.name.starts_with("paperclip")
                 && definition.input_schema.get("type").is_some()

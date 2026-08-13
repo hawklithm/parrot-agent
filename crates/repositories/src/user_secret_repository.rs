@@ -137,7 +137,7 @@ impl UserSecretRepository for PostgresUserSecretRepository {
             r#"SELECT
                  (SELECT COUNT(DISTINCT cm.principal_id)
                   FROM company_memberships cm
-                  WHERE cm.company_id = $1 AND cm.principal_type = 'user' AND cm.status = 'active') as total_users,
+                  WHERE cm.company_id = $1 AND cm.principal_type = 'user'::principal_type AND cm.status = 'active'::company_membership_status) as total_users,
                  (SELECT COUNT(DISTINCT usd.target_id)
                   FROM user_secret_declarations usd
                   WHERE usd.user_secret_definition_id = $2
