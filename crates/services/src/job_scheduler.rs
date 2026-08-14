@@ -898,6 +898,79 @@ impl ScheduledJob for ConsistencyCheckJob {
     }
 }
 
+// ============================================================================
+// Status Card Scheduler Job（对应 paperclip index.ts status-card scheduler tick）
+// ============================================================================
+
+/// Status Card 调度器（每 30 秒）。
+/// 扫描 next_eval_at 到期的卡片触发后台 refresh，并顺带做 stalled-generation
+/// finalization（对应 paperclip tickDueStatusCards + finalizeStatusCardsForStalledGeneration）。
+pub struct StatusCardSchedulerJob {
+    pool: PgPool,
+}
+
+impl StatusCardSchedulerJob {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for StatusCardSchedulerJob {
+    fn job_name(&self) -> &str {
+        "status_card_scheduler"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        // 对应 paperclip config.heartbeatSchedulerIntervalMs (默认 30000ms)
+        JobSchedule::IntervalSeconds(30)
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        let worker = crate::status_card_worker::StatusCardWorker::new(self.pool.clone());
+        let now = chrono::Utc::now();
+        let (evaluated, enqueued) = worker.tick_due_status_cards(&now).await?;
+        let finalized = worker.finalize_stalled_generations().await?;
+        Ok(format!(
+            "Status-card tick: evaluated={} enqueued={} finalized={}",
+            evaluated, enqueued, finalized
+        ))
+    }
+}
+
+// ============================================================================
+// Summary Slot Finalizer Job（对应 paperclip finalizeSummarySlotsForTerminalIssue）
+// ============================================================================
+
+/// Summary Slot 终态 finalizer（每 60 秒）。
+/// 将 generating_issue 已到终态（done/cancelled）的 slot 置为 failed。
+pub struct SummarySlotFinalizerJob {
+    pool: PgPool,
+}
+
+impl SummarySlotFinalizerJob {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for SummarySlotFinalizerJob {
+    fn job_name(&self) -> &str {
+        "summary_slot_finalizer"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(60)
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        let worker = crate::summary_slot_worker::SummarySlotWorker::new(self.pool.clone());
+        let finalized = worker.finalize_terminal_issues().await?;
+        Ok(format!("Summary-slot finalizer: finalized={}", finalized))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

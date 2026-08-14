@@ -1,8 +1,8 @@
 //! Status Cards 路由 —— 对齐 Paperclip `server/src/routes/status-cards.ts`（12 端点）。
 //!
-//! 说明：Paperclip 的 recompile/refresh 依赖后台 agent 编译/刷新 worker；Parrot
-//! 暂无 agent 摘要执行器，本实现采用同步语义（置 state=compiling、返回 202 形状），
-//! 后台执行链留待后续接入。
+//! recompile/refresh 迁移自 Paperclip 后台任务链：创建 hidden issue（assignee =
+//! Summarizer 内置 agent）并通过 heartbeat wakeup 唤醒执行；query/summary 写回时
+//! 强校验 writer 身份与 generationIssueId 匹配。
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
+use services::status_card_worker::StatusCardWorker;
 
 fn card_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
     use sqlx::Row;
@@ -94,11 +95,22 @@ struct WriteQueryRequest {
     queries: Value,
     #[serde(rename = "queryVersion")]
     query_version: Option<i32>,
+    #[serde(rename = "generationIssueId")]
+    generation_issue_id: Option<Uuid>,
+    #[serde(rename = "changeSummary")]
+    change_summary: Option<String>,
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WriteSummaryRequest {
     summary: String,
+    #[serde(rename = "generationIssueId")]
+    generation_issue_id: Option<Uuid>,
+    #[serde(rename = "changeSummary")]
+    change_summary: Option<String>,
+    title: Option<String>,
+    model: Option<String>,
 }
 
 /// GET /companies/:company_id/status-cards
@@ -148,7 +160,7 @@ async fn create_status_card(
     )
     .bind(id)
     .bind(company_id)
-    .bind(created_by_user)
+    .bind(created_by_user.as_deref())
     .bind(created_by_agent)
     .bind(request.title.as_deref())
     .bind(request.title_pinned)
@@ -172,6 +184,26 @@ async fn create_status_card(
         json!({ "state": "compiling" }),
     )
     .await;
+
+    // 对齐 Paperclip：创建后自动 enqueue compile（Summarizer 编译查询并写首版摘要）。
+    let worker = StatusCardWorker::new(state.pool.clone());
+    if let Ok(compile) = worker
+        .request_compile(
+            id,
+            created_by_agent,
+            created_by_user.clone(),
+        )
+        .await
+    {
+        if !compile.already_generating {
+            if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id, None).await {
+                let _ = state
+                    .heartbeat_service
+                    .wakeup(summarizer, compile.generating_issue_id, company_id)
+                    .await;
+            }
+        }
+    }
 
     let row = load_card(&state, id).await?.ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(card_json(&row))))
@@ -245,6 +277,31 @@ async fn patch_status_card(
         json!({ "archived": archived_at.is_some() }),
     )
     .await;
+
+    // 对齐 Paperclip：interestPrompt 变更后自动 recompile；取消归档且已有查询时
+    // 触发一次 restore 刷新。
+    let prompt_changed = request.interest_prompt.is_some();
+    if prompt_changed {
+        let (created_by_agent, created_by_user) = match &actor {
+            AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
+            AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
+            _ => (None, None),
+        };
+        let worker = StatusCardWorker::new(state.pool.clone());
+        if let Ok(compile) = worker
+            .request_compile(card_id, created_by_agent, created_by_user)
+            .await
+        {
+            if !compile.already_generating {
+                if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id, None).await {
+                    let _ = state
+                        .heartbeat_service
+                        .wakeup(summarizer, compile.generating_issue_id, company_id)
+                        .await;
+                }
+            }
+        }
+    }
 
     let updated = load_card(&state, card_id).await?.ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(card_json(&updated)))
@@ -346,6 +403,7 @@ async fn list_status_card_revisions(
 }
 
 /// POST /status-cards/:id/recompile
+/// 对齐 Paperclip：创建 hidden issue（Summarizer 执行编译）并唤醒 agent。
 async fn recompile_status_card(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -356,18 +414,35 @@ async fn recompile_status_card(
     let company_id: Uuid = row.get("company_id");
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    // 同步语义：置 compiling、清 compiled_at、递增 query_version；后台编译链待接入。
-    sqlx::query(
-        "UPDATE status_cards SET state = 'compiling', query_compiled_at = NULL, \
-         query_version = query_version + 1, updated_at = NOW() WHERE id = $1",
-    )
-    .bind(card_id)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to recompile status card: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let (created_by_agent, created_by_user) = match &actor {
+        AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
+        AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
+        _ => (None, None),
+    };
+    let worker = StatusCardWorker::new(state.pool.clone());
+    let result = worker
+        .request_compile(card_id, created_by_agent, created_by_user)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to enqueue status card compile: {}", e);
+            match e.as_str() {
+                "Status card not found" => StatusCode::NOT_FOUND,
+                "Archived status cards cannot be compiled" => StatusCode::UNPROCESSABLE_ENTITY,
+                _ if e.contains("Summarizer built-in agent is not configured") => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        })?;
+    // 唤醒 Summarizer agent 执行（非幂等命中时）。
+    if !result.already_generating {
+        if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id, None).await {
+            let _ = state
+                .heartbeat_service
+                .wakeup(summarizer, result.generating_issue_id, company_id)
+                .await;
+        }
+    }
     crate::routes::log_activity(
         &state.pool,
         company_id,
@@ -375,14 +450,30 @@ async fn recompile_status_card(
         &actor,
         "status_card",
         card_id,
-        json!({}),
+        json!({
+            "generatingIssueId": result.generating_issue_id,
+            "alreadyGenerating": result.already_generating,
+        }),
     )
     .await;
     let updated = load_card(&state, card_id).await?.ok_or(StatusCode::NOT_FOUND)?;
-    Ok((StatusCode::ACCEPTED, Json(card_json(&updated))))
+    let status = if result.already_generating {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((
+        status,
+        Json(json!({
+            "card": card_json(&updated),
+            "generatingIssueId": result.generating_issue_id,
+            "alreadyGenerating": result.already_generating,
+        })),
+    ))
 }
 
 /// POST /status-cards/:id/refresh
+/// 对齐 Paperclip：创建 hidden update issue（Summarizer 执行刷新）并唤醒 agent。
 async fn refresh_status_card(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -393,16 +484,35 @@ async fn refresh_status_card(
     let company_id: Uuid = row.get("company_id");
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    sqlx::query(
-        "UPDATE status_cards SET updated_at = NOW() WHERE id = $1",
-    )
-    .bind(card_id)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to refresh status card: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let (created_by_agent, created_by_user) = match &actor {
+        AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
+        AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
+        _ => (None, None),
+    };
+    let worker = StatusCardWorker::new(state.pool.clone());
+    let result = worker
+        .request_refresh(card_id, false, "manual", created_by_agent, created_by_user)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to enqueue status card refresh: {}", e);
+            match e.as_str() {
+                "Status card not found" => StatusCode::NOT_FOUND,
+                "Archived status cards cannot be refreshed" => StatusCode::UNPROCESSABLE_ENTITY,
+                _ if e.contains("Compile the status-card query") => StatusCode::CONFLICT,
+                _ if e.contains("Summarizer built-in agent is not configured") => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        })?;
+    if !result.already_generating {
+        if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id, None).await {
+            let _ = state
+                .heartbeat_service
+                .wakeup(summarizer, result.generating_issue_id, company_id)
+                .await;
+        }
+    }
     crate::routes::log_activity(
         &state.pool,
         company_id,
@@ -410,11 +520,28 @@ async fn refresh_status_card(
         &actor,
         "status_card",
         card_id,
-        json!({ "enqueued": false }),
+        json!({
+            "generatingIssueId": result.generating_issue_id,
+            "alreadyGenerating": result.already_generating,
+            "enqueued": !result.already_generating,
+        }),
     )
     .await;
     let updated = load_card(&state, card_id).await?.ok_or(StatusCode::NOT_FOUND)?;
-    Ok((StatusCode::OK, Json(card_json(&updated))))
+    let status = if result.already_generating {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((
+        status,
+        Json(json!({
+            "card": card_json(&updated),
+            "generatingIssueId": result.generating_issue_id,
+            "alreadyGenerating": result.already_generating,
+            "enqueued": !result.already_generating,
+        })),
+    ))
 }
 
 /// GET /status-cards/:id/dry-run
@@ -437,6 +564,7 @@ async fn dry_run_status_card(
 }
 
 /// PUT /status-cards/:id/query
+/// 对齐 Paperclip：仅 Summarizer agent 且 generationIssueId 匹配时允许写回。
 async fn write_status_card_query(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -448,22 +576,51 @@ async fn write_status_card_query(
     let company_id: Uuid = row.get("company_id");
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    let agent_id = match &actor {
+        AuthorizationActor::Agent { agent_id, .. } => *agent_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+    // writer 校验：generationIssueId 必须匹配卡片当前占位。
+    let active_gid: Option<Uuid> = row.get("generating_issue_id");
+    let Some(gid) = request.generation_issue_id else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    if active_gid != Some(gid) {
+        return Err(StatusCode::CONFLICT);
+    }
     let current_version = row.get::<i32, _>("query_version");
     let next_version = request.query_version.unwrap_or(current_version + 1).max(current_version);
     sqlx::query(
-        "UPDATE status_cards SET queries = $3, query_version = $4, state = 'compiling', updated_at = NOW() \
+        "UPDATE status_cards SET queries = $3, query_version = $4, state = 'compiling', \
+         query_compiled_at = NOW(), query_compiled_by_agent_id = $5, failure_reason = NULL, \
+         title = CASE WHEN title_pinned THEN title ELSE COALESCE($6, title) END, \
+         updated_at = NOW() \
          WHERE id = $1 AND company_id = $2",
     )
     .bind(card_id)
     .bind(company_id)
     .bind(&request.queries)
     .bind(next_version)
+    .bind(agent_id)
+    .bind(request.title.as_deref())
     .execute(&state.pool)
     .await
     .map_err(|e| {
         tracing::error!("Failed to write status card query: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    // 记录执行记录（compile kind）。
+    let _ = sqlx::query(
+        "INSERT INTO status_card_update_runs \
+         (card_id, kind, trigger, generation_issue_id, query_version, change_summary, status, finished_at) \
+         VALUES ($1, 'compile', 'manual', $2, $3, $4, 'ok', NOW())",
+    )
+    .bind(card_id)
+    .bind(gid)
+    .bind(next_version)
+    .bind(request.change_summary.as_deref())
+    .execute(&state.pool)
+    .await;
     crate::routes::log_activity(
         &state.pool,
         company_id,
@@ -471,7 +628,7 @@ async fn write_status_card_query(
         &actor,
         "status_card",
         card_id,
-        json!({ "queryVersion": next_version }),
+        json!({ "queryVersion": next_version, "generationIssueId": gid }),
     )
     .await;
     let updated = load_card(&state, card_id).await?.ok_or(StatusCode::NOT_FOUND)?;
@@ -479,6 +636,8 @@ async fn write_status_card_query(
 }
 
 /// PUT /status-cards/:id/summary
+/// 对齐 Paperclip：仅 Summarizer agent 且 generationIssueId 匹配时允许写回；
+/// 完成后释放 generating_issue_id、写 summary revision 并推进 next_eval_at。
 async fn write_status_card_summary(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -490,20 +649,40 @@ async fn write_status_card_summary(
     let company_id: Uuid = row.get("company_id");
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    let (compiled_by_agent, compiled_by_user) = match &actor {
-        AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
-        AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
-        _ => (None, None),
+    let agent_id = match &actor {
+        AuthorizationActor::Agent { agent_id, .. } => *agent_id,
+        _ => return Err(StatusCode::FORBIDDEN),
     };
+    let active_gid: Option<Uuid> = row.get("generating_issue_id");
+    let Some(gid) = request.generation_issue_id else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    if active_gid != Some(gid) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let refresh_policy: Value = row.get("refresh_policy");
+    let now = chrono::Utc::now();
+    let next_eval = services::status_card_worker::next_status_card_evaluation_at(
+        &refresh_policy,
+        &now,
+    );
+    let query_version: i32 = row.get("query_version");
+    let revision_id = Uuid::new_v4();
     sqlx::query(
         "UPDATE status_cards SET summary_markdown = $3, summary_compiled_at = NOW(), \
-         summary_compiled_by_agent_id = $4, state = 'active', updated_at = NOW() \
-         WHERE id = $1 AND company_id = $2",
+         summary_compiled_by_agent_id = $4, state = 'active', failure_reason = NULL, \
+         generating_issue_id = NULL, last_generated_at = NOW(), last_model = $5, \
+         last_update_run_kind = $6, next_eval_at = $7, updated_at = NOW() \
+         WHERE id = $1 AND company_id = $2 AND generating_issue_id = $8",
     )
     .bind(card_id)
     .bind(company_id)
     .bind(&request.summary)
-    .bind(compiled_by_agent)
+    .bind(agent_id)
+    .bind(request.model.as_deref())
+    .bind("full")
+    .bind(next_eval)
+    .bind(gid)
     .execute(&state.pool)
     .await
     .map_err(|e| {
@@ -511,19 +690,42 @@ async fn write_status_card_summary(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     sqlx::query(
-        "INSERT INTO status_card_summary_revisions (card_id, markdown, compiled_by_agent_id) \
-         VALUES ($1, $2, $3)",
+        "INSERT INTO status_card_summary_revisions \
+         (id, card_id, markdown, compiled_by_agent_id, created_at) \
+         VALUES ($1, $2, $3, $4, NOW())",
     )
+    .bind(revision_id)
     .bind(card_id)
     .bind(&request.summary)
-    .bind(compiled_by_agent)
+    .bind(agent_id)
     .execute(&state.pool)
     .await
     .map_err(|e| {
         tracing::error!("Failed to record summary revision: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let _ = compiled_by_user;
+    // 关闭执行记录。
+    let _ = sqlx::query(
+        "UPDATE status_card_update_runs SET status = 'ok', finished_at = NOW(), \
+         model = COALESCE($3, model), change_summary = COALESCE($4, change_summary) \
+         WHERE generation_issue_id = $1 AND card_id = $2 AND status = 'running'",
+    )
+    .bind(gid)
+    .bind(card_id)
+    .bind(request.model.as_deref())
+    .bind(request.change_summary.as_deref())
+    .execute(&state.pool)
+    .await;
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "status_card.summary_written",
+        &actor,
+        "status_card",
+        card_id,
+        json!({ "queryVersion": query_version, "generationIssueId": gid }),
+    )
+    .await;
     let updated = load_card(&state, card_id).await?.ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(card_json(&updated)))
 }

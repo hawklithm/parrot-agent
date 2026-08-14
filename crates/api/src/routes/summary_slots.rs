@@ -1,5 +1,7 @@
 //! Summary Slots 路由 —— 对齐 Paperclip `server/src/routes/summary-slots.ts`（4 端点）。
-//! generate 依赖 agent 摘要执行器，Parrot 暂以同步语义占位（创建/更新 slot 并返回）。
+//! generate 迁移自 Paperclip 后台任务链：创建 hidden issue（Summarizer 内置 agent
+//! 执行摘要生成）并通过 heartbeat wakeup 唤醒；write 写回时校验 Summarizer +
+//! generationIssueId 匹配。
 
 use axum::{
     extract::{Extension, Path, State},
@@ -14,6 +16,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
+use services::summary_slot_worker::SummarySlotWorker;
 
 fn slot_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
     use sqlx::Row;
@@ -153,31 +156,85 @@ struct GenerateSummarySlotRequest {
 }
 
 /// POST /companies/:company_id/summary-slots/:scope_kind/:slot_key/generate
+/// 对齐 Paperclip：创建 hidden issue（Summarizer 执行）并唤醒 agent。
 async fn generate_summary_slot(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, scope_kind, slot_key)): Path<(Uuid, String, String)>,
     Json(request): Json<GenerateSummarySlotRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    let row = upsert_slot(&state, company_id, &scope_kind, request.scope_id, &slot_key).await?;
-    use sqlx::Row;
+    let (created_by_agent, created_by_user) = match &actor {
+        AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
+        AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
+        _ => (None, None),
+    };
+    let worker = SummarySlotWorker::new(state.pool.clone());
+    let result = worker
+        .generate(
+            company_id,
+            &scope_kind,
+            request.scope_id,
+            &slot_key,
+            created_by_agent,
+            created_by_user,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to enqueue summary slot generation: {}", e);
+            if e.contains("Summarizer built-in agent is not configured") {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    if !result.already_generating {
+        if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id).await {
+            let _ = state
+                .heartbeat_service
+                .wakeup(summarizer, result.generating_issue_id, company_id)
+                .await;
+        }
+    }
     crate::routes::log_activity(
         &state.pool,
         company_id,
         "summary_slot.generate_requested",
         &actor,
         "summary_slot",
-        row.get::<Uuid, _>("id"),
-        json!({ "scopeKind": scope_kind, "slotKey": slot_key }),
+        result.slot_id,
+        json!({
+            "scopeKind": scope_kind,
+            "slotKey": slot_key,
+            "generatingIssueId": result.generating_issue_id,
+            "alreadyGenerating": result.already_generating,
+        }),
     )
     .await;
-    Ok(Json(json!({
-        "slot": slot_json(&row),
-        "generatingIssueId": Value::Null,
-        "alreadyGenerating": false,
-    })))
+    let row = sqlx::query("SELECT * FROM summary_slots WHERE id = $1")
+        .bind(result.slot_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to reload summary slot: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let status = if result.already_generating {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((
+        status,
+        Json(json!({
+            "slot": slot_json(&row),
+            "generatingIssue": {
+                "id": result.generating_issue_id,
+            },
+            "alreadyGenerating": result.already_generating,
+        })),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +253,7 @@ struct WriteSummarySlotRequest {
 }
 
 /// PUT /companies/:company_id/summary-slots/:scope_kind/:slot_key
-/// 仅 Summarizer agent 可写（对齐 Paperclip）。
+/// 仅 Summarizer agent 可写（对齐 Paperclip assertSummarizerWriter）。
 async fn write_summary_slot(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -209,6 +266,22 @@ async fn write_summary_slot(
     };
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    // writer 校验：Summarizer 内置 agent + generationIssueId 匹配 slot 占位。
+    let worker = SummarySlotWorker::new(state.pool.clone());
+    worker
+        .assert_summarizer_writer(
+            company_id,
+            agent_id,
+            request.generation_issue_id,
+            &scope_kind,
+            request.scope_id,
+            &slot_key,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!("Summary slot writer check failed: {}", e);
+            StatusCode::FORBIDDEN
+        })?;
     let slot = upsert_slot(&state, company_id, &scope_kind, request.scope_id, &slot_key).await?;
     use sqlx::Row;
     let slot_id: Uuid = slot.get("id");

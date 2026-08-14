@@ -232,6 +232,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     job_scheduler.register(Arc::new(services::EnvironmentHealthProber::new(pool.clone()))).await;
     job_scheduler.register(Arc::new(services::StuckRunDetector::new(pool.clone()))).await;
     job_scheduler.register(Arc::new(services::ConsistencyCheckJob::new(pool.clone()))).await;
+    // 后台任务链：status-card scheduler tick + summary-slot 终态 finalizer
+    // （对应 paperclip heartbeatSchedulerInterval 中的 status-card tick）
+    job_scheduler.register(Arc::new(services::StatusCardSchedulerJob::new(pool.clone()))).await;
+    job_scheduler.register(Arc::new(services::SummarySlotFinalizerJob::new(pool.clone()))).await;
     
     // 启动调度器（30 秒间隔，对应 paperclip 的 heartbeatSchedulerIntervalMs）
     let _scheduler_handle = job_scheduler.clone().start(30000).await;

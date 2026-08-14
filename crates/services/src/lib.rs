@@ -294,8 +294,22 @@ pub use job_scheduler::{
     JobScheduler, ScheduledJob, JobSchedule, JobStatus, JobExecutionRecord,
     RoutineCronTrigger, MonitorCheckJob, LeaseExpiryScanner,
     EnvironmentHealthProber, StuckRunDetector, ConsistencyCheckJob,
+    StatusCardSchedulerJob, SummarySlotFinalizerJob,
     monitor_backoff_seconds, is_env_stale, is_run_stuck, ENV_IDLE_TIMEOUT,
 };
+pub mod status_card_worker;
+pub use status_card_worker::{
+    StatusCardWorker, StatusCardDeltaChange, StatusCardFingerprint, FingerprintEntry,
+    build_status_card_fingerprint, diff_status_card_fingerprint,
+    extract_issue_mentions, filter_status_card_changes, next_status_card_evaluation_at,
+    status_card_changes_hash, status_card_fingerprint_hash,
+    choose_status_card_update_kind, ChooseUpdateKindInput, evaluate_status_card_policy,
+    EvaluatePolicyInput, is_within_status_card_active_hours, GenerationEnqueue,
+    SUMMARIZER_BUILT_IN_KEY, TERMINAL_ISSUE_STATUSES, STALLED_GENERATION_STATUSES,
+    STATUS_CARD_MAX_MENTIONED_ISSUES,
+};
+pub mod summary_slot_worker;
+pub use summary_slot_worker::{SummarySlotWorker, SummarySlotGeneration};
 pub mod config;
 pub use config::*;
 pub mod adapter_plugin;
