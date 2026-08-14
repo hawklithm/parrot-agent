@@ -190,6 +190,21 @@ async fn create_company(
         .create(input, creator_user_id)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    // 对齐 Paperclip autoProvisionBundledAgents：公司创建后自动 provision Summarizer，
+    // 使 status-card / summary-slot 后台任务链的 hidden issue 可被唤醒执行。
+    if let Ok(summarizer) = state
+        .built_in_agent_service
+        .provision(company.id, services::BuiltInAgentKey::Summarizer, None)
+        .await
+    {
+        tracing::info!(
+            company_id = %company.id,
+            agent_id = %summarizer.id,
+            "auto-provisioned built-in Summarizer agent"
+        );
+    } else {
+        tracing::warn!(company_id = %company.id, "failed to auto-provision built-in Summarizer agent");
+    }
     Ok((StatusCode::CREATED, Json(company)))
 }
 

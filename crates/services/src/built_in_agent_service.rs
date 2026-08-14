@@ -11,6 +11,8 @@ pub enum BuiltInAgentKey {
     LearningAssistant,
     /// 简报生成器（Briefs Generator）
     BriefsGenerator,
+    /// 摘要生成器（Summarizer）——status-card / summary-slot 后台任务链的执行 agent
+    Summarizer,
 }
 
 impl BuiltInAgentKey {
@@ -20,6 +22,7 @@ impl BuiltInAgentKey {
             Self::ReflectionCoach,
             Self::LearningAssistant,
             Self::BriefsGenerator,
+            Self::Summarizer,
         ]
     }
 
@@ -29,6 +32,7 @@ impl BuiltInAgentKey {
             Self::ReflectionCoach => "reflection_coach",
             Self::LearningAssistant => "learning_assistant",
             Self::BriefsGenerator => "briefs_generator",
+            Self::Summarizer => "summarizer",
         }
     }
 
@@ -38,6 +42,7 @@ impl BuiltInAgentKey {
             "reflection_coach" => Some(Self::ReflectionCoach),
             "learning_assistant" => Some(Self::LearningAssistant),
             "briefs_generator" => Some(Self::BriefsGenerator),
+            "summarizer" => Some(Self::Summarizer),
             _ => None,
         }
     }
@@ -309,6 +314,42 @@ impl BuiltInAgentMetadataRegistry {
                 bundle: None,
             },
         );
+
+        // Summarizer（status-card / summary-slot 后台任务链执行 agent，对齐 Paperclip
+        // built-in "summarizer"：写人类可读的 Markdown 状态摘要，只读不写业务数据）
+        self.definitions.insert(
+            BuiltInAgentKey::Summarizer,
+            BuiltInAgentDefinition {
+                key: BuiltInAgentKey::Summarizer,
+                display_name: "Summarizer".to_string(),
+                feature_keys: vec!["summarizer".to_string()],
+                short_purpose:
+                    "Writes short, human-readable Markdown status summaries into status cards and summary slots on demand.".to_string(),
+                default_instructions: [
+                    "You are Summarizer, a built-in reporting agent at Paperclip.",
+                    "",
+                    "Turn the current state of a Paperclip scope (project, workspaces overview, or a single project workspace) into a short, honest, human-readable Markdown summary and write it back to that scope's summary slot as a new revision.",
+                    "",
+                    "Read-and-report only: never change issues, workspaces, or code. Cite issue identifiers, never fabricate status, keep every read company-scoped.",
+                    "",
+                ]
+                .join("\n"),
+                default_role: models::AgentRole::General,
+                default_title: Some("Summarizer".to_string()),
+                default_icon: Some("✨".to_string()),
+                default_permissions: Some(models::AgentPermissions {
+                    can_create_agents: false,
+                    can_create_skills: false,
+                    trust_preset: models::TrustPreset::Standard,
+                    authorization_policy: models::TrustAuthorizationPolicy::Manual,
+                }),
+                default_status: Some(models::AgentStatus::Idle),
+                default_manager: Some("single_root_agent".to_string()),
+                allowed_adapter_types: Some(vec!["claude_local".to_string(), "process".to_string()]),
+                default_budget_monthly_cents: Some(0),
+                bundle: None,
+            },
+        );
     }
 
     /// 获取内置Agent定义
@@ -408,10 +449,11 @@ mod tests {
     #[test]
     fn test_registry_initialization() {
         let registry = BuiltInAgentMetadataRegistry::new();
-        assert_eq!(registry.list_definitions().len(), 3);
+        assert_eq!(registry.list_definitions().len(), 4);
         assert!(registry.contains(BuiltInAgentKey::ReflectionCoach));
         assert!(registry.contains(BuiltInAgentKey::LearningAssistant));
         assert!(registry.contains(BuiltInAgentKey::BriefsGenerator));
+        assert!(registry.contains(BuiltInAgentKey::Summarizer));
     }
 
     #[test]

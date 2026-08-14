@@ -435,6 +435,36 @@ pub struct StatusCardWorker {
     pool: PgPool,
 }
 
+/// 待绑定参数（保持出现顺序，占位符 $1..$n）。
+enum BindVal {
+    Str(String),
+    Uuid(Uuid),
+    StatusList(Vec<String>),
+    PriorityList(Vec<String>),
+}
+
+/// 按 binds 顺序绑定并执行查询，返回行。
+async fn fetch_issue_rows(
+    pool: &PgPool,
+    sql: &str,
+    company_id: Uuid,
+    binds: &[BindVal],
+) -> Result<Vec<sqlx::postgres::PgRow>, String> {
+    let mut qb = sqlx::query(sql).bind(company_id);
+    for bind_val in binds {
+        match bind_val {
+            BindVal::Str(s) => qb = qb.bind(s),
+            BindVal::Uuid(u) => qb = qb.bind(u),
+            // sqlx-postgres 将 Vec<String> 编码为 text[]，可直接 bind。
+            BindVal::StatusList(list) => qb = qb.bind(list.clone()),
+            BindVal::PriorityList(list) => qb = qb.bind(list.clone()),
+        }
+    }
+    qb.fetch_all(pool)
+        .await
+        .map_err(|e| format!("execute status card query: {e}"))
+}
+
 impl StatusCardWorker {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -481,17 +511,19 @@ impl StatusCardWorker {
         description: &str,
         summarizer_agent_id: Uuid,
         created_by_agent_id: Option<Uuid>,
-        created_by_user_id: Option<String>,
+        created_by_user_id: Option<Uuid>,
         project_id: Option<Uuid>,
         project_workspace_id: Option<Uuid>,
     ) -> Result<Uuid, String> {
         let id = Uuid::new_v4();
+        // origin_fingerprint 必须唯一（issues 表有 (company_id, origin_fingerprint) 唯一约束）。
+        let origin_fingerprint = format!("status_card_generation:{}", id);
         sqlx::query(
             "INSERT INTO issues \
              (id, company_id, project_id, project_workspace_id, title, description, status, \
               priority, assignee_agent_id, created_by_agent_id, created_by_user_id, hidden_at, \
               origin_kind, origin_fingerprint) \
-             VALUES ($1,$2,$3,$4,$5,$6,'todo','medium',$7,$8,$9,NOW(),'status_card_generation','default')",
+             VALUES ($1,$2,$3,$4,$5,$6,'todo','medium',$7,$8,$9,NOW(),'status_card_generation',$10)",
         )
         .bind(id)
         .bind(company_id)
@@ -502,6 +534,7 @@ impl StatusCardWorker {
         .bind(summarizer_agent_id)
         .bind(created_by_agent_id)
         .bind(created_by_user_id)
+        .bind(&origin_fingerprint)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("create generation issue: {e}"))?;
@@ -514,7 +547,7 @@ impl StatusCardWorker {
         card_id: Uuid,
     ) -> Result<Option<Uuid>, String> {
         let row = sqlx::query(
-            "SELECT c.generating_issue_id AS gid, i.status AS status, i.description AS description \
+            "SELECT c.generating_issue_id AS gid, i.status::text AS status, i.description AS description \
              FROM status_cards c LEFT JOIN issues i ON i.id = c.generating_issue_id \
              WHERE c.id = $1",
         )
@@ -563,7 +596,7 @@ impl StatusCardWorker {
         &self,
         card_id: Uuid,
         created_by_agent_id: Option<Uuid>,
-        created_by_user_id: Option<String>,
+        created_by_user_id: Option<Uuid>,
     ) -> Result<GenerationEnqueue, String> {
         let row = sqlx::query(
             "SELECT id, company_id, interest_prompt, title, agent_id, generating_issue_id, \
@@ -640,22 +673,204 @@ impl StatusCardWorker {
         })
     }
 
-    /// 请求刷新（对应 requestRefresh 的调度面：claim + 去重）。
+    /// 执行卡片查询，返回 issue 快照（对应 Paperclip executeQueries 的轻量版）。
     ///
-    /// 说明：完整 requestRefresh 需要执行 company-search 查询来构建 fingerprint，
-    /// 该能力由 search 服务提供；当前 worker 实现「任务链调度面」——
-    /// 若存在活跃生成任务则幂等返回，否则创建 refresh 任务。
+    /// 每个查询支持：scope(project/project_workspace/all)、status/priority 过滤、
+    /// assigneeAgentId/projectId/labelId/limit。查询结果去重合并，并附带
+    /// 最近人工评论时间（用于 fingerprint 的 human_comment 变更检测）。
+    pub async fn execute_queries(
+        &self,
+        company_id: Uuid,
+        queries: &Value,
+    ) -> Result<Vec<Value>, String> {
+        let mut issue_map: std::collections::BTreeMap<String, Value> = Default::default();
+        let Some(query_array) = queries.as_array() else {
+            return Ok(Vec::new());
+        };
+
+        for query in query_array {
+            if !query.is_object() {
+                continue;
+            }
+            let scope = query.get("scope").and_then(|v| v.as_str()).unwrap_or("all");
+            let limit = query
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(20)
+                .clamp(1, 50);
+            let parse_list = |key: &str| -> Vec<String> {
+                match query.get(key) {
+                    Some(Value::String(s)) => s
+                        .split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect(),
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect(),
+                    _ => vec![],
+                }
+            };
+            let statuses = parse_list("status");
+            let priorities = parse_list("priority");
+            let assignee_agent_id = query.get("assigneeAgentId").and_then(|v| {
+                let s = v.as_str().unwrap_or("");
+                if s.is_empty() || s.eq_ignore_ascii_case("null") {
+                    None
+                } else {
+                    Uuid::parse_str(s).ok()
+                }
+            });
+            let project_id = query
+                .get("projectId")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            let project_workspace_id = query
+                .get("projectWorkspaceId")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            let label_id = query
+                .get("labelId")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            let q = query
+                .get("q")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            // 构造 WHERE + bind 顺序（$1 固定为 company_id）。
+            let mut where_clauses = vec!["company_id = $1".to_string(), "hidden_at IS NULL".to_string()];
+            let mut binds: Vec<BindVal> = Vec::new();
+            let mut next_ph = |binds: &mut Vec<BindVal>| format!("${}", binds.len() + 2);
+
+            if scope == "project" {
+                let Some(pid) = project_id else { continue };
+                let ph = next_ph(&mut binds);
+                where_clauses.push(format!("project_id = {}", ph));
+                binds.push(BindVal::Uuid(pid));
+            } else if scope == "project_workspace" {
+                let Some(wid) = project_workspace_id else { continue };
+                let ph = next_ph(&mut binds);
+                where_clauses.push(format!("project_workspace_id = {}", ph));
+                binds.push(BindVal::Uuid(wid));
+            }
+            if !statuses.is_empty() {
+                let ph = next_ph(&mut binds);
+                where_clauses.push(format!("status = ANY({}::issue_status[])", ph));
+                binds.push(BindVal::StatusList(statuses));
+            }
+            if !priorities.is_empty() {
+                let ph = next_ph(&mut binds);
+                where_clauses.push(format!("priority = ANY({}::issue_priority[])", ph));
+                binds.push(BindVal::PriorityList(priorities));
+            }
+            if let Some(aid) = assignee_agent_id {
+                let ph = next_ph(&mut binds);
+                where_clauses.push(format!("assignee_agent_id = {}", ph));
+                binds.push(BindVal::Uuid(aid));
+            }
+            if let Some(pid) = project_id {
+                let ph = next_ph(&mut binds);
+                where_clauses.push(format!("project_id = {}", ph));
+                binds.push(BindVal::Uuid(pid));
+            }
+            if let Some(lid) = label_id {
+                let ph = next_ph(&mut binds);
+                where_clauses.push(format!(
+                    "EXISTS (SELECT 1 FROM issue_labels il WHERE il.issue_id = issues.id AND il.label_id = {})",
+                    ph
+                ));
+                binds.push(BindVal::Uuid(lid));
+            }
+            if !q.is_empty() {
+                let ph = next_ph(&mut binds);
+                where_clauses.push(format!(
+                    "(title ILIKE '%' || {} || '%' OR coalesce(identifier,'') ILIKE '%' || {} || '%')",
+                    ph, ph
+                ));
+                binds.push(BindVal::Str(q.clone()));
+            }
+
+            let sql = format!(
+                "SELECT id, identifier, title, status::text AS status, priority::text AS priority, assignee_agent_id, assignee_user_id, updated_at \
+                 FROM issues WHERE {} \
+                 ORDER BY updated_at DESC LIMIT {}",
+                where_clauses.join(" AND "),
+                limit
+            );
+            let rows = fetch_issue_rows(&self.pool, &sql, company_id, &binds).await?;
+            for row in rows {
+                let id: Uuid = row.get("id");
+                let identifier: Option<String> = row.get("identifier");
+                let title: String = row.get("title");
+                let status: String = row.get("status");
+                let priority: String = row.get("priority");
+                let assignee_agent_id: Option<Uuid> = row.get("assignee_agent_id");
+                let assignee_user_id: Option<String> = row.get("assignee_user_id");
+                let updated_at: DateTime<Utc> = row.get("updated_at");
+                issue_map.insert(
+                    id.to_string(),
+                    json!({
+                        "id": id.to_string(),
+                        "identifier": identifier,
+                        "title": title,
+                        "status": status,
+                        "priority": priority,
+                        "assigneeAgentId": assignee_agent_id.map(|v| v.to_string()),
+                        "assigneeUserId": assignee_user_id,
+                        "updatedAt": updated_at.to_rfc3339(),
+                    }),
+                );
+            }
+        }
+        // 补充最近人工评论时间。
+        if !issue_map.is_empty() {
+            let ids: Vec<Uuid> = issue_map
+                .keys()
+                .filter_map(|k| Uuid::parse_str(k).ok())
+                .collect();
+            if ids.is_empty() {
+                return Ok(issue_map.into_values().collect());
+            }
+            let rows = sqlx::query(
+                "SELECT issue_id, max(updated_at) AS latest \
+                 FROM issue_comments WHERE company_id = $1 AND issue_id = ANY($2::uuid[]) \
+                   AND actor_type = 'user' \
+                 GROUP BY issue_id",
+            )
+            .bind(company_id)
+            .bind(&ids[..])
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("load latest human comments: {e}"))?;
+            for row in rows {
+                let issue_id: Uuid = row.get("issue_id");
+                let latest: DateTime<Utc> = row.get("latest");
+                if let Some(entry) = issue_map.get_mut(&issue_id.to_string()) {
+                    entry["latestHumanCommentAt"] = json!(latest.to_rfc3339());
+                }
+            }
+        }
+        Ok(issue_map.into_values().collect())
+    }
+
+    /// 请求刷新（对应 requestRefresh：执行查询 -> fingerprint diff -> policy 评估 ->
+    /// 决定创建 refresh 任务或仅更新调度状态）。
     pub async fn request_refresh(
         &self,
         card_id: Uuid,
         full: bool,
         trigger: &str,
         created_by_agent_id: Option<Uuid>,
-        created_by_user_id: Option<String>,
+        created_by_user_id: Option<Uuid>,
     ) -> Result<GenerationEnqueue, String> {
         let row = sqlx::query(
             "SELECT id, company_id, title, interest_prompt, agent_id, queries, generating_issue_id, \
-             archived_at, state, query_version FROM status_cards WHERE id = $1",
+             archived_at, state, query_version, fingerprint, refresh_policy, pending_change_hash, \
+             last_change_at, next_eval_at, summary_markdown FROM status_cards WHERE id = $1",
         )
         .bind(card_id)
         .fetch_optional(&self.pool)
@@ -678,9 +893,131 @@ impl StatusCardWorker {
                 already_generating: true,
             });
         }
+
+        // 1) 执行查询构建指纹。
+        let now = Utc::now();
+        let snapshot = self.execute_queries(company_id, &queries).await?;
+        let fingerprint = build_status_card_fingerprint(&snapshot);
+        let previous: Option<StatusCardFingerprint> = row
+            .get::<Option<Value>, _>("fingerprint")
+            .and_then(|v| serde_json::from_value(v).ok());
+        let all_changes = diff_status_card_fingerprint(previous.as_ref(), &fingerprint);
+        let refresh_policy: Value = row.get("refresh_policy");
+        let changes = filter_status_card_changes(all_changes, &refresh_policy);
+        let is_manual = trigger == "manual" || trigger == "restore";
+        let next_eval = next_status_card_evaluation_at(&refresh_policy, &now);
+        let fingerprint_hash = status_card_fingerprint_hash(&fingerprint);
+
+        // 2) 无变化且非手动 -> 仅更新调度状态，不创建任务。
+        if !is_manual && changes.is_empty() {
+            tracing::debug!(
+                %card_id,
+                snapshot_len = snapshot.len(),
+                "status card refresh: no changes, skipping enqueue"
+            );
+            sqlx::query(
+                "UPDATE status_cards SET pending_change_count = 0, pending_change_hash = NULL, \
+                 last_change_at = NULL, state = 'active', fingerprint = $3, fingerprint_at = $4, \
+                 next_eval_at = $5, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(card_id)
+            .bind(company_id)
+            .bind(serde_json::to_value(&fingerprint).unwrap_or(Value::Null))
+            .bind(now)
+            .bind(next_eval)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("update card after no-change refresh: {e}"))?;
+            return Ok(GenerationEnqueue {
+                card_id,
+                generating_issue_id: Uuid::nil(),
+                already_generating: true, // 语义上：无变化 -> 未入队
+            });
+        }
+
+        // 3) policy 评估（预算/活跃时段/频率）。
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM status_card_update_runs WHERE card_id = $1 \
+             AND started_at >= $2 AND kind <> 'compile' AND finished_at IS NOT NULL",
+        )
+        .bind(card_id)
+        .bind(now - chrono::Duration::hours(1))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("count recent updates: {e}"))?;
+        let tokens_today: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(input_tokens + output_tokens), 0) FROM status_card_update_runs \
+             WHERE card_id = $1 AND started_at >= $2",
+        )
+        .bind(card_id)
+        .bind(
+            now.date_naive()
+                .and_hms_opt(0, 0, 0)
+                .map(|d| d.and_utc())
+                .unwrap_or(now),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("sum daily tokens: {e}"))?;
+        let last_change_at: Option<DateTime<Utc>> = row.get("last_change_at");
+        let pending_change_hash: Option<String> = row.get("pending_change_hash");
+        let new_change_hash = status_card_changes_hash(&changes);
+        let last_change_at_effective = if pending_change_hash.as_deref() == Some(new_change_hash.as_str())
+            && last_change_at.is_some()
+        {
+            last_change_at
+        } else {
+            Some(now)
+        };
+        let decision = evaluate_status_card_policy(EvaluatePolicyInput {
+            policy: refresh_policy.clone(),
+            now,
+            last_change_at: last_change_at_effective,
+            updates_last_hour: history_count as usize,
+            tokens_today,
+            manual: is_manual,
+        });
+        if decision != PolicyDecision::Run {
+            let state = match decision {
+                PolicyDecision::PauseBudget => "paused_budget",
+                PolicyDecision::PauseHours => "paused_hours",
+                _ => "active",
+            };
+            let due_at = match decision {
+                PolicyDecision::Wait { due_at } => due_at.or(next_eval),
+                _ => next_eval,
+            };
+            sqlx::query(
+                "UPDATE status_cards SET pending_change_count = $3, pending_change_hash = $4, \
+                 last_change_at = $5, state = $6, fingerprint = $7, fingerprint_at = $8, \
+                 next_eval_at = $9, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(card_id)
+            .bind(company_id)
+            .bind(changes.len() as i32)
+            .bind(&new_change_hash)
+            .bind(last_change_at_effective)
+            .bind(state)
+            .bind(serde_json::to_value(&fingerprint).unwrap_or(Value::Null))
+            .bind(now)
+            .bind(due_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("update card after policy decision: {e}"))?;
+            return Ok(GenerationEnqueue {
+                card_id,
+                generating_issue_id: Uuid::nil(),
+                already_generating: true, // 未入队（wait/pause）
+            });
+        }
+
+        // 4) 决策 run -> 创建 refresh 任务。
         let summarizer = self.resolve_summarizer_agent_id(company_id, None).await?;
         let title: Option<String> = row.get("title");
         let interest_prompt: String = row.get("interest_prompt");
+        let has_document: bool = row
+            .get::<Option<String>, _>("summary_markdown")
+            .is_some();
         let issue_title = format!(
             "{} status card: {}",
             if full { "Rebuild" } else { "Update" },
@@ -693,6 +1030,9 @@ impl StatusCardWorker {
             "kind": if full { "full" } else { "incremental" },
             "trigger": trigger,
             "queryVersion": row.get::<i32, _>("query_version"),
+            "fingerprint": serde_json::to_value(&fingerprint).unwrap_or(Value::Null),
+            "fingerprintHash": fingerprint_hash,
+            "changes": changes.iter().map(|c| c.to_json()).collect::<Vec<_>>(),
         });
         let description = format!(
             "Update this Paperclip status card.\n\n```json\n{}\n```",
@@ -712,13 +1052,22 @@ impl StatusCardWorker {
             .await?;
         sqlx::query(
             "UPDATE status_cards SET generating_issue_id = $2, state = 'active', \
-             failure_reason = NULL, updated_at = NOW() WHERE id = $1",
+             failure_reason = NULL, pending_change_count = $3, pending_change_hash = $4, \
+             last_change_at = $5, fingerprint = $6, fingerprint_at = $7, next_eval_at = $8, \
+             updated_at = NOW() WHERE id = $1",
         )
         .bind(card_id)
         .bind(issue_id)
+        .bind(changes.len() as i32)
+        .bind(&new_change_hash)
+        .bind(last_change_at_effective)
+        .bind(serde_json::to_value(&fingerprint).unwrap_or(Value::Null))
+        .bind(now)
+        .bind(next_eval)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("claim card refresh: {e}"))?;
+        let _ = has_document;
         Ok(GenerationEnqueue {
             card_id,
             generating_issue_id: issue_id,
@@ -777,9 +1126,9 @@ impl StatusCardWorker {
     /// （对应 finalizeStatusCardsForStalledGeneration）。
     pub async fn finalize_stalled_generations(&self) -> Result<usize, String> {
         let stalled = sqlx::query(
-            "SELECT i.id AS issue_id, i.company_id, i.identifier, i.title, i.status \
+            "SELECT i.id AS issue_id, i.company_id, i.identifier, i.title, i.status::text AS status \
              FROM issues i \
-             WHERE i.status = ANY($1) \
+             WHERE i.status = ANY($1::issue_status[]) \
                AND EXISTS (SELECT 1 FROM status_cards c WHERE c.generating_issue_id = i.id)",
         )
         .bind(&STALLED_GENERATION_STATUSES[..])

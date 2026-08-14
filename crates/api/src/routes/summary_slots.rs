@@ -167,7 +167,7 @@ async fn generate_summary_slot(
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let (created_by_agent, created_by_user) = match &actor {
         AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
-        AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
+        AuthorizationActor::Board { user_id, .. } => (None, Some(*user_id)),
         _ => (None, None),
     };
     let worker = SummarySlotWorker::new(state.pool.clone());

@@ -113,8 +113,15 @@ impl SummarySlotWorker {
             "project_workspace" => ("AND project_workspace_id = $2".to_string(), scope_id),
             _ => ("".to_string(), None),
         };
+        // scope 需要 scope_id 但缺失时，返回空快照（避免 SQL 参数占位符悬空）。
+        if !where_sql.is_empty() && project_id.is_none() {
+            return Ok("## Prebuilt scope snapshot\n\nSnapshot generated at "
+                .to_string()
+                + &Utc::now().to_rfc3339()
+                + "\n\n(scope target not resolved — empty snapshot)");
+        }
         let sql = format!(
-            "SELECT identifier, title, status, priority, updated_at \
+            "SELECT identifier, title, status::text AS status, priority::text AS priority, updated_at \
              FROM issues WHERE company_id = $1 AND hidden_at IS NULL {} \
              ORDER BY updated_at DESC LIMIT 12",
             where_sql
@@ -170,7 +177,7 @@ impl SummarySlotWorker {
         scope_id: Option<Uuid>,
         slot_key: &str,
         created_by_agent_id: Option<Uuid>,
-        created_by_user_id: Option<String>,
+        created_by_user_id: Option<Uuid>,
     ) -> Result<SummarySlotGeneration, String> {
         // 幂等：已有 generating 且 issue 活跃 -> 返回 in-flight。
         if let Some(slot_id) = self.find_slot(company_id, scope_kind, scope_id, slot_key).await? {
@@ -187,7 +194,7 @@ impl SummarySlotWorker {
             if slot_status == "generating" {
                 if let Some(gid) = gid {
                     let issue_status: Option<String> =
-                        sqlx::query_scalar("SELECT status FROM issues WHERE id = $1")
+                        sqlx::query_scalar("SELECT status::text FROM issues WHERE id = $1")
                             .bind(gid)
                             .fetch_optional(&self.pool)
                             .await
@@ -239,11 +246,13 @@ impl SummarySlotWorker {
             scope_snapshot,
         );
         let issue_id = Uuid::new_v4();
+        // origin_fingerprint 必须唯一（issues 表有 (company_id, origin_fingerprint) 唯一约束）。
+        let origin_fingerprint = format!("summary_slot_generation:{}", issue_id);
         sqlx::query(
             "INSERT INTO issues \
              (id, company_id, title, description, status, priority, assignee_agent_id, \
               created_by_agent_id, created_by_user_id, hidden_at, origin_kind, origin_fingerprint) \
-             VALUES ($1,$2,$3,$4,'todo','medium',$5,$6,$7,NOW(),'summary_slot_generation','default')",
+             VALUES ($1,$2,$3,$4,'todo','medium',$5,$6,$7,NOW(),'summary_slot_generation',$8)",
         )
         .bind(issue_id)
         .bind(company_id)
@@ -252,6 +261,7 @@ impl SummarySlotWorker {
         .bind(summarizer)
         .bind(created_by_agent_id)
         .bind(created_by_user_id)
+        .bind(&origin_fingerprint)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("create generation issue: {e}"))?;
@@ -294,9 +304,9 @@ impl SummarySlotWorker {
     /// finalization：issue 终态时 slot -> failed（对应 finalizeSummarySlotsForTerminalIssue）。
     pub async fn finalize_terminal_issues(&self) -> Result<usize, String> {
         let terminal = sqlx::query(
-            "SELECT i.id AS issue_id, i.company_id, i.identifier, i.title, i.status \
+            "SELECT i.id AS issue_id, i.company_id, i.identifier, i.title, i.status::text AS status \
              FROM issues i \
-             WHERE i.status = ANY($1) \
+             WHERE i.status = ANY($1::issue_status[]) \
                AND EXISTS (SELECT 1 FROM summary_slots s \
                            WHERE s.generating_issue_id = i.id AND s.status = 'generating')",
         )

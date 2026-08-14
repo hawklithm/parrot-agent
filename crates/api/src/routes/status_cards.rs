@@ -187,11 +187,14 @@ async fn create_status_card(
 
     // 对齐 Paperclip：创建后自动 enqueue compile（Summarizer 编译查询并写首版摘要）。
     let worker = StatusCardWorker::new(state.pool.clone());
+    let created_by_user_uuid = created_by_user
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok());
     if let Ok(compile) = worker
         .request_compile(
             id,
             created_by_agent,
-            created_by_user.clone(),
+            created_by_user_uuid,
         )
         .await
     {
@@ -284,7 +287,7 @@ async fn patch_status_card(
     if prompt_changed {
         let (created_by_agent, created_by_user) = match &actor {
             AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
-            AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
+            AuthorizationActor::Board { user_id, .. } => (None, Some(*user_id)),
             _ => (None, None),
         };
         let worker = StatusCardWorker::new(state.pool.clone());
@@ -416,7 +419,7 @@ async fn recompile_status_card(
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let (created_by_agent, created_by_user) = match &actor {
         AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
-        AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
+        AuthorizationActor::Board { user_id, .. } => (None, Some(*user_id)),
         _ => (None, None),
     };
     let worker = StatusCardWorker::new(state.pool.clone());
@@ -486,7 +489,7 @@ async fn refresh_status_card(
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let (created_by_agent, created_by_user) = match &actor {
         AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
-        AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
+        AuthorizationActor::Board { user_id, .. } => (None, Some(*user_id)),
         _ => (None, None),
     };
     let worker = StatusCardWorker::new(state.pool.clone());
