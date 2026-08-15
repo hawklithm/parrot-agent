@@ -112,8 +112,8 @@ impl PrincipalAccessCompatibilityService {
     
     async fn is_resource_available(
         &self,
-        resource_id: Uuid,
-        resource_type: &str,
+        _resource_id: Uuid,
+        _resource_type: &str,
     ) -> PrincipalAccessResult<bool> {
         // 简化实现：假设大多数资源可用
         Ok(true)
@@ -122,7 +122,7 @@ impl PrincipalAccessCompatibilityService {
     async fn has_compatible_permissions(
         &self,
         principal_id: Uuid,
-        principal_type: &PrincipalType,
+        _principal_type: &PrincipalType,
         resource_id: Uuid,
     ) -> PrincipalAccessResult<bool> {
         // 检查权限表

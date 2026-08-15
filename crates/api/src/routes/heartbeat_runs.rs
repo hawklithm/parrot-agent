@@ -28,6 +28,7 @@ use axum::{
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use uuid::Uuid;
+use sqlx::Row;
 
 use crate::app_state::AppState;
 use services::auth::AuthorizationActor;

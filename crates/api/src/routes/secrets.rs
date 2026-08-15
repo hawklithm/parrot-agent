@@ -25,6 +25,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use sqlx::Row;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;

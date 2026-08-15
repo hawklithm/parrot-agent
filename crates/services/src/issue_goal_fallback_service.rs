@@ -116,7 +116,7 @@ impl IssueGoalFallbackService {
     
     pub async fn suggest_fallback_strategy(
         &self,
-        issue_id: Uuid,
+        _issue_id: Uuid,
         failure_reason: &str,
     ) -> IssueGoalFallbackResult<FallbackStrategy> {
         // 基于失败原因建议降级策略

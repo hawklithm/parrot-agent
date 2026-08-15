@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::Deserialize;
 use uuid::Uuid;
+use sqlx::Row;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;

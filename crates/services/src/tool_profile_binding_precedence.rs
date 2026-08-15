@@ -75,7 +75,7 @@ impl ToolProfileBindingPrecedence {
         match (binding_context, current_context) {
             (BindingContext::Global, _) => true,
             (BindingContext::Workspace(w1), BindingContext::Workspace(w2)) => w1 == w2,
-            (BindingContext::Workspace(w1), BindingContext::Agent(a)) => {
+            (BindingContext::Workspace(_w1), BindingContext::Agent(_a)) => {
                 // In production, would check if agent belongs to workspace
                 true
             }

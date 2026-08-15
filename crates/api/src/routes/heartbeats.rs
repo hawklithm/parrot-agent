@@ -9,6 +9,7 @@ use crate::app_state::AppState;
 use crate::schemas::{
     derive_agent_url_key, parse_scheduler_heartbeat_policy, InstanceSchedulerHeartbeatAgent,
 };
+use sqlx::Row;
 
 /// GET /instance/scheduler-heartbeats
 /// 获取所有配置了调度心跳的 Agent 列表（需要 Instance Admin 权限）

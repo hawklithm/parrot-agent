@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     sqlx::query("CREATE INDEX idx_instruction_templates_name ON instruction_templates(name)")
         .execute(&pool).await?;
-    sqlx::query("CREATE INDEX idx_instruction_templates_created_at ON instruction_templates(created_C)")
+    sqlx::query("CREATE INDEX idx_instruction_templates_created_at ON instruction_templates(created_at)")
         .execute(&pool).await?;
     sqlx::query("CREATE INDEX idx_instruction_templates_version ON instruction_templates(version)")
         .execute(&pool).await?;
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::query(r#"
         INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
         VALUES 
-            (20260815000001,ugin_managed_resources', NOW(), true, decode('00000000000000000000000000000000', 'hex'), 0),
+            (20260815000001, 'create_plugin_managed_resources', NOW(), true, decode('00000000000000000000000000000000', 'hex'), 0),
             (20260815000002, 'create_instruction_templates', NOW(), true, decode('00000000000000000000000000000000', 'hex'), 0)
         ON CONFLICT (version) DO NOTHING
     "#)

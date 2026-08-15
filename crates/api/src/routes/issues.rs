@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use crate::app_state::AppState;
 use uuid::Uuid;
+use sqlx::Row;
 
 use models::{CreateIssueInput, Issue, IssuePriority, IssueStatus, UpdateIssueInput};
 use services::{

@@ -85,8 +85,11 @@ impl HotRestartService {
         }))
     }
     
-    pub async fn initiate_restart(&self, service_name: &str) -> HotRestartResult<()> {
-        // 简化实现：实际应触发服务重启
+    pub async fn initiate_restart(&self, _service_name: &str) -> HotRestartResult<()> {
+        // TODO: 实现实际的服务重启逻辑
+        // 1. 保存当前状态
+        // 2. 优雅关闭服务
+        // 3. 启动新版本
         Ok(())
     }
 }

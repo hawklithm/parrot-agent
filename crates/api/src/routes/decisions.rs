@@ -21,8 +21,8 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
+use sqlx::postgres::PgRow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 

@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use uuid::Uuid;
+use sqlx::Row;
 use futures::StreamExt;
 use models::{CommentActorType, CreateIssueInput, UpdateIssueInput};
 use services::issue_service::{CheckoutInput, IssueQueryFilter, Pagination as IssuePagination, ReleaseInput};

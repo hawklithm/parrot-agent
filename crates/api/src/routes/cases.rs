@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use uuid::Uuid;
+use sqlx::Row;
 
 use models::{Case, CaseDetail, CaseEvent, CreateCaseInput, PipelineCase, UpdateCaseInput};
 use services::{AdvanceCaseInput, CaseQueryFilter, Pagination};

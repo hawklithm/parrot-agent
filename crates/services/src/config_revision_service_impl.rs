@@ -4,7 +4,6 @@ use models::AgentConfigRevision;
 use repositories::{AgentRepository, ConfigRevisionRepository, RepositoryError};
 use serde_json::Value;
 use sqlx::types::Json;
-use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
 

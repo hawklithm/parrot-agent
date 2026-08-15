@@ -26,7 +26,7 @@ pub enum Priority {
     Info = 1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AttentionType {
     Task,
     Issue,
@@ -185,8 +185,8 @@ impl AttentionService {
         let mut items: Vec<&AttentionItem> = self.items.values()
             .filter(|item| {
                 // 过滤类型
-                if let Some(ref t) = filter.item_type {
-                    if !matches!(&item.item_type, t) {
+                if let Some(ref filter_type) = filter.item_type {
+                    if &item.item_type != filter_type {
                         return false;
                     }
                 }

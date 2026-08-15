@@ -112,7 +112,7 @@ impl ExecutionWorkspacePolicyService {
         &self,
         workspace_id: Uuid,
         file_path: &str,
-        operation: &str,
+        _operation: &str,
     ) -> ExecutionWorkspacePolicyResult<()> {
         let policies = self.get_policies(workspace_id).await?;
         

@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
@@ -122,8 +121,43 @@ impl ToolRuntimeSupervisor {
         let mut breakers = self.circuit_breakers.write().await;
         let breaker = breakers.entry(tool_name.to_string())
             .or_insert_with(|| CircuitBreaker::new(5));
-        
         breaker.can_execute()
+    }
+    
+    /// 带超时的工具执行包装
+    pub async fn execute_with_timeout<F, T>(
+        &self,
+        tool_name: &str,
+        timeout: Option<Duration>,
+        f: F,
+    ) -> SupervisorResult<T>
+    where
+        F: std::future::Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
+    {
+        // 使用指定的超时或默认超时
+        let effective_timeout = timeout.unwrap_or(self.default_timeout);
+        let start = std::time::Instant::now();
+        
+        // 执行带超时的操作
+        match tokio::time::timeout(effective_timeout, f).await {
+            Ok(Ok(result)) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                self.record_success(tool_name, duration_ms).await;
+                Ok(result)
+            }
+            Ok(Err(e)) => {
+                self.record_failure(tool_name, false).await;
+                Err(SupervisorError::ExecutionError(e.to_string()))
+            }
+            Err(_) => {
+                self.record_failure(tool_name, true).await;
+                Err(SupervisorError::Timeout(format!(
+                    "tool {} execution exceeded {}ms",
+                    tool_name,
+                    effective_timeout.as_millis()
+                )))
+            }
+        }
     }
     
     /// 记录成功调用
@@ -150,6 +184,8 @@ impl ToolRuntimeSupervisor {
         metric.success_count += 1;
         metric.total_duration_ms += duration_ms;
     }
+    
+    
     
     /// 记录失败调用
     pub async fn record_failure(&self, tool_name: &str, is_timeout: bool) {

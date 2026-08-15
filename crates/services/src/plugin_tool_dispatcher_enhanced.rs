@@ -9,7 +9,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
+
+use super::plugin_worker_manager::{PluginWorkerManager, WorkerError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
@@ -64,12 +67,12 @@ pub struct ParameterSchema {
 
 /// 增强版工具调度器
 pub struct PluginToolDispatcher {
-    // 简化实现，实际应该包含工具注册表和worker管理器
+    worker_manager: Option<Arc<PluginWorkerManager>>,
 }
 
 impl PluginToolDispatcher {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(worker_manager: Option<Arc<PluginWorkerManager>>) -> Self {
+        Self { worker_manager }
     }
     
     /// 验证调用参数
@@ -124,39 +127,88 @@ impl PluginToolDispatcher {
         Ok(params)
     }
     
-    async fn execute_tool(&self, call: &ToolCall) -> DispatchResult<Value> {
-        // 模拟工具执行
-        // 实际实现应该：
-        // 1. 查找工具所属的plugin
-        // 2. 获取worker进程
-        // 3. 通过IPC发送调用请求
-        // 4. 等待结果并处理超时
+    /// 执行工具调用
+    pub async fn execute_tool(&self, call: &ToolCall) -> DispatchResult<ToolResult> {
+        let start_time = std::time::Instant::now();
         
-        Ok(Value::Object(serde_json::Map::new()))
+        // 1. 检查 worker_manager 是否可用
+        let worker_manager = self.worker_manager.as_ref()
+            .ok_or_else(|| DispatchError::ExecutionError(
+                "worker_manager not configured".to_string()
+            ))?;
+        
+        // 2. 验证 worker 是否运行
+        if !worker_manager.is_running(call.plugin_id).await {
+            return Err(DispatchError::PluginNotAvailable(call.plugin_id));
+        }
+        
+        // 3. 准备 RPC 参数
+        let rpc_params = serde_json::json!({
+            "toolName": call.tool_name,
+            "parameters": call.parameters,
+            "runContext": {
+                "agentId": call.agent_id.to_string(),
+                "callId": call.call_id.to_string(),
+            }
+        });
+        
+        // 4. 通过 IPC 调用 worker 的 executeTool 方法
+        let result = worker_manager
+            .call(
+                call.plugin_id,
+                "executeTool".to_string(),
+                rpc_params,
+                call.timeout_ms,
+            )
+            .await
+            .map_err(|e| match e {
+                WorkerError::RpcTimeout { timeout_ms, .. } => {
+                    DispatchError::Timeout(timeout_ms)
+                }
+                WorkerError::NotRunning(plugin_id) => {
+        DispatchError::PluginNotAvailable(plugin_id)
+                }
+                _ => DispatchError::ExecutionError(e.to_string()),
+            })?;
+        
+        // 5. 计算执行时间
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        
+        // 6. 解析结果
+        let success = result.get("error").is_none();
+        let error = result.get("error")
+            .and_then(|e| e.as_str())
+            .map(|s| s.to_string());
+        
+        // 7. 构造返回结果
+        Ok(ToolResult {
+            call_id: call.call_id,
+          success,
+            result: Some(result),
+            error,
+            execution_time_ms,
+            metadata: HashMap::new(),
+        })
     }
     
     /// 序列化结果
-    pub fn serialize_result(&self, result: &ToolResult) -> DispatchResult<String> {
-        serde_json::to_string(result)
-            .map_err(|e| DispatchError::SerializationError(e.to_string()))
-    }
     
-    /// 反序列化参数
-    pub fn deserialize_parameters(&self, json: &str) -> DispatchResult<HashMap<String, Value>> {
-        serde_json::from_str(json)
-            .map_err(|e| DispatchError::SerializationError(e.to_string()))
-    }
-    
-    /// 传播错误
+    /// 将错误传播为工具结果
     pub fn propagate_error(&self, error: DispatchError) -> ToolResult {
         ToolResult {
-            call_id: Uuid::new_v4(),
+            call_id: uuid::Uuid::new_v4(),
             success: false,
             result: None,
             error: Some(error.to_string()),
             execution_time_ms: 0,
             metadata: HashMap::new(),
         }
+    }
+}
+
+impl Default for PluginToolDispatcher {
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 

@@ -3,7 +3,7 @@
 /// GitHub PR合并管理
 
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]

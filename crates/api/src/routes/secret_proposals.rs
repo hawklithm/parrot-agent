@@ -19,6 +19,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
+use sqlx::Row;
 
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};

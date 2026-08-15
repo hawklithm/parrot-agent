@@ -24,12 +24,12 @@ use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::Row;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{interval, sleep};
+use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 

@@ -51,8 +51,8 @@ impl PluginDevWatcherService {
         self.watches.values().collect()
     }
     
-    pub async fn trigger_reload(&self, plugin_id: &str) -> PluginDevWatcherResult<()> {
-        // 简化实现：实际应触发plugin重新加载
+    pub async fn trigger_reload(&self, _plugin_id: &str) -> PluginDevWatcherResult<()> {
+        // TODO: 实现插件热加载逻辑
         Ok(())
     }
 }

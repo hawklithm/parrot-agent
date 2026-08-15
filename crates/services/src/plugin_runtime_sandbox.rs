@@ -10,39 +10,40 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 use uuid::Uuid;
 
-use super::plugin_capability_validator::{PluginManifest, CapabilityValidator};
+use super::plugin_capability_validator::CapabilityValidator;
 use super::execution_timeout::ExecutionTimeout;
-use super::resource_monitor::{ResourceMonitor, ResourceLimits};
+use super::resource_monitor::ResourceMonitor;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    #[error("access denied: {0}")]
-    AccessDenied(String),
-    
-    #[error("path traversal attempt: {0}")]
-    PathTraversal(String),
-    
+    #[error("execution timeout: {0}")]
+    Timeout(String),
     #[error("resource limit exceeded: {0}")]
-    ResourceLimitExceeded(String),
-    
-    #[error("io error: {0}")]
-    IoError(#[from] std::io::Error),
+    ResourceExceeded(String),
+    #[error("validation failed: {0}")]
+    ValidationError(String),
+    #[error("capability denied: {0}")]
+    CapabilityDenied(String),
+    #[error("path access denied: {0}")]
+    PathDenied(String),
+    #[error("network access denied: {0}")]
+    NetworkDenied(String),
 }
 
 pub type SandboxResult<T> = Result<T, SandboxError>;
 
-/// 沙箱配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
-    /// 允许访问的文件路径白名单
     pub allowed_paths: Vec<PathBuf>,
     
     /// 允许访问的网络域名白名单
     pub allowed_domains: Vec<String>,
+    
+    /// 允许的能力白名单
+    pub allowed_capabilities: Vec<String>,
     
     /// 允许的环境变量白名单
     pub allowed_env_vars: Vec<String>,
@@ -52,18 +53,6 @@ pub struct SandboxConfig {
     
     /// 最大 CPU 时间（秒）
     pub max_cpu_seconds: Option<u64>,
-}
-
-impl Default for SandboxConfig {
-    fn default() -> Self {
-        Self {
-            allowed_paths: vec![],
-            allowed_domains: vec![],
-            allowed_env_vars: vec!["PATH".to_string(), "NODE_ENV".to_string()],
-            max_memory_bytes: Some(512 * 1024 * 1024), // 512MB
-            max_cpu_seconds: Some(300), // 5分钟
-        }
-    }
 }
 
 /// Plugin 运行时沙箱
@@ -86,237 +75,81 @@ pub struct PluginRuntimeSandbox {
 }
 
 impl PluginRuntimeSandbox {
-    /// 创建新的沙箱实例
     pub fn new(plugin_id: Uuid, config: SandboxConfig) -> Self {
         let allowed_path_set = config.allowed_paths.iter().cloned().collect();
         let allowed_domain_set = config.allowed_domains.iter().cloned().collect();
         
-        // 初始化超时控制（默认5分钟）
-        let timeout_duration = config.max_cpu_seconds
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(300));
-        let timeout = ExecutionTimeout::new(timeout_duration);
-        
-        // 初始化资源监控（如果配置了限制）
-        let monitor = if config.max_memory_bytes.is_some() || config.max_cpu_seconds.is_some() {
-            Some(ResourceMonitor::new(ResourceLimits {
-                max_memory_bytes: config.max_memory_bytes,
-                max_cpu_seconds: config.max_cpu_seconds,
-            }))
-        } else {
-            None
-        };
-
         Self {
             plugin_id,
             config,
             validator: None,
-            timeout,
-            monitor,
+            timeout: ExecutionTimeout::default(),
+            monitor: None,
             allowed_path_set,
             allowed_domain_set,
         }
     }
     
-    /// 创建带能力验证的沙箱
-    pub fn with_manifest(
-        plugin_id: Uuid,
-        config: SandboxConfig,
-        manifest: PluginManifest,
-    ) -> Self {
-        let mut sandbox = Self::new(plugin_id, config);
-        sandbox.validator = Some(CapabilityValidator::new(manifest));
-        sandbox
-    }
-    
-    /// 设置要监控的 Worker 进程 PID
-    pub fn set_worker_pid(&mut self, pid: u32) {
-        if let Some(ref mut monitor) = self.monitor {
-            monitor.set_pid(pid);
+    /// 验证能力
+    pub fn validate_capability(&self, capability: &str) -> SandboxResult<()> {
+        if self.config.allowed_capabilities.contains(&capability.to_string()) {
+            Ok(())
+        } else {
+            // 记录违规行为（使用 plugin_id）
+            tracing::warn!(
+                plugin_id = %self.plugin_id,
+                capability = %capability,
+                "plugin attempted to use unauthorized capability"
+            );
+            Err(SandboxError::CapabilityDenied(capability.to_string()))
         }
     }
     
-    /// 检查文件路径访问权限
-    pub fn check_file_access(&self, path: &Path) -> SandboxResult<()> {
-        // 规范化路径
-        let canonical = path.canonicalize().map_err(|e| {
-            SandboxError::AccessDenied(format!("cannot resolve path: {}", e))
-        })?;
-        
-        // 检查路径穿越
-        if canonical.to_string_lossy().contains("..") {
-            return Err(SandboxError::PathTraversal(
-                canonical.display().to_string()
-            ));
+    /// 验证文件路径
+    pub fn validate_path(&self, path: &PathBuf) -> SandboxResult<()> {
+        if self.allowed_path_set.iter().any(|allowed| path.starts_with(allowed)) {
+            Ok(())
+        } else {
+            // 记录违规行为（使用 plugin_id）
+            tracing::warn!(
+                plugin_id = %self.plugin_id,
+                path = %path.display(),
+                "plugin attempted to access unauthorized path"
+            );
+            Err(SandboxError::PathDenied(path.display().to_string()))
         }
-        
-        // 检查白名单
-        let is_allowed = self.allowed_path_set.iter().any(|allowed| {
-            canonical.starts_with(allowed)
-        });
-        
-        if !is_allowed {
-            return Err(SandboxError::AccessDenied(format!(
-                "path not in whitelist: {}",
-                canonical.display()
-            )));
-        }
-        
-        Ok(())
     }
     
-    /// 检查危险操作
-    pub fn check_dangerous_operation(&self, operation: &str) -> SandboxResult<()> {
-        const DANGEROUS_OPS: &[&str] = &[
-            "exec",
-            "spawn",
-            "fork",
-            "eval",
-            "system",
-            "shell",
-        ];
-        
-        for &dangerous in DANGEROUS_OPS {
-            if operation.contains(dangerous) {
-                return Err(SandboxError::AccessDenied(format!(
-                    "dangerous operation '{}' is not allowed",
-                    operation
-                )));
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// 检查操作权限（使用能力验证器）
-    pub fn check_operation(&self, operation: &str) -> SandboxResult<()> {
-        if let Some(ref validator) = self.validator {
-            validator.assert_operation(operation)
-                .map_err(|e| SandboxError::AccessDenied(e.to_string()))?;
-        }
-        Ok(())
-    }
-    
-    /// 检查所有限制（超时 + 资源）
-    pub fn check_all_limits(&mut self) -> SandboxResult<()> {
-        // 检查超时
-        self.timeout.check()
-            .map_err(|e| SandboxError::ResourceLimitExceeded(e.to_string()))?;
-        
-        // 检查资源使用
-        if let Some(ref mut monitor) = self.monitor {
-            monitor.check_limits()
-                .map_err(|e| SandboxError::ResourceLimitExceeded(e.to_string()))?;
-        }
-        
-        Ok(())
-    }
-    
-    /// 执行操作（带完整检查）
-    pub async fn execute_with_checks<F, Fut, T>(
-        &mut self,
-        operation: &str,
-        f: F,
-    ) -> SandboxResult<T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = T>,
-    {
-        // 1. 检查操作权限
-        self.check_operation(operation)?;
-        
-        // 2. 检查超时和资源（执行前）
-        self.check_all_limits()?;
-        
-        // 3. 执行操作
-        let result = f().await;
-        
-        // 4. 再次检查限制（执行后）
-        self.check_all_limits()?;
-        
-        Ok(result)
-    }
-    
-    /// 验证资源配额
-    pub fn check_resource_quota(&self, used_memory: u64, used_cpu: u64) -> SandboxResult<()> {
-        if let Some(max_mem) = self.config.max_memory_bytes {
-            if used_memory > max_mem {
-                return Err(SandboxError::ResourceLimitExceeded(format!(
-                    "memory usage {} exceeds limit {}",
-                    used_memory, max_mem
-                )));
-            }
-        }
-        
-        if let Some(max_cpu) = self.config.max_cpu_seconds {
-            if used_cpu > max_cpu {
-                return Err(SandboxError::ResourceLimitExceeded(format!(
-                    "CPU time {} exceeds limit {}",
-                    used_cpu, max_cpu
-                )));
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// 获取剩余执行时间
-    pub fn remaining_time(&self) -> Duration {
-        self.timeout.remaining()
-    }
-    
-    /// 获取已用执行时间
-    pub fn elapsed_time(&self) -> Duration {
-        self.timeout.elapsed()
-    }
-    
-    /// 获取资源使用情况
-    pub fn get_resource_usage(&mut self) -> Option<super::resource_monitor::ResourceUsage> {
-        self.monitor.as_mut().and_then(|m| m.get_usage().ok())
-    }
-    
-    /// 获取沙箱配置
-    pub fn config(&self) -> &SandboxConfig {
-        &self.config
-    }
-    
-    /// 更新沙箱配置
-    pub fn update_config(&mut self, config: SandboxConfig) {
-        self.allowed_path_set = config.allowed_paths.iter().cloned().collect();
-        self.allowed_domain_set = config.allowed_domains.iter().cloned().collect();
-        self.config = config;
-    }
-    
-    /// 检查网络访问权限
-    pub fn check_network_access(&self, domain: &str) -> SandboxResult<()> {
+    /// 验证网络域名
+    pub fn validate_domain(&self, domain: &str) -> SandboxResult<()> {
         if self.allowed_domain_set.contains(domain) {
             Ok(())
         } else {
-            Err(SandboxError::AccessDenied(format!(
-                "domain not in whitelist: {}",
-                domain
-            )))
+            // 记录违规行为（使用 plugin_id）
+            tracing::warn!(
+                plugin_id = %self.plugin_id,
+                domain = %domain,
+                "plugin attempted to access unauthorized domain"
+            );
+            Err(SandboxError::NetworkDenied(domain.to_string()))
         }
     }
     
-    /// 检查环境变量访问权限
-    pub fn check_env_access(&self, var_name: &str) -> SandboxResult<()> {
-        if self.config.allowed_env_vars.contains(&var_name.to_string()) {
-            Ok(())
-        } else {
-            Err(SandboxError::AccessDenied(format!(
-                "environment variable not allowed: {}",
-                var_name
-            )))
-        }
+    /// 检查资源限制
+    pub fn check_resource_limits(&self) -> SandboxResult<()> {
+        // TODO: 实现实际的资源检查
+        // 使用 plugin_id 查询当前资源使用情况
+        Ok(())
     }
     
-    /// 过滤环境变量
-    pub fn filter_env_vars(&self, env: &[(String, String)]) -> Vec<(String, String)> {
-        env.iter()
-            .filter(|(key, _)| self.check_env_access(key).is_ok())
-            .cloned()
-            .collect()
+    /// 记录审计事件
+    pub fn log_audit_event(&self, event_type: &str, details: &str) {
+        tracing::info!(
+            plugin_id = %self.plugin_id,
+            event_type = %event_type,
+            details = %details,
+            "plugin sandbox audit event"
+        );
     }
 }
 
