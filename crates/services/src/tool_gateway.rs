@@ -94,6 +94,16 @@ pub enum ToolRiskLevel {
     Destructive,
 }
 
+impl ToolRiskLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ToolRiskLevel::Read => "read",
+            ToolRiskLevel::Write => "write",
+            ToolRiskLevel::Destructive => "destructive",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRiskInfo {
     pub level: ToolRiskLevel,
@@ -560,14 +570,14 @@ impl ToolGatewayService for ToolGatewayServiceImpl {
         let session = McpSession::new(gateway_id, ttl);
         
         // 存储会话
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write();
         sessions.insert(session.session_id.clone(), session.clone());
         
         Ok(session)
     }
     
     async fn validate_session(&self, session_id: &str) -> GatewayResult<McpSession> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self.sessions.read();
         
         let session = sessions
             .get(session_id)
@@ -581,13 +591,13 @@ impl ToolGatewayService for ToolGatewayServiceImpl {
     }
     
     async fn destroy_session(&self, session_id: &str) -> GatewayResult<()> {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = self.sessions.write();
         sessions.remove(session_id);
         Ok(())
     }
     
     async fn check_rate_limit(&self, key: &str) -> GatewayResult<bool> {
-        let mut limits = self.rate_limits.write().unwrap();
+        let mut limits = self.rate_limits.write();
         
         let state = limits
             .entry(key.to_string())
@@ -602,25 +612,44 @@ impl ToolGatewayService for ToolGatewayServiceImpl {
         response: &ToolResponse,
         risk: &ToolRiskInfo,
     ) -> GatewayResult<()> {
-        // TODO: 将审计日志写入数据库
-        // 包括：request_id, tool_name, agent_id, run_id, risk_level, 
-        //      success, execution_time_ms, timestamp
+        // 🔧 使用 pool 字段持久化审计日志到数据库
+        let result = sqlx::query(
+            r#"
+            INSERT INTO tool_call_audit 
+            (request_id, tool_name, risk_level, 
+             request_data, response_data, timestamp, duration_ms)
+            VALUES ($1, $2, $3, $4, $5, NOW(), $6)
+            ON CONFLICT (request_id) DO NOTHING
+            "#
+        )
+        .bind(&request.request_id)
+        .bind(&request.tool_name)
+        .bind(risk.level.as_str())
+        .bind(serde_json::to_value(&request.parameters).unwrap_or(serde_json::Value::Null))
+        .bind(serde_json::to_value(&response.result).unwrap_or(serde_json::Value::Null))
+        .bind(response.execution_time_ms as i64)
+        .execute(&self.pool)
+        .await;
         
-        let _audit_entry = serde_json::json!({
-            "request_id": request.request_id,
-            "tool_name": request.tool_name,
-            "agent_id": request.agent_id,
-            "run_id": request.run_id,
-            "risk_level": format!("{:?}", risk.level),
-            "success": response.success,
-            "execution_time_ms": response.execution_time_ms,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        });
-        
-        // 简化实现：只在控制台输出
-        println!("Tool call audit: {}", request.tool_name);
-        
-        Ok(())
+        match result {
+            Ok(_) => {
+                tracing::debug!(
+                    "tool_gateway: audit logged - tool={}, risk={:?}, request_id={}",
+                    request.tool_name, risk.level, request.request_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // 审计失败不应阻塞工具调用，只记录错误
+                tracing::error!(
+                    "tool_gateway: failed to persist audit log - error={}, request_id={}",
+                    e, request.request_id
+                );
+                // 降级到控制台输出
+                println!("Tool call audit (fallback): {}", request.tool_name);
+                Ok(())
+            }
+        }
     }
 }
 

@@ -585,8 +585,33 @@ impl PluginWorkerHandle {
 
         let result = timeout(timeout_duration, response_rx).await;
 
+        // 🔧 使用 sent_at 计算请求耗时
+        let elapsed = {
+            if let Some(pending) = self.pending_requests.lock().await.get(&id_key) {
+                pending.sent_at.elapsed().as_millis() as u64
+            } else {
+                0
+            }
+        };
+
         match result {
             Ok(Ok(response)) => {
+                // 清理待处理请求
+                self.pending_requests.lock().await.remove(&id_key);
+                
+                // 记录性能日志
+                if elapsed > 1000 {
+                    warn!(
+                        "plugin_worker_manager: slow RPC call - method={}, elapsed_ms={}",
+                        method, elapsed
+                    );
+                } else {
+                    debug!(
+                        "plugin_worker_manager: RPC call completed - method={}, elapsed_ms={}",
+                        method, elapsed
+                    );
+                }
+                
                 if let Some(error) = response.error {
                     Err(WorkerError::RpcError(error))
                 } else {
@@ -596,11 +621,21 @@ impl PluginWorkerHandle {
             Ok(Err(_)) => {
                 // 通道关闭
                 self.pending_requests.lock().await.remove(&id_key);
+                error!(
+                    "plugin_worker_manager: RPC channel closed - method={}, elapsed_ms={}",
+                    method, elapsed
+                );
                 Err(WorkerError::ChannelClosed)
             }
             Err(_) => {
                 // 超时
                 self.pending_requests.lock().await.remove(&id_key);
+                error!(
+                    "plugin_worker_manager: RPC timeout - method={}, timeout_ms={}, elapsed_ms={}",
+                    method,
+                    timeout_duration.as_millis(),
+                    elapsed
+                );
                 Err(WorkerError::RpcTimeout {
                     method,
                     timeout_ms: timeout_duration.as_millis() as u64,
@@ -634,6 +669,32 @@ impl PluginWorkerHandle {
             None
         };
 
+        // 🔧 使用 method 和 sent_at 字段进行诊断
+        let pending_requests_count = self.pending_requests.lock().await.len();
+        
+        // 检查是否有慢请求
+        let now = Instant::now();
+        let mut slow_requests = Vec::new();
+        for (id, req) in self.pending_requests.lock().await.iter() {
+            let elapsed = now.duration_since(req.sent_at).as_millis() as u64;
+            if elapsed > 5000 {  // 超过 5 秒
+                warn!(
+                    "plugin_worker_manager: slow RPC request detected - method={}, id={}, elapsed_ms={}",
+                    req.method, id, elapsed
+                );
+                slow_requests.push(format!("{} ({}ms)", req.method, elapsed));
+            }
+        }
+        
+        if !slow_requests.is_empty() {
+            warn!(
+                "plugin_worker_manager: {} slow requests for plugin_id={}: {:?}",
+                slow_requests.len(),
+                self.plugin_id,
+                slow_requests
+            );
+        }
+
         WorkerDiagnostics {
             plugin_id: self.plugin_id,
             status: *self.status.read().await,
@@ -641,7 +702,7 @@ impl PluginWorkerHandle {
             uptime_secs,
             consecutive_crashes: *self.consecutive_crashes.lock().await,
             total_crashes: *self.total_crashes.lock().await,
-            pending_requests: self.pending_requests.lock().await.len(),
+            pending_requests: pending_requests_count,
             last_crash_at,
             next_restart_at: None,
         }
