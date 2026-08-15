@@ -27,7 +27,6 @@ use services::auth::AuthorizationActor;
 fn proposal_json(
     row: &sqlx::postgres::PgRow,
 ) -> serde_json::Value {
-    use sqlx::Row;
     json!({
         "id": row.get::<Uuid, _>("id"),
         "companyId": row.get::<Uuid, _>("company_id"),
@@ -180,7 +179,6 @@ async fn list_agent_proposals(
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    use sqlx::Row;
     let rows = sqlx::query(
         "SELECT * FROM company_secret_proposals \
          WHERE company_id = $1 AND proposed_by_agent_id = $2 \
@@ -248,7 +246,6 @@ async fn list_board_proposals(
     let offset = query.offset.unwrap_or(0).max(0);
     let status = query.status.as_deref();
 
-    use sqlx::Row;
     let rows = sqlx::query(
         "SELECT * FROM company_secret_proposals \
          WHERE company_id = $1 AND ($2::text IS NULL OR status = $2) \
@@ -285,7 +282,6 @@ async fn approve_proposal(
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
 
-    use sqlx::Row;
     let row = sqlx::query(
         "SELECT * FROM company_secret_proposals WHERE id = $1 AND company_id = $2 AND status = 'pending'",
     )
@@ -439,7 +435,6 @@ async fn list_agent_secrets(
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let (agent_id, company_id, _) = agent_context(&actor)?;
-    use sqlx::Row;
     let rows = sqlx::query(
         "SELECT p.id, p.proposed_name, p.proposed_key, p.proposed_description, p.created_secret_id, p.created_at \
          FROM company_secret_proposals p \

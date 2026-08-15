@@ -159,7 +159,7 @@ async fn delete_issue_comment(
     Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, comment_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    use sqlx::Row;
+    
     let row = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT company_id FROM issue_comments WHERE id = $1 AND issue_id = $2",
     )
@@ -225,7 +225,7 @@ async fn claim_case(
     let Some(row) = row else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let company_id: Uuid = row.get("company_id");
+    let _company_id: Uuid = row.get("company_id");
     Ok(Json(json!({ "id": case_id, "status": "in_progress", "claimedByAgentId": agent_id })))
 }
 
@@ -632,7 +632,8 @@ async fn environment_secret_refs(
     Ok(Json(vec![]))
 }
 
-/// GET /health —— 健康检查。
+/// GET /health —— 健康检查（未注册到路由，保留备用）。
+#[allow(dead_code)]
 async fn get_health(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -761,7 +762,6 @@ pub fn automation_misc_routes() -> Router<AppState> {
         .route("/cloud/stacks", get(cloud_stacks))
         .route("/environments/:environment_id/leases", get(environment_leases))
         .route("/environments/:environment_id/secret-refs", get(environment_secret_refs))
-        .route("/health", get(get_health))
         .route("/health/dev-server/restart", post(dev_server_restart))
         .route("/skills/catalog/:catalog_id/files", get(skill_catalog_files))
         .route("/pipelines/:pipeline_id", patch(update_pipeline))

@@ -103,8 +103,4 @@ pub fn environment_diagnostics_routes() -> Router<AppState> {
             "/environments/:id/acquire",
             axum::routing::post(acquire_lease),
         )
-        .route(
-            "/environments/:id/delete-blast-radius",
-            axum::routing::get(delete_blast_radius),
-        )
 }

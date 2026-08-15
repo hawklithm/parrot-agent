@@ -1,5 +1,5 @@
 use crate::adapter_plugin_store::{AdapterPluginRecord, AdapterPluginStore};
-use crate::npm_manager::{NpmManager, NpmResult};
+use crate::npm_manager::NpmManager;
 use std::path::PathBuf;
 use thiserror::Error;
 

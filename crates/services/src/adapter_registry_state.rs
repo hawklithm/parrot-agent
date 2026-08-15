@@ -1,8 +1,8 @@
 use crate::adapter_plugin_store::{AdapterPluginStore, JsonFileAdapterPluginStore, AdapterPluginRecord};
 use crate::builtin_adapter_types::is_builtin_adapter_type;
-use models::AdapterType;
+
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 

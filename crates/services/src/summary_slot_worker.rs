@@ -7,14 +7,14 @@
 //! finalization 将 slot 置为 failed。
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::status_card_worker::{SUMMARIZER_BUILT_IN_KEY, TERMINAL_ISSUE_STATUSES};
 
 /// 生成任务创建结果。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SummarySlotGeneration {
     pub slot_id: Uuid,
     pub generating_issue_id: Uuid,

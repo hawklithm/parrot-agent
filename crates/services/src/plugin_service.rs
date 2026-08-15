@@ -371,7 +371,7 @@ impl PluginService for DefaultPluginService {
         folder_key: &str,
         body: Value,
     ) -> PluginResult<Value> {
-        let mut plugin = self.get(plugin_id).await?;
+        let plugin = self.get(plugin_id).await?;
         let mut config = plugin.config.clone();
         let folder_result = {
             let folders = config

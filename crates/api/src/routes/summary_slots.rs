@@ -6,11 +6,11 @@
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
-    routing::{get, post, put},
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
@@ -129,7 +129,7 @@ async fn list_summary_slot_revisions(
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    use sqlx::Row;
+    
     let row = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT id FROM summary_slots WHERE company_id = $1 AND scope_kind = $2 AND slot_key = $3 \
          ORDER BY updated_at DESC LIMIT 1",

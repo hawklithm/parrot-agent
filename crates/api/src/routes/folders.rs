@@ -8,11 +8,10 @@
 //! - `POST   /companies/:company_id/folders/items/move`：移动 item 到目录（`folder.item_moved`）。
 //! - `POST   /companies/:company_id/folders/:folder_id/move`：移动目录（`folder.moved`）。
 //! - `DELETE /companies/:company_id/folders/:folder_id`：删除（`folder.deleted`）。
-
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
-    routing::{delete, get, patch, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -119,7 +118,7 @@ fn folder_json(
     v
 }
 
-fn build_path(company_id: Uuid, kind: &str, slug: &str, parent: Option<&sqlx::postgres::PgRow>) -> String {
+fn build_path(_company_id: Uuid, kind: &str, slug: &str, parent: Option<&sqlx::postgres::PgRow>) -> String {
     match parent {
         Some(p) => {
             use sqlx::Row;

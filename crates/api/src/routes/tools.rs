@@ -16,7 +16,6 @@ use axum::{
 };
 use std::convert::Infallible;
 use serde_json::Value;
-use sqlx::Row;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;

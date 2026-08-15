@@ -11,7 +11,6 @@ use services::adapter_package_loader::AdapterPackageLoader;
 use services::auth::AuthorizationActor;
 
 use crate::errors::AppError;
-use crate::extractors::CompanyIdOrShortname;
 use crate::schemas::{
     AdapterInfoResponse, AdapterModelResponse, DetectModelRequest, DetectModelResponse,
     ListAdaptersResponse, ModelDetectionStatus, TestAdapterEnvironmentRequest,

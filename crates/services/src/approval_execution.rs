@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use repositories::{ActivityLogRepository, AgentRepository, BudgetPolicyRepository};
+use repositories::{AgentRepository, BudgetPolicyRepository};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -7,9 +7,7 @@ use uuid::Uuid;
 use chrono::Utc;
 
 use crate::{AgentService, CreateAgentInput, ServiceError};
-use models::{Agent, AgentStatus, Approval, ApprovalType};
-use models::budget::{BudgetPolicy, BudgetScopeType, BudgetWindowKind};
-use repositories::activity_log_repository::{Activity, ActorType, ActivityAction, ResourceType};
+use models::{Agent, AgentStatus, Approval};
 
 /// Hire Agent Payload - 从审批 payload 解析的数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +139,7 @@ pub trait ApprovalExecutor: Send + Sync {
 
 /// Default Approval Executor Implementation
 pub struct DefaultApprovalExecutor {
+    #[allow(dead_code)]
     pool: PgPool,
     agent_service: Arc<dyn AgentService>,
     agent_repo: Arc<dyn AgentRepository>,
@@ -190,7 +189,7 @@ impl DefaultApprovalExecutor {
         &self,
         company_id: Uuid,
         payload: &HireAgentPayload,
-        decided_by_user_id: Uuid,
+        _decided_by_user_id: Uuid,
     ) -> Result<Agent, ServiceError> {
         let input = CreateAgentInput {
             company_id,

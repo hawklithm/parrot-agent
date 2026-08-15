@@ -1,6 +1,4 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Timeline actor types - agent, user, system, or plugin
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

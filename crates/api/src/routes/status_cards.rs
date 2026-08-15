@@ -7,7 +7,7 @@
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
-    routing::{delete, get, patch, post, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -109,6 +109,7 @@ struct WriteSummaryRequest {
     generation_issue_id: Option<Uuid>,
     #[serde(rename = "changeSummary")]
     change_summary: Option<String>,
+    #[allow(dead_code)]
     title: Option<String>,
     model: Option<String>,
 }

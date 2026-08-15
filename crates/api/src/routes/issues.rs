@@ -7,7 +7,6 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::Row;
 use crate::app_state::AppState;
 use uuid::Uuid;
 

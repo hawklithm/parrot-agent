@@ -1,4 +1,4 @@
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

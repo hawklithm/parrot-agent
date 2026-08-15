@@ -1,0 +1,12 @@
+[package]
+name = "fix_db"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fix_db"
+path = "fix_db_tables.rs"
+
+[dependencies]
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid"] }
+tokio = { version = "1", features = ["full"] }

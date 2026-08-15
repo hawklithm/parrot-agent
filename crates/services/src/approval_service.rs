@@ -446,7 +446,7 @@ impl ApprovalService for DefaultApprovalService {
     }
 
     async fn review(&self, input: ReviewApprovalInput) -> Result<Approval, ServiceError> {
-        let mut approval = self
+        let approval = self
             .approval_repo
             .find_by_id(input.approval_id)
             .await?

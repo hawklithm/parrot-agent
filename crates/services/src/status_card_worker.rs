@@ -63,7 +63,7 @@ pub struct FingerprintEntry {
 pub type StatusCardFingerprint = std::collections::BTreeMap<String, FingerprintEntry>;
 
 /// 一次 delta 变化。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct StatusCardDeltaChange {
     pub issue_id: String,
     pub identifier: String,
@@ -744,7 +744,7 @@ impl StatusCardWorker {
             // 构造 WHERE + bind 顺序（$1 固定为 company_id）。
             let mut where_clauses = vec!["company_id = $1".to_string(), "hidden_at IS NULL".to_string()];
             let mut binds: Vec<BindVal> = Vec::new();
-            let mut next_ph = |binds: &mut Vec<BindVal>| format!("${}", binds.len() + 2);
+            let next_ph = |binds: &mut Vec<BindVal>| format!("${}", binds.len() + 2);
 
             if scope == "project" {
                 let Some(pid) = project_id else { continue };

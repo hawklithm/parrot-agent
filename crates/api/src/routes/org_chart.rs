@@ -7,7 +7,6 @@ use axum::{Router,
     Json,
 };
 use models::{OrgChartOptions, OrgChartStyle};
-use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize)]

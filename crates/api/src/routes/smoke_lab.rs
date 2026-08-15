@@ -5,7 +5,7 @@ use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, patch, post},
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -219,7 +219,7 @@ async fn get_smoke_run(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    use sqlx::Row;
+    
     let row = sqlx::query("SELECT * FROM smoke_runs WHERE id = $1 AND company_id = $2")
         .bind(run_id)
         .bind(company_id)
@@ -262,7 +262,7 @@ async fn update_smoke_run(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    use sqlx::Row;
+    
     let row = sqlx::query(
         "UPDATE smoke_runs SET \
          status = COALESCE($3, status), \

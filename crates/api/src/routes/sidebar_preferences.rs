@@ -5,7 +5,7 @@
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
-    routing::{get, put},
+    routing::get,
     Json, Router,
 };
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::routes::{require_company_access, AccessMode};
+use crate::routes::require_company_access;
 use services::auth::AuthorizationActor;
 
 fn board_user_id(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {

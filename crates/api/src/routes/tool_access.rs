@@ -321,7 +321,7 @@ async fn delete_tool_application(
     Extension(actor): Extension<AuthorizationActor>,
     Path(application_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    use sqlx::Row;
+    
     let row = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT company_id FROM tool_applications WHERE id = $1",
     )

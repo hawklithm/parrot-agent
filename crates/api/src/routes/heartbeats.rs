@@ -4,7 +4,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use sqlx::Row;
 
 use crate::app_state::AppState;
 use crate::schemas::{

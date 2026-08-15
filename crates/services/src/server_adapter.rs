@@ -309,6 +309,7 @@ pub fn create_default_server_adapter_registry() -> AdapterRegistry {
 
 /// Claude Local adapter
 pub struct ClaudeLocalAdapter {
+    #[allow(dead_code)]
     label: String,
 }
 
@@ -426,6 +427,7 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
 }
 
 /// Codex Local adapter
+#[allow(dead_code)]
 pub struct CodexLocalAdapter {
     label: String,
 }
@@ -538,6 +540,7 @@ impl ServerAdapterModule for CodexLocalAdapter {
 
 
 /// Process adapter (default local process adapter)
+#[allow(dead_code)]
 pub struct ProcessAdapter {
     label: String,
 }
