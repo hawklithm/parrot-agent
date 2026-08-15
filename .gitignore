@@ -5,6 +5,8 @@
 .env
 .env.local
 .env.*.local
+*.md
+*.log
 
 # Temporary scripts and setup files
 *.sh
@@ -25,3 +27,11 @@ docs/examples/claude-*.json
 
 # Examples and temporary code
 examples/setup_*.rs
+
+# 归档目录 (添加于 2026-08-15)
+archive_*/
+
+# 临时文档
+**/*_REPORT.md
+**/*_STATUS.md
+**/*_SUMMARY.md
