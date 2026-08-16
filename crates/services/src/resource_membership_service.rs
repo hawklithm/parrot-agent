@@ -219,9 +219,8 @@ impl ResourceMembershipService {
         company_id: Uuid,
         user_id: &str,
     ) -> Result<ResourceMemberships, AppError> {
-        let user_uuid = user_id
-            .parse::<Uuid>()
-            .map_err(|_| AppError::BadRequest("Invalid user_id".to_string()))?;
+        // NOTE: user_id is TEXT in the database (project_memberships.user_id, agent_memberships.user_id)
+        // Do NOT parse to UUID - use it directly as TEXT to avoid "operator does not exist: text = uuid" error
 
         // Query project memberships with project status check
         // Migrated from paperclip: server/src/services/resource-memberships.ts:176-193
@@ -234,7 +233,7 @@ impl ResourceMembershipService {
             "#
         )
         .bind(company_id)
-        .bind(user_uuid)
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to query project memberships: {e}")))?;
@@ -250,7 +249,7 @@ impl ResourceMembershipService {
             "#
         )
         .bind(company_id)
-        .bind(user_uuid)
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to query agent memberships: {e}")))?;
