@@ -31,6 +31,7 @@ pub mod agent_action_audit_service;
 pub mod agent_secret_bindings_service;
 pub mod agent_start_lock_service;
 pub mod workspace_runtime_service;
+
 pub mod workspace_realization_service;
 pub mod session_workspace_cwd;
 pub mod attention_service;

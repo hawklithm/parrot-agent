@@ -22,6 +22,10 @@ pub const MIGRATION_014: &str = include_str!("../../../migrations/20260712000004
 pub const MIGRATION_015: &str = include_str!("../../../migrations/20260712000005_create_issue_thread_interactions.sql");
 pub const MIGRATION_016: &str = include_str!("../../../migrations/20260805000004_create_issue_relations.sql");
 pub const MIGRATION_017: &str = include_str!("../../../migrations/20260805000005_add_issue_harness_kind.sql");
+pub const MIGRATION_042: &str = include_str!("../../../migrations/08_fix_activity_logs_add_missing_columns.sql");
+pub const MIGRATION_043: &str = include_str!("../../../migrations/09_fix_issue_thread_interactions_add_missing_columns.sql");
+pub const MIGRATION_044: &str = include_str!("../../../migrations/10_create_plugin_managed_resources.sql");
+pub const MIGRATION_045: &str = include_str!("../../../migrations/11_create_instruction_templates.sql");
 
 /// Ordered list of all migrations (ascending by migration number).
 pub const ALL_MIGRATIONS: &[(&str, &str)] = &[
@@ -41,6 +45,10 @@ pub const ALL_MIGRATIONS: &[(&str, &str)] = &[
     ("017_add_issue_harness_kind", MIGRATION_017),
     ("039_add_heartbeat_run_output", MIGRATION_039),
     ("040_create_tool_invocation_audit", MIGRATION_040),
+    ("044_create_plugin_managed_resources", MIGRATION_044),
+    ("045_create_instruction_templates", MIGRATION_045),
+    ("042_fix_activity_logs_add_missing_columns", MIGRATION_042),
+    ("043_fix_issue_thread_interactions_add_missing_columns", MIGRATION_043),
     ("041_create_named_mcp_gateways", MIGRATION_041),
 ];
 
