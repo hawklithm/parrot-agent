@@ -35,3 +35,4 @@ archive_*/
 **/*_REPORT.md
 **/*_STATUS.md
 **/*_SUMMARY.md
+.sqlx/
