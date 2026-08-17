@@ -1,13 +1,16 @@
 # Parrot Agent
 
-A Rust port of Paperclip's agent orchestration backend. Built with Axum, SQLx, and Tokio.
+[中文文档](README_CN.md)
 
-## Architecture
+Rust implementation of Paperclip's agent orchestration backend. Built with Axum, SQLx, and Tokio.
+
+## Architecture Overview
 
 ```
 parrot-agent/
-├── Cargo.toml                  # Workspace root
-├── migrations/                 # SQL migrations (31 files)
+├── Cargo.toml                  # Workspace root configuration
+├── migrations/                 # SQL migration files (19 files)
+├── docker-compose.yml          # PostgreSQL container configuration
 └── crates/
     ├── models/                 # Domain models, enums, state machines
     ├── repositories/           # Data access layer (PostgreSQL via SQLx)
@@ -15,521 +18,308 @@ parrot-agent/
     ├── api/                    # HTTP API (Axum routes, middleware, schemas)
     ├── access/                 # ABAC permission model
     ├── adapters/               # Adapter pattern (Process, Claude Local)
-    └── migrations/             # Migration runner
+    ├── migrations/             # Migration runner
+    └── server/                 # Main server application
+        ├── src/
+        │   ├── main.rs         # Server entry point
+        │   └── bin/            # 20 utility programs
+        └── examples/           # 3 example programs
 ```
 
-## Core Modules
+## Core Feature Modules
 
 | Module | Status | Description |
 |--------|--------|-------------|
-| **Agent Management** | ✅ Complete | Agent CRUD, state machine, org chart, config revisions |
-| **Issue/Case Management** | ✅ Complete | Full lifecycle, tree control, checkout/release, diagnostics |
-| **Task Watchdog** | ✅ Complete | Subtree liveness classifier, periodic evaluation, fingerprinting |
-| **Authentication** | ✅ Complete | JWT, API keys (Board + Agent), Session, Cloud Tenant |
-| **Authorization** | ✅ Complete | ABAC engine, field-level redaction, company isolation |
-| **Event Bus** | ✅ Complete | InMemory event bus with 7 listener types |
-| **Adapter Plugin** | ✅ Complete | npm-based plugin system with real npm install support |
-| **Pipeline** | ✅ Complete | Stage-based pipeline with case transitions |
-| **Routine/Goal** | ✅ Complete | Cron triggers, revision control, goal progress tracking |
-| **Secrets** | ✅ Complete | Provider configs, remote import, environment binding |
-| **Environment** | ✅ Complete | Runtime leases, workspace isolation, codex_local isolation |
-
-## Key Features
-
-- **Watchdog Subsystem** — Monitors issue subtrees for liveness. When a subtree stops (no live execution paths), creates a review issue for the watchdog agent. Includes 5-state classifier (Live, Stopped, PendingFirstRun, AlreadyReviewed, NotApplicable) and stable fingerprinting.
-
-- **Adapter Plugin System** — Supports npm-based plugins and local path loading. Reads `package.json` for metadata and entry point. Error-typed with `AdapterPluginError`.
-
-- **Event-Driven Architecture** — In-memory event bus with typed events (Issue, Approval, Routine, Agent, Environment, Goal). Listeners for watchdog evaluation, recovery reconciliation, goal progress updates, and more.
-
-- **Auth Middleware** — Multi-strategy: Bearer token (Board API Key `bak_*`, Agent API Key `aak_*`, JWT), Session Cookie, Cloud Tenant Header, Local implicit. Rate-limited with audit logging.
-
-## Database
-
-31 SQL migration files covering all tables. Run via:
-
-```rust
-migrations::run_migrations(&pool).await?;
-```
-
-For local development, PostgreSQL may be either a local service or Docker. For
-the existing local database used by the Paperclip migration:
-
-```bash
-export DATABASE_URL=postgres://postgres:admin123@localhost:5432/parrot_agent_dev
-export PAPERCLIP_API_URL=http://127.0.0.1:3102/api
-cargo run -p parrot-server
-```
-
-The server runs idempotent migrations against the existing database; do not
-drop and recreate `parrot_agent_dev` to resolve schema errors. The MCP gateway
-runbook is in [`docs/paperclip-mcp-runbook.md`](docs/paperclip-mcp-runbook.md).
-
-Alternatively, start PostgreSQL with Docker Compose:
-
-```bash
-docker compose up -d postgres
-cargo run -p parrot-server
-```
-
-The container publishes PostgreSQL on `localhost:5433`, matching the default
-`DATABASE_URL` in `.env`. Data is kept in the `parrot-agent-postgres-data`
-Docker volume.
+| **Agent Management** | ✅ | Agent CRUD, state machine, org chart, config revisions |
+| **Issue/Case Management** | ✅ | Full lifecycle, tree control, checkout/release, diagnostics |
+| **Task Watchdog** | ✅ | Subtree liveness classifier, periodic evaluation, fingerprinting |
+| **Authentication** | ✅ | JWT, API Keys (Board + Agent), Session, Cloud Tenant |
+| **Authorization** | ✅ | ABAC engine, field-level redaction, company isolation |
+| **Event Bus** | ✅ | In-memory event bus with 7 listener types |
+| **Adapter Plugin** | ✅ | npm-based plugin system with real npm install support |
+| **Pipeline** | ✅ | Stage-based pipeline with case transitions |
+| **Routine/Goal** | ✅ | Cron triggers, revision control, goal progress tracking |
+| **Secret Management** | ✅ | Provider configs, remote import, environment binding |
+| **Environment** | ✅ | Runtime leases, workspace isolation, codex_local isolation |
 
 ## Quick Start
 
+### Requirements
+
+- Rust 1.75+
+- PostgreSQL 16
+- (Optional) Docker & Docker Compose
+
+### 1. Database Setup
+
+**Option A: Using Docker Compose (Recommended)**
+
 ```bash
-# Build
-cargo build --workspace
+# Start PostgreSQL container
+docker compose up -d postgres
 
-# Check
-cargo check --workspace
-
-# Test (lib only - some test modules have pre-existing compilation issues)
-cargo test --lib -p services
+# Database connection info
+# Host: localhost:5433
+# User: postgres
+# Password: postgres
+# Database: parrot_agent_dev
 ```
 
-## Dependencies
+**Option B: Using Local PostgreSQL**
 
-- **Web**: Axum 0.7, Tower, Tower-HTTP
-- **DB**: SQLx 0.7 (PostgreSQL), SeaORM 0.12
-- **Async**: Tokio (full features)
-- **Serialization**: Serde, Serde JSON
-- **Auth**: SHA-2, UUID v4
-- **Validation**: Garde 0.18
+```bash
+# Create database
+createdb parrot_agent_dev
 
-## 🤖 Claude Local Agent 配置
+# Configure environment variable
+export DATABASE_URL=postgres://postgres:admin123@localhost:5432/parrot_agent_dev
+```
 
-parrot-agent 支持使用 Claude Code CLI 作为本地 AI agent。通过**环境变量智能引用功能**，你可以安全地配置认证信息，避免硬编码敏感数据。
+### 2. Configure Environment Variables
 
-### 前置条件
+Edit the `.env` file:
 
-1. **安装 Claude Code CLI**
+```bash
+# Database connection
+DATABASE_URL=postgres://postgres:postgres@localhost:5433/parrot_agent_dev
+
+# Deployment mode
+DEPLOYMENT_MODE=local_trusted
+```
+
+### 3. Build and Run
+
+```bash
+# Build the entire workspace
+cargo build --workspace
+
+# Run the main server (migrations run automatically)
+cargo run -p server
+
+# Server listens on http://localhost:3100 by default
+```
+
+## Development Tools
+
+### Utility Programs (in `crates/server/src/bin/`)
+
+The server crate provides 20 management tools:
+
+```bash
+# Database Management
+cargo run -p server --bin clear_db              # Clear database
+cargo run -p server --bin clean_all_companies   # Clear all company data
+cargo run -p server --bin truncate_all_data     # Truncate all tables
+cargo run -p server --bin fix_db_tables         # Fix database table structure
+
+# Migration Management
+cargo run -p server --bin list_migrations          # List all migrations
+cargo run -p server --bin verify_migrations        # Verify migration status
+cargo run -p server --bin fix_migrations           # Fix migrations
+cargo run -p server --bin fix_migration_checksum   # Fix migration checksums
+cargo run -p server --bin apply_migration          # Apply migrations
+cargo run -p server --bin clean_migration          # Clean migrations
+
+# Data Repair
+cargo run -p server --bin fix_agents_data       # Fix agent data
+
+# Query and Analysis
+cargo run -p server --bin query_db              # Query database
+cargo run -p server --bin check_db              # Check database status
+cargo run -p server --bin simple_query          # Simple query
+cargo run -p server --bin test_uuid_query       # Test UUID query
+cargo run -p server --bin analyze_all_tasks     # Analyze all tasks
+cargo run -p server --bin analyze_hire          # Analyze hiring data
+cargo run -p server --bin verify_duplicate_tasks # Verify duplicate tasks
+
+# Testing Tools
+cargo run -p server --bin test_user_directory   # Test user directory
+cargo run -p server --bin clean_test_data       # Clean test data
+```
+
+### Example Programs (in `crates/server/examples/`)
+
+```bash
+cargo run -p server --example check_scheduling   # Check scheduling status
+cargo run -p server --example reset_database     # Reset database
+cargo run -p server --example verify_scheduler   # Verify scheduler
+```
+
+## Testing
+
+```bash
+# Run all library tests
+cargo test --lib --workspace
+
+# Run tests for specific crate
+cargo test -p services
+cargo test -p repositories
+cargo test -p models
+
+# Check compilation
+cargo check --workspace
+```
+
+## Database Migrations
+
+The project contains 19 SQL migration files that are automatically executed on server startup.
+
+```bash
+# View migration list
+ls -lh migrations/*.sql
+
+# Manually run migrations
+cargo run -p server --bin apply_migration
+```
+
+Migration files use incremental numbering:
+- `00_init_schema_unified.sql` - Initial complete schema
+- `01_*.sql` ~ `18_*.sql` - Incremental migrations
+
+## Main Dependencies
+
+| Category | Dependencies |
+|----------|-------------|
+| **Web Framework** | Axum 0.7, Tower, Tower-HTTP |
+| **Database** | SQLx 0.7 (PostgreSQL), SeaORM 0.12 |
+| **Async Runtime** | Tokio (full features) |
+| **Serialization** | Serde, Serde JSON |
+| **UUID/Time** | UUID v4, Chrono |
+| **Error Handling** | thiserror, anyhow |
+| **Validation** | Garde 0.18 |
+| **Logging** | Tracing, Tracing-subscriber |
+
+## Claude Local Agent Configuration
+
+Parrot Agent supports using Claude Code CLI as a local AI agent.
+
+### Quick Configuration
+
+1. **Install Claude Code CLI**
    ```bash
    npm install -g @anthropic-ai/claude-code
-   claude --version  # 验证安装
+   claude --version
    ```
 
-2. **配置环境变量**（二选一或两者结合）
-   
-   **方式 A：在项目 `.env` 文件中**（推荐用于本地开发）
+2. **Configure Environment Variables**
+
+   Add to `.env` file or shell config file (`~/.zshrc`):
    ```bash
-   # 数据库配置
-   DATABASE_URL=postgres://postgres:admin123@localhost:5432/parrot_agent_dev
-   
-   # Claude 认证配置
    ANTHROPIC_AUTH_TOKEN=your_token_here
    ANTHROPIC_BASE_URL=http://127.0.0.1:8787
    ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
    ```
-   
-   **方式 B：在 Shell 配置文件中**（推荐用于全局使用）
-   
-   编辑 `~/.zshrc` 或 `~/.bashrc`：
+
+3. **Create Agent**
+
    ```bash
-   export ANTHROPIC_AUTH_TOKEN="your_token_here"
-   export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
-   export ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"
-   ```
+   # Using automation script
+   ./setup-claude-local-agent.sh
    
-   然后执行：
-   ```bash
-   source ~/.zshrc  # 或 source ~/.bashrc
+   # Or using API
+   curl -X POST http://localhost:3100/api/agents \
+     -H "Content-Type: application/json" \
+     -d @claude-local-agent-config.json
    ```
 
-### 环境变量优先级
+### Smart Environment Variable Reference
 
-系统会按以下优先级加载环境变量：
+Adapter configuration supports environment variable references to avoid hardcoding sensitive information:
 
-1. **操作系统环境变量**（优先级最高）
-   - Shell 中设置的：`export ANTHROPIC_AUTH_TOKEN="xxx"`
-   - `~/.zshrc` 或 `~/.bashrc` 中的全局配置
-
-2. **项目 `.env` 文件**
-   - 仅在操作系统环境变量不存在时生效
-   - 适合本地开发环境
-
-**工作原理**：
-```
-服务启动
-  ↓
-加载 .env 文件到进程环境变量
-  ↓
-如果操作系统已有同名变量，保持不变（不覆盖）
-  ↓
-Agent 执行时从进程环境变量读取
-```
-
-**示例**：
-```bash
-# 操作系统环境变量
-export ANTHROPIC_AUTH_TOKEN="token_from_shell"
-
-# .env 文件中
-ANTHROPIC_AUTH_TOKEN=token_from_dotenv
-
-# 实际使用：token_from_shell（操作系统优先）
-```
-### 快速配置
-
-#### 方式 1：使用自动化脚本（推荐）
-
-```bash
-# 检查环境并创建 agent
-./setup-claude-local-agent.sh
-```
-
-#### 方式 2：使用 SQL 脚本
-
-```bash
-# 如果你有 PostgreSQL 客户端
-psql $DATABASE_URL -f setup-claude-local-agent.sql
-
-# 或使用简化脚本
-./final_setup_claude.sh
-```
-
-#### 方式 3：通过 API 使用项目配置文件
-
-项目中已包含完整的配置文件 `claude-local-agent-config.json`：
-
-```bash
-# 查看配置文件
-cat claude-local-agent-config.json
-
-# 通过 API 创建 agent
-curl -X POST http://localhost:3100/api/agents \
-  -H "Content-Type: application/json" \
-  -d @claude-local-agent-config.json
-```
-
-**配置文件结构**（`claude-local-agent-config.json`）：
 ```json
 {
-  "name": "claude-local-agent",
-  "adapter_type": "claude_local",
   "adapter_config": {
     "env": {
-
-### Adapter 默认配置目录
-
-`adapters/` 目录存放各个 adapter 的默认配置文件，作为数据库配置的回退（fallback）。
-
-#### 工作原理
-
-当 agent 执行任务时，系统会自动进行配置合并：
-
-```
-1. 从数据库读取 agent.adapter_config
-2. 检查是否缺少字段（如 env）
-3. 加载 adapters/{adapter_type}.json 作为默认配置
-4. 合并：数据库配置 + 默认配置（数据库优先）
-```
-
-#### 文件命名规则
-
-文件名必须与 `adapter_type` 匹配，下划线转横线：
-
-| adapter_type | 配置文件 |
-|--------------|---------|
-| `claude_local` | `adapters/claude-local.json` |
-| `codex_local` | `adapters/codex-local.json` |
-| `openai` | `adapters/openai.json` |
-
-#### 配置合并示例
-
-**数据库配置**（`adapter_config` 字段）：
-```json
-{
-  "command": "claude",
-  "maxTurnsPerRun": 10
-}
-```
-
-**默认配置**（`adapters/claude-local.json`）：
-```json
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN"
-  },
-  "command": "claude",
-  "maxTurnsPerRun": 20,
-  "effort": "high"
-}
-```
-
-**最终生效配置**：
-```json
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN"
-  },
-  "command": "claude",
-  "maxTurnsPerRun": 10,
-  "effort": "high"
-}
-```
-
-注意：
-- ✅ `env` 从默认配置补充（数据库没有）
-- ✅ `maxTurnsPerRun` 使用数据库值 10（数据库优先）
-- ✅ `effort` 从默认配置补充（数据库没有）
-
-#### 使用场景
-
-1. **简化 Agent 创建**
-   
-   创建 agent 时无需提供完整配置：
-   ```bash
-   curl -X POST http://localhost:3100/api/companies/$COMPANY_ID/agent-hires \
-     -H "Content-Type: application/json" \
-     -d '{
-       "name": "my-agent",
-       "adapter_type": "claude_local",
-       "adapter_config": {}
-     }'
-   ```
-   系统会自动使用 `adapters/claude-local.json` 中的默认配置。
-
-2. **升级现有 Agent**
-   
-   数据库中的旧 agent 缺少 `env` 字段？无需手动更新数据库，系统会自动补充默认配置。
-
-3. **统一配置管理**
-   
-   修改 `adapters/claude-local.json` 可以统一影响所有使用默认配置的 agent。
-
-#### 添加新的 Adapter 配置
-
-1. 在 `adapters/` 目录创建新文件：
-   ```bash
-   cat > adapters/my-adapter.json << 'EOF'
-   {
-     "env": {
-       "MY_API_KEY": "MY_API_KEY"
-     },
-     "command": "my-cli",
-     "timeout": 300
-   }
-   EOF
-   ```
-
-2. 文件名规则：`adapter_type` 的下划线转横线
-   - `my_adapter` → `my-adapter.json`
-
-3. 创建使用该 adapter 的 agent
-
-#### 查看合并日志
-
-启动服务时开启 debug 日志可以看到配置合并过程：
-
-```bash
-RUST_LOG=services=debug cargo run --bin parrot-server
-```
-
-日志示例：
-```
-loaded default adapter config from file: adapters/claude-local.json
-merged adapter config: db + default, db_keys=["command"], default_keys=["env", "command", "effort"], merged_keys=["env", "command", "effort"]
-```
-
-详细说明请查看：[adapters/README.md](adapters/README.md)
-
-      "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN",  // Auto-read from environment
       "ANTHROPIC_BASE_URL": "ANTHROPIC_BASE_URL",
       "ANTHROPIC_MODEL": "ANTHROPIC_MODEL"
     },
     "command": "claude",
-    "dangerouslySkipPermissions": true,
-    "maxTurnsPerRun": 20,
-    "effort": "high",
-    "timeoutSec": 1800
+    "maxTurnsPerRun": 20
   }
 }
 ```
 
-### 环境变量智能引用
+The system automatically recognizes uppercase environment variable names and reads actual values from the host environment.
 
-**核心特性**：在 `adapter_config.env` 中，你可以引用宿主环境变量，而不是硬编码敏感信息。
+### Default Configuration (adapters/ directory)
 
-**工作原理**：
-```json
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN"  // ← 引用环境变量
-  }
-}
+The `adapters/` directory contains default configurations for each adapter, serving as a fallback for database configurations:
+
+```
+adapters/
+├── claude-local.json      # Claude Local default config
+├── codex-local.json       # Codex Local default config
+└── README.md             # Detailed documentation
 ```
 
-系统会自动：
-1. 识别这是一个环境变量引用（纯大写字母数字下划线）
-2. 从宿主环境读取 `$ANTHROPIC_AUTH_TOKEN` 的实际值
-3. 传递给 Claude CLI
+When creating an agent, if the database configuration is missing fields, the system automatically supplements them from the corresponding default configuration file.
 
-**支持的引用格式**：
-- `"ANTHROPIC_AUTH_TOKEN"` - 直接格式
-- `"$ANTHROPIC_AUTH_TOKEN"` - Shell 风格
-- `"${ANTHROPIC_AUTH_TOKEN}"` - Shell 风格（带花括号）
+**Configuration Merge Rule**: Database configuration takes priority, default configuration supplements missing fields.
 
-**混合使用示例**：
-```json
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN",  // 从环境读取
-    "ANTHROPIC_BASE_URL": "http://localhost:8787",   // 直接值
-    "ANTHROPIC_MODEL": "claude-3-opus"               // 直接值
-  }
-}
-```
+### Detailed Documentation
 
-**执行流程**：
-```
-Agent 启动
-  ↓
-读取 adapter_config.env: {"ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN"}
-  ↓
-resolve_env_value("ANTHROPIC_AUTH_TOKEN")  // 智能解析函数
-  ↓
-识别为环境变量引用（纯大写）
-  ↓
-std::env::var("ANTHROPIC_AUTH_TOKEN")  // 从系统环境读取
-  ↓
-获取实际值: "ck_fr6dggn0zxfk.xxx..."
-  ↓
-传递给 Claude CLI
-  ↓
-✅ 认证成功，不再报 "claude_auth_required"
-```
+- **Complete Feature Documentation**: [docs/adapter-env-var-reference.md](docs/adapter-env-var-reference.md)
+- **Quick Start Guide**: [docs/QUICKSTART-env-var-reference.md](docs/QUICKSTART-env-var-reference.md)
+- **Adapter Configuration**: [adapters/README.md](adapters/README.md)
+- **MCP Gateway Runbook**: [docs/paperclip-mcp-runbook.md](docs/paperclip-mcp-runbook.md)
 
-### 验证配置
+## Troubleshooting
 
-1. **检查环境变量**
-   ```bash
-   env | grep ANTHROPIC
-   ```
-   应该能看到你的认证配置。
+### Issue: Database Connection Failed
 
-2. **启动服务并查看日志**
-   ```bash
-   RUST_LOG=services=debug cargo run --bin parrot-server
-   ```
-   
-   应该能看到：
-   ```
-   resolved env var reference from host environment, key=ANTHROPIC_AUTH_TOKEN
-   ```
-
-3. **测试 Claude CLI**
-   ```bash
-   claude --version
-   claude chat "hello" --print
-   ```
-
-4. **创建测试任务**
-   ```bash
-   curl -X POST http://localhost:3100/api/issues \
-     -H "Content-Type: application/json" \
-     -d '{
-       "title": "测试任务",
-       "description": "创建一个 Hello World 脚本",
-       "agentId": "<your-agent-id>"
-     }'
-   ```
-
-### 故障排查
-
-#### 问题 1: 报错 "claude_auth_required"
-
-**原因**：环境变量未正确传递给 Claude CLI
-
-**解决步骤**：
-1. 确认环境变量已设置：`echo $ANTHROPIC_AUTH_TOKEN`
-2. 确认 agent 配置中的 `env` 字段使用了引用格式
-3. 检查 `.env` 文件是否包含认证配置
-4. 重启服务，确保加载了最新的环境变量
-5. 查看日志确认环境变量解析成功（应该有 "resolved env var reference"）
-
-#### 问题 2: 环境变量没有被引用
-
-**可能原因**：值包含小写字母或特殊字符，被识别为直接值
-
-**解决**：使用明确的引用格式
-```json
-{
-  "MY_TOKEN": "$MY_TOKEN"  // 使用 $ 前缀明确表示引用
-}
-```
-
-#### 问题 3: Agent 未创建成功
-
-**检查数据库**：
 ```bash
-# 如果安装了 psql
-psql $DATABASE_URL -c "SELECT id, name, adapter_type FROM agents WHERE adapter_type='claude_local';"
+# Check if PostgreSQL is running
+docker compose ps
+
+# View container logs
+docker compose logs postgres
+
+# Test connection
+psql $DATABASE_URL -c "SELECT 1"
 ```
 
-**重新创建**：
+### Issue: Migration Failed
+
 ```bash
-./final_setup_claude.sh
+# Check migration status
+cargo run -p server --bin verify_migrations
+
+# Fix migration checksums
+cargo run -p server --bin fix_migration_checksum
+
+# View database tables
+psql $DATABASE_URL -c "\dt"
 ```
 
-### 项目配置文件说明
+### Issue: Claude Agent Authentication Failed
 
+```bash
+# Check environment variables
+env | grep ANTHROPIC
 
-| 文件 | 说明 |
-|------|------|
-| `claude-local-agent-config.json` | ✅ **主配置文件** - Agent 完整配置模板（可直接使用） |
-| `setup-claude-local-agent.sql` | SQL 数据库插入脚本 |
-| `setup-claude-local-agent.sh` | 自动化配置脚本（带环境检查） |
-| `final_setup_claude.sh` | 简化版配置脚本（快速执行） |
-| `.env` | 环境变量配置文件（包含 `ANTHROPIC_*` 认证信息） |
-| `CLAUDE_AGENT_SETUP_COMPLETE.md` | 配置完成总结文档 |
+# Test Claude CLI
+claude chat "hello" --print
 
-### 详细文档
-
-- **完整功能文档**: [docs/adapter-env-var-reference.md](docs/adapter-env-var-reference.md)
-- **快速开始指南**: [docs/QUICKSTART-env-var-reference.md](docs/QUICKSTART-env-var-reference.md)
-- **实现方案说明**: [docs/IMPLEMENTATION-env-var-reference.md](docs/IMPLEMENTATION-env-var-reference.md)
-- **配置完成总结**: [CLAUDE_AGENT_SETUP_COMPLETE.md](CLAUDE_AGENT_SETUP_COMPLETE.md)
-- **示例配置文件**: [docs/examples/claude-agent-with-env-ref.json](docs/examples/claude-agent-with-env-ref.json)
-
-### 安全建议
-
-✅ **推荐做法**：
-- 使用环境变量引用，不要硬编码 API Key
-- 将 `.env` 文件添加到 `.gitignore`
-- 在不同环境（dev/staging/prod）使用不同的环境变量值
-- 在 shell 配置文件（`~/.zshrc`）中设置全局环境变量
-
-❌ **避免**：
-- 在配置文件中硬编码敏感信息
-- 将包含真实 token 的 `.env` 文件提交到版本控制
-- 在日志中输出完整的认证 token
-
-### 核心实现
-
-环境变量智能引用功能的核心实现在 `crates/services/src/heartbeat_service.rs`：
-
-```rust
-fn resolve_env_value(configured_value: &str) -> String {
-    let trimmed = configured_value.trim();
-    let key = trimmed
-        .strip_prefix("${").and_then(|s| s.strip_suffix("}"))
-        .or_else(|| trimmed.strip_prefix("$"))
-        .unwrap_or(trimmed);
-    
-    let looks_like_env_var = !key.is_empty() 
-        && key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    
-    if looks_like_env_var {
-        if let Ok(env_value) = std::env::var(key) {
-            if !env_value.is_empty() {
-                return env_value;
-            }
-        }
-    }
-    
-    configured_value.to_string()
-}
+# View service logs
+RUST_LOG=services=debug cargo run -p server
 ```
 
+## Project Status
+
+- ✅ Core feature modules complete
+- ✅ Database migration system stable
+- ✅ Claude Local Agent integration
+- ✅ Adapter plugin system
+- ✅ Complete development toolset
+
+## Related Resources
+
+- **Testing Guide**: [tests/TESTING_GUIDE.md](tests/TESTING_GUIDE.md)
+- **Architecture Documentation**: [architecture/](architecture/)
+- **Team Catalog**: [teams-catalog/](teams-catalog/)
+- **Scripts**: [scripts/](scripts/)
+
+## License
+
+[To be added]

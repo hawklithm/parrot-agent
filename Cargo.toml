@@ -51,6 +51,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Testing
 mockall = "0.12"
 
-[[bin]]
-name = "fix_agents_data"
-path = "fix_agents_data.rs"
