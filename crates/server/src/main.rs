@@ -185,6 +185,25 @@ async fn ensure_local_trusted_principal(pool: &PgPool) -> Result<(), Box<dyn std
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 设置panic hook，记录崩溃信息到日志和stderr
+    std::panic::set_hook(Box::new(|panic_info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        eprintln!("\n{}", "=".repeat(80));
+        eprintln!("💥 APPLICATION PANIC 💥");
+        eprintln!("{}", "=".repeat(80));
+        eprintln!("Panic occurred: {:?}", panic_info);
+        eprintln!("\nBacktrace:\n{}", backtrace);
+        eprintln!("{}\n", "=".repeat(80));
+        
+        // 也尝试写入tracing日志（如果已初始化）
+        tracing::error!(
+            panic_info = ?panic_info,
+            backtrace = %backtrace,
+            "APPLICATION PANIC - Service crashed"
+        );
+    }));
+
+
     // 加载 .env 文件（优先级：环境变量 > .env）
     let _ = dotenvy::dotenv();
 

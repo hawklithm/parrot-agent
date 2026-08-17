@@ -160,7 +160,56 @@ impl DefaultApprovalExecutor {
             budget_repo,
         }
     }
+    /// 查找公司唯一的根节点 Agent（用于自动分配汇报线）
+    /// 
+    /// 逻辑参考 Paperclip 的 findSingleRootManager:
+    /// 1. 查找该公司所有非 terminated 的 Agent
+    /// 2. 过滤出没有上级（reports_to = NULL）的根节点
+    /// 3. 进一步过滤出非 built-in 的 Agent（通过 metadata 检查）
+    /// 4. 如果只有一个符合条件的根节点，返回其 ID
+    /// 5. 否则返回 None（多个根节点或没有根节点）
+    async fn find_single_root_agent(&self, company_id: Uuid) -> Result<Option<Uuid>, ServiceError> {
+        // 查询所有非 terminated 的 Agent
+        let agents = sqlx::query!(
+            r#"
+            SELECT id, reports_to, metadata, status
+            FROM agents
+            WHERE company_id = $1
+              AND status != 'terminated'
+            "#,
+            company_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to fetch agents: {}", e)))?;
 
+        // 过滤出根节点：reports_to 为 NULL 且不是 built-in Agent
+        let root_agents: Vec<Uuid> = agents
+            .iter()
+            .filter(|agent| {
+                // 必须是根节点（没有上级）
+                if agent.reports_to.is_some() {
+                    return false;
+                }
+
+                // 排除 built-in Agent（检查 metadata 中是否有 built_in 标记）
+                if agent.metadata.get("builtIn").is_some() || 
+                   agent.metadata.get("built_in").is_some() {
+                    return false;
+                }
+
+                true
+            })
+            .map(|agent| agent.id)
+            .collect();
+
+        // 只有唯一一个根节点时才返回
+        if root_agents.len() == 1 {
+            Ok(Some(root_agents[0]))
+        } else {
+            Ok(None)
+        }
+    }
     /// 激活已存在的 pending_approval Agent
     async fn activate_pending_agent(&self, agent_id: Uuid) -> Result<Agent, ServiceError> {
         let agent = self.agent_repo.get_by_id(agent_id).await?;
@@ -267,7 +316,33 @@ impl ApprovalExecutor for DefaultApprovalExecutor {
         approval: &Approval,
         decided_by_user_id: Uuid,
     ) -> Result<ApprovalExecutionResult, ServiceError> {
-        let payload = HireAgentPayload::from_json(&approval.payload)?;
+        let mut payload = HireAgentPayload::from_json(&approval.payload)?;
+
+        // 🆕 自动推断汇报线：参考 Paperclip 的策略
+        // 策略 1: 如果未指定上级，使用审批请求者（通常是 CEO）
+        // 策略 2: 如果没有请求者，查找公司唯一的根节点 Agent
+        if payload.reports_to.is_none() {
+            if let Some(requested_by_agent_id) = approval.requested_by_agent_id {
+                payload.reports_to = Some(requested_by_agent_id);
+                
+                tracing::info!(
+                    approval_id = %approval.id,
+                    requested_by_agent_id = %requested_by_agent_id,
+                    "Auto-assigned reports_to to requesting agent"
+                );
+            } else {
+                // Fallback: 查找唯一的根节点 Agent
+                if let Ok(Some(single_root_id)) = self.find_single_root_agent(approval.company_id).await {
+                    payload.reports_to = Some(single_root_id);
+                    
+                    tracing::info!(
+                        approval_id = %approval.id,
+                        single_root_id = %single_root_id,
+                        "Auto-assigned reports_to to single root agent"
+                    );
+                }
+            }
+        }
 
         // 创建或激活 Agent
         let agent = if let Some(agent_id) = payload.agent_id {

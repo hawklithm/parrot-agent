@@ -31,8 +31,11 @@ pub enum ResourceType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedResource {
     pub id: Uuid,
+    pub company_id: Uuid,
     pub plugin_id: Uuid,
-    pub resource_type: ResourceType,
+    pub plugin_key: String,
+    pub resource_kind: String,
+    pub resource_key: String,
     pub resource_id: Uuid,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -50,19 +53,24 @@ impl PluginManagedResourcesService {
     /// 注册 Plugin 管理的资源
     pub async fn register_resource(
         &self,
+        company_id: Uuid,
         plugin_id: Uuid,
-        resource_type: ResourceType,
+        plugin_key: String,
+        resource_kind: String,
+        resource_key: String,
         resource_id: Uuid,
     ) -> ManagedResourceResult<Uuid> {
         let id = Uuid::new_v4();
-        let resource_type_str = format!("{:?}", resource_type);
         
         sqlx::query!(
-            "INSERT INTO plugin_managed_resources (id, plugin_id, resource_type, resource_id, created_at)
-             VALUES ($1, $2, $3, $4, NOW())",
+            "INSERT INTO plugin_managed_resources (id, company_id, plugin_id, plugin_key, resource_kind, resource_key, resource_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
             id,
+            company_id,
             plugin_id,
-            resource_type_str,
+            plugin_key,
+            resource_kind,
+            resource_key,
             resource_id
         )
         .execute(&self.pool)
@@ -74,7 +82,7 @@ impl PluginManagedResourcesService {
     /// 列出 Plugin 
     pub async fn list_resources(&self, plugin_id: Uuid) -> ManagedResourceResult<Vec<ManagedResource>> {
         let rows = sqlx::query!(
-            "SELECT id, plugin_id, resource_type, resource_id, created_at
+            "SELECT id, company_id, plugin_id, plugin_key, resource_kind, resource_key, resource_id, created_at
              FROM plugin_managed_resources
              WHERE plugin_id = $1
              ORDER BY created_at DESC",
@@ -84,18 +92,13 @@ impl PluginManagedResourcesService {
         .await?;
         
         Ok(rows.into_iter().map(|row| {
-            let resource_type = match row.resource_type.as_str() {
-                "Agent" => ResourceType::Agent,
-                "Routine" => ResourceType::Routine,
-                "Skill" => ResourceType::Skill,
-                "Tool" => ResourceType::Tool,
-                _ => ResourceType::Tool,
-            };
-            
             ManagedResource {
                 id: row.id,
+                company_id: row.company_id,
                 plugin_id: row.plugin_id,
-                resource_type,
+                plugin_key: row.plugin_key,
+                resource_kind: row.resource_kind,
+                resource_key: row.resource_key,
                 resource_id: row.resource_id,
                 created_at: row.created_at,
             }

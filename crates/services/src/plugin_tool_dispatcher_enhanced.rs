@@ -138,7 +138,7 @@ impl PluginToolDispatcher {
             ))?;
         
         // 2. 验证 worker 是否运行
-        if !worker_manager.is_running(call.plugin_id).await {
+        if !worker_manager.is_running(&call.plugin_id).await {
             return Err(DispatchError::PluginNotAvailable(call.plugin_id));
         }
         
@@ -155,8 +155,8 @@ impl PluginToolDispatcher {
         // 4. 通过 IPC 调用 worker 的 executeTool 方法
         let result = worker_manager
             .call(
-                call.plugin_id,
-                "executeTool".to_string(),
+                &call.plugin_id,
+                "executeTool",
                 rpc_params,
                 call.timeout_ms,
             )
@@ -165,8 +165,8 @@ impl PluginToolDispatcher {
                 WorkerError::RpcTimeout { timeout_ms, .. } => {
                     DispatchError::Timeout(timeout_ms)
                 }
-                WorkerError::NotRunning(plugin_id) => {
-        DispatchError::PluginNotAvailable(plugin_id)
+                WorkerError::NotRunning(_) => {
+                    DispatchError::PluginNotAvailable(call.plugin_id)
                 }
                 _ => DispatchError::ExecutionError(e.to_string()),
             })?;

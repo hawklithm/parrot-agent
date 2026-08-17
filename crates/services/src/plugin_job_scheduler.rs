@@ -600,7 +600,7 @@ impl PluginJobScheduler {
 
         let result = self
             .worker_manager
-            .call(plugin_id, "runJob".to_string(), params, Some(self.job_timeout_ms))
+            .call(&plugin_id, "runJob", params, Some(self.job_timeout_ms))
             .await;
 
         let end_time = Utc::now();
