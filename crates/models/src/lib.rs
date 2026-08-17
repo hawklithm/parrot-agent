@@ -1,4 +1,5 @@
 pub mod activity_log;
+pub mod agent_runtime_state;
 pub mod adapter;
 pub mod agent;
 pub mod agent_api_key;
@@ -78,6 +79,7 @@ pub use secret_provider::{ProviderHealthStatus, SecretProviderConfig};
 pub use secrets::{SecretBinding, UserSecret, UserSecretDefinition};
 pub use state_machine::AgentStateMachine;
 
+pub use agent_runtime_state::*;
 // ===== glob re-export（非冲突类型继续使用） =====
 pub use activity_log::*;
 pub use adapter::*;

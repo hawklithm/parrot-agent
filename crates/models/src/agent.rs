@@ -205,17 +205,6 @@ pub struct AgentConfigRevision {
     pub created_at: DateTime<Utc>,
 }
 
-/// Agent 运行时状态
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentRuntimeState {
-    pub agent_id: Uuid,
-    pub status: AgentStatus,
-    pub is_healthy: bool,
-    pub last_heartbeat_at: Option<DateTime<Utc>>,
-    pub current_task_id: Option<Uuid>,
-}
-
 /// Agent 任务会话
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

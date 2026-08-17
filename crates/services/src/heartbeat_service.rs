@@ -221,6 +221,13 @@ struct AdapterOutcome {
     tool_call_count: usize,
     handoff: Option<Value>,
     result_event: Option<Value>,
+    // Token usage and cost tracking
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_input_tokens: i64,
+    cost_usd: Option<f64>,
+    model: Option<String>,
+    provider: Option<String>,
 }
 
 #[derive(Debug)]
@@ -282,6 +289,32 @@ fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: b
     }
     if kind == "handoff" || value.get("handoff").is_some() {
         outcome.handoff = value.get("handoff").cloned().or_else(|| Some(value.clone()));
+    }
+
+    // Parse usage and cost information (from adapter JSON output)
+    if let Some(usage) = value.get("usage") {
+        if let Some(input) = usage.get("inputTokens").and_then(Value::as_i64) {
+            outcome.input_tokens = outcome.input_tokens.max(input);
+        }
+        if let Some(output) = usage.get("outputTokens").and_then(Value::as_i64) {
+            outcome.output_tokens = outcome.output_tokens.max(output);
+        }
+        if let Some(cached) = usage.get("cachedInputTokens").and_then(Value::as_i64) {
+            outcome.cached_input_tokens = outcome.cached_input_tokens.max(cached);
+        }
+    }
+    if let Some(cost) = value.get("costUsd").and_then(Value::as_f64) {
+        outcome.cost_usd = Some(cost);
+    }
+    if outcome.model.is_none() {
+        if let Some(model) = value.get("model").and_then(Value::as_str) {
+            outcome.model = Some(model.to_string());
+        }
+    }
+    if outcome.provider.is_none() {
+        if let Some(provider) = value.get("provider").and_then(Value::as_str) {
+            outcome.provider = Some(provider.to_string());
+        }
     }
 
     // Claude Code nests tool_use records inside assistant.message.content. Only
@@ -357,6 +390,7 @@ pub struct DefaultHeartbeatService {
     pool: PgPool,
     children: Arc<Mutex<HashMap<Uuid, Arc<Mutex<Child>>>>>,
     sse_service: Arc<dyn SseService>,
+    cost_service: Option<Arc<dyn crate::CostService>>,
 }
 
 async fn publish_live_event(
@@ -429,11 +463,17 @@ impl DefaultHeartbeatService {
             pool,
             children: Arc::new(Mutex::new(HashMap::new())),
             sse_service: InMemorySseService::new(),
+            cost_service: None,
         }
     }
 
     pub fn with_sse_service(mut self, sse_service: Arc<dyn SseService>) -> Self {
         self.sse_service = sse_service;
+        self
+    }
+
+    pub fn with_cost_service(mut self, cost_service: Arc<dyn crate::CostService>) -> Self {
+        self.cost_service = Some(cost_service);
         self
     }
 
@@ -443,6 +483,7 @@ impl DefaultHeartbeatService {
             pool: self.pool.clone(),
             children: Arc::clone(&self.children),
             sse_service: Arc::clone(&self.sse_service),
+            cost_service: self.cost_service.clone(),
         }
     }
 
@@ -1035,6 +1076,91 @@ impl DefaultHeartbeatService {
         {
             tracing::error!(%run_id, %error, "failed to persist heartbeat run final status");
         }
+
+        // Update agent runtime state with token usage and cost (incremental)
+        let has_token_usage = outcome.input_tokens > 0 || outcome.output_tokens > 0 || outcome.cached_input_tokens > 0;
+        if has_token_usage || outcome.cost_usd.is_some() {
+            let cost_cents = outcome.cost_usd.map(|v| (v * 100.0) as i64).unwrap_or(0);
+            
+            let update_result = sqlx::query(
+                "UPDATE agent_runtime_states 
+                 SET total_input_tokens = total_input_tokens + $2,
+                     total_output_tokens = total_output_tokens + $3,
+                     total_cached_input_tokens = total_cached_input_tokens + $4,
+                     total_cost_cents = total_cost_cents + $5,
+                     last_run_id = $6,
+                     last_run_status = $7,
+                     updated_at = NOW()
+                 WHERE agent_id = $1"
+            )
+            .bind(agent_id)
+            .bind(outcome.input_tokens)
+            .bind(outcome.output_tokens)
+            .bind(outcome.cached_input_tokens)
+            .bind(cost_cents)
+            .bind(run_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await;
+            
+            if let Err(error) = update_result {
+                tracing::warn!(%run_id, %agent_id, %error, "failed to update agent runtime state with token usage");
+            } else {
+                tracing::debug!(
+                    %run_id, 
+                    %agent_id, 
+                    input_tokens = outcome.input_tokens,
+                    output_tokens = outcome.output_tokens,
+                    cached_input_tokens = outcome.cached_input_tokens,
+                cost_cents,
+                    "updated agent runtime state with token usage and cost"
+                );
+            }
+            
+            
+            // Create cost event via CostService for ledger tracking
+            if let Some(cost_service) = &self.cost_service {
+                if cost_cents > 0 || has_token_usage {
+                    let create_event_input = crate::CreateCostEventInput {
+                        agent_id,
+                        heartbeat_run_id: Some(run_id),
+                        issue_id: Some(issue_id),
+                        project_id: None,
+                        goal_id: None,
+                        billing_code: None,
+                        provider: outcome.provider.clone().unwrap_or_else(|| "unknown".to_string()),
+                        model: outcome.model.clone().unwrap_or_else(|| "unknown".to_string()),
+                        biller: "anthropic".to_string(), // TODO: resolve biller from adapter config
+                        billing_type: "api".to_string(), // TODO: resolve billing_type from adapter config
+                        input_tokens: outcome.input_tokens as i32,
+                        cached_input_tokens: outcome.cached_input_tokens as i32,
+                        output_tokens: outcome.output_tokens as i32,
+                        cost_cents: cost_cents as i32,
+                        occurred_at: None, // Use current time
+                    };
+                    
+                    match cost_service.create_event(company_id, create_event_input).await {
+                        Ok(event) => {
+                            tracing::debug!(
+                                %run_id,
+                                event_id = %event.id,
+                                cost_cents,
+                                "created cost event for heartbeat run"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %run_id,
+                                %agent_id,
+                                ?error,
+                                "failed to create cost event"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         publish_live_event(
             &self.sse_service,
             company_id,
@@ -1935,6 +2061,7 @@ impl DefaultHeartbeatService {
             pool: self.pool.clone(),
             children: self.children.clone(),
             sse_service: self.sse_service.clone(),
+            cost_service: self.cost_service.clone(),
         }
     }
 }

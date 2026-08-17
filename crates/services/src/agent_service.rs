@@ -1198,44 +1198,45 @@ where
 
     async fn get_runtime_state(&self, id: Uuid) -> Result<AgentRuntimeState, ServiceError> {
         let agent = self.repository.get_by_id(id).await?;
-        let latest_run = if let Some(pool) = &self.heartbeat_pool {
-            sqlx::query(
-                    "SELECT started_at, context_snapshot
-                     FROM heartbeat_runs
-                     WHERE company_id = $1 AND agent_id = $2
-                     ORDER BY COALESCE(started_at, created_at) DESC, created_at DESC
-                     LIMIT 1",
-                )
-                .bind(agent.company_id)
-                .bind(agent.id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| {
-                    ServiceError::Internal(format!("failed to load latest heartbeat: {e}"))
-                })?
-        } else {
-            None
+        
+        // 从 agent_runtime_states 表读取完整的 runtime state
+        let Some(pool) = &self.heartbeat_pool else {
+            return Err(ServiceError::Internal("heartbeat pool not configured".to_string()));
         };
-        let last_heartbeat_at = latest_run
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<chrono::DateTime<Utc>>, _>("started_at").ok().flatten());
-        let current_task_id = latest_run
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<serde_json::Value>, _>("context_snapshot").ok().flatten())
-            .and_then(|context| {
-                context
-                    .get("issueId")
-                    .or_else(|| context.get("taskId"))
-                    .and_then(|value| value.as_str())
-                    .and_then(|value| Uuid::parse_str(value).ok())
-            });
-        Ok(AgentRuntimeState {
-            agent_id: agent.id,
-            status: agent.status,
-            is_healthy: agent.status != AgentStatus::Terminated,
-            last_heartbeat_at,
-            current_task_id,
-        })
+        
+        // 如果不存在，先初始化
+        let state: Option<AgentRuntimeState> = sqlx::query_as(
+            "SELECT * FROM agent_runtime_states WHERE agent_id = $1"
+        )
+        .bind(agent.id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| ServiceError::Internal(format!("failed to load runtime state: {e}")))?;
+        
+        if let Some(state) = state {
+            return Ok(state);
+        }
+        
+        // 初始化 runtime state
+        let new_state: AgentRuntimeState = sqlx::query_as(
+            r#"
+            INSERT INTO agent_runtime_states (
+                agent_id, company_id, adapter_type,
+                state_json, total_input_tokens, total_output_tokens,
+                total_cached_input_tokens, total_cost_cents
+            )
+            VALUES ($1, $2, $3, '{}', 0, 0, 0, 0)
+            RETURNING *
+            "#
+        )
+        .bind(agent.id)
+        .bind(agent.company_id)
+        .bind(&agent.adapter_type)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ServiceError::Internal(format!("failed to initialize runtime state: {e}")))?;
+        
+        Ok(new_state)
     }
 
     async fn get_task_sessions(&self, id: Uuid) -> Result<Vec<AgentTaskSession>, ServiceError> {

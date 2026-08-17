@@ -547,8 +547,21 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         wakeup_repo,
         interaction_repo,
     ));
+    
+    // Create cost service before heartbeat service (heartbeat needs it for cost event tracking)
+    let cost_service: Arc<dyn services::CostService> = Arc::new(
+        services::DefaultCostService::new(
+            cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
+            Arc::new(agent_repo.clone()) as Arc<dyn repositories::AgentRepository>,
+            Arc::new(company_repo_for_services.clone()),
+        )
+        .with_adapter_registry(adapter_registry.clone()),
+    );
+    
     let heartbeat_coordinator = Arc::new(
-        DefaultHeartbeatService::new(pool.clone()).with_sse_service(sse_service.clone()),
+        DefaultHeartbeatService::new(pool.clone())
+            .with_sse_service(sse_service.clone())
+            .with_cost_service(cost_service.clone()),
     );
     let heartbeat_service: Arc<dyn services::HeartbeatService> = heartbeat_coordinator.clone();
     // Label service
@@ -637,14 +650,7 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         Arc::new(services::DefaultTermService::new()),
         label_service,
         instance_settings_service,
-        Arc::new(
-            services::DefaultCostService::new(
-                cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
-                Arc::new(agent_repo.clone()) as Arc<dyn repositories::AgentRepository>,
-                Arc::new(company_repo_for_services.clone()),
-            )
-            .with_adapter_registry(server_adapter_registry),
-        ),
+        cost_service.clone(),
         Arc::new(services::DefaultBudgetService::new(
             cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
             budget_policy_repo.clone() as Arc<dyn repositories::BudgetPolicyRepository>,
