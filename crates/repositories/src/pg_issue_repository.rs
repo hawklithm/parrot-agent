@@ -676,6 +676,18 @@ impl IssueRepository for PgIssueRepository {
             }
         });
         
+        // Generate identifier for the issue (e.g., "ISSUE-1", "ISSUE-2")
+        // Get the next issue number for this company
+        let issue_number: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(issue_number), 0) + 1 FROM issues WHERE company_id = $1"
+        )
+        .bind(input.company_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+        
+        let identifier = format!("ISSUE-{}", issue_number);
+        
         let mut issue = sqlx::query_as::<_, Issue>(
             r#"
             INSERT INTO issues (
@@ -683,6 +695,7 @@ impl IssueRepository for PgIssueRepository {
                 title, description, status, work_mode, harness_kind, priority,
                 assignee_agent_id, assignee_user_id,
                 created_by_agent_id, created_by_user_id, responsible_user_id,
+                issue_number, identifier,
                 origin_kind, origin_id, origin_run_id, origin_fingerprint, request_depth,
                 billing_code, assignee_adapter_overrides,
                 execution_policy, execution_workspace_settings,
@@ -693,10 +706,11 @@ impl IssueRepository for PgIssueRepository {
                 $6, $7, $8, $9, $10, $11,
                 $12, $13,
                 $14, $15, $16,
-                $17, $18, $19, $20, $21,
-                $22, $23,
+                $17, $18,
+                $19, $20, $21, $22, $23,
                 $24, $25,
-                $26, $27
+                $26, $27,
+                $28, $29
             )
             RETURNING *
             "#,
@@ -717,6 +731,8 @@ impl IssueRepository for PgIssueRepository {
         .bind(input.created_by_agent_id)
         .bind(input.created_by_user_id)
         .bind(input.responsible_user_id)
+        .bind(issue_number)
+        .bind(&identifier)
         // PostgreSQL defaults are not applied when a column is explicitly
         // bound as NULL. Paperclip normalizes ordinary issue creation to the
         // manual origin kind before inserting.
