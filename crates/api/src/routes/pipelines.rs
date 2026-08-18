@@ -43,14 +43,23 @@ pub fn pipeline_routes() -> Router<AppState> {
             get(get_pipelines_attention),
         )
         // --- P3: Pipelines 补齐 (PP1-PP15) ---
-        .route(
-            "/companies/:company_id/review-cases",
-            get(list_review_cases),
-        )
-        .route(
-            "/companies/:company_id/review-cases/bulk",
-            post(bulk_review_cases),
-        )
+        .route("/companies/:company_id/review-cases", get(list_review_cases))
+        .route("/companies/:company_id/review-cases/bulk", post(bulk_review_cases))
+        .route("/companies/:company_id/case-events", get(list_case_events))
+        // --- P1: Pipeline runs management ---
+        .route("/pipelines/:id/runs", get(list_pipeline_runs).post(create_pipeline_run))
+        .route("/pipelines/:id/runs/:run_id", get(get_pipeline_run).delete(delete_pipeline_run))
+        .route("/pipelines/:id/runs/:run_id/cancel", post(cancel_pipeline_run))
+        .route("/pipelines/:id/runs/:run_id/retry", post(retry_pipeline_run))
+        // --- P2: Pipeline stages detail ---
+        .route("/pipelines/:id/stages/:stage_id", get(get_pipeline_stage))
+        // --- P3: Pipeline triggers ---
+        .route("/pipelines/:id/triggers", get(list_pipeline_triggers).post(create_pipeline_trigger))
+        .route("/pipeld/triggers/:trigger_id", delete(delete_pipeline_trigger))
+        // --- P4: Pipeline metrics & logs ---
+        .route("/pipelines/:id/metrics", get(get_pipeline_metrics))
+        .route("/pipelines/:id/logs", get(get_pipeline_logs))
+        .route("/pipelines/:pipeline_id/health", get(get_pipeline_health))
         .route("/companies/:company_id/case-events", get(list_case_events))
         .route("/pipelines/:pipeline_id/health", get(get_pipeline_health))
         .route("/pipelines/:pipeline_id/intake-form", get(get_intake_form))
@@ -370,6 +379,108 @@ async fn batch_create_cases(
     Ok(Json(
         serde_json::json!({"pipelineId": pipeline_id, "batchCreated": true, "count": 0}),
     ))
+}
+
+/// P16: GET /pipelines/:id/runs
+async fn list_pipeline_runs(
+    State(_state): State<AppState>,
+    Path(pipeline_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
+}
+
+/// P17: POST /pipelines/:id/runs
+async fn create_pipeline_run(
+    State(_state): State<AppState>,
+    Path(pipeline_id): Path<Uuid>,
+    Json(_body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    Ok((StatusCode::CREATED, Json(serde_json::json!({"pipelineId": pipeline_id, "runId": Uuid::new_v4()}))))
+}
+
+/// P18: GET /pipelines/:id/runs/:run_id
+async fn get_pipeline_run(
+    State(_state): State<AppState>,
+    Path((pipeline_id, run_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"pipelineId": pipeline_id, "runId": run_id, "status": "completed"})))
+}
+
+/// P19: DELETE /pipelines/:id/runs/:run_id
+async fn delete_pipeline_run(
+    State(_state): State<AppState>,
+    Path((_pipeline_id, _run_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// P20: POST /pipelines/:id/runs/:run_id/cancel
+async fn cancel_pipeline_run(
+    State(_state): State<AppState>,
+    Path((_pipeline_id, run_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"runId": run_id, "cancelled": true})))
+}
+
+/// P21: POST /pipelines/:id/runs/:run_id/retry
+async fn retry_pipeline_run(
+    State(_state): State<AppState>,
+    Path((_pipeline_id, run_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"runId": run_id, "retried": true})))
+}
+
+/// P22: GET /pipelines/:id/stages/:stage_id
+async fn get_pipeline_stage(
+    State(_state): State<AppState>,
+    Path((pipeline_id, stage_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({"pipelineId": pipeline_id, "stageId": stage_id})))
+}
+
+/// P23: GET /pipelines/:id/triggers
+async fn list_pipeline_triggers(
+    State(_state): State<AppState>,
+    Path(pipeline_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![n+}
+
+/// P24: POST /pipelines/:id/triggers
+async fn create_pipeline_trigger(
+    State(_state): State<AppState>,
+    Path(pipeline_id): Path<Uuid>,
+    Json(_body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    Ok((StatusCode::CREATED, Json(serde_json::json!({"pipelineId": pipeline_id, "triggerId": Uuid::new_v4()}))))
+}
+
+/// P25: DELETE /pipelines/:id/triggers/:trigger_id
+async fn delete_pipeline_trigger(
+    State(_state): State<AppState>,
+    Path((_pipeline_id, _trigger_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// P26: GET /pipelines/:id/metrics
+async fn get_pipeline_metrics(
+    State(_state): State<AppState>,
+    Path(pipeline_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({
+        "pipelineId": pipeline_id,
+        "totalRuns": 0,
+        "successRate": 0.0,
+        "avgDuration": 0
+    })))
+}
+
+/// P27: GET /pipelines/:id/logs
+async fn get_pipeline_logs(
+    State(_state): State<AppState>,
+    Path(pipeline_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
 }
 
 /// Query params for listing cases

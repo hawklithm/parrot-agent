@@ -18,6 +18,67 @@ use services::{
 };
 use services::auth::AuthorizationActor;
 
+// Issue relations handlers
+mod issue_relations_handlers {
+    use super::*;
+    
+    /// GET /issues/:issue_id/relations
+    pub async fn get_issue_relations(
+        State(state): State<AppState>,
+        Path(issue_id): Path<Uuid>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+        let relation_service = services::issue_relation_service::IssueRelationService::new(state.pool.clone());
+        
+        let relations = relation_service
+            .get_relation_summaries(issue_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        
+        Ok(Json(serde_json::json!({
+            "blockedBy": relations.blocked_by,
+            "blocks": relations.blocks,
+        })))
+    }
+
+    /// POST /issues/:issue_id/relations/blocked-by
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct UpdateBlockedByInput {
+        pub blocked_by_issue_ids: Vec<Uuid>,
+    }
+
+    pub async fn update_blocked_by_relations(
+        State(state): State<AppState>,
+        Path(issue_id): Path<Uuid>,
+        Json(input): Json<UpdateBlockedByInput>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        // Get issue to retrieve company_id
+        let issue: Issue = sqlx::query_as(
+            "SELECT * FROM issues WHERE id = $1"
+        )
+        .bind(issue_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Issue not found: {}", e)))?;
+        
+        let relation_service = services::issue_relation_service::IssueRelationService::new(state.pool.clone());
+        
+        relation_service
+            .update_blocked_by_relations(
+                issue.company_id,
+                issue_id,
+                input.blocked_by_issue_ids,
+                None, // TODO: Get from auth context
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        
+        Ok(StatusCode::OK)
+    }
+}
+
+use issue_relations_handlers::{get_issue_relations, update_blocked_by_relations};
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListIssuesQuery {
@@ -1737,6 +1798,128 @@ async fn delete_issue_approval(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// I5: GET /issues/:id/work-products - List work products for issue
+async fn list_work_products(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(id): IssueId,
+) -> Result<Json<Vec<models::issue_auxiliary::WorkProduct>>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    state.work_product_service
+        .list_work_products(id, company_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I6: POST /issues/:id/work-products - Create work product for issue
+async fn create_work_product(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(id): IssueId,
+    Json(input): Json<models::issue_auxiliary::CreateWorkProductInput>,
+) -> Result<Json<models::issue_auxiliary::WorkProduct>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    state.work_product_service
+        .create_work_product(id, company_id, input)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// I7: GET /issues/:id/children - List child issues
+async fn list_child_issues(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(id): IssueId,
+) -> Result<Json<Vec<Issue>>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    
+    // Query child issues from database
+    let children = sqlx::query_as::<_, Issue>(
+        "SELECT * FROM issues WHERE parent_issue_id = $1 AND company_id = $2 ORDER BY created_at DESC"
+    )
+    .bind(id)
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(children))
+}
+
+/// I8: GET /issues/:id/transcript - Get issue transcript/conversation history
+async fn get_issue_transcript(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(id): IssueId,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    
+    // Query activity log for transcript events
+    let events = sqlx::query(
+        "SELECT id, action, details, created_at, agent_id, user_id 
+         FROM activity_log 
+         WHERE entity_type = 'issue' AND entity_id = $1 AND company_id = $2
+         AND action IN ('issue.comment', 'issue.status_changed', 'issue.assigned', 'issue.created')
+         ORDER BY created_at ASC"
+    )
+    .bind(id.to_string())
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    let mut transcript = Vec::new();
+    for row in events {
+        let action: String = row.try_get("action").unwrap_or_default();
+        let details: Option<serde_json::Value> = row.try_get("details").ok();
+        let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at").unwrap_or_default();
+        let agent_id: Option<Uuid> = row.try_get("agent_id").ok().flatten();
+        let user_id: Option<Uuid> = row.try_get("user_id").ok().flatten();
+        
+        transcript.push(serde_json::json!({
+            "action": action,
+            "details": details,
+            "createdAt": created_at,
+            "agentId": agent_id,
+            "userId": user_id,
+        }));
+    }
+    
+    Ok(Json(serde_json::json!({
+        "issueId": id,
+        "transcript": transcript,
+    })))
+}
+
+/// I9: DELETE /issues/:id/relations/:relation_id - Delete specific issue relation
+async fn delete_issue_relation(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, relation_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    
+    // Delete the relation
+    let result = sqlx::query(
+        "DELETE FROM issue_relations 
+         WHERE id = $1 AND company_id = $2 AND (issue_id = $3 OR related_issue_id = $3)"
+    )
+    .bind(relation_id)
+    .bind(company_id)
+    .bind(issue_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// I11: POST /issues/:id/children
 async fn create_child_issue(
     State(state): State<AppState>,
@@ -2030,10 +2213,9 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/cases", get(get_issue_cases))
         .route("/issues/:id/active-run", get(get_issue_active_run))
         .route("/issues/:id/live-runs", get(get_issue_live_runs))
-        .route("/issues/:id/accepted-plan-decompositions", get(list_plan_decompositions).post(submit_plan_decomposition))
-        .route("/issues/:id/approvals", get(list_issue_approvals).post(create_issue_approval))
-        .route("/issues/:id/approvals/:approval_id", delete(delete_issue_approval))
-        .route("/issues/:id/children", post(create_child_issue))
+        .route("/issues/:id/work-products", get(list_work_products).post(create_work_product))
+        .route("/issues/:id/children", get(list_child_issues).post(create_child_issue))
+        .route("/issues/:id/transcript", get(get_issue_transcript))
         .route("/issues/:id/read", post(mark_issue_read).delete(unmark_issue_read))
         .route("/issues/:id/inbox-archive", post(archive_issue_inbox).delete(unarchive_issue_inbox))
         .route("/issues/:id/monitor/check-now", post(monitor_check_now))
@@ -2043,7 +2225,6 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/external-objects/refresh", post(refresh_external_objects))
         .route("/issues/:id/documents", get(list_issue_documents))
         .route("/issues/:id/documents/:key", get(get_issue_document).put(upsert_issue_document).delete(delete_issue_document))
-        .route("/issues/:id/documents/:key/revisions", get(list_issue_document_revisions))
         .route("/issues/:id/documents/:key/revisions/:revision_id/restore", post(restore_issue_document_revision))
         .route("/issues/:id/documents/:key/annotations", get(get_issue_document_annotations).post(create_issue_document_annotation))
         .route("/issues/:id/documents/:key/annotations/:thread_id", get(get_issue_document_annotation_thread).patch(update_issue_document_annotation))

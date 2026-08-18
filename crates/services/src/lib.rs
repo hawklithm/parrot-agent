@@ -50,6 +50,7 @@ pub mod tool_runtime_metrics_service;
 pub mod database_backup_health_service;
 pub mod document_service;
 pub mod document_annotation_service;
+pub mod issue_relation_service;
 pub mod status_card_service;
 pub mod status_card_finalization_service;
 pub mod webhook_service;
