@@ -2,7 +2,6 @@
 //!
 //! 对应 Pipeline/Adapter 模块 §6 Pipeline HTTP 路由层
 
-use axum::routing::{delete, get, patch, post, put};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
