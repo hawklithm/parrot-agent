@@ -436,13 +436,14 @@ async fn get_pipeline_stage(
 }
 
 /// P23: GET /pipelines/:id/triggers
-async fn list_pipeline_triggers(
-    State(_state): State<AppState>,
+
 /// P23: GET /pipelines/:id/triggers
 async fn list_pipeline_triggers(
     State(_state): State<AppState>,
-    Path(pipeline_id): Path<Uuid>,
+    Path(_pipeline_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    Ok(Json(vec![]))
+}
     Ok(Json(vec![]))
 }
     State(_state): State<AppState>,
