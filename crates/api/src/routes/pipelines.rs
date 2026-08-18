@@ -1,6 +1,6 @@
 //! Pipeline routes — CRUD + Case operations + Stage/Transition management
 //!
-use axum::routing::{delete, get, patch, post, put};
+//! 对应 Pipeline/Adapter 模块 §6 Pipeline HTTP 路由层
 
 use axum::{
     extract::{Path, Query, State},
