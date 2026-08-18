@@ -55,7 +55,7 @@ pub fn pipeline_routes() -> Router<AppState> {
         .route("/pipelines/:id/stages/:stage_id", get(get_pipeline_stage))
         // --- P3: Pipeline triggers ---
         .route("/pipelines/:id/triggers", get(list_pipeline_triggers).post(create_pipeline_trigger))
-        .route("/pipelines/:id/triggers/:trigger_id", delete(delete_pipeline_trigger))
+        .route("/pipelines/:id/triggers/:trigger_id", axum::routing::delete(delete_pipeline_trigger))
         // --- P4: Pipeline metrics & logs ---
         .route("/pipelines/:id/metrics", get(get_pipeline_metrics))
         .route("/pipelines/:id/logs", get(get_pipeline_logs))
