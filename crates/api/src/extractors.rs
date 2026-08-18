@@ -92,6 +92,55 @@ where
     }
 }
 
+/// Issue ID 提取器 - 支持 UUID 或 identifier
+///
+/// 从路径参数 `:id` 或 `:issue_id` 中提取 Issue ID，支持 UUID 或 identifier (ISSUE-*) 格式。
+/// 参照 Paperclip 的 router.param() 实现，在路由层面统一处理 identifier → UUID 的转换。
+#[derive(Debug, Clone, Copy)]
+pub struct IssueId(pub Uuid);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for IssueId
+where
+    S: Send + Sync,
+    crate::app_state::AppState: axum::extract::FromRef<S>,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(params): Path<HashMap<String, String>> = Path::from_request_parts(parts, state)
+            .await
+            .map_err(|_| AppError::BadRequest("Invalid issue ID parameter".to_string()))?;
+
+        let reference = params
+            .get("id")
+            .or_else(|| params.get("issue_id"))
+            .ok_or_else(|| AppError::BadRequest("Missing issue ID path parameter".to_string()))?;
+
+        // 尝试直接解析为 UUID
+        if let Ok(uuid) = Uuid::parse_str(reference) {
+            return Ok(IssueId(uuid));
+        }
+
+        // 尝试作为 identifier 从数据库查询
+        let app_state: crate::app_state::AppState = axum::extract::FromRef::from_ref(state);
+
+        let uuid = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM issues WHERE identifier = $1"
+        )
+        .bind(reference)
+        .fetch_optional(&app_state.pool)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, reference = %reference, "Failed to resolve issue identifier");
+            AppError::InternalServerError("Database error".to_string())
+        })?
+        .ok_or_else(|| AppError::NotFound(format!("Issue not found: {}", reference)))?;
+
+        Ok(IssueId(uuid))
+    }
+}
+
 /// Revision ID 提取器
 #[derive(Debug, Clone)]
 pub struct RevisionId(pub Uuid);

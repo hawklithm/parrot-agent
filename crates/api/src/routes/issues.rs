@@ -8,6 +8,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::Value;
 use crate::app_state::AppState;
+use crate::extractors::IssueId;
 use uuid::Uuid;
 use sqlx::Row;
 
@@ -266,7 +267,7 @@ struct IssueDocumentResponse {
 async fn list_issue_documents(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
     Query(query): Query<ListIssueDocumentsQuery>,
 ) -> Result<Json<Vec<IssueDocumentResponse>>, StatusCode> {
     scoped_issue_company(&state, &actor, issue_id).await?;
@@ -299,8 +300,9 @@ async fn list_issue_documents(
 async fn get_issue_document(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key)): Path<(Uuid, String)>,
+    Path((issue_id, key)): Path<(String, String)>,
 ) -> Result<Json<IssueDocumentResponse>, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
 
     let key = key.trim().to_lowercase();
@@ -336,10 +338,11 @@ fn validate_issue_document_key(key: &str) -> Result<String, StatusCode> {
 async fn upsert_issue_document(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, raw_key)): Path<(Uuid, String)>,
+    Path((issue_id, raw_key)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
     let content = payload.get("body").or_else(|| payload.get("content")).and_then(|value| value.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
     if content.len() > 524_288 {
@@ -408,8 +411,9 @@ async fn upsert_issue_document(
 async fn list_issue_document_revisions(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, raw_key)): Path<(Uuid, String)>,
+    Path((issue_id, raw_key)): Path<(String, String)>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
     let document_id: Uuid = sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
@@ -427,9 +431,10 @@ async fn list_issue_document_revisions(
 async fn restore_issue_document_revision(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, raw_key, revision_id)): Path<(Uuid, String, Uuid)>,
+    Path((issue_id, raw_key, revision_id)): Path<(String, String, Uuid)>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
     let document_id: Uuid = sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
@@ -460,9 +465,10 @@ async fn restore_issue_document_revision(
 async fn get_issue_document_annotations(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key)): Path<(Uuid, String)>,
+    Path((issue_id, key)): Path<(String, String)>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let document_id: Uuid = sqlx::query_scalar(
         "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
@@ -558,8 +564,9 @@ async fn get_issue_document_annotations(
 async fn get_issue_document_annotation_thread(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key, thread_id)): Path<(Uuid, String, Uuid)>,
+    Path((issue_id, key, thread_id)): Path<(String, String, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let document_id: Uuid = sqlx::query_scalar(
         "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
@@ -637,9 +644,10 @@ async fn get_issue_document_annotation_thread(
 async fn create_issue_document_annotation(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key)): Path<(Uuid, String)>,
+    Path((issue_id, key)): Path<(String, String)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let document_id: Uuid = sqlx::query_scalar(
         "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
@@ -728,9 +736,10 @@ async fn create_issue_document_annotation(
 async fn reply_issue_document_annotation(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key, thread_id)): Path<(Uuid, String, Uuid)>,
+    Path((issue_id, key, thread_id)): Path<(String, String, Uuid)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let document_id: Uuid = sqlx::query_scalar(
         "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
@@ -789,9 +798,10 @@ async fn reply_issue_document_annotation(
 async fn update_issue_document_annotation(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key, thread_id)): Path<(Uuid, String, Uuid)>,
+    Path((issue_id, key, thread_id)): Path<(String, String, Uuid)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let document_id: Uuid = sqlx::query_scalar(
         "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
@@ -836,9 +846,10 @@ async fn update_issue_document_annotation(
 async fn lock_issue_document(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key)): Path<(Uuid, String)>,
+    Path((issue_id, key)): Path<(String, String)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
     
     let document_id: Uuid = sqlx::query_scalar(
@@ -875,8 +886,9 @@ async fn lock_issue_document(
 async fn unlock_issue_document(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key)): Path<(Uuid, String)>,
+    Path((issue_id, key)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
     
     let document_id: Uuid = sqlx::query_scalar(
@@ -909,8 +921,9 @@ async fn unlock_issue_document(
 async fn delete_issue_document(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key)): Path<(Uuid, String)>,
+    Path((issue_id, key)): Path<(String, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     
     sqlx::query(
@@ -933,6 +946,22 @@ struct SearchQuery {
     q: String,
     #[serde(default)]
     limit: Option<i64>,
+}
+
+/// 解析 Issue ID：支持 UUID 或 identifier
+async fn resolve_issue_id(pool: &sqlx::PgPool, reference: &str) -> Result<Uuid, StatusCode> {
+    // 尝试解析为 UUID
+    if let Ok(uuid) = Uuid::parse_str(reference) {
+        return Ok(uuid);
+    }
+    
+    // 作为 identifier 查询
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM issues WHERE identifier = $1")
+        .bind(reference)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn issue_company_id(state: &AppState, issue_id: Uuid) -> Result<Uuid, StatusCode> {
@@ -1298,7 +1327,7 @@ async fn list_company_issues(
 async fn update_issue(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(mut input): Json<UpdateIssueInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     // Paperclip first loads the issue and uses its companyId for the mutation
@@ -1340,7 +1369,7 @@ async fn update_issue(
 /// DELETE /issues/:id - Delete issue
 async fn delete_issue(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
     let service = state.issue_service.clone();
     let company_id = issue_company_id(&state, id).await?;
@@ -1387,7 +1416,7 @@ async fn search_issues(
 async fn checkout_issue(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(mut input): Json<CheckoutInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
@@ -1449,7 +1478,7 @@ async fn checkout_issue(
 async fn release_issue(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(input): Json<ReleaseInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
@@ -1485,7 +1514,7 @@ async fn release_issue(
 /// POST /issues/:id/admin/force-release - Force release issue (admin only)
 async fn force_release_issue(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(input): Json<services::ForceReleaseInput>,
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
@@ -1551,7 +1580,7 @@ async fn get_heartbeat_context(
 /// I2: GET /issues/:id/cases
 async fn get_issue_cases(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
     state.issue_service.get_cases(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -1561,7 +1590,7 @@ async fn get_issue_cases(
 async fn get_issue_active_run(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
     crate::routes::assert_company_access(&actor, company_id, true)?;
@@ -1649,7 +1678,7 @@ async fn get_issue_active_run(
 /// I4: GET /issues/:id/live-runs
 async fn get_issue_live_runs(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
     state.issue_service.get_live_runs(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -1658,7 +1687,7 @@ async fn get_issue_live_runs(
 /// I6: GET /issues/:id/accepted-plan-decompositions
 async fn list_plan_decompositions(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
     state.issue_service.get_accepted_plan_decompositions(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -1667,7 +1696,7 @@ async fn list_plan_decompositions(
 /// I7: POST /issues/:id/accepted-plan-decompositions
 async fn submit_plan_decomposition(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
@@ -1679,7 +1708,7 @@ async fn submit_plan_decomposition(
 async fn list_issue_approvals(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
     state.issue_service.get_approvals(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -1689,7 +1718,7 @@ async fn list_issue_approvals(
 async fn create_issue_approval(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
@@ -1712,7 +1741,7 @@ async fn delete_issue_approval(
 async fn create_child_issue(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(parent_id): Path<Uuid>,
+    IssueId(parent_id): IssueId,
     Json(mut input): Json<CreateIssueInput>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let service = state.issue_service.clone();
@@ -1791,7 +1820,7 @@ async fn create_child_issue(
 async fn mark_issue_read(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let user_id = match actor {
         AuthorizationActor::Board { user_id, .. } => user_id,
@@ -1840,7 +1869,7 @@ async fn mark_issue_read(
 /// I13: DELETE /issues/:id/read
 async fn unmark_issue_read(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
     state.issue_service.unmark_read(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1850,7 +1879,7 @@ async fn unmark_issue_read(
 /// I14: POST /issues/:id/inbox-archive
 async fn archive_issue_inbox(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
     state.issue_service.archive_inbox(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1860,7 +1889,7 @@ async fn archive_issue_inbox(
 /// I15: DELETE /issues/:id/inbox-archive
 async fn unarchive_issue_inbox(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
     state.issue_service.unarchive_inbox(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1870,7 +1899,7 @@ async fn unarchive_issue_inbox(
 /// I16: POST /issues/:id/monitor/check-now
 async fn monitor_check_now(
     State(_state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(serde_json::json!({"issueId": id, "monitorCheckTriggered": true})))
 }
@@ -1878,7 +1907,7 @@ async fn monitor_check_now(
 /// I17: POST /issues/:id/scheduled-retry/retry-now
 async fn scheduled_retry_now(
     State(_state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(serde_json::json!({"issueId": id, "retryTriggered": true})))
 }
@@ -1894,7 +1923,7 @@ async fn list_external_objects(
 /// I19: GET /issues/:id/external-object-summary
 async fn get_external_object_summary(
     State(_state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(serde_json::json!({"issueId": id, "externalObjectCount": 0})))
 }
@@ -1902,7 +1931,7 @@ async fn get_external_object_summary(
 /// I20: POST /issues/:id/external-objects/refresh
 async fn refresh_external_objects(
     State(_state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(serde_json::json!({"issueId": id, "refreshTriggered": true})))
 }
@@ -1918,7 +1947,7 @@ async fn list_file_resources(
 /// I22: GET /issues/:id/file-resources/resolve
 async fn resolve_file_resource(
     State(_state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(serde_json::json!({"issueId": id, "resolved": []})))
 }
@@ -1926,7 +1955,7 @@ async fn resolve_file_resource(
 /// I23: GET /issues/:id/file-resources/content
 async fn get_file_resource_content(
     State(_state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(serde_json::json!({"issueId": id, "content": ""})))
 }
@@ -1942,7 +1971,7 @@ async fn list_feedback_votes(
 /// I25: POST /issues/:id/feedback-votes
 async fn create_feedback_vote(
     State(_state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     Ok((StatusCode::CREATED, Json(serde_json::json!({"issueId": id, "vote": payload, "created": true}))))
@@ -1959,7 +1988,7 @@ async fn list_feedback_traces(
 /// I27: GET /issues/:id/recovery-actions
 async fn list_recovery_actions(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
     state.issue_service.get_recovery_actions(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -1968,7 +1997,7 @@ async fn list_recovery_actions(
 /// I28: POST /issues/:id/recovery-actions/resolve
 async fn resolve_recovery_action(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;

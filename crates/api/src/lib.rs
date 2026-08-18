@@ -29,6 +29,7 @@ pub use validation::{
 pub use extractors::{
     AgentIdOrShortname,
     CompanyIdOrShortname,
+    IssueId,
     RevisionId,
     encode_shortname,
 };
