@@ -50,6 +50,7 @@ pub mod user_secret;
 pub mod user_secret_definition;
 pub mod work_timeline;
 pub mod websocket;
+pub mod tool_access;
 
 // ===== 显式导出：消除 glob re-export 歧义 =====
 // 规则：显式导出优先于 glob 导出，放在 glob 之前即可消除歧义
