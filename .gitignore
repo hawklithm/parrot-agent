@@ -11,6 +11,7 @@
 # Temporary scripts and setup files
 *.sh
 *.sql
+!migrations/*.sql
 *.py
 setup_*.rs
 create_*.sh
