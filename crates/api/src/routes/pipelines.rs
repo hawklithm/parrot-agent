@@ -55,13 +55,10 @@ pub fn pipeline_routes() -> Router<AppState> {
         .route("/pipelines/:id/stages/:stage_id", get(get_pipeline_stage))
         // --- P3: Pipeline triggers ---
         .route("/pipelines/:id/triggers", get(list_pipeline_triggers).post(create_pipeline_trigger))
-        .route("/pipeld/triggers/:trigger_id", delete(delete_pipeline_trigger))
+        .route("/pipelines/:id/triggers/:trigger_id", delete(delete_pipeline_trigger))
         // --- P4: Pipeline metrics & logs ---
         .route("/pipelines/:id/metrics", get(get_pipeline_metrics))
         .route("/pipelines/:id/logs", get(get_pipeline_logs))
-        .route("/pipelines/:pipeline_id/health", get(get_pipeline_health))
-        .route("/companies/:company_id/case-events", get(list_case_events))
-        .route("/pipelines/:pipeline_id/health", get(get_pipeline_health))
         .route("/pipelines/:pipeline_id/intake-form", get(get_intake_form))
         .route("/pipelines/:pipeline_id/stages", post(create_stage))
         .route(
@@ -443,7 +440,7 @@ async fn list_pipeline_triggers(
     State(_state): State<AppState>,
     Path(pipeline_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    Ok(Json(vec![n+}
+    Ok(Json(vec![]))
 
 /// P24: POST /pipelines/:id/triggers
 async fn create_pipeline_trigger(
