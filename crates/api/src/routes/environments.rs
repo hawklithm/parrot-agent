@@ -326,8 +326,12 @@ async fn get_delete_blast_radius(
 /// E17: GET /environments/:environment_id/custom-image-template
 async fn get_custom_image_template(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(environment_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_environment_company_access(&state, environment_id, &actor)
+        .await
+        .map_err(|response| response.status())?;
     let active = sqlx::query_scalar::<_, serde_json::Value>("SELECT json_build_object('id', id, 'environmentId', environment_id, 'provider', provider, 'templateKind', template_kind, 'templateRef', template_ref, 'sourceTemplateRef', source_template_ref, 'status', status, 'supersededByTemplateId', superseded_by_template_id, 'createdByUserId', created_by_user_id, 'createdByAgentId', created_by_agent_id, 'capturedAt', captured_at, 'metadata', metadata, 'lastUsedAt', last_used_at, 'createdAt', created_at, 'updatedAt', updated_at) FROM environment_custom_image_templates WHERE environment_id = $1 AND status = 'active'")
         .bind(environment_id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let active_session = sqlx::query_scalar::<_, Uuid>("SELECT id FROM environment_custom_image_setup_sessions WHERE environment_id = $1 AND status IN ('pending','running','starting','waiting_for_user','capturing') ORDER BY created_at DESC LIMIT 1")
@@ -342,8 +346,12 @@ async fn get_custom_image_template(
 /// E18: DELETE /environments/:environment_id/custom-image-template
 async fn delete_custom_image_template(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(environment_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
+    assert_environment_company_access(&state, environment_id, &actor)
+        .await
+        .map_err(|response| response.status())?;
     let result = sqlx::query("UPDATE environment_custom_image_templates SET status = 'disabled', updated_at = NOW() WHERE environment_id = $1 AND status = 'active'")
         .bind(environment_id).execute(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if result.rows_affected() == 0 {
@@ -355,8 +363,12 @@ async fn delete_custom_image_template(
 /// E19: POST /environments/:environment_id/custom-image-template/rollback
 async fn rollback_custom_image_template(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(environment_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_environment_company_access(&state, environment_id, &actor)
+        .await
+        .map_err(|response| response.status())?;
     let active: Option<Uuid> = sqlx::query_scalar("SELECT id FROM environment_custom_image_templates WHERE environment_id = $1 AND status = 'active' LIMIT 1").bind(environment_id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let previous: Option<Uuid> = sqlx::query_scalar("SELECT id FROM environment_custom_image_templates WHERE environment_id = $1 AND status = 'superseded' ORDER BY captured_at DESC LIMIT 1").bind(environment_id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (Some(active), Some(previous)) = (active, previous) else {
@@ -386,6 +398,9 @@ async fn create_custom_image_setup_session(
     Path(environment_id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_environment_company_access(&state, environment_id, &actor)
+        .await
+        .map_err(|response| response.status())?;
     let user_id = match actor {
         AuthorizationActor::Board { user_id, .. } => Some(user_id.to_string()),
         _ => None,
@@ -427,11 +442,15 @@ async fn create_custom_image_setup_session(
 /// E21: GET /environment-custom-image-setup-sessions/:id/finish
 async fn finish_custom_image_setup_session(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let session = sqlx::query_as::<_, (Uuid, String, Option<String>)>("SELECT environment_id, provider, base_template_ref FROM environment_custom_image_setup_sessions WHERE id = $1 AND status IN ('running','waiting_for_user','starting')")
         .bind(id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    assert_environment_company_access(&state, session.0, &actor)
+        .await
+        .map_err(|response| response.status())?;
     let template_ref = body
         .get("templateRef")
         .and_then(|v| v.as_str())
@@ -462,9 +481,19 @@ async fn finish_custom_image_setup_session(
 /// E22: POST /environment-custom-image-setup-sessions/:id/cancel
 async fn cancel_custom_image_setup_session(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let environment_id: Uuid = sqlx::query_scalar("SELECT environment_id FROM environment_custom_image_setup_sessions WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    assert_environment_company_access(&state, environment_id, &actor)
+        .await
+        .map_err(|response| response.status())?;
     let result = sqlx::query("UPDATE environment_custom_image_setup_sessions SET status='cancelled', failure_reason=$2, updated_at=NOW() WHERE id=$1 AND status IN ('pending','running','starting','waiting_for_user','capturing')")
         .bind(id).bind(body.get("reason").and_then(|v| v.as_str()).unwrap_or("cancelled")).execute(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if result.rows_affected() == 0 {
@@ -479,9 +508,19 @@ async fn cancel_custom_image_setup_session(
 
 /// E23: GET /environment-leases/:lease_id
 async fn get_environment_lease(
-    State(_state): State<AppState>,
-    Path(_lease_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(lease_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let environment_id: Uuid = sqlx::query_scalar("SELECT environment_id FROM environment_leases WHERE id = $1")
+        .bind(lease_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    assert_environment_company_access(&state, environment_id, &actor)
+        .await
+        .map_err(|response| response.status())?;
     Err(StatusCode::NOT_IMPLEMENTED)
 }
 
