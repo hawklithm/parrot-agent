@@ -252,6 +252,15 @@ impl BuiltInAgentMetadataRegistry {
 
     /// 注册默认的内置Agent定义
     fn register_default_definitions(&mut self) {
+        let reflection_coach_instructions = [
+            "# Reflection Coach",
+            "",
+            "You are Paperclip's built-in Reflection Coach.",
+            "Review recent agent execution records, identify evidence-backed improvement patterns, and propose the smallest durable instruction, skill, or tool-description change.",
+            "Do not apply changes in the same run. Present a reviewable diff and wait for the required approval before any follow-up applies it.",
+        ]
+        .join("\n");
+
         // Reflection Coach
         self.definitions.insert(
             BuiltInAgentKey::ReflectionCoach,
@@ -260,7 +269,7 @@ impl BuiltInAgentMetadataRegistry {
                 display_name: "Reflection Coach".to_string(),
                 feature_keys: vec!["built_in_agents".to_string()],
                 short_purpose: "Helps team members reflect on their work and growth".to_string(),
-                default_instructions: "You are Paperclip's built-in Reflection Coach.".to_string(),
+                default_instructions: reflection_coach_instructions.clone(),
                 default_role: models::AgentRole::General,
                 default_title: Some("Reflection Coach".to_string()),
                 default_icon: Some("🪞".to_string()),
@@ -269,7 +278,44 @@ impl BuiltInAgentMetadataRegistry {
                 default_manager: Some("single_root_agent".to_string()),
                 allowed_adapter_types: Some(vec!["claude_local".to_string(), "process".to_string()]),
                 default_budget_monthly_cents: Some(50000), // $500
-                bundle: None, // TODO: 实现bundle定义
+                bundle: Some(BuiltInAgentBundleDefinition {
+                    stock_version: "2026-08-21".to_string(),
+                    instructions: BundleInstructionsDefinition {
+                        entry_file: "AGENTS.md".to_string(),
+                        files: HashMap::from([("AGENTS.md".to_string(), reflection_coach_instructions)]),
+                    },
+                    skill: BundleSkillDefinition {
+                        skill_key: "reflection-coach".to_string(),
+                        display_name: "Reflection Coach".to_string(),
+                        slug: "reflection-coach".to_string(),
+                        canonical_key: "parrot/bundled/reflection-coach".to_string(),
+                        files: HashMap::from([(
+                            "reflection-coach/SKILL.md".to_string(),
+                            "# Reflection Coach\n\nUse evidence-backed observations and propose reviewable changes.".to_string(),
+                        )]),
+                    },
+                    routine: BundleRoutineDefinition {
+                        routine_key: "recent-agent-reflection".to_string(),
+                        title: "Review recent agent trajectories for coaching proposals".to_string(),
+                        description: "Review recent agent work and produce an approval-ready coaching proposal.".to_string(),
+                        status: RoutineStatus::Paused,
+                        priority: RoutinePriority::Medium,
+                        concurrency_policy: RoutineConcurrencyPolicy::CoalesceIfActive,
+                        catch_up_policy: RoutineCatchUpPolicy::SkipMissed,
+                        variables: vec![RoutineVariable {
+                            key: "lookbackDays".to_string(),
+                            label: "Lookback days".to_string(),
+                            default_value: Some(serde_json::json!(7)),
+                        }],
+                        triggers: vec![RoutineTrigger {
+                            kind: "schedule".to_string(),
+                            label: Some("Weekly reflection review".to_string()),
+                            enabled: false,
+                            cron_expression: "0 9 * * 1".to_string(),
+                            timezone: "UTC".to_string(),
+                        }],
+                    },
+                }),
             },
         );
 
@@ -347,7 +393,47 @@ impl BuiltInAgentMetadataRegistry {
                 default_manager: Some("single_root_agent".to_string()),
                 allowed_adapter_types: Some(vec!["claude_local".to_string(), "process".to_string()]),
                 default_budget_monthly_cents: Some(0),
-                bundle: None,
+                bundle: Some(BuiltInAgentBundleDefinition {
+                    stock_version: "2026-08-21".to_string(),
+                    instructions: BundleInstructionsDefinition {
+                        entry_file: "AGENTS.md".to_string(),
+                        files: HashMap::from([(
+                            "AGENTS.md".to_string(),
+                            "You are Paperclip's built-in Summarizer. Write short, honest, company-scoped Markdown summaries; never mutate issues, workspaces, or code.".to_string(),
+                        )]),
+                    },
+                    skill: BundleSkillDefinition {
+                        skill_key: "summarize-status".to_string(),
+                        display_name: "Summarize status".to_string(),
+                        slug: "summarize-status".to_string(),
+                        canonical_key: "parrot/bundled/summarize-status".to_string(),
+                        files: HashMap::from([(
+                            "summarize-status/SKILL.md".to_string(),
+                            "# Summarize status\n\nProduce concise, evidence-backed Markdown summaries.".to_string(),
+                        )]),
+                    },
+                    routine: BundleRoutineDefinition {
+                        routine_key: "refresh-stale-summaries".to_string(),
+                        title: "Refresh stale summary slots".to_string(),
+                        description: "Refresh stale summary slots from current company state.".to_string(),
+                        status: RoutineStatus::Paused,
+                        priority: RoutinePriority::Medium,
+                        concurrency_policy: RoutineConcurrencyPolicy::CoalesceIfActive,
+                        catch_up_policy: RoutineCatchUpPolicy::SkipMissed,
+                        variables: vec![RoutineVariable {
+                            key: "staleAfterHours".to_string(),
+                            label: "Refresh slots older than (hours)".to_string(),
+                            default_value: Some(serde_json::json!(24)),
+                        }],
+                        triggers: vec![RoutineTrigger {
+                            kind: "schedule".to_string(),
+                            label: Some("Daily stale-summary refresh".to_string()),
+                            enabled: false,
+                            cron_expression: "0 8 * * *".to_string(),
+                            timezone: "UTC".to_string(),
+                        }],
+                    },
+                }),
             },
         );
     }
@@ -462,6 +548,25 @@ mod tests {
         let def = registry.get_definition(BuiltInAgentKey::ReflectionCoach).unwrap();
         assert_eq!(def.display_name, "Reflection Coach");
         assert_eq!(def.default_budget_monthly_cents, Some(50000));
+    }
+
+    #[test]
+    fn bundled_agents_have_concrete_instruction_skill_and_routine_defaults() {
+        let registry = BuiltInAgentMetadataRegistry::new();
+        for key in [BuiltInAgentKey::ReflectionCoach, BuiltInAgentKey::Summarizer] {
+            let definition = registry.get_definition(key).unwrap();
+            let bundle = definition.bundle.as_ref().unwrap();
+            assert!(!bundle.stock_version.is_empty());
+            assert!(bundle.instructions.files.contains_key(&bundle.instructions.entry_file));
+            assert!(!bundle.skill.files.is_empty());
+            assert!(!bundle.routine.routine_key.is_empty());
+            assert!(!bundle.routine.triggers.is_empty());
+        }
+        assert!(registry
+            .get_definition(BuiltInAgentKey::LearningAssistant)
+            .unwrap()
+            .bundle
+            .is_none());
     }
 
     #[test]
