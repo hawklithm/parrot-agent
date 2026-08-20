@@ -21,14 +21,14 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
 use sqlx::postgres::PgRow;
+use sqlx::{PgPool, Row};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
-use services::auth::AuthorizationActor;
+use services::auth::{decide_access, AuthorizationAction, AuthorizationActor};
 
 // ---------------------------------------------------------------------------
 // Constants (ported verbatim from Paperclip)
@@ -101,7 +101,10 @@ pub fn decision_routes() -> Router<AppState> {
             "/companies/:company_id/decisions",
             get(list_decisions).post(create_decision),
         )
-        .route("/companies/:company_id/decisions/stats", get(decision_stats))
+        .route(
+            "/companies/:company_id/decisions/stats",
+            get(decision_stats),
+        )
         .route(
             "/companies/:company_id/decision-bundles",
             post(create_decision_bundle),
@@ -243,6 +246,191 @@ fn is_valid_source_kind(kind: &str) -> bool {
     ATTENTION_SOURCE_KINDS.contains(&kind)
 }
 
+/// Match Paperclip's `canReadDecisionSource`: retention mutations must not
+/// manufacture state for a missing attention source, and company membership
+/// alone is not enough for issue/agent-scoped sources.
+async fn require_decision_source_read(
+    pool: &PgPool,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    source_kind: &str,
+    source_id: &str,
+) -> Result<(), AppError> {
+    let source_uuid = Uuid::parse_str(source_id)
+        .map_err(|_| AppError::NotFound("Attention source not found".to_string()))?;
+
+    let source = match source_kind {
+        "approval" => sqlx::query(
+            "SELECT ia.issue_id, NULL::uuid AS agent_id, NULL::jsonb AS context_snapshot
+               FROM approvals a
+               LEFT JOIN issue_approvals ia
+                 ON ia.approval_id = a.id AND ia.company_id = $1
+              WHERE a.company_id = $1 AND a.id = $2
+              LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(source_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+        "decision" => sqlx::query(
+            "SELECT origin_issue_id AS issue_id, NULL::uuid AS agent_id, NULL::jsonb AS context_snapshot
+               FROM decisions
+              WHERE company_id = $1 AND id = $2",
+        )
+        .bind(company_id)
+        .bind(source_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+        "issue_thread_interaction" => sqlx::query(
+            "SELECT issue_id, NULL::uuid AS agent_id, NULL::jsonb AS context_snapshot
+               FROM issue_thread_interactions
+              WHERE company_id = $1 AND id = $2",
+        )
+        .bind(company_id)
+        .bind(source_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+        "recovery_action" => sqlx::query(
+            "SELECT issue_id, NULL::uuid AS agent_id, NULL::jsonb AS context_snapshot
+               FROM recovery_actions
+              WHERE company_id = $1 AND id = $2",
+        )
+        .bind(company_id)
+        .bind(source_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+        "productivity_review" | "blocker_attention" | "review" => sqlx::query(
+            "SELECT id AS issue_id, NULL::uuid AS agent_id, NULL::jsonb AS context_snapshot
+               FROM issues
+              WHERE company_id = $1 AND id = $2 AND hidden_at IS NULL",
+        )
+        .bind(company_id)
+        .bind(source_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+        "failed_run" => sqlx::query(
+            "SELECT NULL::uuid AS issue_id, agent_id, context_snapshot
+               FROM heartbeat_runs
+              WHERE company_id = $1 AND id = $2",
+        )
+        .bind(company_id)
+        .bind(source_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+        "agent_error_alert" => sqlx::query(
+            "SELECT NULL::uuid AS issue_id, id AS agent_id, NULL::jsonb AS context_snapshot
+               FROM agents
+              WHERE company_id = $1 AND id = $2",
+        )
+        .bind(company_id)
+        .bind(source_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+        "join_request" => sqlx::query(
+            "SELECT NULL::uuid AS issue_id, NULL::uuid AS agent_id, NULL::jsonb AS context_snapshot
+               FROM join_requests
+              WHERE company_id = $1 AND id = $2",
+        )
+        .bind(company_id)
+        .bind(source_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+        "budget_alert" => sqlx::query(
+            "SELECT NULL::uuid AS issue_id, NULL::uuid AS agent_id, NULL::jsonb AS context_snapshot
+               FROM budget_incidents
+              WHERE company_id = $1 AND id = $2",
+        )
+        .bind(company_id)
+        .bind(source_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+        _ => None,
+    };
+
+    let Some(source) = source else {
+        return Err(AppError::NotFound("Attention source not found".to_string()));
+    };
+    let context_snapshot: Option<Value> = source.try_get("context_snapshot").map_err(db_err)?;
+    let issue_id: Option<Uuid> = source.try_get("issue_id").map_err(db_err)?.or_else(|| {
+        context_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("issueId").or_else(|| snapshot.get("taskId")))
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+    });
+    if let Some(issue_id) = issue_id {
+        let issue_exists = sqlx::query(
+            "SELECT 1 FROM issues WHERE company_id = $1 AND id = $2 AND hidden_at IS NULL",
+        )
+        .bind(company_id)
+        .bind(issue_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?
+        .is_some();
+        if !issue_exists
+            || !decide_access(
+                pool,
+                actor,
+                &AuthorizationAction::IssueRead { issue_id },
+                Some(company_id),
+            )
+            .await
+        {
+            return Err(AppError::NotFound("Attention source not found".to_string()));
+        }
+        return Ok(());
+    }
+
+    let agent_id: Option<Uuid> = source.try_get("agent_id").map_err(db_err)?;
+    if source_kind == "agent_error_alert" {
+        let Some(agent_id) = agent_id else {
+            return Err(AppError::NotFound("Attention source not found".to_string()));
+        };
+        if !decide_access(
+            pool,
+            actor,
+            &AuthorizationAction::AgentRead { agent_id },
+            Some(company_id),
+        )
+        .await
+        {
+            return Err(AppError::NotFound("Attention source not found".to_string()));
+        }
+        return Ok(());
+    }
+
+    if source_kind == "failed_run" {
+        let Some(owner_agent_id) = agent_id else {
+            return Err(AppError::NotFound("Attention source not found".to_string()));
+        };
+        if let AuthorizationActor::Agent { agent_id, .. } = actor {
+            if *agent_id != owner_agent_id {
+                return Err(AppError::NotFound("Attention source not found".to_string()));
+            }
+            return Ok(());
+        }
+        if !actor.is_board() {
+            return Err(AppError::NotFound("Attention source not found".to_string()));
+        }
+        return Ok(());
+    }
+
+    if !actor.is_board() {
+        return Err(AppError::NotFound("Attention source not found".to_string()));
+    }
+    Ok(())
+}
+
 /// Actor attribution used by every `*_by_type` / `*_by_agent_id` / `*_by_user_id` column trio.
 struct Attribution {
     actor_type: &'static str,
@@ -291,7 +479,9 @@ fn attribution(actor: &AuthorizationActor) -> Attribution {
 /// `(agent_id, run_id)` for the endpoints Paperclip restricts to an agent run context.
 fn agent_context(actor: &AuthorizationActor) -> Result<(Uuid, Option<Uuid>), AppError> {
     match actor {
-        AuthorizationActor::Agent { agent_id, run_id, .. } => Ok((*agent_id, *run_id)),
+        AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => Ok((*agent_id, *run_id)),
         _ => Err(forbid("Agent run context required")),
     }
 }
@@ -483,10 +673,7 @@ async fn load_issue_refs(
 }
 
 /// Build the raw (un-enriched) attention items for a company from live tables.
-async fn collect_attention_items(
-    pool: &PgPool,
-    company_id: Uuid,
-) -> Result<Vec<Value>, AppError> {
+async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<Value>, AppError> {
     let mut items: Vec<Value> = Vec::new();
     let mut issue_ids: HashSet<Uuid> = HashSet::new();
 
@@ -723,7 +910,11 @@ async fn collect_attention_items(
             ],
             "review" => vec![
                 verb("accept", "Accept", "Accept the reviewed work."),
-                verb("request_changes", "Request changes", "Send it back for changes."),
+                verb(
+                    "request_changes",
+                    "Request changes",
+                    "Send it back for changes.",
+                ),
             ],
             _ => vec![verb("answer", "Answer", "Answer the agent's question.")],
         };
@@ -883,7 +1074,11 @@ async fn collect_attention_items(
         let description: Option<String> = r.try_get("description").unwrap_or(None);
         let created_at: DateTime<Utc> = r.get("created_at");
         let updated_at: DateTime<Utc> = r.get("updated_at");
-        let severity = if status == "in_progress" { "high" } else { "medium" };
+        let severity = if status == "in_progress" {
+            "high"
+        } else {
+            "medium"
+        };
         items.push(create_item(
             company_id,
             "recovery_action",
@@ -977,7 +1172,11 @@ async fn collect_attention_items(
             vec![
                 verb("retry", "Retry", "Retry the failed run or issue."),
                 verb("reassign", "Reassign", "Move the work to another owner."),
-                verb("dismiss", "Dismiss", "Dismiss this failed-run attention row."),
+                verb(
+                    "dismiss",
+                    "Dismiss",
+                    "Dismiss this failed-run attention row.",
+                ),
             ],
             true,
             "heartbeat_runs.status in ('failed','timed_out')",
@@ -1091,7 +1290,9 @@ async fn collect_attention_items(
 fn item_source_key(item: &Value) -> String {
     format!(
         "{}:{}",
-        item.get("sourceKind").and_then(|v| v.as_str()).unwrap_or(""),
+        item.get("sourceKind")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
         item.get("subject")
             .and_then(|s| s.get("id"))
             .and_then(|v| v.as_str())
@@ -1109,7 +1310,12 @@ fn item_subject_id(item: &Value) -> String {
 
 fn item_metadata_agent_id(item: &Value) -> Option<Uuid> {
     let meta = item.get("subject")?.get("metadata")?;
-    for key in ["originAgentId", "agentId", "createdByAgentId", "requestedByAgentId"] {
+    for key in [
+        "originAgentId",
+        "agentId",
+        "createdByAgentId",
+        "requestedByAgentId",
+    ] {
         if let Some(v) = meta.get(key).and_then(|v| v.as_str()) {
             if let Ok(id) = Uuid::parse_str(v) {
                 return Some(id);
@@ -1158,11 +1364,17 @@ async fn enrich_attention_items(
             r.get::<String, _>("source_kind"),
             r.get::<String, _>("source_id")
         );
-        queues_by_source.entry(key.clone()).or_default().push(json!({
-            "key": r.get::<String, _>("key"),
-            "title": r.get::<String, _>("title"),
-        }));
-        if let Some(days) = r.try_get::<Option<i32>, _>("retention_days").unwrap_or(None) {
+        queues_by_source
+            .entry(key.clone())
+            .or_default()
+            .push(json!({
+                "key": r.get::<String, _>("key"),
+                "title": r.get::<String, _>("title"),
+            }));
+        if let Some(days) = r
+            .try_get::<Option<i32>, _>("retention_days")
+            .unwrap_or(None)
+        {
             retention_days_by_source
                 .entry(key)
                 .or_default()
@@ -1198,19 +1410,23 @@ async fn enrich_attention_items(
     // -- agent names --------------------------------------------------------
     let mut agent_ids: HashSet<Uuid> = items.iter().filter_map(item_metadata_agent_id).collect();
     for r in &triage_rows {
-        if let Some(id) = r.try_get::<Option<Uuid>, _>("set_by_agent_id").unwrap_or(None) {
+        if let Some(id) = r
+            .try_get::<Option<Uuid>, _>("set_by_agent_id")
+            .unwrap_or(None)
+        {
             agent_ids.insert(id);
         }
     }
     let agent_id_list: Vec<Uuid> = agent_ids.into_iter().collect();
     let mut agent_names: HashMap<Uuid, String> = HashMap::new();
     if !agent_id_list.is_empty() {
-        let rows = sqlx::query("SELECT id, name FROM agents WHERE company_id = $1 AND id = ANY($2)")
-            .bind(company_id)
-            .bind(&agent_id_list)
-            .fetch_all(pool)
-            .await
-            .map_err(db_err)?;
+        let rows =
+            sqlx::query("SELECT id, name FROM agents WHERE company_id = $1 AND id = ANY($2)")
+                .bind(company_id)
+                .bind(&agent_id_list)
+                .fetch_all(pool)
+                .await
+                .map_err(db_err)?;
         for r in &rows {
             agent_names.insert(r.get("id"), r.get("name"));
         }
@@ -1321,8 +1537,10 @@ async fn enrich_attention_items(
                     "responsibleUserId": r.try_get::<Option<String>, _>("responsible_user_id").unwrap_or(None),
                     "updatedAt": iso(r.get::<DateTime<Utc>, _>("updated_at")),
                 });
-                let snoozed =
-                    iso_opt(r.try_get::<Option<DateTime<Utc>>, _>("snoozed_until").unwrap_or(None));
+                let snoozed = iso_opt(
+                    r.try_get::<Option<DateTime<Utc>>, _>("snoozed_until")
+                        .unwrap_or(None),
+                );
                 (
                     decide_by.map(Value::String).unwrap_or(Value::Null),
                     attribution,
@@ -1346,7 +1564,10 @@ async fn enrich_attention_items(
         let (keep, archived_at, retention_version) = match retention_by_source.get(&key) {
             Some(r) => (
                 r.try_get::<bool, _>("keep").unwrap_or(false),
-                iso_opt(r.try_get::<Option<DateTime<Utc>>, _>("archived_at").unwrap_or(None)),
+                iso_opt(
+                    r.try_get::<Option<DateTime<Utc>>, _>("archived_at")
+                        .unwrap_or(None),
+                ),
                 r.try_get::<i32, _>("version").unwrap_or(0) as i64,
             ),
             None => (false, Value::Null, 0),
@@ -1442,17 +1663,31 @@ fn compare_attention_items(left: &Value, right: &Value) -> std::cmp::Ordering {
     if time_diff != std::cmp::Ordering::Equal {
         return time_diff;
     }
-    let sev = severity_rank(left.get("severity").and_then(|v| v.as_str()).unwrap_or("low"))
-        .cmp(&severity_rank(
-            right.get("severity").and_then(|v| v.as_str()).unwrap_or("low"),
-        ));
+    let sev = severity_rank(
+        left.get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("low"),
+    )
+    .cmp(&severity_rank(
+        right
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("low"),
+    ));
     if sev != std::cmp::Ordering::Equal {
         return sev;
     }
-    let src = source_rank(left.get("sourceKind").and_then(|v| v.as_str()).unwrap_or(""))
-        .cmp(&source_rank(
-            right.get("sourceKind").and_then(|v| v.as_str()).unwrap_or(""),
-        ));
+    let src = source_rank(
+        left.get("sourceKind")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    )
+    .cmp(&source_rank(
+        right
+            .get("sourceKind")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    ));
     if src != std::cmp::Ordering::Equal {
         return src;
     }
@@ -1487,10 +1722,17 @@ fn compare_decide_items(left: &Value, right: &Value, now: DateTime<Utc>) -> std:
     if le != re {
         return le.cmp(&re);
     }
-    let sev = severity_rank(left.get("severity").and_then(|v| v.as_str()).unwrap_or("low"))
-        .cmp(&severity_rank(
-            right.get("severity").and_then(|v| v.as_str()).unwrap_or("low"),
-        ));
+    let sev = severity_rank(
+        left.get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("low"),
+    )
+    .cmp(&severity_rank(
+        right
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("low"),
+    ));
     if sev != std::cmp::Ordering::Equal {
         return sev;
     }
@@ -1652,7 +1894,8 @@ async fn get_attention_feed(
         .filter(|item| is_new_today(item, now) || is_decide_now(item, now))
         .count();
 
-    let mut counts: BTreeMap<&str, usize> = ATTENTION_SOURCE_KINDS.iter().map(|k| (*k, 0)).collect();
+    let mut counts: BTreeMap<&str, usize> =
+        ATTENTION_SOURCE_KINDS.iter().map(|k| (*k, 0)).collect();
     for item in &items {
         if let Some(kind) = item.get("sourceKind").and_then(|v| v.as_str()) {
             if let Some(slot) = counts.get_mut(kind) {
@@ -1671,10 +1914,9 @@ async fn get_attention_feed(
         let mut start = 0usize;
         if let Some(cursor) = q.cursor.as_deref() {
             let cursor_id = decode_cursor(cursor, sort)?;
-            match items
-                .iter()
-                .position(|item| item.get("id").and_then(|v| v.as_str()) == Some(cursor_id.as_str()))
-            {
+            match items.iter().position(|item| {
+                item.get("id").and_then(|v| v.as_str()) == Some(cursor_id.as_str())
+            }) {
                 Some(index) => start = index + 1,
                 None => start = items.len(),
             }
@@ -1736,7 +1978,8 @@ fn decision_to_json(r: &PgRow) -> Value {
     })
 }
 
-const DECISION_SELECT: &str = "SELECT id, company_id, bundle_id, origin_agent_id, origin_issue_id, \
+const DECISION_SELECT: &str =
+    "SELECT id, company_id, bundle_id, origin_agent_id, origin_issue_id, \
      origin_run_id, rule_key, title, body, options, inputs, status, execution_status, \
      chosen_option_id, input_values, decided_by_user_id, decided_at, expires_at, idempotency_key, \
      signed_spec, target_snapshots, continuation_policy, metadata, created_at, updated_at \
@@ -2053,8 +2296,9 @@ async fn insert_decision(
 
     let now = Utc::now();
     let expires_at = match input.expires_at.as_deref() {
-        Some(value) => parse_iso(value)
-            .ok_or_else(|| AppError::Validation("expiresAt must be an ISO timestamp".to_string()))?,
+        Some(value) => parse_iso(value).ok_or_else(|| {
+            AppError::Validation("expiresAt must be an ISO timestamp".to_string())
+        })?,
         None => now + Duration::days(7),
     };
     if expires_at < now + Duration::days(1) || expires_at > now + Duration::days(30) {
@@ -2318,13 +2562,13 @@ async fn decision_stats(
             ));
         }
     }
-    let since = match q.since.as_deref() {
-        Some(value) => Some(
-            parse_iso(value)
-                .ok_or_else(|| AppError::BadRequest("since must be an ISO timestamp".to_string()))?,
-        ),
-        None => None,
-    };
+    let since =
+        match q.since.as_deref() {
+            Some(value) => Some(parse_iso(value).ok_or_else(|| {
+                AppError::BadRequest("since must be an ISO timestamp".to_string())
+            })?),
+            None => None,
+        };
     let pool = &state.pool;
 
     let rows = sqlx::query(
@@ -2576,7 +2820,10 @@ async fn create_decision_archive_proposal(
         .map(|entry| {
             format!(
                 "- **{}:{}** — {}",
-                entry.get("sourceKind").and_then(|v| v.as_str()).unwrap_or(""),
+                entry
+                    .get("sourceKind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
                 entry.get("sourceId").and_then(|v| v.as_str()).unwrap_or(""),
                 entry.get("reason").and_then(|v| v.as_str()).unwrap_or("")
             )
@@ -2595,9 +2842,11 @@ async fn create_decision_archive_proposal(
         ]),
         inputs: Some(json!([])),
         expires_at: None,
-        idempotency_key: Some(input.idempotency_key.unwrap_or_else(|| {
-            format!("attention-archive:{manifest_hash}:{}", origin.run_id)
-        })),
+        idempotency_key: Some(
+            input
+                .idempotency_key
+                .unwrap_or_else(|| format!("attention-archive:{manifest_hash}:{}", origin.run_id)),
+        ),
         continuation_policy: Some("wake_origin_agent".to_string()),
         metadata: Some(json!({
             "attentionArchive": { "manifest": manifest, "manifestHash": manifest_hash },
@@ -2879,7 +3128,9 @@ async fn dismiss_decision(
              metadata = $4, updated_at = NOW() \
          WHERE id = $1 AND status = 'open' \
          RETURNING {}",
-        DECISION_SELECT.trim_start_matches("SELECT ").replace(" FROM decisions", "")
+        DECISION_SELECT
+            .trim_start_matches("SELECT ")
+            .replace(" FROM decisions", "")
     ))
     .bind(decision_id)
     .bind(&chosen_option_id)
@@ -2930,7 +3181,9 @@ async fn cancel_decision(
     let updated = sqlx::query(&format!(
         "UPDATE decisions SET status = 'cancelled', updated_at = NOW() \
          WHERE id = $1 AND status = 'open' RETURNING {}",
-        DECISION_SELECT.trim_start_matches("SELECT ").replace(" FROM decisions", "")
+        DECISION_SELECT
+            .trim_start_matches("SELECT ")
+            .replace(" FROM decisions", "")
     ))
     .bind(decision_id)
     .fetch_optional(pool)
@@ -2996,9 +3249,12 @@ fn validate_queue_key(key: &str) -> Result<(), AppError> {
             "queue key must be 1-80 characters".to_string(),
         ));
     }
-    let valid = key
-        .split('-')
-        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    let valid = key.split('-').all(|part| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    });
     if !valid {
         return Err(AppError::Validation(
             "queue key must be lowercase kebab-case (a-z, 0-9, single hyphens)".to_string(),
@@ -3039,10 +3295,7 @@ async fn list_decision_queues(
     let queues: Vec<Value> = rows
         .iter()
         .map(|r| {
-            let count = count_map
-                .get(&r.get::<Uuid, _>("id"))
-                .copied()
-                .unwrap_or(0);
+            let count = count_map.get(&r.get::<Uuid, _>("id")).copied().unwrap_or(0);
             queue_to_json(r, count)
         })
         .collect();
@@ -3094,14 +3347,13 @@ async fn create_decision_queue(
 
     let attr = attribution(&actor);
     let pool = &state.pool;
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM decision_queues WHERE company_id = $1 AND key = $2",
-    )
-    .bind(company_id)
-    .bind(&input.key)
-    .fetch_optional(pool)
-    .await
-    .map_err(db_err)?;
+    let existing: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM decision_queues WHERE company_id = $1 AND key = $2")
+            .bind(company_id)
+            .bind(&input.key)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
     if existing.is_some() {
         return Err(AppError::Conflict(format!(
             "Queue '{}' already exists",
@@ -3115,7 +3367,9 @@ async fn create_decision_queue(
              created_by_agent_api_key_id, retention_days, seed_rules, seed_rules_enabled) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {}",
-        QUEUE_SELECT.trim_start_matches("SELECT ").replace(" FROM decision_queues", "")
+        QUEUE_SELECT
+            .trim_start_matches("SELECT ")
+            .replace(" FROM decision_queues", "")
     ))
     .bind(company_id)
     .bind(&input.key)
@@ -3181,7 +3435,9 @@ async fn update_decision_queue(
              seed_rules_enabled = COALESCE($7, seed_rules_enabled), \
              updated_at = NOW() \
          WHERE company_id = $1 AND key = $2 RETURNING {}",
-        QUEUE_SELECT.trim_start_matches("SELECT ").replace(" FROM decision_queues", "")
+        QUEUE_SELECT
+            .trim_start_matches("SELECT ")
+            .replace(" FROM decision_queues", "")
     ))
     .bind(company_id)
     .bind(&key)
@@ -3195,13 +3451,12 @@ async fn update_decision_queue(
     .map_err(db_err)?
     .ok_or_else(|| AppError::NotFound(format!("Queue '{key}' not found")))?;
 
-    let item_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM decision_queue_items WHERE queue_id = $1",
-    )
-    .bind(row.get::<Uuid, _>("id"))
-    .fetch_one(pool)
-    .await
-    .map_err(db_err)?;
+    let item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM decision_queue_items WHERE queue_id = $1")
+            .bind(row.get::<Uuid, _>("id"))
+            .fetch_one(pool)
+            .await
+            .map_err(db_err)?;
 
     Ok(Json(queue_to_json(&row, item_count)))
 }
@@ -3444,6 +3699,7 @@ async fn get_decision_triage(
             "unknown sourceKind '{source_kind}'"
         )));
     }
+    require_decision_source_read(&state.pool, &actor, company_id, &source_kind, &source_id).await?;
     let pool = &state.pool;
     let row = sqlx::query(&format!(
         "{TRIAGE_SELECT} WHERE company_id = $1 AND source_kind = $2 AND source_id = $3"
@@ -3568,7 +3824,9 @@ async fn put_decision_triage(
              version = decision_triage.version + 1, \
              updated_at = NOW() \
          RETURNING {}",
-        TRIAGE_SELECT.trim_start_matches("SELECT ").replace(" FROM decision_triage", "")
+        TRIAGE_SELECT
+            .trim_start_matches("SELECT ")
+            .replace(" FROM decision_triage", "")
     ))
     .bind(company_id)
     .bind(&source_kind)
@@ -3632,7 +3890,8 @@ fn retention_to_json(r: &PgRow) -> Value {
     })
 }
 
-const RETENTION_SELECT: &str = "SELECT id, company_id, source_kind, source_id, source_activity_at, \
+const RETENTION_SELECT: &str =
+    "SELECT id, company_id, source_kind, source_id, source_activity_at, \
      keep, archived_at, archived_reason, archived_by_type, archived_by_agent_id, \
      archived_by_user_id, archived_by_run_id, version, archive_version, created_at, updated_at \
      FROM decision_retention";
@@ -3711,6 +3970,7 @@ async fn archive_decision_retention(
             "unknown sourceKind '{source_kind}'"
         )));
     }
+    require_decision_source_read(&state.pool, &actor, company_id, &source_kind, &source_id).await?;
     let attr = attribution(&actor);
     let reason = input.reason.unwrap_or_else(|| "manual".to_string());
     let pool = &state.pool;
@@ -3788,6 +4048,7 @@ async fn revive_decision_retention(
             "unknown sourceKind '{source_kind}'"
         )));
     }
+    require_decision_source_read(&state.pool, &actor, company_id, &source_kind, &source_id).await?;
     let pool = &state.pool;
     let row = sqlx::query(&format!(
         "UPDATE decision_retention SET \
@@ -3868,7 +4129,8 @@ fn training_example_to_json(r: &PgRow) -> Value {
     })
 }
 
-const TRAINING_SELECT: &str = "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, \
+const TRAINING_SELECT: &str =
+    "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, \
      notes, notes_history, decision_outcome, retention_policy, snapshot, created_by_user_id, \
      created_at, updated_at FROM decision_training_examples";
 
@@ -4002,9 +4264,15 @@ async fn capture_decision_snapshot(
     issue_id: Uuid,
 ) -> Result<CapturedSnapshot, AppError> {
     let captured_at = Utc::now();
-    let decision =
-        load_source_decision(pool, company_id, source_kind, source_id, issue_id, captured_at)
-            .await?;
+    let decision = load_source_decision(
+        pool,
+        company_id,
+        source_kind,
+        source_id,
+        issue_id,
+        captured_at,
+    )
+    .await?;
 
     let issue_row = sqlx::query(
         "SELECT id, company_id, project_id, parent_id, title, description, status::text AS status, \
@@ -4105,11 +4373,17 @@ async fn capture_decision_snapshot(
             .iter()
             .find(|r| r.get::<Uuid, _>("id") == run_id)
             .and_then(|r| {
-                find_commit_sha(&r.try_get::<Option<Value>, _>("context_snapshot").unwrap_or(None))
+                find_commit_sha(
+                    &r.try_get::<Option<Value>, _>("context_snapshot")
+                        .unwrap_or(None),
+                )
             })
     });
     let nearest_commit = run_rows.iter().rev().find_map(|r| {
-        find_commit_sha(&r.try_get::<Option<Value>, _>("context_snapshot").unwrap_or(None))
+        find_commit_sha(
+            &r.try_get::<Option<Value>, _>("context_snapshot")
+                .unwrap_or(None),
+        )
     });
     let commit_sha = exact_commit.clone().or_else(|| nearest_commit.clone());
     let resolution = if exact_commit.is_some() {
@@ -4228,7 +4502,9 @@ async fn create_decision_training(
          VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, $7, $8, $9, $10) \
          ON CONFLICT (source_kind, source_id, created_by_user_id) DO NOTHING \
          RETURNING {}",
-        TRAINING_SELECT.trim_start_matches("SELECT ").replace(" FROM decision_training_examples", "")
+        TRAINING_SELECT
+            .trim_start_matches("SELECT ")
+            .replace(" FROM decision_training_examples", "")
     ))
     .bind(company_id)
     .bind(&input.source_kind)
