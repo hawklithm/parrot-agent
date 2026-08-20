@@ -253,6 +253,11 @@ fn parse_adapter_outcome(output: &str) -> AdapterOutcome {
     outcome
 }
 
+fn valid_claude_resume_session(session_id: Option<&str>) -> Option<String> {
+    let session_id = session_id?.trim();
+    if uuid::Uuid::parse_str(session_id).is_ok() { Some(session_id.to_string()) } else { None }
+}
+
 fn classify_claude_error(message: &str) -> (Option<String>, Option<String>) {
     let normalized = message.to_ascii_lowercase();
     if normalized.contains("not logged in")
@@ -1430,6 +1435,18 @@ impl DefaultHeartbeatService {
                 args.push("--dangerously-bypass-approvals-and-sandbox".into());
             }
         }
+        if adapter == "claude_local" && !custom_args {
+            let persisted_session: Option<String> = sqlx::query_scalar(
+                "SELECT session_id FROM agent_runtime_states WHERE agent_id = $1",
+            )
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| format!("failed to load Claude session: {error}"))?;
+            if let Some(session_id) = valid_claude_resume_session(persisted_session.as_deref()) {
+                args.extend(["--resume".to_string(), session_id]);
+            }
+        }
         let mut cmd = Command::new(command);
         let gateway_token = format!("ptg_{}", Uuid::new_v4().simple());
         let mut token_hasher = Sha256::new();
@@ -2093,7 +2110,7 @@ impl DefaultHeartbeatService {
 
 #[cfg(test)]
 mod adapter_outcome_tests {
-    use super::parse_adapter_outcome;
+    use super::{parse_adapter_outcome, valid_claude_resume_session};
 
     #[test]
     fn explicit_structured_error_overrides_zero_exit() {
@@ -2154,6 +2171,13 @@ mod adapter_outcome_tests {
         assert_eq!(outcome.cached_input_tokens, 10);
         assert_eq!(outcome.cost_usd, Some(0.0123));
         assert_eq!(outcome.model.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[test]
+    fn only_uuid_claude_sessions_are_eligible_for_resume() {
+        assert!(valid_claude_resume_session(Some("550e8400-e29b-41d4-a716-446655440000")).is_some());
+        assert!(valid_claude_resume_session(Some("not-a-session")).is_none());
+        assert!(valid_claude_resume_session(None).is_none());
     }
 }
 
