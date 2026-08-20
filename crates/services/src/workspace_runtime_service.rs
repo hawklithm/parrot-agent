@@ -215,21 +215,53 @@ impl WorkspaceRuntimeService {
     
     /// 终止workspace的所有进程
     fn terminate_processes(&mut self, workspace_id: Uuid) -> WorkspaceRuntimeResult<()> {
-        let workspace = self.get_workspace(workspace_id)?;
-        
-        for &pid in &workspace.process_ids {
-            // TODO: 实现进程终止逻辑
-            // 简化实现 - 实际应该使用系统调用
+        let process_ids = self.get_workspace(workspace_id)?.process_ids.clone();
+
+        for pid in process_ids {
             #[cfg(unix)]
             {
                 use std::process::Command;
-                let _ = Command::new("kill")
+                let result = Command::new("kill")
                     .arg("-TERM")
                     .arg(pid.to_string())
                     .output();
+                match result {
+                    Ok(output) => {
+                        // A process may have exited between discovery and cleanup.
+                        // Treat that race as success, but surface other command
+                        // failures so the workspace cannot be reported as clean.
+                        if !output.status.success()
+                            && !String::from_utf8_lossy(&output.stderr).contains("No such process")
+                        {
+                            return Err(WorkspaceRuntimeError::ProcessError(
+                                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                            ));
+                        }
+                    }
+                    Err(error) => return Err(WorkspaceRuntimeError::ProcessError(error.to_string())),
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::process::Command;
+                let output = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output()
+                    .map_err(|error| WorkspaceRuntimeError::ProcessError(error.to_string()))?;
+                let diagnostics = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if !output.status.success()
+                    && !diagnostics.contains("not found")
+                    && !diagnostics.contains("不存在")
+                {
+                    return Err(WorkspaceRuntimeError::ProcessError(diagnostics.trim().to_string()));
+                }
             }
         }
-        
+
         Ok(())
     }
     
