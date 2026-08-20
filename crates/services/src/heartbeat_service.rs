@@ -228,6 +228,7 @@ struct AdapterOutcome {
     cost_usd: Option<f64>,
     model: Option<String>,
     provider: Option<String>,
+    session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -291,19 +292,28 @@ fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: b
         outcome.handoff = value.get("handoff").cloned().or_else(|| Some(value.clone()));
     }
 
-    // Parse usage and cost information (from adapter JSON output)
+    if outcome.session_id.is_none() {
+        outcome.session_id = value
+            .get("session_id")
+            .or_else(|| value.get("sessionId"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+
+    // Parse usage and cost information (Claude emits snake_case JSONL fields;
+    // retain the camelCase aliases used by older Parrot adapters).
     if let Some(usage) = value.get("usage") {
-        if let Some(input) = usage.get("inputTokens").and_then(Value::as_i64) {
+        if let Some(input) = usage.get("input_tokens").or_else(|| usage.get("inputTokens")).and_then(Value::as_i64) {
             outcome.input_tokens = outcome.input_tokens.max(input);
         }
-        if let Some(output) = usage.get("outputTokens").and_then(Value::as_i64) {
+        if let Some(output) = usage.get("output_tokens").or_else(|| usage.get("outputTokens")).and_then(Value::as_i64) {
             outcome.output_tokens = outcome.output_tokens.max(output);
         }
-        if let Some(cached) = usage.get("cachedInputTokens").and_then(Value::as_i64) {
+        if let Some(cached) = usage.get("cache_read_input_tokens").or_else(|| usage.get("cached_input_tokens")).or_else(|| usage.get("cachedInputTokens")).and_then(Value::as_i64) {
             outcome.cached_input_tokens = outcome.cached_input_tokens.max(cached);
         }
     }
-    if let Some(cost) = value.get("costUsd").and_then(Value::as_f64) {
+    if let Some(cost) = value.get("total_cost_usd").or_else(|| value.get("costUsd")).and_then(Value::as_f64) {
         outcome.cost_usd = Some(cost);
     }
     if outcome.model.is_none() {
@@ -1067,6 +1077,7 @@ impl DefaultHeartbeatService {
             "errorCode": outcome.error_code,
             "errorFamily": outcome.error_family,
             "resultEvent": outcome.result_event,
+            "sessionId": outcome.session_id,
             "stdout": output.stdout,
             "stderr": output.stderr,
         });
@@ -1075,6 +1086,20 @@ impl DefaultHeartbeatService {
             .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output.stdout).bind(&result_json).execute(&self.pool).await
         {
             tracing::error!(%run_id, %error, "failed to persist heartbeat run final status");
+        }
+
+        if let Some(session_id) = outcome.session_id.as_deref().filter(|value| !value.trim().is_empty()) {
+            if let Err(error) = sqlx::query(
+                "UPDATE agent_runtime_states SET session_id = $2, last_run_id = $3, updated_at = NOW() WHERE agent_id = $1",
+            )
+            .bind(agent_id)
+            .bind(session_id)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await
+            {
+                tracing::warn!(%run_id, %agent_id, %error, "failed to persist adapter session id");
+            }
         }
 
         // Update agent runtime state with token usage and cost (incremental)
@@ -2115,6 +2140,20 @@ mod adapter_outcome_tests {
         assert_eq!(outcome.tool_call_count, 1);
         assert!(!outcome.explicit_failure);
         assert_eq!(outcome.result_summary.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn parses_native_claude_session_usage_and_cost_fields() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"system","session_id":"sess-42","model":"claude-sonnet","usage":{"input_tokens":120,"output_tokens":45,"cache_read_input_tokens":10},"total_cost_usd":0.0123}
+{"type":"result","subtype":"success","result":"done"}"#,
+        );
+        assert_eq!(outcome.session_id.as_deref(), Some("sess-42"));
+        assert_eq!(outcome.input_tokens, 120);
+        assert_eq!(outcome.output_tokens, 45);
+        assert_eq!(outcome.cached_input_tokens, 10);
+        assert_eq!(outcome.cost_usd, Some(0.0123));
+        assert_eq!(outcome.model.as_deref(), Some("claude-sonnet"));
     }
 }
 
