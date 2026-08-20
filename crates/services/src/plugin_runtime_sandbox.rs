@@ -162,6 +162,10 @@ impl PluginRuntimeSandbox {
     pub fn remaining_time(&self) -> Duration {
         self.timeout.remaining()
     }
+
+    pub fn set_timeout(&mut self, duration: Duration) {
+        self.timeout = ExecutionTimeout::new(duration);
+    }
     
     /// 验证能力
     pub fn validate_capability(&self, capability: &str) -> SandboxResult<()> {
@@ -294,6 +298,7 @@ mod tests {
             config,
             manifest,
         );
+        sandbox.set_timeout(Duration::from_secs(1));
         
         // 测试允许的操作
         let result = sandbox.execute_with_checks("read_file", || async {
