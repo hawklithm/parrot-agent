@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-use crate::{checks, config::CliConfig};
+use crate::{backup, checks, config::CliConfig};
 
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -20,13 +20,14 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
             checks::run_doctor(&config, json)
         }
         Some("configure") => configure(&args[1..]),
+        Some("db-backup") => backup::run(&args[1..]),
         Some(command) => bail!("unknown command '{command}'. Run 'parrot --help' for usage."),
     }
 }
 
 fn print_help() -> Result<()> {
     println!(
-        "parrot {}\n\nUsage:\n  parrot --version\n  parrot doctor [--config PATH] [--json]\n  parrot configure --server-url URL [--api-token TOKEN] [--config PATH]\n  parrot help\n\nEnvironment:\n  PARROT_SERVER_URL  Server base URL (default: http://localhost:3100)\n  PARROT_API_TOKEN   Optional API token; environment overrides config file\n  PARROT_CONFIG      Optional config file path",
+        "parrot {}\n\nUsage:\n  parrot --version\n  parrot doctor [--config PATH] [--json]\n  parrot configure --server-url URL [--api-token TOKEN] [--config PATH]\n  parrot db-backup [--connection-string URL] [--dir PATH] [--retention-days N] [--json]\n  parrot help\n\nEnvironment:\n  PARROT_SERVER_URL  Server base URL (default: http://localhost:3100)\n  PARROT_API_TOKEN   Optional API token; environment overrides config file\n  PARROT_CONFIG      Optional config file path",
         env!("CARGO_PKG_VERSION")
     );
     Ok(())
