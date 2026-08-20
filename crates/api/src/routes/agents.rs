@@ -1157,10 +1157,55 @@ async fn interrupt_agent(
 
 /// A16: POST /agents/:id/reset-credentials
 async fn reset_agent_credentials(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"agentId": id, "credentialsReset": true})))
+) -> Result<Json<serde_json::Value>, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentUpdate { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden("Insufficient permissions: Missing agent:update permission".into()));
+    }
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+    let revoked = sqlx::query(
+        "UPDATE agent_api_keys
+         SET revoked_at = COALESCE(revoked_at, NOW()), updated_at = NOW()
+         WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AppError::InternalServerError(error.to_string()))?
+    .rows_affected();
+    sqlx::query(
+        "UPDATE agent_runtime_states
+         SET session_id = NULL, session_display_id = NULL,
+             session_params_json = NULL, updated_at = NOW()
+         WHERE agent_id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+    Ok(Json(json!({
+        "agentId": id,
+        "credentialsReset": true,
+        "revokedKeyCount": revoked,
+        "sessionReset": true,
+    })))
 }
 
 /// A17: GET /agents/:id/credentials
