@@ -93,36 +93,77 @@ impl WorkspaceInstanceCleanupService {
         &self,
         task_id: Uuid,
     ) -> WorkspaceCleanupResult<()> {
-        // 标记为运行中
-        sqlx::query(
+        let mut transaction = self.pool.begin().await?;
+        let claimed = sqlx::query(
             r#"
-            UPDATE workspace_cleanup_tasks 
-            SET status = $1
-            WHERE id = $2
-            "#
+            UPDATE workspace_cleanup_tasks
+            SET status = $1, started_at = NOW(), updated_at = NOW()
+            WHERE id = $2 AND status = $3
+            "#,
         )
         .bind(format!("{:?}", CleanupStatus::Running))
         .bind(task_id)
-        .execute(&self.pool)
+        .bind(format!("{:?}", CleanupStatus::Pending))
+        .execute(&mut *transaction)
         .await?;
-        
-        // 执行清理（简化实现）
-        // 实际实现应该调用文件系统操作
-        
-        // 标记为完成
+
+        if claimed.rows_affected() == 0 {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM workspace_cleanup_tasks WHERE id = $1",
+            )
+            .bind(task_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if status.as_deref() == Some("Completed") {
+                transaction.rollback().await?;
+                return Ok(());
+            }
+            transaction.rollback().await?;
+            return Err(WorkspaceCleanupError::CleanupFailed(format!(
+                "cleanup task {} is not runnable ({})",
+                task_id,
+                status.unwrap_or_else(|| "not found".to_string())
+            )));
+        }
+
+        let workspace_id: Uuid = sqlx::query_scalar(
+            "SELECT workspace_id FROM workspace_cleanup_tasks WHERE id = $1",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let details = serde_json::json!({
+            "cleanupCompletedAt": chrono::Utc::now(),
+            "cleanupTaskId": task_id,
+        });
         sqlx::query(
             r#"
-            UPDATE workspace_cleanup_tasks 
-            SET status = $1, completed_at = $2
+            UPDATE workspaces
+            SET status = 'inactive',
+                metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb,
+                updated_at = NOW(),
+                last_accessed_at = COALESCE(last_accessed_at, NOW())
+            WHERE id = $2
+            "#,
+        )
+        .bind(&details)
+        .bind(workspace_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE workspace_cleanup_tasks
+            SET status = $1, completed_at = NOW(), details = details || $2::jsonb, updated_at = NOW()
             WHERE id = $3
-            "#
+            "#,
         )
         .bind(format!("{:?}", CleanupStatus::Completed))
-        .bind(chrono::Utc::now())
+        .bind(&details)
         .bind(task_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
-        
+        transaction.commit().await?;
         Ok(())
     }
     
@@ -134,7 +175,7 @@ impl WorkspaceInstanceCleanupService {
             SELECT id
             FROM workspaces
             WHERE last_accessed_at < $1
-              AND status = 'inactive'
+              AND status = 'active'
             "#
         )
         .bind(cutoff_date)
