@@ -1287,32 +1287,132 @@ async fn delete_agent_skill(
 
 /// A23: GET /agents/:id/sessions/:session_id
 async fn get_agent_session(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path((id, session_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({
+) -> Result<Json<serde_json::Value>, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentRead { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden("Insufficient permissions: Missing agent:read permission".into()));
+    }
+    let row = sqlx::query(
+        "SELECT session_id, session_display_id, session_params_json, state_json,
+                last_run_id, last_run_status, last_error, updated_at
+         FROM agent_runtime_states
+         WHERE agent_id = $1 AND session_id = $2",
+    )
+    .bind(id)
+    .bind(session_id.to_string())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| AppError::InternalServerError(error.to_string()))?
+    .ok_or_else(|| AppError::NotFound(format!("Agent session not found: {session_id}")))?;
+    use sqlx::Row;
+    Ok(Json(json!({
         "agentId": id,
-        "sessionId": session_id,
-        "status": "active"
+        "sessionId": row.get::<Option<String>, _>("session_id"),
+        "sessionDisplayId": row.get::<Option<String>, _>("session_display_id"),
+        "sessionParams": row.get::<Option<serde_json::Value>, _>("session_params_json"),
+        "state": row.get::<serde_json::Value, _>("state_json"),
+        "lastRunId": row.get::<Option<Uuid>, _>("last_run_id"),
+        "lastRunStatus": row.get::<Option<String>, _>("last_run_status"),
+        "lastError": row.get::<Option<String>, _>("last_error"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
     })))
 }
 
 /// A24: DELETE /agents/:id/sessions/:session_id
 async fn delete_agent_session(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path((id, session_id)): Path<(Uuid, Uuid)>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentUpdate { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden("Insufficient permissions: Missing agent:update permission".into()));
+    }
+    let result = sqlx::query(
+        "UPDATE agent_runtime_states
+         SET session_id = NULL, session_display_id = NULL,
+             session_params_json = NULL, updated_at = NOW()
+         WHERE agent_id = $1 AND session_id = $2",
+    )
+    .bind(id)
+    .bind(session_id.to_string())
+    .execute(&state.pool)
+    .await
+    .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("Agent session not found: {session_id}")));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// A25: GET /agents/:id/runs/:run_id
 async fn get_agent_run(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path((id, run_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({
-        "agentId": id,
-        "runId": run_id,
-        "status": "completed"
+) -> Result<Json<serde_json::Value>, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentRead { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden("Insufficient permissions: Missing agent:read permission".into()));
+    }
+    let row = sqlx::query(
+        "SELECT id, company_id, agent_id, invocation_source, status::text AS status,
+                responsible_user_id, started_at, finished_at, error, exit_code,
+                context_snapshot, output, result_json, scheduled_retry_at,
+                scheduled_retry_attempt, scheduled_retry_reason, created_at, updated_at
+         FROM heartbeat_runs
+         WHERE id = $1 AND agent_id = $2 AND company_id = $3",
+    )
+    .bind(run_id)
+    .bind(id)
+    .bind(agent.company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| AppError::InternalServerError(error.to_string()))?
+    .ok_or_else(|| AppError::NotFound(format!("Agent run not found: {run_id}")))?;
+    use sqlx::Row;
+    Ok(Json(json!({
+        "id": row.get::<Uuid, _>("id"),
+        "agentId": row.get::<Uuid, _>("agent_id"),
+        "companyId": row.get::<Uuid, _>("company_id"),
+        "invocationSource": row.get::<String, _>("invocation_source"),
+        "status": row.get::<String, _>("status"),
+        "responsibleUserId": row.get::<Option<String>, _>("responsible_user_id"),
+        "startedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at"),
+        "finishedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"),
+        "error": row.get::<Option<String>, _>("error"),
+        "exitCode": row.get::<Option<i32>, _>("exit_code"),
+        "contextSnapshot": row.get::<Option<serde_json::Value>, _>("context_snapshot"),
+        "output": row.get::<Option<String>, _>("output"),
+        "resultJson": row.get::<Option<serde_json::Value>, _>("result_json"),
+        "scheduledRetryAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("scheduled_retry_at"),
+        "scheduledRetryAttempt": row.get::<Option<i32>, _>("scheduled_retry_attempt"),
+        "scheduledRetryReason": row.get::<Option<String>, _>("scheduled_retry_reason"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
     })))
 }
