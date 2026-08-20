@@ -50,6 +50,83 @@ impl PgWorkProductService {
     }
 }
 
+fn validate_work_product_value(
+    work_product_type: Option<&str>,
+    provider: Option<&str>,
+    title: Option<&str>,
+    url: Option<&str>,
+    status: Option<&str>,
+    review_state: Option<&str>,
+    health_status: Option<&str>,
+) -> ServiceResult<()> {
+    const TYPES: [&str; 7] = [
+        "preview_url",
+        "runtime_service",
+        "pull_request",
+        "branch",
+        "commit",
+        "artifact",
+        "document",
+    ];
+    const STATUSES: [&str; 9] = [
+        "active",
+        "ready_for_review",
+        "approved",
+        "changes_requested",
+        "merged",
+        "closed",
+        "failed",
+        "archived",
+        "draft",
+    ];
+    const REVIEWS: [&str; 4] = [
+        "none",
+        "needs_board_review",
+        "approved",
+        "changes_requested",
+    ];
+    const HEALTH: [&str; 3] = ["unknown", "healthy", "unhealthy"];
+
+    if let Some(value) = work_product_type.filter(|value| !TYPES.contains(value)) {
+        return Err(crate::errors::ServiceError::Validation(format!(
+            "unsupported work product type: {value}"
+        )));
+    }
+    if let Some(value) = provider.filter(|value| value.trim().is_empty()) {
+        return Err(crate::errors::ServiceError::Validation(
+            "provider must not be empty".into(),
+        ));
+    }
+    if let Some(value) = title.filter(|value| value.trim().is_empty()) {
+        return Err(crate::errors::ServiceError::Validation(
+            "title must not be empty".into(),
+        ));
+    }
+    if let Some(value) =
+        url.filter(|value| !(value.starts_with("https://") || value.starts_with("http://")))
+    {
+        return Err(crate::errors::ServiceError::Validation(format!(
+            "invalid work product URL: {value}"
+        )));
+    }
+    if let Some(value) = status.filter(|value| !STATUSES.contains(value)) {
+        return Err(crate::errors::ServiceError::Validation(format!(
+            "unsupported work product status: {value}"
+        )));
+    }
+    if let Some(value) = review_state.filter(|value| !REVIEWS.contains(value)) {
+        return Err(crate::errors::ServiceError::Validation(format!(
+            "unsupported work product review state: {value}"
+        )));
+    }
+    if let Some(value) = health_status.filter(|value| !HEALTH.contains(value)) {
+        return Err(crate::errors::ServiceError::Validation(format!(
+            "unsupported work product health status: {value}"
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl WorkProductService for PgWorkProductService {
     async fn list_work_products(
@@ -73,6 +150,15 @@ impl WorkProductService for PgWorkProductService {
         company_id: Uuid,
         input: CreateWorkProductInput,
     ) -> ServiceResult<WorkProduct> {
+        validate_work_product_value(
+            input.work_product_type.as_deref(),
+            input.provider.as_deref(),
+            input.title.as_deref().or(input.name.as_deref()),
+            input.url.as_deref(),
+            input.status.as_deref(),
+            input.review_state.as_deref(),
+            input.health_status.as_deref(),
+        )?;
         let title = input.title.clone().or(input.name.clone()).ok_or_else(|| {
             crate::errors::ServiceError::Validation("title or name is required".into())
         })?;
@@ -127,6 +213,15 @@ impl WorkProductService for PgWorkProductService {
         company_id: Uuid,
         input: UpdateWorkProductInput,
     ) -> ServiceResult<WorkProduct> {
+        validate_work_product_value(
+            input.work_product_type.as_deref(),
+            input.provider.as_deref(),
+            input.title.as_deref().or(input.name.as_deref()),
+            input.url.as_deref(),
+            input.status.as_deref(),
+            input.review_state.as_deref(),
+            input.health_status.as_deref(),
+        )?;
         let mut tx = self.pool.begin().await?;
         if input.is_primary.unwrap_or(false) {
             let work_product_type: String = if let Some(value) = input.work_product_type.clone() {
