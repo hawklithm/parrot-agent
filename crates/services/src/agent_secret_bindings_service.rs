@@ -199,7 +199,10 @@ mod tests {
     
     #[test]
     fn test_scope_check() {
-        let service = AgentSecretBindingsService::new(PgPool::connect("").await.unwrap());
+        let service = AgentSecretBindingsService::new(
+            PgPool::connect_lazy("postgres://postgres:postgres@localhost:5432/parrot_agent_dev")
+                .unwrap(),
+        );
         let agent_id = Uuid::new_v4();
         let other_agent = Uuid::new_v4();
         

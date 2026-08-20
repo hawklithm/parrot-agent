@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 use uuid::Uuid;
 
 use super::plugin_capability_validator::CapabilityValidator;
@@ -27,6 +28,8 @@ pub enum SandboxError {
     ValidationError(String),
     #[error("capability denied: {0}")]
     CapabilityDenied(String),
+    #[error("access denied: {0}")]
+    AccessDenied(String),
     #[error("path access denied: {0}")]
     PathDenied(String),
     #[error("network access denied: {0}")]
@@ -35,7 +38,7 @@ pub enum SandboxError {
 
 pub type SandboxResult<T> = Result<T, SandboxError>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SandboxConfig {
     pub allowed_paths: Vec<PathBuf>,
     
@@ -88,6 +91,76 @@ impl PluginRuntimeSandbox {
             allowed_path_set,
             allowed_domain_set,
         }
+    }
+
+    pub fn with_manifest(plugin_id: Uuid, config: SandboxConfig, manifest: super::plugin_capability_validator::PluginManifest) -> Self {
+        let mut sandbox = Self::new(plugin_id, config);
+        sandbox.validator = Some(CapabilityValidator::new(manifest));
+        sandbox
+    }
+
+    pub fn check_dangerous_operation(&self, operation: &str) -> SandboxResult<()> {
+        let lower = operation.to_ascii_lowercase();
+        if lower.contains("eval(") || lower.contains("exec(") || lower.contains("drop database") {
+            return Err(SandboxError::AccessDenied(operation.to_owned()));
+        }
+        Ok(())
+    }
+
+    pub fn filter_env_vars(&self, env: &[(String, String)]) -> Vec<(String, String)> {
+        env.iter()
+            .filter(|(name, _)| self.config.allowed_env_vars.iter().any(|allowed| allowed == name))
+            .cloned()
+            .collect()
+    }
+
+    pub async fn execute_with_checks<F, Fut, T>(&mut self, operation: &str, action: F) -> SandboxResult<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        self.check_dangerous_operation(operation)?;
+        if let Some(validator) = &self.validator {
+            validator.assert_operation(operation)
+                .map_err(|error| SandboxError::AccessDenied(error.to_string()))?;
+        }
+        self.check_all_limits()?;
+        let result = action().await;
+        self.check_all_limits()?;
+        Ok(result)
+    }
+
+    pub fn check_all_limits(&mut self) -> SandboxResult<()> {
+        self.timeout
+            .check()
+            .map_err(|error| SandboxError::Timeout(error.to_string()))?;
+        if let Some(monitor) = &mut self.monitor {
+            monitor
+                .check_limits()
+                .map_err(|error| SandboxError::ResourceExceeded(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn set_worker_pid(&mut self, pid: u32) {
+        let limits = super::resource_monitor::ResourceLimits {
+            max_memory_bytes: self.config.max_memory_bytes,
+            max_cpu_seconds: self.config.max_cpu_seconds,
+        };
+        let monitor = self.monitor.get_or_insert_with(|| ResourceMonitor::new(limits));
+        monitor.set_pid(pid);
+    }
+
+    pub fn get_resource_usage(&mut self) -> Option<super::resource_monitor::ResourceUsage> {
+        self.monitor.as_mut().and_then(|monitor| monitor.get_usage().ok())
+    }
+
+    pub fn elapsed_time(&self) -> Duration {
+        self.timeout.elapsed()
+    }
+
+    pub fn remaining_time(&self) -> Duration {
+        self.timeout.remaining()
     }
     
     /// 验证能力
@@ -310,6 +383,7 @@ mod tests {
         let config = SandboxConfig {
             allowed_paths: vec![],
             allowed_domains: vec![],
+            allowed_capabilities: vec![],
             allowed_env_vars: vec![],
             max_memory_bytes: Some(512 * 1024 * 1024), // 512MB
             max_cpu_seconds: Some(300),

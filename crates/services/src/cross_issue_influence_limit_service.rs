@@ -150,7 +150,7 @@ impl DefaultCrossIssueInfluenceLimitService {
     }
 
     /// 从run context快照中读取source issue ID
-    fn read_run_source_issue_id(context_snapshot: serde_json::Value) -> Option<Uuid> {
+    fn read_run_source_issue_id(context_snapshot: &serde_json::Value) -> Option<Uuid> {
         context_snapshot
             .get("assignmentSnapshot")
             .and_then(|v| v.get("issueId"))

@@ -63,6 +63,7 @@ pub struct ParameterSchema {
     pub param_type: String,
     pub required: bool,
     pub description: Option<String>,
+    pub default: Option<Value>,
 }
 
 /// 增强版工具调度器
@@ -123,8 +124,15 @@ impl PluginToolDispatcher {
         params: HashMap<String, Value>,
         _schema: &[ParameterSchema],
     ) -> DispatchResult<HashMap<String, Value>> {
-        // ParameterSchema 暂不支持默认值，直接返回原参数
-        Ok(params)
+        let mut transformed = params;
+        for parameter in _schema {
+            if !transformed.contains_key(&parameter.name) {
+                if let Some(default) = &parameter.default {
+                    transformed.insert(parameter.name.clone(), default.clone());
+                }
+            }
+        }
+        Ok(transformed)
     }
     
     /// 执行工具调用
@@ -204,6 +212,11 @@ impl PluginToolDispatcher {
             metadata: HashMap::new(),
         }
     }
+
+    pub fn serialize_result(&self, result: &ToolResult) -> DispatchResult<Value> {
+        serde_json::to_value(result)
+            .map_err(|error| DispatchError::SerializationError(error.to_string()))
+    }
 }
 
 impl Default for PluginToolDispatcher {
@@ -218,7 +231,7 @@ mod tests {
     
     #[test]
     fn test_parameter_validation() {
-        let dispatcher = PluginToolDispatcher::new();
+        let dispatcher = PluginToolDispatcher::new(None);
         
         let schema = vec![
             ParameterSchema {
@@ -249,7 +262,7 @@ mod tests {
     
     #[test]
     fn test_parameter_transformation() {
-        let dispatcher = PluginToolDispatcher::new();
+        let dispatcher = PluginToolDispatcher::new(None);
         
         let schema = vec![
             ParameterSchema {
@@ -270,7 +283,7 @@ mod tests {
     
     #[test]
     fn test_result_serialization() {
-        let dispatcher = PluginToolDispatcher::new();
+        let dispatcher = PluginToolDispatcher::new(None);
         
         let result = ToolResult {
             call_id: Uuid::new_v4(),
@@ -287,7 +300,7 @@ mod tests {
     
     #[test]
     fn test_error_propagation() {
-        let dispatcher = PluginToolDispatcher::new();
+        let dispatcher = PluginToolDispatcher::new(None);
         
         let error = DispatchError::ToolNotFound("test-tool".to_string());
         let result = dispatcher.propagate_error(error);

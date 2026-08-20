@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(status.warnings.len(), 1);
         assert_eq!(
             status.warnings[0].code,
-            DatabaseBackupHealthngCode::DatabaseBackupMissing
+            DatabaseBackupHealthWarningCode::DatabaseBackupMissing
         );
     }
 }
