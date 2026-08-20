@@ -127,6 +127,10 @@ pub trait AgentService: Send + Sync {
     async fn sync_skills(&self, agent_id: Uuid)
         -> Result<models::AgentSkillSnapshot, ServiceError>;
 
+    /// Remove a skill from the agent's desired runtime skill configuration.
+    /// This intentionally does not delete the company-level skill itself.
+    async fn remove_skill(&self, agent_id: Uuid, skill_id: &str) -> Result<(), ServiceError>;
+
     /// 重置Agent会话运行时状态
     async fn reset_session(&self, agent_id: Uuid) -> Result<(), ServiceError>;
 
@@ -1062,6 +1066,33 @@ where
         agent_id: Uuid,
     ) -> Result<models::AgentSkillSnapshot, ServiceError> {
         self.get_skills(agent_id).await
+    }
+
+    async fn remove_skill(&self, agent_id: Uuid, skill_id: &str) -> Result<(), ServiceError> {
+        let mut agent = self.repository.get_by_id(agent_id).await?;
+        let desired = agent
+            .adapter_config
+            .get("desired_skills")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let next = desired
+            .iter()
+            .filter(|value| value.as_str() != Some(skill_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if next.len() == desired.len() {
+            return Err(ServiceError::NotFound(format!(
+                "Agent skill '{}' is not configured",
+                skill_id
+            )));
+        }
+        let mut adapter_config = agent.adapter_config.0;
+        adapter_config["desired_skills"] = serde_json::Value::Array(next);
+        agent.adapter_config = sqlx::types::Json(adapter_config);
+        agent.updated_at = Utc::now();
+        self.repository.update(agent).await?;
+        Ok(())
     }
 
     async fn reset_session(&self, _agent_id: Uuid) -> Result<(), ServiceError> {

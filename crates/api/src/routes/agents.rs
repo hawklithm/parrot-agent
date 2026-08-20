@@ -1364,9 +1364,22 @@ async fn delete_agent_permission(
 
 /// A22: DELETE /agents/:id/skills/:skill_id
 async fn delete_agent_skill(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path((id, skill_id)): Path<(Uuid, String)>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentUpdate { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden("Insufficient permissions: Missing agent:update permission".into()));
+    }
+    state.agent_service.remove_skill(id, &skill_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
