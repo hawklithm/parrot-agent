@@ -1262,11 +1262,27 @@ async fn get_agent_activity(
 
 /// A20: POST /agents/:id/permissions
 async fn add_agent_permission(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-    Json(_payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"agentId": id, "permissionAdded": true})))
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentUpdate { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden("Insufficient permissions: Missing agent:update permission".into()));
+    }
+    let permissions_value = payload.get("permissions").cloned().unwrap_or(payload);
+    let permissions = serde_json::from_value::<models::AgentPermissions>(permissions_value)
+        .map_err(|error| AppError::BadRequest(format!("Invalid agent permissions: {error}")))?;
+    let updated = state.agent_service.update_permissions(id, permissions).await?;
+    Ok(Json(updated))
 }
 
 /// A21: DELETE /agents/:id/permissions/:permission_id
