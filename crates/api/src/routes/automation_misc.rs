@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::routes::{require_company_access, AccessMode};
-use services::auth::AuthorizationActor;
+use crate::routes::{log_activity, require_company_access, AccessMode};
+use services::auth::{ActorSource, AuthorizationActor};
 
 fn actor_company(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
     match actor {
@@ -444,38 +444,193 @@ async fn company_inbox_agent_policy(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    let policy: Value = sqlx::query_scalar(
-        "SELECT policy FROM company_inbox_policies WHERE company_id = $1",
+    let user_id = board_user_id(&actor)?;
+    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| StatusCode::FORBIDDEN)?;
+    get_user_inbox_agent_policy(&state, company_id, user_id).await
+}
+
+fn board_user_id(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
+    match actor {
+        AuthorizationActor::Board { user_id, .. } => Ok(*user_id),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
+}
+
+fn can_manage_inbox_agent_policy(actor: &AuthorizationActor, company_id: Uuid) -> bool {
+    actor.is_instance_admin()
+        || actor.role_in(company_id).is_some_and(|role| role.can_manage_members())
+        || matches!(
+            actor,
+            AuthorizationActor::Board {
+                source: ActorSource::LocalImplicit,
+                ..
+            }
+        )
+}
+
+async fn get_user_inbox_agent_policy(
+    state: &AppState,
+    company_id: Uuid,
+    user_id: Uuid,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT mode, allowed_agent_ids, created_at, updated_at \
+         FROM user_inbox_agent_policies WHERE company_id = $1 AND user_id = $2",
     )
     .bind(company_id)
+    .bind(user_id)
     .fetch_optional(&state.pool)
     .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| json!({ "allowAgentInboxActions": true }));
-    Ok(Json(policy))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let response = match row {
+        Some(row) => json!({
+            "companyId": company_id,
+            "userId": user_id,
+            "mode": row.get::<String, _>("mode"),
+            "allowedAgentIds": row.get::<Vec<Uuid>, _>("allowed_agent_ids"),
+            "materialized": true,
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+        }),
+        None => json!({
+            "companyId": company_id,
+            "userId": user_id,
+            "mode": "open",
+            "allowedAgentIds": [],
+            "materialized": false,
+            "createdAt": Value::Null,
+            "updatedAt": Value::Null,
+        }),
+    };
+    Ok(Json(response))
+}
+
+async fn require_active_company_user(
+    state: &AppState,
+    company_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), StatusCode> {
+    let active = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM company_memberships \
+         WHERE company_id = $1 AND principal_type = 'user' AND principal_id = $2 AND status = 'active')",
+    )
+    .bind(company_id)
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if active { Ok(()) } else { Err(StatusCode::NOT_FOUND) }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateInboxAgentPolicyRequest {
+    mode: String,
+    #[serde(default, rename = "allowedAgentIds")]
+    allowed_agent_ids: Vec<Uuid>,
+}
+
+async fn update_user_inbox_agent_policy(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, user_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateInboxAgentPolicyRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_company_access(&actor, company_id, AccessMode::Write).map_err(|_| StatusCode::FORBIDDEN)?;
+    let self_user = board_user_id(&actor)?;
+    if user_id != self_user && !can_manage_inbox_agent_policy(&actor, company_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    require_active_company_user(&state, company_id, user_id).await?;
+    if request.mode != "open" && request.mode != "allowlist" {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if request.mode == "open" && !request.allowed_agent_ids.is_empty() {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let mut allowed_agent_ids = request.allowed_agent_ids;
+    allowed_agent_ids.sort_unstable();
+    allowed_agent_ids.dedup();
+    if !allowed_agent_ids.is_empty() {
+        let matching = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM agents WHERE company_id = $1 AND id = ANY($2)",
+        )
+        .bind(company_id)
+        .bind(&allowed_agent_ids)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if matching.len() != allowed_agent_ids.len() {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    let row = sqlx::query(
+        "INSERT INTO user_inbox_agent_policies (company_id, user_id, mode, allowed_agent_ids) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (company_id, user_id) DO UPDATE \
+         SET mode = EXCLUDED.mode, allowed_agent_ids = EXCLUDED.allowed_agent_ids, updated_at = NOW() \
+         RETURNING mode, allowed_agent_ids, created_at, updated_at",
+    )
+    .bind(company_id)
+    .bind(user_id)
+    .bind(&request.mode)
+    .bind(&allowed_agent_ids)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    use sqlx::Row;
+    let response = json!({
+        "companyId": company_id,
+        "userId": user_id,
+        "mode": row.get::<String, _>("mode"),
+        "allowedAgentIds": row.get::<Vec<Uuid>, _>("allowed_agent_ids"),
+        "materialized": true,
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    });
+    log_activity(
+        &state.pool,
+        company_id,
+        "inbox.agent_policy_updated",
+        &actor,
+        "user_inbox_agent_policy",
+        user_id,
+        json!({ "userId": user_id, "mode": request.mode, "allowedAgentIds": allowed_agent_ids }),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn update_current_user_inbox_agent_policy(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+    Json(request): Json<UpdateInboxAgentPolicyRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let user_id = board_user_id(&actor)?;
+    update_user_inbox_agent_policy(
+        State(state),
+        Extension(actor),
+        Path((company_id, user_id)),
+        Json(request),
+    )
+    .await
 }
 
 /// GET /companies/:company_id/users/:user_id/inbox-agent-policy
 async fn user_inbox_agent_policy(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((company_id, _user_id)): Path<(Uuid, Uuid)>,
+    Path((company_id, user_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    let policy: Value = sqlx::query_scalar(
-        "SELECT policy FROM company_inbox_policies WHERE company_id = $1",
-    )
-    .bind(company_id)
-    .fetch_optional(&state.pool)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| json!({ "allowAgentInboxActions": true }));
-    Ok(Json(policy))
+    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| StatusCode::FORBIDDEN)?;
+    if !can_manage_inbox_agent_policy(&actor, company_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    require_active_company_user(&state, company_id, user_id).await?;
+    get_user_inbox_agent_policy(&state, company_id, user_id).await
 }
 
 /// GET /companies/import/jobs/:job_id —— 导入任务状态（基础：404 或占位记录）。
@@ -753,8 +908,14 @@ pub fn automation_misc_routes() -> Router<AppState> {
         .route("/companies/:company_id/export/fidelity", get(company_export_fidelity))
         .route("/companies/:company_id/recovery-observability", get(company_recovery_observability))
         .route("/companies/:company_id/search/extract", get(company_search_extract))
-        .route("/companies/:company_id/users/me/inbox-agent-policy", get(company_inbox_agent_policy))
-        .route("/companies/:company_id/users/:user_id/inbox-agent-policy", get(user_inbox_agent_policy))
+        .route(
+            "/companies/:company_id/users/me/inbox-agent-policy",
+            get(company_inbox_agent_policy).put(update_current_user_inbox_agent_policy),
+        )
+        .route(
+            "/companies/:company_id/users/:user_id/inbox-agent-policy",
+            get(user_inbox_agent_policy).put(update_user_inbox_agent_policy),
+        )
         .route("/companies/import/jobs/:job_id", get(get_import_job))
         .route("/companies/import/preview", post(preview_company_import))
         .route("/board-claim/:token", get(get_board_claim))
