@@ -158,6 +158,9 @@ fn run_to_json(r: &sqlx::postgres::PgRow) -> Value {
         "stdoutExcerpt": output,
         "stderrExcerpt": Value::Null,
         "resultJson": result_json,
+        "scheduledRetryAt": r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("scheduled_retry_at").unwrap_or(None),
+        "scheduledRetryAttempt": r.try_get::<Option<i32>, _>("scheduled_retry_attempt").unwrap_or(None),
+        "scheduledRetryReason": r.try_get::<Option<String>, _>("scheduled_retry_reason").unwrap_or(None),
         "usageJson": Value::Null,
         "errorCode": Value::Null,
         "logStore": Value::Null,
@@ -173,7 +176,8 @@ fn run_to_json(r: &sqlx::postgres::PgRow) -> Value {
 
 const RUN_SELECT: &str = r#"SELECT id, company_id, agent_id, invocation_source, status::text,
        responsible_user_id, started_at, finished_at, error, exit_code,
-       context_snapshot, output, result_json, created_at, updated_at,
+       context_snapshot, output, result_json, scheduled_retry_at, scheduled_retry_attempt,
+       scheduled_retry_reason, created_at, updated_at,
        (SELECT name FROM agents WHERE agents.id = agent_id) AS agent_name,
        (SELECT adapter_type FROM agents WHERE agents.id = agent_id) AS adapter_type
   FROM heartbeat_runs"#;

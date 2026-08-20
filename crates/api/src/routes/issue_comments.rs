@@ -243,6 +243,65 @@ pub async fn add_comment(
         }
     }
 
+    // A human follow-up supersedes a pending scheduled retry.  This mirrors
+    // Paperclip's rule that the operator's comment becomes the next turn,
+    // rather than allowing the old retry to fire afterward.
+    let superseded_scheduled_retry = if board_comment
+        && !comment.body.trim().is_empty()
+        && issue.status == models::IssueStatus::InProgress
+        && issue.assignee_agent_id.is_some()
+    {
+        sqlx::query_as::<_, (Uuid, Uuid)>(
+            "SELECT id, agent_id
+             FROM heartbeat_runs
+             WHERE company_id = $1
+               AND status = 'scheduled_retry'
+               AND (context_snapshot->>'issueId' = $2 OR context_snapshot->>'taskId' = $2)
+             ORDER BY scheduled_retry_at ASC NULLS LAST, created_at ASC
+             LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(issue_id.to_string())
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?
+    } else {
+        None
+    };
+
+    if let Some((run_id, agent_id)) = superseded_scheduled_retry {
+        state
+            .heartbeat_service
+            .cancel_run(agent_id, issue_id, company_id, "Scheduled retry superseded by board comment")
+            .await
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+        state
+            .issue_service
+            .update(
+                issue_id,
+                company_id,
+                models::UpdateIssueInput {
+                    status: Some(models::IssueStatus::Todo),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(ApiError::InternalServerError)?;
+        log_activity(
+            &state.pool,
+            company_id,
+            "heartbeat.scheduled_retry_superseded",
+            &actor,
+            "heartbeat_run",
+            run_id,
+            serde_json::json!({
+                "source": "issue_comment_scheduled_retry_superseded",
+                "issueId": issue_id,
+            }),
+        )
+        .await;
+    }
+
     if should_reopen {
         state
             .issue_service
