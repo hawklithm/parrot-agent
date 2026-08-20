@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
@@ -22,6 +23,81 @@ fn actor_company(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
         AuthorizationActor::Board { company_id, .. }
         | AuthorizationActor::Agent { company_id, .. } => Ok(*company_id),
         _ => Err(StatusCode::FORBIDDEN),
+    }
+}
+
+fn collect_environment_secret_refs(
+    value: &Value,
+    path: &str,
+    refs: &mut Vec<(Uuid, String, String)>,
+    seen: &mut HashSet<(Uuid, String)>,
+) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    if object.get("type").and_then(Value::as_str) == Some("secret_ref") {
+        let Some(secret_id) = object
+            .get("secretId")
+            .and_then(Value::as_str)
+            .and_then(|raw| Uuid::parse_str(raw.trim()).ok())
+        else {
+            return;
+        };
+        let version = match object.get("version") {
+            Some(Value::Number(number)) => number
+                .as_i64()
+                .filter(|value| *value > 0)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "latest".to_string()),
+            Some(Value::String(version)) if !version.is_empty() => version.clone(),
+            _ => "latest".to_string(),
+        };
+        if seen.insert((secret_id, path.to_string())) {
+            refs.push((secret_id, path.to_string(), version));
+        }
+    }
+    for (key, child) in object {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        collect_environment_secret_refs(child, &child_path, refs, seen);
+    }
+}
+
+#[cfg(test)]
+mod environment_secret_ref_tests {
+    use super::collect_environment_secret_refs;
+    use serde_json::json;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    #[test]
+    fn collects_nested_secret_ref_bindings_without_values() {
+        let secret_id = Uuid::new_v4();
+        let config = json!({
+            "provider": "secure",
+            "credentials": {
+                "apiKey": {
+                    "type": "secret_ref",
+                    "secretId": secret_id,
+                    "version": 3,
+                    "value": "must-not-be-returned"
+                }
+            }
+        });
+        let mut refs = Vec::new();
+        collect_environment_secret_refs(&config, "", &mut refs, &mut HashSet::new());
+        assert_eq!(refs, vec![(secret_id, "credentials.apiKey".to_string(), "3".to_string())]);
+    }
+
+    #[test]
+    fn ignores_malformed_secret_ref_objects() {
+        let config = json!({"apiKey": {"type": "secret_ref", "secretId": "not-a-uuid"}});
+        let mut refs = Vec::new();
+        collect_environment_secret_refs(&config, "", &mut refs, &mut HashSet::new());
+        assert!(refs.is_empty());
     }
 }
 
@@ -804,12 +880,12 @@ async fn environment_leases(
     })).collect()))
 }
 
-/// GET /environments/:id/secret-refs —— 环境 secret 引用列表（基础：空）。
+/// GET /environments/:id/secret-refs —— 环境 secret 引用元数据（不返回 secret value）。
 async fn environment_secret_refs(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(environment_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+) -> Result<Json<Value>, StatusCode> {
     let company_id: Uuid = sqlx::query_scalar(
         "SELECT company_id FROM environments WHERE id = $1",
     )
@@ -820,7 +896,41 @@ async fn environment_secret_refs(
     .ok_or(StatusCode::NOT_FOUND)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(vec![]))
+    let config: Value = sqlx::query_scalar("SELECT config FROM environments WHERE id = $1")
+        .bind(environment_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut refs = Vec::new();
+    collect_environment_secret_refs(&config, "", &mut refs, &mut HashSet::new());
+
+    let mut descriptors = Vec::new();
+    for (secret_id, config_path, version_selector) in refs {
+        let row = sqlx::query(
+            "SELECT s.id, s.name, s.status, s.company_id, c.name AS company_name
+             FROM company_secrets s
+             JOIN companies c ON c.id = s.company_id
+             WHERE s.id = $1 AND s.deleted_at IS NULL",
+        )
+        .bind(secret_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let Some(row) = row else {
+            continue;
+        };
+        use sqlx::Row;
+        descriptors.push(json!({
+            "configPath": config_path,
+            "secretId": row.get::<Uuid, _>("id"),
+            "name": row.get::<String, _>("name"),
+            "status": row.get::<String, _>("status"),
+            "companyId": row.get::<Uuid, _>("company_id"),
+            "companyName": row.get::<String, _>("company_name"),
+            "versionSelector": version_selector,
+        }));
+    }
+    Ok(Json(json!({ "refs": descriptors })))
 }
 
 /// GET /health —— 健康检查（未注册到路由，保留备用）。
