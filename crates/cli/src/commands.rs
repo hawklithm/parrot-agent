@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use std::path::PathBuf;
 
 use crate::{checks, config::CliConfig};
 
@@ -14,15 +15,43 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
             let config = CliConfig::load()?;
             checks::run_doctor(&config)
         }
+        Some("configure") => configure(&args[1..]),
         Some(command) => bail!("unknown command '{command}'. Run 'parrot --help' for usage."),
     }
 }
 
 fn print_help() -> Result<()> {
     println!(
-        "parrot {}\n\nUsage:\n  parrot --version\n  parrot doctor\n  parrot help\n\nEnvironment:\n  PARROT_SERVER_URL  Server base URL (default: http://localhost:3100)\n  PARROT_API_TOKEN   Optional API token used by future API commands\n  PARROT_CONFIG      Optional config file path",
+        "parrot {}\n\nUsage:\n  parrot --version\n  parrot doctor\n  parrot configure --server-url URL [--api-token TOKEN] [--config PATH]\n  parrot help\n\nEnvironment:\n  PARROT_SERVER_URL  Server base URL (default: http://localhost:3100)\n  PARROT_API_TOKEN   Optional API token; environment overrides config file\n  PARROT_CONFIG      Optional config file path",
         env!("CARGO_PKG_VERSION")
     );
     Ok(())
 }
 
+fn configure(args: &[String]) -> Result<()> {
+    let mut server_url = None;
+    let mut api_token = None;
+    let mut config_path = std::env::var_os("PARROT_CONFIG").map(PathBuf::from);
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args.get(index + 1).ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))?;
+        match flag {
+            "--server-url" => server_url = Some(value.clone()),
+            "--api-token" => api_token = Some(value.clone()),
+            "--config" => config_path = Some(PathBuf::from(value)),
+            _ => bail!("unknown configure option '{flag}'"),
+        }
+        index += 2;
+    }
+    let path = config_path.ok_or_else(|| anyhow::anyhow!("--config or PARROT_CONFIG is required"))?;
+    let url = server_url.unwrap_or_else(|| "http://localhost:3100".to_owned());
+    let config = CliConfig {
+        server_url: url,
+        api_token,
+        config_path: Some(path.clone()),
+    };
+    config.save()?;
+    println!("configuration saved to {}", path.display());
+    Ok(())
+}
