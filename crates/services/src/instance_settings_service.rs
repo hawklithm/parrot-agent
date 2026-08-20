@@ -42,6 +42,53 @@ impl Default for InstanceSettings {
 pub struct GeneralSettings {
     pub timezone: String,
     pub language: String,
+    #[serde(default)]
+    pub censor_username_in_logs: bool,
+    #[serde(default)]
+    pub keyboard_shortcuts: bool,
+    #[serde(default = "default_feedback_preference")]
+    pub feedback_data_sharing_preference: String,
+    #[serde(default)]
+    pub backup_retention: BackupRetentionPolicy,
+    #[serde(default)]
+    pub execution_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupRetentionPolicy {
+    #[serde(default = "default_daily_retention")]
+    pub daily_days: u32,
+    #[serde(default = "default_weekly_retention")]
+    pub weekly_weeks: u32,
+    #[serde(default = "default_monthly_retention")]
+    pub monthly_months: u32,
+}
+
+fn default_feedback_preference() -> String {
+    "prompt".to_string()
+}
+
+fn default_daily_retention() -> u32 {
+    7
+}
+
+fn default_weekly_retention() -> u32 {
+    4
+}
+
+fn default_monthly_retention() -> u32 {
+    1
+}
+
+impl Default for BackupRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            daily_days: default_daily_retention(),
+            weekly_weeks: default_weekly_retention(),
+            monthly_months: default_monthly_retention(),
+        }
+    }
 }
 
 impl Default for GeneralSettings {
@@ -49,8 +96,77 @@ impl Default for GeneralSettings {
         Self {
             timezone: "UTC".to_string(),
             language: "en".to_string(),
+            censor_username_in_logs: false,
+            keyboard_shortcuts: false,
+            feedback_data_sharing_preference: default_feedback_preference(),
+            backup_retention: BackupRetentionPolicy::default(),
+            execution_mode: None,
         }
     }
+}
+
+fn apply_general_updates(
+    settings: &mut GeneralSettings,
+    updates: &serde_json::Value,
+) -> Result<(), String> {
+    if let Some(v) = updates.get("timezone").and_then(|v| v.as_str()) {
+        settings.timezone = v.to_string();
+    }
+    if let Some(v) = updates.get("language").and_then(|v| v.as_str()) {
+        settings.language = v.to_string();
+    }
+    if let Some(v) = updates
+        .get("censorUsernameInLogs")
+        .and_then(|v| v.as_bool())
+    {
+        settings.censor_username_in_logs = v;
+    }
+    if let Some(v) = updates.get("keyboardShortcuts").and_then(|v| v.as_bool()) {
+        settings.keyboard_shortcuts = v;
+    }
+    if let Some(v) = updates
+        .get("feedbackDataSharingPreference")
+        .and_then(|v| v.as_str())
+    {
+        if !matches!(v, "allowed" | "not_allowed" | "prompt") {
+            return Err(
+                "feedbackDataSharingPreference must be allowed, not_allowed, or prompt"
+                    .to_string(),
+            );
+        }
+        settings.feedback_data_sharing_preference = v.to_string();
+    }
+    if let Some(retention) = updates.get("backupRetention") {
+        let current = &mut settings.backup_retention;
+        if let Some(v) = retention.get("dailyDays").and_then(|v| v.as_u64()) {
+            if !matches!(v, 3 | 7 | 14) {
+                return Err("backupRetention.dailyDays must be 3, 7, or 14".to_string());
+            }
+            current.daily_days = v as u32;
+        }
+        if let Some(v) = retention.get("weeklyWeeks").and_then(|v| v.as_u64()) {
+            if !matches!(v, 1 | 2 | 4) {
+                return Err("backupRetention.weeklyWeeks must be 1, 2, or 4".to_string());
+            }
+            current.weekly_weeks = v as u32;
+        }
+        if let Some(v) = retention.get("monthlyMonths").and_then(|v| v.as_u64()) {
+            if !matches!(v, 1 | 3 | 6) {
+                return Err("backupRetention.monthlyMonths must be 1, 3, or 6".to_string());
+            }
+            current.monthly_months = v as u32;
+        }
+    }
+    if let Some(mode) = updates.get("executionMode") {
+        settings.execution_mode = match mode {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(value) if matches!(value.as_str(), "any" | "kubernetes") => {
+                Some(value.clone())
+            }
+            _ => return Err("executionMode must be any, kubernetes, or null".to_string()),
+        };
+    }
+    Ok(())
 }
 
 /// 实验性功能设置
@@ -328,23 +444,12 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
     ) -> Result<GeneralSettings, String> {
         if self.pool.is_some() {
             let mut settings = self.load_from_db().await?;
-            if let Some(v) = updates.get("timezone").and_then(|v| v.as_str()) {
-                settings.general.timezone = v.into();
-            }
-            if let Some(v) = updates.get("language").and_then(|v| v.as_str()) {
-                settings.general.language = v.into();
-            }
+            apply_general_updates(&mut settings.general, &updates)?;
             self.persist(&settings).await?;
             return Ok(settings.general);
         }
         let mut settings = self.settings.write().await;
-
-        if let Some(tz) = updates.get("timezone").and_then(|v| v.as_str()) {
-            settings.general.timezone = tz.to_string();
-        }
-        if let Some(lang) = updates.get("language").and_then(|v| v.as_str()) {
-            settings.general.language = lang.to_string();
-        }
+        apply_general_updates(&mut settings.general, &updates)?;
 
         Ok(settings.general.clone())
     }
@@ -494,11 +599,17 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
             .await
             .map_err(|error| format!("failed to stat database backup: {}", error))?
             .len();
+        let configured_daily_retention = self
+            .get_general_settings()
+            .await
+            .ok()
+            .map(|settings| settings.backup_retention.daily_days)
+            .unwrap_or(7);
         let retention_days = std::env::var("PARROT_DATABASE_BACKUP_RETENTION_DAYS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(7);
+            .unwrap_or(configured_daily_retention as u64);
         let pruned_count = prune_database_backups(&backup_dir, retention_days)
             .await
             .map_err(|error| format!("failed to prune database backups: {}", error))?;
@@ -540,7 +651,8 @@ async fn prune_database_backups(directory: &Path, retention_days: u64) -> std::i
 
 #[cfg(test)]
 mod tests {
-    use super::prune_database_backups;
+    use super::{apply_general_updates, prune_database_backups, GeneralSettings};
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -557,5 +669,48 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!directory.path().join("parrot-old.sql").exists());
         assert!(directory.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn general_settings_defaults_match_paperclip_defaults() {
+        let settings = GeneralSettings::default();
+        assert!(!settings.censor_username_in_logs);
+        assert!(!settings.keyboard_shortcuts);
+        assert_eq!(settings.feedback_data_sharing_preference, "prompt");
+        assert_eq!(settings.backup_retention.daily_days, 7);
+        assert_eq!(settings.backup_retention.weekly_weeks, 4);
+        assert_eq!(settings.backup_retention.monthly_months, 1);
+        assert_eq!(settings.execution_mode, None);
+    }
+
+    #[test]
+    fn general_settings_update_validates_paperclip_compatible_values() {
+        let mut settings = GeneralSettings::default();
+        apply_general_updates(
+            &mut settings,
+            &json!({
+                "censorUsernameInLogs": true,
+                "keyboardShortcuts": true,
+                "feedbackDataSharingPreference": "allowed",
+                "backupRetention": { "dailyDays": 14, "weeklyWeeks": 2, "monthlyMonths": 6 },
+                "executionMode": "kubernetes"
+            }),
+        )
+        .unwrap();
+        assert!(settings.censor_username_in_logs);
+        assert!(settings.keyboard_shortcuts);
+        assert_eq!(settings.feedback_data_sharing_preference, "allowed");
+        assert_eq!(settings.backup_retention.daily_days, 14);
+        assert_eq!(settings.backup_retention.weekly_weeks, 2);
+        assert_eq!(settings.backup_retention.monthly_months, 6);
+        assert_eq!(settings.execution_mode.as_deref(), Some("kubernetes"));
+
+        for update in [
+            json!({ "feedbackDataSharingPreference": "unknown" }),
+            json!({ "backupRetention": { "dailyDays": 30 } }),
+            json!({ "executionMode": "docker" }),
+        ] {
+            assert!(apply_general_updates(&mut settings, &update).is_err());
+        }
     }
 }
