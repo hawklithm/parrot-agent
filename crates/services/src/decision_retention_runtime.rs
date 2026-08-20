@@ -101,6 +101,17 @@ impl PgDecisionRetentionRuntime {
             });
         };
         let limit = limit.clamp(1, 5000);
+        let stale_cutoff = Utc::now() - Duration::minutes(5);
+        sqlx::query(
+            "UPDATE decision_archive_notification_outbox
+                SET status = 'pending'
+              WHERE status = 'delivering'
+                AND (last_attempt_at IS NULL OR last_attempt_at <= $1)",
+        )
+        .bind(stale_cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(db_retention_error)?;
         let mut tx = self.pool.begin().await.map_err(db_retention_error)?;
         let rows = sqlx::query(
             "SELECT id, company_id, source_kind, source_id, archive_version,
@@ -171,6 +182,7 @@ impl PgDecisionRetentionRuntime {
             sqlx::query(
                 "UPDATE decision_archive_notification_outbox
                     SET status = $2,
+                        last_attempt_at = NOW(),
                         delivered_at = CASE WHEN $2 = 'delivered' THEN NOW() ELSE delivered_at END
                   WHERE id = ANY($1) AND status = 'delivering'",
             )
