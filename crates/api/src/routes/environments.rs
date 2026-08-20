@@ -521,7 +521,37 @@ async fn get_environment_lease(
     assert_environment_company_access(&state, environment_id, &actor)
         .await
         .map_err(|response| response.status())?;
-    Err(StatusCode::NOT_IMPLEMENTED)
+    let lease = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT json_build_object(
+            'id', id,
+            'companyId', company_id,
+            'environmentId', environment_id,
+            'executionWorkspaceId', execution_workspace_id,
+            'issueId', issue_id,
+            'heartbeatRunId', heartbeat_run_id,
+            'status', status,
+            'leasePolicy', lease_policy,
+            'provider', provider,
+            'providerLeaseId', provider_lease_id,
+            'acquiredAt', acquired_at,
+            'lastUsedAt', last_used_at,
+            'expiresAt', expires_at,
+            'releasedAt', released_at,
+            'failureReason', failure_reason,
+            'cleanupStatus', cleanup_status,
+            'metadata', metadata,
+            'createdAt', created_at,
+            'updatedAt', updated_at
+        )
+        FROM environment_leases
+        WHERE id = $1",
+    )
+    .bind(lease_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(lease))
 }
 
 async fn load_session_json(
