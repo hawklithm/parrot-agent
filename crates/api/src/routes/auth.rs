@@ -309,15 +309,6 @@ async fn update_profile(
 // 空数组或固定成功响应冒充生产能力），不再伪造成功，统一返回 501
 // feature-disabled 错误。
 
-/// 501 feature-disabled 响应。
-fn not_implemented(message: impl Into<String>) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({ "error": message.into() })),
-    )
-        .into_response()
-}
-
 /// AU1: POST /admin/users/:user_id/promote-instance-admin
 async fn promote_instance_admin(
     State(state): State<AppState>,
@@ -500,13 +491,122 @@ async fn update_user_company_access(
 
 /// AU5: POST /join-requests/:request_id/claim-api-key
 async fn claim_join_request_api_key(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(request_id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Result<Response, AuthError> {
-    Ok(not_implemented(format!(
-        "claim-api-key for join request {} is not implemented; feature disabled",
-        request_id
-    )))
+    let claim_secret = payload
+        .get("claimSecret")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AuthError::bad_request("claimSecret is required"))?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| AuthError::internal(error.to_string()))?;
+    let row = sqlx::query(
+        "SELECT company_id, request_type, status::text AS status, created_agent_id,
+                claim_secret_hash, claim_secret_expires_at, claim_secret_consumed_at
+         FROM join_requests
+         WHERE id = $1
+         FOR UPDATE",
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| AuthError::internal(error.to_string()))?
+    .ok_or_else(|| AuthError::bad_request("Join request not found"))?;
+    use sqlx::Row;
+    let request_type = row.get::<String, _>("request_type");
+    if request_type != "agent" {
+        return Err(AuthError::bad_request("Only agent join requests can claim API keys"));
+    }
+    if row.get::<String, _>("status") != "approved" {
+        return Err(AuthError::conflict("Join request must be approved before key claim"));
+    }
+    let agent_id = row
+        .get::<Option<Uuid>, _>("created_agent_id")
+        .ok_or_else(|| AuthError::conflict("Join request has no created agent"))?;
+    let expected_hash = row
+        .get::<Option<String>, _>("claim_secret_hash")
+        .ok_or_else(|| AuthError::conflict("Join request is missing claim secret metadata"))?;
+    let mut digest = Sha256::new();
+    digest.update(claim_secret.as_bytes());
+    let presented_hash = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if expected_hash != presented_hash {
+        return Err(AuthError::forbidden("Invalid claim secret"));
+    }
+    if let Some(expires_at) = row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("claim_secret_expires_at") {
+        if expires_at <= chrono::Utc::now() {
+            return Err(AuthError::conflict("Claim secret expired"));
+        }
+    }
+    if row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("claim_secret_consumed_at").is_some() {
+        return Err(AuthError::conflict("Claim secret already used"));
+    }
+    let company_id = row.get::<Uuid, _>("company_id");
+    let existing_key: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM agent_api_keys WHERE agent_id = $1)",
+    )
+    .bind(agent_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| AuthError::internal(error.to_string()))?;
+    if existing_key {
+        return Err(AuthError::conflict("API key already claimed"));
+    }
+    let raw_key = format!("aak_{}", Uuid::new_v4().simple());
+    let mut key_digest = Sha256::new();
+    key_digest.update(raw_key.as_bytes());
+    let key_hash = key_digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let key_id = Uuid::new_v4();
+    let created_at = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO agent_api_keys
+             (id, agent_id, company_id, name, key_hash, scope, created_at, updated_at)
+         VALUES ($1, $2, $3, 'initial-join-key', $4, $5, $6, $6)",
+    )
+    .bind(key_id)
+    .bind(agent_id)
+    .bind(company_id)
+    .bind(key_hash)
+    .bind(json!({ "scope_type": "standard", "agent_id": agent_id, "company_id": company_id }))
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AuthError::internal(error.to_string()))?;
+    sqlx::query(
+        "UPDATE join_requests
+         SET claim_secret_consumed_at = $2, updated_at = $2
+         WHERE id = $1 AND claim_secret_consumed_at IS NULL",
+    )
+    .bind(request_id)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AuthError::internal(error.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|error| AuthError::internal(error.to_string()))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "keyId": key_id,
+            "token": raw_key,
+            "agentId": agent_id,
+            "createdAt": created_at,
+        })),
+    )
+        .into_response())
 }
 
 #[cfg(test)]
