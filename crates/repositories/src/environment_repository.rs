@@ -56,11 +56,12 @@ impl EnvironmentRepository for PgEnvironmentRepository {
 
         let environment = sqlx::query_as::<_, ExecutionEnvironment>(
             r#"
-            INSERT INTO environments (name, description, driver, status, config, env_vars, metadata)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
+            INSERT INTO environments (company_id, name, description, driver, status, config, env_vars, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id, company_id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
             "#
         )
+        .bind(input.company_id.ok_or_else(|| RepositoryError::InvalidData("company_id is required".to_string()))?)
         .bind(&input.name)
         .bind(&input.description)
         .bind(&input.driver)
@@ -77,7 +78,7 @@ impl EnvironmentRepository for PgEnvironmentRepository {
     async fn get_by_id(&self, id: Uuid) -> Result<Option<ExecutionEnvironment>, RepositoryError> {
         let environment = sqlx::query_as::<_, ExecutionEnvironment>(
             r#"
-            SELECT id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
+            SELECT id, company_id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
             FROM environments
             WHERE id = $1
             "#
@@ -92,7 +93,7 @@ impl EnvironmentRepository for PgEnvironmentRepository {
     async fn get_by_name(&self, name: &str) -> Result<Option<ExecutionEnvironment>, RepositoryError> {
         let environment = sqlx::query_as::<_, ExecutionEnvironment>(
             r#"
-            SELECT id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
+            SELECT id, company_id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
             FROM environments
             WHERE name = $1
             "#
@@ -107,7 +108,7 @@ impl EnvironmentRepository for PgEnvironmentRepository {
     async fn list_by_status(&self, status: EnvironmentStatus) -> Result<Vec<ExecutionEnvironment>, RepositoryError> {
         let environments = sqlx::query_as::<_, ExecutionEnvironment>(
             r#"
-            SELECT id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
+            SELECT id, company_id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
             FROM environments
             WHERE status = $1
             ORDER BY created_at DESC
@@ -123,7 +124,7 @@ impl EnvironmentRepository for PgEnvironmentRepository {
     async fn list_all(&self) -> Result<Vec<ExecutionEnvironment>, RepositoryError> {
         let environments = sqlx::query_as::<_, ExecutionEnvironment>(
             r#"
-            SELECT id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
+            SELECT id, company_id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at
             FROM environments
             ORDER BY created_at DESC
             "#
@@ -168,7 +169,7 @@ impl EnvironmentRepository for PgEnvironmentRepository {
             query.push_str(&format!(", metadata = ${}", bind_count));
         }
 
-        query.push_str(" WHERE id = $1 RETURNING id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at");
+        query.push_str(" WHERE id = $1 RETURNING id, company_id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at");
 
         let mut query_builder = sqlx::query_as::<_, ExecutionEnvironment>(&query).bind(id);
 

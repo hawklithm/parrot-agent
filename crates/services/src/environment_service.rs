@@ -67,7 +67,8 @@ impl DefaultEnvironmentService {
 
 #[async_trait]
 impl EnvironmentService for DefaultEnvironmentService {
-    async fn create(&self, _company_id: Uuid, input: CreateEnvironmentInput) -> Result<Environment, ServiceError> {
+    async fn create(&self, company_id: Uuid, mut input: CreateEnvironmentInput) -> Result<Environment, ServiceError> {
+        input.company_id = Some(company_id);
         // Validate config
         self.validate_config(input.driver.clone(), input.config.as_ref().unwrap_or(&serde_json::Value::Null))?;
 
@@ -187,7 +188,10 @@ impl EnvironmentService for DefaultEnvironmentService {
             .environment_repo
             .list_all()
             .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to list environment capabilities: {}", e)))?;
+            .map_err(|e| ServiceError::Internal(format!("Failed to list environment capabilities: {}", e)))?
+            .into_iter()
+            .filter(|environment| environment.company_id == company_id)
+            .collect::<Vec<_>>();
         let mut drivers = environments
             .iter()
             .map(|environment| match environment.driver {

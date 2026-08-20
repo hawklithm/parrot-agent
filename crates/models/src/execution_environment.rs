@@ -27,6 +27,7 @@ pub enum EnvironmentStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ExecutionEnvironment {
     pub id: Uuid,
+    pub company_id: Uuid,
     pub name: String,
     pub description: Option<String>,
     pub driver: EnvironmentDriver,
@@ -125,6 +126,8 @@ impl RuntimeLease {
 /// Create Environment Input
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateEnvironmentInput {
+    #[serde(skip)]
+    pub company_id: Option<Uuid>,
     pub name: String,
     pub description: Option<String>,
     pub driver: EnvironmentDriver,
