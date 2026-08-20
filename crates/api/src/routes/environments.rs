@@ -1,7 +1,7 @@
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -61,12 +61,104 @@ pub fn environment_routes() -> Router<AppState> {
         .route("/environment-leases/:lease_id", get(get_environment_lease))
 }
 
+async fn assert_environment_company_access(
+    state: &AppState,
+    environment_id: Uuid,
+    actor: &AuthorizationActor,
+) -> Result<(), Response> {
+    let company_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT company_id FROM environments WHERE id = $1",
+    )
+    .bind(environment_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Failed to resolve environment company"})),
+        )
+            .into_response()
+    })?
+    .ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(json!({"error": "Environment not found"}))).into_response()
+    })?;
+
+    let allowed = match actor {
+        AuthorizationActor::Board {
+            company_id: actor_company_id,
+            is_instance_admin,
+            ..
+        } => *is_instance_admin || *actor_company_id == company_id,
+        AuthorizationActor::Agent {
+            company_id: actor_company_id,
+            ..
+        } => *actor_company_id == company_id,
+        AuthorizationActor::None => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, Json(json!({"error": "Environment is outside the actor's company scope"}))).into_response())
+    }
+}
+
+fn assert_company_path_access(
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+) -> Result<(), Response> {
+    let allowed = match actor {
+        AuthorizationActor::Board {
+            company_id: actor_company_id,
+            is_instance_admin,
+            ..
+        } => *is_instance_admin || *actor_company_id == company_id,
+        AuthorizationActor::Agent {
+            company_id: actor_company_id,
+            ..
+        } => *actor_company_id == company_id,
+        AuthorizationActor::None => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, Json(json!({"error": "Company is outside the actor's scope"}))).into_response())
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::assert_company_path_access;
+    use services::auth::AuthorizationActor;
+    use uuid::Uuid;
+
+    #[test]
+    fn company_environment_access_rejects_cross_company_actor() {
+        let actor = AuthorizationActor::board(Uuid::new_v4(), Uuid::new_v4());
+        assert!(assert_company_path_access(&actor, Uuid::new_v4()).is_err());
+    }
+
+    #[test]
+    fn instance_admin_can_access_other_company_environment_path() {
+        let actor = AuthorizationActor::board_with_memberships(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Vec::new(),
+            true,
+        );
+        assert!(assert_company_path_access(&actor, Uuid::new_v4()).is_ok());
+    }
+}
+
 // ===== V2 Handlers (AppState-based) =====
 
 async fn list_environments_v2(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(response) = assert_company_path_access(&actor, company_id) {
+        return response;
+    }
     match state
         .environment_service
         .list_by_company(
@@ -86,9 +178,13 @@ async fn list_environments_v2(
 
 async fn create_environment_v2(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(input): Json<CreateEnvironmentInput>,
 ) -> impl IntoResponse {
+    if let Err(response) = assert_company_path_access(&actor, company_id) {
+        return response;
+    }
     match state.environment_service.create(company_id, input).await {
         Ok(env) => (StatusCode::CREATED, Json(env)).into_response(),
         Err(e) => (
@@ -101,8 +197,12 @@ async fn create_environment_v2(
 
 async fn get_environment_v2(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(response) = assert_environment_company_access(&state, id, &actor).await {
+        return response;
+    }
     match state.environment_service.get(id).await {
         Ok(env) => (StatusCode::OK, Json(env)).into_response(),
         Err(e) => match e {
@@ -120,9 +220,13 @@ async fn get_environment_v2(
 
 async fn update_environment_v2(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateEnvironmentInput>,
 ) -> impl IntoResponse {
+    if let Err(response) = assert_environment_company_access(&state, id, &actor).await {
+        return response;
+    }
     match state.environment_service.update(id, input).await {
         Ok(env) => (StatusCode::OK, Json(env)).into_response(),
         Err(e) => (
@@ -135,8 +239,12 @@ async fn update_environment_v2(
 
 async fn delete_environment_v2(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(response) = assert_environment_company_access(&state, id, &actor).await {
+        return response;
+    }
     match state.environment_service.delete(id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
@@ -149,8 +257,12 @@ async fn delete_environment_v2(
 
 async fn probe_environment_v2(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(response) = assert_environment_company_access(&state, id, &actor).await {
+        return response;
+    }
     match state.environment_diagnostics_service.probe(id).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(error) => (
@@ -166,8 +278,10 @@ async fn probe_environment_v2(
 /// E11: GET /companies/:company_id/environments/capabilities
 async fn get_environment_capabilities(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_company_path_access(&actor, company_id).map_err(|_| StatusCode::FORBIDDEN)?;
     state
         .environment_service
         .get_capabilities(company_id)
@@ -179,9 +293,11 @@ async fn get_environment_capabilities(
 /// E12: POST /companies/:company_id/environments/probe-config
 async fn probe_environment_config(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_company_path_access(&actor, company_id).map_err(|_| StatusCode::FORBIDDEN)?;
     state
         .environment_service
         .probe_config(company_id, payload)
@@ -193,8 +309,12 @@ async fn probe_environment_config(
 /// E16: GET /environments/:id/delete-blast-radius
 async fn get_delete_blast_radius(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_environment_company_access(&state, id, &actor)
+        .await
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     state
         .environment_service
         .get_delete_blast_radius(id)
