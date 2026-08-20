@@ -4668,6 +4668,30 @@ mod tests {
     }
 
     #[test]
+    fn attention_activity_sort_is_deterministic() {
+        let mut items = vec![
+            json!({"activityAt": "2026-01-01T00:00:00Z", "severity": "low", "sourceKind": "approval", "dedupKey": "z"}),
+            json!({"activityAt": "2026-01-01T00:00:00Z", "severity": "critical", "sourceKind": "approval", "dedupKey": "a"}),
+            json!({"activityAt": "2026-01-02T00:00:00Z", "severity": "low", "sourceKind": "approval", "dedupKey": "new"}),
+        ];
+        items.sort_by(compare_attention_items);
+        assert_eq!(items[0]["dedupKey"], "new");
+        assert_eq!(items[1]["dedupKey"], "a");
+        assert_eq!(items[2]["dedupKey"], "z");
+    }
+
+    #[test]
+    fn attention_decide_sort_prefers_decision_ready_items() {
+        let now = Utc::now();
+        let mut items = vec![
+            json!({"activityAt": "2026-01-01T00:00:00Z", "severity": "critical", "sourceKind": "approval", "dedupKey": "whenever", "decideBy": "whenever"}),
+            json!({"activityAt": "2026-01-02T00:00:00Z", "severity": "low", "sourceKind": "approval", "dedupKey": "today", "decideBy": "today"}),
+        ];
+        items.sort_by(|left, right| compare_decide_items(left, right, now));
+        assert_eq!(items[0]["dedupKey"], "today");
+    }
+
+    #[test]
     fn cursor_round_trips() {
         let item = json!({
             "id": "approval:11111111-1111-1111-1111-111111111111",
