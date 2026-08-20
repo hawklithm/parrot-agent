@@ -43,6 +43,7 @@ pub mod recovery_observability_service;
 pub mod decision_service;
 pub mod decision_queue_service;
 pub mod decision_retention_service;
+pub mod decision_retention_runtime;
 pub mod decision_signing_service;
 pub mod decision_training_service;
 pub mod decision_wakeup_service;

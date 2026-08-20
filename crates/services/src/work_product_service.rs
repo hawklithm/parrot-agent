@@ -92,12 +92,12 @@ fn validate_work_product_value(
             "unsupported work product type: {value}"
         )));
     }
-    if let Some(value) = provider.filter(|value| value.trim().is_empty()) {
+    if provider.as_deref().is_some_and(|value| value.trim().is_empty()) {
         return Err(crate::errors::ServiceError::Validation(
             "provider must not be empty".into(),
         ));
     }
-    if let Some(value) = title.filter(|value| value.trim().is_empty()) {
+    if title.as_deref().is_some_and(|value| value.trim().is_empty()) {
         return Err(crate::errors::ServiceError::Validation(
             "title must not be empty".into(),
         ));

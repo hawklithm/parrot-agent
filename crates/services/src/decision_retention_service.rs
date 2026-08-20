@@ -22,19 +22,7 @@ pub struct DecisionRetentionState {
 }
 
 /// 归档通知批次
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArchiveNotificationBatch {
-    pub agent_id: Uuid,
-    pub items: Vec<ArchiveNotificationItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArchiveNotificationItem {
-    pub source_kind: String,
-    pub source_id: String,
-    pub issue_id: Uuid,
-    pub archive_version: i32,
-}
+pub use crate::decision_wakeup_service::{ArchiveNotificationBatch, ArchiveNotificationItem};
 
 /// Attention归档清单条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,7 +72,9 @@ pub trait DecisionRetentionService: Send + Sync {
     ) -> Result<usize, RetentionError>;
 
     /// 发送归档通知
-    async fn send_archive_notifications(&self) -> Result<Vec<ArchiveNotificationBatch>, RetentionError>;
+    async fn send_archive_notifications(
+        &self,
+    ) -> Result<Vec<ArchiveNotificationBatch>, RetentionError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,7 +102,9 @@ pub fn hash_attention_archive_manifest(manifest: &[AttentionArchiveManifestEntry
 }
 
 /// 规范化归档清单（用于一致性哈希）
-fn canonical_manifest(manifest: &[AttentionArchiveManifestEntry]) -> Vec<AttentionArchiveManifestEntry> {
+fn canonical_manifest(
+    manifest: &[AttentionArchiveManifestEntry],
+) -> Vec<AttentionArchiveManifestEntry> {
     let mut sorted = manifest.to_vec();
     sorted.sort_by(|a, b| {
         let a_key = format!("{}:{}", a.source_kind, a.source_id);
@@ -154,7 +146,7 @@ impl DecisionRetentionService for DefaultDecisionRetentionService {
         // 1. 检查决策是否存在
         // 2. 更新或创建retention record，设置shelved_at
         // 3. 记录activity log
-        
+
         let now = Utc::now();
         Ok(DecisionRetentionState {
             id: Uuid::new_v4(),
@@ -180,10 +172,10 @@ impl DecisionRetentionService for DefaultDecisionRetentionService {
         // 3. 更新retention record，设置archived_at和manifest_hash
         // 4. 创建归档通知
         // 5. 记录activity log
-        
+
         let now = Utc::now();
         let manifest_hash = hash_attention_archive_manifest(&manifest);
-        
+
         Ok(DecisionRetentionState {
             id: Uuid::new_v4(),
             company_id: _company_id,
@@ -213,7 +205,7 @@ impl DecisionRetentionService for DefaultDecisionRetentionService {
         // 1. 查找所有超过shelf_days且未shelved的决策
         // 2. 批量更新为shelved状态
         // 3. 返回处理数量
-        
+
         let _cutoff = self.calculate_shelf_cutoff(shelf_days);
         Ok(0)
     }
@@ -228,18 +220,20 @@ impl DecisionRetentionService for DefaultDecisionRetentionService {
         // 2. 对每个决策构建attention archive manifest
         // 3. 批量归档
         // 4. 返回处理数量
-        
+
         let _cutoff = self.calculate_archive_cutoff(archive_days);
         Ok(0)
     }
 
-    async fn send_archive_notifications(&self) -> Result<Vec<ArchiveNotificationBatch>, RetentionError> {
+    async fn send_archive_notifications(
+        &self,
+    ) -> Result<Vec<ArchiveNotificationBatch>, RetentionError> {
         // TODO: 实现归档通知逻辑
         // 1. 从notification outbox中读取待发送的通知
         // 2. 按agent_id分组
         // 3. 调用notification service发送
         // 4. 标记为已发送
-        
+
         Ok(vec![])
     }
 }
@@ -250,18 +244,16 @@ mod tests {
 
     #[test]
     fn test_hash_attention_archive_manifest() {
-        let manifest = vec![
-            AttentionArchiveManifestEntry {
-                source_kind: "issue".to_string(),
-                source_id: "test-1".to_string(),
-                issue_id: Some(Uuid::new_v4()),
-                archived_at: Utc::now(),
-            },
-        ];
+        let manifest = vec![AttentionArchiveManifestEntry {
+            source_kind: "issue".to_string(),
+            source_id: "test-1".to_string(),
+            issue_id: Some(Uuid::new_v4()),
+            archived_at: Utc::now(),
+        }];
 
         let hash1 = hash_attention_archive_manifest(&manifest);
         let hash2 = hash_attention_archive_manifest(&manifest);
-        
+
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 64); // SHA256 produces 64 hex chars
     }
