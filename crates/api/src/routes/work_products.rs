@@ -63,6 +63,68 @@ async fn get_scope_for_work_product(
     .ok_or_else(|| AppError::NotFound("Work product not found".to_string()))
 }
 
+/// Paperclip's `resolveWorkProductCreatedByRunId` guard.  A work product may
+/// only point at a real heartbeat run in the same company; an Agent may only
+/// point at its authenticated run, and creation defaults to that run.
+async fn resolve_created_by_run_id(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    requested: Option<Uuid>,
+    assign_current_run: bool,
+) -> Result<Option<Uuid>, AppError> {
+    let (agent_id, actor_run_id) = match actor {
+        AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => (Some(*agent_id), *run_id),
+        _ => (None, None),
+    };
+    if let (Some(requested), Some(actor_run_id)) = (requested, actor_run_id) {
+        if requested != actor_run_id {
+            return Err(AppError::Forbidden(
+                "createdByRunId must match the authenticated agent run".into(),
+            ));
+        }
+    }
+    let selected = if assign_current_run {
+        requested.or(actor_run_id)
+    } else {
+        requested
+    };
+    let Some(run_id) = selected else {
+        return Ok(None);
+    };
+    let valid = match agent_id {
+        Some(agent_id) => {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT h.id FROM heartbeat_runs h
+              JOIN agents a ON a.id = h.agent_id AND a.company_id = h.company_id
+             WHERE h.id = $1 AND h.company_id = $2 AND h.agent_id = $3",
+            )
+            .bind(run_id)
+            .bind(company_id)
+            .bind(agent_id)
+            .fetch_optional(&state.pool)
+            .await?
+        }
+        None => {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM heartbeat_runs WHERE id = $1 AND company_id = $2",
+            )
+            .bind(run_id)
+            .bind(company_id)
+            .fetch_optional(&state.pool)
+            .await?
+        }
+    };
+    if valid.is_none() {
+        return Err(AppError::Forbidden(
+            "createdByRunId is not valid for this work product actor".into(),
+        ));
+    }
+    Ok(Some(run_id))
+}
+
 fn forbidden(_: StatusCode) -> AppError {
     AppError::Forbidden("No access to this company".to_string())
 }
@@ -89,10 +151,14 @@ async fn create_work_product(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-    Json(input): Json<CreateWorkProductInput>,
+    Json(mut input): Json<CreateWorkProductInput>,
 ) -> Result<(StatusCode, Json<WorkProduct>), AppError> {
     let company_id = get_company_id_for_issue(&state, id).await?;
-    require_company_access(&actor, company_id, WorkProductOp::Create.access()).map_err(forbidden)?;
+    require_company_access(&actor, company_id, WorkProductOp::Create.access())
+        .map_err(forbidden)?;
+    input.created_by_run_id =
+        resolve_created_by_run_id(&state, &actor, company_id, input.created_by_run_id, true)
+            .await?;
 
     let work_product = state
         .work_product_service
@@ -118,10 +184,14 @@ async fn update_work_product(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-    Json(input): Json<UpdateWorkProductInput>,
+    Json(mut input): Json<UpdateWorkProductInput>,
 ) -> Result<Json<WorkProduct>, AppError> {
     let (company_id, issue_id) = get_scope_for_work_product(&state, id).await?;
-    require_company_access(&actor, company_id, WorkProductOp::Update.access()).map_err(forbidden)?;
+    require_company_access(&actor, company_id, WorkProductOp::Update.access())
+        .map_err(forbidden)?;
+    input.created_by_run_id =
+        resolve_created_by_run_id(&state, &actor, company_id, input.created_by_run_id, false)
+            .await?;
 
     let work_product = state
         .work_product_service
@@ -149,7 +219,8 @@ async fn delete_work_product(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let (company_id, issue_id) = get_scope_for_work_product(&state, id).await?;
-    require_company_access(&actor, company_id, WorkProductOp::Delete.access()).map_err(forbidden)?;
+    require_company_access(&actor, company_id, WorkProductOp::Delete.access())
+        .map_err(forbidden)?;
 
     state
         .work_product_service
