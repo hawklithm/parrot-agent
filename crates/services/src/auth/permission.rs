@@ -26,6 +26,8 @@ impl PermissionKey {
     pub const COMPANY_SETTINGS_UPDATE: &'static str = "company:settings:update";
     pub const COMPANY_DELETE: &'static str = "company:delete";
     pub const MEMBERS_MANAGE: &'static str = "members:manage";
+    /// Paperclip-compatible delegated permission for managing another user's inbox-agent policy.
+    pub const USERS_MANAGE_PERMISSIONS: &'static str = "users:manage_permissions";
     pub const ROLES_ASSIGN: &'static str = "roles:assign";
 
     // 项目级权限常量

@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::routes::{log_activity, require_company_access, AccessMode};
-use services::auth::{ActorSource, AuthorizationActor};
+use services::auth::{ActorSource, AuthorizationActor, PermissionKey};
 
 fn actor_company(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
     match actor {
@@ -457,7 +457,7 @@ fn board_user_id(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
 }
 
 fn can_manage_inbox_agent_policy(actor: &AuthorizationActor, company_id: Uuid) -> bool {
-    actor.is_instance_admin()
+    if actor.is_instance_admin()
         || actor.role_in(company_id).is_some_and(|role| role.can_manage_members())
         || matches!(
             actor,
@@ -466,6 +466,28 @@ fn can_manage_inbox_agent_policy(actor: &AuthorizationActor, company_id: Uuid) -
                 ..
             }
         )
+    {
+        return true;
+    }
+
+    match actor {
+        AuthorizationActor::Agent {
+            key_scope,
+            on_behalf_of_memberships,
+            ..
+        } => {
+            let delegated_role = on_behalf_of_memberships.iter().any(|membership| {
+                membership.company_id == company_id
+                    && membership.status.is_active()
+                    && membership.role.can_manage_members()
+            });
+            let delegated_key = key_scope.as_ref().is_some_and(|scope| {
+                scope.can_perform_action(PermissionKey::USERS_MANAGE_PERMISSIONS)
+            });
+            delegated_role || delegated_key
+        }
+        _ => false,
+    }
 }
 
 async fn get_user_inbox_agent_policy(
