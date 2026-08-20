@@ -238,7 +238,7 @@ async fn claude_oauth_token_status(
         Err(response) => return response,
     };
     let row = sqlx::query(
-        "SELECT declaration.id, 1::int AS latest_version FROM user_secret_declarations declaration JOIN user_secret_definitions definition ON definition.id = declaration.user_secret_definition_id WHERE declaration.company_id = $1 AND declaration.target_type = 'user' AND declaration.target_id = $2 AND declaration.value_material IS NOT NULL AND definition.key = 'claude_code_oauth_token' AND definition.deleted_at IS NULL LIMIT 1",
+        "SELECT declaration.id, declaration.latest_version FROM user_secret_declarations declaration JOIN user_secret_definitions definition ON definition.id = declaration.user_secret_definition_id WHERE declaration.company_id = $1 AND declaration.target_type = 'user' AND declaration.target_id = $2 AND declaration.value_material IS NOT NULL AND definition.key = 'claude_code_oauth_token' AND definition.deleted_at IS NULL LIMIT 1",
     )
     .bind(company_id)
     .bind(&owner)
@@ -271,12 +271,6 @@ async fn start_session(
     if request.adapter_type != CLAUDE_ADAPTER {
         return error(StatusCode::BAD_REQUEST, "Only claude_local is supported.");
     }
-    if request.overwrite.is_some() {
-        // The first transport slice does not yet implement compare-and-set
-        // rotation. Reject it explicitly instead of silently treating a
-        // confirmed overwrite as a first write.
-        return error(StatusCode::CONFLICT, "Claude OAuth overwrite is not available yet.");
-    }
     let environment_exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM environments WHERE id = $1 AND company_id = $2 AND status = 'active')",
     )
@@ -288,10 +282,25 @@ async fn start_session(
         return error(StatusCode::NOT_FOUND, "Environment not found.");
     }
 
+    if let Some(expected) = request.overwrite.as_ref() {
+        let matches_capture = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM user_secret_declarations declaration JOIN user_secret_definitions definition ON definition.id = declaration.user_secret_definition_id WHERE declaration.id = $1 AND declaration.company_id = $2 AND declaration.target_type = 'user' AND declaration.target_id = $3 AND declaration.value_material IS NOT NULL AND declaration.latest_version = $4 AND definition.key = 'claude_code_oauth_token' AND definition.deleted_at IS NULL)",
+        )
+        .bind(expected.expected_secret_id)
+        .bind(company_id)
+        .bind(&owner)
+        .bind(expected.expected_latest_version)
+        .fetch_one(&state.pool)
+        .await;
+        if !matches!(matches_capture, Ok(true)) {
+            return error(StatusCode::CONFLICT, "The Claude OAuth confirmation is stale.");
+        }
+    }
+
     let session_id = format!("parrot_{}", Uuid::new_v4().simple());
     let deadline = Utc::now() + Duration::minutes(15);
     let result = sqlx::query(
-        "INSERT INTO claude_setup_token_sessions (session_id, company_id, owner_user_id, adapter_type, environment_id, state, deadline_at) VALUES ($1,$2,$3,$4,$5,'awaiting_code',$6)",
+        "INSERT INTO claude_setup_token_sessions (session_id, company_id, owner_user_id, adapter_type, environment_id, state, deadline_at, expected_secret_id, expected_latest_version) VALUES ($1,$2,$3,$4,$5,'awaiting_code',$6,$7,$8)",
     )
     .bind(&session_id)
     .bind(company_id)
@@ -299,6 +308,8 @@ async fn start_session(
     .bind(CLAUDE_ADAPTER)
     .bind(request.environment_id)
     .bind(deadline)
+    .bind(request.overwrite.as_ref().map(|value| value.expected_secret_id))
+    .bind(request.overwrite.as_ref().map(|value| value.expected_latest_version))
     .execute(&state.pool)
     .await;
     if let Err(err) = result {
@@ -496,7 +507,16 @@ async fn completion(
         Some(id) => id,
         None => return error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED"),
     };
-    if store_claude_token(&state, company_id, owner_id, &token).await.is_err() {
+    let expected = (
+        row.get::<Option<Uuid>, _>("expected_secret_id"),
+        row.get::<Option<i32>, _>("expected_latest_version"),
+    );
+    let expected = match expected {
+        (Some(secret_id), Some(version)) => Some((secret_id, version)),
+        (None, None) => None,
+        _ => return error(StatusCode::CONFLICT, "The Claude OAuth confirmation is invalid."),
+    };
+    if store_claude_token(&state, company_id, owner_id, &token, expected).await.is_err() {
         let _ = sqlx::query("UPDATE claude_setup_token_sessions SET state = 'failed', failure_reason = 'storage_failed', failure_message = 'The Claude credential could not be stored.', updated_at = NOW() WHERE session_id = $1 AND company_id = $2")
             .bind(&session_id)
             .bind(company_id)
@@ -525,6 +545,7 @@ async fn store_claude_token(
     company_id: Uuid,
     owner_id: Uuid,
     token: &str,
+    expected: Option<(Uuid, i32)>,
 ) -> Result<(), ()> {
     let definitions = state.user_secret_definition_service
         .list_definitions(company_id)
@@ -547,11 +568,19 @@ async fn store_claude_token(
             .map_err(|_| ())?
             .id
     };
-    state.user_secret_service
-        .set_user_secret(owner_id, definition_id, token.to_string())
-        .await
-        .map(|_| ())
-        .map_err(|_| ())
+    if let Some((secret_id, expected_version)) = expected {
+        state.user_secret_service
+            .rotate_user_secret_if_version(secret_id, token.to_string(), expected_version)
+            .await
+            .map_err(|_| ())?
+            .ok_or(())?;
+    } else {
+        state.user_secret_service
+            .set_user_secret(owner_id, definition_id, token.to_string())
+            .await
+            .map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 async fn cancel(

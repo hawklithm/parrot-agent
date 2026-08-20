@@ -19,6 +19,11 @@ pub trait UserSecretRepository: Send + Sync {
     async fn list_user_secrets(&self, user_id: Uuid, company_id: Uuid) -> RepositoryResult<Vec<UserSecret>>;
     async fn get_secret(&self, secret_id: Uuid) -> RepositoryResult<Option<UserSecret>>;
     async fn update_secret(&self, secret: UserSecret) -> RepositoryResult<UserSecret>;
+    async fn update_secret_if_version(
+        &self,
+        secret: UserSecret,
+        expected_version: i32,
+    ) -> RepositoryResult<Option<UserSecret>>;
     async fn delete_secret(&self, secret_id: Uuid) -> RepositoryResult<()>;
     async fn get_secret_bindings(&self, secret_id: Uuid) -> RepositoryResult<Vec<SecretBinding>>;
 }
@@ -170,8 +175,8 @@ impl UserSecretRepository for PostgresUserSecretRepository {
             r#"INSERT INTO user_secret_declarations
                (id, company_id, user_secret_definition_id, target_type, target_id, config_path,
                 env_key, version_selector, required, allow_missing_override, value_material, value_sha256,
-                created_at, updated_at)
-               VALUES ($1, $2, $3, 'user', $4, 'env', $5, $6, $7, $8, $9, $10, $11, $12)"#
+                latest_version, created_at, updated_at)
+               VALUES ($1, $2, $3, 'user', $4, 'env', $5, $6, $7, $8, to_jsonb($9::text), $10, 1, $11, $12)"#
         )
         .bind(secret.id)
         .bind(secret.company_id)
@@ -193,7 +198,7 @@ impl UserSecretRepository for PostgresUserSecretRepository {
     async fn list_user_secrets(&self, user_id: Uuid, company_id: Uuid) -> RepositoryResult<Vec<UserSecret>> {
         let secrets = sqlx::query_as::<_, UserSecret>(
             r#"SELECT id, company_id, user_secret_definition_id, target_id::uuid AS user_id, env_key,
-                      value_material, value_sha256, version_selector, required, allow_missing_override,
+                      value_material #>> '{}' AS value_material, value_sha256, latest_version, version_selector, required, allow_missing_override,
                       created_at, updated_at
                FROM user_secret_declarations
                WHERE target_type = 'user' AND target_id = $1 AND company_id = $2
@@ -209,7 +214,7 @@ impl UserSecretRepository for PostgresUserSecretRepository {
     async fn get_secret(&self, secret_id: Uuid) -> RepositoryResult<Option<UserSecret>> {
         let secret = sqlx::query_as::<_, UserSecret>(
             r#"SELECT id, company_id, user_secret_definition_id, target_id::uuid AS user_id, env_key,
-                      value_material, value_sha256, version_selector, required, allow_missing_override,
+                      value_material #>> '{}' AS value_material, value_sha256, latest_version, version_selector, required, allow_missing_override,
                       created_at, updated_at
                FROM user_secret_declarations
                WHERE id = $1"#
@@ -223,8 +228,9 @@ impl UserSecretRepository for PostgresUserSecretRepository {
     async fn update_secret(&self, secret: UserSecret) -> RepositoryResult<UserSecret> {
         sqlx::query(
             r#"UPDATE user_secret_declarations
-               SET value_material = $2, value_sha256 = $3, env_key = $4,
-                   version_selector = $5, required = $6, allow_missing_override = $7, updated_at = $8
+               SET value_material = to_jsonb($2::text), value_sha256 = $3, env_key = $4,
+                   latest_version = latest_version + 1, version_selector = $5,
+                   required = $6, allow_missing_override = $7, updated_at = $8
                WHERE id = $1"#
         )
         .bind(secret.id)
@@ -237,7 +243,39 @@ impl UserSecretRepository for PostgresUserSecretRepository {
         .bind(Utc::now())
         .execute(&self.pool)
         .await?;
-        Ok(secret)
+        let mut updated = secret;
+        updated.latest_version += 1;
+        Ok(updated)
+    }
+
+    async fn update_secret_if_version(
+        &self,
+        secret: UserSecret,
+        expected_version: i32,
+    ) -> RepositoryResult<Option<UserSecret>> {
+        let updated = sqlx::query_as::<_, UserSecret>(
+            r#"UPDATE user_secret_declarations
+               SET value_material = to_jsonb($2::text), value_sha256 = $3, env_key = $4,
+                   latest_version = latest_version + 1, version_selector = $5,
+                   required = $6, allow_missing_override = $7, updated_at = $8
+               WHERE id = $1 AND latest_version = $9
+               RETURNING id, company_id, user_secret_definition_id,
+                         target_id::uuid AS user_id, env_key, value_material #>> '{}' AS value_material,
+                         value_sha256, latest_version, version_selector,
+                         required, allow_missing_override, created_at, updated_at"#,
+        )
+        .bind(secret.id)
+        .bind(&secret.value_material)
+        .bind(&secret.value_sha256)
+        .bind(&secret.env_key)
+        .bind(&secret.version_selector)
+        .bind(secret.required)
+        .bind(secret.allow_missing_override)
+        .bind(Utc::now())
+        .bind(expected_version)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(updated)
     }
 
     async fn delete_secret(&self, secret_id: Uuid) -> RepositoryResult<()> {

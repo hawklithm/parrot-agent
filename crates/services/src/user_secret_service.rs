@@ -50,6 +50,12 @@ pub trait UserSecretService: Send + Sync {
 
     /// Rotate the secret value. `new_value` is the **plaintext** new value.
     async fn rotate_user_secret(&self, secret_id: Uuid, new_value: String) -> ServiceResult<UserSecret>;
+    async fn rotate_user_secret_if_version(
+        &self,
+        secret_id: Uuid,
+        new_value: String,
+        expected_version: i32,
+    ) -> ServiceResult<Option<UserSecret>>;
     async fn delete_user_secret(&self, secret_id: Uuid) -> ServiceResult<()>;
     async fn get_secret_bindings(&self, secret_id: Uuid) -> ServiceResult<Vec<SecretBinding>>;
 }
@@ -244,6 +250,28 @@ impl UserSecretService for UserSecretServiceImpl {
 
         self.repository
             .update_secret(secret)
+            .await
+            .map_err(|e| ServiceError::Repository(e.to_string()))
+    }
+
+    async fn rotate_user_secret_if_version(
+        &self,
+        secret_id: Uuid,
+        new_value: String,
+        expected_version: i32,
+    ) -> ServiceResult<Option<UserSecret>> {
+        let mut secret = self
+            .repository
+            .get_secret(secret_id)
+            .await
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
+            .ok_or_else(|| ServiceError::NotFound(format!("Secret {} not found", secret_id)))?;
+        let rotated = self.encrypt_value(&new_value)?;
+        secret.value_material = Some(rotated.0);
+        secret.value_sha256 = Some(rotated.1);
+        secret.updated_at = chrono::Utc::now();
+        self.repository
+            .update_secret_if_version(secret, expected_version)
             .await
             .map_err(|e| ServiceError::Repository(e.to_string()))
     }

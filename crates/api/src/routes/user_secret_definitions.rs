@@ -424,6 +424,7 @@ mod tests {
             env_key: "TEST_KEY".to_string(),
             value_material: Some("encrypted".to_string()),
             value_sha256: Some("abc123".to_string()),
+            latest_version: 1,
             version_selector: "latest".to_string(),
             required: true,
             allow_missing_override: false,
