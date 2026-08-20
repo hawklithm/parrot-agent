@@ -12,6 +12,7 @@ use tokio::process::Command;
 use std::process::Stdio;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 // ============================================================================
 // 执行引擎核心接口
@@ -153,19 +154,25 @@ impl AdapterExecutor for LocalExecutor {
         let mut cmd = Command::new(command);
         cmd.args(&args);
 
-        // 设置工作目录
-        if let Some(dir) = &ctx.working_dir {
+        // Paperclip uses config.cwd for process adapters; retain the execution
+        // context as a fallback for callers that already resolved the directory.
+        if let Some(dir) = config.get("cwd").and_then(|v| v.as_str()).or(ctx.working_dir.as_deref()) {
             cmd.current_dir(dir);
         }
 
         // 设置环境变量
         if let Some(env) = config.get("env").and_then(|v| v.as_object()) {
             for (key, value) in env {
+                // Never allow adapter configuration to forge the run identity
+                // or the API credential namespace. These are runtime-owned in
+                // Paperclip and must not be inherited from user configuration.
+                if key == "PAPERCLIP_API_KEY" || key == "PAPERCLIP_RUN_ID" { continue; }
                 if let Some(val) = value.as_str() {
                     cmd.env(key, val);
                 }
             }
         }
+        cmd.env("PAPERCLIP_RUN_ID", &ctx.run_id);
 
         // 执行命令
         let timeout_seconds = config.get("timeoutSec")
@@ -173,44 +180,57 @@ impl AdapterExecutor for LocalExecutor {
             .or_else(|| config.get("timeout"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        let grace_seconds = config.get("graceSec")
+            .or_else(|| config.get("grace_sec"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(15);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some(format!("Failed to execute: {}", e)), metadata: serde_json::json!({"run_id": ctx.run_id}) },
         };
         if let Some(pid) = child.id() { self.running_processes.lock().await.insert(ctx.run_id.clone(), pid); }
         let run_id = ctx.run_id.clone();
-        let result = if timeout_seconds == 0 {
-            child.wait_with_output().await.map_err(|e| e.to_string())
+        let stdout_task = child.stdout.take().map(|reader| {
+            let sink = ctx.log_sink.clone();
+            tokio::spawn(read_process_stream(reader, sink, StdioKind::Stdout))
+        });
+        let stderr_task = child.stderr.take().map(|reader| {
+            let sink = ctx.log_sink.clone();
+            tokio::spawn(read_process_stream(reader, sink, StdioKind::Stderr))
+        });
+        let wait_result = if timeout_seconds == 0 {
+            child.wait().await.map_err(|e| e.to_string())
         } else {
-            match timeout(Duration::from_secs(timeout_seconds), child.wait_with_output()).await {
+            match timeout(Duration::from_secs(timeout_seconds), child.wait()).await {
                 Ok(result) => result.map_err(|e| e.to_string()),
                 Err(_) => {
-                    if let Some(pid) = self.running_processes.lock().await.get(&run_id).copied() { kill_process(pid).await; }
+                    if let Some(pid) = self.running_processes.lock().await.get(&run_id).copied() { terminate_process(pid, grace_seconds).await; }
+                    let _ = child.wait().await;
+                    let _ = join_stream(stdout_task).await;
+                    let _ = join_stream(stderr_task).await;
                     self.running_processes.lock().await.remove(&run_id);
                     return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some(format!("Timed out after {}s", timeout_seconds)), metadata: serde_json::json!({"run_id": run_id, "timed_out": true}) };
                 }
             }
         };
         self.running_processes.lock().await.remove(&run_id);
-        match result {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                if let Some(sink) = &ctx.log_sink {
-                    if !stdout.is_empty() { sink.on_log(StdioKind::Stdout, &stdout).await; }
-                    if !stderr.is_empty() { sink.on_log(StdioKind::Stderr, &stderr).await; }
-                }
+        let stdout = join_stream(stdout_task).await;
+        let stderr = join_stream(stderr_task).await;
+        match wait_result {
+            Ok(status) => {
+                let stdout = String::from_utf8_lossy(&stdout).to_string();
+                let stderr = String::from_utf8_lossy(&stderr).to_string();
 
-                let status = if output.status.success() {
+                let execution_status = if status.success() {
                     ExecutionStatus::Ok
                 } else {
                     ExecutionStatus::Error
                 };
 
                 AdapterExecutionResult {
-                    status,
-                    exit_code: output.status.code(),
+                    status: execution_status,
+                    exit_code: status.code(),
                     output: stdout,
                     error: if stderr.is_empty() { None } else { Some(stderr) },
                     metadata: serde_json::json!({
@@ -236,6 +256,37 @@ impl AdapterExecutor for LocalExecutor {
             kill_process(pid).await;
         }
     }
+}
+
+async fn read_process_stream<R: AsyncRead + Unpin>(mut reader: R, sink: Option<Arc<dyn LogSink>>, stream: StdioKind) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(size) => {
+                output.extend_from_slice(&chunk[..size]);
+                if let Some(sink) = &sink {
+                    sink.on_log(stream, &String::from_utf8_lossy(&chunk[..size])).await;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    output
+}
+
+async fn join_stream(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    match task { Some(task) => task.await.unwrap_or_default(), None => Vec::new() }
+}
+
+async fn terminate_process(pid: u32, grace_seconds: u64) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T"]).status().await;
+        if grace_seconds > 0 { tokio::time::sleep(Duration::from_secs(grace_seconds)).await; }
+    }
+    kill_process(pid).await;
 }
 
 async fn kill_process(pid: u32) {
@@ -343,7 +394,7 @@ mod tests {
     }
 
     fn context(run_id: &str, args: Vec<&str>, config_extra: serde_json::Value) -> AdapterExecutionContext {
-        let mut config = serde_json::json!({"command": "cmd", "args": args, "env": {"PARROT_PROCESS_TEST": "ok"}});
+        let mut config = serde_json::json!({"command": "cmd", "args": args, "env": {"PARROT_PROCESS_TEST": "ok", "PAPERCLIP_RUN_ID": "forged"}});
         if let (Some(base), Some(extra)) = (config.as_object_mut(), config_extra.as_object()) {
             for (key, value) in extra { base.insert(key.clone(), value.clone()); }
         }
@@ -360,11 +411,13 @@ mod tests {
     #[tokio::test]
     async fn process_captures_env_stdout_stderr_and_exit_code() {
         let executor = LocalExecutor::new();
-        let ctx = context("process-output", vec!["/C", "echo %PARROT_PROCESS_TEST% & echo stderr 1>&2 & exit /B 7"], serde_json::json!({}));
+        let ctx = context("process-output", vec!["/C", "echo %PARROT_PROCESS_TEST% & echo %PAPERCLIP_RUN_ID% & echo stderr 1>&2 & exit /B 7"], serde_json::json!({}));
         let result = executor.execute(ctx).await;
         assert_eq!(result.status, ExecutionStatus::Error);
         assert_eq!(result.exit_code, Some(7));
         assert!(result.output.contains("ok"));
+        assert!(result.output.contains("process-output"));
+        assert!(!result.output.contains("forged"));
         assert!(result.error.as_deref().unwrap_or_default().contains("stderr"));
     }
 
