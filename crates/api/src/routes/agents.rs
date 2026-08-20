@@ -1103,10 +1103,56 @@ fn extract_agent_key(headers: &HeaderMap) -> Result<String, AppError> {
 
 /// A15: POST /agents/:id/interrupt
 async fn interrupt_agent(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
-    Ok(StatusCode::OK)
+) -> Result<Json<serde_json::Value>, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentUpdate { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agent:update permission".to_string(),
+        ));
+    }
+
+    let runs: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT id, (context_snapshot->>'issueId')::uuid
+         FROM heartbeat_runs
+         WHERE company_id = $1
+           AND agent_id = $2
+           AND status IN ('queued','running','scheduled_retry')
+           AND (context_snapshot->>'issueId') IS NOT NULL
+         ORDER BY created_at ASC",
+    )
+    .bind(agent.company_id)
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+
+    let mut interrupted = Vec::new();
+    for (run_id, issue_id) in runs {
+        state
+            .heartbeat_service
+            .cancel_run(id, issue_id, agent.company_id, "Interrupted by operator")
+            .await
+            .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+        interrupted.push(run_id);
+    }
+    if !interrupted.is_empty() && agent.status == AgentStatus::Running {
+        let _ = state.agent_service.set_status(id, AgentStatus::Idle).await?;
+    }
+    Ok(Json(json!({
+        "agentId": id,
+        "interruptedRunIds": interrupted,
+        "interruptedCount": interrupted.len(),
+    })))
 }
 
 /// A16: POST /agents/:id/reset-credentials
