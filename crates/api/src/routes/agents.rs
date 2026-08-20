@@ -1173,23 +1173,91 @@ async fn get_agent_credentials(
 
 /// A18: GET /agents/:id/metrics
 async fn get_agent_metrics(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({
+) -> Result<Json<serde_json::Value>, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentRead { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden("Insufficient permissions: Missing agent:read permission".into()));
+    }
+    let row = sqlx::query(
+        "SELECT COUNT(*)::bigint AS total_runs,
+                COUNT(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded_runs,
+                COUNT(*) FILTER (WHERE status IN ('queued','running','scheduled_retry'))::bigint AS active_runs,
+                COALESCE(AVG(EXTRACT(EPOCH FROM (finished_at - started_at)) * 1000)
+                    FILTER (WHERE started_at IS NOT NULL AND finished_at IS NOT NULL), 0)::double precision AS avg_response_time_ms
+         FROM heartbeat_runs
+         WHERE company_id = $1 AND agent_id = $2",
+    )
+    .bind(agent.company_id)
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+    use sqlx::Row;
+    let total_runs: i64 = row.get("total_runs");
+    let succeeded_runs: i64 = row.get("succeeded_runs");
+    Ok(Json(json!({
         "agentId": id,
-        "totalRuns": 0,
-        "successRate": 0.0,
-        "avgResponseTime": 0
+        "totalRuns": total_runs,
+        "succeededRuns": succeeded_runs,
+        "activeRuns": row.get::<i64, _>("active_runs"),
+        "successRate": if total_runs == 0 { 0.0 } else { succeeded_runs as f64 / total_runs as f64 },
+        "avgResponseTime": row.get::<f64, _>("avg_response_time_ms"),
     })))
 }
 
 /// A19: GET /agents/:id/activity
 async fn get_agent_activity(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentRead { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden("Insufficient permissions: Missing agent:read permission".into()));
+    }
+    let rows = sqlx::query(
+        "SELECT id, event_type, actor_type, actor_id, resource_type, resource_id,
+                metadata, run_id, created_at
+         FROM activity_logs
+         WHERE company_id = $1
+           AND (agent_id = $2 OR (resource_type = 'agent' AND resource_id = $2))
+         ORDER BY created_at DESC
+         LIMIT 100",
+    )
+    .bind(agent.company_id)
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+    use sqlx::Row;
+    Ok(Json(rows.into_iter().map(|row| json!({
+        "id": row.get::<Uuid, _>("id"),
+        "eventType": row.get::<String, _>("event_type"),
+        "actorType": row.get::<String, _>("actor_type"),
+        "actorId": row.get::<Uuid, _>("actor_id"),
+        "resourceType": row.get::<String, _>("resource_type"),
+        "resourceId": row.get::<Uuid, _>("resource_id"),
+        "metadata": row.get::<serde_json::Value, _>("metadata"),
+        "runId": row.get::<Option<Uuid>, _>("run_id"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+    })).collect()))
 }
 
 /// A20: POST /agents/:id/permissions
