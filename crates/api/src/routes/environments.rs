@@ -65,11 +65,14 @@ pub fn environment_routes() -> Router<AppState> {
 
 async fn list_environments_v2(
     State(state): State<AppState>,
-    Path(_company_id): Path<Uuid>,
+    Path(company_id): Path<Uuid>,
 ) -> impl IntoResponse {
     match state
         .environment_service
-        .list_by_status(models::execution_environment::EnvironmentStatus::Active)
+        .list_by_company(
+            company_id,
+            Some(models::execution_environment::EnvironmentStatus::Active),
+        )
         .await
     {
         Ok(environments) => (StatusCode::OK, Json(environments)).into_response(),

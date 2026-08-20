@@ -36,6 +36,13 @@ pub trait EnvironmentService: Send + Sync {
     /// List environments by status
     async fn list_by_status(&self, status: EnvironmentStatus) -> Result<Vec<Environment>, ServiceError>;
 
+    /// List environments within a company boundary.
+    async fn list_by_company(
+        &self,
+        company_id: Uuid,
+        status: Option<EnvironmentStatus>,
+    ) -> Result<Vec<Environment>, ServiceError>;
+
     /// List all environments
     async fn list_all(&self) -> Result<Vec<Environment>, ServiceError>;
 
@@ -132,6 +139,17 @@ impl EnvironmentService for DefaultEnvironmentService {
             .list_by_status(status)
             .await
             .map_err(|e| ServiceError::Internal(format!("Failed to list environments by status: {}", e)))
+    }
+
+    async fn list_by_company(
+        &self,
+        company_id: Uuid,
+        status: Option<EnvironmentStatus>,
+    ) -> Result<Vec<Environment>, ServiceError> {
+        self.environment_repo
+            .list_by_company(company_id, status)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list company environments: {}", e)))
     }
 
     async fn list_all(&self) -> Result<Vec<Environment>, ServiceError> {

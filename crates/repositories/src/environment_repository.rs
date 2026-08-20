@@ -22,6 +22,11 @@ pub trait EnvironmentRepository: Send + Sync {
 
     /// List environments by status
     async fn list_by_status(&self, status: EnvironmentStatus) -> Result<Vec<ExecutionEnvironment>, RepositoryError>;
+    async fn list_by_company(
+        &self,
+        company_id: Uuid,
+        status: Option<EnvironmentStatus>,
+    ) -> Result<Vec<ExecutionEnvironment>, RepositoryError>;
 
     /// List all environments
     async fn list_all(&self) -> Result<Vec<ExecutionEnvironment>, RepositoryError>;
@@ -118,6 +123,30 @@ impl EnvironmentRepository for PgEnvironmentRepository {
         .fetch_all(&self.pool)
         .await?;
 
+        Ok(environments)
+    }
+
+    async fn list_by_company(
+        &self,
+        company_id: Uuid,
+        status: Option<EnvironmentStatus>,
+    ) -> Result<Vec<ExecutionEnvironment>, RepositoryError> {
+        let environments = if let Some(status) = status {
+            sqlx::query_as::<_, ExecutionEnvironment>(
+                "SELECT id, company_id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at FROM environments WHERE company_id = $1 AND status = $2 ORDER BY created_at DESC",
+            )
+            .bind(company_id)
+            .bind(status)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ExecutionEnvironment>(
+                "SELECT id, company_id, name, description, driver, status, config, env_vars, metadata, created_at, updated_at FROM environments WHERE company_id = $1 ORDER BY created_at DESC",
+            )
+            .bind(company_id)
+            .fetch_all(&self.pool)
+            .await?
+        };
         Ok(environments)
     }
 
