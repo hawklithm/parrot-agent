@@ -1165,10 +1165,34 @@ async fn reset_agent_credentials(
 
 /// A17: GET /agents/:id/credentials
 async fn get_agent_credentials(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"agentId": id, "credentials": []})))
+) -> Result<Json<serde_json::Value>, AppError> {
+    let agent = state.agent_service.get_by_id(id).await?;
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        &auth_actor,
+        &AuthorizationAction::AgentRead { agent_id: id },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden("Insufficient permissions: Missing agent:read permission".into()));
+    }
+    let keys = state.agent_service.list_keys(id).await?;
+    Ok(Json(json!({
+        "agentId": id,
+        "credentials": keys.into_iter().map(|key| json!({
+            "id": key.id,
+            "name": key.name,
+            "scope": key.scope,
+            "lastUsedAt": key.last_used_at,
+            "revokedAt": key.revoked_at,
+            "createdAt": key.created_at,
+            "active": key.is_active(),
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 /// A18: GET /agents/:id/metrics
