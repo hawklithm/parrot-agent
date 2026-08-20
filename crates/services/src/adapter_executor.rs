@@ -6,9 +6,12 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 use std::sync::Arc;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
+use std::process::Stdio;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 // ============================================================================
 // 执行引擎核心接口
@@ -40,13 +43,14 @@ pub enum ExecutionTargetType {
 }
 
 /// Adapter 执行上下文
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdapterExecutionContext {
     pub run_id: String,
     pub agent_id: String,
     pub config: serde_json::Value,
     pub working_dir: Option<String>,
     pub execution_target: ExecutionTargetConfig,
+    pub log_sink: Option<Arc<dyn LogSink>>,
 }
 
 /// Adapter 执行结果
@@ -124,18 +128,13 @@ pub trait SpawnNotifier: Send + Sync {
 
 /// 本地执行器
 pub struct LocalExecutor {
-    running_processes: Arc<Mutex<Vec<RunningProcess>>>,
-}
-
-struct RunningProcess {
-    run_id: String,
-    child: Option<Child>,
+    running_processes: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl LocalExecutor {
     pub fn new() -> Self {
         Self {
-            running_processes: Arc::new(Mutex::new(Vec::new())),
+            running_processes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -169,10 +168,39 @@ impl AdapterExecutor for LocalExecutor {
         }
 
         // 执行命令
-        match cmd.output().await {
+        let timeout_seconds = config.get("timeoutSec")
+            .or_else(|| config.get("timeout_sec"))
+            .or_else(|| config.get("timeout"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some(format!("Failed to execute: {}", e)), metadata: serde_json::json!({"run_id": ctx.run_id}) },
+        };
+        if let Some(pid) = child.id() { self.running_processes.lock().await.insert(ctx.run_id.clone(), pid); }
+        let run_id = ctx.run_id.clone();
+        let result = if timeout_seconds == 0 {
+            child.wait_with_output().await.map_err(|e| e.to_string())
+        } else {
+            match timeout(Duration::from_secs(timeout_seconds), child.wait_with_output()).await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => {
+                    if let Some(pid) = self.running_processes.lock().await.get(&run_id).copied() { kill_process(pid).await; }
+                    self.running_processes.lock().await.remove(&run_id);
+                    return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some(format!("Timed out after {}s", timeout_seconds)), metadata: serde_json::json!({"run_id": run_id, "timed_out": true}) };
+                }
+            }
+        };
+        self.running_processes.lock().await.remove(&run_id);
+        match result {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                if let Some(sink) = &ctx.log_sink {
+                    if !stdout.is_empty() { sink.on_log(StdioKind::Stdout, &stdout).await; }
+                    if !stderr.is_empty() { sink.on_log(StdioKind::Stderr, &stderr).await; }
+                }
 
                 let status = if output.status.success() {
                     ExecutionStatus::Ok
@@ -204,14 +232,17 @@ impl AdapterExecutor for LocalExecutor {
     }
 
     async fn cancel(&self, run_id: &str) {
-        let mut processes = self.running_processes.lock().await;
-        if let Some(pos) = processes.iter().position(|p| p.run_id == run_id) {
-            if let Some(mut child) = processes[pos].child.take() {
-                let _ = child.start_kill();
-            }
-            processes.remove(pos);
+        if let Some(pid) = self.running_processes.lock().await.remove(run_id) {
+            kill_process(pid).await;
         }
     }
+}
+
+async fn kill_process(pid: u32) {
+    #[cfg(windows)]
+    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).status().await;
+    #[cfg(not(windows))]
+    let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status().await;
 }
 
 // ============================================================================
@@ -293,5 +324,71 @@ impl AdapterExecutor for RemoteExecutor {
         let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).status().await;
         #[cfg(not(windows))]
         let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status().await;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct TestSink(AtomicUsize);
+
+    #[async_trait]
+    impl LogSink for TestSink {
+        async fn on_log(&self, _stream: StdioKind, _chunk: &str) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn context(run_id: &str, args: Vec<&str>, config_extra: serde_json::Value) -> AdapterExecutionContext {
+        let mut config = serde_json::json!({"command": "cmd", "args": args, "env": {"PARROT_PROCESS_TEST": "ok"}});
+        if let (Some(base), Some(extra)) = (config.as_object_mut(), config_extra.as_object()) {
+            for (key, value) in extra { base.insert(key.clone(), value.clone()); }
+        }
+        AdapterExecutionContext {
+            run_id: run_id.to_string(),
+            agent_id: "test-agent".to_string(),
+            config,
+            working_dir: None,
+            execution_target: ExecutionTargetConfig { target_type: ExecutionTargetType::Local, connection_info: None, asset_sync_config: None },
+            log_sink: Some(Arc::new(TestSink(AtomicUsize::new(0)))),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_captures_env_stdout_stderr_and_exit_code() {
+        let executor = LocalExecutor::new();
+        let ctx = context("process-output", vec!["/C", "echo %PARROT_PROCESS_TEST% & echo stderr 1>&2 & exit /B 7"], serde_json::json!({}));
+        let result = executor.execute(ctx).await;
+        assert_eq!(result.status, ExecutionStatus::Error);
+        assert_eq!(result.exit_code, Some(7));
+        assert!(result.output.contains("ok"));
+        assert!(result.error.as_deref().unwrap_or_default().contains("stderr"));
+    }
+
+    #[tokio::test]
+    async fn process_timeout_returns_timed_out_result() {
+        let executor = LocalExecutor::new();
+        let ctx = context("process-timeout", vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 5"], serde_json::json!({"command": "powershell", "timeoutSec": 1}));
+        let result = executor.execute(ctx).await;
+        assert_eq!(result.status, ExecutionStatus::Error);
+        assert!(result.error.as_deref().unwrap_or_default().contains("Timed out"));
+        assert_eq!(result.metadata.get("timed_out"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    #[tokio::test]
+    async fn process_cancel_terminates_registered_child() {
+        let executor = Arc::new(LocalExecutor::new());
+        let task_executor = executor.clone();
+        let task = tokio::spawn(async move {
+            task_executor.execute(context("process-cancel", vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 30"], serde_json::json!({"command": "powershell"}))).await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        executor.cancel("process-cancel").await;
+        let result = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert_eq!(result.status, ExecutionStatus::Error);
+        assert!(result.exit_code.is_some() || result.error.is_some());
     }
 }
