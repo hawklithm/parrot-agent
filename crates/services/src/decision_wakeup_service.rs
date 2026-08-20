@@ -1,10 +1,14 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
+
+use crate::heartbeat_service::HeartbeatService;
 
 /// 决策唤醒输入
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionWakeupInput {
+    pub company_id: Uuid,
     pub agent_id: Uuid,
     pub issue_id: Uuid,
     pub decision_id: Uuid,
@@ -14,6 +18,7 @@ pub struct DecisionWakeupInput {
 /// 归档通知批次（用于retention服务）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveNotificationBatch {
+    pub company_id: Uuid,
     pub agent_id: Uuid,
     pub items: Vec<ArchiveNotificationItem>,
 }
@@ -80,7 +85,7 @@ pub enum WakeupError {
 /// 这确保即使在heartbeat调度器禁用时，决策系统仍可正常工作。
 pub struct DefaultDecisionWakeupService {
     heartbeat_enabled: bool,
-    // TODO: 添加 heartbeat_service 依赖
+    heartbeat_service: Option<Arc<dyn HeartbeatService>>,
 }
 
 impl DefaultDecisionWakeupService {
@@ -90,7 +95,13 @@ impl DefaultDecisionWakeupService {
     pub fn new(heartbeat_enabled: bool) -> Self {
         Self {
             heartbeat_enabled,
+            heartbeat_service: None,
         }
+    }
+
+    pub fn with_heartbeat_service(mut self, heartbeat_service: Arc<dyn HeartbeatService>) -> Self {
+        self.heartbeat_service = Some(heartbeat_service);
+        self
     }
 
     /// 检查heartbeat runtime是否可用
@@ -153,7 +164,15 @@ impl DecisionWakeupService for DefaultDecisionWakeupService {
             return Ok(());
         }
 
-        // TODO: 调用heartbeat service的wakeup方法
+        let heartbeat = self
+            .heartbeat_service
+            .as_ref()
+            .ok_or(WakeupError::HeartbeatUnavailable)?;
+        heartbeat
+            .wakeup(input.agent_id, input.issue_id, input.company_id)
+            .await
+            .map_err(|error| WakeupError::WakeupFailed(error.to_string()))?;
+        /*
         // let options = HeartbeatWakeupOptions {
         //     source: "automation".to_string(),
         //     triggdetail: "system".to_string(),
@@ -171,7 +190,8 @@ impl DecisionWakeupService for DefaultDecisionWakeupService {
             decision_id = %input.decision_id,
             outcome = %input.outcome,
             "Would wake origin agent for decision completion"
-        );Ok(())
+        );*/
+        Ok(())
     }
 
     async fn notify_origin_agent_for_archives(
@@ -183,7 +203,22 @@ impl DecisionWakeupService for DefaultDecisionWakeupService {
             return Ok(());
         }
 
-        // TODO: 调用heartbeat service的wakeup方法
+        let heartbeat = self
+            .heartbeat_service
+            .as_ref()
+            .ok_or(WakeupError::HeartbeatUnavailable)?;
+        let issue_ids = batch
+            .items
+            .iter()
+            .map(|item| item.issue_id)
+            .collect::<std::collections::HashSet<_>>();
+        for issue_id in issue_ids {
+            heartbeat
+                .wakeup(batch.agent_id, issue_id, batch.company_id)
+                .await
+                .map_err(|error| WakeupError::NotificationFailed(error.to_string()))?;
+        }
+        /*
         // let options = HeartbeatWakeupOptions {
         //     source: "automation".to_string(),
         //     trigger_detail: "system".to_string(),
@@ -200,8 +235,7 @@ impl DecisionWakeupService for DefaultDecisionWakeupService {
             agent_id = %batch.agent_id,
             item_count = batch.items.len(),
             "Would notify origin agent for archived attention items"
-        );
-
+        );*/
         Ok(())
     }
 }
@@ -246,11 +280,78 @@ pub fn create_decision_retention_notify_origin_agent_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heartbeat_service::{HeartbeatContext, HeartbeatError};
+    use std::sync::Mutex;
+
+    struct RecordingHeartbeat {
+        wakes: Mutex<Vec<(Uuid, Uuid, Uuid)>>,
+    }
+
+    #[async_trait]
+    impl HeartbeatService for RecordingHeartbeat {
+        async fn wakeup(
+            &self,
+            agent_id: Uuid,
+            issue_id: Uuid,
+            company_id: Uuid,
+        ) -> Result<(), HeartbeatError> {
+            self.wakes.lock().unwrap().push((agent_id, issue_id, company_id));
+            Ok(())
+        }
+
+        async fn cancel_run(
+            &self,
+            _agent_id: Uuid,
+            _issue_id: Uuid,
+            _company_id: Uuid,
+            _reason: &str,
+        ) -> Result<(), HeartbeatError> {
+            Ok(())
+        }
+
+        async fn get_heartbeat_context(
+            &self,
+            issue_id: Uuid,
+            company_id: Uuid,
+        ) -> Result<HeartbeatContext, HeartbeatError> {
+            Ok(HeartbeatContext {
+                issue_id,
+                company_id,
+                active_agents: Vec::new(),
+                last_wakeup_at: None,
+                wakeup_count: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_service_delivers_decision_wakeup_to_runtime() {
+        let heartbeat = Arc::new(RecordingHeartbeat { wakes: Mutex::new(Vec::new()) });
+        let company_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        let service = DefaultDecisionWakeupService::new(true)
+            .with_heartbeat_service(heartbeat.clone());
+
+        service
+            .wake_origin_agent_for_decision(DecisionWakeupInput {
+                company_id,
+                agent_id,
+                issue_id,
+                decision_id: Uuid::new_v4(),
+                outcome: "approved".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(heartbeat.wakes.lock().unwrap().as_slice(), &[(agent_id, issue_id, company_id)]);
+    }
 
     #[tokio::test]
     async fn test_wake_origin_agent_disabled() {
         let service = DefaultDecisionWakeupService::new(false);
         let input = DecisionWakeupInput {
+            company_id: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             issue_id: Uuid::new_v4(),
             decision_id: Uuid::new_v4(),
@@ -265,6 +366,7 @@ mod tests {
     async fn test_notify_origin_agent_disabled() {
         let service = DefaultDecisionWakeupService::new(false);
         let batch = ArchiveNotificationBatch {
+            company_id: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             items: vec![ArchiveNotificationItem {
                 source_kind: "issue".to_string(),
@@ -281,6 +383,7 @@ mod tests {
     #[test]
     fn test_build_decision_wakeup_payload() {
         let input = DecisionWakeupInput {
+            company_id: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             issue_id: Uuid::new_v4(),
             decision_id: Uuid::new_v4(),
@@ -297,6 +400,7 @@ mod tests {
     fn test_build_archive_notification_payload() {
         let issue_id = Uuid::new_v4();
         let batch = ArchiveNotificationBatch {
+            company_id: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             items: vec![
                 ArchiveNotificationItem {
