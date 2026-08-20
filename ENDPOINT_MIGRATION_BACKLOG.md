@@ -2,7 +2,7 @@
 
 自动生成：`scripts/gen_endpoint_backlog.py`。按用户决策：**by-design-candidate + missing 全部迁移**。
 
-- 待迁移端点: **8**（by-design-candidate: 0，missing: 8）
+- 待迁移端点: **7**（by-design-candidate: 0，missing: 7）
 - 实现每个端点时同步：handler + service + schema（如需）+ 权限 + activity log 事件（见 audit event 列）。
 
 | # | Method | Path | Paperclip source | 状态 | 域 | 建议 audit event |
@@ -14,4 +14,3 @@
 | 5 | POST | `/api/companies/:param/setup-token-login-sessions/:param/cancel` | `routes/agents.ts:4812` | missing | companies | `company.created` |
 | 6 | POST | `/api/companies/:param/setup-token-login-sessions/:param/code` | `routes/agents.ts:4754` | missing | companies | `company.created` |
 | 7 | POST | `/api/companies/:param/setup-token-login-sessions/:param/completion` | `routes/agents.ts:4790` | missing | companies | `company.created` |
-| 8 | POST | `/api/issues/:param/file-resources/availability` | `routes/file-resources.ts:453` | missing | issues | `issue.created` |

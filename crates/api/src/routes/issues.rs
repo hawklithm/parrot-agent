@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use crate::app_state::AppState;
 use crate::extractors::IssueId;
 use uuid::Uuid;
@@ -2120,6 +2120,148 @@ async fn refresh_external_objects(
 }
 
 /// I21: GET /issues/:id/file-resources/list
+/// POST /issues/:id/file-resources/availability
+async fn check_file_resource_availability(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(issue_id): IssueId,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let queries = payload
+        .get("queries")
+        .and_then(Value::as_array)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    if queries.len() > 100 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let project_id: Option<Uuid> = sqlx::query_scalar("SELECT project_id FROM issues WHERE id = $1 AND company_id = $2")
+        .bind(issue_id)
+        .bind(company_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut results = Vec::with_capacity(queries.len());
+    for query in queries {
+        let path = query.get("path").and_then(Value::as_str).unwrap_or("");
+        let workspace = query.get("workspace").and_then(Value::as_str).unwrap_or("auto");
+        let project_filter = query.get("projectId").and_then(Value::as_str).and_then(|v| Uuid::parse_str(v).ok());
+        let workspace_filter = query.get("workspaceId").and_then(Value::as_str).and_then(|v| Uuid::parse_str(v).ok());
+        let normalized_query = json!({
+            "projectId": project_filter,
+            "workspaceId": workspace_filter,
+            "path": path,
+            "workspace": workspace,
+        });
+
+        let invalid_path = path.is_empty()
+            || path.starts_with('/')
+            || path.starts_with('\\')
+            || path.split(['/', '\\']).any(|part| part == ".." || part.contains('\0') || part.chars().any(|c| c.is_control()));
+        if invalid_path || !matches!(workspace, "auto" | "execution" | "project") {
+            results.push(json!({
+                "query": normalized_query,
+                "openable": false,
+                "unavailableReason": "invalid_path",
+                "resource": null,
+            }));
+            continue;
+        }
+
+        let row = if workspace == "project" {
+            None
+        } else {
+            sqlx::query(
+            "SELECT 'execution_workspace' AS workspace_kind, ew.id, ew.project_id, ew.cwd, ew.name, ew.provider_type, p.name AS project_name
+             FROM execution_workspaces ew
+             JOIN projects p ON p.id = ew.project_id
+             WHERE ew.company_id = $1
+               AND ($2::uuid IS NULL OR ew.project_id = $2)
+               AND ($3::uuid IS NULL OR ew.id = $3)
+               AND $4 <> 'project'
+               AND ew.status NOT IN ('closed', 'cleaned')
+             UNION ALL
+             SELECT 'project_workspace' AS workspace_kind, pw.id, pw.project_id, pw.config->>'cwd', pw.name, 'local_fs', p.name AS project_name
+             FROM project_workspaces pw
+             JOIN projects p ON p.id = pw.project_id
+             WHERE p.company_id = $1
+               AND ($2::uuid IS NULL OR pw.project_id = $2)
+               AND ($3::uuid IS NULL OR pw.id = $3)
+               AND $4 <> 'execution'
+             ORDER BY id
+             LIMIT 20",
+        )
+        .bind(company_id)
+        .bind(project_filter.or(project_id))
+        .bind(workspace_filter)
+        .bind(workspace)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .next()
+        };
+
+        let Some(row) = row else {
+            results.push(json!({
+                "query": normalized_query,
+                "openable": false,
+                "unavailableReason": "no_workspace",
+                "resource": null,
+            }));
+            continue;
+        };
+
+        let workspace_id: Uuid = row.get("id");
+        let root: Option<String> = row.try_get("cwd").ok().flatten();
+        let Some(root) = root else {
+            results.push(json!({ "query": normalized_query, "openable": false, "unavailableReason": "no_workspace", "resource": null }));
+            continue;
+        };
+        let root_path = tokio::fs::canonicalize(&root).await.ok();
+        let Some(root_path) = root_path else {
+            results.push(json!({ "query": normalized_query, "openable": false, "unavailableReason": "workspace_unavailable", "resource": null }));
+            continue;
+        };
+        let candidate = root_path.join(path);
+        let canonical = tokio::fs::canonicalize(&candidate).await.ok();
+        let Some(canonical) = canonical else {
+            results.push(json!({ "query": normalized_query, "openable": false, "unavailableReason": "not_found", "resource": null }));
+            continue;
+        };
+        if !canonical.starts_with(&root_path) || canonical.components().any(|part| part.as_os_str() == ".git" || part.as_os_str() == ".env") {
+            results.push(json!({ "query": normalized_query, "openable": false, "unavailableReason": "permission_denied", "resource": null }));
+            continue;
+        }
+        let metadata = tokio::fs::metadata(&canonical).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let is_dir = metadata.is_dir();
+        let extension = canonical.extension().and_then(|v| v.to_str()).unwrap_or("");
+        let preview_kind = if is_dir { "unsupported" } else if ["png", "jpg", "jpeg", "gif", "webp"].contains(&extension) { "image" } else { "text" };
+        let project_name: String = row.get("project_name");
+        let resource = json!({
+            "kind": if is_dir { "directory" } else { "file" },
+            "provider": row.get::<String, _>("provider_type"),
+            "title": canonical.file_name().and_then(|v| v.to_str()).unwrap_or(path),
+            "displayPath": path,
+            "workspaceLabel": row.get::<String, _>("name"),
+            "workspaceKind": row.get::<String, _>("workspace_kind"),
+            "workspaceId": workspace_id,
+            "projectId": row.get::<Uuid, _>("project_id"),
+            "projectName": project_name,
+            "contentType": if is_dir { Value::Null } else { json!("application/octet-stream") },
+            "byteSize": if is_dir { Value::Null } else { json!(metadata.len()) },
+            "previewKind": preview_kind,
+            "denialReason": null,
+            "capabilities": { "preview": !is_dir, "download": !is_dir, "listChildren": is_dir },
+        });
+        results.push(json!({ "query": normalized_query, "openable": true, "resource": resource }));
+    }
+
+    Ok(Json(json!({ "kind": "workspace_file_availability", "results": results })))
+}
+
 async fn list_file_resources(
     State(_state): State<AppState>,
     Path(_id): Path<Uuid>,
@@ -2233,6 +2375,7 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/documents/:key/lock", post(lock_issue_document))
         .route("/issues/:id/documents/:key/unlock", post(unlock_issue_document))
         .route("/issues/:id/file-resources/list", get(list_file_resources))
+        .route("/issues/:id/file-resources/availability", post(check_file_resource_availability))
         .route("/issues/:id/file-resources/resolve", get(resolve_file_resource))
         .route("/issues/:id/file-resources/content", get(get_file_resource_content))
         .route("/issues/:id/feedback-votes", get(list_feedback_votes).post(create_feedback_vote))

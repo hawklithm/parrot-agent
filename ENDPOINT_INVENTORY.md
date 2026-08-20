@@ -9,11 +9,11 @@
 - **Limitation**：状态为结构性判定；`partial` 语义、`by-design-candidate` 最终清单需人工复核。
 
 - Paperclip endpoints: **606**
-- Parrot endpoints: **791**
-- implemented: **597**
+- Parrot endpoints: **792**
+- implemented: **598**
 - partial: **0**
 - by-design-candidate: **0**
-- missing: **9**
+- missing: **8**
 - Parrot-only (extension): **194**
 
 ## 1. Implemented
@@ -546,6 +546,7 @@
 | `POST /api/issues/:param/documents/:param/unlock` | `routes/issues.ts:7284` |
 | `POST /api/issues/:param/external-objects/refresh` | `routes/issues.ts:6848` |
 | `POST /api/issues/:param/feedback-votes` | `routes/issues.ts:12362` |
+| `POST /api/issues/:param/file-resources/availability` | `routes/file-resources.ts:453` |
 | `POST /api/issues/:param/inbox-archive` | `routes/issues.ts:7929` |
 | `POST /api/issues/:param/interactions` | `routes/issues.ts:10779` |
 | `POST /api/issues/:param/low-trust/promotions` | `routes/issues.ts:7587` |
@@ -640,7 +641,6 @@
 | `POST /api/companies/:param/setup-token-login-sessions/:param/cancel` | `routes/agents.ts:4812` |  |
 | `POST /api/companies/:param/setup-token-login-sessions/:param/code` | `routes/agents.ts:4754` |  |
 | `POST /api/companies/:param/setup-token-login-sessions/:param/completion` | `routes/agents.ts:4790` |  |
-| `POST /api/issues/:param/file-resources/availability` | `routes/file-resources.ts:453` |  |
 
 ## 5. Parrot-only（Parrot 扩展端点）
 
