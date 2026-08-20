@@ -805,12 +805,63 @@ impl DefaultBudgetService {
             }
         };
 
-        let total = self.cost_repo.window_spend(policy.company_id, start, end).await
-            .map_err(|e| ServiceError::Repository(e.to_string()))?;
+        let total = match policy.scope_type {
+            BudgetScopeType::Company => {
+                if policy.scope_id != policy.company_id {
+                    0
+                } else {
+                    self.cost_repo
+                        .window_spend(policy.company_id, start, end)
+                        .await
+                        .map_err(|e| ServiceError::Repository(e.to_string()))?
+                }
+            }
+            BudgetScopeType::Agent => sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT COALESCE(SUM(cost_cents), 0)::bigint
+                 FROM cost_events
+                 WHERE company_id = $1 AND agent_id = $2
+                   AND occurred_at >= $3 AND occurred_at < $4",
+            )
+            .bind(policy.company_id)
+            .bind(policy.scope_id)
+            .bind(start)
+            .bind(end)
+            .fetch_one(&self.company_repo.pool)
+            .await
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
+            .unwrap_or(0),
+            BudgetScopeType::Project => sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT COALESCE(SUM(ce.cost_cents), 0)::bigint
+                 FROM cost_events ce
+                 WHERE ce.company_id = $1
+                   AND ce.occurred_at >= $2 AND ce.occurred_at < $3
+                   AND (
+                     ce.project_id = $4
+                     OR (
+                       ce.project_id IS NULL
+                       AND EXISTS (
+                         SELECT 1
+                         FROM activity_logs al
+                         JOIN issues i ON i.id = al.resource_id
+                         WHERE al.company_id = ce.company_id
+                           AND al.run_id = ce.heartbeat_run_id
+                           AND al.resource_type = 'issue'
+                           AND i.company_id = ce.company_id
+                           AND i.project_id = $4
+                       )
+                     )
+                   )",
+            )
+            .bind(policy.company_id)
+            .bind(start)
+            .bind(end)
+            .bind(policy.scope_id)
+            .fetch_one(&self.company_repo.pool)
+            .await
+            .map_err(|e| ServiceError::Repository(e.to_string()))?
+            .unwrap_or(0),
+        };
 
-        // If policy has a specific scope, we need more granular filtering
-        // For now, return total company spend as approximation
-        // TODO: Implement scope-aware aggregation when needed
         Ok(total)
     }
 
