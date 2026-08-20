@@ -236,6 +236,11 @@ pub use built_in_agent_service_impl::{
     BuiltInAgentError, BuiltInAgentResult, BuiltInAgentService, DefaultBuiltInAgentService,
     ProvisionInput, ReconcileResult,
 };
+pub use cross_issue_influence_limit_service::{
+    CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
+    DefaultCrossIssueInfluenceLimitService, InfluenceLimitError,
+    ObserveCrossIssueInfluenceInput,
+};
 pub use case_service::CaseService;
 pub use case_service::MockCaseService;
 pub use config_revision_service::{

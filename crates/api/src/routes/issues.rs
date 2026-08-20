@@ -14,7 +14,8 @@ use sqlx::Row;
 
 use models::{CreateIssueInput, Issue, IssuePriority, IssueStatus, UpdateIssueInput};
 use services::{
-    CheckoutInput, IssueQueryFilter, Pagination, ReleaseInput,
+    CheckoutInput, CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
+    DefaultCrossIssueInfluenceLimitService, IssueQueryFilter, Pagination, ReleaseInput,
 };
 use services::auth::AuthorizationActor;
 
@@ -1409,6 +1410,45 @@ async fn update_issue(
         }
     } else if matches!(input.work_mode, Some(models::IssueWorkMode::SkillTest)) {
         input.harness_kind = Some("skill_test".to_string());
+    }
+
+    if let AuthorizationActor::Agent {
+        agent_id,
+        run_id: Some(run_id),
+        company_id: actor_company_id,
+        ..
+    } = &actor
+    {
+        if *actor_company_id != company_id {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let guard = DefaultCrossIssueInfluenceLimitService::new().with_pool(state.pool.clone());
+        match guard
+            .observe_influence(services::ObserveCrossIssueInfluenceInput {
+                heartbeat_run_id: *run_id,
+                company_id,
+                agent_id: *agent_id,
+                source_issue_id: id,
+                target_issue_id: id,
+                influence_kind: CrossIssueInfluenceKind::Update,
+                actor_label: None,
+                assignee_label: None,
+                issue_identifier: None,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(services::InfluenceLimitError::LimitExceeded { .. }) => {
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+            Err(services::InfluenceLimitError::RunNotFound(_)
+            | services::InfluenceLimitError::RunContextRequired) => {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            Err(services::InfluenceLimitError::DatabaseError(_)) => {
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
     }
     let service = state.issue_service.clone();
 

@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use models::{IssueComment, CommentActorType};
-use services::CommentServiceError;
+use services::{CommentServiceError, CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
+    DefaultCrossIssueInfluenceLimitService};
 use crate::errors::ApiError;
 use crate::app_state::AppState;
 use repositories::ISSUE_COMMENT_COLUMNS;
@@ -86,6 +87,47 @@ pub async fn add_comment(
 ) -> Result<impl IntoResponse, ApiError> {
     assert_issue_company(&state, &actor, issue_id).await?;
     let service = state.issue_comment_service.clone();
+
+    if let AuthorizationActor::Agent {
+        agent_id,
+        run_id: Some(run_id),
+        company_id: actor_company_id,
+        ..
+    } = &actor
+    {
+        if actor.company_id() != Some(*actor_company_id) {
+            return Err(ApiError::Forbidden("Missing company scope".into()));
+        }
+        let guard = DefaultCrossIssueInfluenceLimitService::new().with_pool(state.pool.clone());
+        match guard
+            .observe_influence(services::ObserveCrossIssueInfluenceInput {
+                heartbeat_run_id: *run_id,
+                company_id: *actor_company_id,
+                agent_id: *agent_id,
+                source_issue_id: issue_id,
+                target_issue_id: issue_id,
+                influence_kind: CrossIssueInfluenceKind::Comment,
+                actor_label: None,
+                assignee_label: None,
+                issue_identifier: None,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(services::InfluenceLimitError::LimitExceeded { current, cap }) => {
+                return Err(ApiError::Forbidden(format!(
+                    "Cross-issue influence limit exceeded: {current}/{cap}"
+                )));
+            }
+            Err(services::InfluenceLimitError::RunNotFound(_)
+            | services::InfluenceLimitError::RunContextRequired) => {
+                return Err(ApiError::Forbidden("Run context required for cross-issue comments".into()));
+            }
+            Err(services::InfluenceLimitError::DatabaseError(error)) => {
+                return Err(ApiError::InternalServerError(error));
+            }
+        }
+    }
     
     // Save actor_type before moving req
     let actor_type = req.actor_type;
