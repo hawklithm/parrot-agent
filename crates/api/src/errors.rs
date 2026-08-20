@@ -36,6 +36,9 @@ pub enum AppError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
+
     #[error("Internal server error")]
     Internal,
 
@@ -221,6 +224,9 @@ impl IntoResponse for AppError {
             AppError::BadRequest(msg) => {
                 (StatusCode::BAD_REQUEST, msg)
             }
+            AppError::TooManyRequests(msg) => {
+                (StatusCode::TOO_MANY_REQUESTS, msg)
+            }
             AppError::Internal => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
             }
@@ -255,6 +261,7 @@ mod tests {
         assert_eq!(status_of(AppError::Conflict("x".into())), StatusCode::CONFLICT);
         assert_eq!(status_of(AppError::Validation("x".into())), StatusCode::BAD_REQUEST);
         assert_eq!(status_of(AppError::BadRequest("x".into())), StatusCode::BAD_REQUEST);
+        assert_eq!(status_of(AppError::TooManyRequests("x".into())), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(status_of(AppError::Forbidden("x".into())), StatusCode::FORBIDDEN);
         assert_eq!(status_of(AppError::Unauthorized("x".into())), StatusCode::UNAUTHORIZED);
         assert_eq!(

@@ -13,6 +13,7 @@ pub const CROSS_ISSUE_INFLUENCE_LIMIT: usize = 20;
 pub enum CrossIssueInfluenceKind {
     Comment,
     Update,
+    InteractionResolution,
 }
 
 /// 跨Issue影响决策

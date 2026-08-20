@@ -9,6 +9,57 @@ use uuid::Uuid;
 use crate::{app_state::AppState, errors::ApiError};
 use models;
 use services::auth::AuthorizationActor;
+use services::{CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
+    DefaultCrossIssueInfluenceLimitService, InfluenceLimitError, ObserveCrossIssueInfluenceInput};
+
+async fn guard_cross_issue_resolution(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    issue_id: Uuid,
+) -> Result<(), ApiError> {
+    let AuthorizationActor::Agent {
+        agent_id,
+        run_id: Some(run_id),
+        company_id: actor_company_id,
+        ..
+    } = actor
+    else {
+        return Ok(());
+    };
+    if *actor_company_id != company_id {
+        return Err(ApiError::Forbidden("Missing company scope".into()));
+    }
+    let guard = DefaultCrossIssueInfluenceLimitService::new().with_pool(state.pool.clone());
+    match guard
+        .observe_influence(ObserveCrossIssueInfluenceInput {
+            heartbeat_run_id: *run_id,
+            company_id,
+            agent_id: *agent_id,
+            source_issue_id: issue_id,
+            target_issue_id: issue_id,
+            influence_kind: CrossIssueInfluenceKind::InteractionResolution,
+            actor_label: None,
+            assignee_label: None,
+            issue_identifier: None,
+        })
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(InfluenceLimitError::LimitExceeded { current, cap }) => Err(
+            ApiError::TooManyRequests(format!(
+                "Cross-issue influence limit exceeded: {current}/{cap}"
+            )),
+        ),
+        Err(InfluenceLimitError::RunNotFound(_)
+        | InfluenceLimitError::RunContextRequired) => Err(ApiError::Forbidden(
+            "Run context required for cross-issue interaction resolution".into(),
+        )),
+        Err(InfluenceLimitError::DatabaseError(error)) => {
+            Err(ApiError::InternalServerError(error))
+        }
+    }
+}
 
 /// POST /issues/:issue_id/interactions - Create a thread interaction
 pub async fn create_interaction(
@@ -115,6 +166,8 @@ pub async fn accept_interaction(
     crate::routes::assert_company_access(&actor, company_id, true)
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
 
+    guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
+
     // Load issue directly from DB
     let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
         .bind(issue_id)
@@ -170,6 +223,8 @@ pub async fn reject_interaction(
     
     crate::routes::assert_company_access(&actor, company_id, true)
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
 
     // Load issue directly from DB
     let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
@@ -259,6 +314,8 @@ pub async fn answer_questions(
     
     crate::routes::assert_company_access(&actor, company_id, true)
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
     // Determine resolver
     let resolver = match &actor {
         AuthorizationActor::Board { user_id, .. } => {
