@@ -13,6 +13,7 @@ use services::{CommentServiceError, CrossIssueInfluenceKind, CrossIssueInfluence
     DefaultCrossIssueInfluenceLimitService};
 use crate::errors::ApiError;
 use crate::app_state::AppState;
+use crate::routes::log_activity;
 use repositories::ISSUE_COMMENT_COLUMNS;
 use services::auth::AuthorizationActor;
 
@@ -185,6 +186,7 @@ pub async fn add_comment(
         ));
     }
 
+    let interrupt_requested = req.interrupt;
     // Save actor_type before moving req
     let actor_type = req.actor_type;
     let actor_id = req.actor_id;
@@ -197,6 +199,49 @@ pub async fn add_comment(
         req.actor_run_id,
         req.metadata,
     ).await?;
+
+    if interrupt_requested {
+        let active_run: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT id, agent_id
+             FROM heartbeat_runs
+             WHERE company_id = $1
+               AND status = 'running'
+               AND (context_snapshot->>'issueId' = $2 OR context_snapshot->>'taskId' = $2)
+             ORDER BY started_at DESC NULLS LAST, created_at DESC
+             LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(issue_id.to_string())
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+
+        if let Some((run_id, agent_id)) = active_run {
+            state
+                .heartbeat_service
+                .cancel_run(agent_id, issue_id, company_id, "Interrupted by board comment")
+                .await
+                .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+            log_activity(
+                &state.pool,
+                company_id,
+                "issue.comment_interrupt",
+                &actor,
+                "heartbeat_run",
+                run_id,
+                serde_json::json!({
+                    "issueId": issue_id,
+                    "source": "issue_comment_interrupt",
+                    "interruptedBy": match &actor {
+                        AuthorizationActor::Board { user_id, .. } => user_id.to_string(),
+                        AuthorizationActor::Agent { agent_id, .. } => agent_id.to_string(),
+                        AuthorizationActor::None => "unknown".to_string(),
+                    },
+                }),
+            )
+            .await;
+        }
+    }
 
     if should_reopen {
         state
