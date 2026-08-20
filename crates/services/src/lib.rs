@@ -12,8 +12,10 @@ pub mod adapter_install_transaction;
 pub mod server_adapter;
 pub mod adapters;
 pub mod plugin_worker_manager;
+pub use plugin_worker_manager::PluginWorkerManager;
 pub mod plugin_runtime_sandbox;
 pub mod plugin_job_scheduler;
+pub use plugin_job_scheduler::{PluginJobScheduler, PluginJobSchedulerOptions};
 pub mod plugin_job_coordinator;
 pub mod plugin_tool_registry;
 pub mod plugin_capability_validator;
@@ -406,6 +408,7 @@ pub use job_scheduler::{
     RoutineCronTrigger, MonitorCheckJob, LeaseExpiryScanner,
     EnvironmentHealthProber, StuckRunDetector, ConsistencyCheckJob,
     StatusCardSchedulerJob, SummarySlotFinalizerJob,
+    HeartbeatRecoveryJob,
     monitor_backoff_seconds, is_env_stale, is_run_stuck, ENV_IDLE_TIMEOUT,
 };
 pub mod status_card_worker;

@@ -281,6 +281,7 @@ async fn store_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
 
     #[test]
     fn empty_image_is_rejected() {

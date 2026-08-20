@@ -6,7 +6,7 @@
 //! 3. 并发策略（skip_if_active, coalesce）正确处理
 //! 4. 乐观锁防止重复触发
 
-use services::{JobScheduler, RoutineCronTrigger, RoutineExecutionService};
+use services::{JobScheduler, RoutineCronTrigger, RoutineExecutionService, ScheduledJob};
 use std::sync::Arc;
 use sqlx::PgPool;
 use chrono::Utc;
@@ -90,7 +90,7 @@ async fn test_routine_cron_trigger_basic() {
     
     // 创建服务
     let routine_execution_service = Arc::new(RoutineExecutionService::new(pool.clone()));
-    let cron_trigger = eCronTrigger::new(pool.clone(), routine_execution_service);
+    let cron_trigger = RoutineCronTrigger::new(pool.clone(), routine_execution_service);
     
     // 执行触发
     let result = cron_trigger.execute().await;
