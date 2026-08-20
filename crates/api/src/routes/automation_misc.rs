@@ -958,3 +958,51 @@ pub fn automation_misc_routes() -> Router<AppState> {
         )
         .route("/_plugins/:plugin_id/ui/*file_path", get(plugin_ui_static))
 }
+
+#[cfg(test)]
+mod inbox_agent_policy_tests {
+    use super::can_manage_inbox_agent_policy;
+    use services::auth::{AgentApiKeyScope, AuthorizationActor, CompanyMembership, MembershipRole, PermissionKey, PrincipalType};
+    use uuid::Uuid;
+
+    #[test]
+    fn board_admin_can_manage_other_user_policy() {
+        let company_id = Uuid::new_v4();
+        let membership = CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            Uuid::new_v4(),
+            MembershipRole::Admin,
+        );
+        let actor = AuthorizationActor::board_with_memberships(
+            Uuid::new_v4(),
+            company_id,
+            vec![membership],
+            false,
+        );
+        assert!(can_manage_inbox_agent_policy(&actor, company_id));
+    }
+
+    #[test]
+    fn agent_key_scope_can_delegate_policy_management() {
+        let company_id = Uuid::new_v4();
+        let scope = AgentApiKeyScope::new(Uuid::new_v4(), company_id).with_actions(vec![
+            PermissionKey::USERS_MANAGE_PERMISSIONS.to_string(),
+        ]);
+        let actor = AuthorizationActor::agent_with_key(
+            scope.agent_id,
+            company_id,
+            Uuid::new_v4(),
+            scope,
+            None,
+        );
+        assert!(can_manage_inbox_agent_policy(&actor, company_id));
+    }
+
+    #[test]
+    fn unrelated_agent_cannot_manage_policy() {
+        let company_id = Uuid::new_v4();
+        let actor = AuthorizationActor::agent(Uuid::new_v4(), company_id, None);
+        assert!(!can_manage_inbox_agent_policy(&actor, company_id));
+    }
+}
