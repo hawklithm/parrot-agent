@@ -298,7 +298,6 @@ mod tests {
             config,
             manifest,
         );
-        sandbox.set_timeout(Duration::from_secs(1));
         
         // 测试允许的操作
         let result = sandbox.execute_with_checks("read_file", || async {
@@ -376,6 +375,7 @@ mod tests {
         );
         
         // 等待超时
+        sandbox.set_timeout(Duration::from_secs(1));
         sleep(Duration::from_millis(1100)).await;
         
         // 检查限制应该失败
