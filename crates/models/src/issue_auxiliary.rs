@@ -8,9 +8,26 @@ pub struct WorkProduct {
     pub id: Uuid,
     pub issue_id: Uuid,
     pub company_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub execution_workspace_id: Option<Uuid>,
+    pub runtime_service_id: Option<Uuid>,
     pub name: String,
     pub description: Option<String>,
     pub artifact: Option<serde_json::Value>,
+    #[serde(rename = "type")]
+    pub work_product_type: String,
+    pub provider: String,
+    pub external_id: Option<String>,
+    pub title: String,
+    pub url: Option<String>,
+    pub status: String,
+    pub review_state: String,
+    pub is_primary: bool,
+    pub health_status: String,
+    pub summary: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub source_trust: Option<serde_json::Value>,
+    pub created_by_run_id: Option<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -19,9 +36,26 @@ pub struct WorkProduct {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkProductInput {
-    pub name: String,
+    pub name: Option<String>,
     pub description: Option<String>,
     pub artifact: Option<serde_json::Value>,
+    pub project_id: Option<Uuid>,
+    pub execution_workspace_id: Option<Uuid>,
+    pub runtime_service_id: Option<Uuid>,
+    #[serde(rename = "type")]
+    pub work_product_type: Option<String>,
+    pub provider: Option<String>,
+    pub external_id: Option<String>,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub status: Option<String>,
+    pub review_state: Option<String>,
+    pub is_primary: Option<bool>,
+    pub health_status: Option<String>,
+    pub summary: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub source_trust: Option<serde_json::Value>,
+    pub created_by_run_id: Option<Uuid>,
 }
 
 /// Update work product input
@@ -31,6 +65,23 @@ pub struct UpdateWorkProductInput {
     pub name: Option<String>,
     pub description: Option<String>,
     pub artifact: Option<serde_json::Value>,
+    pub project_id: Option<Uuid>,
+    pub execution_workspace_id: Option<Uuid>,
+    pub runtime_service_id: Option<Uuid>,
+    #[serde(rename = "type")]
+    pub work_product_type: Option<String>,
+    pub provider: Option<String>,
+    pub external_id: Option<String>,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub status: Option<String>,
+    pub review_state: Option<String>,
+    pub is_primary: Option<bool>,
+    pub health_status: Option<String>,
+    pub summary: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub source_trust: Option<serde_json::Value>,
+    pub created_by_run_id: Option<Uuid>,
 }
 
 /// Attachment

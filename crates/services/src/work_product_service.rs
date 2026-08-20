@@ -32,11 +32,7 @@ pub trait WorkProductService: Send + Sync {
     ) -> ServiceResult<WorkProduct>;
 
     /// Delete a work product by id
-    async fn delete_work_product(
-        &self,
-        product_id: Uuid,
-        company_id: Uuid,
-    ) -> ServiceResult<()>;
+    async fn delete_work_product(&self, product_id: Uuid, company_id: Uuid) -> ServiceResult<()>;
 }
 
 /// Mock implementation
@@ -49,49 +45,161 @@ pub struct PgWorkProductService {
 }
 
 impl PgWorkProductService {
-    pub fn new(pool: PgPool) -> Self { Self { pool } }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
 }
 
 #[async_trait]
 impl WorkProductService for PgWorkProductService {
-    async fn list_work_products(&self, issue_id: Uuid, company_id: Uuid) -> ServiceResult<Vec<WorkProduct>> {
+    async fn list_work_products(
+        &self,
+        issue_id: Uuid,
+        company_id: Uuid,
+    ) -> ServiceResult<Vec<WorkProduct>> {
         sqlx::query_as::<_, WorkProduct>(
-            "SELECT id, issue_id, company_id, name, description, artifact, created_at, updated_at
-             FROM issue_work_products WHERE issue_id = $1 AND company_id = $2 ORDER BY created_at ASC")
+            "SELECT id, issue_id, company_id, project_id, execution_workspace_id, runtime_service_id,
+                    name, description, artifact, type AS work_product_type, provider, external_id,
+                    title, url, status, review_state, is_primary, health_status, summary, metadata,
+                    source_trust, created_by_run_id, created_at, updated_at
+             FROM issue_work_products WHERE issue_id = $1 AND company_id = $2
+             ORDER BY is_primary DESC, updated_at DESC, id DESC")
             .bind(issue_id).bind(company_id).fetch_all(&self.pool).await.map_err(Into::into)
     }
 
-    async fn create_work_product(&self, issue_id: Uuid, company_id: Uuid, input: CreateWorkProductInput) -> ServiceResult<WorkProduct> {
-        sqlx::query_as::<_, WorkProduct>(
-            "INSERT INTO issue_work_products (issue_id, company_id, name, description, artifact)
-             VALUES ($1, $2, $3, $4, COALESCE($5, '{}'::jsonb))
-             RETURNING id, issue_id, company_id, name, description, artifact, created_at, updated_at")
-            .bind(issue_id).bind(company_id).bind(input.name).bind(input.description).bind(input.artifact)
-            .fetch_one(&self.pool).await.map_err(Into::into)
+    async fn create_work_product(
+        &self,
+        issue_id: Uuid,
+        company_id: Uuid,
+        input: CreateWorkProductInput,
+    ) -> ServiceResult<WorkProduct> {
+        let title = input.title.clone().or(input.name.clone()).ok_or_else(|| {
+            crate::errors::ServiceError::Validation("title or name is required".into())
+        })?;
+        let artifact = input
+            .artifact
+            .clone()
+            .or(input.metadata.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let summary = input.summary.clone().or(input.description.clone());
+        let work_product_type = input
+            .work_product_type
+            .clone()
+            .unwrap_or_else(|| "artifact".into());
+        let mut tx = self.pool.begin().await?;
+        if input.is_primary.unwrap_or(false) {
+            sqlx::query(
+                "UPDATE issue_work_products SET is_primary = FALSE, updated_at = NOW()
+                 WHERE company_id = $1 AND issue_id = $2 AND type = $3",
+            )
+            .bind(company_id)
+            .bind(issue_id)
+            .bind(&work_product_type)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let product = sqlx::query_as::<_, WorkProduct>(
+            "INSERT INTO issue_work_products
+             (issue_id, company_id, project_id, execution_workspace_id, runtime_service_id,
+              name, description, artifact, type, provider, external_id, title, url, status,
+              review_state, is_primary, health_status, summary, metadata, source_trust, created_by_run_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+             RETURNING id, issue_id, company_id, project_id, execution_workspace_id, runtime_service_id,
+                       name, description, artifact, type AS work_product_type, provider, external_id,
+                       title, url, status, review_state, is_primary, health_status, summary, metadata,
+                       source_trust, created_by_run_id, created_at, updated_at")
+            .bind(issue_id).bind(company_id).bind(input.project_id).bind(input.execution_workspace_id)
+            .bind(input.runtime_service_id).bind(input.name.clone().unwrap_or_else(|| title.clone()))
+            .bind(input.description).bind(artifact).bind(work_product_type)
+            .bind(input.provider.unwrap_or_else(|| "parrot".into())).bind(input.external_id).bind(title)
+            .bind(input.url).bind(input.status.unwrap_or_else(|| "active".into()))
+            .bind(input.review_state.unwrap_or_else(|| "none".into())).bind(input.is_primary.unwrap_or(false))
+            .bind(input.health_status.unwrap_or_else(|| "unknown".into())).bind(summary)
+            .bind(input.metadata).bind(input.source_trust).bind(input.created_by_run_id)
+            .fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(product)
     }
 
-    async fn update_work_product(&self, product_id: Uuid, company_id: Uuid, input: UpdateWorkProductInput) -> ServiceResult<WorkProduct> {
-        sqlx::query_as::<_, WorkProduct>(
-            "UPDATE issue_work_products SET name = COALESCE($3, name), description = COALESCE($4, description),
-             artifact = COALESCE($5, artifact), updated_at = NOW()
+    async fn update_work_product(
+        &self,
+        product_id: Uuid,
+        company_id: Uuid,
+        input: UpdateWorkProductInput,
+    ) -> ServiceResult<WorkProduct> {
+        let mut tx = self.pool.begin().await?;
+        if input.is_primary.unwrap_or(false) {
+            let work_product_type: String = if let Some(value) = input.work_product_type.clone() {
+                value
+            } else {
+                sqlx::query_scalar(
+                    "SELECT type FROM issue_work_products WHERE id = $1 AND company_id = $2",
+                )
+                .bind(product_id)
+                .bind(company_id)
+                .fetch_one(&mut *tx)
+                .await?
+            };
+            sqlx::query(
+                "UPDATE issue_work_products SET is_primary = FALSE, updated_at = NOW()
+                 WHERE company_id = $1 AND type = $2 AND id <> $3
+                   AND issue_id = (SELECT issue_id FROM issue_work_products WHERE id = $3 AND company_id = $1)",
+            )
+            .bind(company_id)
+            .bind(work_product_type)
+            .bind(product_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let product = sqlx::query_as::<_, WorkProduct>(
+            "UPDATE issue_work_products SET
+             project_id=COALESCE($3,project_id), execution_workspace_id=COALESCE($4,execution_workspace_id),
+             runtime_service_id=COALESCE($5,runtime_service_id), name=COALESCE($6,name),
+             description=COALESCE($7,description), artifact=COALESCE($8,artifact),
+             type=COALESCE($9,type), provider=COALESCE($10,provider), external_id=COALESCE($11,external_id),
+             title=COALESCE($12,title), url=COALESCE($13,url), status=COALESCE($14,status),
+             review_state=COALESCE($15,review_state), is_primary=COALESCE($16,is_primary),
+             health_status=COALESCE($17,health_status), summary=COALESCE($18,summary),
+             metadata=COALESCE($19,metadata), source_trust=COALESCE($20,source_trust),
+             created_by_run_id=COALESCE($21,created_by_run_id), updated_at=NOW()
              WHERE id = $1 AND company_id = $2
-             RETURNING id, issue_id, company_id, name, description, artifact, created_at, updated_at")
-            .bind(product_id).bind(company_id).bind(input.name).bind(input.description).bind(input.artifact)
-            .fetch_optional(&self.pool).await.map_err(ServiceErrorFromSql::into_service)?
-            .ok_or_else(|| crate::errors::ServiceError::NotFound("work product not found".into()))
+             RETURNING id, issue_id, company_id, project_id, execution_workspace_id, runtime_service_id,
+                       name, description, artifact, type AS work_product_type, provider, external_id,
+                       title, url, status, review_state, is_primary, health_status, summary, metadata,
+                       source_trust, created_by_run_id, created_at, updated_at")
+            .bind(product_id).bind(company_id).bind(input.project_id).bind(input.execution_workspace_id)
+            .bind(input.runtime_service_id).bind(input.name).bind(input.description).bind(input.artifact)
+            .bind(input.work_product_type).bind(input.provider).bind(input.external_id).bind(input.title)
+            .bind(input.url).bind(input.status).bind(input.review_state).bind(input.is_primary)
+            .bind(input.health_status).bind(input.summary).bind(input.metadata).bind(input.source_trust)
+            .bind(input.created_by_run_id)
+            .fetch_optional(&mut *tx).await.map_err(ServiceErrorFromSql::into_service)?
+            .ok_or_else(|| crate::errors::ServiceError::NotFound("work product not found".into()))?;
+        tx.commit().await?;
+        Ok(product)
     }
 
     async fn delete_work_product(&self, product_id: Uuid, company_id: Uuid) -> ServiceResult<()> {
-        let result = sqlx::query("DELETE FROM issue_work_products WHERE id = $1 AND company_id = $2")
-            .bind(product_id).bind(company_id).execute(&self.pool).await?;
-        if result.rows_affected() == 0 { return Err(crate::errors::ServiceError::NotFound("work product not found".into())); }
+        let result =
+            sqlx::query("DELETE FROM issue_work_products WHERE id = $1 AND company_id = $2")
+                .bind(product_id)
+                .bind(company_id)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(crate::errors::ServiceError::NotFound(
+                "work product not found".into(),
+            ));
+        }
         Ok(())
     }
 }
 
 struct ServiceErrorFromSql;
 impl ServiceErrorFromSql {
-    fn into_service(e: sqlx::Error) -> crate::errors::ServiceError { e.into() }
+    fn into_service(e: sqlx::Error) -> crate::errors::ServiceError {
+        e.into()
+    }
 }
 
 impl MockWorkProductService {
@@ -132,11 +240,7 @@ impl WorkProductService for MockWorkProductService {
         ))
     }
 
-    async fn delete_work_product(
-        &self,
-        _product_id: Uuid,
-        _company_id: Uuid,
-    ) -> ServiceResult<()> {
+    async fn delete_work_product(&self, _product_id: Uuid, _company_id: Uuid) -> ServiceResult<()> {
         Err(crate::errors::ServiceError::NotImplemented(
             "WorkProductService::delete_work_product not implemented".to_string(),
         ))
