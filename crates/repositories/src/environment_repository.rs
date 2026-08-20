@@ -3,6 +3,7 @@ use models::{
     ExecutionEnvironment, EnvironmentStatus, CreateEnvironmentInput,
     UpdateEnvironmentInput, EnvironmentDeleteBlastRadius,
     EnvironmentStaticReferences, EnvironmentActiveRuntimeUse,
+    EnvironmentDeleteBlockedReason,
 };
 use uuid::Uuid;
 use sqlx::PgPool;
@@ -216,55 +217,125 @@ impl EnvironmentRepository for PgEnvironmentRepository {
     }
 
     async fn get_delete_blast_radius(&self, id: Uuid) -> Result<EnvironmentDeleteBlastRadius, RepositoryError> {
-        // Count active leases
-        let active_leases: (i64,) = sqlx::query_as(
-            r#"
-            SELECT COUNT(*) as count
-            FROM environment_leases
-            WHERE environment_id = $1 AND status = 'active'
-            "#
+        let environment: Option<(String,)> = sqlx::query_as(
+            "SELECT driver FROM environments WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((driver,)) = environment else {
+            return Err(RepositoryError::NotFound(id));
+        };
+
+        let affected_agents: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM agents WHERE metadata->>'environmentId' = $1 ORDER BY id",
+        )
+        .bind(id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let affected_issues: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM issues WHERE execution_workspace_settings->>'environmentId' = $1 ORDER BY id",
+        )
+        .bind(id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let active_leases: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM environment_leases WHERE environment_id = $1 AND status = 'active' ORDER BY last_used_at DESC, created_at DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let agent_default_count = affected_agents.len() as i32;
+        let workspace_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_workspaces WHERE metadata->'config'->>'environmentId' = $1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        let issue_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM issues WHERE execution_workspace_settings->>'environmentId' = $1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        let project_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM projects WHERE env->>'environmentId' = $1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        let secret_binding_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM company_secret_bindings WHERE target_type = 'environment' AND target_id = $1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        let is_instance_default: bool = sqlx::query_scalar(
+            "SELECT COALESCE(general->>'defaultEnvironmentId', '') = $1 FROM instance_settings WHERE id = 1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false);
+        let pending_cleanup_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM environment_leases WHERE environment_id = $1 AND status = 'pending_cleanup'",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        let reusable_lease_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM environment_leases WHERE environment_id = $1 AND lease_policy = 'reuse_by_environment' AND status IN ('active', 'released', 'retained')",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        let active_setup_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM environment_custom_image_setup_sessions WHERE environment_id = $1 AND status IN ('pending', 'running', 'starting', 'waiting_for_user', 'capturing')",
         )
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
 
-        // Check for agents using this environment
-        // TODO: This requires agents table to have environment_id field
-        let _affected_agents: i64 = 0;
-
-        // Check for issues using this environment
-        // TODO: This requires issues table to have environment_id or execution_workspace_id field
-        let _affected_issues: i64 = 0;
-
+        let is_managed_local = driver == "local";
+        let mut delete_blocked_reasons = Vec::new();
         let mut blocked_reasons = Vec::new();
-        let can_delete = if active_leases.0 > 0 {
-            blocked_reasons.push(format!("{} active lease(s) must be released first", active_leases.0));
-            false
-        } else {
-            true
-        };
+        if is_managed_local {
+            delete_blocked_reasons.push(EnvironmentDeleteBlockedReason::ManagedLocal);
+            blocked_reasons.push("managed local environments cannot be deleted".to_string());
+        }
+        if is_instance_default {
+            delete_blocked_reasons.push(EnvironmentDeleteBlockedReason::InstanceDefault);
+            blocked_reasons.push("environment is the instance default".to_string());
+        }
+        if pending_cleanup_count > 0 {
+            blocked_reasons.push(format!("{} pending sandbox cleanup lease(s) must be resolved first", pending_cleanup_count));
+        }
+        if reusable_lease_count > 0 {
+            blocked_reasons.push(format!("{} reusable sandbox lease(s) must be released first", reusable_lease_count));
+        }
 
         Ok(EnvironmentDeleteBlastRadius {
             environment_id: id,
-            can_delete,
-            delete_blocked_reasons: Vec::new(),
+            can_delete: delete_blocked_reasons.is_empty() && pending_cleanup_count == 0 && reusable_lease_count == 0,
+            delete_blocked_reasons,
             blocked_reasons,
-            affected_agents: Vec::new(),
-            affected_issues: Vec::new(),
-            active_leases: Vec::new(),
+            affected_agents,
+            affected_issues,
+            active_leases: active_leases.clone(),
             static_references: EnvironmentStaticReferences {
-                is_managed_local: false,
-                is_instance_default: false,
-                agent_default_count: 0,
-                execution_workspace_selection_count: 0,
-                issue_selection_count: 0,
-                project_selection_count: 0,
-                secret_binding_count: 0,
+                is_managed_local,
+                is_instance_default,
+                agent_default_count,
+                execution_workspace_selection_count: workspace_count as i32,
+                issue_selection_count: issue_count as i32,
+                project_selection_count: project_count as i32,
+                secret_binding_count: secret_binding_count as i32,
             },
             active_runtime_use: EnvironmentActiveRuntimeUse {
-                active_lease_count: active_leases.0 as i32,
-                active_custom_image_setup_session_count: 0,
-                has_active_runtime_use: active_leases.0 > 0,
+                active_lease_count: active_leases.len() as i32,
+                active_custom_image_setup_session_count: active_setup_count as i32,
+                has_active_runtime_use: !active_leases.is_empty() || active_setup_count > 0,
             },
         })
     }
