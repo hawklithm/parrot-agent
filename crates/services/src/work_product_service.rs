@@ -341,3 +341,46 @@ impl WorkProductService for MockWorkProductService {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::validate_work_product_value;
+
+    #[test]
+    fn accepts_paperclip_work_product_values() {
+        validate_work_product_value(
+            Some("pull_request"),
+            Some("github"),
+            Some("Review PR"),
+            Some("https://github.com/example/repo/pull/1"),
+            Some("ready_for_review"),
+            Some("needs_board_review"),
+            Some("healthy"),
+        )
+        .expect("valid work product should pass");
+    }
+
+    #[test]
+    fn rejects_invalid_work_product_enum_and_url() {
+        assert!(validate_work_product_value(
+            Some("unknown"),
+            Some("provider"),
+            Some("title"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(validate_work_product_value(
+            None,
+            Some("provider"),
+            Some("title"),
+            Some("file:///tmp/output"),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+    }
+}
