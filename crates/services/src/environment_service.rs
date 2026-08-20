@@ -183,20 +183,71 @@ impl EnvironmentService for DefaultEnvironmentService {
     // --- P1: Environment 补齐 Mock 实现 ---
 
     async fn get_capabilities(&self, company_id: Uuid) -> Result<serde_json::Value, ServiceError> {
+        let environments = self
+            .environment_repo
+            .list_all()
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list environment capabilities: {}", e)))?;
+        let mut drivers = environments
+            .iter()
+            .map(|environment| match environment.driver {
+                EnvironmentDriver::Local => "local".to_string(),
+                EnvironmentDriver::Ssh => "ssh".to_string(),
+                EnvironmentDriver::Sandbox => "sandbox".to_string(),
+                EnvironmentDriver::Plugin => "plugin".to_string(),
+            })
+            .collect::<Vec<_>>();
+        for driver in ["local", "ssh", "sandbox", "plugin"] {
+            if !drivers.iter().any(|value| value == driver) {
+                drivers.push(driver.to_string());
+            }
+        }
+        drivers.sort();
+        drivers.dedup();
         Ok(serde_json::json!({
             "companyId": company_id,
-            "environments": [],
-            "totalEnvironments": 0,
-            "supportedDrivers": ["local", "ssh", "sandbox", "plugin"],
+            "environments": environments.iter().map(|environment| serde_json::json!({
+                "id": environment.id,
+                "name": environment.name,
+                "driver": environment.driver,
+                "status": environment.status,
+            })).collect::<Vec<_>>(),
+            "totalEnvironments": environments.len(),
+            "supportedDrivers": drivers,
+            "supportsCustomImages": true,
+            "supportsInteractiveSetup": true,
         }))
     }
 
     async fn probe_config(&self, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, ServiceError> {
+        let driver = input
+            .get("driver")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ServiceError::InvalidInput("Environment probe requires a driver".into()))?;
+        let parsed_driver = match driver {
+            "local" => EnvironmentDriver::Local,
+            "ssh" => EnvironmentDriver::Ssh,
+            "sandbox" => EnvironmentDriver::Sandbox,
+            "plugin" => EnvironmentDriver::Plugin,
+            other => return Err(ServiceError::InvalidInput(format!("Unsupported environment driver: {other}"))),
+        };
+        let config = input.get("config").unwrap_or(&serde_json::Value::Null);
+        self.validate_config(parsed_driver, config)?;
+        let summary = match parsed_driver {
+            EnvironmentDriver::Local => "Local environment configuration is valid",
+            EnvironmentDriver::Ssh => "SSH environment configuration is valid",
+            EnvironmentDriver::Sandbox => "Sandbox environment configuration is valid",
+            EnvironmentDriver::Plugin => "Plugin environment configuration is valid",
+        };
         Ok(serde_json::json!({
             "companyId": company_id,
-            "probeConfig": input,
+            "driver": driver,
             "status": "ok",
             "compatible": true,
+            "summary": summary,
+            "details": {
+                "configTopLevelKeyCount": config.as_object().map(|value| value.len()).unwrap_or(0),
+            },
         }))
     }
 
@@ -281,5 +332,50 @@ mod tests {
         // Local config - always valid
         let empty_config = serde_json::json!({});
         assert!(service.validate_config(EnvironmentDriver::Local, &empty_config).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use repositories::PgEnvironmentRepository;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn service() -> DefaultEnvironmentService {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@localhost:5433/parrot_agent_compile")
+            .expect("lazy pool should be constructible");
+        DefaultEnvironmentService::new(Arc::new(PgEnvironmentRepository::new(pool)))
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_missing_ssh_fields() {
+        let result = service()
+            .probe_config(
+                Uuid::new_v4(),
+                serde_json::json!({
+                    "driver": "ssh",
+                    "config": {"host": "example.test"}
+                }),
+            )
+            .await;
+        assert!(matches!(result, Err(ServiceError::InvalidInput(message)) if message.contains("username")));
+    }
+
+    #[tokio::test]
+    async fn probe_returns_structured_success_for_valid_sandbox() {
+        let result = service()
+            .probe_config(
+                Uuid::new_v4(),
+                serde_json::json!({
+                    "driver": "sandbox",
+                    "config": {"provider": "local", "image": "ubuntu:24.04"}
+                }),
+            )
+            .await
+            .expect("valid sandbox probe should succeed");
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["compatible"], true);
+        assert_eq!(result["driver"], "sandbox");
     }
 }
