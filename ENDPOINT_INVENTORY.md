@@ -9,11 +9,11 @@
 - **Limitation**：状态为结构性判定；`partial` 语义、`by-design-candidate` 最终清单需人工复核。
 
 - Paperclip endpoints: **606**
-- Parrot endpoints: **792**
-- implemented: **598**
+- Parrot endpoints: **799**
+- implemented: **605**
 - partial: **0**
 - by-design-candidate: **0**
-- missing: **8**
+- missing: **1**
 - Parrot-only (extension): **194**
 
 ## 1. Implemented
@@ -133,6 +133,7 @@
 | `GET /api/companies/:param/built-in-agents/:param/status` | `routes/built-in-agents.ts:156` |
 | `GET /api/companies/:param/case-events` | `routes/pipelines.ts:880` |
 | `GET /api/companies/:param/cases` | `routes/cases.ts:720` |
+| `GET /api/companies/:param/claude-oauth-token-status` | `routes/agents.ts:4616` |
 | `GET /api/companies/:param/costs/by-agent` | `routes/costs.ts:192` |
 | `GET /api/companies/:param/costs/by-agent-model` | `routes/costs.ts:201` |
 | `GET /api/companies/:param/costs/by-biller` | `routes/costs.ts:219` |
@@ -189,6 +190,8 @@
 | `GET /api/companies/:param/secret-providers/health` | `routes/secrets.ts:387` |
 | `GET /api/companies/:param/secrets` | `routes/secrets.ts:612` |
 | `GET /api/companies/:param/secrets/catalog` | `routes/secrets.ts:604` |
+| `GET /api/companies/:param/setup-token-login-sessions/:param` | `routes/agents.ts:4702` |
+| `GET /api/companies/:param/setup-token-login-sessions/:param/prompt` | `routes/agents.ts:4721` |
 | `GET /api/companies/:param/sidebar-badges` | `routes/sidebar-badges.ts:33` |
 | `GET /api/companies/:param/sidebar-preferences/me` | `routes/sidebar-preferences.ts:33` |
 | `GET /api/companies/:param/skill-policy` | `routes/company-skill-policy.ts:71` |
@@ -493,6 +496,10 @@
 | `POST /api/companies/:param/secret-proposals/:param/reject` | `routes/secrets.ts:319` |
 | `POST /api/companies/:param/secret-provider-configs` | `routes/secrets.ts:437` |
 | `POST /api/companies/:param/secrets` | `routes/secrets.ts:905` |
+| `POST /api/companies/:param/setup-token-login-sessions` | `routes/agents.ts:4632` |
+| `POST /api/companies/:param/setup-token-login-sessions/:param/cancel` | `routes/agents.ts:4812` |
+| `POST /api/companies/:param/setup-token-login-sessions/:param/code` | `routes/agents.ts:4754` |
+| `POST /api/companies/:param/setup-token-login-sessions/:param/completion` | `routes/agents.ts:4790` |
 | `POST /api/companies/:param/skills/:param/star` | `routes/company-skills.ts:783` |
 | `POST /api/companies/:param/skills/:param/test-runs/:param/cancel` | `routes/company-skills.ts:673` |
 | `POST /api/companies/:param/smoke-lab/install-fixtures` | `routes/smoke-lab.ts:164` |
@@ -634,13 +641,6 @@
 | Method+Path | Source | Note |
 |---|---|---|
 | `ALL /api/auth/{:param}` | `app.ts:365` |  |
-| `GET /api/companies/:param/claude-oauth-token-status` | `routes/agents.ts:4616` |  |
-| `GET /api/companies/:param/setup-token-login-sessions/:param` | `routes/agents.ts:4702` |  |
-| `GET /api/companies/:param/setup-token-login-sessions/:param/prompt` | `routes/agents.ts:4721` |  |
-| `POST /api/companies/:param/setup-token-login-sessions` | `routes/agents.ts:4632` |  |
-| `POST /api/companies/:param/setup-token-login-sessions/:param/cancel` | `routes/agents.ts:4812` |  |
-| `POST /api/companies/:param/setup-token-login-sessions/:param/code` | `routes/agents.ts:4754` |  |
-| `POST /api/companies/:param/setup-token-login-sessions/:param/completion` | `routes/agents.ts:4790` |  |
 
 ## 5. Parrot-only（Parrot 扩展端点）
 

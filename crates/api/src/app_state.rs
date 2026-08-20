@@ -345,6 +345,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::folders::folder_routes())
         .merge(crate::routes::secret_proposals::secret_proposal_routes())
         .merge(crate::routes::status_cards::status_card_routes())
+        .merge(crate::routes::setup_token::setup_token_routes())
         .merge(crate::routes::summary_slots::summary_slot_routes())
         .merge(crate::routes::smoke_lab::smoke_lab_routes())
         .merge(crate::routes::tool_access::tool_access_routes())
@@ -398,4 +399,3 @@ mod route_conflict_tests {
             .merge(crate::routes::sidebar_preferences::sidebar_preference_routes());
     }
 }
-

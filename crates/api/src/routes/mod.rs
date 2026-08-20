@@ -33,6 +33,7 @@ pub mod secret_provider_configs;
 pub mod secret_remote_import;
 pub mod secrets;
 pub mod status_cards;
+pub mod setup_token;
 pub mod summary_slots;
 pub mod smoke_lab;
 pub mod tool_access;
