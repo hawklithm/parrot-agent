@@ -1,0 +1,14 @@
+[package]
+name = "parrot-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Parrot command-line client"
+license = "MIT"
+
+[[bin]]
+name = "parrot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+
