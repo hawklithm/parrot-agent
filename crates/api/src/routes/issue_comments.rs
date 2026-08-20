@@ -23,6 +23,12 @@ pub struct AddCommentRequest {
     pub actor_type: CommentActorType,
     pub actor_id: Option<Uuid>,
     pub actor_run_id: Option<Uuid>,
+    #[serde(default)]
+    pub reopen: bool,
+    #[serde(default)]
+    pub resume: bool,
+    #[serde(default)]
+    pub interrupt: bool,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -53,6 +59,21 @@ pub struct CommentPaginationQuery {
 #[derive(Debug, Serialize)]
 pub struct CommentResponse {
     pub comment: IssueComment,
+}
+
+fn should_reopen_issue_after_comment(
+    status: models::IssueStatus,
+    has_assignee: bool,
+    board_comment: bool,
+    explicit_reopen: bool,
+) -> bool {
+    let reopenable = matches!(
+        status,
+        models::IssueStatus::Done
+            | models::IssueStatus::Cancelled
+            | models::IssueStatus::Blocked
+    );
+    reopenable && (explicit_reopen || (board_comment && has_assignee))
 }
 
 // Convert service errors to API errors
@@ -87,6 +108,22 @@ pub async fn add_comment(
 ) -> Result<impl IntoResponse, ApiError> {
     assert_issue_company(&state, &actor, issue_id).await?;
     let service = state.issue_comment_service.clone();
+
+    let company_id = actor.company_id().ok_or_else(|| {
+        ApiError::Forbidden("Company scope is required for issue comments".into())
+    })?;
+    let issue = state
+        .issue_service
+        .get(issue_id, company_id)
+        .await
+        .map_err(ApiError::InternalServerError)?
+        .ok_or_else(|| ApiError::NotFound(format!("Issue not found: {issue_id}")))?;
+
+    if req.interrupt && !matches!(actor, AuthorizationActor::Board { .. }) {
+        return Err(ApiError::Forbidden(
+            "Only board users can interrupt active runs from issue comments".into(),
+        ));
+    }
 
     if let AuthorizationActor::Agent {
         agent_id,
@@ -129,6 +166,25 @@ pub async fn add_comment(
         }
     }
     
+    let explicit_resume = req.resume;
+    let explicit_reopen = req.reopen || explicit_resume;
+    let board_comment = matches!(actor, AuthorizationActor::Board { .. });
+    let should_reopen = should_reopen_issue_after_comment(
+        issue.status,
+        issue.assignee_agent_id.is_some(),
+        board_comment,
+        explicit_reopen,
+    );
+
+    if explicit_resume
+        && issue.status == models::IssueStatus::Blocked
+        && !issue.blocked_by_issue_ids.is_empty()
+    {
+        return Err(ApiError::Conflict(
+            "Issue follow-up blocked by unresolved blockers".into(),
+        ));
+    }
+
     // Save actor_type before moving req
     let actor_type = req.actor_type;
     let actor_id = req.actor_id;
@@ -141,6 +197,36 @@ pub async fn add_comment(
         req.actor_run_id,
         req.metadata,
     ).await?;
+
+    if should_reopen {
+        state
+            .issue_service
+            .update(
+                issue_id,
+                company_id,
+                models::UpdateIssueInput {
+                    status: Some(models::IssueStatus::Todo),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(ApiError::InternalServerError)?;
+
+        if let Some(assignee_agent_id) = issue.assignee_agent_id {
+            if let Err(error) = state
+                .heartbeat_service
+                .wakeup(assignee_agent_id, issue_id, company_id)
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    %issue_id,
+                    %assignee_agent_id,
+                    "Failed to wake assignee after issue comment reopen"
+                );
+            }
+        }
+    }
 
     // Expire superseded interactions when a user comments
     if actor_type == CommentActorType::User {
@@ -161,6 +247,54 @@ pub async fn add_comment(
     }
 
     Ok((StatusCode::CREATED, Json(CommentResponse { comment })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_reopen_issue_after_comment;
+    use models::IssueStatus;
+
+    #[test]
+    fn explicit_reopen_allows_agent_or_board_comments_on_terminal_issues() {
+        assert!(should_reopen_issue_after_comment(
+            IssueStatus::Done,
+            false,
+            false,
+            true,
+        ));
+        assert!(should_reopen_issue_after_comment(
+            IssueStatus::Cancelled,
+            true,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn board_comment_implicitly_reopens_assigned_terminal_issue() {
+        assert!(should_reopen_issue_after_comment(
+            IssueStatus::Blocked,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn ordinary_comments_do_not_reopen_without_explicit_intent() {
+        assert!(!should_reopen_issue_after_comment(
+            IssueStatus::Done,
+            true,
+            false,
+            false,
+        ));
+        assert!(!should_reopen_issue_after_comment(
+            IssueStatus::InProgress,
+            true,
+            true,
+            true,
+        ));
+    }
 }
 
 /// GET /issues/:issue_id/comments - List comments for an issue
