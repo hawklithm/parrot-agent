@@ -1095,10 +1095,19 @@ where
         Ok(())
     }
 
-    async fn reset_session(&self, _agent_id: Uuid) -> Result<(), ServiceError> {
-        // 重置 Agent 的会话运行时状态。
-        // 完整实现需要 ChannelManager/SessionManager 来终止活跃会话与运行时；
-        // 此处为保证编译通过与行为安全，标记为已接受请求但无副作用。
+    async fn reset_session(&self, agent_id: Uuid) -> Result<(), ServiceError> {
+        sqlx::query(
+            "UPDATE agent_runtime_states
+             SET session_id = NULL,
+                 session_display_id = NULL,
+                 session_params_json = NULL,
+                 updated_at = NOW()
+             WHERE agent_id = $1",
+        )
+        .bind(agent_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| ServiceError::Internal(format!("Failed to reset agent session: {error}")))?;
         Ok(())
     }
 
