@@ -23,6 +23,20 @@ CREATE TABLE IF NOT EXISTS tool_applications (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- The unified baseline already contains an older request-oriented
+-- tool_applications table. Extend it in place so this migration remains
+-- compatible with both the baseline and a clean database.
+ALTER TABLE tool_applications
+    ADD COLUMN IF NOT EXISTS application_key TEXT,
+    ADD COLUMN IF NOT EXISTS name TEXT,
+    ADD COLUMN IF NOT EXISTS description TEXT,
+    ADD COLUMN IF NOT EXISTS type TEXT,
+    ADD COLUMN IF NOT EXISTS plugin_id UUID,
+    ADD COLUMN IF NOT EXISTS owner_agent_id UUID,
+    ADD COLUMN IF NOT EXISTS owner_user_id TEXT,
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+
 -- Indexes for tool_applications
 CREATE INDEX IF NOT EXISTS tool_applications_company_idx ON tool_applications(company_id);
 CREATE INDEX IF NOT EXISTS tool_applications_company_status_idx ON tool_applications(company_id, status);
@@ -63,6 +77,23 @@ CREATE TABLE IF NOT EXISTS tool_connections (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT tool_connections_company_id_uq UNIQUE (company_id, id)
 );
+
+ALTER TABLE tool_connections
+    ADD COLUMN IF NOT EXISTS config JSONB NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS credential_refs JSONB NOT NULL DEFAULT '[]',
+    ADD COLUMN IF NOT EXISTS credential_secret_refs JSONB NOT NULL DEFAULT '[]',
+    ADD COLUMN IF NOT EXISTS health_status TEXT NOT NULL DEFAULT 'unchecked',
+    ADD COLUMN IF NOT EXISTS health_message TEXT,
+    ADD COLUMN IF NOT EXISTS health_checked_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_healthy_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_catalog_refresh_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_error TEXT,
+    ADD COLUMN IF NOT EXISTS tool_type TEXT;
+
+-- The baseline has the same logical uniqueness but not the compound key used
+-- by connection_grants' tenant-scoped foreign key.
+CREATE UNIQUE INDEX IF NOT EXISTS tool_connections_company_id_id_uq
+    ON tool_connections(company_id, id);
 
 -- Indexes for tool_connections
 CREATE INDEX IF NOT EXISTS tool_connections_company_idx ON tool_connections(company_id);
