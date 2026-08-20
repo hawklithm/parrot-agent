@@ -4,12 +4,13 @@
 //! POST 设置（带版本与校验），POST /simulate 预览评估结果。
 use crate::{app_state::AppState, errors::AppError};
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::Value;
+use services::auth::{AuthorizationAction, AuthorizationActor};
 use uuid::Uuid;
 
 pub fn skill_policy_routes() -> Router<AppState> {
@@ -18,7 +19,10 @@ pub fn skill_policy_routes() -> Router<AppState> {
             "/companies/:company_id/skill-policy",
             get(get_skill_policy).delete(delete_skill_policy),
         )
-        .route("/companies/:company_id/skill-policy", post(set_skill_policy))
+        .route(
+            "/companies/:company_id/skill-policy",
+            post(set_skill_policy).put(set_skill_policy),
+        )
         .route(
             "/companies/:company_id/skill-policy/simulate",
             post(simulate_skill_policy),
@@ -37,10 +41,44 @@ struct SimulateRequest {
     skill: Option<String>,
 }
 
+async fn assert_skill_policy_access(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    write: bool,
+) -> Result<(), AppError> {
+    if actor.is_anonymous() {
+        return Err(AppError::Unauthorized("Authentication required".into()));
+    }
+    let action = if write {
+        AuthorizationAction::CompanyUpdate { company_id }
+    } else {
+        AuthorizationAction::CompanyRead { company_id }
+    };
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        actor,
+        &action,
+        Some(company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(if write {
+            "Insufficient permissions: company skill policy administration required"
+        } else {
+            "Insufficient permissions: company membership required"
+        }
+        .into()));
+    }
+    Ok(())
+}
+
 async fn get_skill_policy(
     State(s): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Value>, AppError> {
+    assert_skill_policy_access(&s, &actor, company_id, false).await?;
     let policy = s
         .skill_policy_service
         .get_policy(company_id)
@@ -54,9 +92,33 @@ async fn get_skill_policy(
 
 async fn set_skill_policy(
     State(s): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
-    Json(policy): Json<Value>,
+    Json(mut policy): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    assert_skill_policy_access(&s, &actor, company_id, true).await?;
+    if let Some(expected) = policy.get("expectedRevision").and_then(|v| v.as_i64()) {
+        if let Some(current) = s
+            .skill_policy_service
+            .get_policy(company_id)
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        {
+            let current_version = current.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
+            if current_version != expected {
+                return Err(AppError::Conflict(format!(
+                    "Skill policy revision conflict: expected {}, current {}",
+                    expected, current_version
+                )));
+            }
+        }
+        if let Some(object) = policy.as_object_mut() {
+            object.remove("expectedRevision");
+        }
+    }
+    if let Some(inner) = policy.get("policy").cloned() {
+        policy = inner;
+    }
     let result = s
         .skill_policy_service
         .set_policy(company_id, policy)
@@ -72,8 +134,10 @@ async fn set_skill_policy(
 
 async fn delete_skill_policy(
     State(s): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode, AppError> {
+    assert_skill_policy_access(&s, &actor, company_id, true).await?;
     s.skill_policy_service
         .delete_policy(company_id)
         .await
@@ -83,9 +147,11 @@ async fn delete_skill_policy(
 
 async fn simulate_skill_policy(
     State(s): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(req): Json<SimulateRequest>,
 ) -> Result<Json<Value>, AppError> {
+    assert_skill_policy_access(&s, &actor, company_id, false).await?;
     let role = req.role.unwrap_or_else(|| "member".to_string());
     let action = req.action.unwrap_or_else(|| "execute".to_string());
     let source = req.source.unwrap_or_else(|| "user".to_string());
