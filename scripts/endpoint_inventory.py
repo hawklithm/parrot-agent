@@ -31,7 +31,7 @@ import re
 import sys
 from collections import OrderedDict
 
-ROOT = "/Users/adazhao/workspace"
+ROOT = os.environ.get("PARROT_WORKSPACE", r"D:\workspace")
 PAPERCLIP_SRC = os.path.join(ROOT, "paperclip/server/src")
 PARROT_ROUTES = os.path.join(ROOT, "parrot/parrot-agent/crates/api/src/routes")
 OUT = os.path.join(ROOT, "parrot/parrot-agent/ENDPOINT_INVENTORY.md")
@@ -159,6 +159,19 @@ def parrot_endpoints() -> OrderedDict:
                         (decl, fn)
                     )
             idx = j + 1
+    # The public health route is mounted directly in app_state.rs rather than
+    # in crates/api/src/routes/*.rs; include direct application routes so the
+    # inventory does not report a mounted endpoint as missing.
+    app_state = os.path.join(os.path.dirname(PARROT_ROUTES), "app_state.rs")
+    if os.path.exists(app_state):
+        text = open(app_state, encoding="utf-8", errors="replace").read()
+        for m in re.finditer(r'\.route\(\s*"([^"]+)"\s*,\s*([^\n]+)', text):
+            decl, handlers = m.group(1), m.group(2)
+            full = "/api" + (decl if decl.startswith("/") else "/" + decl)
+            for method in re.findall(r'\b(get|post|patch|put|delete|options)\s*\(', handlers):
+                eps.setdefault((method.upper(), normalize(full)), []).append(
+                    (decl, "app_state.rs")
+                )
     return eps
 
 

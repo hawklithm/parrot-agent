@@ -2225,6 +2225,7 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/external-objects/refresh", post(refresh_external_objects))
         .route("/issues/:id/documents", get(list_issue_documents))
         .route("/issues/:id/documents/:key", get(get_issue_document).put(upsert_issue_document).delete(delete_issue_document))
+        .route("/issues/:id/documents/:key/revisions", get(list_issue_document_revisions))
         .route("/issues/:id/documents/:key/revisions/:revision_id/restore", post(restore_issue_document_revision))
         .route("/issues/:id/documents/:key/annotations", get(get_issue_document_annotations).post(create_issue_document_annotation))
         .route("/issues/:id/documents/:key/annotations/:thread_id", get(get_issue_document_annotation_thread).patch(update_issue_document_annotation))
@@ -2238,6 +2239,9 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/feedback-traces", get(list_feedback_traces))
         .route("/issues/:id/recovery-actions", get(list_recovery_actions))
         .route("/issues/:id/recovery-actions/resolve", post(resolve_recovery_action))
+        .route("/issues/:id/accepted-plan-decompositions", get(list_plan_decompositions).post(submit_plan_decomposition))
+        .route("/issues/:id/approvals", get(list_issue_approvals).post(create_issue_approval))
+        .route("/issues/:id/approvals/:approval_id", axum::routing::delete(delete_issue_approval))
 }
 
 #[cfg(test)]

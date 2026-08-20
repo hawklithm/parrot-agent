@@ -44,6 +44,10 @@ pub fn secret_routes() -> Router<AppState> {
             "/companies/:company_id/secrets",
             get(list_company_secrets).post(create_company_secret),
         )
+        .route(
+            "/companies/:company_id/secrets/catalog",
+            get(list_secret_catalog),
+        )
         // Secret-scoped CRUD + actions
         .route(
             "/secrets/:id",
@@ -160,6 +164,32 @@ async fn list_company_secrets(
     .map_err(|e| SecretError::Database(e.to_string()))?;
 
     Ok(Json(rows.iter().map(secret_to_json).collect()))
+}
+
+/// GET /companies/:company_id/secrets/catalog
+///
+/// Agent-readable metadata only. Secret values and provider metadata are
+/// intentionally excluded, matching Paperclip's catalog contract.
+async fn list_secret_catalog(
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<Vec<Value>>, SecretError> {
+    let rows = sqlx::query(
+        "SELECT id, name, key, status FROM company_secrets \
+         WHERE company_id = $1 AND scope = 'company' AND deleted_at IS NULL \
+         ORDER BY created_at DESC",
+    )
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| SecretError::Database(e.to_string()))?;
+
+    Ok(Json(rows.iter().map(|row| json!({
+        "id": row.get::<Uuid, _>("id"),
+        "name": row.get::<String, _>("name"),
+        "key": row.get::<String, _>("key"),
+        "status": row.get::<String, _>("status"),
+    })).collect()))
 }
 
 /// POST /companies/:companyId/secrets body — mirrors `createSecretSchema`.

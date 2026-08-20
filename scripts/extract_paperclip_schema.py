@@ -12,8 +12,9 @@ import os
 import re
 import sys
 
-SCHEMA_DIR = "/Users/adazhao/workspace/paperclip/packages/db/src/schema"
-OUT = "/Users/adazhao/workspace/parrot/parrot-agent/PAPERCLIP_SCHEMA_BASELINE.md"
+ROOT = os.environ.get("PARROT_WORKSPACE", r"D:\workspace")
+SCHEMA_DIR = os.path.join(ROOT, "paperclip", "packages", "db", "src", "schema")
+OUT = os.path.join(ROOT, "parrot", "parrot-agent", "PAPERCLIP_SCHEMA_BASELINE.md")
 
 REF_RE = re.compile(r'references\(\(\) => (\w+)\.id(?:,\s*\{ onDelete: "(\w+)" \})?\)')
 IDX_RE = re.compile(r'(?:uniqueIndex|index)\("([^"]+)"\)\s*\.on\(\s*([^)]*?)\s*\)', re.S)

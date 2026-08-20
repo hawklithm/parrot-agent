@@ -11,15 +11,16 @@ import os
 import re
 import sys
 
-ROOT = "/Users/adazhao/workspace"
+ROOT = os.environ.get("PARROT_WORKSPACE", r"D:\workspace")
 PAPERCLIP_SRC = os.path.join(ROOT, "paperclip/server/src")
 PARROT_ROUTES = os.path.join(ROOT, "parrot/parrot-agent/crates/api/src/routes")
 OUT = os.path.join(ROOT, "parrot/parrot-agent/ENDPOINT_MIGRATION_BACKLOG.md")
 
 # paperclip action vocabulary (from activity-log extraction)
 PC_ACTIONS = set()
-if os.path.exists("/tmp/pc_actions.txt"):
-    PC_ACTIONS = set(open("/tmp/pc_actions.txt").read().split())
+PC_ACTIONS_PATH = os.environ.get("PAPERCLIP_ACTIONS_FILE", "")
+if PC_ACTIONS_PATH and os.path.exists(PC_ACTIONS_PATH):
+    PC_ACTIONS = set(open(PC_ACTIONS_PATH, encoding="utf-8").read().split())
 
 BY_DESIGN_CANDIDATE_SEGMENTS = {
     "cloud", "smoke-lab", "cli-auth", "sidebar-preferences", "status-cards",
@@ -122,6 +123,17 @@ def main():
                 for method in re.findall(r"\b(get|post|patch|put|delete|options)\s*\(", inner):
                     pr_keys.add((method.upper(), normalize(full)))
             idx = j + 1
+
+    # Keep direct application mounts (currently /health in app_state.rs) in
+    # sync with endpoint_inventory.py.
+    app_state = os.path.join(os.path.dirname(PARROT_ROUTES), "app_state.rs")
+    if os.path.exists(app_state):
+        text = open(app_state, encoding="utf-8", errors="replace").read()
+        for m in re.finditer(r'\.route\(\s*"([^"]+)"\s*,\s*([^\n]+)', text):
+            decl, handlers = m.group(1), m.group(2)
+            full = "/api" + (decl if decl.startswith("/") else "/" + decl)
+            for method in re.findall(r'\b(get|post|patch|put|delete|options)\s*\(', handlers):
+                pr_keys.add((method.upper(), normalize(full)))
 
     rows = []
     for key in sorted(pc_keys):

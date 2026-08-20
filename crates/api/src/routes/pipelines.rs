@@ -38,6 +38,7 @@ pub fn pipeline_routes() -> Router<AppState> {
             "/pipelines/:pipeline_id/health-warnings",
             get(get_health_warnings),
         )
+        .route("/pipelines/:pipeline_id/health", get(get_pipeline_health))
         .route(
             "/companies/:company_id/pipelines-attention",
             get(get_pipelines_attention),

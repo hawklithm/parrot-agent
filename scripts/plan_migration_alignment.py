@@ -14,11 +14,12 @@ import os
 import re
 import sys
 
-MIGRATIONS = "/Users/adazhao/workspace/parrot/parrot-agent/migrations"
-OUT = "/Users/adazhao/workspace/parrot/parrot-agent/MIGRATION_ALIGNMENT_PLAN.md"
+ROOT = os.environ.get("PARROT_WORKSPACE", r"D:\workspace")
+MIGRATIONS = os.path.join(ROOT, "parrot", "parrot-agent", "migrations")
+OUT = os.path.join(ROOT, "parrot", "parrot-agent", "MIGRATION_ALIGNMENT_PLAN.md")
 
 # Paperclip: table -> onDelete for company_id FK (from baseline extraction; hardcoded re-extract here)
-PAPERCLIP_SCHEMA_DIR = "/Users/adazhao/workspace/paperclip/packages/db/src/schema"
+PAPERCLIP_SCHEMA_DIR = os.path.join(ROOT, "paperclip", "packages", "db", "src", "schema")
 REF_RE = re.compile(r'pgTable\(\s*"(\w+)"[\s\S]*?references\(\(\) => companies\.id(?:,\s*\{ onDelete: "(\w+)" \})?\)')
 
 def paperclip_company_policy():
