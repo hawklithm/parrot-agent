@@ -773,7 +773,14 @@ async fn environment_leases(
     Extension(actor): Extension<AuthorizationActor>,
     Path(environment_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id: Uuid = sqlx::query_scalar(
+        "SELECT company_id FROM environments WHERE id = $1",
+    )
+    .bind(environment_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
@@ -799,11 +806,18 @@ async fn environment_leases(
 
 /// GET /environments/:id/secret-refs —— 环境 secret 引用列表（基础：空）。
 async fn environment_secret_refs(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(_environment_id): Path<Uuid>,
+    Path(environment_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id: Uuid = sqlx::query_scalar(
+        "SELECT company_id FROM environments WHERE id = $1",
+    )
+    .bind(environment_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(vec![]))
