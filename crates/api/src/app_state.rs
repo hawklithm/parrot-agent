@@ -258,6 +258,10 @@ impl AppState {
 /// 返回 `Router<AppState>`，或返回已绑定状态的无状态 `Router`，方可被
 /// `merge` 合并。
 pub fn create_router(state: AppState) -> Router {
+    let setup_token_reaper_pool = state.pool.clone();
+    tokio::spawn(async move {
+        crate::routes::setup_token::reap_stale_sessions(setup_token_reaper_pool).await;
+    });
     let auth_middleware = std::sync::Arc::new(services::auth::middleware_from_env(
         std::sync::Arc::new(state.pool.clone()),
     ));

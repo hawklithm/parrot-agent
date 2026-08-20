@@ -119,6 +119,18 @@ pub fn setup_token_routes() -> Router<AppState> {
         )
 }
 
+/// Crash-recovery backstop. The in-memory process map cannot survive a server
+/// restart, so stale durable active rows must be closed before a new login can
+/// claim the same owner/environment slot.
+pub async fn reap_stale_sessions(pool: sqlx::PgPool) {
+    if let Err(err) = sqlx::query("UPDATE claude_setup_token_sessions SET state = 'timed_out', failure_reason = 'server_restarted', failure_message = 'The Claude login session ended when the server restarted.', updated_at = NOW() WHERE state IN ('starting','awaiting_code','submitting','persisting')")
+        .execute(&pool)
+        .await
+    {
+        tracing::warn!(%err, "failed to reap stale Claude setup-token sessions");
+    }
+}
+
 fn owner(actor: &AuthorizationActor, company_id: Uuid) -> Result<String, Response> {
     crate::routes::assert_company_access(actor, company_id, true)
         .map_err(|status| status.into_response())?;
