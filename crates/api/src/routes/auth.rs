@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use services::auth::authorization_service::assert_instance_admin;
 use services::auth::{auth_cookie_prefix, AuthError, AuthorizationActor};
 use services::auth::{ActorSource, MembershipRole};
 
@@ -319,47 +320,182 @@ fn not_implemented(message: impl Into<String>) -> Response {
 
 /// AU1: POST /admin/users/:user_id/promote-instance-admin
 async fn promote_instance_admin(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Response, AuthError> {
-    Ok(not_implemented(format!(
-        "promote-instance-admin for user {} is not implemented; feature disabled",
-        user_id
-    )))
+    assert_instance_admin(&actor)?;
+    if !actor.is_board() {
+        return Err(AuthError::forbidden("Only a Board user can manage instance administrators"));
+    }
+    let target = PgAuthUserRepository::new(state.pool.clone())
+        .find_by_id(user_id)
+        .await
+        .map_err(|error| AuthError::internal(error.to_string()))?
+        .ok_or_else(|| AuthError::bad_request("Target user does not exist"))?;
+    let granted_by = actor
+        .principal_id()
+        .ok_or_else(|| AuthError::unauthenticated("Authenticated user is required"))?;
+    sqlx::query(
+        "INSERT INTO instance_user_roles (user_id, role)
+         VALUES ($1, 'instance_admin')
+         ON CONFLICT (user_id, role) DO NOTHING",
+    )
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| AuthError::internal(error.to_string()))?;
+    Ok(Json(json!({
+        "userId": target.id,
+        "email": target.email,
+        "isInstanceAdmin": true,
+        "grantedByUserId": granted_by,
+    }))
+    .into_response())
 }
 
 /// AU2: POST /admin/users/:user_id/demote-instance-admin
 async fn demote_instance_admin(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Response, AuthError> {
-    Ok(not_implemented(format!(
-        "demote-instance-admin for user {} is not implemented; feature disabled",
-        user_id
-    )))
+    assert_instance_admin(&actor)?;
+    if !actor.is_board() {
+        return Err(AuthError::forbidden("Only a Board user can manage instance administrators"));
+    }
+    if actor.principal_id() == Some(user_id) {
+        return Err(AuthError::conflict("An instance administrator cannot demote themselves"));
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM instance_user_roles WHERE user_id = $1 AND role = 'instance_admin'",
+    )
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| AuthError::internal(error.to_string()))?
+    .rows_affected();
+    if deleted == 0 {
+        return Err(AuthError::bad_request("Target user is not an instance administrator"));
+    }
+    Ok(Json(json!({
+        "userId": user_id,
+        "isInstanceAdmin": false,
+    }))
+    .into_response())
 }
 
 /// AU3: GET /admin/users/:user_id/company-access
 async fn get_user_company_access(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Response, AuthError> {
-    Ok(not_implemented(format!(
-        "company-access lookup for user {} is not implemented; feature disabled",
-        user_id
-    )))
+    assert_instance_admin(&actor)?;
+    let rows = sqlx::query(
+        "SELECT cm.company_id, c.name, c.issue_prefix,
+                cm.membership_role::text AS role, cm.status::text AS status,
+                cm.created_at, cm.updated_at
+         FROM company_memberships cm
+         JOIN companies c ON c.id = cm.company_id
+         WHERE cm.principal_type = 'user'::principal_type
+           AND cm.principal_id = $1
+         ORDER BY c.name ASC",
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| AuthError::internal(error.to_string()))?;
+    use sqlx::Row;
+    let access = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "companyId": row.get::<Uuid, _>("company_id"),
+                "companyName": row.get::<String, _>("name"),
+                "issuePrefix": row.get::<String, _>("issue_prefix"),
+                "role": row.get::<String, _>("role"),
+                "status": row.get::<String, _>("status"),
+                "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "userId": user_id, "access": access })).into_response())
 }
 
 /// AU4: PUT /admin/users/:user_id/company-access
 async fn update_user_company_access(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(user_id): Path<Uuid>,
-    Json(_payload): Json<serde_json::Value>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Result<Response, AuthError> {
-    Ok(not_implemented(format!(
-        "company-access update for user {} is not implemented; feature disabled",
-        user_id
-    )))
+    assert_instance_admin(&actor)?;
+    let company_id = payload
+        .get("companyId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AuthError::bad_request("companyId is required"))
+        .and_then(|value| Uuid::parse_str(value).map_err(|_| AuthError::bad_request("companyId must be a UUID")))?;
+    let role = payload
+        .get("role")
+        .and_then(|value| value.as_str())
+        .unwrap_or("operator");
+    let status = payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("active");
+    if !matches!(role, "owner" | "admin" | "operator" | "viewer") {
+        return Err(AuthError::bad_request("role must be owner, admin, operator, or viewer"));
+    }
+    if !matches!(status, "active" | "inactive") {
+        return Err(AuthError::bad_request("status must be active or inactive"));
+    }
+    let user_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM auth_users WHERE id = $1)")
+        .bind(user_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|error| AuthError::internal(error.to_string()))?;
+    if !user_exists {
+        return Err(AuthError::bad_request("Target user does not exist"));
+    }
+    let company_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM companies WHERE id = $1)")
+        .bind(company_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|error| AuthError::internal(error.to_string()))?;
+    if !company_exists {
+        return Err(AuthError::bad_request("Target company does not exist"));
+    }
+    let row = sqlx::query(
+        "INSERT INTO company_memberships
+             (company_id, principal_type, principal_id, membership_role, status)
+         VALUES ($1, 'user'::principal_type, $2, $3::membership_role, $4::company_membership_status)
+         ON CONFLICT (company_id, principal_type, principal_id)
+         DO UPDATE SET membership_role = EXCLUDED.membership_role,
+                       status = EXCLUDED.status,
+                       updated_at = NOW()
+         RETURNING id, company_id, membership_role::text AS role, status::text AS status,
+                   created_at, updated_at",
+    )
+    .bind(company_id)
+    .bind(user_id)
+    .bind(role)
+    .bind(status)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| AuthError::internal(error.to_string()))?;
+    use sqlx::Row;
+    Ok(Json(json!({
+        "userId": user_id,
+        "membershipId": row.get::<Uuid, _>("id"),
+        "companyId": row.get::<Uuid, _>("company_id"),
+        "role": row.get::<String, _>("role"),
+        "status": row.get::<String, _>("status"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    }))
+    .into_response())
 }
 
 /// AU5: POST /join-requests/:request_id/claim-api-key
