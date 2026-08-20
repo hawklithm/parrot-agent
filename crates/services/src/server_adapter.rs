@@ -485,30 +485,23 @@ impl ServerAdapterModule for CodexLocalAdapter {
     }
 
     async fn test_environment(&self, ctx: &AdapterEnvironmentTestContext) -> AdapterResult<TestEnvironmentResult> {
-        let checks = if let Some(model) = ctx.config.get("model").and_then(|v| v.as_str()) {
-            vec![
-                AdapterEnvironmentCheck {
-                    name: "adapter_available".to_string(),
-                    status: "pass".to_string(),
-                    message: Some("Codex Local adapter is available".to_string()),
-                },
-                AdapterEnvironmentCheck {
-                    name: "model_configured".to_string(),
-                    status: "pass".to_string(),
-                    message: Some(format!("Model configured: {}", model)),
-                },
-            ]
-        } else {
-            vec![AdapterEnvironmentCheck {
-                name: "adapter_available".to_string(),
-                status: "pass".to_string(),
-                message: Some("Codex Local adapter is available".to_string()),
-            }]
-        };
+        let command = ctx.config.get("command").and_then(|value| value.as_str()).filter(|value| !value.trim().is_empty()).unwrap_or("codex");
+        let mut probe = tokio::process::Command::new(command);
+        probe.arg("--version");
+        if let Some(cwd) = ctx.config.get("cwd").and_then(|value| value.as_str()).filter(|value| !value.trim().is_empty()) { probe.current_dir(cwd); }
+        let mut checks = Vec::new();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), probe.output()).await {
+            Ok(Ok(output)) if output.status.success() => checks.push(AdapterEnvironmentCheck { name: "codex_cli_resolvable".to_string(), status: "pass".to_string(), message: Some(String::from_utf8_lossy(&output.stdout).trim().to_string()) }),
+            Ok(Ok(output)) => checks.push(AdapterEnvironmentCheck { name: "codex_cli_unhealthy".to_string(), status: "fail".to_string(), message: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()) }),
+            Ok(Err(error)) => checks.push(AdapterEnvironmentCheck { name: "codex_cli_missing".to_string(), status: "fail".to_string(), message: Some(format!("Codex command '{}' is not executable: {}", command, error)) }),
+            Err(_) => checks.push(AdapterEnvironmentCheck { name: "codex_cli_probe_timeout".to_string(), status: "fail".to_string(), message: Some("Codex CLI version probe timed out after 5 seconds".to_string()) }),
+        }
+        if let Some(model) = ctx.config.get("model").and_then(|value| value.as_str()).filter(|value| !value.trim().is_empty()) { checks.push(AdapterEnvironmentCheck { name: "model_configured".to_string(), status: "pass".to_string(), message: Some(format!("Model configured: {}", model)) }); }
+        let status = if checks.iter().any(|check| check.status == "fail") { "fail" } else { "pass" };
 
         Ok(TestEnvironmentResult {
             adapter_type: ctx.adapter_type.clone(),
-            status: "pass".to_string(),
+            status: status.to_string(),
             checks,
             tested_at: chrono::Utc::now().to_rfc3339(),
         })
@@ -758,6 +751,19 @@ mod tests {
         let result = adapter.test_environment(&ctx).await.unwrap();
         assert_eq!(result.status, "fail");
         assert!(result.checks.iter().any(|check| check.name == "claude_cli_missing"));
+    }
+
+    #[tokio::test]
+    async fn codex_environment_probe_rejects_missing_command() {
+        let adapter = CodexLocalAdapter::new();
+        let ctx = AdapterEnvironmentTestContext {
+            company_id: "test-company".to_string(), adapter_type: "codex_local".to_string(),
+            config: serde_json::json!({"command": "parrot-command-that-does-not-exist"}),
+            execution_target: None, environment_name: None, deployment: None,
+        };
+        let result = adapter.test_environment(&ctx).await.unwrap();
+        assert_eq!(result.status, "fail");
+        assert!(result.checks.iter().any(|check| check.name == "codex_cli_missing"));
     }
 
     #[test]
