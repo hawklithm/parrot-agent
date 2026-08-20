@@ -33,6 +33,7 @@ pub enum AdapterType {
     Process,
     CodexLocal,
     OpenaiCompatible,
+    Http,
 }
 
 impl std::fmt::Display for AdapterType {
@@ -44,6 +45,7 @@ impl std::fmt::Display for AdapterType {
             AdapterType::Process => write!(f, "process"),
             AdapterType::CodexLocal => write!(f, "codex_local"),
             AdapterType::OpenaiCompatible => write!(f, "openai_compatible"),
+            AdapterType::Http => write!(f, "http"),
         }
     }
 }
@@ -59,6 +61,7 @@ impl std::str::FromStr for AdapterType {
             "process" => Ok(AdapterType::Process),
             "codex_local" => Ok(AdapterType::CodexLocal),
             "openai_compatible" => Ok(AdapterType::OpenaiCompatible),
+            "http" => Ok(AdapterType::Http),
             _ => Err(AdapterError::AdapterNotFound(s.to_string())),
         }
     }
@@ -301,6 +304,7 @@ pub fn create_default_server_adapter_registry() -> AdapterRegistry {
 
     // 注册所有内置适配器
     registry.register(Box::new(ProcessAdapter::new()));
+    registry.register(Box::new(HttpAdapter::new()));
     registry.register(Box::new(ClaudeLocalAdapter::new()));
     registry.register(Box::new(CodexLocalAdapter::new()));
 
@@ -538,6 +542,42 @@ impl ServerAdapterModule for CodexLocalAdapter {
     }
 }
 
+
+/// HTTP webhook adapter. Invocation is implemented by `HttpExecutor`; this
+/// registry module owns configuration discovery and environment diagnostics.
+pub struct HttpAdapter;
+
+impl HttpAdapter { pub fn new() -> Self { Self } }
+impl Default for HttpAdapter { fn default() -> Self { Self::new() } }
+
+#[async_trait]
+impl ServerAdapterModule for HttpAdapter {
+    fn adapter_type(&self) -> AdapterType { AdapterType::Http }
+    fn label(&self) -> &str { "HTTP Webhook" }
+    async fn list_models(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelInfo>> { Ok(Vec::new()) }
+    async fn get_model_profiles(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelProfile>> { Ok(Vec::new()) }
+    async fn test_environment(&self, ctx: &AdapterEnvironmentTestContext) -> AdapterResult<TestEnvironmentResult> {
+        let config = ctx.config.as_object();
+        let Some(url_value) = config.and_then(|value| value.get("url")).and_then(|value| value.as_str()).filter(|value| !value.trim().is_empty()) else {
+            return Ok(TestEnvironmentResult { adapter_type: ctx.adapter_type.clone(), status: "fail".to_string(), checks: vec![AdapterEnvironmentCheck { name: "http_url_missing".to_string(), status: "fail".to_string(), message: Some("HTTP adapter requires a URL".to_string()) }], tested_at: chrono::Utc::now().to_rfc3339() });
+        };
+        let parsed = match reqwest::Url::parse(url_value) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+            _ => return Ok(TestEnvironmentResult { adapter_type: ctx.adapter_type.clone(), status: "fail".to_string(), checks: vec![AdapterEnvironmentCheck { name: "http_url_invalid".to_string(), status: "fail".to_string(), message: Some("URL must use http or https".to_string()) }], tested_at: chrono::Utc::now().to_rfc3339() }),
+        };
+        let method = config.and_then(|value| value.get("method")).and_then(|value| value.as_str()).unwrap_or("POST").to_uppercase();
+        let mut checks = vec![AdapterEnvironmentCheck { name: "http_url_valid".to_string(), status: "pass".to_string(), message: Some(parsed.to_string()) }, AdapterEnvironmentCheck { name: "http_method_configured".to_string(), status: "pass".to_string(), message: Some(method) }];
+        let probe = reqwest::Client::new().head(parsed).timeout(std::time::Duration::from_secs(3)).send().await;
+        match probe {
+            Ok(response) if response.status().is_success() || response.status().as_u16() == 405 || response.status().as_u16() == 501 => checks.push(AdapterEnvironmentCheck { name: "http_endpoint_probe_ok".to_string(), status: "pass".to_string(), message: Some(format!("HTTP {}", response.status())) }),
+            Ok(response) => checks.push(AdapterEnvironmentCheck { name: "http_endpoint_probe_unexpected_status".to_string(), status: "warn".to_string(), message: Some(format!("HTTP {}", response.status())) }),
+            Err(error) => checks.push(AdapterEnvironmentCheck { name: "http_endpoint_probe_failed".to_string(), status: "warn".to_string(), message: Some(error.to_string()) }),
+        }
+        Ok(TestEnvironmentResult { adapter_type: ctx.adapter_type.clone(), status: "pass".to_string(), checks, tested_at: chrono::Utc::now().to_rfc3339() })
+    }
+    async fn detect_model(&self, _config: &serde_json::Value) -> AdapterResult<DetectModelResult> { Ok(DetectModelResult { model_id: None, confidence: 0.0, source: "http".to_string() }) }
+    fn supports_instructions_bundle(&self) -> InstructionsBundleSupport { InstructionsBundleSupport { supported: false, max_files: None, max_size_bytes: None } }
+}
 
 /// Process adapter (default local process adapter)
 #[allow(dead_code)]

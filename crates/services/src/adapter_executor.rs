@@ -132,6 +132,95 @@ pub struct LocalExecutor {
     running_processes: Arc<Mutex<HashMap<String, u32>>>,
 }
 
+/// HTTP webhook executor corresponding to Paperclip's `http` adapter.
+pub struct HttpExecutor {
+    client: reqwest::Client,
+    running_requests: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+}
+
+impl HttpExecutor {
+    pub fn new() -> Self {
+        Self { client: reqwest::Client::new(), running_requests: Arc::new(Mutex::new(HashMap::new())) }
+    }
+}
+
+impl Default for HttpExecutor {
+    fn default() -> Self { Self::new() }
+}
+
+#[async_trait]
+impl AdapterExecutor for HttpExecutor {
+    async fn execute(&self, ctx: AdapterExecutionContext) -> AdapterExecutionResult {
+        let Some(url) = ctx.config.get("url").and_then(|v| v.as_str()).filter(|v| !v.trim().is_empty()) else {
+            return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some("HTTP adapter missing url".to_string()), metadata: serde_json::json!({"run_id": ctx.run_id}) };
+        };
+        let method = ctx.config.get("method").and_then(|v| v.as_str()).unwrap_or("POST");
+        let method = match reqwest::Method::from_bytes(method.as_bytes()) {
+            Ok(method) => method,
+            Err(error) => return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some(format!("Invalid HTTP method: {}", error)), metadata: serde_json::json!({"run_id": ctx.run_id}) },
+        };
+        let timeout_ms = ctx.config.get("timeoutMs").or_else(|| ctx.config.get("timeout_ms")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let retries = ctx.config.get("retries").and_then(|v| v.as_u64()).unwrap_or(0).min(10);
+        let headers = ctx.config.get("headers").and_then(|v| v.as_object());
+        let mut payload = ctx.config.get("payloadTemplate").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        payload.insert("agentId".to_string(), serde_json::Value::String(ctx.agent_id.clone()));
+        payload.insert("runId".to_string(), serde_json::Value::String(ctx.run_id.clone()));
+        payload.insert("context".to_string(), ctx.config.get("context").cloned().unwrap_or(serde_json::Value::Null));
+
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        self.running_requests.lock().await.insert(ctx.run_id.clone(), cancel_tx);
+        let mut last_error = None;
+        for attempt in 0..=retries {
+            let mut request = self.client.request(method.clone(), url).header(reqwest::header::CONTENT_TYPE, "application/json").json(&payload);
+            if let Some(headers) = headers {
+                for (key, value) in headers {
+                    if let Some(value) = value.as_str() { request = request.header(key, value); }
+                }
+            }
+            let response = if timeout_ms > 0 {
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        self.running_requests.lock().await.remove(&ctx.run_id);
+                        return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some("HTTP request cancelled".to_string()), metadata: serde_json::json!({"run_id": ctx.run_id, "cancelled": true}) };
+                    }
+                    result = tokio::time::timeout(Duration::from_millis(timeout_ms), request.send()) => result.map_err(|_| "timeout".to_string()).and_then(|result| result.map_err(|e| e.to_string()))
+                }
+            } else {
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        self.running_requests.lock().await.remove(&ctx.run_id);
+                        return AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: Some("HTTP request cancelled".to_string()), metadata: serde_json::json!({"run_id": ctx.run_id, "cancelled": true}) };
+                    }
+                    result = request.send() => result.map_err(|e| e.to_string())
+                }
+            };
+            match response {
+                Ok(response) => {
+                    let status_code = response.status().as_u16();
+                    let body = response.text().await.unwrap_or_default();
+                    if (200..300).contains(&status_code) {
+                        self.running_requests.lock().await.remove(&ctx.run_id);
+                        if let Some(sink) = &ctx.log_sink { sink.on_log(StdioKind::Stdout, &body).await; }
+                        return AdapterExecutionResult { status: ExecutionStatus::Ok, exit_code: Some(0), output: body, error: None, metadata: serde_json::json!({"run_id": ctx.run_id, "status": status_code, "attempt": attempt + 1}) };
+                    }
+                    last_error = Some(format!("HTTP invoke failed with status {}: {}", status_code, body));
+                    if status_code < 500 && status_code != 429 { break; }
+                }
+                Err(error) => {
+                    last_error = Some(if error == "timeout" { format!("HTTP request timed out after {}ms", timeout_ms) } else { format!("HTTP request failed: {}", error) });
+                }
+            }
+            if attempt < retries { tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await; }
+        }
+        self.running_requests.lock().await.remove(&ctx.run_id);
+        AdapterExecutionResult { status: ExecutionStatus::Error, exit_code: None, output: String::new(), error: last_error, metadata: serde_json::json!({"run_id": ctx.run_id}) }
+    }
+
+    async fn cancel(&self, run_id: &str) {
+        if let Some(sender) = self.running_requests.lock().await.remove(run_id) { let _ = sender.send(()); }
+    }
+}
+
 impl LocalExecutor {
     pub fn new() -> Self {
         Self {
@@ -443,5 +532,75 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
         assert_eq!(result.status, ExecutionStatus::Error);
         assert!(result.exit_code.is_some() || result.error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn test_server(status: u16, body: &'static str, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 8192];
+            let size = socket.read(&mut request).await.unwrap();
+            if status == 200 { assert!(String::from_utf8_lossy(&request[..size]).contains("agent-1")); }
+            tokio::time::sleep(delay).await;
+            let response = format!("HTTP/1.1 {} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", status, body.len(), body);
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{}", address)
+    }
+
+    fn context(run_id: &str, url: String, extra: serde_json::Value) -> AdapterExecutionContext {
+        let mut config = serde_json::json!({"url": url, "payloadTemplate": {"kind": "test"}});
+        if let (Some(base), Some(extra)) = (config.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra { base.insert(key.clone(), value.clone()); }
+        }
+        AdapterExecutionContext {
+            run_id: run_id.to_string(), agent_id: "agent-1".to_string(), config,
+            working_dir: None,
+            execution_target: ExecutionTargetConfig { target_type: ExecutionTargetType::Local, connection_info: None, asset_sync_config: None },
+            log_sink: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_posts_payload_and_maps_success() {
+        let url = test_server(200, "{\"ok\":true}", Duration::ZERO).await;
+        let result = HttpExecutor::new().execute(context("http-success", url, serde_json::json!({}))).await;
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn http_maps_non_success_and_timeout() {
+        let url = test_server(503, "down", Duration::ZERO).await;
+        let result = HttpExecutor::new().execute(context("http-error", url, serde_json::json!({}))).await;
+        assert_eq!(result.status, ExecutionStatus::Error);
+        assert!(result.error.as_deref().unwrap_or_default().contains("503"));
+
+        let url = test_server(200, "slow", Duration::from_millis(200)).await;
+        let result = HttpExecutor::new().execute(context("http-timeout", url, serde_json::json!({"timeoutMs": 20}))).await;
+        assert_eq!(result.status, ExecutionStatus::Error);
+        assert!(result.error.as_deref().unwrap_or_default().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn http_cancel_aborts_in_flight_request() {
+        let url = test_server(200, "slow", Duration::from_secs(5)).await;
+        let executor = Arc::new(HttpExecutor::new());
+        let task_executor = executor.clone();
+        let task = tokio::spawn(async move { task_executor.execute(context("http-cancel", url, serde_json::json!({}))).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        executor.cancel("http-cancel").await;
+        let result = tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+        assert_eq!(result.status, ExecutionStatus::Error);
+        assert_eq!(result.metadata.get("cancelled"), Some(&serde_json::Value::Bool(true)));
     }
 }
