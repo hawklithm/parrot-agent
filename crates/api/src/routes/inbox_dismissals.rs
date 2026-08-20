@@ -42,7 +42,7 @@ async fn list_inbox_dismissals(
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT item_key, kind, dismissed_at, snoozed_until \
-         FROM inbox_dismissals WHERE company_id = $1 AND user_id = $2 ORDER BY created_at DESC",
+         FROM inbox_dismissals WHERE company_id = $1 AND user_id = $2 ORDER BY updated_at DESC",
     )
     .bind(company_id)
     .bind(user_id)
@@ -113,10 +113,10 @@ async fn create_inbox_dismissal(
     };
     let now = chrono::Utc::now();
     sqlx::query(
-        "INSERT INTO inbox_dismissals (company_id, user_id, item_key, kind, dismissed_at, snoozed_until) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+        "INSERT INTO inbox_dismissals (company_id, user_id, item_key, kind, dismissed_at, snoozed_until, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $5) \
          ON CONFLICT (company_id, user_id, item_key) DO UPDATE \
-         SET kind = EXCLUDED.kind, dismissed_at = EXCLUDED.dismissed_at, snoozed_until = EXCLUDED.snoozed_until",
+         SET kind = EXCLUDED.kind, dismissed_at = EXCLUDED.dismissed_at, snoozed_until = EXCLUDED.snoozed_until, updated_at = EXCLUDED.updated_at",
     )
     .bind(company_id)
     .bind(user_id)
