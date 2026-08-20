@@ -18,7 +18,7 @@ pub fn instance_settings_routes() -> Router<AppState> {
         .route("/instance/settings/experimental", get(get_experimental_settings).patch(update_experimental_settings))
         .route("/instance/settings/experimental/issue-graph-liveness-auto-recovery/preview", post(preview_auto_recovery))
         .route("/instance/settings/experimental/issue-graph-liveness-auto-recovery/run", post(run_auto_recovery))
-        .route("/instance/database-backups", post(create_database_backup))
+        .route("/instance/database-backups", get(get_database_backup_health).post(create_database_backup))
 }
 
 /// IS1: GET /instance/settings
@@ -173,6 +173,20 @@ async fn create_database_backup(
     .await;
 
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
+}
+
+/// IS10: GET /instance/database-backups
+async fn get_database_backup_health(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
+    let status = state
+        .instance_settings_service
+        .get_database_backup_health()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
 }
 
 #[cfg(test)]

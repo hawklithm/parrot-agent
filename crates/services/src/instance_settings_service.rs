@@ -4,10 +4,14 @@
 //! 当前使用内存存储，后续可迁移到数据库。
 
 use crate::task_watchdog::WatchdogService;
+use crate::database_backup_health_service::{
+    inspect_database_backup_health, DatabaseBackupHealthStatus, InspectDatabaseBackupHealthOptions,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use std::sync::Arc;
+use std::{path::{Path, PathBuf}, sync::Arc, time::SystemTime};
+use tokio::process::Command;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -101,6 +105,9 @@ pub struct AutoRecoveryResult {
 pub struct DatabaseBackupResult {
     pub backup_id: Uuid,
     pub status: String,
+    pub backup_file: String,
+    pub size_bytes: u64,
+    pub pruned_count: u32,
 }
 
 /// 实例设置服务接口
@@ -141,6 +148,9 @@ pub trait InstanceSettingsService: Send + Sync {
 
     /// 创建数据库备份
     async fn create_database_backup(&self) -> Result<DatabaseBackupResult, String>;
+
+    /// 查询数据库备份健康状态
+    async fn get_database_backup_health(&self) -> Result<DatabaseBackupHealthStatus, String>;
 }
 
 /// 内存实现的实例设置服务
@@ -236,6 +246,28 @@ impl DefaultInstanceSettingsService {
         .map_err(|e| e.to_string())?;
         
         Ok(())
+    }
+
+    fn database_backup_health_options() -> InspectDatabaseBackupHealthOptions {
+        let backup_dir = std::env::var("PARROT_DATABASE_BACKUP_DIR")
+            .unwrap_or_else(|_| "data/backups".to_string());
+        let max_age_hours = std::env::var("PARROT_DATABASE_BACKUP_MAX_AGE_HOURS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(24.0);
+        let alert_file = std::env::var("PARROT_DATABASE_BACKUP_FAILURE_FILE").ok();
+        InspectDatabaseBackupHealthOptions {
+            enabled: std::env::var("PARROT_DATABASE_BACKUP_ENABLED")
+                .ok()
+                .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+                .unwrap_or(true),
+            backup_dir,
+            max_age_hours,
+            alert_file,
+            alert_files: None,
+            now: None,
+        }
     }
 }
 
@@ -419,6 +451,111 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
     }
 
     async fn create_database_backup(&self) -> Result<DatabaseBackupResult, String> {
-        Err("database backup is not configured; configure the deployment backup worker before requesting a backup".to_string())
+        let connection_string = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "database backup is not configured; DATABASE_URL is required".to_string())?;
+        let backup_dir = std::env::var("PARROT_DATABASE_BACKUP_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("data/backups"));
+        tokio::fs::create_dir_all(&backup_dir)
+            .await
+            .map_err(|error| format!("failed to create database backup directory: {}", error))?;
+
+        let backup_id = Uuid::new_v4();
+        let file_name = format!(
+            "parrot-{}-{}.sql",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+            backup_id.simple()
+        );
+        let backup_path = backup_dir.join(file_name);
+        let pg_dump = std::env::var("PARROT_PG_DUMP")
+            .unwrap_or_else(|_| "pg_dump".to_string());
+        let output = Command::new(pg_dump)
+            .args(["--no-owner", "--no-privileges", "--format=plain", "--file"])
+            .arg(&backup_path)
+            .arg(&connection_string)
+            .output()
+            .await
+            .map_err(|error| format!("failed to start pg_dump: {}", error))?;
+        if !output.status.success() {
+            let _ = tokio::fs::remove_file(&backup_path).await;
+            let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!(
+                "pg_dump exited with code {}{}",
+                output.status.code().unwrap_or(-1),
+                if diagnostics.is_empty() { String::new() } else { format!(": {}", diagnostics) }
+            ));
+        }
+
+        let size_bytes = tokio::fs::metadata(&backup_path)
+            .await
+            .map_err(|error| format!("failed to stat database backup: {}", error))?
+            .len();
+        let retention_days = std::env::var("PARROT_DATABASE_BACKUP_RETENTION_DAYS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(7);
+        let pruned_count = prune_database_backups(&backup_dir, retention_days)
+            .await
+            .map_err(|error| format!("failed to prune database backups: {}", error))?;
+        Ok(DatabaseBackupResult {
+            backup_id,
+            status: "completed".to_string(),
+            backup_file: backup_path.to_string_lossy().to_string(),
+            size_bytes,
+            pruned_count,
+        })
+    }
+
+    async fn get_database_backup_health(&self) -> Result<DatabaseBackupHealthStatus, String> {
+        Ok(inspect_database_backup_health(
+            Self::database_backup_health_options(),
+        ))
+    }
+}
+
+async fn prune_database_backups(directory: &Path, retention_days: u64) -> std::io::Result<u32> {
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    let cutoff = SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(retention_days.saturating_mul(86_400)))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut removed = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("parrot-") || !name.ends_with(".sql") {
+            continue;
+        }
+        let metadata = entry.metadata().await?;
+        if metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH) < cutoff {
+            tokio::fs::remove_file(entry.path()).await?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prune_database_backups;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn prune_removes_only_parrot_sql_backups() {
+        let directory = tempdir().unwrap();
+        tokio::fs::write(directory.path().join("parrot-old.sql"), "old")
+            .await
+            .unwrap();
+        tokio::fs::write(directory.path().join("keep.txt"), "keep")
+            .await
+            .unwrap();
+
+        let removed = prune_database_backups(directory.path(), 0).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(!directory.path().join("parrot-old.sql").exists());
+        assert!(directory.path().join("keep.txt").exists());
     }
 }
