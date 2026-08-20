@@ -12,8 +12,12 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
             Ok(())
         }
         Some("doctor") => {
-            let config = CliConfig::load()?;
-            checks::run_doctor(&config)
+            let (config_path, json) = parse_doctor_args(&args[1..])?;
+            let config = match config_path {
+                Some(path) => CliConfig::load_from(Some(path))?,
+                None => CliConfig::load()?,
+            };
+            checks::run_doctor(&config, json)
         }
         Some("configure") => configure(&args[1..]),
         Some(command) => bail!("unknown command '{command}'. Run 'parrot --help' for usage."),
@@ -22,10 +26,33 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
 
 fn print_help() -> Result<()> {
     println!(
-        "parrot {}\n\nUsage:\n  parrot --version\n  parrot doctor\n  parrot configure --server-url URL [--api-token TOKEN] [--config PATH]\n  parrot help\n\nEnvironment:\n  PARROT_SERVER_URL  Server base URL (default: http://localhost:3100)\n  PARROT_API_TOKEN   Optional API token; environment overrides config file\n  PARROT_CONFIG      Optional config file path",
+        "parrot {}\n\nUsage:\n  parrot --version\n  parrot doctor [--config PATH] [--json]\n  parrot configure --server-url URL [--api-token TOKEN] [--config PATH]\n  parrot help\n\nEnvironment:\n  PARROT_SERVER_URL  Server base URL (default: http://localhost:3100)\n  PARROT_API_TOKEN   Optional API token; environment overrides config file\n  PARROT_CONFIG      Optional config file path",
         env!("CARGO_PKG_VERSION")
     );
     Ok(())
+}
+
+fn parse_doctor_args(args: &[String]) -> Result<(Option<PathBuf>, bool)> {
+    let mut config_path = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --config"))?;
+                config_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            flag => bail!("unknown doctor option '{flag}'"),
+        }
+    }
+    Ok((config_path, json))
 }
 
 fn configure(args: &[String]) -> Result<()> {
@@ -35,7 +62,9 @@ fn configure(args: &[String]) -> Result<()> {
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
-        let value = args.get(index + 1).ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))?;
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))?;
         match flag {
             "--server-url" => server_url = Some(value.clone()),
             "--api-token" => api_token = Some(value.clone()),
@@ -44,7 +73,8 @@ fn configure(args: &[String]) -> Result<()> {
         }
         index += 2;
     }
-    let path = config_path.ok_or_else(|| anyhow::anyhow!("--config or PARROT_CONFIG is required"))?;
+    let path =
+        config_path.ok_or_else(|| anyhow::anyhow!("--config or PARROT_CONFIG is required"))?;
     let url = server_url.unwrap_or_else(|| "http://localhost:3100".to_owned());
     let config = CliConfig {
         server_url: url,

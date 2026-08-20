@@ -1,5 +1,8 @@
 use anyhow::{bail, Context, Result};
-use std::{env, fs, path::{Path, PathBuf}};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliConfig {
@@ -10,11 +13,14 @@ pub struct CliConfig {
 
 impl CliConfig {
     pub fn load() -> Result<Self> {
-        let config_path = env::var_os("PARROT_CONFIG").map(PathBuf::from);
+        Self::load_from(env::var_os("PARROT_CONFIG").map(PathBuf::from))
+    }
+
+    pub fn load_from(config_path: Option<PathBuf>) -> Result<Self> {
         let file_values = config_path
             .as_deref()
             .map(read_config_file)
-            .transpose()? 
+            .transpose()?
             .unwrap_or_default();
         let server_url = env::var("PARROT_SERVER_URL")
             .ok()
@@ -27,18 +33,26 @@ impl CliConfig {
             api_token: env::var("PARROT_API_TOKEN")
                 .ok()
                 .filter(|v| !v.is_empty())
-                .or_else(|| file_values.get("api_token").cloned().filter(|v| !v.is_empty())),
+                .or_else(|| {
+                    file_values
+                        .get("api_token")
+                        .cloned()
+                        .filter(|v| !v.is_empty())
+                }),
             config_path,
         })
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = self
-            .config_path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("PARROT_CONFIG must be set to save CLI configuration"))?;
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        let path = self.config_path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("PARROT_CONFIG must be set to save CLI configuration")
+        })?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let mut contents = format!("server_url={}\n", self.server_url);
         if let Some(token) = &self.api_token {
@@ -53,8 +67,8 @@ fn read_config_file(path: &Path) -> Result<std::collections::BTreeMap<String, St
     if !path.exists() {
         return Ok(std::collections::BTreeMap::new());
     }
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut values = std::collections::BTreeMap::new();
     for (line_number, line) in contents.lines().enumerate() {
         let line = line.trim();
@@ -62,7 +76,11 @@ fn read_config_file(path: &Path) -> Result<std::collections::BTreeMap<String, St
             continue;
         }
         let (key, value) = line.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("invalid config line {} in {}", line_number + 1, path.display())
+            anyhow::anyhow!(
+                "invalid config line {} in {}",
+                line_number + 1,
+                path.display()
+            )
         })?;
         if !matches!(key.trim(), "server_url" | "api_token") {
             bail!("unknown config key '{}' in {}", key.trim(), path.display());
@@ -108,7 +126,11 @@ mod tests {
     fn reads_known_config_keys_and_preserves_equals_in_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config");
-        fs::write(&path, "server_url=https://example.test\napi_token=abc=def\n").unwrap();
+        fs::write(
+            &path,
+            "server_url=https://example.test\napi_token=abc=def\n",
+        )
+        .unwrap();
         let values = read_config_file(&path).unwrap();
         assert_eq!(values.get("server_url").unwrap(), "https://example.test");
         assert_eq!(values.get("api_token").unwrap(), "abc=def");
