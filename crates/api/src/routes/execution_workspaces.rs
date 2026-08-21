@@ -309,6 +309,7 @@ async fn get_close_readiness(
 ///
 async fn list_workspace_operations(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ExecutionWorkspaceError> {
     let workspace = sqlx::query("SELECT company_id FROM execution_workspaces WHERE id = $1")
@@ -318,6 +319,9 @@ async fn list_workspace_operations(
         .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?
         .ok_or(ExecutionWorkspaceError::NotFound(id))?;
     let company_id: Uuid = workspace.get("company_id");
+    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| {
+        ExecutionWorkspaceError::Forbidden("Workspace company access denied".to_string())
+    })?;
     let rows = sqlx::query(
         "SELECT id, phase, command, cwd, status, exit_code, log_store, log_ref, log_bytes, log_sha256, log_compressed, stdout_excerpt, stderr_excerpt, metadata, started_at, finished_at, created_at, updated_at FROM workspace_operations WHERE execution_workspace_id = $1 ORDER BY started_at DESC",
     ).bind(id).fetch_all(&state.pool).await
