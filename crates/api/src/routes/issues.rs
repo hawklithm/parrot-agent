@@ -1961,19 +1961,6 @@ async fn checkout_issue(
     let service = state.issue_service.clone();
     let company_id = scoped_issue_company(&state, &actor, id).await?;
 
-    if state
-        .issue_tree_control_service
-        .get_pause_state(id)
-        .await
-        .map_err(|error| {
-            tracing::error!(error = %error, issue_id = %id, "failed to evaluate issue tree pause hold");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .is_some()
-    {
-        return Err(StatusCode::CONFLICT);
-    }
-
     if let AuthorizationActor::Agent {
         agent_id, run_id, ..
     } = &actor
@@ -2005,6 +1992,79 @@ async fn checkout_issue(
     }
     let checkout_agent_id = input.agent_id;
     let checkout_run_id = input.checkout_run_id;
+
+    if state
+        .issue_tree_control_service
+        .get_pause_state(id)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, issue_id = %id, "failed to evaluate issue tree pause hold");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .is_some()
+    {
+        let interaction_allowed = if let Some(agent_id) = checkout_agent_id
+        {
+            let context: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT context_snapshot
+                 FROM heartbeat_runs
+                 WHERE id = $1 AND company_id = $2 AND agent_id = $3",
+            )
+            .bind(checkout_run_id)
+            .bind(company_id)
+            .bind(agent_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let Some(context) = context else {
+                return Err(StatusCode::CONFLICT);
+            };
+            let reason = context.get("wakeReason").and_then(|value| value.as_str());
+            let source = context.get("source").and_then(|value| value.as_str());
+            let comment_id = context
+                .get("commentId")
+                .and_then(|value| value.as_str())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok());
+            let expected_source = match reason {
+                Some("issue_commented") => Some("issue.comment"),
+                Some("issue_reopened_via_comment") => Some("issue.comment.reopen"),
+                Some("issue_comment_mentioned") => Some("comment.mention"),
+                _ => None,
+            };
+            if source != expected_source || comment_id.is_none() {
+                false
+            } else {
+                let requested_type = context
+                    .get("requestedByActorType")
+                    .and_then(|value| value.as_str());
+                let requested_id = context
+                    .get("requestedByActorId")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok());
+                let comment = sqlx::query_as::<_, (String, Option<uuid::Uuid>)>(
+                    "SELECT actor_type::text, actor_id
+                     FROM issue_comments
+                     WHERE id = $1 AND company_id = $2 AND issue_id = $3",
+                )
+                .bind(comment_id)
+                .bind(company_id)
+                .bind(id)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                comment.is_some_and(|(actor_type, actor_id)| {
+                    Some(actor_type) == requested_type.map(str::to_string)
+                        && actor_id.is_some()
+                        && actor_id == requested_id
+                })
+            }
+        } else {
+            false
+        };
+        if !interaction_allowed {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
 
     service
         .checkout(id, company_id, input)

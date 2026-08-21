@@ -326,16 +326,23 @@ pub async fn add_comment(
                     issue_id,
                     company_id,
                     HeartbeatWakeupOptions {
-                        source: Some("on_demand".to_string()),
+                        source: Some("issue.comment.reopen".to_string()),
                         trigger_detail: Some("system".to_string()),
-                        reason: Some("issue_comment_added".to_string()),
+                        reason: Some("issue_reopened_via_comment".to_string()),
+                        requested_by_actor_type: Some(format!("{actor_type:?}").to_lowercase()),
+                        requested_by_actor_id: actor_id,
                         payload: Some(serde_json::json!({
                             "issueId": issue_id,
+                            "commentId": comment.id,
                             "mutation": "comment_reopen",
                         })),
                         context_snapshot: Some(serde_json::json!({
                             "issueId": issue_id,
-                            "source": "issue.comment",
+                            "source": "issue.comment.reopen",
+                            "wakeReason": "issue_reopened_via_comment",
+                            "commentId": comment.id,
+                            "requestedByActorType": format!("{actor_type:?}").to_lowercase(),
+                            "requestedByActorId": actor_id,
                         })),
                         ..Default::default()
                     },

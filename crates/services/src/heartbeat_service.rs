@@ -1814,6 +1814,120 @@ impl DefaultHeartbeatService {
     }
 }
 
+impl DefaultHeartbeatService {
+    async fn wakeup_with_context(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        options: HeartbeatWakeupOptions,
+        idempotency_row_id: Option<Uuid>,
+    ) -> Result<(), HeartbeatError> {
+        let _agent = self.load_agent(agent_id).await?;
+        let active_run: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM heartbeat_runs WHERE company_id = $1 AND agent_id = $2 AND status IN ('queued','running') AND (context_snapshot->>'issueId' = $3 OR context_snapshot->>'taskId' = $3) ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(issue_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        if active_run.is_some() {
+            return Ok(());
+        }
+
+        let mut context = options
+            .context_snapshot
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = context.as_object_mut() {
+            object.insert("issueId".to_string(), serde_json::json!(issue_id));
+        } else {
+            context = serde_json::json!({ "issueId": issue_id });
+        }
+        let run_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot) VALUES ($1,$2,$3,'queued',$4) RETURNING id",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind("on_demand")
+        .bind(&context)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        publish_live_event(
+            &self.sse_service,
+            company_id,
+            "heartbeat.run.queued",
+            serde_json::json!({
+                "runId": run_id,
+                "agentId": agent_id,
+                "issueId": issue_id,
+                "status": "queued",
+                "invocationSource": "on_demand",
+            }),
+        )
+        .await;
+
+        let mut payload = options
+            .payload
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("issueId".to_string(), serde_json::json!(issue_id));
+            object.insert("runId".to_string(), serde_json::json!(run_id));
+        } else {
+            payload = serde_json::json!({ "issueId": issue_id, "runId": run_id });
+        }
+        if let Some(request_id) = idempotency_row_id {
+            sqlx::query(
+                "UPDATE agent_wakeup_requests
+                 SET status = 'dispatched', payload = $2, source = $3, trigger_detail = $4,
+                     reason = $5, requested_by_actor_type = $6, requested_by_actor_id = $7,
+                     updated_at = NOW()
+                 WHERE id = $1",
+            )
+            .bind(request_id)
+            .bind(&payload)
+            .bind(options.source.as_deref())
+            .bind(options.trigger_detail.as_deref())
+            .bind(options.reason.as_deref())
+            .bind(options.requested_by_actor_type.as_deref())
+            .bind(options.requested_by_actor_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        } else {
+            sqlx::query(
+                "INSERT INTO agent_wakeup_requests
+                 (company_id, agent_id, status, payload, source, trigger_detail, reason,
+                  requested_by_actor_type, requested_by_actor_id, updated_at)
+                 VALUES ($1,$2,'dispatched',$3,$4,$5,$6,$7,$8,NOW())",
+            )
+            .bind(company_id)
+            .bind(agent_id)
+            .bind(&payload)
+            .bind(options.source.as_deref())
+            .bind(options.trigger_detail.as_deref())
+            .bind(options.reason.as_deref())
+            .bind(options.requested_by_actor_type.as_deref())
+            .bind(options.requested_by_actor_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        }
+        sqlx::query("UPDATE issues SET assignee_agent_id = $2, assignee_user_id = NULL, status = CASE WHEN status IN ('todo','backlog') THEN 'in_progress'::issue_status ELSE status END, checkout_run_id = $3, execution_run_id = $3, started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND company_id = $4 AND (assignee_agent_id IS NULL OR assignee_agent_id = $2) AND status NOT IN ('done','cancelled')")
+            .bind(issue_id).bind(agent_id).bind(run_id).bind(company_id)
+            .execute(&self.pool).await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        sqlx::query("UPDATE agents SET status = 'running', updated_at = NOW() WHERE id = $1")
+            .bind(agent_id).execute(&self.pool).await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        let service = self.clone_for_task();
+        tokio::spawn(async move { service.execute_run(run_id, agent_id, issue_id, company_id).await; });
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl HeartbeatService for DefaultHeartbeatService {
     async fn wakeup_with_options(
@@ -2001,7 +2115,9 @@ impl HeartbeatService for DefaultHeartbeatService {
             }
         }
 
-        let result = self.wakeup(agent_id, issue_id, company_id).await;
+        let result = self
+            .wakeup_with_context(agent_id, issue_id, company_id, options, idempotency_row_id)
+            .await;
         if let (Some(idempotency_row_id), Err(error)) = (idempotency_row_id, &result) {
             let _ = sqlx::query(
                 "UPDATE agent_wakeup_requests
@@ -2022,56 +2138,16 @@ impl HeartbeatService for DefaultHeartbeatService {
         issue_id: Uuid,
         company_id: Uuid,
     ) -> Result<(), HeartbeatError> {
-        let _agent = self.load_agent(agent_id).await?;
-        let active_run: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM heartbeat_runs WHERE company_id = $1 AND agent_id = $2 AND status IN ('queued','running') AND (context_snapshot->>'issueId' = $3 OR context_snapshot->>'taskId' = $3) ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(company_id)
-        .bind(agent_id)
-        .bind(issue_id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-        if active_run.is_some() {
-            return Ok(());
-        }
-        let run_id: Uuid = sqlx::query_scalar("INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot) VALUES ($1,$2,'on_demand','queued',$3) RETURNING id")
-            .bind(company_id).bind(agent_id).bind(serde_json::json!({"issueId": issue_id})).fetch_one(&self.pool).await.map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-        publish_live_event(
-            &self.sse_service,
+        self.wakeup_with_context(
+            agent_id,
+            issue_id,
             company_id,
-            "heartbeat.run.queued",
-            serde_json::json!({
-                "runId": run_id,
-                "agentId": agent_id,
-                "issueId": issue_id,
-                "status": "queued",
-                "invocationSource": "on_demand",
-            }),
-        ).await;
-        sqlx::query("INSERT INTO agent_wakeup_requests (company_id, agent_id, status, payload) VALUES ($1,$2,'dispatched',$3)")
-            .bind(company_id).bind(agent_id).bind(serde_json::json!({"issueId": issue_id, "runId": run_id})).execute(&self.pool).await.map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-        sqlx::query("UPDATE issues SET assignee_agent_id = $2, assignee_user_id = NULL, status = CASE WHEN status IN ('todo','backlog') THEN 'in_progress'::issue_status ELSE status END, checkout_run_id = $3, execution_run_id = $3, started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND company_id = $4 AND (assignee_agent_id IS NULL OR assignee_agent_id = $2) AND status NOT IN ('done','cancelled')")
-            .bind(issue_id)
-            .bind(agent_id)
-            .bind(run_id)
-            .bind(company_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-        sqlx::query("UPDATE agents SET status = 'running', updated_at = NOW() WHERE id = $1")
-            .bind(agent_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-        let service = self.clone_for_task();
-        tokio::spawn(async move {
-            service
-                .execute_run(run_id, agent_id, issue_id, company_id)
-                .await;
-        });
-        Ok(())
+            HeartbeatWakeupOptions::default(),
+            None,
+        )
+        .await
     }
+
 
     async fn cancel_run(
         &self,
