@@ -514,6 +514,39 @@ async fn runtime_command(
             })?;
     }
 
+    let phase = match action.as_str() {
+        "start" => "runtime_start",
+        "stop" => "runtime_stop",
+        "restart" => "runtime_restart",
+        "run" => "command_execution",
+        _ => unreachable!("runtime action was validated above"),
+    };
+    let command_id = body.workspace_command_id.clone();
+    let runtime_service_id = body.runtime_service_id.clone();
+    let service_index = body.service_index;
+    let operation = sqlx::query(
+        r#"INSERT INTO workspace_operations
+              (company_id, execution_workspace_id, phase, command, metadata)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id, status, started_at"#,
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(phase)
+    .bind(command_id)
+    .bind(json!({
+        "runtimeServiceId": runtime_service_id,
+        "serviceIndex": service_index,
+        "action": action.clone(),
+        "providerExecution": "pending",
+    }))
+    .fetch_one(pool)
+    .await
+    .map_err(|error| ExecutionWorkspaceError::Database(error.to_string()))?;
+    let operation_id: Uuid = operation.get("id");
+    let operation_status: String = operation.get("status");
+    let operation_started_at: chrono::DateTime<chrono::Utc> = operation.get("started_at");
+
     Ok(Json(json!({
         "workspaceId": id,
         "action": action,
@@ -521,6 +554,9 @@ async fn runtime_command(
         "runtimeServiceId": body.runtime_service_id,
         "serviceIndex": body.service_index,
         "accepted": true,
+        "operationId": operation_id,
+        "operationStatus": operation_status,
+        "startedAt": operation_started_at,
     })))
 }
 
