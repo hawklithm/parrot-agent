@@ -160,6 +160,14 @@ pub trait Actor: Send + Sync {
                     .get("can_promote_low_trust")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                Action::BuiltInAgentsProvision => perms
+                    .get("can_provision_built_in_agents")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                Action::BuiltInRoutineControl => perms
+                    .get("can_control_built_in_routine")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 _ => false, // Unknown actions default to denied
             }
         } else {

@@ -314,7 +314,11 @@ impl AccessService for DefaultAccessService {
 
     async fn assert_can_provision_built_in_agents(&self, actor: &dyn Actor, company_id: Uuid) -> Result<(), AccessError> {
         self.assert_company_access(actor, company_id).await?;
-        // TODO: 添加额外的权限检查
+        if actor.is_agent() && !actor.has_permission(Action::BuiltInAgentsProvision) {
+            return Err(AccessError::InsufficientPermissions(
+                "Missing built_in_agents:provision permission".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -455,10 +459,28 @@ impl AccessService for DefaultAccessService {
         project_id: Uuid,
         company_id: Uuid,
     ) -> Result<(), AccessError> {
-        let _ = (project_id, company_id);
-        // TODO: 查询数据库验证 project.company_id == company_id
-        // 这里需要 ProjectRepository，简化实现中假设验证通过
-        Ok(())
+        let pool = self.pool.as_ref().ok_or_else(|| {
+            AccessError::Internal("Access service requires a database pool".to_string())
+        })?;
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM projects
+                  WHERE id = $1 AND company_id = $2
+             )",
+        )
+        .bind(project_id)
+        .bind(company_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| AccessError::Internal(e.to_string()))?;
+        if exists {
+            Ok(())
+        } else {
+            Err(AccessError::ResourceNotFound(format!(
+                "Project {} not found in company {}",
+                project_id, company_id
+            )))
+        }
     }
 
     async fn assert_board(&self, actor: &dyn Actor) -> Result<(), AccessError> {
@@ -513,5 +535,103 @@ mod tests {
 
         assert!(service.assert_can_create_agents_for_company(&agent_with_perm, company_id).await.is_ok());
         assert!(service.assert_can_create_agents_for_company(&agent_without_perm, company_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_built_in_agent_provision_requires_agent_permission() {
+        let service = DefaultAccessService::new();
+        let company_id = Uuid::new_v4();
+        let agent = AgentActor {
+            agent_id: Uuid::new_v4(),
+            company_id,
+            permissions: serde_json::json!({
+                "can_provision_built_in_agents": true
+            }),
+        };
+        let denied = AgentActor {
+            agent_id: Uuid::new_v4(),
+            company_id,
+            permissions: serde_json::json!({}),
+        };
+
+        assert!(service
+            .assert_can_provision_built_in_agents(&agent, company_id)
+            .await
+            .is_ok());
+        assert!(matches!(
+            service
+                .assert_can_provision_built_in_agents(&denied, company_id)
+                .await,
+            Err(AccessError::InsufficientPermissions(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_project_scope_is_checked_against_database() {
+        let Some(database_url) = std::env::var_os("DATABASE_URL") else {
+            eprintln!("skipping project scope integration test: DATABASE_URL is not set");
+            return;
+        };
+        let pool = PgPool::connect(
+            database_url
+                .to_str()
+                .expect("DATABASE_URL must be valid UTF-8"),
+        )
+        .await
+        .expect("connect database");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let company_id = Uuid::new_v4();
+        let other_company_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let prefix = format!("AS{}", &company_id.simple().to_string()[..6]);
+        let other_prefix = format!("AS{}", &other_company_id.simple().to_string()[..6]);
+        for (id, name, issue_prefix) in [
+            (company_id, "Access Scope Company", prefix),
+            (other_company_id, "Other Access Scope Company", other_prefix),
+        ] {
+            sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(name)
+                .bind(issue_prefix)
+                .execute(&pool)
+                .await
+                .expect("insert company");
+        }
+        sqlx::query("INSERT INTO projects (id, company_id, name) VALUES ($1, $2, $3)")
+            .bind(project_id)
+            .bind(company_id)
+            .bind("Scoped project")
+            .execute(&pool)
+            .await
+            .expect("insert project");
+
+        let service = DefaultAccessService::with_pool(pool.clone());
+        assert!(service
+            .assert_project_belongs_to_company(project_id, company_id)
+            .await
+            .is_ok());
+        assert!(matches!(
+            service
+                .assert_project_belongs_to_company(project_id, other_company_id)
+                .await,
+            Err(AccessError::ResourceNotFound(_))
+        ));
+        assert!(matches!(
+            service
+                .assert_project_belongs_to_company(Uuid::new_v4(), company_id)
+                .await,
+            Err(AccessError::ResourceNotFound(_))
+        ));
+
+        sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup companies");
     }
 }
