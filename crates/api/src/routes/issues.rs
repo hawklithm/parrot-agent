@@ -2399,20 +2399,74 @@ async fn scheduled_retry_now(
 
 /// I18: GET /issues/:id/external-objects
 async fn list_external_objects(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
+    let _company_id = scoped_issue_company(&state, &actor, id).await?;
+    let rows = sqlx::query(
+        "SELECT id, object_type, object_id, summary, created_at, updated_at
+         FROM issue_external_objects
+         WHERE issue_id = $1
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to list issue external objects");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "objectType": row.get::<String, _>("object_type"),
+                    "objectId": row.get::<String, _>("object_id"),
+                    "summary": row.get::<Option<Value>, _>("summary"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// I19: GET /issues/:id/external-object-summary
 async fn get_external_object_summary(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(
-        serde_json::json!({"issueId": id, "externalObjectCount": 0}),
-    ))
+    let _company_id = scoped_issue_company(&state, &actor, id).await?;
+    let rows = sqlx::query(
+        "SELECT object_type, COUNT(*)::bigint AS object_count
+         FROM issue_external_objects
+         WHERE issue_id = $1
+         GROUP BY object_type
+         ORDER BY object_type ASC",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to summarize issue external objects");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut by_type = serde_json::Map::new();
+    let mut total = 0_i64;
+    for row in rows {
+        let object_type = row.get::<String, _>("object_type");
+        let count = row.get::<i64, _>("object_count");
+        total += count;
+        by_type.insert(object_type, json!(count));
+    }
+    Ok(Json(json!({
+        "issueId": id,
+        "externalObjectCount": total,
+        "byObjectType": Value::Object(by_type),
+    })))
 }
 
 /// I20: POST /issues/:id/external-objects/refresh
