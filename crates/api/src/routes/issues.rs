@@ -3076,13 +3076,72 @@ async fn get_external_object_summary(
 }
 
 /// I20: POST /issues/:id/external-objects/refresh
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefreshExternalObjectsInput {
+    #[serde(default)]
+    object_ids: Option<Vec<Uuid>>,
+}
+
 async fn refresh_external_objects(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
+    Json(input): Json<RefreshExternalObjectsInput>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(
-        serde_json::json!({"issueId": id, "refreshTriggered": true}),
-    ))
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    if input.object_ids.as_ref().is_some_and(|ids| ids.len() > 50) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let rows = sqlx::query(
+        "UPDATE external_objects AS object
+         SET next_refresh_at = NOW(), refresh_started_at = NULL, updated_at = NOW()
+         WHERE object.company_id = $1
+           AND object.id IN (
+               SELECT mention.object_id
+               FROM external_object_mentions AS mention
+               WHERE mention.company_id = $1
+                 AND mention.source_issue_id = $2
+                 AND mention.object_id IS NOT NULL
+           )
+           AND ($3::uuid[] IS NULL OR object.id = ANY($3))
+         RETURNING object.id, object.object_type, object.external_id, object.next_refresh_at",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(input.object_ids.as_deref())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to schedule external object refresh");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let object_ids: Vec<Uuid> = rows.iter().map(|row| row.get("id")).collect();
+    sqlx::query(
+        "INSERT INTO activity_logs (company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata)
+         VALUES ($1, 'external_object_refresh_requested', $2, $3, 'issue', $4, $5)",
+    )
+    .bind(company_id)
+    .bind(actor.actor_type())
+    .bind(actor.principal_id().unwrap_or_else(Uuid::nil))
+    .bind(id)
+    .bind(json!({ "objectIds": object_ids }))
+    .execute(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to record external object refresh request");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({
+        "issueId": id,
+        "refreshed": [],
+        "scheduled": rows.into_iter().map(|row| json!({
+            "id": row.get::<Uuid, _>("id"),
+            "objectType": row.get::<String, _>("object_type"),
+            "objectId": row.get::<String, _>("external_id"),
+            "nextRefreshAt": row.get::<chrono::DateTime<chrono::Utc>, _>("next_refresh_at"),
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 /// I21: GET /issues/:id/file-resources/list
