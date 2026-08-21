@@ -318,11 +318,9 @@ impl JobScheduler {
         let rows = sqlx::query(
             "SELECT id, job_name, started_at, completed_at, status, error_message
                FROM scheduler_job_executions
-              WHERE owner_id = $1
               ORDER BY created_at DESC
-              LIMIT $2",
+              LIMIT $1",
         )
-        .bind(self.owner_id)
         .bind(limit.clamp(1, 1000))
         .fetch_all(pool)
         .await
@@ -499,6 +497,7 @@ mod scheduler_tests {
             .await
             .expect("database required for scheduler history test");
         let scheduler = JobScheduler::new().with_pool(pool.clone());
+        let reader = JobScheduler::new().with_pool(pool.clone());
         let id = Uuid::new_v4();
         scheduler
             .record_execution(super::JobExecutionRecord {
@@ -510,7 +509,7 @@ mod scheduler_tests {
                 error_message: None,
             })
             .await;
-        let rows = scheduler
+        let rows = reader
             .load_persisted_executions(10)
             .await
             .expect("load persisted scheduler history");
