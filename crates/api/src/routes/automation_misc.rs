@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::routes::{log_activity, require_company_access, AccessMode};
-use services::auth::{ActorSource, AuthorizationActor, PermissionKey};
+use services::auth::{
+    ActorSource, AuthorizationAction, AuthorizationActor, AuthorizationService, PermissionKey,
+};
 
 fn actor_company(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
     match actor {
@@ -1032,7 +1034,35 @@ async fn project_runtime_command(
     if exists.is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
+    require_runtime_manage_for_agent(&state, &actor, company_id, workspace_id).await?;
     Ok(Json(json!({ "projectId": project_id, "workspaceId": workspace_id, "commandId": cmd_id, "status": "accepted" })))
+}
+
+async fn require_runtime_manage_for_agent(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    workspace_id: Uuid,
+) -> Result<(), StatusCode> {
+    if !actor.is_agent() {
+        return Ok(());
+    }
+
+    let decision = AuthorizationService::decide(
+        &state.pool,
+        actor,
+        &AuthorizationAction::Custom {
+            action: "runtime:manage".to_string(),
+            resource_id: Some(workspace_id),
+        },
+        Some(company_id),
+    )
+    .await;
+    if decision.allowed {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 /// POST /projects/:project_id/workspaces/:workspace_id/runtime-services/:service_id
@@ -1062,6 +1092,7 @@ async fn project_runtime_service(
     if exists.is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
+    require_runtime_manage_for_agent(&state, &actor, company_id, workspace_id).await?;
     Ok(Json(json!({ "projectId": project_id, "workspaceId": workspace_id, "serviceId": service_id, "status": "accepted" })))
 }
 
