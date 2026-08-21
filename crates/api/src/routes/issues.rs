@@ -14,6 +14,7 @@ use sqlx::Row;
 use uuid::Uuid;
 use std::path::{Path as FsPath, PathBuf};
 
+use models::event_bus::{EventMetadata, IssueEvent, SystemEvent, SystemEventPayload};
 use models::{CreateIssueInput, Issue, IssuePriority, IssueStatus, UpdateIssueInput};
 use services::auth::AuthorizationActor;
 use services::{
@@ -21,6 +22,28 @@ use services::{
     DefaultCrossIssueInfluenceLimitService, HeartbeatWakeupOptions, IssueQueryFilter, Pagination,
     ReleaseInput,
 };
+
+async fn publish_issue_event(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    payload: IssueEvent,
+) {
+    let event = SystemEvent::new(
+        EventMetadata {
+            event_id: Uuid::new_v4(),
+            correlation_id: None,
+            causation_id: None,
+            actor_type: actor.actor_type().to_string(),
+            actor_id: actor.principal_id().unwrap_or(Uuid::nil()),
+            company_id,
+        },
+        SystemEventPayload::Issue(payload),
+    );
+    if let Err(error) = state.event_bus.publish(Box::new(event)).await {
+        tracing::warn!(%error, company_id = %company_id, "failed to publish issue event");
+    }
+}
 
 // Issue relations handlers
 mod issue_relations_handlers {
@@ -2095,6 +2118,21 @@ async fn checkout_issue(
     )
     .await;
 
+    if let Some(agent_id) = checkout_agent_id {
+        publish_issue_event(
+            &state,
+            &actor,
+            company_id,
+            IssueEvent::CheckedOut {
+                issue_id: id,
+                company_id,
+                agent_id,
+                checked_out_by: actor.principal_id().unwrap_or(agent_id),
+            },
+        )
+        .await;
+    }
+
     // Paperclip wakes the assignee after a successful checkout so the agent
     // can continue with the newly-owned execution context.
     if let Some(assignee_agent_id) = checkout_agent_id {
@@ -2232,12 +2270,28 @@ async fn release_issue(
             }
         }
     }
-    service
+    let released_issue = service
         .get(id, company_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let actor_id = actor.principal_id().unwrap_or(Uuid::nil());
+    let release_event = if released_issue.status == IssueStatus::Done {
+        IssueEvent::Completed {
+            issue_id: id,
+            company_id,
+            completed_by: actor_id,
+            resolution: None,
+        }
+    } else {
+        IssueEvent::Released {
+            issue_id: id,
+            company_id,
+            released_by: actor_id,
+        }
+    };
+    publish_issue_event(&state, &actor, company_id, release_event).await;
+    Ok(Json(released_issue))
 }
 
 /// POST /issues/:id/admin/force-release - Force release issue (admin only)
