@@ -482,7 +482,10 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         ConfigRevisionServiceImpl::new(Arc::new(agent_repo.clone()), config_revision_repo.clone()),
     );
     let built_in_agent_service: Arc<dyn BuiltInAgentService> = Arc::new(
-        DefaultBuiltInAgentService::new(Arc::new(agent_repo.clone())),
+        DefaultBuiltInAgentService::new(
+            Arc::new(agent_repo.clone()),
+            Arc::new(repositories::PgBuiltInManagedResourceRepository::new(pool.clone())),
+        ),
     );
     let adapter_registry: Arc<services::server_adapter::AdapterRegistry> =
         Arc::new(services::create_default_server_adapter_registry());

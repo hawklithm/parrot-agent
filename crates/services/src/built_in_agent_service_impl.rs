@@ -6,6 +6,7 @@ use crate::built_in_agent_service::{
     BuiltInAgentDefinition, BuiltInAgentKey, BuiltInAgentMetadataRegistry, BuiltInAgentStatus,
 };
 use repositories;
+use repositories::BuiltInManagedResourceRepository;
 
 #[derive(Debug, Error)]
 pub enum BuiltInAgentError {
@@ -118,16 +119,127 @@ where
 {
     registry: BuiltInAgentMetadataRegistry,
     agent_repo: std::sync::Arc<A>,
+    managed_repo: std::sync::Arc<dyn BuiltInManagedResourceRepository>,
 }
 
 impl<A> DefaultBuiltInAgentService<A>
 where
     A: repositories::AgentRepository,
 {
-    pub fn new(agent_repo: std::sync::Arc<A>) -> Self {
+    pub fn new(
+        agent_repo: std::sync::Arc<A>,
+        managed_repo: std::sync::Arc<dyn BuiltInManagedResourceRepository>,
+    ) -> Self {
         Self {
             registry: BuiltInAgentMetadataRegistry::new(),
             agent_repo,
+            managed_repo,
+        }
+    }
+
+    /// 将内置 Agent 的 Skill/Routine 受管资源绑定同步到 `builtin_managed_resources`
+    /// 表：按 (company, built_in_key, resource_type, canonical_key) 幂等 upsert；
+    /// 若存量行的 `stock_version` 落后于定义版本，则修复漂移并清除 `drift_detected`。
+    ///
+    /// 返回 (是否有变更, 变更说明)。
+    async fn sync_managed_resources(
+        &self,
+        company_id: Uuid,
+        key: BuiltInAgentKey,
+        definition: &BuiltInAgentDefinition,
+    ) -> BuiltInAgentResult<(bool, Vec<String>)> {
+        let mut changed = false;
+        let mut changes = Vec::new();
+        let bundle = match &definition.bundle {
+            Some(b) => b,
+            None => return Ok((changed, changes)),
+        };
+
+        let (skill_changed, skill_msg) = self
+            .sync_one_resource(
+                company_id,
+                key,
+                "skill",
+                &bundle.skill.canonical_key,
+                &bundle.stock_version,
+            )
+            .await?;
+        if skill_changed {
+            changed = true;
+            changes.push(skill_msg);
+        }
+
+        let (routine_changed, routine_msg) = self
+            .sync_one_resource(
+                company_id,
+                key,
+                "routine",
+                &bundle.routine.routine_key,
+                &bundle.stock_version,
+            )
+            .await?;
+        if routine_changed {
+            changed = true;
+            changes.push(routine_msg);
+        }
+
+        Ok((changed, changes))
+    }
+
+    async fn sync_one_resource(
+        &self,
+        company_id: Uuid,
+        key: BuiltInAgentKey,
+        resource_type: &str,
+        canonical_key: &str,
+        stock_version: &str,
+    ) -> BuiltInAgentResult<(bool, String)> {
+        let existing = self
+            .managed_repo
+            .get(company_id, key.as_str(), resource_type, canonical_key)
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+        match existing {
+            None => {
+                self.managed_repo
+                    .upsert(
+                        company_id,
+                        key.as_str(),
+                        resource_type,
+                        canonical_key,
+                        None,
+                        stock_version,
+                        stock_version,
+                    )
+                    .await
+                    .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                Ok((
+                    true,
+                    format!(
+                        "Bound managed {} '{}' at {}",
+                        resource_type, canonical_key, stock_version
+                    ),
+                ))
+            }
+            Some(row)
+                if row.stock_version != stock_version
+                    || row.current_version != stock_version
+                    || row.drift_detected
+                    || row.status != "active" =>
+            {
+                self.managed_repo
+                    .repair_drift(row.id, stock_version)
+                    .await
+                    .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                Ok((
+                    true,
+                    format!(
+                        "Repaired {} '{}' stock drift to {}",
+                        resource_type, canonical_key, stock_version
+                    ),
+                ))
+            }
+            Some(_) => Ok((false, String::new())),
         }
     }
 
@@ -325,56 +437,47 @@ where
             .get_definition(key)
             .ok_or(BuiltInAgentError::NotFound(key))?;
 
-        // 检查是否已存在
-        if let Some(existing) = self.find_existing_agent(company_id, key).await? {
-            // 已存在的Agent：更新配置（如果提供了自定义参数）
+        let is_new = self.find_existing_agent(company_id, key).await?.is_none();
+        let mut agent = if is_new {
+            self.create_agent_from_definition(company_id, definition, input)
+                .await?
+        } else {
+            let mut existing = self
+                .find_existing_agent(company_id, key)
+                .await?
+                .ok_or(BuiltInAgentError::NotFound(key))?;
             if let Some(input) = input {
-                let mut updated = existing;
                 if let Some(ref adapter_type) = input.adapter_type {
-                    updated.adapter_type = adapter_type.clone();
+                    existing.adapter_type = adapter_type.clone();
                 }
                 if let Some(ref adapter_config) = input.adapter_config {
-                    updated.adapter_config = sqlx::types::Json(adapter_config.clone());
+                    existing.adapter_config = sqlx::types::Json(adapter_config.clone());
                 }
                 if let Some(budget) = input.budget_monthly_cents {
-                    updated.budget_monthly_cents = budget;
+                    existing.budget_monthly_cents = budget;
                 }
-                updated.updated_at = chrono::Utc::now();
-
-                let saved = self
-                    .agent_repo
-                    .update(updated)
-                    .await
-                    .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
-
-                let mut saved = saved;
-                self.materialize_bundle(&mut saved, definition).await?;
-                return self
-                    .agent_repo
-                    .update(saved)
-                    .await
-                    .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()));
+                existing.updated_at = chrono::Utc::now();
             }
-            let mut existing = existing;
-            self.materialize_bundle(&mut existing, definition).await?;
-            return self
-                .agent_repo
-                .update(existing)
-                .await
-                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()));
-        }
-
-        // 创建新Agent（传入用户自定义配置）
-        let mut agent = self
-            .create_agent_from_definition(company_id, definition, input)
-            .await?;
+            existing
+        };
 
         // 物化指令文件
         self.materialize_bundle(&mut agent, definition).await?;
-        self.agent_repo
+        let saved = self
+            .agent_repo
             .update(agent)
             .await
-            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+
+        // 同步受管资源绑定；若绑定失败则回滚新建的 Agent，避免留下半预置的孤立 Agent。
+        if let Err(e) = self.sync_managed_resources(company_id, key, definition).await {
+            if is_new {
+                let _ = self.agent_repo.delete(saved.id).await;
+            }
+            return Err(e);
+        }
+
+        Ok(saved)
     }
 
     async fn get_status(
@@ -400,12 +503,18 @@ where
             .await?
             .ok_or(BuiltInAgentError::NotFound(key))?;
 
-        // 重置为初始状态
         let definition = self
             .registry
             .get_definition(key)
             .ok_or(BuiltInAgentError::NotFound(key))?;
 
+        // 回滚边界：先清理受管资源绑定，失败则不应宣称 Agent 已重置。
+        self.managed_repo
+            .delete_by_company_and_key(company_id, key.as_str())
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+
+        // 重置为初始状态
         let mut updated_agent = agent;
         updated_agent.status = definition.default_status.unwrap_or(models::AgentStatus::Idle);
         updated_agent.adapter_config = sqlx::types::Json(serde_json::json!({}));
@@ -452,15 +561,21 @@ where
         let after_instructions = after_bundle.and_then(|bundle| bundle.get("instructions"));
         result.instructions_materialized = before_path != agent.metadata.0.instructions_path
             || before_instructions != after_instructions;
-        result.skills_synced = before_bundle
-            .as_ref()
-            .and_then(|bundle| bundle.get("skill"))
-            != after_bundle.and_then(|bundle| bundle.get("skill"));
-        result.routines_synced = before_bundle
-            .as_ref()
-            .and_then(|bundle| bundle.get("routine"))
-            != after_bundle.and_then(|bundle| bundle.get("routine"));
-        if result.instructions_materialized || result.skills_synced || result.routines_synced {
+
+        // 同步受管资源绑定并检测/修复漂移。
+        let (managed_changed, managed_changes) =
+            self.sync_managed_resources(company_id, key, definition).await?;
+        result.changes.extend(managed_changes);
+
+        let bindings = self
+            .managed_repo
+            .list_by_company_and_key(company_id, key.as_str())
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+        result.skills_synced = bindings.iter().any(|b| b.resource_type == "skill");
+        result.routines_synced = bindings.iter().any(|b| b.resource_type == "routine");
+
+        if result.instructions_materialized || managed_changed {
             self.agent_repo
                 .update(agent)
                 .await
@@ -470,10 +585,10 @@ where
                 result.changes.push("Synchronized managed instruction bundle".to_string());
             }
             if result.skills_synced {
-                result.changes.push("Synchronized managed skill bundle metadata".to_string());
+                result.changes.push("Synchronized managed skill binding".to_string());
             }
             if result.routines_synced {
-                result.changes.push("Synchronized managed routine bundle metadata".to_string());
+                result.changes.push("Synchronized managed routine binding".to_string());
             }
         }
         Ok(result)

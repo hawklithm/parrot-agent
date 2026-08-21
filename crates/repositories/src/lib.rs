@@ -31,6 +31,7 @@ pub mod models;
 pub mod board_api_key_repository;
 pub mod cli_auth_challenge_repository;
 pub mod auth_repositories;
+pub mod builtin_managed_resource_repository;
 pub mod company_repository;
 pub mod project_repository;
 pub mod repository;
@@ -101,6 +102,9 @@ pub mod budget_repository;
 pub use budget_repository::{
     BudgetPolicyRepository, PgBudgetPolicyRepository,
     BudgetIncidentRepository, PgBudgetIncidentRepository,
+};
+pub use builtin_managed_resource_repository::{
+    BuiltInManagedResource, BuiltInManagedResourceRepository, PgBuiltInManagedResourceRepository,
 };
 pub mod finance_event_repository;
 pub use finance_event_repository::{FinanceEventRepository, PgFinanceEventRepository, FinanceSummaryRow};
