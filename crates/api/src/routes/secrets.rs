@@ -260,7 +260,6 @@ async fn create_company_secret(
     Json(body): Json<CreateSecretBody>,
 ) -> Result<(StatusCode, Json<Value>), SecretError> {
     require_company_access(&actor, company_id, AccessMode::Write).map_err(|_| SecretError::NotFound)?;
-    let pool = &state.pool;
 
     let managed_mode = body.managed_mode.as_deref().unwrap_or("paperclip_managed");
     let is_external = managed_mode == "external" || managed_mode == "external_reference";
@@ -298,6 +297,11 @@ async fn create_company_secret(
     }
     validate_secret_name_key(&body.name, &key)?;
     let db_managed_mode = if is_external { "external" } else { "paperclip_managed" };
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| SecretError::Database(e.to_string()))?;
 
     let row = sqlx::query(
         r#"INSERT INTO company_secrets
@@ -320,7 +324,7 @@ async fn create_company_secret(
     .bind(&body.provider_metadata)
     .bind(body.description.as_deref())
     .bind("board")
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| SecretError::Database(e.to_string()))?;
 
@@ -332,7 +336,7 @@ async fn create_company_secret(
     // redacted material envelope so the version audit row exists.
     if !is_external {
         if let Some(id) = secret.get("id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok()) {
-            let _ = sqlx::query(
+            sqlx::query(
                 r#"INSERT INTO company_secret_versions (secret_id, version, material, value_sha256, status)
                    VALUES ($1, 1, $2, $3, 'current')"#,
             )
@@ -344,10 +348,15 @@ async fn create_company_secret(
                     .map(|s| sha256_hex(s.as_bytes()))
                     .unwrap_or_default(),
             )
-            .execute(pool)
-            .await;
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SecretError::Database(e.to_string()))?;
         }
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| SecretError::Database(e.to_string()))?;
 
     Ok((StatusCode::CREATED, Json(secret)))
 }
@@ -391,7 +400,7 @@ async fn update_secret(
     Json(body): Json<UpdateSecretBody>,
 ) -> Result<Json<Value>, SecretError> {
     let pool = &state.pool;
-    authorize_secret(pool, id, &actor, AccessMode::Write).await?;
+    authorize_secret(&state.pool, id, &actor, AccessMode::Write).await?;
     if let Some(name) = body.name.as_deref() {
         let key = body.key.as_deref().unwrap_or("");
         if body.key.is_some() {
@@ -500,10 +509,16 @@ async fn rotate_secret(
         ));
     }
 
-    // Fetch existing (must be company-scoped, non-deleted).
-    let existing = sqlx::query(&format!("{} WHERE id = $1", SECRET_SELECT))
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| SecretError::Database(e.to_string()))?;
+    // Fetch existing (must be company-scoped, non-deleted) while locking the
+    // row so concurrent rotations cannot reuse the same version number.
+    let existing = sqlx::query(&format!("{} WHERE id = $1 FOR UPDATE", SECRET_SELECT))
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| SecretError::Database(e.to_string()))?;
     let existing = existing.ok_or(SecretError::NotFound)?;
@@ -518,20 +533,21 @@ async fn rotate_secret(
     let next_version: i32 = existing.get::<i32, _>("latest_version") + 1;
 
     // Insert the new version row (current), retiring the prior current.
-    let _ = sqlx::query(
+    sqlx::query(
         r#"UPDATE company_secret_versions SET status = 'superseded', revoked_at = NOW()
             WHERE secret_id = $1 AND status = 'current'"#,
     )
     .bind(id)
-    .execute(pool)
-    .await;
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| SecretError::Database(e.to_string()))?;
     let material = body.value.as_ref().map(|_| json!({"redacted": true})).unwrap_or(json!({}));
     let value_sha = body
         .value
         .as_deref()
         .map(|s| sha256_hex(s.as_bytes()))
         .unwrap_or_else(|| sha256_hex(format!("{:?}", body).as_bytes()));
-    let _ = sqlx::query(
+    sqlx::query(
         r#"INSERT INTO company_secret_versions
              (secret_id, version, material, value_sha256, provider_version_ref, status)
            VALUES ($1, $2, $3, $4, $5, 'current')"#,
@@ -541,8 +557,9 @@ async fn rotate_secret(
     .bind(&material)
     .bind(&value_sha)
     .bind(body.provider_version_ref.as_deref())
-    .execute(pool)
-    .await;
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| SecretError::Database(e.to_string()))?;
 
     // Bump latest_version + last_rotated_at, optionally update external_ref/provider_config_id.
     let row = sqlx::query(
@@ -562,10 +579,13 @@ async fn rotate_secret(
     .bind(next_version)
     .bind(body.external_ref.as_deref())
     .bind(body.provider_config_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| SecretError::Database(e.to_string()))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| SecretError::Database(e.to_string()))?;
     Ok(Json(secret_to_json(&row)))
 }
 
