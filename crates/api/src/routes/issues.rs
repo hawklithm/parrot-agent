@@ -27,19 +27,60 @@ mod issue_relations_handlers {
     /// GET /issues/:issue_id/relations
     pub async fn get_issue_relations(
         State(state): State<AppState>,
+        Extension(actor): Extension<AuthorizationActor>,
         Path(issue_id): Path<Uuid>,
     ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-        let relation_service =
-            services::issue_relation_service::IssueRelationService::new(state.pool.clone());
-
-        let relations = relation_service
-            .get_relation_summaries(issue_id)
+        let company_id = super::scoped_issue_company(&state, &actor, issue_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|status| (status, "Issue is outside the actor company".to_string()))?;
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                ir.issue_id,
+                ir.related_issue_id,
+                ir.type,
+                CASE WHEN ir.related_issue_id = $2 THEN 'blocked_by' ELSE 'blocks' END AS relation_kind,
+                i.identifier,
+                i.title,
+                i.status
+            FROM issue_relations ir
+            JOIN issues i ON i.id = CASE WHEN ir.related_issue_id = $2 THEN ir.issue_id ELSE ir.related_issue_id END
+            WHERE ir.company_id = $1
+              AND (ir.issue_id = $2 OR ir.related_issue_id = $2)
+              AND ir.type = 'blocks'
+            ORDER BY i.created_at DESC
+            "#,
+        )
+        .bind(company_id)
+        .bind(issue_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let mut blocked_by = Vec::new();
+        let mut blocks = Vec::new();
+        for row in rows {
+            let relation = serde_json::json!({
+                "id": if row.get::<String, _>("relation_kind") == "blocked_by" {
+                    row.get::<Uuid, _>("issue_id")
+                } else {
+                    row.get::<Uuid, _>("related_issue_id")
+                },
+                "identifier": row.get::<Option<String>, _>("identifier"),
+                "title": row.get::<String, _>("title"),
+                "status": row.get::<String, _>("status"),
+                "relationType": row.get::<String, _>("relation_kind"),
+            });
+            if relation["relationType"] == "blocked_by" {
+                blocked_by.push(relation);
+            } else {
+                blocks.push(relation);
+            }
+        }
 
         Ok(Json(serde_json::json!({
-            "blockedBy": relations.blocked_by,
-            "blocks": relations.blocks,
+            "blockedBy": blocked_by,
+            "blocks": blocks,
         })))
     }
 
@@ -52,26 +93,73 @@ mod issue_relations_handlers {
 
     pub async fn update_blocked_by_relations(
         State(state): State<AppState>,
+        Extension(actor): Extension<AuthorizationActor>,
         Path(issue_id): Path<Uuid>,
         Json(input): Json<UpdateBlockedByInput>,
     ) -> Result<StatusCode, (StatusCode, String)> {
-        // Get issue to retrieve company_id
-        let issue: Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
-            .bind(issue_id)
-            .fetch_one(&state.pool)
+        let company_id = super::scoped_issue_company(&state, &actor, issue_id)
             .await
-            .map_err(|e| (StatusCode::NOT_FOUND, format!("Issue not found: {}", e)))?;
+            .map_err(|status| (status, "Issue is outside the actor company".to_string()))?;
+        let mut blocker_ids = input.blocked_by_issue_ids;
+        blocker_ids.sort_unstable();
+        blocker_ids.dedup();
+        if blocker_ids.iter().any(|blocker_id| *blocker_id == issue_id) {
+            return Err((StatusCode::BAD_REQUEST, "An issue cannot block itself".to_string()));
+        }
 
-        let relation_service =
-            services::issue_relation_service::IssueRelationService::new(state.pool.clone());
+        let visible_blockers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM issues WHERE company_id = $1 AND id = ANY($2)",
+        )
+        .bind(company_id)
+        .bind(&blocker_ids)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if visible_blockers != blocker_ids.len() as i64 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "All blocker issues must belong to the same company".to_string(),
+            ));
+        }
 
-        relation_service
-            .update_blocked_by_relations(
-                issue.company_id,
-                issue_id,
-                input.blocked_by_issue_ids,
-                None, // TODO: Get from auth context
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        sqlx::query(
+            "DELETE FROM issue_relations WHERE company_id = $1 AND related_issue_id = $2 AND type = 'blocks'",
+        )
+        .bind(company_id)
+        .bind(issue_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for blocker_id in &blocker_ids {
+            sqlx::query(
+                "INSERT INTO issue_relations (company_id, issue_id, related_issue_id, type, created_by_agent_id, created_by_user_id) VALUES ($1, $2, $3, 'blocks', $4, $5) ON CONFLICT (company_id, issue_id, related_issue_id, type) DO NOTHING",
             )
+            .bind(company_id)
+            .bind(blocker_id)
+            .bind(issue_id)
+            .bind(if actor.is_agent() { actor.principal_id() } else { None })
+            .bind(if actor.is_board() { actor.principal_id() } else { None })
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        sqlx::query(
+            "INSERT INTO activity_logs (company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata) VALUES ($1, 'issue_blockers_updated', $2, $3, 'issue', $4, $5)",
+        )
+        .bind(company_id)
+        .bind(actor.actor_type())
+        .bind(actor.principal_id().unwrap_or_else(Uuid::nil))
+        .bind(issue_id)
+        .bind(serde_json::json!({ "blockedByIssueIds": blocker_ids }))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        tx.commit()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -3524,6 +3612,15 @@ pub fn issue_routes() -> Router<AppState> {
         )
         .route("/issues/:id/heartbeat-context", get(get_heartbeat_context))
         // --- P1: Issue 子资源补齐 (I1-I44) ---
+        .route("/issues/:id/relations", get(get_issue_relations))
+        .route(
+            "/issues/:id/relations/blocked-by",
+            post(update_blocked_by_relations),
+        )
+        .route(
+            "/issues/:id/relations/:relation_id",
+            delete(delete_issue_relation),
+        )
         .route("/issues/:id/cases", get(get_issue_cases))
         .route("/issues/:id/active-run", get(get_issue_active_run))
         .route("/issues/:id/live-runs", get(get_issue_live_runs))
