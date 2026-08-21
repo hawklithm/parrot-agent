@@ -415,7 +415,7 @@ pub use job_scheduler::{
     RoutineCronTrigger, MonitorCheckJob, LeaseExpiryScanner,
     EnvironmentHealthProber, StuckRunDetector, ConsistencyCheckJob,
     StatusCardSchedulerJob, SummarySlotFinalizerJob,
-    HeartbeatRecoveryJob,
+    HeartbeatRecoveryJob, SchedulerExecutionHistoryCleanupJob,
     monitor_backoff_seconds, is_env_stale, is_run_stuck, ENV_IDLE_TIMEOUT,
 };
 pub mod status_card_worker;

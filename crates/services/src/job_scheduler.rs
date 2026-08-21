@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 /// 最大补发运行次数（对应 paperclip MAX_CATCH_UP_RUNS）
 const MAX_CATCH_UP_RUNS: usize = 25;
+const SCHEDULER_EXECUTION_RETENTION_DAYS: i64 = 30;
 
 /// Monitor 调度：单次检查失败后指数退避（基础 60s，封顶 24h）。
 pub fn monitor_backoff_seconds(attempt: i32) -> i64 {
@@ -168,6 +169,39 @@ pub trait ScheduledJob: Send + Sync {
 
 pub struct HeartbeatRecoveryJob {
     heartbeat: Arc<DefaultHeartbeatService>,
+}
+
+/// Periodic cleanup for durable scheduler history.
+pub struct SchedulerExecutionHistoryCleanupJob {
+    scheduler: Arc<JobScheduler>,
+}
+
+impl SchedulerExecutionHistoryCleanupJob {
+    pub fn new(scheduler: Arc<JobScheduler>) -> Self {
+        Self { scheduler }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for SchedulerExecutionHistoryCleanupJob {
+    fn job_name(&self) -> &str {
+        "scheduler_execution_history_cleanup"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(86_400)
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        let removed = self
+            .scheduler
+            .prune_persisted_executions(
+                ChronoDuration::days(SCHEDULER_EXECUTION_RETENTION_DAYS),
+                1_000,
+            )
+            .await?;
+        Ok(format!("removed {removed} expired scheduler executions"))
+    }
 }
 
 impl HeartbeatRecoveryJob {
@@ -357,6 +391,40 @@ impl JobScheduler {
                 })
             })
             .collect())
+    }
+
+    /// Delete a bounded batch of execution records older than the retention cutoff.
+    pub async fn prune_persisted_executions(
+        &self,
+        retention: ChronoDuration,
+        batch_size: i64,
+    ) -> Result<u64, String> {
+        let Some(pool) = self.pool.as_ref() else {
+            return Ok(0);
+        };
+        if retention <= ChronoDuration::zero() {
+            return Err("scheduler execution retention must be positive".to_string());
+        }
+        let cutoff = Utc::now() - retention;
+        let deleted = sqlx::query(
+            "WITH expired AS (
+                 SELECT id
+                   FROM scheduler_job_executions
+                  WHERE created_at < $1
+                  ORDER BY created_at ASC
+                  LIMIT $2
+             )
+             DELETE FROM scheduler_job_executions execution
+              USING expired
+              WHERE execution.id = expired.id
+             RETURNING execution.id",
+        )
+        .bind(cutoff)
+        .bind(batch_size.clamp(1, 10_000))
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(deleted.len() as u64)
     }
 
     /// 启动调度器主循环
@@ -559,6 +627,53 @@ mod scheduler_tests {
             .execute(&pool)
             .await
             .expect("cleanup scheduler history test row");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_execution_history_prunes_expired_records_in_batches() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("database required for scheduler history retention test");
+        let scheduler = JobScheduler::new().with_pool(pool.clone());
+        let id = Uuid::new_v4();
+        scheduler
+            .record_execution(super::JobExecutionRecord {
+                id: id.to_string(),
+                job_name: "scheduler_history_retention_test".to_string(),
+                started_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+                status: JobStatus::Succeeded,
+                error_message: None,
+            })
+            .await;
+        sqlx::query(
+            "UPDATE scheduler_job_executions
+                SET created_at = NOW() - INTERVAL '2 days'
+              WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("age scheduler history test row");
+
+        assert_eq!(
+            scheduler
+                .prune_persisted_executions(ChronoDuration::days(1), 1)
+                .await
+                .expect("prune scheduler history"),
+            1
+        );
+        let rows = scheduler
+            .load_persisted_executions(100)
+            .await
+            .expect("load scheduler history after prune");
+        assert!(!rows.iter().any(|row| row.id == id.to_string()));
         pool.close().await;
     }
 
