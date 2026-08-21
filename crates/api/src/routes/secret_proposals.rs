@@ -24,7 +24,7 @@ use sqlx::Row;
 
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
-use services::auth::AuthorizationActor;
+use services::auth::{AuthorizationAction, AuthorizationActor};
 use services::secret_provider::encrypt_secret_material;
 
 fn proposal_json(
@@ -47,6 +47,7 @@ fn proposal_json(
         "targetId": row.get::<Option<Uuid>, _>("target_id"),
         "configPath": row.get::<Option<String>, _>("config_path"),
         "proposedByAgentId": row.get::<Uuid, _>("proposed_by_agent_id"),
+        "originRunId": row.get::<Option<Uuid>, _>("origin_run_id").map(|id| id.to_string()).unwrap_or_default(),
         "resolvedByUserId": row.get::<Option<String>, _>("resolved_by_user_id"),
         "resolvedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("resolved_at"),
         "resolutionReason": row.get::<Option<String>, _>("resolution_reason"),
@@ -55,6 +56,116 @@ fn proposal_json(
         "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
         "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
     })
+}
+
+async fn enriched_proposal_json(
+    pool: &sqlx::PgPool,
+    row: &sqlx::postgres::PgRow,
+    actor: &AuthorizationActor,
+) -> Result<serde_json::Value, StatusCode> {
+    let proposal_id: Uuid = row.get("id");
+    let context = sqlx::query(
+        "SELECT p.company_id,
+                s.name AS secret_name,
+                dependency.id AS dependency_id,
+                dependency.proposed_name AS dependency_name,
+                proposer.name AS proposer_name,
+                target.name AS target_name,
+                issue.identifier AS issue_identifier,
+                issue.title AS issue_title
+           FROM company_secret_proposals p
+           LEFT JOIN company_secrets s ON s.id = p.secret_id
+           LEFT JOIN company_secret_proposals dependency ON dependency.id = p.secret_proposal_id
+           LEFT JOIN agents proposer ON proposer.id = p.proposed_by_agent_id
+           LEFT JOIN agents target ON target.id = p.target_id
+           LEFT JOIN issues issue ON issue.id = p.origin_issue_id
+          WHERE p.id = $1",
+    )
+    .bind(proposal_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let company_id: Uuid = context.get("company_id");
+    let kind: String = row.get("kind");
+    let target_id: Option<Uuid> = row.get("target_id");
+    let company_write = matches!(actor, AuthorizationActor::Board { .. })
+        && require_company_access(actor, company_id, AccessMode::Write).is_ok();
+    let target_write = if let Some(target_id) = target_id {
+        services::auth::decision_engine::decide_access(
+            pool,
+            actor,
+            &AuthorizationAction::AgentUpdate { agent_id: target_id },
+            Some(company_id),
+        )
+        .await
+    } else {
+        true
+    };
+    let viewer_can_approve = company_write && (kind != "binding" || target_write);
+    let approve_block_reason = if viewer_can_approve {
+        Value::Null
+    } else if !company_write {
+        json!("Company write permission required")
+    } else {
+        json!("Agent configuration update permission required")
+    };
+    let mut result = proposal_json(row);
+    let object = result.as_object_mut().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    object.insert(
+        "secretName".into(),
+        context
+            .get::<Option<String>, _>("secret_name")
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "secretProposalId".into(),
+        context
+            .get::<Option<Uuid>, _>("dependency_id")
+            .map(|id| Value::String(id.to_string()))
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "secretProposalName".into(),
+        context
+            .get::<Option<String>, _>("dependency_name")
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "target".into(),
+        context
+            .get::<Option<String>, _>("target_name")
+            .zip(target_id)
+            .map(|(name, id)| json!({ "id": id, "name": name, "icon": null }))
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "proposedBy".into(),
+        json!({
+            "id": row.get::<Uuid, _>("proposed_by_agent_id"),
+            "name": context.get::<Option<String>, _>("proposer_name").unwrap_or_default(),
+            "icon": null
+        }),
+    );
+    object.insert(
+        "originIssue".into(),
+        context
+            .get::<Option<String>, _>("issue_identifier")
+            .zip(context.get::<Option<String>, _>("issue_title"))
+            .zip(row.get::<Option<Uuid>, _>("origin_issue_id"))
+            .map(|((key, title), id)| json!({ "id": id, "key": key, "title": title }))
+            .unwrap_or(Value::Null),
+    );
+    object.insert("appliedBindingConfigPath".into(), if kind == "binding" && row.get::<String, _>("status") == "approved" {
+        row.get::<Option<String>, _>("config_path").map(Value::String).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    });
+    object.insert("viewerCanApprove".into(), json!(viewer_can_approve));
+    object.insert("approveBlockReason".into(), approve_block_reason);
+    Ok(result)
 }
 
 fn agent_context(
@@ -235,7 +346,10 @@ async fn create_agent_proposal(
             tracing::error!("Failed to reload proposal: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    Ok((StatusCode::CREATED, Json(proposal_json(&row))))
+    Ok((
+        StatusCode::CREATED,
+        Json(enriched_proposal_json(&state.pool, &row, &actor).await?),
+    ))
 }
 
 /// GET /agents/me/secret-proposals
@@ -265,8 +379,12 @@ async fn list_agent_proposals(
     })?;
     let has_more = rows.len() as i64 > limit;
     let visible = if has_more { &rows[..limit as usize] } else { &rows[..] };
+    let mut proposals = Vec::with_capacity(visible.len());
+    for row in visible {
+        proposals.push(enriched_proposal_json(&state.pool, row, &actor).await?);
+    }
     Ok(Json(json!({
-        "proposals": visible.iter().map(proposal_json).collect::<Vec<_>>(),
+        "proposals": proposals,
         "nextOffset": if has_more { json!(offset + limit) } else { Value::Null },
     })))
 }
@@ -295,7 +413,7 @@ async fn withdraw_agent_proposal(
     let Some(row) = row else {
         return Err(StatusCode::NOT_FOUND);
     };
-    Ok(Json(proposal_json(&row)))
+    Ok(Json(enriched_proposal_json(&state.pool, &row, &actor).await?))
 }
 
 /// GET /companies/:company_id/secret-proposals
@@ -332,8 +450,12 @@ async fn list_board_proposals(
     })?;
     let has_more = rows.len() as i64 > limit;
     let visible = if has_more { &rows[..limit as usize] } else { &rows[..] };
+    let mut proposals = Vec::with_capacity(visible.len());
+    for row in visible {
+        proposals.push(enriched_proposal_json(&state.pool, row, &actor).await?);
+    }
     Ok(Json(json!({
-        "proposals": visible.iter().map(proposal_json).collect::<Vec<_>>(),
+        "proposals": proposals,
         "nextOffset": if has_more { json!(offset + limit) } else { Value::Null },
     })))
 }
@@ -578,7 +700,7 @@ async fn approve_proposal(
             tracing::error!("Failed to reload proposal: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    Ok(Json(proposal_json(&updated)))
+    Ok(Json(enriched_proposal_json(&state.pool, &updated, &actor).await?))
 }
 
 /// POST /companies/:company_id/secret-proposals/:id/reject
@@ -629,7 +751,7 @@ async fn reject_proposal(
     )
     .await;
 
-    Ok(Json(proposal_json(&row)))
+    Ok(Json(enriched_proposal_json(&state.pool, &row, &actor).await?))
 }
 
 /// GET /agents/me/secrets
@@ -748,5 +870,5 @@ async fn get_board_proposal(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(proposal_json(&row)))
+    Ok(Json(enriched_proposal_json(&state.pool, &row, &actor).await?))
 }
