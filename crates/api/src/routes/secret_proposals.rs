@@ -141,6 +141,38 @@ async fn create_agent_proposal(
     {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
+    if let Some(secret_id) = request.secret_id {
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM company_secrets
+                 WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL
+            )",
+        )
+        .bind(secret_id)
+        .bind(company_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !valid {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+    if let Some(secret_proposal_id) = request.secret_proposal_id {
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM company_secret_proposals
+                 WHERE id = $1 AND company_id = $2 AND kind = 'secret' AND status = 'pending'
+            )",
+        )
+        .bind(secret_proposal_id)
+        .bind(company_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !valid {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
 
     let encrypted_value = request.value.as_ref().map(|value| {
         let plaintext = value
