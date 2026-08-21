@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     Json, Router,
 };
@@ -12,9 +12,26 @@ use services::{
 use crate::extractors::CompanyIdOrShortname;
 use crate::validation::agent_schemas::ProvisionBuiltInAgentSchema;
 use garde::Validate;
+use services::auth::{decide_access, AuthorizationAction, AuthorizationActor};
 
 /// AppState 别名，统一状态类型
 pub use crate::app_state::AppState;
+
+async fn require_company_access(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    action: AuthorizationAction,
+    company_id: uuid::Uuid,
+) -> Result<(), (StatusCode, String)> {
+    if decide_access(&state.pool, actor, &action, Some(company_id)).await {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!("Not authorized for {}", action.action_type()),
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,8 +71,16 @@ fn map_built_in_error(e: BuiltInAgentError) -> (StatusCode, String) {
 /// 列出公司所有内置 Agent 的状态
 pub async fn list_built_in_agents(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
 ) -> Result<Json<Vec<BuiltInAgentStateResponse>>, (StatusCode, String)> {
+    require_company_access(
+        &state,
+        &actor,
+        AuthorizationAction::CompanyRead { company_id },
+        company_id,
+    )
+    .await?;
     let service = state.built_in_agent_service.clone();
     let definitions = service.list_definitions();
 
@@ -83,10 +108,18 @@ pub async fn list_built_in_agents(
 /// 配置指定的内置 Agent
 pub async fn provision_built_in_agent(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
     Path(key): Path<String>,
     Json(payload): Json<ProvisionBuiltInAgentRequest>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
+    require_company_access(
+        &state,
+        &actor,
+        AuthorizationAction::AgentCreate { company_id },
+        company_id,
+    )
+    .await?;
     let service = state.built_in_agent_service.clone();
     // 验证请求
     let schema = ProvisionBuiltInAgentSchema {
@@ -132,10 +165,18 @@ pub async fn provision_built_in_agent(
 /// 协调指定内置 Agent 的状态（重新应用默认配置）
 pub async fn reconcile_built_in_agent(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
     Path(key): Path<String>,
     Json(_payload): Json<ReconcileBuiltInAgentRequest>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
+    require_company_access(
+        &state,
+        &actor,
+        AuthorizationAction::CompanyUpdate { company_id },
+        company_id,
+    )
+    .await?;
     let service = state.built_in_agent_service.clone();
     let key = BuiltInAgentKey::from_str(&key)
         .ok_or((StatusCode::NOT_FOUND, "Unknown built-in agent key".to_string()))?;
@@ -168,9 +209,17 @@ pub async fn reconcile_built_in_agent(
 /// 获取指定内置 Agent 的状态
 pub async fn get_built_in_agent_status(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
     Path(key): Path<String>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
+    require_company_access(
+        &state,
+        &actor,
+        AuthorizationAction::CompanyRead { company_id },
+        company_id,
+    )
+    .await?;
     let service = state.built_in_agent_service.clone();
     let key = BuiltInAgentKey::from_str(&key)
         .ok_or((StatusCode::NOT_FOUND, "Unknown built-in agent key".to_string()))?;
@@ -199,9 +248,17 @@ pub async fn get_built_in_agent_status(
 /// 重置指定内置 Agent（清除资源 + 恢复初始状态）
 pub async fn reset_built_in_agent(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
     Path(key): Path<String>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
+    require_company_access(
+        &state,
+        &actor,
+        AuthorizationAction::CompanyUpdate { company_id },
+        company_id,
+    )
+    .await?;
     let service = state.built_in_agent_service.clone();
     let key = BuiltInAgentKey::from_str(&key)
         .ok_or((StatusCode::NOT_FOUND, "Unknown built-in agent key".to_string()))?;
@@ -257,10 +314,18 @@ async fn find_built_in_routine(
 /// 启用内置 Agent 的定时任务
 pub async fn enable_built_in_routine(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
     Path((_key, routine_key)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let routine = find_built_in_routine(state.routine_service.as_ref(), company_id, &routine_key).await?;
+    require_company_access(
+        &state,
+        &actor,
+        AuthorizationAction::RoutineUpdate { routine_id: routine.id },
+        company_id,
+    )
+    .await?;
     let updated = state.routine_service.resume_routine(routine.id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({"status": "active", "routine": updated})))
@@ -270,10 +335,18 @@ pub async fn enable_built_in_routine(
 /// 禁用内置 Agent 的定时任务
 pub async fn disable_built_in_routine(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
     Path((_key, routine_key)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let routine = find_built_in_routine(state.routine_service.as_ref(), company_id, &routine_key).await?;
+    require_company_access(
+        &state,
+        &actor,
+        AuthorizationAction::RoutineUpdate { routine_id: routine.id },
+        company_id,
+    )
+    .await?;
     let updated = state.routine_service.pause_routine(routine.id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({"status": "paused", "routine": updated})))
@@ -283,10 +356,18 @@ pub async fn disable_built_in_routine(
 /// 手动触发内置 Agent 的定时任务
 pub async fn run_built_in_routine(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
     Path((_key, routine_key)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let routine = find_built_in_routine(state.routine_service.as_ref(), company_id, &routine_key).await?;
+    require_company_access(
+        &state,
+        &actor,
+        AuthorizationAction::RoutineTrigger { routine_id: routine.id },
+        company_id,
+    )
+    .await?;
     let run = state.routine_service.trigger_routine(routine.id, "manual".to_string()).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!(run))))
