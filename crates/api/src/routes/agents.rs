@@ -15,7 +15,7 @@ use models::{AgentPermissions, AgentStatus, ApprovalType, TrustAuthorizationPoli
 use serde_json::json;
 use services::approval_service::CreateApprovalInput;
 use services::auth::{AuthorizationAction, AuthorizationActor};
-use services::{CreateAgentInput, UpdateAgentInput};
+use services::{CreateAgentInput, HeartbeatWakeupOptions, UpdateAgentInput};
 
 use crate::routes::heartbeats::list_scheduler_heartbeats;
 
@@ -991,7 +991,17 @@ async fn wakeup_agent(
         .ok_or_else(|| AppError::BadRequest("Agent has no assigned executable issue".to_string()))?;
     state
         .heartbeat_service
-        .wakeup(id, issue_id, agent.company_id)
+        .wakeup_with_options(
+            id,
+            issue_id,
+            agent.company_id,
+            HeartbeatWakeupOptions {
+                source: Some("on_demand".to_string()),
+                trigger_detail: Some("manual".to_string()),
+                reason: Some("manual_agent_wakeup".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     Ok(Json(state.agent_service.get_by_id(id).await?))
@@ -1070,7 +1080,17 @@ async fn heartbeat_invoke(
     if let Some(issue_id) = issue_id {
         state
             .heartbeat_service
-            .wakeup(id, issue_id, agent.company_id)
+            .wakeup_with_options(
+                id,
+                issue_id,
+                agent.company_id,
+                HeartbeatWakeupOptions {
+                    source: Some("on_demand".to_string()),
+                    trigger_detail: Some("manual".to_string()),
+                    reason: Some("manual_agent_invoke".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     }
