@@ -79,14 +79,20 @@ async fn tools_action_requests(
         tracing::error!("Failed to list tool action requests: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(rows.iter().map(|r| json!({
-        "id": r.get::<Uuid, _>("id"),
-        "agentId": r.get::<Option<Uuid>, _>("agent_id"),
-        "action": r.get::<String, _>("action"),
-        "toolName": r.get::<String, _>("tool_name"),
-        "status": r.get::<String, _>("status"),
-        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-    })).collect()))
+    Ok(Json(
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "id": r.get::<Uuid, _>("id"),
+                    "agentId": r.get::<Option<Uuid>, _>("agent_id"),
+                    "action": r.get::<String, _>("action"),
+                    "toolName": r.get::<String, _>("tool_name"),
+                    "status": r.get::<String, _>("status"),
+                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// GET /companies/:cid/tools/applications —— tool_applications 列表。
@@ -108,14 +114,20 @@ async fn tools_applications(
         tracing::error!("Failed to list tool applications: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(rows.iter().map(|r| json!({
-        "id": r.get::<Uuid, _>("id"),
-        "agentId": r.get::<Option<Uuid>, _>("agent_id"),
-        "connectionId": r.get::<Option<Uuid>, _>("connection_id"),
-        "status": r.get::<String, _>("status"),
-        "justification": r.get::<Option<String>, _>("justification"),
-        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-    })).collect()))
+    Ok(Json(
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "id": r.get::<Uuid, _>("id"),
+                    "agentId": r.get::<Option<Uuid>, _>("agent_id"),
+                    "connectionId": r.get::<Option<Uuid>, _>("connection_id"),
+                    "status": r.get::<String, _>("status"),
+                    "justification": r.get::<Option<String>, _>("justification"),
+                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// POST /companies/:cid/tools/applications —— 创建申请。
@@ -178,21 +190,28 @@ async fn tools_profiles(
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
-    let rows = sqlx::query("SELECT * FROM tool_profiles WHERE company_id = $1 ORDER BY created_at ASC")
-        .bind(company_id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to list tool profiles: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    Ok(Json(rows.iter().map(|r| json!({
-        "id": r.get::<Uuid, _>("id"),
-        "name": r.get::<String, _>("name"),
-        "description": r.get::<Option<String>, _>("description"),
-        "status": r.get::<Option<String>, _>("status"),
-        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-    })).collect()))
+    let rows =
+        sqlx::query("SELECT * FROM tool_profiles WHERE company_id = $1 ORDER BY created_at ASC")
+            .bind(company_id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to list tool profiles: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    Ok(Json(
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "id": r.get::<Uuid, _>("id"),
+                    "name": r.get::<String, _>("name"),
+                    "description": r.get::<Option<String>, _>("description"),
+                    "status": r.get::<Option<String>, _>("status"),
+                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// GET /companies/:cid/tools/runtime-health —— 连接健康聚合。
@@ -216,55 +235,126 @@ async fn tools_runtime_health(
     })?;
     let mut by_status = serde_json::Map::new();
     for r in &rows {
-        by_status.insert(
-            r.get::<String, _>("status"),
-            json!(r.get::<i64, _>("cnt")),
-        );
+        by_status.insert(r.get::<String, _>("status"), json!(r.get::<i64, _>("cnt")));
     }
-    Ok(Json(json!({ "connectionsByStatus": by_status, "healthy": true })))
+    Ok(Json(
+        json!({ "connectionsByStatus": by_status, "healthy": true }),
+    ))
 }
 
-/// GET /companies/:cid/tools/runtime-slots —— 聚合（静态空，后续接 runtime slot 服务）。
+/// GET /companies/:cid/tools/runtime-slots —— 当前工具运行时槽位。
 async fn tools_runtime_slots(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(vec![]))
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, connection_id, slot_key, runtime_kind, status, health_status, process_id, last_error, last_used_at, updated_at FROM tool_runtime_slots WHERE company_id = $1 ORDER BY updated_at DESC",
+    )
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list tool runtime slots: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(rows.iter().map(|row| json!({
+        "id": row.get::<Uuid, _>("id"),
+        "connectionId": row.get::<Option<Uuid>, _>("connection_id"),
+        "slotKey": row.get::<String, _>("slot_key"),
+        "runtimeKind": row.get::<String, _>("runtime_kind"),
+        "status": row.get::<String, _>("status"),
+        "healthStatus": row.get::<String, _>("health_status"),
+        "processId": row.get::<Option<i32>, _>("process_id"),
+        "lastError": row.get::<Option<String>, _>("last_error"),
+        "lastUsedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_used_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })).collect()))
 }
 
-/// GET /companies/:cid/tools/trust-rules —— 默认信任规则（静态）。
+/// GET /companies/:cid/tools/trust-rules —— 已持久化的工具策略。
 async fn tools_trust_rules(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(vec![json!({
-        "id": "default-allow-approved-tools",
-        "scope": "approved_tools",
-        "decision": "allow",
-        "priority": 100,
-    })]))
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, name, description, policy_type, priority, enabled, selectors, conditions, config, created_at, updated_at
+         FROM tool_policies WHERE company_id = $1 ORDER BY priority DESC, created_at ASC",
+    )
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list tool policies: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "name": row.get::<String, _>("name"),
+                    "description": row.get::<Option<String>, _>("description"),
+                    "scope": row.get::<String, _>("policy_type"),
+                    "priority": row.get::<i32, _>("priority"),
+                    "enabled": row.get::<bool, _>("enabled"),
+                    "selectors": row.get::<Value, _>("selectors"),
+                    "conditions": row.get::<Option<Value>, _>("conditions"),
+                    "config": row.get::<Option<Value>, _>("config"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
-/// GET /companies/:cid/tools/stdio-templates —— 静态 stdio 模板。
+/// GET /companies/:cid/tools/stdio-templates —— 已登记的 stdio 模板。
 async fn tools_stdio_templates(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(vec![json!({
-        "name": "node-mcp-stdio",
-        "command": "npx",
-        "args": ["-y", "@modelcontextprotocol/server-{name}"],
-        "env": {},
-    })]))
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, template_key, name, description, status, command, args, env_keys, tools, created_at, updated_at
+         FROM tool_stdio_command_templates WHERE company_id = $1 ORDER BY name ASC",
+    )
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list stdio templates: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "templateKey": row.get::<String, _>("template_key"),
+                    "name": row.get::<String, _>("name"),
+                    "description": row.get::<Option<String>, _>("description"),
+                    "status": row.get::<String, _>("status"),
+                    "command": row.get::<String, _>("command"),
+                    "args": row.get::<Value, _>("args"),
+                    "envKeys": row.get::<Value, _>("env_keys"),
+                    "tools": row.get::<Value, _>("tools"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 // ---------- tool-applications ----------
@@ -312,7 +402,9 @@ async fn update_tool_application(
         json!({ "status": request.status }),
     )
     .await;
-    Ok(Json(json!({ "id": application_id, "status": request.status })))
+    Ok(Json(
+        json!({ "id": application_id, "status": request.status }),
+    ))
 }
 
 /// DELETE /api/tool-applications/:id
@@ -321,7 +413,6 @@ async fn delete_tool_application(
     Extension(actor): Extension<AuthorizationActor>,
     Path(application_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    
     let row = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT company_id FROM tool_applications WHERE id = $1",
     )
@@ -500,12 +591,18 @@ async fn list_connection_grants(
         tracing::error!("Failed to list grants: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(rows.iter().map(|r| json!({
-        "id": r.get::<Uuid, _>("id"),
-        "agentId": r.get::<Uuid, _>("agent_id"),
-        "grantType": r.get::<String, _>("grant_type"),
-        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-    })).collect()))
+    Ok(Json(
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "id": r.get::<Uuid, _>("id"),
+                    "agentId": r.get::<Uuid, _>("agent_id"),
+                    "grantType": r.get::<String, _>("grant_type"),
+                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// DELETE /api/tool-connections/:id/grants/:grant_id
@@ -538,41 +635,88 @@ async fn connection_usage(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tool_invocations WHERE connection_id = $1",
-    )
-    .bind(connection_id)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tool_invocations WHERE connection_id = $1")
+            .bind(connection_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(0);
     Ok(Json(json!({ "totalInvocations": total })))
 }
 
-/// GET /api/tool-connections/:id/installs —— 静态空（安装记录后续接）。
+/// GET /api/tool-connections/:id/installs —— 连接安装记录。
 async fn connection_installs(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(_connection_id): Path<Uuid>,
+    Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(vec![]))
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, target_type, target_id, created_by_user_id, created_at FROM tool_connection_installs WHERE connection_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(connection_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list connection installs: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "targetType": row.get::<String, _>("target_type"),
+                    "targetId": row.get::<String, _>("target_id"),
+                    "createdByUserId": row.get::<Option<String>, _>("created_by_user_id"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
-/// GET /api/tool-connections/:id/catalog —— 静态工具目录。
+/// GET /api/tool-connections/:id/catalog —— MCP 发现得到的工具目录。
 async fn connection_catalog(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(_connection_id): Path<Uuid>,
+    Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(vec![
-        json!({ "name": "list_files", "description": "List files in workspace" }),
-        json!({ "name": "read_file", "description": "Read a file's contents" }),
-    ]))
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, name, tool_name, title, description, input_schema, output_schema, risk_level, status, last_seen_at FROM tool_catalog_entries WHERE connection_id = $1 ORDER BY name ASC",
+    )
+    .bind(connection_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list connection catalog: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "name": row.get::<String, _>("name"),
+                    "toolName": row.get::<String, _>("tool_name"),
+                    "title": row.get::<Option<String>, _>("title"),
+                    "description": row.get::<Option<String>, _>("description"),
+                    "inputSchema": row.get::<Value, _>("input_schema"),
+                    "outputSchema": row.get::<Option<Value>, _>("output_schema"),
+                    "riskLevel": row.get::<String, _>("risk_level"),
+                    "status": row.get::<String, _>("status"),
+                    "lastSeenAt": row.get::<chrono::DateTime<chrono::Utc>, _>("last_seen_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// GET /api/tool-connections/:id/activity —— 最近调用事件。
@@ -596,26 +740,68 @@ async fn connection_activity(
         tracing::error!("Failed to list connection activity: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(rows.iter().map(|r| json!({
-        "id": r.get::<Uuid, _>("id"),
-        "toolName": r.get::<String, _>("tool_name"),
-        "status": r.get::<String, _>("status"),
-        "occurredAt": r.get::<chrono::DateTime<chrono::Utc>, _>("occurred_at"),
-    })).collect()))
+    Ok(Json(
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "id": r.get::<Uuid, _>("id"),
+                    "toolName": r.get::<String, _>("tool_name"),
+                    "status": r.get::<String, _>("status"),
+                    "occurredAt": r.get::<chrono::DateTime<chrono::Utc>, _>("occurred_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 // ---------- tool-profiles ----------
 
-/// GET /api/tool-profiles/:id/new-tools —— 静态空。
+/// GET /api/tool-profiles/:id/new-tools —— profile 尚未审核的目录工具。
 async fn profile_new_tools(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(_profile_id): Path<Uuid>,
+    Path(profile_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(vec![]))
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT c.id, c.connection_id, c.name, c.tool_name, c.title, c.description, c.input_schema,
+                c.output_schema, c.risk_level, c.status, c.first_seen_at, c.last_seen_at
+           FROM tool_catalog_entries c
+           JOIN tool_profiles p ON p.id = $1 AND p.company_id = c.company_id
+          WHERE c.company_id = $2 AND c.reviewed_at IS NULL AND c.status = 'active'
+          ORDER BY c.first_seen_at DESC",
+    )
+    .bind(profile_id)
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list profile new tools: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "connectionId": row.get::<Uuid, _>("connection_id"),
+                    "name": row.get::<String, _>("name"),
+                    "toolName": row.get::<String, _>("tool_name"),
+                    "title": row.get::<Option<String>, _>("title"),
+                    "description": row.get::<Option<String>, _>("description"),
+                    "inputSchema": row.get::<Value, _>("input_schema"),
+                    "outputSchema": row.get::<Option<Value>, _>("output_schema"),
+                    "riskLevel": row.get::<String, _>("risk_level"),
+                    "status": row.get::<String, _>("status"),
+                    "firstSeenAt": row.get::<chrono::DateTime<chrono::Utc>, _>("first_seen_at"),
+                    "lastSeenAt": row.get::<chrono::DateTime<chrono::Utc>, _>("last_seen_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// DELETE /api/tool-profiles/:id
@@ -701,24 +887,59 @@ async fn gateway_audit(
         tracing::error!("Failed to list gateway audit: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(rows.iter().map(|r| json!({
-        "id": r.get::<Uuid, _>("id"),
-        "agentId": r.get::<Option<Uuid>, _>("agent_id"),
-        "toolName": r.get::<String, _>("tool_name"),
-        "status": r.get::<String, _>("status"),
-        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-    })).collect()))
+    Ok(Json(
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "id": r.get::<Uuid, _>("id"),
+                    "agentId": r.get::<Option<Uuid>, _>("agent_id"),
+                    "toolName": r.get::<String, _>("tool_name"),
+                    "status": r.get::<String, _>("status"),
+                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
-/// GET /api/tool-gateway/runtime-slots —— 静态空。
+/// GET /api/tool-gateway/runtime-slots —— 网关运行时槽位。
 async fn gateway_runtime_slots(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(vec![]))
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, connection_id, slot_key, runtime_kind, status, health_status, process_id, last_error, last_used_at, updated_at
+           FROM tool_runtime_slots WHERE company_id = $1 ORDER BY updated_at DESC",
+    )
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list gateway runtime slots: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "connectionId": row.get::<Option<Uuid>, _>("connection_id"),
+                    "slotKey": row.get::<String, _>("slot_key"),
+                    "runtimeKind": row.get::<String, _>("runtime_kind"),
+                    "status": row.get::<String, _>("status"),
+                    "healthStatus": row.get::<String, _>("health_status"),
+                    "processId": row.get::<Option<i32>, _>("process_id"),
+                    "lastError": row.get::<Option<String>, _>("last_error"),
+                    "lastUsedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_used_at"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 pub fn tool_access_routes() -> Router<AppState> {
@@ -737,10 +958,7 @@ pub fn tool_access_routes() -> Router<AppState> {
             "/companies/:company_id/tools/applications",
             get(tools_applications).post(create_tool_application),
         )
-        .route(
-            "/companies/:company_id/tools/profiles",
-            get(tools_profiles),
-        )
+        .route("/companies/:company_id/tools/profiles", get(tools_profiles))
         .route(
             "/companies/:company_id/tools/runtime-health",
             get(tools_runtime_health),
@@ -788,10 +1006,22 @@ pub fn tool_access_routes() -> Router<AppState> {
             "/tool-profile-entries/:id",
             patch(update_tool_profile_entry).delete(delete_tool_profile_entry),
         )
-        .route("/tool-connections/:id/test-agents", get(connection_test_agents))
-        .route("/tool-connections/:id/test-calls/:call_id", get(connection_test_call))
-        .route("/tool-connections/:id/catalog/refresh", post(refresh_connection_catalog))
-        .route("/tool-connections/:id/grants/installations", post(install_connection_grants))
+        .route(
+            "/tool-connections/:id/test-agents",
+            get(connection_test_agents),
+        )
+        .route(
+            "/tool-connections/:id/test-calls/:call_id",
+            get(connection_test_call),
+        )
+        .route(
+            "/tool-connections/:id/catalog/refresh",
+            post(refresh_connection_catalog),
+        )
+        .route(
+            "/tool-connections/:id/grants/installations",
+            post(install_connection_grants),
+        )
         .route("/tools/oauth/callback", get(tools_oauth_callback))
         .route(
             "/companies/:company_id/tools/connections",
@@ -863,14 +1093,32 @@ pub fn tool_access_routes() -> Router<AppState> {
         )
         .route("/agents/me/secrets/:key/value", post(agent_secret_value))
         // ---- round 3 ----
-        .route("/tool-connections/:id/health-check", post(connection_health_check))
-        .route("/tool-connections/:id/test-calls", post(create_connection_test_call))
+        .route(
+            "/tool-connections/:id/health-check",
+            post(connection_health_check),
+        )
+        .route(
+            "/tool-connections/:id/test-calls",
+            post(create_connection_test_call),
+        )
         .route("/tool-profiles/:id/duplicate", post(duplicate_tool_profile))
-        .route("/tool-profiles/:id/entries", post(create_tool_profile_entry))
-        .route("/tool-profiles/:id/new-tools/review", post(review_profile_new_tools))
+        .route(
+            "/tool-profiles/:id/entries",
+            post(create_tool_profile_entry),
+        )
+        .route(
+            "/tool-profiles/:id/new-tools/review",
+            post(review_profile_new_tools),
+        )
         .route("/tools/oauth/:provider/start", post(tools_oauth_start))
-        .route("/tool-gateway/runtime-slots/:slot_id/stop", post(gateway_slot_stop))
-        .route("/tool-gateway/runtime-slots/:slot_id/restart", post(gateway_slot_restart))
+        .route(
+            "/tool-gateway/runtime-slots/:slot_id/stop",
+            post(gateway_slot_stop),
+        )
+        .route(
+            "/tool-gateway/runtime-slots/:slot_id/restart",
+            post(gateway_slot_restart),
+        )
 }
 
 // ================= Round 2 =================
@@ -892,12 +1140,12 @@ async fn update_tool_profile_entry(
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let row = sqlx::query(
-        "UPDATE tool_profile_entries SET enabled = COALESCE($2, enabled), position = COALESCE($3, position), \
+        "UPDATE tool_profile_entries SET effect = CASE WHEN COALESCE($2, effect = 'include') THEN 'include' ELSE 'exclude' END,
          updated_at = NOW() WHERE id = $1 RETURNING *",
     )
     .bind(entry_id)
     .bind(request.enabled)
-    .bind(request.order)
+    .bind(request.enabled)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| {
@@ -909,8 +1157,7 @@ async fn update_tool_profile_entry(
     };
     Ok(Json(json!({
         "id": entry_id,
-        "enabled": row.get::<Option<bool>, _>("enabled"),
-        "position": row.get::<Option<i32>, _>("position"),
+        "enabled": row.get::<String, _>("effect") == "include",
     })))
 }
 
@@ -934,16 +1181,47 @@ async fn delete_tool_profile_entry(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /api/tool-connections/:id/test-agents —— 静态空。
+/// GET /api/tool-connections/:id/test-agents —— 当前公司可用于测试的 agent。
 async fn connection_test_agents(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(_connection_id): Path<Uuid>,
+    Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(vec![]))
+    use sqlx::Row;
+    let exists = sqlx::query("SELECT id FROM tool_connections WHERE id = $1 AND company_id = $2")
+        .bind(connection_id)
+        .bind(company_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if exists.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let rows = sqlx::query(
+        "SELECT id, name, role, status FROM agents WHERE company_id = $1 AND status <> 'terminated' ORDER BY name ASC",
+    )
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list connection test agents: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "name": row.get::<String, _>("name"),
+                    "role": row.get::<String, _>("role"),
+                    "status": row.get::<String, _>("status"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// GET /api/tool-connections/:id/test-calls/:call_id —— 静态空结构。
@@ -955,19 +1233,104 @@ async fn connection_test_call(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "connectionId": connection_id, "callId": call_id, "status": "noop" })))
+    Ok(Json(
+        json!({ "connectionId": connection_id, "callId": call_id, "status": "noop" }),
+    ))
 }
 
-/// POST /api/tool-connections/:id/catalog/refresh —— mock（200）。
+/// POST /api/tool-connections/:id/catalog/refresh —— 真实调用 MCP tools/list 并落库。
 async fn refresh_connection_catalog(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "connectionId": connection_id, "refreshed": true, "toolCount": 2 })))
+    use sqlx::Row;
+    let connection = sqlx::query(
+        "SELECT transport, transport_config FROM tool_connections WHERE id = $1 AND company_id = $2",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let transport: String = connection.get("transport");
+    let config: Value = connection.get("transport_config");
+    let result = if transport == "mcp_remote" {
+        let url = config
+            .get("url")
+            .or_else(|| config.get("endpoint"))
+            .and_then(Value::as_str)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        crate::routes::tools::mcp_http_request(url, "tools/list", json!({})).await
+    } else {
+        let command = config
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        let args = config
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        crate::routes::tools::mcp_stdio_request(command, &args, "tools/list", json!({})).await
+    }
+    .map_err(|error| {
+        tracing::warn!(connection_id = %connection_id, %error, "MCP catalog refresh failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let tools = result
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut refreshed = 0usize;
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(StatusCode::BAD_GATEWAY)?;
+        let entry_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO tool_catalog_entries
+                (id, company_id, connection_id, name, tool_name, title, description, input_schema, output_schema, version_hash, last_seen_at, updated_at)
+             VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,NOW(),NOW())
+             ON CONFLICT (connection_id, name) DO UPDATE SET
+                title = EXCLUDED.title, description = EXCLUDED.description, input_schema = EXCLUDED.input_schema,
+                output_schema = EXCLUDED.output_schema, status = 'active', last_seen_at = NOW(), updated_at = NOW()",
+        )
+        .bind(entry_id)
+        .bind(company_id)
+        .bind(connection_id)
+        .bind(name)
+        .bind(tool.get("title").and_then(Value::as_str))
+        .bind(tool.get("description").and_then(Value::as_str))
+        .bind(tool.get("inputSchema").cloned().unwrap_or_else(|| json!({})))
+        .bind(tool.get("outputSchema").cloned())
+        .bind(Uuid::new_v4().to_string())
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to upsert catalog entry: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        refreshed += 1;
+    }
+    sqlx::query("UPDATE tool_connections SET health_status = 'healthy', health_message = NULL, health_checked_at = NOW(), last_catalog_refresh_at = NOW(), last_healthy_at = NOW(), last_error = NULL, status = 'active', updated_at = NOW() WHERE id = $1 AND company_id = $2")
+        .bind(connection_id).bind(company_id).execute(&state.pool).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(
+        json!({ "connectionId": connection_id, "refreshed": true, "toolCount": refreshed }),
+    ))
 }
 
 /// POST /api/tool-connections/:id/grants/installations —— 按安装批量授权（基础：204 语义）。
@@ -1133,15 +1496,102 @@ async fn finish_tool_app(
     Ok(Json(json!({ "finished": true })))
 }
 
-/// POST /companies/:cid/tools/mcp/import-json —— mock。
+/// POST /companies/:cid/tools/mcp/import-json —— 解析 MCP 配置并返回可审阅草稿。
 async fn import_mcp_json(
     State(_state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
+    Json(body): Json<Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "imported": 0, "errors": [] })))
+    let raw = body
+        .get("mcpJson")
+        .cloned()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let parsed = match raw {
+        Value::String(text) => {
+            serde_json::from_str::<Value>(&text).map_err(|_| StatusCode::BAD_REQUEST)?
+        }
+        value => value,
+    };
+    let servers = parsed
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let drafts = servers
+        .iter()
+        .map(|(name, value)| {
+            let server = value.as_object();
+            let mut warnings = Vec::new();
+            let (transport, config, credential_fields) = if let Some(server) = server {
+                if let Some(url) = server
+                    .get("url")
+                    .or_else(|| server.get("endpoint"))
+                    .and_then(Value::as_str)
+                {
+                    let headers = server
+                        .get("headers")
+                        .and_then(Value::as_object)
+                        .map(|headers| {
+                            headers
+                                .keys()
+                                .map(|key| {
+                                    warnings.push(format!(
+                                        "Header {key} will be stored as a Paperclip secret before activation."
+                                    ));
+                                    json!({
+                                        "configPath": format!("headers.{key}"),
+                                        "label": key,
+                                        "placement": "header",
+                                        "key": key,
+                                        "prefix": Value::Null,
+                                        "required": true
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    ("mcp_remote", json!({ "url": url }), headers)
+                } else if let Some(command) = server.get("command").and_then(Value::as_str) {
+                    warnings.push(
+                        "Imported stdio commands stay draft-only unless mapped to an approved Paperclip template."
+                            .to_string(),
+                    );
+                    (
+                        "local_stdio",
+                        json!({
+                            "importedCommand": command,
+                            "importedArgs": server.get("args").cloned().unwrap_or_else(|| json!([]))
+                        }),
+                        Vec::new(),
+                    )
+                } else {
+                    warnings.push("Unsupported MCP server entry.".to_string());
+                    ("mcp_remote", json!({}), Vec::new())
+                }
+            } else {
+                warnings.push("Unsupported MCP server entry.".to_string());
+                ("mcp_remote", json!({}), Vec::new())
+            };
+
+            json!({
+                "name": name,
+                "transport": transport,
+                "status": "draft",
+                "config": config,
+                "credentialRefs": [],
+                "credentialFields": credential_fields,
+                "warnings": warnings
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if drafts.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(Json(json!({ "drafts": drafts })))
 }
 
 /// PATCH /companies/:cid/tools/policies/:policy_id —— 更新策略。
@@ -1172,7 +1622,9 @@ async fn update_company_tool_policy(
         tracing::error!("Failed to update tool policy: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(json!({ "id": policy_id, "name": request.name, "enabled": request.enabled })))
+    Ok(Json(
+        json!({ "id": policy_id, "name": request.name, "enabled": request.enabled }),
+    ))
 }
 
 /// POST /companies/:cid/tools/policies/:policy_id/duplicate —— mock。
@@ -1183,7 +1635,9 @@ async fn duplicate_tool_policy(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "id": Uuid::new_v4(), "duplicatedFrom": policy_id })))
+    Ok(Json(
+        json!({ "id": Uuid::new_v4(), "duplicatedFrom": policy_id }),
+    ))
 }
 
 /// POST /companies/:cid/tools/policies/reorder —— mock。
@@ -1264,7 +1718,9 @@ async fn start_agent_connection_auth(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "connectionId": connection_id, "authorizationUrl": format!("/api/tools/oauth/authorize?connection={}", connection_id) })))
+    Ok(Json(
+        json!({ "connectionId": connection_id, "authorizationUrl": format!("/api/tools/oauth/authorize?connection={}", connection_id) }),
+    ))
 }
 
 /// POST /agents/me/connections/:connection_id/token —— mock token。
@@ -1276,7 +1732,9 @@ async fn agent_connection_token(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "connectionId": connection_id, "accessToken": format!("mock-{}", Uuid::new_v4()) })))
+    Ok(Json(
+        json!({ "connectionId": connection_id, "accessToken": format!("mock-{}", Uuid::new_v4()) }),
+    ))
 }
 
 /// POST /agents/me/secrets/:key/value —— 读取 agent 已获批 secret 的值。
@@ -1286,7 +1744,12 @@ async fn agent_secret_value(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let (agent_id, company_id, _) = match &actor {
-        AuthorizationActor::Agent { agent_id, company_id, run_id, .. } => (*agent_id, *company_id, *run_id),
+        AuthorizationActor::Agent {
+            agent_id,
+            company_id,
+            run_id,
+            ..
+        } => (*agent_id, *company_id, *run_id),
         _ => return Err(StatusCode::FORBIDDEN),
     };
     let material: Option<Value> = sqlx::query_scalar(
@@ -1313,16 +1776,36 @@ async fn agent_secret_value(
 
 // ================= Round 3 =================
 
-/// POST /api/tool-connections/:id/health-check —— mock 健康检查。
+/// POST /api/tool-connections/:id/health-check —— 对 MCP 做 initialize/tools.list 探测。
 async fn connection_health_check(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "connectionId": connection_id, "healthy": true, "latencyMs": 12 })))
+    let started = std::time::Instant::now();
+    let refreshed = refresh_connection_catalog(
+        State(state.clone()),
+        Extension(actor.clone()),
+        Path(connection_id),
+    )
+    .await;
+    match refreshed {
+        Ok(Json(result)) => Ok(Json(json!({
+            "connectionId": connection_id,
+            "healthy": true,
+            "latencyMs": started.elapsed().as_millis(),
+            "catalog": result,
+        }))),
+        Err(status) => {
+            let _ = sqlx::query("UPDATE tool_connections SET health_status = 'unhealthy', health_message = $3, health_checked_at = NOW(), last_error = $3, updated_at = NOW() WHERE id = $1 AND company_id = $2")
+                .bind(connection_id).bind(company_id).bind(format!("MCP health check failed ({status})"))
+                .execute(&state.pool).await;
+            Err(status)
+        }
+    }
 }
 
 /// POST /api/tool-connections/:id/test-calls —— mock。
@@ -1341,7 +1824,9 @@ async fn create_connection_test_call(
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "id": Uuid::new_v4(), "connectionId": connection_id, "tool": request.tool, "status": "passed" })),
+        Json(
+            json!({ "id": Uuid::new_v4(), "connectionId": connection_id, "tool": request.tool, "status": "passed" }),
+        ),
     ))
 }
 
@@ -1354,7 +1839,9 @@ async fn duplicate_tool_profile(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "id": Uuid::new_v4(), "duplicatedFrom": profile_id })))
+    Ok(Json(
+        json!({ "id": Uuid::new_v4(), "duplicatedFrom": profile_id }),
+    ))
 }
 
 /// POST /api/tool-profiles/:id/entries —— 添加 profile entry。
@@ -1374,13 +1861,14 @@ async fn create_tool_profile_entry(
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO tool_profile_entries (id, profile_id, tool_name, enabled, position) \
-         VALUES ($1, $2, $3, COALESCE($4, true), 0)",
+        "INSERT INTO tool_profile_entries (id, company_id, profile_id, selector_type, effect, tool_name) \
+         VALUES ($1, $2, $3, 'tool_name', CASE WHEN COALESCE($4, true) THEN 'include' ELSE 'exclude' END, $5)",
     )
     .bind(id)
+    .bind(company_id)
     .bind(profile_id)
-    .bind(&request.tool)
     .bind(request.enabled)
+    .bind(&request.tool)
     .execute(&state.pool)
     .await
     .map_err(|e| {
@@ -1402,7 +1890,9 @@ async fn review_profile_new_tools(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "profileId": profile_id, "newTools": [], "reviewed": true })))
+    Ok(Json(
+        json!({ "profileId": profile_id, "newTools": [], "reviewed": true }),
+    ))
 }
 
 /// POST /api/tools/oauth/:provider/start —— mock。
@@ -1414,27 +1904,55 @@ async fn tools_oauth_start(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "provider": provider, "authorizationUrl": format!("/api/tools/oauth/{}", provider) })))
+    Ok(Json(
+        json!({ "provider": provider, "authorizationUrl": format!("/api/tools/oauth/{}", provider) }),
+    ))
 }
 
-/// POST /api/tool-gateway/runtime-slots/:slot_id/stop|restart —— mock。
+/// POST /api/tool-gateway/runtime-slots/:slot_id/stop
+/// 真实更新 tool_runtime_slots 行状态（数据层与 Paperclip 一致）。
+/// 注：实际进程启停（spawn/kill）属运行时组件，不在本迁移范围；此处仅对齐状态机。
 async fn gateway_slot_stop(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(_slot_id): Path<String>,
+    Path(slot_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    let slot_id: Uuid = slot_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    sqlx::query(
+        "UPDATE tool_runtime_slots \
+         SET status = 'stopped', stopped_at = NOW(), process_id = NULL, last_error = NULL, updated_at = NOW() \
+         WHERE id = $1 AND company_id = $2",
+    )
+    .bind(slot_id)
+    .bind(company_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "stopped": true })))
 }
+/// POST /api/tool-gateway/runtime-slots/:slot_id/restart
+/// 真实更新 tool_runtime_slots 行状态（数据层与 Paperclip 一致）。
 async fn gateway_slot_restart(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(_slot_id): Path<String>,
+    Path(slot_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    let slot_id: Uuid = slot_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    sqlx::query(
+        "UPDATE tool_runtime_slots \
+         SET status = 'running', started_at = NOW(), stopped_at = NULL, updated_at = NOW() \
+         WHERE id = $1 AND company_id = $2",
+    )
+    .bind(slot_id)
+    .bind(company_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "restarted": true })))
 }
