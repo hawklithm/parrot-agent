@@ -238,7 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 初始化并启动 Job Scheduler
     tracing::info!("initializing job scheduler...");
-    let job_scheduler = Arc::new(services::JobScheduler::new());
+    let job_scheduler = Arc::new(services::JobScheduler::new().with_pool(pool.clone()));
 
     // 创建 RoutineExecutionService
     let routine_execution_service = Arc::new(services::RoutineExecutionService::new(pool.clone()));

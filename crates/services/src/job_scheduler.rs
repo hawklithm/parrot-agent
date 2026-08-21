@@ -187,6 +187,8 @@ pub struct JobScheduler {
     jobs: Arc<RwLock<HashMap<String, Arc<dyn ScheduledJob>>>>,
     executions: Arc<RwLock<Vec<JobExecutionRecord>>>,
     running_jobs: Arc<RwLock<HashSet<String>>>,
+    pool: Option<PgPool>,
+    owner_id: Uuid,
 }
 
 impl JobScheduler {
@@ -195,7 +197,56 @@ impl JobScheduler {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             executions: Arc::new(RwLock::new(Vec::new())),
             running_jobs: Arc::new(RwLock::new(HashSet::new())),
+            pool: None,
+            owner_id: Uuid::new_v4(),
         }
+    }
+
+    pub fn with_pool(mut self, pool: PgPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    async fn try_acquire_lease(&self, job_name: &str, lease_seconds: i64) -> bool {
+        let Some(pool) = self.pool.as_ref() else {
+            return true;
+        };
+        sqlx::query_scalar::<_, bool>(
+            "INSERT INTO scheduler_job_leases
+                 (job_name, owner_id, leased_until, heartbeat_at, updated_at)
+             VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 second'), NOW(), NOW())
+             ON CONFLICT (job_name) DO UPDATE SET
+                 owner_id = EXCLUDED.owner_id,
+                 leased_until = EXCLUDED.leased_until,
+                 heartbeat_at = NOW(),
+                 updated_at = NOW()
+             WHERE scheduler_job_leases.leased_until <= NOW()
+                OR scheduler_job_leases.owner_id = EXCLUDED.owner_id
+             RETURNING TRUE",
+        )
+        .bind(job_name)
+        .bind(self.owner_id)
+        .bind(lease_seconds.max(1))
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    }
+
+    async fn release_lease(&self, job_name: &str) {
+        let Some(pool) = self.pool.as_ref() else {
+            return;
+        };
+        let _ = sqlx::query(
+            "UPDATE scheduler_job_leases
+                SET leased_until = NOW(), heartbeat_at = NOW(), updated_at = NOW()
+              WHERE job_name = $1 AND owner_id = $2",
+        )
+        .bind(job_name)
+        .bind(self.owner_id)
+        .execute(pool)
+        .await;
     }
 
     pub async fn register(&self, job: Arc<dyn ScheduledJob>) {
@@ -243,6 +294,14 @@ impl JobScheduler {
                     if !self.running_jobs.write().await.insert(name.clone()) {
                         continue;
                     }
+                    let lease_seconds = match job.schedule() {
+                        JobSchedule::IntervalSeconds(seconds) => seconds.max(1) as i64,
+                        _ => 60,
+                    };
+                    if !self.try_acquire_lease(name, lease_seconds).await {
+                        self.running_jobs.write().await.remove(name);
+                        continue;
+                    }
                     last_started.insert(name.clone(), now);
                     let job = Arc::clone(job);
                     let scheduler = Arc::clone(&self);
@@ -270,6 +329,7 @@ impl JobScheduler {
                             })
                             .await;
                         running_jobs.write().await.remove(&name);
+                        scheduler.release_lease(&name).await;
                     });
                 }
             }
@@ -294,8 +354,10 @@ impl Default for JobScheduler {
 
 #[cfg(test)]
 mod scheduler_tests {
-    use super::{schedule_is_due, JobSchedule};
+    use super::{schedule_is_due, JobSchedule, JobScheduler};
+    use sqlx::postgres::PgPoolOptions;
     use std::time::{Duration, Instant};
+    use uuid::Uuid;
 
     #[test]
     fn interval_schedule_runs_once_then_waits_for_interval() {
@@ -321,6 +383,33 @@ mod scheduler_tests {
     fn event_schedule_is_not_tick_driven() {
         let now = Instant::now();
         assert!(!schedule_is_due(&JobSchedule::OnEvent, None, now));
+    }
+
+    #[tokio::test]
+    async fn database_lease_allows_one_owner_and_recovery_after_release() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("database required for scheduler lease test");
+        let name = format!("scheduler_test_{}", Uuid::new_v4());
+        let first = JobScheduler::new().with_pool(pool.clone());
+        let second = JobScheduler::new().with_pool(pool.clone());
+
+        assert!(first.try_acquire_lease(&name, 60).await);
+        assert!(!second.try_acquire_lease(&name, 60).await);
+        first.release_lease(&name).await;
+        assert!(second.try_acquire_lease(&name, 60).await);
+        second.release_lease(&name).await;
+        sqlx::query("DELETE FROM scheduler_job_leases WHERE job_name = $1")
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("cleanup scheduler lease test row");
+        pool.close().await;
     }
 }
 
