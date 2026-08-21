@@ -1581,6 +1581,27 @@ async fn create_issue(
             .execute(&mut *connection)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let cleanup_result = sqlx::query(
+            "DELETE FROM issue_create_idempotency_keys
+             WHERE id IN (
+                 SELECT id
+                 FROM issue_create_idempotency_keys
+                 WHERE company_id = $1
+                   AND created_at < NOW() - INTERVAL '7 days'
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT 500
+             )",
+        )
+        .bind(company_id)
+        .execute(&mut *connection)
+        .await;
+        if cleanup_result.is_err() {
+            let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                .bind(&lock_key)
+                .execute(&mut *connection)
+                .await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
         let existing_issue_id: Option<Uuid> = match sqlx::query_scalar(
             "SELECT issue_id FROM issue_create_idempotency_keys WHERE company_id = $1 AND idempotency_key = $2",
         )
