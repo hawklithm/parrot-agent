@@ -2069,6 +2069,8 @@ async fn release_issue(
         }
     }
     let release_run_id = input.release_run_id;
+    let resolves_blocker = input.result.as_deref() == Some("success")
+        || input.target_status.as_deref() == Some("done");
     service
         .release(id, company_id, input)
         .await
@@ -2094,6 +2096,62 @@ async fn release_issue(
         json!({ "releaseRunId": release_run_id }),
     )
     .await;
+
+    if resolves_blocker {
+        let dependent_rows = sqlx::query(
+            "SELECT DISTINCT dependent.id, dependent.assignee_agent_id
+             FROM issue_relations relation
+             JOIN issues dependent ON dependent.id = relation.related_issue_id
+             WHERE relation.company_id = $1
+               AND relation.issue_id = $2
+               AND relation.type = 'blocks'
+               AND dependent.status = 'blocked'
+               AND dependent.assignee_agent_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM issue_relations remaining
+                   JOIN issues blocker ON blocker.id = remaining.issue_id
+                   WHERE remaining.company_id = $1
+                     AND remaining.related_issue_id = dependent.id
+                     AND remaining.type = 'blocks'
+                     AND blocker.status <> 'done'
+               )",
+        )
+        .bind(company_id)
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let wakeup_service =
+            services::IssueAssignmentWakeupService::new(state.heartbeat_service.clone());
+        for row in dependent_rows {
+            let dependent_id: Uuid = row.get("id");
+            let Some(assignee_agent_id) = row.get::<Option<Uuid>, _>("assignee_agent_id") else {
+                continue;
+            };
+            let wakeup_input = services::issue_assignment_wakeup::QueueWakeupInput {
+                company_id,
+                issue_id: dependent_id,
+                assignee_agent_id: Some(assignee_agent_id),
+                status: "blocked".to_string(),
+                reason: "issue_blockers_resolved".to_string(),
+                mutation: "blockers_resolved".to_string(),
+                context_source: "issue.release".to_string(),
+                requested_by_actor_type: Some(actor.actor_type().to_string()),
+                requested_by_actor_id: actor.principal_id(),
+                rethrow_on_error: false,
+            };
+            if let Err(error) = wakeup_service.queue_wakeup(wakeup_input).await {
+                tracing::warn!(
+                    error = %error,
+                    issue_id = %dependent_id,
+                    blocker_issue_id = %id,
+                    "Failed to wake dependent issue after blocker release"
+                );
+            }
+        }
+    }
     service
         .get(id, company_id)
         .await
