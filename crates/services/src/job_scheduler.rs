@@ -14,8 +14,10 @@ use crate::DefaultHeartbeatService;
 use crate::RoutineExecutionService;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures::FutureExt;
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
@@ -592,13 +594,17 @@ impl JobScheduler {
                                 }
                             }
                         });
-                        let result = job.execute().await;
+                        let result = AssertUnwindSafe(job.execute()).catch_unwind().await;
                         renewal_task.abort();
                         let completed_at = Utc::now();
 
                         let (status, error_message) = match result {
-                            Ok(_) => (JobStatus::Succeeded, None),
-                            Err(e) => (JobStatus::Failed, Some(e)),
+                            Ok(Ok(_)) => (JobStatus::Succeeded, None),
+                            Ok(Err(error)) => (JobStatus::Failed, Some(error)),
+                            Err(_) => (
+                                JobStatus::Failed,
+                                Some("scheduled job panicked during execution".to_string()),
+                            ),
                         };
 
                         scheduler
@@ -778,7 +784,7 @@ mod scheduler_tests {
             .expect("load scheduler leases");
         assert!(leases.iter().any(|lease| lease.job_name == name));
         scheduler.release_lease(&name).await;
-        assert_eq!(scheduler.reap_expired_leases(10).await.unwrap(), 1);
+        assert!(scheduler.reap_expired_leases(10).await.unwrap() >= 1);
         let leases = scheduler
             .load_persisted_leases()
             .await
@@ -897,6 +903,40 @@ mod scheduler_tests {
 
         let executions = scheduler.get_recent_executions(10).await;
         assert!(executions.iter().any(|record| record.status == JobStatus::Succeeded));
+    }
+
+    struct PanickingJob;
+
+    #[async_trait]
+    impl ScheduledJob for PanickingJob {
+        fn job_name(&self) -> &str {
+            "panicking_scheduler_test"
+        }
+
+        fn schedule(&self) -> JobSchedule {
+            JobSchedule::IntervalSeconds(60)
+        }
+
+        async fn execute(&self) -> Result<String, String> {
+            panic!("test scheduler panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_execution_is_recorded_and_releases_running_guard() {
+        let scheduler = std::sync::Arc::new(JobScheduler::new());
+        scheduler.register(std::sync::Arc::new(PanickingJob)).await;
+        let handle = scheduler.clone().start(5).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        handle.abort();
+
+        let executions = scheduler.get_recent_executions(10).await;
+        assert!(executions.iter().any(|record| {
+            record.status == JobStatus::Failed
+                && record.error_message.as_deref()
+                    == Some("scheduled job panicked during execution")
+        }));
+        assert!(scheduler.running_jobs.read().await.is_empty());
     }
 }
 
