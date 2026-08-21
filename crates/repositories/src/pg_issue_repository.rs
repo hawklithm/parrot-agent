@@ -449,6 +449,30 @@ impl IssueRepository for PgIssueRepository {
         Ok(issues)
     }
 
+    async fn list_locked_by_company(
+        &self,
+        company_id: Uuid,
+        pagination: &Pagination,
+    ) -> Result<Vec<Issue>, RepositoryError> {
+        let mut issues = sqlx::query_as::<_, Issue>(
+            "SELECT * FROM issues
+              WHERE company_id = $1 AND execution_locked_at IS NOT NULL
+              ORDER BY execution_locked_at ASC
+              LIMIT $2 OFFSET $3",
+        )
+        .bind(company_id)
+        .bind(pagination.limit)
+        .bind(pagination.offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        for issue in &mut issues {
+            self.load_issue_projections(issue).await?;
+        }
+        Ok(issues)
+    }
+
     async fn count_by_company(
         &self,
         company_id: Uuid,

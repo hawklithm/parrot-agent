@@ -3,7 +3,7 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc, Duration};
 use std::sync::Arc;
 
-use models::{Issue, UpdateIssueInput};
+use models::{Issue, Pagination, UpdateIssueInput};
 use repositories::IssueRepository;
 use crate::errors::ServiceError;
 
@@ -313,11 +313,107 @@ impl IssueExecutionLockService for DefaultIssueExecutionLockService {
         // List issues with active locks and check for expired ones
         // In production: query with filter execution_locked_at IS NOT NULL
         // For now, we return empty — this would be driven by a background scheduler
-        tracing::info!("Zombie lock cleanup triggered for company_id={}", company_id);
+        tracing::debug!("Zombie lock cleanup triggered for company_id={}", company_id);
+        const PAGE_SIZE: i64 = 500;
+        let mut offset = 0;
+        let mut released = Vec::new();
 
-        // TODO: Implement paginated query of locked issues and release expired ones
-        // This requires a repository method to list issues with active locks
-        Ok(vec![])
+        loop {
+            let issues = self
+                .issue_repo
+                .list_locked_by_company(
+                    company_id,
+                    &Pagination {
+                        limit: PAGE_SIZE,
+                        offset,
+                        cursor: None,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    ServiceError::Internal(format!("Failed to list locked issues: {}", error))
+                })?;
+            if issues.is_empty() {
+                break;
+            }
+            let released_before_page = released.len();
+
+            for issue in &issues {
+                let Some(locked_at) = issue.execution_locked_at else {
+                    continue;
+                };
+                if !self.is_lock_expired(&locked_at) {
+                    continue;
+                }
+
+                let Some(current) = self
+                    .issue_repo
+                    .get_by_id(issue.id)
+                    .await
+                    .map_err(|error| {
+                        ServiceError::Internal(format!("Failed to recheck lock: {}", error))
+                    })?
+                else {
+                    continue;
+                };
+                let Some(current_locked_at) = current.execution_locked_at else {
+                    continue;
+                };
+                if current_locked_at != locked_at || !self.is_lock_expired(&current_locked_at) {
+                    continue;
+                }
+
+                self.issue_repo
+                    .update(
+                        issue.id,
+                        UpdateIssueInput {
+                            title: None,
+                            description: None,
+                            status: None,
+                            priority: None,
+                            assignee_agent_id: None,
+                            assignee_user_id: None,
+                            work_mode: None,
+                            responsible_user_id: None,
+                            source_trust: None,
+                            monitor_scheduled_by: None,
+                            monitor_notes: None,
+                            monitor_next_check_at: None,
+                            monitor_last_triggered_at: None,
+                            monitor_attempt_count: None,
+                            hidden_at: None,
+                            execution_workspace_preference: None,
+                            execution_workspace_settings: None,
+                            execution_policy: None,
+                            execution_state: None,
+                            execution_locked_at: None,
+                            execution_run_id: None,
+                            harness_kind: None,
+                            label_ids: None,
+                            blocked_by_issue_ids: None,
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        ServiceError::Internal(format!("Failed to release zombie lock: {}", error))
+                    })?;
+                released.push(issue.id);
+            }
+
+            if issues.len() < PAGE_SIZE as usize {
+                break;
+            }
+            // Releasing rows changes the offset of later pages, so restart
+            // from the beginning whenever this page removed anything.
+            offset = if released.len() > released_before_page {
+                0
+            } else {
+                offset + PAGE_SIZE
+            };
+        }
+
+        tracing::info!(company_id = %company_id, released = released.len(), "Zombie lock cleanup completed");
+        Ok(released)
     }
 
     async fn get_lock_diagnostics(&self, issue_id: Uuid, company_id: Uuid) -> Result<ExecutionLockDiagnostics, ServiceError> {

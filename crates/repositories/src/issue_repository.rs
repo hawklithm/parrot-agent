@@ -64,4 +64,22 @@ pub trait IssueRepository: Send + Sync {
     /// Walk up the parent chain from an issue and return all ancestors.
     /// Returns them in order from immediate parent to root.
     async fn list_ancestors(&self, issue_id: Uuid) -> Result<Vec<Issue>, RepositoryError>;
+
+    /// List issues that currently carry an execution lock.
+    ///
+    /// The default keeps legacy repository implementations source-compatible;
+    /// PostgreSQL repositories override it with a filtered query.
+    async fn list_locked_by_company(
+        &self,
+        company_id: Uuid,
+        pagination: &Pagination,
+    ) -> Result<Vec<Issue>, RepositoryError> {
+        let issues = self
+            .list_by_company(company_id, &IssueQueryFilter::default(), pagination)
+            .await?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| issue.execution_locked_at.is_some())
+            .collect())
+    }
 }
