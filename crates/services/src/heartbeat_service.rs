@@ -2495,7 +2495,28 @@ impl DefaultHeartbeatService {
             let company_id: Uuid = row
                 .try_get("company_id")
                 .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
-            self.wakeup(agent_id, issue_id, company_id).await?;
+            self.wakeup_with_options(
+                agent_id,
+                issue_id,
+                company_id,
+                HeartbeatWakeupOptions {
+                    source: Some("recovery".to_string()),
+                    trigger_detail: Some("heartbeat_recovery".to_string()),
+                    reason: Some("issue_assignment_recovery".to_string()),
+                    idempotency_key: Some(format!("issue_assignment_recovery:{issue_id}")),
+                    payload: Some(serde_json::json!({
+                        "issueId": issue_id,
+                        "recovery": "assigned_issue_without_live_wakeup",
+                    })),
+                    context_snapshot: Some(serde_json::json!({
+                        "issueId": issue_id,
+                        "source": "heartbeat.recovery",
+                        "reason": "issue_assignment_recovery",
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await?;
             reconciled += 1;
         }
         Ok(reconciled)
