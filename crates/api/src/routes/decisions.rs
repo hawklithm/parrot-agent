@@ -4124,6 +4124,8 @@ fn training_example_to_json(r: &PgRow) -> Value {
         "cutoffAt": iso(r.get::<DateTime<Utc>, _>("cutoff_at")),
         "notes": r.get::<String, _>("notes"),
         "notesHistory": r.try_get::<Value, _>("notes_history").unwrap_or(Value::Null),
+        "tags": r.try_get::<Value, _>("tags").unwrap_or_else(|_| json!([])),
+        "qualityScore": r.try_get::<Option<f32>, _>("quality_score").unwrap_or(None),
         "decisionOutcome": r.try_get::<Option<String>, _>("decision_outcome").unwrap_or(None),
         "retentionPolicy": r.get::<String, _>("retention_policy"),
         "snapshot": r.try_get::<Value, _>("snapshot").unwrap_or(Value::Null),
@@ -4135,7 +4137,7 @@ fn training_example_to_json(r: &PgRow) -> Value {
 
 const TRAINING_SELECT: &str =
     "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, \
-     notes, notes_history, decision_outcome, retention_policy, snapshot, created_by_user_id, \
+     notes, notes_history, tags, quality_score, decision_outcome, retention_policy, snapshot, created_by_user_id, \
      created_at, updated_at FROM decision_training_examples";
 
 struct SourceDecision {
@@ -4464,6 +4466,37 @@ pub struct CreateDecisionTrainingInput {
     #[serde(rename = "issueId")]
     pub issue_id: Uuid,
     pub notes: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(rename = "qualityScore")]
+    pub quality_score: Option<f32>,
+}
+
+fn normalize_training_tags(tags: Vec<String>) -> Result<Vec<String>, AppError> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.len() > 64 {
+            return Err(AppError::Validation("training tag is too long".to_string()));
+        }
+        if !normalized.iter().any(|existing| existing == tag) {
+            normalized.push(tag.to_string());
+        }
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
+fn validate_training_quality(score: Option<f32>) -> Result<(), AppError> {
+    if score.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err(AppError::Validation(
+            "qualityScore must be between 0 and 1".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn require_human(actor: &AuthorizationActor) -> Result<String, AppError> {
@@ -4498,12 +4531,14 @@ async fn create_decision_training(
     )
     .await?;
     let notes = input.notes.unwrap_or_default();
+    let tags = normalize_training_tags(input.tags.unwrap_or_default())?;
+    validate_training_quality(input.quality_score)?;
 
     let inserted = sqlx::query(&format!(
         "INSERT INTO decision_training_examples (company_id, source_kind, source_id, issue_id, \
-             cutoff_at, notes, notes_history, decision_outcome, retention_policy, snapshot, \
+             cutoff_at, notes, notes_history, tags, quality_score, decision_outcome, retention_policy, snapshot, \
              created_by_user_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, $7, $8, $9, $10) \
+         VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (source_kind, source_id, created_by_user_id) DO NOTHING \
          RETURNING {}",
         TRAINING_SELECT
@@ -4516,6 +4551,8 @@ async fn create_decision_training(
     .bind(input.issue_id)
     .bind(captured.cutoff_at)
     .bind(&notes)
+    .bind(serde_json::to_value(&tags).map_err(|error| AppError::InternalServerError(error.to_string()))?)
+    .bind(input.quality_score)
     .bind(&captured.decision_outcome)
     .bind(DECISION_TRAINING_RETENTION_POLICY)
     .bind(&captured.snapshot)
@@ -4603,7 +4640,7 @@ pub struct TrainingListQuery {
 }
 
 const TRAINING_LIST_SELECT: &str = "SELECT e.id, e.company_id, e.source_kind, e.source_id, \
-     e.issue_id, e.cutoff_at, e.notes, e.notes_history, e.decision_outcome, e.retention_policy, \
+     e.issue_id, e.cutoff_at, e.notes, e.notes_history, e.tags, e.quality_score, e.decision_outcome, e.retention_policy, \
      e.snapshot, e.created_by_user_id, e.created_at, e.updated_at, \
      i.title AS issue_title, i.identifier AS issue_identifier \
        FROM decision_training_examples e \
@@ -4800,7 +4837,11 @@ async fn get_decision_training(
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateDecisionTrainingInput {
-    pub notes: String,
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(rename = "qualityScore")]
+    pub quality_score: Option<f32>,
 }
 
 /// PATCH /decision-training/:example_id
@@ -4815,16 +4856,22 @@ async fn update_decision_training(
     let user_id = require_human(&actor)?;
     let created_by: String = existing.get("created_by_user_id");
     require_example_owner(&user_id, &created_by)?;
+    let tags = match input.tags {
+        Some(tags) => Some(normalize_training_tags(tags)?),
+        None => None,
+    };
+    validate_training_quality(input.quality_score)?;
 
-    if input.notes.len() > 100_000 {
+    let previous_notes: String = existing.get("notes");
+    let notes = input.notes.unwrap_or_else(|| previous_notes.clone());
+    if notes == previous_notes && tags.is_none() && input.quality_score.is_none() {
+        return Ok(Json(training_example_to_json(&existing)));
+    }
+
+    if notes.len() > 100_000 {
         return Err(AppError::Validation(
             "notes must be at most 100000 characters".to_string(),
         ));
-    }
-
-    let previous_notes: String = existing.get("notes");
-    if input.notes == previous_notes {
-        return Ok(Json(training_example_to_json(&existing)));
     }
 
     let mut history = existing
@@ -4833,25 +4880,30 @@ async fn update_decision_training(
     if !history.is_array() {
         history = json!([]);
     }
-    if let Some(entries) = history.as_array_mut() {
-        entries.push(json!({
-            "author": user_id,
-            "at": iso(Utc::now()),
-            "body": previous_notes,
-        }));
+    if notes != previous_notes {
+        if let Some(entries) = history.as_array_mut() {
+            entries.push(json!({
+                "author": user_id,
+                "at": iso(Utc::now()),
+                "body": previous_notes,
+            }));
+        }
     }
 
     let updated = sqlx::query(&format!(
         "UPDATE decision_training_examples \
-            SET notes = $1, notes_history = $2, updated_at = NOW() \
-          WHERE id = $3 \
+            SET notes = $1, notes_history = $2, \
+                tags = COALESCE($3, tags), quality_score = COALESCE($4, quality_score), updated_at = NOW() \
+          WHERE id = $5 \
       RETURNING {}",
         TRAINING_SELECT
             .trim_start_matches("SELECT ")
             .replace(" FROM decision_training_examples", "")
     ))
-    .bind(&input.notes)
+    .bind(&notes)
     .bind(&history)
+    .bind(tags.as_ref().map(|value| serde_json::to_value(value)).transpose().map_err(|error| AppError::InternalServerError(error.to_string()))?)
+    .bind(input.quality_score)
     .bind(example_id)
     .fetch_optional(pool)
     .await
@@ -4945,6 +4997,24 @@ mod tests {
     fn attention_source_kinds_are_recognised() {
         assert!(is_valid_source_kind("approval"));
         assert!(!is_valid_source_kind("nope"));
+    }
+
+    #[test]
+    fn training_tags_are_normalized_and_quality_is_bounded() {
+        assert_eq!(
+            normalize_training_tags(vec![
+                "  urgent ".to_string(),
+                "urgent".to_string(),
+                "".to_string(),
+                "review".to_string(),
+            ])
+            .unwrap(),
+            vec!["review".to_string(), "urgent".to_string()]
+        );
+        assert!(validate_training_quality(Some(0.0)).is_ok());
+        assert!(validate_training_quality(Some(1.0)).is_ok());
+        assert!(validate_training_quality(Some(1.01)).is_err());
+        assert!(validate_training_quality(Some(f32::NAN)).is_err());
     }
 
     #[test]
