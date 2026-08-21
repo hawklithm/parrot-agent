@@ -208,7 +208,9 @@ impl DefaultAccessService {
     }
 
     async fn feature_enabled(&self, company_id: Uuid, feature: &str) -> Result<(), AccessError> {
-        let pool = self.pool.as_ref().ok_or_else(|| AccessError::Internal("Access service requires a database pool".to_string()))?;
+        let Some(pool) = self.pool.as_ref() else {
+            return Ok(());
+        };
         let enabled = sqlx::query_scalar::<_, bool>(
             "SELECT COALESCE((experimental ->> $1)::boolean, true) FROM instance_settings WHERE id = 1",
         )
@@ -217,7 +219,14 @@ impl DefaultAccessService {
         .await
         .map_err(|e| AccessError::Internal(e.to_string()))?
         .unwrap_or(true);
-        if enabled { Ok(()) } else { Err(AccessError::FeatureNotEnabled(format!("{} is disabled for company {}", feature, company_id))) }
+        if enabled {
+            Ok(())
+        } else {
+            Err(AccessError::FeatureNotEnabled(format!(
+                "{} is disabled for company {}",
+                feature, company_id
+            )))
+        }
     }
 }
 
@@ -260,6 +269,14 @@ impl AccessService for DefaultAccessService {
                 }
                 AccessDecision::deny("Cannot read agent from different company")
             }
+            Action::AgentConfigRead | Action::AgentConfigUpdate => {
+                if let Some(res) = resource {
+                    if actor.company_id() == Some(res.company_id) {
+                        return AccessDecision::allow("Same company agent configuration access");
+                    }
+                }
+                AccessDecision::deny("Cannot access agent configuration from different company")
+            }
             _ => AccessDecision::deny("Action not implemented"),
         }
     }
@@ -301,19 +318,48 @@ impl AccessService for DefaultAccessService {
     }
 
     async fn assert_can_update_agent(&self, actor: &dyn Actor, agent_id: Uuid) -> Result<(), AccessError> {
-        self.assert_agent_read_allowed(actor, agent_id).await?;
-        if !actor.has_permission(Action::AgentsCreate) {
-            return Err(AccessError::InsufficientPermissions("Missing agents:update permission".to_string()));
+        let company_id = self.agent_company(agent_id).await?;
+        let resource = Resource {
+            resource_type: ResourceType::Agent,
+            resource_id: agent_id,
+            company_id,
+            issue_context: None,
+        };
+        if !self
+            .decide(Action::AgentConfigUpdate, actor, Some(&resource))
+            .await
+            .allowed
+        {
+            return Err(AccessError::InsufficientPermissions(
+                "Missing agent_config:update permission".to_string(),
+            ));
         }
         Ok(())
     }
 
     async fn assert_can_read_configurations(&self, actor: &dyn Actor, agent_id: Uuid) -> Result<(), AccessError> {
-        self.assert_agent_read_allowed(actor, agent_id).await
+        let company_id = self.agent_company(agent_id).await?;
+        let resource = Resource {
+            resource_type: ResourceType::Agent,
+            resource_id: agent_id,
+            company_id,
+            issue_context: None,
+        };
+        if !self
+            .decide(Action::AgentConfigRead, actor, Some(&resource))
+            .await
+            .allowed
+        {
+            return Err(AccessError::InsufficientPermissions(
+                "Missing agent_config:read permission".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     async fn assert_can_provision_built_in_agents(&self, actor: &dyn Actor, company_id: Uuid) -> Result<(), AccessError> {
         self.assert_company_access(actor, company_id).await?;
+        self.assert_built_in_agents_enabled(company_id).await?;
         if actor.is_agent() && !actor.has_permission(Action::BuiltInAgentsProvision) {
             return Err(AccessError::InsufficientPermissions(
                 "Missing built_in_agents:provision permission".to_string(),
@@ -535,6 +581,54 @@ mod tests {
 
         assert!(service.assert_can_create_agents_for_company(&agent_with_perm, company_id).await.is_ok());
         assert!(service.assert_can_create_agents_for_company(&agent_without_perm, company_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_agent_configuration_decisions_are_company_scoped() {
+        let service = DefaultAccessService::new();
+        let company_id = Uuid::new_v4();
+        let other_company_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let actor = UserActor {
+            user_id: Uuid::new_v4(),
+            company_id,
+            is_admin: false,
+        };
+        let same_company = Resource {
+            resource_type: ResourceType::Agent,
+            resource_id: agent_id,
+            company_id,
+            issue_context: None,
+        };
+        let other_company = Resource {
+            company_id: other_company_id,
+            ..same_company.clone()
+        };
+
+        assert!(
+            service
+                .decide(Action::AgentConfigRead, &actor, Some(&same_company))
+                .await
+                .allowed
+        );
+        assert!(
+            service
+                .decide(Action::AgentConfigUpdate, &actor, Some(&same_company))
+                .await
+                .allowed
+        );
+        assert!(
+            !service
+                .decide(Action::AgentConfigRead, &actor, Some(&other_company))
+                .await
+                .allowed
+        );
+        assert!(
+            !service
+                .decide(Action::AgentConfigUpdate, &actor, Some(&other_company))
+                .await
+                .allowed
+        );
     }
 
     #[tokio::test]
