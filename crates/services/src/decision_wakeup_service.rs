@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::heartbeat_service::HeartbeatService;
+use crate::heartbeat_service::{HeartbeatService, HeartbeatWakeupOptions};
 
 /// 决策唤醒输入
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,14 +32,6 @@ pub struct ArchiveNotificationItem {
 }
 
 /// Heartbeat唤醒选项
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatWakeupOptions {
-    pub source: String,
-    pub trigger_detail: String,
-    pub reason: String,
-    pub payload: serde_json::Value,
-}
-
 /// 决策唤醒服务
 /// 
 /// 此服务负责在决策完成后唤醒origin agent，以及在attention items归档时通知agent。
@@ -169,7 +161,18 @@ impl DecisionWakeupService for DefaultDecisionWakeupService {
             .as_ref()
             .ok_or(WakeupError::HeartbeatUnavailable)?;
         heartbeat
-            .wakeup(input.agent_id, input.issue_id, input.company_id)
+            .wakeup_with_options(
+                input.agent_id,
+                input.issue_id,
+                input.company_id,
+                HeartbeatWakeupOptions {
+                    source: Some("automation".to_string()),
+                    trigger_detail: Some("system".to_string()),
+                    reason: Some(format!("decision_{}", input.outcome)),
+                    payload: Some(Self::build_decision_wakeup_payload(&input)),
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(|error| WakeupError::WakeupFailed(error.to_string()))?;
         /*
@@ -214,7 +217,18 @@ impl DecisionWakeupService for DefaultDecisionWakeupService {
             .collect::<std::collections::HashSet<_>>();
         for issue_id in issue_ids {
             heartbeat
-                .wakeup(batch.agent_id, issue_id, batch.company_id)
+                .wakeup_with_options(
+                    batch.agent_id,
+                    issue_id,
+                    batch.company_id,
+                    HeartbeatWakeupOptions {
+                        source: Some("automation".to_string()),
+                        trigger_detail: Some("system".to_string()),
+                        reason: Some("attention_auto_archived".to_string()),
+                        payload: Some(Self::build_archive_notification_payload(&batch)),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .map_err(|error| WakeupError::NotificationFailed(error.to_string()))?;
         }
