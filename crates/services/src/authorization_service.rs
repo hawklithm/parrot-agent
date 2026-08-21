@@ -283,8 +283,8 @@ impl WorkspaceRuntimeServiceAuthzService for DefaultRuntimeServiceAuthzService {
             )));
         }
 
-        // TODO: Integrate with accessService.decide() to check runtime:manage permission
-        // For now, allow if require_runtime_manage_permission is false
+        // Resolve runtime:manage through the shared authorization service when
+        // the policy requires an explicit permission check.
         if self.policy.require_runtime_manage_permission {
             let Some(agent_id) = request.agent_id else {
                 return Ok(AuthzDecision::deny(

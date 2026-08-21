@@ -277,6 +277,18 @@ impl AccessService for DefaultAccessService {
                 }
                 AccessDecision::deny("Cannot access agent configuration from different company")
             }
+            Action::BuiltInAgentsProvision | Action::BuiltInRoutineControl => {
+                if let Some(res) = resource {
+                    if actor.company_id() != Some(res.company_id) {
+                        return AccessDecision::deny("Cannot control built-in resources from different company");
+                    }
+                }
+                if !actor.is_agent() || actor.has_permission(action) {
+                    AccessDecision::allow("Built-in resource control permitted")
+                } else {
+                    AccessDecision::deny(format!("Missing {} permission", action))
+                }
+            }
             _ => AccessDecision::deny("Action not implemented"),
         }
     }
@@ -360,7 +372,17 @@ impl AccessService for DefaultAccessService {
     async fn assert_can_provision_built_in_agents(&self, actor: &dyn Actor, company_id: Uuid) -> Result<(), AccessError> {
         self.assert_company_access(actor, company_id).await?;
         self.assert_built_in_agents_enabled(company_id).await?;
-        if actor.is_agent() && !actor.has_permission(Action::BuiltInAgentsProvision) {
+        let resource = Resource {
+            resource_type: ResourceType::BuiltInAgent,
+            resource_id: company_id,
+            company_id,
+            issue_context: None,
+        };
+        if !self
+            .decide(Action::BuiltInAgentsProvision, actor, Some(&resource))
+            .await
+            .allowed
+        {
             return Err(AccessError::InsufficientPermissions(
                 "Missing built_in_agents:provision permission".to_string(),
             ));
@@ -370,10 +392,25 @@ impl AccessService for DefaultAccessService {
 
     async fn assert_can_control_built_in_routine(&self, actor: &dyn Actor, routine_key: &str) -> Result<(), AccessError> {
         let _ = routine_key;
-        if actor.company_id().is_some() {
+        let company_id = actor
+            .company_id()
+            .ok_or_else(|| AccessError::Denied("No company context".to_string()))?;
+        let resource = Resource {
+            resource_type: ResourceType::BuiltInAgent,
+            resource_id: Uuid::nil(),
+            company_id,
+            issue_context: None,
+        };
+        if self
+            .decide(Action::BuiltInRoutineControl, actor, Some(&resource))
+            .await
+            .allowed
+        {
             Ok(())
         } else {
-            Err(AccessError::Denied("No company context".to_string()))
+            Err(AccessError::InsufficientPermissions(
+                "Missing built_in_routine:control permission".to_string(),
+            ))
         }
     }
 
@@ -723,6 +760,44 @@ mod tests {
         }
 
         assert!(matches!(result, Err(AccessError::FeatureNotEnabled(_))));
+    }
+
+    #[tokio::test]
+    async fn test_built_in_routine_control_requires_agent_permission() {
+        let service = DefaultAccessService::new();
+        let company_id = Uuid::new_v4();
+        let permitted = AgentActor {
+            agent_id: Uuid::new_v4(),
+            company_id,
+            permissions: serde_json::json!({
+                "can_control_built_in_routine": true
+            }),
+        };
+        let denied = AgentActor {
+            agent_id: Uuid::new_v4(),
+            company_id,
+            permissions: serde_json::json!({}),
+        };
+        let user = UserActor {
+            user_id: Uuid::new_v4(),
+            company_id,
+            is_admin: false,
+        };
+
+        assert!(service
+            .assert_can_control_built_in_routine(&permitted, "summarizer")
+            .await
+            .is_ok());
+        assert!(matches!(
+            service
+                .assert_can_control_built_in_routine(&denied, "summarizer")
+                .await,
+            Err(AccessError::InsufficientPermissions(_))
+        ));
+        assert!(service
+            .assert_can_control_built_in_routine(&user, "summarizer")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
