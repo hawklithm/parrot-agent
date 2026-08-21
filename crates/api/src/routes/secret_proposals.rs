@@ -42,6 +42,7 @@ fn proposal_json(
         "valueFingerprintSha256": row.get::<Option<String>, _>("value_fingerprint_sha256"),
         "valueLength": row.get::<Option<i32>, _>("value_length"),
         "secretId": row.get::<Option<Uuid>, _>("secret_id"),
+        "secretProposalId": row.get::<Option<Uuid>, _>("secret_proposal_id"),
         "targetType": row.get::<Option<String>, _>("target_type"),
         "targetId": row.get::<Option<Uuid>, _>("target_id"),
         "configPath": row.get::<Option<String>, _>("config_path"),
@@ -79,6 +80,8 @@ struct CreateProposalRequest {
     justification: Option<String>,
     #[serde(rename = "secretId")]
     secret_id: Option<Uuid>,
+    #[serde(rename = "secretProposalId")]
+    secret_proposal_id: Option<Uuid>,
     #[serde(rename = "targetAgentId")]
     target_agent_id: Option<Uuid>,
     #[serde(rename = "configPath")]
@@ -131,7 +134,11 @@ async fn create_agent_proposal(
     if kind == "secret" && (request.name.is_none() || request.key.is_none() || request.value.is_none()) {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
-    if kind == "binding" && (request.secret_id.is_none() || request.target_agent_id.is_none() || request.config_path.is_none()) {
+    if kind == "binding"
+        && (request.secret_id.is_none() == request.secret_proposal_id.is_none()
+            || request.target_agent_id.is_none()
+            || request.config_path.is_none())
+    {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -159,9 +166,9 @@ async fn create_agent_proposal(
     sqlx::query(
         "INSERT INTO company_secret_proposals \
          (id, company_id, kind, proposed_name, proposed_key, proposed_description, justification, \
-          value_ciphertext, value_fingerprint_sha256, value_length, secret_id, target_type, target_id, \
+         value_ciphertext, value_fingerprint_sha256, value_length, secret_id, secret_proposal_id, target_type, target_id, \
           config_path, proposed_by_agent_id, origin_run_id, expires_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
     )
     .bind(id)
     .bind(company_id)
@@ -174,6 +181,7 @@ async fn create_agent_proposal(
     .bind(&value_fingerprint)
     .bind(value_length)
     .bind(request.secret_id)
+    .bind(request.secret_proposal_id)
     .bind(if kind == "binding" { Some("agent") } else { None })
     .bind(request.target_agent_id)
     .bind(request.config_path.as_deref())
@@ -334,12 +342,9 @@ async fn approve_proposal(
     let fingerprint: Option<String> = row.get("value_fingerprint_sha256");
     let proposed_by: Uuid = row.get("proposed_by_agent_id");
     let request = request.map(|Json(value)| value).unwrap_or_default();
-    if request.cascade {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
     let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut created_secret_id: Option<Uuid> = None;
+    let mut resolved_secret_id: Option<Uuid> = row.get("secret_id");
     if kind == "secret" {
         let secret_id = Uuid::new_v4();
         let name = request
@@ -390,7 +395,81 @@ async fn approve_proposal(
         })?;
         created_secret_id = Some(secret_id);
     } else if kind == "binding" {
-        let secret_id: Uuid = row.get("secret_id");
+        let secret_proposal_id: Option<Uuid> = row.get("secret_proposal_id");
+        if let Some(secret_proposal_id) = secret_proposal_id {
+            if !request.cascade {
+                return Err(StatusCode::CONFLICT);
+            }
+            let dependency = sqlx::query(
+                "SELECT * FROM company_secret_proposals
+                   WHERE id = $1 AND company_id = $2 AND kind = 'secret'
+                     AND status = 'pending' AND expires_at > NOW()
+                   FOR UPDATE",
+            )
+            .bind(secret_proposal_id)
+            .bind(company_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::CONFLICT)?;
+            let dependency_id = Uuid::new_v4();
+            let dependency_name: String = dependency
+                .get::<Option<String>, _>("proposed_name")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+            let dependency_key: String = dependency
+                .get::<Option<String>, _>("proposed_key")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+            let dependency_description: Option<String> = dependency.get("proposed_description");
+            let dependency_material: Value = dependency
+                .get::<Option<Value>, _>("value_ciphertext")
+                .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+            let dependency_fingerprint: String = dependency
+                .get::<Option<String>, _>("value_fingerprint_sha256")
+                .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+            let dependency_proposer: Uuid = dependency.get("proposed_by_agent_id");
+            sqlx::query(
+                "INSERT INTO company_secrets
+                    (id, company_id, key, name, provider, status, managed_mode, description, created_by_agent_id)
+                 VALUES ($1,$2,$3,$4,'local_encrypted','active','paperclip_managed',$5,$6)",
+            )
+            .bind(dependency_id)
+            .bind(company_id)
+            .bind(dependency_key)
+            .bind(dependency_name)
+            .bind(dependency_description)
+            .bind(dependency_proposer)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            sqlx::query(
+                "INSERT INTO company_secret_versions
+                    (secret_id, version, material, value_sha256, fingerprint_sha256, status)
+                 VALUES ($1, 1, $2, $3, $3, 'current')",
+            )
+            .bind(dependency_id)
+            .bind(dependency_material)
+            .bind(dependency_fingerprint)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            sqlx::query(
+                "UPDATE company_secret_proposals
+                    SET status = 'approved', created_secret_id = $2,
+                        resolved_by_user_id = $3, resolved_at = NOW(), updated_at = NOW()
+                  WHERE id = $1",
+            )
+            .bind(secret_proposal_id)
+            .bind(dependency_id)
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            resolved_secret_id = Some(dependency_id);
+            created_secret_id = Some(dependency_id);
+        }
+        let secret_id = resolved_secret_id.ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
         let target_type: String = row.get("target_type");
         let target_id: Uuid = row.get("target_id");
         let config_path: String = row.get("config_path");
@@ -431,19 +510,22 @@ async fn approve_proposal(
 
     sqlx::query(
         "UPDATE company_secret_proposals \
-         SET status = 'approved', created_secret_id = $3, resolved_by_user_id = $4, resolved_at = NOW(), updated_at = NOW() \
+         SET status = 'approved', secret_id = COALESCE($5, secret_id), created_secret_id = $3, resolved_by_user_id = $4, resolved_at = NOW(), updated_at = NOW() \
          WHERE id = $1 AND company_id = $2",
     )
     .bind(proposal_id)
     .bind(company_id)
     .bind(created_secret_id)
     .bind(user_id.to_string())
+    .bind(resolved_secret_id)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!("Failed to approve proposal: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     crate::routes::log_activity(
         &state.pool,
@@ -464,8 +546,6 @@ async fn approve_proposal(
             tracing::error!("Failed to reload proposal: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(proposal_json(&updated)))
 }
 
