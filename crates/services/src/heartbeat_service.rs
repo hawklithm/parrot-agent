@@ -1823,6 +1823,35 @@ impl HeartbeatService for DefaultHeartbeatService {
         company_id: Uuid,
         options: HeartbeatWakeupOptions,
     ) -> Result<(), HeartbeatError> {
+        let idempotency_row_id = if let Some(idempotency_key) = options.idempotency_key.as_deref() {
+            let row = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO agent_wakeup_requests
+                 (company_id, agent_id, status, payload, source, trigger_detail, reason,
+                  requested_by_actor_type, requested_by_actor_id, idempotency_key, updated_at)
+                 VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, NOW())
+                 ON CONFLICT (company_id, idempotency_key) DO NOTHING
+                 RETURNING id",
+            )
+            .bind(company_id)
+            .bind(agent_id)
+            .bind(serde_json::json!({ "issueId": issue_id }))
+            .bind(options.source.as_deref())
+            .bind(options.trigger_detail.as_deref())
+            .bind(options.reason.as_deref())
+            .bind(options.requested_by_actor_type.as_deref())
+            .bind(options.requested_by_actor_id)
+            .bind(idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+            if row.is_none() {
+                return Ok(());
+            }
+            row
+        } else {
+            None
+        };
+
         let throttle_candidate = matches!(
             options.reason.as_deref(),
             None
@@ -1933,7 +1962,20 @@ impl HeartbeatService for DefaultHeartbeatService {
                                 "nextAllowedAt": next_allowed_at,
                             }
                         });
-                        sqlx::query(
+                        if let Some(idempotency_row_id) = idempotency_row_id.as_ref() {
+                            sqlx::query(
+                                "UPDATE agent_wakeup_requests
+                                 SET status = 'skipped', payload = $2, reason = 'issue_rewake_throttled',
+                                     finished_at = NOW(), updated_at = NOW()
+                                 WHERE id = $1",
+                            )
+                            .bind(idempotency_row_id)
+                            .bind(&payload)
+                            .execute(&self.pool)
+                            .await
+                            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                        } else {
+                            sqlx::query(
                             "INSERT INTO agent_wakeup_requests
                              (company_id, agent_id, status, payload, source, trigger_detail,
                               reason, requested_by_actor_type, requested_by_actor_id,
@@ -1952,13 +1994,26 @@ impl HeartbeatService for DefaultHeartbeatService {
                         .execute(&self.pool)
                         .await
                         .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                        }
                         return Ok(());
                     }
                 }
             }
         }
 
-        self.wakeup(agent_id, issue_id, company_id).await
+        let result = self.wakeup(agent_id, issue_id, company_id).await;
+        if let (Some(idempotency_row_id), Err(error)) = (idempotency_row_id, &result) {
+            let _ = sqlx::query(
+                "UPDATE agent_wakeup_requests
+                 SET status = 'failed', error = $2, finished_at = NOW(), updated_at = NOW()
+                 WHERE id = $1",
+            )
+            .bind(idempotency_row_id)
+            .bind(error.to_string())
+            .execute(&self.pool)
+            .await;
+        }
+        result
     }
 
     async fn wakeup(

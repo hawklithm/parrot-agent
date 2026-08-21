@@ -1747,6 +1747,7 @@ async fn create_issue(
                 context_source: "issue.create".to_string(),
                 requested_by_actor_type: Some(actor.actor_type().to_string()),
                 requested_by_actor_id: actor.principal_id(),
+                idempotency_key: None,
                 rethrow_on_error: false, // Swallow error to avoid blocking response
             };
 
@@ -2036,6 +2037,7 @@ async fn checkout_issue(
             context_source: "issue.checkout".to_string(),
             requested_by_actor_type: Some(actor.actor_type().to_string()),
             requested_by_actor_id: actor.principal_id(),
+            idempotency_key: None,
             rethrow_on_error: false,
         };
         if let Err(error) = wakeup_service.queue_wakeup(wakeup_input).await {
@@ -2141,6 +2143,10 @@ async fn release_issue(
                 context_source: "issue.release".to_string(),
                 requested_by_actor_type: Some(actor.actor_type().to_string()),
                 requested_by_actor_id: actor.principal_id(),
+                idempotency_key: Some(format!(
+                    "issue_blockers_resolved:{}:{}",
+                    dependent_id, id
+                )),
                 rethrow_on_error: false,
             };
             if let Err(error) = wakeup_service.queue_wakeup(wakeup_input).await {
@@ -2930,6 +2936,7 @@ async fn create_child_issue(
                 context_source: "issue.child_create".to_string(),
                 requested_by_actor_type: Some(actor.actor_type().to_string()),
                 requested_by_actor_id: actor.principal_id(),
+                idempotency_key: None,
                 rethrow_on_error: false, // Don't block child creation on wakeup failure
             };
 

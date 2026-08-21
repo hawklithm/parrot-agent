@@ -23,6 +23,7 @@ pub struct QueueWakeupInput {
     pub context_source: String,
     pub requested_by_actor_type: Option<String>,
     pub requested_by_actor_id: Option<Uuid>,
+    pub idempotency_key: Option<String>,
     pub rethrow_on_error: bool,
 }
 
@@ -77,7 +78,7 @@ impl IssueAssignmentWakeupService {
                         "issueId": input.issue_id,
                         "source": input.context_source,
                     })),
-                    idempotency_key: None,
+                    idempotency_key: input.idempotency_key.clone(),
                 },
             )
             .await;
@@ -133,6 +134,7 @@ mod tests {
             context_source: "issue.create".to_string(),
             requested_by_actor_type: Some("user".to_string()),
             requested_by_actor_id: Some(Uuid::new_v4()),
+            idempotency_key: None,
             rethrow_on_error: false,
         };
 
@@ -156,6 +158,7 @@ mod tests {
             context_source: "issue.create".to_string(),
             requested_by_actor_type: None,
             requested_by_actor_id: None,
+            idempotency_key: None,
             rethrow_on_error: false,
         };
 
@@ -179,6 +182,7 @@ mod tests {
             context_source: "issue.create".to_string(),
             requested_by_actor_type: None,
             requested_by_actor_id: None,
+            idempotency_key: None,
             rethrow_on_error: false,
         };
 
@@ -203,6 +207,7 @@ mod tests {
             context_source: "issue.create".to_string(),
             requested_by_actor_type: None,
             requested_by_actor_id: None,
+            idempotency_key: None,
             rethrow_on_error: false, // Should swallow error
         };
 
@@ -226,6 +231,7 @@ mod tests {
             context_source: "issue.create".to_string(),
             requested_by_actor_type: None,
             requested_by_actor_id: None,
+            idempotency_key: None,
             rethrow_on_error: true, // Should rethrow
         };
 
