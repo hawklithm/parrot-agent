@@ -425,10 +425,10 @@ impl PrincipalPermissionGrantRepository for PgPrincipalPermissionGrantRepository
         permission_key: &str,
     ) -> RepositoryResult<Option<PrincipalPermissionGrantRow>> {
         let grant = sqlx::query_as::<_, PrincipalPermissionGrantRow>(
-            r#"SELECT id, company_id, principal_type, principal_id, permission_key,
+            r#"SELECT id, company_id, principal_type::text AS principal_type, principal_id, permission_key,
                       scope, granted_by_user_id, expires_at, created_at, updated_at
                FROM principal_permission_grants
-               WHERE company_id = $1 AND principal_type = $2 AND principal_id = $3
+               WHERE company_id = $1 AND principal_type::text = $2 AND principal_id = $3
                  AND permission_key = $4
                  AND (expires_at IS NULL OR expires_at > NOW())"#,
         )
@@ -449,10 +449,10 @@ impl PrincipalPermissionGrantRepository for PgPrincipalPermissionGrantRepository
         principal_id: Uuid,
     ) -> RepositoryResult<Vec<PrincipalPermissionGrantRow>> {
         let grants = sqlx::query_as::<_, PrincipalPermissionGrantRow>(
-            r#"SELECT id, company_id, principal_type, principal_id, permission_key,
+            r#"SELECT id, company_id, principal_type::text AS principal_type, principal_id, permission_key,
                       scope, granted_by_user_id, expires_at, created_at, updated_at
                FROM principal_permission_grants
-               WHERE company_id = $1 AND principal_type = $2 AND principal_id = $3
+               WHERE company_id = $1 AND principal_type::text = $2 AND principal_id = $3
                  AND (expires_at IS NULL OR expires_at > NOW())"#,
         )
         .bind(company_id)

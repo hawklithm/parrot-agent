@@ -502,6 +502,9 @@ fn permission_key_for_action(action: &AuthorizationAction) -> Option<PermissionK
         AuthorizationAction::MembershipRevoke { .. } => PermissionKey::MEMBERS_MANAGE,
         AuthorizationAction::EnvironmentLease { .. } => PermissionKey::ENVIRONMENTS_LEASE,
         AuthorizationAction::EnvironmentRelease { .. } => PermissionKey::ENVIRONMENTS_RELEASE,
+        AuthorizationAction::Custom { action, .. } if action == PermissionKey::RUNTIME_MANAGE => {
+            PermissionKey::RUNTIME_MANAGE
+        }
         AuthorizationAction::RoutineCreate { .. } => PermissionKey::ROUTINES_CREATE,
         AuthorizationAction::RoutineUpdate { .. } => PermissionKey::ROUTINES_UPDATE,
         AuthorizationAction::RoutineDelete { .. } => PermissionKey::ROUTINES_DELETE,

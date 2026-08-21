@@ -48,6 +48,7 @@ impl PermissionKey {
     pub const ENVIRONMENTS_LEASE: &'static str = "environments:lease";
     pub const ENVIRONMENTS_RELEASE: &'static str = "environments:release";
     pub const ENVIRONMENTS_MANAGE: &'static str = "environments:manage";
+    pub const RUNTIME_MANAGE: &'static str = "runtime:manage";
 
     // Routine权限常量
     pub const ROUTINES_CREATE: &'static str = "routines:create";

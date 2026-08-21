@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 use regex::Regex;
+
+use crate::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService};
 
 #[derive(Debug, Error)]
 pub enum AuthorizationError {
@@ -227,17 +230,30 @@ impl WorkspaceCommandAuthzService for DefaultCommandAuthzService {
 /// Default implementation of runtime service authorization service
 pub struct DefaultRuntimeServiceAuthzService {
     policy: AuthorizationPolicy,
+    pool: Option<PgPool>,
 }
 
 impl DefaultRuntimeServiceAuthzService {
     pub fn new(policy: AuthorizationPolicy) -> Self {
-        Self { policy }
+        Self { policy, pool: None }
     }
 
     pub fn with_default_policy() -> Self {
         Self {
             policy: AuthorizationPolicy::default(),
+            pool: None,
         }
+    }
+
+    pub fn with_pool(policy: AuthorizationPolicy, pool: PgPool) -> Self {
+        Self {
+            policy,
+            pool: Some(pool),
+        }
+    }
+
+    pub fn with_default_policy_and_pool(pool: PgPool) -> Self {
+        Self::with_pool(AuthorizationPolicy::default(), pool)
     }
 
     fn action_allowed(&self, action: &RuntimeServiceAction) -> bool {
@@ -270,17 +286,54 @@ impl WorkspaceRuntimeServiceAuthzService for DefaultRuntimeServiceAuthzService {
         // TODO: Integrate with accessService.decide() to check runtime:manage permission
         // For now, allow if require_runtime_manage_permission is false
         if self.policy.require_runtime_manage_permission {
-            if request.agent_id.is_none() {
+            let Some(agent_id) = request.agent_id else {
                 return Ok(AuthzDecision::deny(
                     "Agent ID required for permission check".to_string(),
                 ));
+            };
+            let Some(pool) = &self.pool else {
+                return Ok(AuthzDecision::deny(
+                    "Runtime access service is not configured".to_string(),
+                ));
+            };
+
+            let workspace_company_id = sqlx::query_scalar::<_, Uuid>(
+                "SELECT company_id FROM execution_workspaces WHERE id = $1",
+            )
+            .bind(request.workspace_id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or(AuthorizationError::WorkspaceNotFound(request.workspace_id))?;
+            let agent_company_id = sqlx::query_scalar::<_, Uuid>(
+                "SELECT company_id FROM agents WHERE id = $1 AND status <> 'terminated'",
+            )
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or(AuthorizationError::AgentNotFound(agent_id))?;
+            if workspace_company_id != agent_company_id {
+                return Ok(AuthzDecision::deny(
+                    "Agent and workspace belong to different companies".to_string(),
+                ));
             }
 
-            // TODO: Call accessService.decide({
-            //   actor: { type: 'agent', agentId: request.agent_id },
-            //   resource: { type: 'execution_workspace', id: request.workspace_id },
-            //   action: 'runtime:manage',
-            // })
+            let actor = AuthorizationActor::agent(agent_id, agent_company_id, None);
+            let decision = AuthorizationService::decide(
+                pool,
+                &actor,
+                &AuthorizationAction::Custom {
+                    action: "runtime:manage".to_string(),
+                    resource_id: Some(request.workspace_id),
+                },
+                Some(workspace_company_id),
+            )
+            .await;
+            if !decision.allowed {
+                return Ok(AuthzDecision::deny(format!(
+                    "Runtime manage permission denied: {}",
+                    decision.explanation
+                )));
+            }
         }
 
         Ok(AuthzDecision::allow(format!(
@@ -339,7 +392,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runtime_service_authz_allowed() {
-        let service = DefaultRuntimeServiceAuthzService::with_default_policy();
+        let service = DefaultRuntimeServiceAuthzService::new(AuthorizationPolicy {
+            require_runtime_manage_permission: false,
+            ..AuthorizationPolicy::default()
+        });
 
         let request = RuntimeServiceAuthzRequest {
             workspace_id: Uuid::new_v4(),
@@ -350,6 +406,200 @@ mod tests {
 
         let result = service.check_runtime_service_permission(request).await.unwrap();
         assert!(result.allowed);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_service_authz_fails_closed_without_access_service() {
+        let service = DefaultRuntimeServiceAuthzService::with_default_policy();
+        let request = RuntimeServiceAuthzRequest {
+            workspace_id: Uuid::new_v4(),
+            service_name: "postgres".to_string(),
+            action: RuntimeServiceAction::Start,
+            agent_id: Some(Uuid::new_v4()),
+        };
+
+        let result = service
+            .check_runtime_service_permission(request)
+            .await
+            .expect("authorization decision");
+        assert!(!result.allowed);
+        assert!(result.reason.contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn test_runtime_service_authz_uses_database_grants_and_scope() {
+        let Some(database_url) = std::env::var_os("DATABASE_URL") else {
+            eprintln!("skipping runtime authz integration test: DATABASE_URL is not set");
+            return;
+        };
+        let pool = PgPool::connect(
+            database_url
+                .to_str()
+                .expect("DATABASE_URL must be valid UTF-8"),
+        )
+        .await
+        .expect("connect database");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let company_id = Uuid::new_v4();
+        let other_company_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let ungranted_agent_id = Uuid::new_v4();
+        let other_agent_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let other_project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let other_workspace_id = Uuid::new_v4();
+        let grantor_id = Uuid::new_v4();
+        let prefix = format!("RA{}", &company_id.simple().to_string()[..6]);
+        let other_prefix = format!("RA{}", &other_company_id.simple().to_string()[..6]);
+
+        for (id, name, issue_prefix) in [
+            (company_id, "Runtime Authz Company", prefix),
+            (other_company_id, "Other Runtime Authz Company", other_prefix),
+        ] {
+            sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(name)
+                .bind(issue_prefix)
+                .execute(&pool)
+                .await
+                .expect("insert company");
+        }
+        sqlx::query("INSERT INTO auth_users (id, email) VALUES ($1, $2)")
+            .bind(grantor_id)
+            .bind(format!("runtime-authz-{}@example.test", grantor_id))
+            .execute(&pool)
+            .await
+            .expect("insert grantor");
+        for (id, company, name) in [
+            (agent_id, company_id, "Granted runtime agent"),
+            (ungranted_agent_id, company_id, "Ungrant runtime agent"),
+            (other_agent_id, other_company_id, "Other company runtime agent"),
+        ] {
+            sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(company)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .expect("insert agent");
+        }
+        for (id, company, name) in [
+            (project_id, company_id, "Runtime authz project"),
+            (other_project_id, other_company_id, "Other runtime authz project"),
+        ] {
+            sqlx::query("INSERT INTO projects (id, company_id, name) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(company)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .expect("insert project");
+        }
+        for (id, company, project, name) in [
+            (workspace_id, company_id, project_id, "Granted workspace"),
+            (
+                other_workspace_id,
+                other_company_id,
+                other_project_id,
+                "Other workspace",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO execution_workspaces
+                    (id, company_id, project_id, mode, strategy_type, name)
+                 VALUES ($1, $2, $3, 'local', 'shared', $4)",
+            )
+            .bind(id)
+            .bind(company)
+            .bind(project)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("insert execution workspace");
+        }
+        sqlx::query(
+            "INSERT INTO principal_permission_grants
+                (company_id, principal_type, principal_id, permission_key, scope, granted_by_user_id)
+             VALUES ($1, 'agent', $2, 'runtime:manage', '{}', $3)",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(grantor_id)
+        .execute(&pool)
+        .await
+        .expect("insert runtime grant");
+        let raw_grant: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT principal_id, permission_key FROM principal_permission_grants
+             WHERE company_id = $1 AND principal_id = $2",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("read runtime grant");
+        assert_eq!(raw_grant, Some((agent_id, "runtime:manage".to_string())));
+        assert!(
+            crate::auth::check_explicit_grants(
+                &pool,
+                company_id,
+                "agent",
+                agent_id,
+                "runtime:manage",
+            )
+            .await
+        );
+
+        let service = DefaultRuntimeServiceAuthzService::with_default_policy_and_pool(pool.clone());
+        let request = |workspace_id, agent_id| RuntimeServiceAuthzRequest {
+            workspace_id,
+            service_name: "postgres".to_string(),
+            action: RuntimeServiceAction::Start,
+            agent_id: Some(agent_id),
+        };
+        let granted = service
+            .check_runtime_service_permission(request(workspace_id, agent_id))
+            .await
+            .expect("granted runtime authorization");
+        assert!(granted.allowed, "{granted:?}");
+        assert!(!service
+            .check_runtime_service_permission(request(workspace_id, ungranted_agent_id))
+            .await
+            .expect("ungranted runtime authorization")
+            .allowed);
+        assert!(!service
+            .check_runtime_service_permission(request(other_workspace_id, agent_id))
+            .await
+            .expect("cross-company runtime authorization")
+            .allowed);
+        assert!(matches!(
+            service
+                .check_runtime_service_permission(request(Uuid::new_v4(), other_agent_id))
+                .await,
+            Err(AuthorizationError::WorkspaceNotFound(_))
+        ));
+
+        sqlx::query("DELETE FROM execution_workspaces WHERE id IN ($1, $2)")
+            .bind(workspace_id)
+            .bind(other_workspace_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup execution workspaces");
+        sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup runtime authz companies");
+        sqlx::query("DELETE FROM auth_users WHERE id = $1")
+            .bind(grantor_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup grantor");
     }
 
     #[tokio::test]
