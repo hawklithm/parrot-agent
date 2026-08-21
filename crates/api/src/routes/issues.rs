@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
+use std::path::{Path as FsPath, PathBuf};
 
 use models::{CreateIssueInput, Issue, IssuePriority, IssueStatus, UpdateIssueInput};
 use services::auth::AuthorizationActor;
@@ -104,6 +105,38 @@ struct ListIssuesQuery {
     execution_workspace_id: Option<Uuid>,
     origin_kind: Option<String>,
     origin_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileResourceQuery {
+    path: String,
+    workspace: Option<String>,
+    project_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileResourceListQuery {
+    workspace: Option<String>,
+    project_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+    path: Option<String>,
+    mode: Option<String>,
+    q: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+struct WorkspaceFileRoot {
+    workspace_kind: String,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    cwd: PathBuf,
+    name: String,
+    provider: String,
+    project_name: String,
 }
 
 const TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND: &str = "task_watchdog_product_bug";
@@ -2649,26 +2682,273 @@ async fn check_file_resource_availability(
 }
 
 async fn list_file_resources(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(issue_id): IssueId,
+    Query(query): Query<FileResourceListQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let root = workspace_file_root(
+        &state,
+        company_id,
+        issue_id,
+        query.workspace.as_deref().unwrap_or("auto"),
+        query.project_id,
+        query.workspace_id,
+    )
+    .await?;
+    if let Some(mode) = query.mode.as_deref() {
+        if !matches!(mode, "all" | "recent" | "changed") {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    let relative = query.path.as_deref().unwrap_or("");
+    validate_workspace_file_path(relative)?;
+    let target = canonical_workspace_path(&root.cwd, relative).await?;
+    let metadata = tokio::fs::metadata(&target)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if !metadata.is_dir() {
+        return Ok(Json(vec![workspace_file_payload(&root, &target, relative, &metadata)]));
+    }
+
+    let mut entries = tokio::fs::read_dir(&target)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let needle = query.q.as_deref().map(str::to_ascii_lowercase);
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).min(200);
+    let mut matched = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" || name == ".env" || name.starts_with('.') {
+            continue;
+        }
+        if let Some(needle) = needle.as_deref() {
+            if !name.to_ascii_lowercase().contains(needle) {
+                continue;
+            }
+        }
+        let entry_path = entry.path();
+        let entry_metadata = tokio::fs::metadata(&entry_path)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        matched.push((name, entry_path, entry_metadata));
+    }
+    matched.sort_by(|left, right| left.0.cmp(&right.0));
+    let items = matched
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(name, path, metadata)| {
+            let child_relative = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
+            workspace_file_payload(&root, &path, &child_relative, &metadata)
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(items))
 }
 
 /// I22: GET /issues/:id/file-resources/resolve
 async fn resolve_file_resource(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
+    Query(query): Query<FileResourceQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "resolved": []})))
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let root = workspace_file_root(
+        &state,
+        company_id,
+        id,
+        query.workspace.as_deref().unwrap_or("auto"),
+        query.project_id,
+        query.workspace_id,
+    )
+    .await?;
+    validate_workspace_file_path(&query.path)?;
+    let target = canonical_workspace_path(&root.cwd, &query.path).await?;
+    let metadata = tokio::fs::metadata(&target)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(Json(workspace_file_payload(
+        &root,
+        &target,
+        &query.path,
+        &metadata,
+    )))
 }
 
 /// I23: GET /issues/:id/file-resources/content
 async fn get_file_resource_content(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
+    Query(query): Query<FileResourceQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "content": ""})))
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let root = workspace_file_root(
+        &state,
+        company_id,
+        id,
+        query.workspace.as_deref().unwrap_or("auto"),
+        query.project_id,
+        query.workspace_id,
+    )
+    .await?;
+    validate_workspace_file_path(&query.path)?;
+    let target = canonical_workspace_path(&root.cwd, &query.path).await?;
+    let metadata = tokio::fs::metadata(&target)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if metadata.is_dir() || metadata.len() > 1_048_576 {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let content = tokio::fs::read_to_string(&target)
+        .await
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    Ok(Json(json!({
+        "resource": workspace_file_payload(&root, &target, &query.path, &metadata),
+        "content": content,
+        "truncated": false,
+    })))
+}
+
+async fn workspace_file_root(
+    state: &AppState,
+    company_id: Uuid,
+    issue_id: Uuid,
+    workspace: &str,
+    project_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+) -> Result<WorkspaceFileRoot, StatusCode> {
+    if !matches!(workspace, "auto" | "execution" | "project") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let issue_project_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT project_id FROM issues WHERE id = $1 AND company_id = $2",
+    )
+    .bind(issue_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let row = sqlx::query(
+        "SELECT workspace_kind, id, project_id, cwd, name, provider_type, project_name
+         FROM (
+           SELECT 'execution_workspace' AS workspace_kind, ew.id, ew.project_id,
+                  ew.cwd, ew.name, ew.provider_type, p.name AS project_name
+           FROM execution_workspaces ew
+           JOIN projects p ON p.id = ew.project_id
+           WHERE ew.company_id = $1
+             AND ($2::uuid IS NULL OR ew.project_id = $2)
+             AND ($3::uuid IS NULL OR ew.id = $3)
+             AND $4 <> 'project'
+             AND ew.status NOT IN ('closed', 'cleaned')
+           UNION ALL
+           SELECT 'project_workspace' AS workspace_kind, pw.id, pw.project_id,
+                  pw.config->>'cwd', pw.name, 'local_fs', p.name AS project_name
+           FROM project_workspaces pw
+           JOIN projects p ON p.id = pw.project_id
+           WHERE p.company_id = $1
+             AND ($2::uuid IS NULL OR pw.project_id = $2)
+             AND ($3::uuid IS NULL OR pw.id = $3)
+             AND $4 <> 'execution'
+         ) candidates
+         WHERE cwd IS NOT NULL
+         ORDER BY CASE WHEN workspace_kind = 'execution_workspace' THEN 0 ELSE 1 END, id
+         LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(project_id.or(issue_project_id))
+    .bind(workspace_id)
+    .bind(workspace)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let cwd = row.get::<String, _>("cwd");
+    let cwd = tokio::fs::canonicalize(cwd)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(WorkspaceFileRoot {
+        workspace_kind: row.get("workspace_kind"),
+        workspace_id: row.get("id"),
+        project_id: row.get("project_id"),
+        cwd,
+        name: row.get("name"),
+        provider: row.get("provider_type"),
+        project_name: row.get("project_name"),
+    })
+}
+
+fn validate_workspace_file_path(path: &str) -> Result<(), StatusCode> {
+    if path.starts_with('/')
+        || path.starts_with('\\')
+        || path.split(['/', '\\']).any(|part| {
+            part == ".." || part.contains('\0') || part.chars().any(|c| c.is_control())
+        })
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+async fn canonical_workspace_path(root: &FsPath, relative: &str) -> Result<PathBuf, StatusCode> {
+    let candidate = tokio::fs::canonicalize(root.join(relative))
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if !candidate.starts_with(root)
+        || candidate
+            .components()
+            .any(|part| part.as_os_str() == ".git" || part.as_os_str() == ".env")
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(candidate)
+}
+
+fn workspace_file_payload(
+    root: &WorkspaceFileRoot,
+    path: &FsPath,
+    relative: &str,
+    metadata: &std::fs::Metadata,
+) -> serde_json::Value {
+    let is_dir = metadata.is_dir();
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let preview_kind = if is_dir {
+        "unsupported"
+    } else if ["png", "jpg", "jpeg", "gif", "webp"].contains(&extension) {
+        "image"
+    } else {
+        "text"
+    };
+    json!({
+        "kind": if is_dir { "directory" } else { "file" },
+        "provider": root.provider,
+        "title": path.file_name().and_then(|value| value.to_str()).unwrap_or(relative),
+        "displayPath": relative,
+        "workspaceLabel": root.name,
+        "workspaceKind": root.workspace_kind,
+        "workspaceId": root.workspace_id,
+        "projectId": root.project_id,
+        "projectName": root.project_name,
+        "contentType": if is_dir { Value::Null } else { json!("application/octet-stream") },
+        "byteSize": if is_dir { Value::Null } else { json!(metadata.len()) },
+        "previewKind": preview_kind,
+        "capabilities": {
+            "preview": !is_dir,
+            "download": !is_dir,
+            "listChildren": is_dir,
+        },
+    })
 }
 
 /// I24: GET /issues/:id/feedback-votes
