@@ -3,7 +3,9 @@ use models::{
     CompanyLogo, InviteOnboardingManifest, InviteSkillDetails, InviteSkillIndex,
 };
 use sqlx::{PgPool, Row};
-use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::asset_storage::{StorageProviderRegistry, StorageService};
 
 #[async_trait]
 pub trait InviteResourceService: Send + Sync {
@@ -23,9 +25,22 @@ pub trait InviteResourceService: Send + Sync {
     async fn get_skill_details(&self, token: &str, skill_name: &str) -> Result<InviteSkillDetails, String>;
 }
 
-pub struct PgInviteResourceService { pool: PgPool, asset_root: PathBuf }
+pub struct PgInviteResourceService {
+    pool: PgPool,
+    storage: Arc<dyn StorageService>,
+}
 impl PgInviteResourceService {
-    pub fn new(pool: PgPool) -> Self { Self { pool, asset_root: std::env::var_os("PARROT_ASSET_STORAGE_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("data/assets")) } }
+    pub fn new(pool: PgPool) -> Self {
+        Self::with_storage(
+            pool,
+            StorageProviderRegistry::from_env().provider_or_unavailable(None),
+        )
+    }
+
+    pub fn with_storage(pool: PgPool, storage: Arc<dyn StorageService>) -> Self {
+        Self { pool, storage }
+    }
+
     async fn company(&self, token: &str) -> Result<(uuid::Uuid, String), String> {
         let row = sqlx::query("SELECT i.company_id, c.name FROM invites i JOIN companies c ON c.id=i.company_id WHERE i.token=$1 AND i.accepted=false AND i.expires_at > NOW()").bind(token).fetch_optional(&self.pool).await.map_err(|e| e.to_string())?.ok_or_else(|| String::from("invite is invalid or expired"))?;
         Ok((row.get("company_id"), row.get("name")))
@@ -37,8 +52,19 @@ impl InviteResourceService for PgInviteResourceService {
     async fn get_company_logo(&self, token: &str) -> Result<CompanyLogo, String> {
         let (company_id, _) = self.company(token).await?;
         let row = sqlx::query("SELECT a.provider, a.object_key, a.content_type FROM companies c JOIN assets a ON a.id=c.logo_asset_id WHERE c.id=$1").bind(company_id).fetch_optional(&self.pool).await.map_err(|e| e.to_string())?.ok_or_else(|| "company logo not found".to_string())?;
-        if row.get::<String,_>("provider") != "local" { return Err("unsupported logo asset provider".into()); }
-        let data = tokio::fs::read(self.asset_root.join(row.get::<String,_>("object_key"))).await.map_err(|e| e.to_string())?;
+        let provider = row.get::<String, _>("provider");
+        let storage: Arc<dyn StorageService> = if provider == "local" || provider == "local_disk" {
+            self.storage.clone()
+        } else {
+            StorageProviderRegistry::from_env()
+                .provider(Some(&provider))
+                .map_err(|e| e.to_string())?
+        };
+        let object_key = row.get::<String, _>("object_key");
+        let data = storage
+            .get_object(company_id, &object_key)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(CompanyLogo { content_type: row.get("content_type"), data })
     }
     async fn get_onboarding(&self, token: &str) -> Result<InviteOnboardingManifest, String> {
