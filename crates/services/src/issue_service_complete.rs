@@ -13,7 +13,7 @@ use crate::issue_tree_control_service::IssueTreeControlService;
 use crate::issue_comment_service::IssueCommentService;
 use crate::work_product_service::WorkProductService;
 use crate::attachment_service::AttachmentService;
-use crate::heartbeat_service::HeartbeatService;
+use crate::heartbeat_service::{HeartbeatService, HeartbeatWakeupOptions};
 use crate::recovery_action_service::RecoveryActionService;
 
 /// Issue mutation result
@@ -877,7 +877,7 @@ impl LegacyIssueService {
         }
     }
 
-    fn wake_assigned_issue(&self, issue: &Issue) {
+    fn wake_assigned_issue(&self, issue: &Issue, reason: &str) {
         let Some(agent_id) = issue.assignee_agent_id else { return };
         if !matches!(issue.status, models::IssueStatus::Todo | models::IssueStatus::InProgress) {
             return;
@@ -885,8 +885,22 @@ impl LegacyIssueService {
         let heartbeat = self.heartbeat_service.clone();
         let issue_id = issue.id;
         let company_id = issue.company_id;
+        let reason = reason.to_string();
         tokio::spawn(async move {
-            if let Err(error) = heartbeat.wakeup(agent_id, issue_id, company_id).await {
+            if let Err(error) = heartbeat
+                .wakeup_with_options(
+                    agent_id,
+                    issue_id,
+                    company_id,
+                    HeartbeatWakeupOptions {
+                        source: Some("assignment".to_string()),
+                        trigger_detail: Some("system".to_string()),
+                        reason: Some(reason),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
                 tracing::warn!(%error, %agent_id, %issue_id, "failed to wake assigned issue");
             }
         });
@@ -936,7 +950,7 @@ impl issue_service::IssueService for LegacyIssueService {
             watchdog_discovery_audit: input.watchdog_discovery_audit,
         };
         let result = self.inner.create(compat_input).await.map_err(|e| e.to_string())?;
-        self.wake_assigned_issue(&result.issue);
+        self.wake_assigned_issue(&result.issue, "issue_assigned");
         Ok(crate::issue_service::IssueMutationResult {
             changed: result.changed,
             issue: result.issue,
@@ -984,7 +998,7 @@ impl issue_service::IssueService for LegacyIssueService {
             watchdog_discovery_audit: input.watchdog_discovery_audit,
         };
         let result = self.inner.create_child(parent_id, compat_input).await.map_err(|e| e.to_string())?;
-        self.wake_assigned_issue(&result.issue);
+        self.wake_assigned_issue(&result.issue, "issue_assigned");
         Ok(crate::issue_service::IssueMutationResult {
             changed: result.changed,
             issue: result.issue,
@@ -1053,7 +1067,7 @@ impl issue_service::IssueService for LegacyIssueService {
             assignee_changed || became_runnable || reopened
         });
         if should_wake {
-            self.wake_assigned_issue(&result.issue);
+            self.wake_assigned_issue(&result.issue, "issue_reopened");
         }
         Ok(crate::issue_service::IssueMutationResult {
             changed: result.changed,

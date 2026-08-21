@@ -7,7 +7,7 @@ use models::{Issue, IssueStatus, EnvironmentLease};
 use repositories::IssueRepository;
 use crate::errors::ServiceError;
 use crate::lease_service::{LeaseService, AcquireLeaseRequest};
-use crate::heartbeat_service::HeartbeatService;
+use crate::heartbeat_service::{HeartbeatService, HeartbeatWakeupOptions};
 
 /// Checkout input with environment acquisition
 #[derive(Debug, Clone, Deserialize)]
@@ -277,7 +277,20 @@ impl IssueCheckoutService for DefaultIssueCheckoutService {
                         let company_id = updated_issue.company_id;
                         // Fire-and-forget wakeup — don't block the checkout response
                         tokio::spawn(async move {
-                            if let Err(e) = heartbeat.wakeup(assignee_agent_id, issue_id, company_id).await {
+                            if let Err(e) = heartbeat
+                                .wakeup_with_options(
+                                    assignee_agent_id,
+                                    issue_id,
+                                    company_id,
+                                    HeartbeatWakeupOptions {
+                                        source: Some("assignment".to_string()),
+                                        trigger_detail: Some("system".to_string()),
+                                        reason: Some("issue_checked_out".to_string()),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            {
                                 tracing::warn!("Heartbeat wakeup failed for agent={}, issue={}: {}", assignee_agent_id, issue_id, e);
                             }
                         });
