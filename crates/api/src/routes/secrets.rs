@@ -107,6 +107,40 @@ fn validate_secret_name_key(name: &str, key: &str) -> Result<(), SecretError> {
     Ok(())
 }
 
+async fn validate_provider_config(
+    pool: &sqlx::PgPool,
+    company_id: Uuid,
+    provider: &str,
+    provider_config_id: Option<Uuid>,
+) -> Result<(), SecretError> {
+    let Some(config_id) = provider_config_id else {
+        if provider != "local_encrypted" {
+            return Err(SecretError::BadRequest(
+                "Non-local providers require providerConfigId".into(),
+            ));
+        }
+        return Ok(());
+    };
+    let config: Option<(String, String)> = sqlx::query_as(
+        "SELECT provider, status FROM company_secret_provider_configs WHERE id = $1 AND company_id = $2",
+    )
+    .bind(config_id)
+    .bind(company_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| SecretError::Database(e.to_string()))?;
+    let Some((configured_provider, status)) = config else {
+        return Err(SecretError::BadRequest("Provider configuration not found for company".into()));
+    };
+    if configured_provider != provider {
+        return Err(SecretError::BadRequest("Provider configuration does not match provider".into()));
+    }
+    if !matches!(status.as_str(), "ready" | "active") {
+        return Err(SecretError::BadRequest("Provider configuration is disabled".into()));
+    }
+    Ok(())
+}
+
 /// SE5: GET /companies/:company_id/secret-providers
 async fn list_secret_providers(
     State(state): State<AppState>,
@@ -295,6 +329,7 @@ async fn create_company_secret(
     if !KNOWN_PROVIDERS.iter().any(|(id, _)| *id == provider) {
         return Err(SecretError::BadRequest("Unsupported secret provider".into()));
     }
+    validate_provider_config(&state.pool, company_id, &provider, body.provider_config_id).await?;
     validate_secret_name_key(&body.name, &key)?;
     let db_managed_mode = if is_external { "external" } else { "paperclip_managed" };
     let mut tx = state
@@ -400,7 +435,21 @@ async fn update_secret(
     Json(body): Json<UpdateSecretBody>,
 ) -> Result<Json<Value>, SecretError> {
     let pool = &state.pool;
-    authorize_secret(&state.pool, id, &actor, AccessMode::Write).await?;
+    let company_id = authorize_secret(&state.pool, id, &actor, AccessMode::Write).await?;
+    if body.provider_config_id.is_some() {
+        let provider: String = sqlx::query_scalar("SELECT provider FROM company_secrets WHERE id = $1")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| SecretError::Database(e.to_string()))?;
+        validate_provider_config(
+            &state.pool,
+            company_id,
+            &provider,
+            body.provider_config_id.flatten(),
+        )
+        .await?;
+    }
     if let Some(name) = body.name.as_deref() {
         let key = body.key.as_deref().unwrap_or("");
         if body.key.is_some() {
@@ -495,7 +544,7 @@ async fn rotate_secret(
     Json(body): Json<RotateSecretBody>,
 ) -> Result<Json<Value>, SecretError> {
     let pool = &state.pool;
-    authorize_secret(pool, id, &actor, AccessMode::Write).await?;
+    let company_id = authorize_secret(pool, id, &actor, AccessMode::Write).await?;
 
     // Validate rotation input (requireSecretRotationInput).
     let has_input = body.value.as_deref().map_or(false, |s| !s.trim().is_empty())
@@ -530,6 +579,15 @@ async fn rotate_secret(
     if deleted.is_some() {
         return Err(SecretError::NotFound);
     }
+    let provider: String = existing.get("provider");
+    let existing_provider_config_id: Option<Uuid> = existing.get("provider_config_id");
+    validate_provider_config(
+        pool,
+        company_id,
+        &provider,
+        body.provider_config_id.or(existing_provider_config_id),
+    )
+    .await?;
     let next_version: i32 = existing.get::<i32, _>("latest_version") + 1;
 
     // Insert the new version row (current), retiring the prior current.
