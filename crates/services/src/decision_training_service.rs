@@ -105,6 +105,9 @@ pub struct CaptureInput {
 pub struct ListInput {
     pub company_id: Uuid,
     pub source_kind: Option<DecisionTrainingSourceKind>,
+    pub project_id: Option<Uuid>,
+    pub author_id: Option<String>,
+    pub query: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -600,35 +603,36 @@ impl DecisionTrainingService for PgDecisionTrainingService {
     async fn list_examples(&self, input: ListInput) -> Result<Vec<DecisionTrainingExample>, TrainingError> {
         let limit = input.limit.unwrap_or(100).clamp(1, 1000);
         let offset = input.offset.unwrap_or(0).max(0);
-        let rows = if let Some(kind) = input.source_kind.as_ref() {
-            sqlx::query(
-                "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, notes,
-                        notes_history, tags, quality_score, decision_outcome, retention_policy,
-                        snapshot, created_by_user_id, created_at, updated_at FROM decision_training_examples
-                  WHERE company_id = $1 AND source_kind = $2
-                  ORDER BY created_at DESC, id ASC LIMIT $3 OFFSET $4",
-            )
-            .bind(input.company_id)
-            .bind(Self::source_kind_name(kind))
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(Self::db_error)?
-        } else {
-            sqlx::query(
-                "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, notes,
-                        notes_history, tags, quality_score, decision_outcome, retention_policy,
-                        snapshot, created_by_user_id, created_at, updated_at FROM decision_training_examples
-                  WHERE company_id = $1 ORDER BY created_at DESC, id ASC LIMIT $2 OFFSET $3",
-            )
-            .bind(input.company_id)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(Self::db_error)?
-        };
+        let pattern = input
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(|query| format!("%{query}%"));
+        let rows = sqlx::query(
+            "SELECT e.id, e.company_id, e.source_kind, e.source_id, e.issue_id, e.cutoff_at, e.notes,
+                    e.notes_history, e.tags, e.quality_score, e.decision_outcome, e.retention_policy,
+                    e.snapshot, e.created_by_user_id, e.created_at, e.updated_at
+               FROM decision_training_examples e
+               JOIN issues i ON i.id = e.issue_id
+              WHERE e.company_id = $1
+                AND ($2::uuid IS NULL OR i.project_id = $2)
+                AND ($3::text IS NULL OR e.source_kind = $3)
+                AND ($4::text IS NULL OR e.created_by_user_id = $4)
+                AND ($5::text IS NULL OR e.notes ILIKE $5 OR i.title ILIKE $5 OR COALESCE(i.identifier, '') ILIKE $5)
+              ORDER BY e.created_at DESC, e.id DESC
+              LIMIT $6 OFFSET $7",
+        )
+        .bind(input.company_id)
+        .bind(input.project_id)
+        .bind(input.source_kind.as_ref().map(Self::source_kind_name))
+        .bind(input.author_id.as_deref())
+        .bind(pattern.as_deref())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Self::db_error)?;
         rows.into_iter().map(|row| self.row_to_example(row)).collect()
     }
 
@@ -903,6 +907,19 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
                     .as_ref()
                     .map_or(true, |kind| &example.source_kind == kind)
             })
+            .filter(|example| {
+                input
+                    .author_id
+                    .as_ref()
+                    .map_or(true, |author| &example.created_by_user_id == author)
+            })
+            .filter(|example| {
+                input.query.as_ref().map_or(true, |query| {
+                    let query = query.trim().to_ascii_lowercase();
+                    example.notes.as_deref().unwrap_or_default().to_ascii_lowercase().contains(&query)
+                        || example.snapshot.context.issue_title.as_deref().unwrap_or_default().to_ascii_lowercase().contains(&query)
+                })
+            })
             .cloned()
             .collect();
         examples.sort_by(|left, right| {
@@ -1028,6 +1045,9 @@ mod tests {
                 .list_examples(ListInput {
                     company_id,
                     source_kind: None,
+                    project_id: None,
+                    author_id: None,
+                    query: None,
                     limit: None,
                     offset: None,
                 })

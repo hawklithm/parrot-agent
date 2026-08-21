@@ -30,7 +30,7 @@ use crate::app_state::AppState;
 use crate::errors::AppError;
 use services::auth::{decide_access, AuthorizationAction, AuthorizationActor};
 use services::decision_training_service::{
-    DecisionTrainingSourceKind, PersistSnapshotInput, TrainingError,
+    DecisionTrainingSourceKind, ListInput, PersistSnapshotInput, TrainingError,
 };
 
 // ---------------------------------------------------------------------------
@@ -4725,49 +4725,68 @@ pub struct TrainingListQuery {
     pub q: Option<String>,
 }
 
-const TRAINING_LIST_SELECT: &str = "SELECT e.id, e.company_id, e.source_kind, e.source_id, \
-     e.issue_id, e.cutoff_at, e.notes, e.notes_history, e.tags, e.quality_score, e.decision_outcome, e.retention_policy, \
-     e.snapshot, e.created_by_user_id, e.created_at, e.updated_at, \
-     i.title AS issue_title, i.identifier AS issue_identifier \
-       FROM decision_training_examples e \
-       JOIN issues i ON i.id = e.issue_id \
-      WHERE e.company_id = $1 \
-        AND ($2::uuid IS NULL OR i.project_id = $2) \
-        AND ($3::text IS NULL OR e.source_kind = $3) \
-        AND ($4::text IS NULL OR e.created_by_user_id = $4) \
-        AND ($5::text IS NULL OR e.notes ILIKE $5 OR i.title ILIKE $5 OR i.identifier ILIKE $5) \
-      ORDER BY e.created_at DESC, e.id DESC";
-
-/// Paperclip `decisionTrainingService.list()` — examples joined to their issue.
+/// Paperclip `decisionTrainingService.list()` - examples joined to their issue.
 async fn load_training_rows(
-    pool: &PgPool,
+    state: &AppState,
     company_id: Uuid,
     filters: &TrainingListQuery,
 ) -> Result<Vec<Value>, AppError> {
-    let pattern = filters
-        .q
-        .as_ref()
-        .map(|q| q.trim())
-        .filter(|q| !q.is_empty())
-        .map(|q| format!("%{q}%"));
-
-    let rows = sqlx::query(TRAINING_LIST_SELECT)
-        .bind(company_id)
-        .bind(filters.project)
-        .bind(filters.kind.as_deref())
-        .bind(filters.author.as_deref())
-        .bind(pattern.as_deref())
-        .fetch_all(pool)
+    let examples = state
+        .decision_training_service
+        .list_examples(ListInput {
+            company_id,
+            source_kind: filters
+                .kind
+                .as_deref()
+                .map(training_source_kind)
+                .transpose()?,
+            project_id: filters.project,
+            author_id: filters.author.clone(),
+            query: filters.q.clone(),
+            limit: None,
+            offset: None,
+        })
         .await
-        .map_err(db_err)?;
+        .map_err(training_service_err)?;
 
-    Ok(rows
+    let issue_ids: Vec<Uuid> = examples
         .iter()
-        .map(|r| {
+        .filter_map(|example| example.snapshot.issue_id)
+        .collect();
+    let issue_rows = if issue_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query(
+            "SELECT id, title, identifier FROM issues WHERE company_id = $1 AND id = ANY($2)",
+        )
+        .bind(company_id)
+        .bind(&issue_ids)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(db_err)?
+    };
+    let issue_meta: HashMap<Uuid, (String, Option<String>)> = issue_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("id"),
+                (row.get("title"), row.try_get("identifier").unwrap_or(None)),
+            )
+        })
+        .collect();
+
+    Ok(examples
+        .iter()
+        .map(|example| {
+            let (issue_title, issue_identifier) = example
+                .snapshot
+                .issue_id
+                .and_then(|id| issue_meta.get(&id).cloned())
+                .unwrap_or_else(|| (String::new(), None));
             json!({
-                "example": training_example_to_json(r),
-                "issueTitle": r.get::<String, _>("issue_title"),
-                "issueIdentifier": r.try_get::<Option<String>, _>("issue_identifier").unwrap_or(None),
+                "example": training_service_example_to_json(example),
+                "issueTitle": issue_title,
+                "issueIdentifier": issue_identifier,
             })
         })
         .collect())
@@ -4796,7 +4815,7 @@ async fn list_decision_training(
         ));
     }
 
-    let rows = load_training_rows(&state.pool, company_id, &query).await?;
+    let rows = load_training_rows(&state, company_id, &query).await?;
     Ok(Json(Value::Array(rows)))
 }
 
@@ -4810,7 +4829,7 @@ async fn export_decision_training(
     require_company_access(&actor, company_id, true)?;
 
     let pool = &state.pool;
-    let rows = load_training_rows(pool, company_id, &TrainingListQuery::default()).await?;
+    let rows = load_training_rows(&state, company_id, &TrainingListQuery::default()).await?;
 
     let lines: Vec<String> = rows
         .iter()
