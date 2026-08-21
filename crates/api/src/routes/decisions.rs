@@ -4443,26 +4443,7 @@ async fn export_decision_training(
     let pool = &state.pool;
     let rows = load_training_rows(&state, company_id, &TrainingListQuery::default()).await?;
 
-    let lines: Vec<String> = rows
-        .iter()
-        .filter_map(|row| row.get("example"))
-        .map(|example| {
-            json!({
-                "retentionPolicy": example.get("retentionPolicy").cloned().unwrap_or(Value::Null),
-                "state": example.get("snapshot").cloned().unwrap_or(Value::Null),
-                "label": {
-                    "outcome": example.get("decisionOutcome").cloned().unwrap_or(Value::Null),
-                    "notes": example.get("notes").cloned().unwrap_or(Value::Null),
-                },
-            })
-            .to_string()
-        })
-        .collect();
-    let body = if lines.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", lines.join("\n"))
-    };
+    let body = decision_training_export_body(&rows);
 
     let example_ids: Vec<Value> = rows
         .iter()
@@ -4487,6 +4468,32 @@ async fn export_decision_training(
         body,
     )
         .into_response())
+}
+
+fn decision_training_export_body(rows: &[Value]) -> String {
+    let lines: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.get("example"))
+        .map(|example| {
+            json!({
+                "retentionPolicy": example.get("retentionPolicy").cloned().unwrap_or(Value::Null),
+                "state": example.get("snapshot").cloned().unwrap_or(Value::Null),
+                "label": {
+                    "outcome": example.get("decisionOutcome").cloned().unwrap_or(Value::Null),
+                    "notes": example.get("notes").cloned().unwrap_or(Value::Null),
+                    "notesHistory": example.get("notesHistory").cloned().unwrap_or_else(|| json!([])),
+                    "tags": example.get("tags").cloned().unwrap_or_else(|| json!([])),
+                    "qualityScore": example.get("qualityScore").cloned().unwrap_or(Value::Null),
+                },
+            })
+            .to_string()
+        })
+        .collect();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
 }
 
 fn training_not_found() -> AppError {
@@ -4847,6 +4854,41 @@ mod tests {
         // A cursor minted for one sort order is not valid for another.
         assert!(decode_cursor(&cursor, "decide").is_err());
         assert!(decode_cursor("!!!not-base64!!!", "recent").is_err());
+    }
+
+    #[test]
+    fn decision_training_export_preserves_raw_state_and_labels() {
+        let rows = vec![json!({
+            "example": {
+                "id": "example-1",
+                "retentionPolicy": "scrub_deleted_comments_v1",
+                "snapshot": {
+                    "version": 1,
+                    "comments": [{"id": "comment-1", "body": "retained"}],
+                },
+                "decisionOutcome": "approved",
+                "notes": "keep this",
+                "notesHistory": [{"body": "initial"}],
+                "tags": ["reviewed", "training"],
+                "qualityScore": 0.75,
+            }
+        })];
+
+        let body = decision_training_export_body(&rows);
+        assert!(body.ends_with('\n'));
+        let exported: Value = serde_json::from_str(body.trim_end()).expect("valid JSONL row");
+        assert_eq!(exported["retentionPolicy"], "scrub_deleted_comments_v1");
+        assert_eq!(exported["state"]["comments"][0]["body"], "retained");
+        assert_eq!(exported["label"]["outcome"], "approved");
+        assert_eq!(exported["label"]["notes"], "keep this");
+        assert_eq!(exported["label"]["notesHistory"][0]["body"], "initial");
+        assert_eq!(exported["label"]["tags"][0], "reviewed");
+        assert_eq!(exported["label"]["qualityScore"], 0.75);
+    }
+
+    #[test]
+    fn decision_training_export_is_empty_without_examples() {
+        assert_eq!(decision_training_export_body(&[]), "");
     }
 
 }
