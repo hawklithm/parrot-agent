@@ -130,6 +130,7 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
     let issue_id = Uuid::new_v4();
     let source_id = Uuid::new_v4();
     let comment_id = Uuid::new_v4();
+    let creator_id = Uuid::new_v4();
     let prefix = format!("DC{}", &company_id.simple().to_string()[..8]);
     sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
         .bind(company_id)
@@ -179,6 +180,12 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
             company_id,
             source_kind: DecisionTrainingSourceKind::IssueThreadInteraction,
             source_id: source_id.to_string(),
+            issue_id: Some(issue_id),
+            notes: Some("captured by service".to_string()),
+            tags: vec!["capture".to_string()],
+            quality_score: Some(0.75),
+            retention_policy: Some("scrub_deleted_comments_v1".to_string()),
+            created_by_user_id: Some(creator_id.to_string()),
         })
         .await
         .expect("capture snapshot");
@@ -201,6 +208,21 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
         example.snapshot.context.thread_messages[0].content,
         "A retained decision-training comment"
     );
+    let duplicate = service
+        .capture_snapshot(CaptureInput {
+            company_id,
+            source_kind: DecisionTrainingSourceKind::IssueThreadInteraction,
+            source_id: source_id.to_string(),
+            issue_id: Some(issue_id),
+            notes: Some("captured by service".to_string()),
+            tags: vec!["capture".to_string()],
+            quality_score: Some(0.75),
+            retention_policy: Some("scrub_deleted_comments_v1".to_string()),
+            created_by_user_id: Some(creator_id.to_string()),
+        })
+        .await
+        .expect_err("same user/source capture must be rejected");
+    assert!(duplicate.to_string().contains("duplicate decision training example"));
 
     sqlx::query("DELETE FROM issues WHERE id = $1")
         .bind(issue_id)

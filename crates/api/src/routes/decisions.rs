@@ -30,7 +30,7 @@ use crate::app_state::AppState;
 use crate::errors::AppError;
 use services::auth::{decide_access, AuthorizationAction, AuthorizationActor};
 use services::decision_training_service::{
-    DecisionTrainingSourceKind, ListInput, PersistSnapshotInput, TrainingError, UpdateInput,
+    CaptureInput, DecisionTrainingSourceKind, ListInput, TrainingError, UpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -4140,27 +4140,6 @@ async fn revive_decision_retention(
 
 const TRAINING_SOURCE_KINDS: [&str; 3] = ["interaction", "approval", "execution_decision"];
 
-fn training_example_to_json(r: &PgRow) -> Value {
-    json!({
-        "id": r.get::<Uuid, _>("id"),
-        "companyId": r.get::<Uuid, _>("company_id"),
-        "sourceKind": r.get::<String, _>("source_kind"),
-        "sourceId": r.get::<Uuid, _>("source_id"),
-        "issueId": r.get::<Uuid, _>("issue_id"),
-        "cutoffAt": iso(r.get::<DateTime<Utc>, _>("cutoff_at")),
-        "notes": r.get::<String, _>("notes"),
-        "notesHistory": r.try_get::<Value, _>("notes_history").unwrap_or(Value::Null),
-        "tags": r.try_get::<Value, _>("tags").unwrap_or_else(|_| json!([])),
-        "qualityScore": r.try_get::<Option<f32>, _>("quality_score").unwrap_or(None),
-        "decisionOutcome": r.try_get::<Option<String>, _>("decision_outcome").unwrap_or(None),
-        "retentionPolicy": r.get::<String, _>("retention_policy"),
-        "snapshot": r.try_get::<Value, _>("snapshot").unwrap_or(Value::Null),
-        "createdByUserId": r.get::<String, _>("created_by_user_id"),
-        "createdAt": iso(r.get::<DateTime<Utc>, _>("created_at")),
-        "updatedAt": iso(r.get::<DateTime<Utc>, _>("updated_at")),
-    })
-}
-
 fn training_service_example_to_json(example: &services::DecisionTrainingExample) -> Value {
     json!({
         "id": example.id,
@@ -4186,11 +4165,6 @@ fn training_service_example_to_json(example: &services::DecisionTrainingExample)
         "updatedAt": iso(example.updated_at),
     })
 }
-
-const TRAINING_SELECT: &str =
-    "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, \
-     notes, notes_history, tags, quality_score, decision_outcome, retention_policy, snapshot, created_by_user_id, \
-     created_at, updated_at FROM decision_training_examples";
 
 struct SourceDecision {
     cutoff_at: DateTime<Utc>,
@@ -4610,34 +4584,25 @@ async fn create_decision_training(
         )));
     }
 
-    let pool = &state.pool;
-    let captured = capture_decision_snapshot(
-        pool,
-        company_id,
-        &input.source_kind,
-        input.source_id,
-        input.issue_id,
-    )
-    .await?;
     let notes = input.notes.unwrap_or_default();
     let tags = normalize_training_tags(input.tags.unwrap_or_default())?;
     validate_training_quality(input.quality_score)?;
+    let source_kind_label = input.source_kind.clone();
+    let source_id = input.source_id;
+    let issue_id = input.issue_id;
 
-    let example_id = state
+    let example = state
         .decision_training_service
-        .persist_snapshot(PersistSnapshotInput {
+        .capture_snapshot(CaptureInput {
             company_id,
-            source_kind: training_source_kind(&input.source_kind)?,
-            source_id: input.source_id,
-            issue_id: input.issue_id,
-            cutoff_at: captured.cutoff_at,
-            notes,
+            source_kind: training_source_kind(&source_kind_label)?,
+            source_id: source_id.to_string(),
+            issue_id: Some(issue_id),
+            notes: Some(notes),
             tags,
             quality_score: input.quality_score,
-            decision_outcome: captured.decision_outcome.clone(),
-            retention_policy: DECISION_TRAINING_RETENTION_POLICY.to_string(),
-            snapshot: captured.snapshot,
-            created_by_user_id: user_id,
+            retention_policy: Some(DECISION_TRAINING_RETENTION_POLICY.to_string()),
+            created_by_user_id: Some(user_id.clone()),
         })
         .await
         .map_err(|error| match error {
@@ -4647,29 +4612,25 @@ async fn create_decision_training(
                 }
             other => training_service_err(other),
         })?;
-    let row = sqlx::query(&format!("{TRAINING_SELECT} WHERE id = $1"))
-        .bind(example_id)
-        .fetch_one(pool)
-        .await
-        .map_err(db_err)?;
-    let example = training_example_to_json(&row);
+    let example_id = example.id;
+    let example_json = training_service_example_to_json(&example);
 
     log_activity(
-        pool,
+        &state.pool,
         company_id,
         &actor,
         "decision_training.created",
         "decision_training_example",
-        row.get::<Uuid, _>("id"),
+        example_id,
         json!({
-            "sourceKind": input.source_kind,
-            "sourceId": input.source_id,
-            "issueId": input.issue_id,
+            "sourceKind": source_kind_label,
+            "sourceId": source_id,
+            "issueId": issue_id,
         }),
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(example)))
+    Ok((StatusCode::CREATED, Json(example_json)))
 }
 
 #[derive(Debug, Deserialize)]

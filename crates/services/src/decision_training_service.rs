@@ -99,6 +99,12 @@ pub struct CaptureInput {
     pub company_id: Uuid,
     pub source_kind: DecisionTrainingSourceKind,
     pub source_id: String,
+    pub issue_id: Option<Uuid>,
+    pub notes: Option<String>,
+    pub tags: Vec<String>,
+    pub quality_score: Option<f32>,
+    pub retention_policy: Option<String>,
+    pub created_by_user_id: Option<String>,
 }
 
 /// 列表输入
@@ -545,25 +551,56 @@ impl DecisionTrainingService for PgDecisionTrainingService {
             kind: input.source_kind.clone(),
             id: input.source_id.clone(),
         })?;
+        let created_by_user_id = input
+            .created_by_user_id
+            .clone()
+            .unwrap_or_else(|| "system".to_string());
         let existing = sqlx::query(
             "SELECT id FROM decision_training_examples
               WHERE company_id = $1 AND source_kind = $2 AND source_id = $3
-                AND created_by_user_id = 'system' LIMIT 1",
+                AND created_by_user_id = $4 LIMIT 1",
         )
         .bind(input.company_id)
         .bind(Self::source_kind_name(&input.source_kind))
         .bind(source_id)
+        .bind(&created_by_user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(Self::db_error)?;
         if let Some(row) = existing {
-            return self
-                .load_example(row.get("id"))
-                .await?
-                .ok_or_else(|| TrainingError::ExampleNotFound(row.get("id")));
+            let _ = row;
+            return Err(TrainingError::InvalidSnapshot(
+                "duplicate decision training example".to_string(),
+            ));
         }
 
         let (issue_id, agent_id, source_payload, outcome, cutoff_at) = self.source_context(&input).await?;
+        if let Some(expected_issue_id) = input.issue_id {
+            if expected_issue_id != issue_id {
+                return Err(TrainingError::SourceNotFound {
+                    kind: input.source_kind.clone(),
+                    id: input.source_id.clone(),
+                });
+            }
+        }
+        if input
+            .quality_score
+            .is_some_and(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
+        {
+            return Err(TrainingError::InvalidSnapshot(
+                "quality score must be between 0 and 1".to_string(),
+            ));
+        }
+        let tags = normalize_update_tags(input.tags)?;
+        let notes = input.notes.unwrap_or_default();
+        if notes.len() > 100_000 {
+            return Err(TrainingError::InvalidSnapshot(
+                "notes must be at most 100000 characters".to_string(),
+            ));
+        }
+        let retention_policy = input
+            .retention_policy
+            .unwrap_or_else(|| "scrub_deleted_comments_v1".to_string());
         let now = Utc::now();
         let issue = sqlx::query(
             "SELECT id, company_id, project_id, parent_id, title, description, status::text AS status,
@@ -665,7 +702,7 @@ impl DecisionTrainingService for PgDecisionTrainingService {
         let snapshot = serde_json::json!({
             "version": 1,
             "retention": {
-                "policy": "scrub_deleted_comments_v1",
+                "policy": retention_policy.clone(),
                 "commentDeletion": "redact",
                 "issueDeletion": "cascade",
             },
@@ -680,9 +717,9 @@ impl DecisionTrainingService for PgDecisionTrainingService {
             "runs": runs,
             "decision": {
                 "kind": Self::source_kind_name(&input.source_kind),
-                "payload": source_payload,
+                "payload": source_payload.clone(),
                 "actor": { "agentId": agent_id },
-                "outcome": outcome,
+                "outcome": outcome.clone(),
             },
             "code": {
                 "repoUrl": Value::Null,
@@ -703,8 +740,9 @@ impl DecisionTrainingService for PgDecisionTrainingService {
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO decision_training_examples
                 (company_id, source_kind, source_id, issue_id, cutoff_at, notes,
-                 notes_history, decision_outcome, snapshot, created_by_user_id)
-             VALUES ($1, $2, $3, $4, $5, '', '[]'::jsonb, $6, $7, 'system')
+                 notes_history, tags, quality_score, decision_outcome, retention_policy,
+                 snapshot, created_by_user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, $7, $8, $9, $10, $11, $12)
              RETURNING id",
         )
         .bind(input.company_id)
@@ -712,8 +750,13 @@ impl DecisionTrainingService for PgDecisionTrainingService {
         .bind(source_id)
         .bind(issue_id)
         .bind(cutoff_at)
+        .bind(&notes)
+        .bind(serde_json::to_value(tags).map_err(|error| TrainingError::SerializationError(error.to_string()))?)
+        .bind(input.quality_score)
         .bind(outcome)
+        .bind(retention_policy)
         .bind(snapshot)
+        .bind(created_by_user_id)
         .fetch_one(&self.pool)
         .await
         .map_err(Self::db_error)?;
@@ -1040,6 +1083,21 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
                 "source_id must not be empty".to_string(),
             ));
         }
+        if input
+            .quality_score
+            .is_some_and(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
+        {
+            return Err(TrainingError::InvalidSnapshot(
+                "quality score must be between 0 and 1".to_string(),
+            ));
+        }
+        let tags = normalize_update_tags(input.tags)?;
+        let notes = input.notes.unwrap_or_default();
+        if notes.len() > 100_000 {
+            return Err(TrainingError::InvalidSnapshot(
+                "notes must be at most 100000 characters".to_string(),
+            ));
+        }
 
         let now = Utc::now();
         let example_id = Uuid::new_v4();
@@ -1049,7 +1107,7 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
             source_kind: input.source_kind.clone(),
             source_id: input.source_id.clone(),
             company_id: input.company_id,
-            issue_id: None,
+            issue_id: input.issue_id,
             agent_id: None,
             decision_spec: serde_json::json!({}),
             decision_outcome: None,
@@ -1074,15 +1132,19 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
             source_id: input.source_id,
             snapshot,
             raw_snapshot,
-            notes: None,
+            notes: Some(notes),
             notes_history: vec![],
-            tags: vec![],
-            quality_score: None,
+            tags,
+            quality_score: input.quality_score,
             created_at: now,
             updated_at: now,
             cutoff_at: now,
-            retention_policy: "scrub_deleted_comments_v1".to_string(),
-            created_by_user_id: "system".to_string(),
+            retention_policy: input
+                .retention_policy
+                .unwrap_or_else(|| "scrub_deleted_comments_v1".to_string()),
+            created_by_user_id: input
+                .created_by_user_id
+                .unwrap_or_else(|| "system".to_string()),
         };
         self.examples
             .lock()
@@ -1287,6 +1349,12 @@ mod tests {
             company_id,
             source_kind: DecisionTrainingSourceKind::IssueExecutionDecision,
             source_id: "test-123".to_string(),
+            issue_id: None,
+            notes: None,
+            tags: vec![],
+            quality_score: None,
+            retention_policy: None,
+            created_by_user_id: None,
         };
 
         let result = service.capture_snapshot(input).await.unwrap();
@@ -1320,6 +1388,12 @@ mod tests {
                 company_id: Uuid::new_v4(),
                 source_kind: DecisionTrainingSourceKind::IssueApproval,
                 source_id: "approval-1".to_string(),
+                issue_id: None,
+                notes: None,
+                tags: vec![],
+                quality_score: None,
+                retention_policy: None,
+                created_by_user_id: None,
             })
             .await
             .unwrap();
