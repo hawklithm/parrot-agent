@@ -2040,16 +2040,64 @@ async fn list_plan_decompositions(
 /// I7: POST /issues/:id/accepted-plan-decompositions
 async fn submit_plan_decomposition(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
-    let result = state
-        .issue_service
-        .submit_plan_decomposition(id, company_id, payload)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok((StatusCode::CREATED, Json(result)))
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let revision_id = payload
+        .get("acceptedPlanRevisionId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let children = payload
+        .get("children")
+        .and_then(Value::as_array)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    if children.is_empty() || children.len() > 25 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let plan = json!({
+        "acceptedPlanRevisionId": revision_id,
+        "children": children,
+    });
+    let (accepted_by_type, accepted_by_id) = match actor {
+        AuthorizationActor::Board { user_id, .. } => ("user", user_id),
+        AuthorizationActor::Agent { agent_id, .. } => ("agent", agent_id),
+        AuthorizationActor::None => return Err(StatusCode::UNAUTHORIZED),
+    };
+    let row = sqlx::query(
+        "INSERT INTO plan_decompositions
+             (company_id, issue_id, plan, accepted_at, accepted_by_type, accepted_by_id)
+         VALUES ($1, $2, $3, NOW(), $4, $5)
+         RETURNING id, company_id, issue_id, plan, accepted_at,
+                   accepted_by_type, accepted_by_id, created_at, updated_at",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(plan)
+    .bind(accepted_by_type)
+    .bind(accepted_by_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to create plan decomposition");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": row.get::<Uuid, _>("id"),
+            "companyId": row.get::<Uuid, _>("company_id"),
+            "issueId": row.get::<Uuid, _>("issue_id"),
+            "plan": row.get::<Value, _>("plan"),
+            "acceptedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("accepted_at"),
+            "acceptedByType": row.get::<Option<String>, _>("accepted_by_type"),
+            "acceptedById": row.get::<Option<Uuid>, _>("accepted_by_id"),
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+        })),
+    ))
 }
 
 /// I8: GET /issues/:id/approvals
