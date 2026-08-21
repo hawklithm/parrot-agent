@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::abac::{AccessDecision, Action, Actor};
@@ -111,11 +112,37 @@ pub enum AccessError {
     Internal(String),
 }
 
-pub struct DefaultAccessService;
+pub struct DefaultAccessService {
+    pool: Option<PgPool>,
+}
 
 impl DefaultAccessService {
     pub fn new() -> Self {
-        Self
+        Self { pool: None }
+    }
+
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self { pool: Some(pool) }
+    }
+
+    async fn assert_built_in_agents_feature(&self, _company_id: Uuid) -> Result<(), AccessError> {
+        let Some(pool) = &self.pool else {
+            return Ok(());
+        };
+        let enabled = sqlx::query_scalar::<_, bool>(
+            r#"SELECT COALESCE((experimental ->> $1)::boolean, true)
+               FROM instance_settings WHERE id = 1"#,
+        )
+        .bind("enableBuiltInAgents")
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| AccessError::Internal(error.to_string()))?
+        .unwrap_or(true);
+        if enabled {
+            Ok(())
+        } else {
+            Err(AccessError::BuiltInAgentsNotEnabled)
+        }
     }
 }
 
@@ -314,6 +341,7 @@ impl AccessService for DefaultAccessService {
         company_id: Uuid,
     ) -> Result<(), AccessError> {
         self.assert_company_access(actor, company_id).await?;
+        self.assert_built_in_agents_feature(company_id).await?;
 
         let resource = ResourceContext {
             resource_type: ResourceType::BuiltInAgent,
@@ -358,11 +386,9 @@ impl AccessService for DefaultAccessService {
 
     async fn assert_built_in_agents_enabled(
         &self,
-        _company_id: Uuid,
+        company_id: Uuid,
     ) -> Result<(), AccessError> {
-        // Built-in agents are currently always enabled. Future implementation
-        // can check company.experimental_features if needed.
-        Ok(())
+        self.assert_built_in_agents_feature(company_id).await
     }
 
     async fn filter_agents_for_actor(
