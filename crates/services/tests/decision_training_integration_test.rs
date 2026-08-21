@@ -131,6 +131,8 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
     let source_id = Uuid::new_v4();
     let comment_id = Uuid::new_v4();
     let creator_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
     let prefix = format!("DC{}", &company_id.simple().to_string()[..8]);
     sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
         .bind(company_id)
@@ -147,14 +149,38 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
         .execute(&pool)
         .await
         .expect("insert issue");
+    sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, $3)")
+        .bind(agent_id)
+        .bind(company_id)
+        .bind("Decision Capture Agent")
+        .execute(&pool)
+        .await
+        .expect("insert agent");
+    sqlx::query(
+        "INSERT INTO heartbeat_runs (id, company_id, agent_id, context_snapshot)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(serde_json::json!({
+        "issueId": issue_id,
+        "commitSha": "abcdef1234567890"
+    }))
+    .execute(&pool)
+    .await
+    .expect("insert source heartbeat run");
     sqlx::query(
         "INSERT INTO issue_thread_interactions
-            (id, company_id, issue_id, kind, status, payload, title, summary)
-         VALUES ($1, $2, $3, 'question', 'pending', $4, $5, $6)",
+            (id, company_id, issue_id, kind, status, source_run_id,
+             created_by_agent_id, payload, title, summary)
+         VALUES ($1, $2, $3, 'question', 'pending', $4, $5, $6, $7, $8)",
     )
     .bind(source_id)
     .bind(company_id)
     .bind(issue_id)
+    .bind(run_id)
+    .bind(agent_id)
     .bind(serde_json::json!({"question": "Should this be reviewed?"}))
     .bind("Review question")
     .bind("Capture source summary")
@@ -205,6 +231,11 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
         "A retained decision-training comment"
     );
     assert_eq!(example.raw_snapshot["decision"]["kind"], "interaction");
+    assert_eq!(
+        example.raw_snapshot["code"]["commitSha"],
+        "abcdef1234567890"
+    );
+    assert_eq!(example.raw_snapshot["code"]["resolution"], "exact");
     assert_eq!(
         example.snapshot.context.thread_messages[0].content,
         "A retained decision-training comment"

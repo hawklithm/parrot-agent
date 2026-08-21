@@ -402,7 +402,17 @@ impl PgDecisionTrainingService {
     async fn source_context(
         &self,
         input: &CaptureInput,
-    ) -> Result<(Uuid, Option<Uuid>, Value, Option<String>, DateTime<Utc>), TrainingError> {
+    ) -> Result<
+        (
+            Uuid,
+            Option<Uuid>,
+            Value,
+            Option<String>,
+            DateTime<Utc>,
+            Option<Uuid>,
+        ),
+        TrainingError,
+    > {
         let kind = Self::source_kind_name(&input.source_kind);
         let source_id = Uuid::parse_str(&input.source_id).map_err(|_| TrainingError::SourceNotFound {
             kind: input.source_kind.clone(),
@@ -412,7 +422,8 @@ impl PgDecisionTrainingService {
             "execution_decision" => sqlx::query(
                 "SELECT origin_issue_id AS issue_id, origin_agent_id AS agent_id,
                         to_jsonb(d) AS payload, status::text AS outcome,
-                        COALESCE(decided_at, NOW()) AS cutoff_at
+                        COALESCE(decided_at, NOW()) AS cutoff_at,
+                        origin_run_id AS exact_run_id
                    FROM decisions d WHERE id = $1 AND company_id = $2",
             )
             .bind(source_id)
@@ -423,7 +434,8 @@ impl PgDecisionTrainingService {
             "approval" => sqlx::query(
                 "SELECT ia.issue_id, a.requested_by_agent_id AS agent_id,
                         to_jsonb(a) AS payload, a.status::text AS outcome,
-                        COALESCE(a.decided_at, NOW()) AS cutoff_at
+                        COALESCE(a.decided_at, NOW()) AS cutoff_at,
+                        NULL::uuid AS exact_run_id
                    FROM approvals a
                    JOIN issue_approvals ia ON ia.approval_id = a.id
                   WHERE a.id = $1 AND a.company_id = $2 LIMIT 1",
@@ -436,7 +448,8 @@ impl PgDecisionTrainingService {
             _ => sqlx::query(
                 "SELECT issue_id, created_by_agent_id AS agent_id,
                         to_jsonb(i) AS payload, i.status::text AS outcome,
-                        COALESCE(i.resolved_at, NOW()) AS cutoff_at
+                        COALESCE(i.resolved_at, NOW()) AS cutoff_at,
+                        source_run_id AS exact_run_id
                    FROM issue_thread_interactions i
                   WHERE id = $1 AND company_id = $2",
             )
@@ -456,6 +469,7 @@ impl PgDecisionTrainingService {
             row.get("payload"),
             row.try_get("outcome").unwrap_or(None),
             row.get("cutoff_at"),
+            row.try_get("exact_run_id").unwrap_or(None),
         ))
     }
 
@@ -597,7 +611,8 @@ impl DecisionTrainingService for PgDecisionTrainingService {
             }
         }
 
-        let (issue_id, agent_id, source_payload, outcome, cutoff_at) = self.source_context(&input).await?;
+        let (issue_id, agent_id, source_payload, outcome, cutoff_at, exact_run_id) =
+            self.source_context(&input).await?;
         if let Some(expected_issue_id) = input.issue_id {
             if expected_issue_id != issue_id {
                 return Err(TrainingError::SourceNotFound {
@@ -698,12 +713,28 @@ impl DecisionTrainingService for PgDecisionTrainingService {
                 })
             })
             .collect();
+        let exact_commit = exact_run_id.and_then(|run_id| {
+            runs.iter()
+                .find(|run| {
+                    run.get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        == Some(run_id)
+                })
+                .and_then(|run| run.pointer("/contextSnapshot").and_then(Self::find_commit_sha))
+        });
         let nearest_commit = runs
             .iter()
             .rev()
             .find_map(|run| run.pointer("/contextSnapshot").and_then(Self::find_commit_sha));
-        let commit_sha = nearest_commit.clone();
-        let resolution = if nearest_commit.is_some() { "nearest_run" } else { "none" };
+        let commit_sha = exact_commit.clone().or_else(|| nearest_commit.clone());
+        let resolution = if exact_commit.is_some() {
+            "exact"
+        } else if nearest_commit.is_some() {
+            "nearest_run"
+        } else {
+            "none"
+        };
         let issue_json = serde_json::json!({
             "id": issue.get::<Uuid, _>("id"),
             "companyId": issue.get::<Uuid, _>("company_id"),
