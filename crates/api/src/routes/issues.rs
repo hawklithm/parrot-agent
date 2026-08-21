@@ -1,3 +1,5 @@
+use crate::app_state::AppState;
+use crate::extractors::IssueId;
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
@@ -7,34 +9,33 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::app_state::AppState;
-use crate::extractors::IssueId;
-use uuid::Uuid;
 use sqlx::Row;
+use uuid::Uuid;
 
 use models::{CreateIssueInput, Issue, IssuePriority, IssueStatus, UpdateIssueInput};
+use services::auth::AuthorizationActor;
 use services::{
     CheckoutInput, CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
     DefaultCrossIssueInfluenceLimitService, IssueQueryFilter, Pagination, ReleaseInput,
 };
-use services::auth::AuthorizationActor;
 
 // Issue relations handlers
 mod issue_relations_handlers {
     use super::*;
-    
+
     /// GET /issues/:issue_id/relations
     pub async fn get_issue_relations(
         State(state): State<AppState>,
         Path(issue_id): Path<Uuid>,
     ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-        let relation_service = services::issue_relation_service::IssueRelationService::new(state.pool.clone());
-        
+        let relation_service =
+            services::issue_relation_service::IssueRelationService::new(state.pool.clone());
+
         let relations = relation_service
             .get_relation_summaries(issue_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        
+
         Ok(Json(serde_json::json!({
             "blockedBy": relations.blocked_by,
             "blocks": relations.blocks,
@@ -54,16 +55,15 @@ mod issue_relations_handlers {
         Json(input): Json<UpdateBlockedByInput>,
     ) -> Result<StatusCode, (StatusCode, String)> {
         // Get issue to retrieve company_id
-        let issue: Issue = sqlx::query_as(
-            "SELECT * FROM issues WHERE id = $1"
-        )
-        .bind(issue_id)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("Issue not found: {}", e)))?;
-        
-        let relation_service = services::issue_relation_service::IssueRelationService::new(state.pool.clone());
-        
+        let issue: Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
+            .bind(issue_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| (StatusCode::NOT_FOUND, format!("Issue not found: {}", e)))?;
+
+        let relation_service =
+            services::issue_relation_service::IssueRelationService::new(state.pool.clone());
+
         relation_service
             .update_blocked_by_relations(
                 issue.company_id,
@@ -73,7 +73,7 @@ mod issue_relations_handlers {
             )
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        
+
         Ok(StatusCode::OK)
     }
 }
@@ -195,12 +195,18 @@ async fn resolve_watchdog_discovery_scope(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::FORBIDDEN)?;
-    let run_company_id: Uuid = run.try_get("company_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let run_agent_id: Uuid = run.try_get("agent_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let run_company_id: Uuid = run
+        .try_get("company_id")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let run_agent_id: Uuid = run
+        .try_get("agent_id")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if run_company_id != company_id || run_agent_id != agent_id {
         return Err(StatusCode::FORBIDDEN);
     }
-    let context: Option<Value> = run.try_get("context_snapshot").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let context: Option<Value> = run
+        .try_get("context_snapshot")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let task_watchdog = context
         .as_ref()
         .and_then(Value::as_object)
@@ -225,8 +231,8 @@ async fn resolve_watchdog_discovery_scope(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let stop_fingerprint = stop_fingerprint
-        .or_else(|| context_string(context.as_ref(), "stopFingerprint"));
+    let stop_fingerprint =
+        stop_fingerprint.or_else(|| context_string(context.as_ref(), "stopFingerprint"));
 
     let watchdog = sqlx::query(
         "SELECT id, issue_id, watchdog_issue_id FROM issue_watchdogs
@@ -241,9 +247,15 @@ async fn resolve_watchdog_discovery_scope(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::FORBIDDEN)?;
     Ok(Some(WatchdogDiscoveryScope {
-        watchdog_id: watchdog.try_get("id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-        watched_issue_id: watchdog.try_get("issue_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-        watchdog_issue_id: watchdog.try_get("watchdog_issue_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        watchdog_id: watchdog
+            .try_get("id")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        watched_issue_id: watchdog
+            .try_get("issue_id")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        watchdog_issue_id: watchdog
+            .try_get("watchdog_issue_id")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         stop_fingerprint,
     }))
 }
@@ -267,7 +279,10 @@ fn append_watchdog_discovery_context(
         format!("Watched source issue: `{source_ref}`"),
     ];
     if let Some(issue) = watchdog_issue {
-        let reference = issue.identifier.clone().unwrap_or_else(|| issue.id.to_string());
+        let reference = issue
+            .identifier
+            .clone()
+            .unwrap_or_else(|| issue.id.to_string());
         lines.push(format!("Watchdog issue: `{reference}`"));
     }
     if let Some(fingerprint) = stop_fingerprint.filter(|value| !value.is_empty()) {
@@ -289,7 +304,9 @@ fn append_watchdog_discovery_context(
 fn parse_issue_statuses(value: Option<&str>) -> Option<Vec<IssueStatus>> {
     let values = value?.split(',').map(str::trim).filter(|v| !v.is_empty());
     let parsed: Vec<_> = values
-        .filter_map(|value| serde_json::from_value::<IssueStatus>(serde_json::Value::String(value.to_owned())).ok())
+        .filter_map(|value| {
+            serde_json::from_value::<IssueStatus>(serde_json::Value::String(value.to_owned())).ok()
+        })
         .collect();
     Some(parsed).filter(|values| !values.is_empty())
 }
@@ -297,7 +314,10 @@ fn parse_issue_statuses(value: Option<&str>) -> Option<Vec<IssueStatus>> {
 fn parse_issue_priorities(value: Option<&str>) -> Option<Vec<IssuePriority>> {
     let values = value?.split(',').map(str::trim).filter(|v| !v.is_empty());
     let parsed: Vec<_> = values
-        .filter_map(|value| serde_json::from_value::<IssuePriority>(serde_json::Value::String(value.to_owned())).ok())
+        .filter_map(|value| {
+            serde_json::from_value::<IssuePriority>(serde_json::Value::String(value.to_owned()))
+                .ok()
+        })
         .collect();
     Some(parsed).filter(|values| !values.is_empty())
 }
@@ -390,7 +410,12 @@ async fn get_issue_document(
 
 fn validate_issue_document_key(key: &str) -> Result<String, StatusCode> {
     let key = key.trim().to_lowercase();
-    if key.is_empty() || key.len() > 64 || !key.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
+    if key.is_empty()
+        || key.len() > 64
+        || !key
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(key)
@@ -406,15 +431,38 @@ async fn upsert_issue_document(
 ) -> Result<impl IntoResponse, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
-    let content = payload.get("body").or_else(|| payload.get("content")).and_then(|value| value.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
+    let content = payload
+        .get("body")
+        .or_else(|| payload.get("content"))
+        .and_then(|value| value.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     if content.len() > 524_288 {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    let content_type = if payload.get("format").and_then(|value| value.as_str()).unwrap_or("markdown") == "markdown" { "text/markdown" } else { return Err(StatusCode::BAD_REQUEST) };
-    let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let existing = sqlx::query("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2 FOR UPDATE")
-        .bind(issue_id).bind(&key).fetch_optional(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let content_type = if payload
+        .get("format")
+        .and_then(|value| value.as_str())
+        .unwrap_or("markdown")
+        == "markdown"
+    {
+        "text/markdown"
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let existing = sqlx::query(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2 FOR UPDATE",
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let base_revision_id = payload
         .get("baseRevisionId")
         .and_then(|value| value.as_str())
@@ -437,8 +485,15 @@ async fn upsert_issue_document(
         }
         let revision: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1")
             .bind(document_id).fetch_one(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        sqlx::query("UPDATE documents SET content=$2, content_type=$3, updated_at=NOW() WHERE id=$1")
-            .bind(document_id).bind(content).bind(content_type).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        sqlx::query(
+            "UPDATE documents SET content=$2, content_type=$3, updated_at=NOW() WHERE id=$1",
+        )
+        .bind(document_id)
+        .bind(content)
+        .bind(content_type)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         (document_id, revision)
     } else {
         if base_revision_id.is_some() {
@@ -460,13 +515,23 @@ async fn upsert_issue_document(
          VALUES ($1,$2,$3,CASE WHEN $4::uuid IS NULL THEN NULL ELSE 'agent' END,
                  (SELECT agent_id FROM heartbeat_runs WHERE id=$4))",
     )
-        .bind(document_id).bind(revision_number).bind(content).bind(run_id)
-        .execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok((StatusCode::OK, Json(serde_json::json!({
-        "id": document_id, "issueId": issue_id, "key": key, "content": content,
-        "body": content, "contentType": content_type, "format": "markdown", "revisionNumber": revision_number,
-    }))))
+    .bind(document_id)
+    .bind(revision_number)
+    .bind(content)
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": document_id, "issueId": issue_id, "key": key, "content": content,
+            "body": content, "contentType": content_type, "format": "markdown", "revisionNumber": revision_number,
+        })),
+    ))
 }
 
 /// GET /issues/:id/documents/:key/revisions — List issue document revisions.
@@ -478,8 +543,14 @@ async fn list_issue_document_revisions(
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
-    let document_id: Uuid = sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
-        .bind(issue_id).bind(&key).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    let document_id: Uuid =
+        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
     let rows = sqlx::query("SELECT id, revision_number, content, created_at FROM document_revisions WHERE document_id=$1 ORDER BY revision_number DESC")
         .bind(document_id).fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(rows.into_iter().map(|row| serde_json::json!({
@@ -499,14 +570,40 @@ async fn restore_issue_document_revision(
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
-    let document_id: Uuid = sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
-        .bind(issue_id).bind(&key).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
-    let content: String = sqlx::query_scalar("SELECT content FROM document_revisions WHERE id=$1 AND document_id=$2")
-        .bind(revision_id).bind(document_id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
-    let revision: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1")
-        .bind(document_id).fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    sqlx::query("UPDATE documents SET content=$2, updated_at=NOW() WHERE id=$1").bind(document_id).bind(&content).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let document_id: Uuid =
+        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+    let content: String =
+        sqlx::query_scalar("SELECT content FROM document_revisions WHERE id=$1 AND document_id=$2")
+            .bind(revision_id)
+            .bind(document_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+    let revision: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1",
+    )
+    .bind(document_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("UPDATE documents SET content=$2, updated_at=NOW() WHERE id=$1")
+        .bind(document_id)
+        .bind(&content)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let run_id = headers
         .get("x-paperclip-run-id")
         .and_then(|value| value.to_str().ok())
@@ -517,10 +614,19 @@ async fn restore_issue_document_revision(
          VALUES ($1,$2,$3,CASE WHEN $4::uuid IS NULL THEN NULL ELSE 'agent' END,
                  (SELECT agent_id FROM heartbeat_runs WHERE id=$4))",
     )
-        .bind(document_id).bind(revision).bind(&content).bind(run_id)
-        .execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"restored": true, "issueId": issue_id, "key": key, "revisionId": revision_id, "revisionNumber": revision, "content": content, "body": content})))
+    .bind(document_id)
+    .bind(revision)
+    .bind(&content)
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(
+        serde_json::json!({"restored": true, "issueId": issue_id, "key": key, "revisionId": revision_id, "revisionNumber": revision, "content": content, "body": content}),
+    ))
 }
 
 /// GET /issues/:id/documents/:key/annotations
@@ -532,37 +638,39 @@ async fn get_issue_document_annotations(
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    let document_id: Uuid = sqlx::query_scalar(
-        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
-    )
-    .bind(issue_id)
-    .bind(&key)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-    
+    let document_id: Uuid =
+        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("all");
-    let include_comments = params.get("includeComments").map(|s| s == "true").unwrap_or(true);
-    
+    let include_comments = params
+        .get("includeComments")
+        .map(|s| s == "true")
+        .unwrap_or(true);
+
     let mut query = "SELECT id, status, anchor_state, selected_text, anchor_selector, anchor_confidence, \
                      prefix_text, suffix_text, normalized_start, normalized_end, markdown_start, markdown_end, \
                      original_revision_number, current_revision_number, created_at, updated_at \
                      FROM document_annotation_threads \
                      WHERE issue_id=$1 AND document_id=$2".to_string();
-    
+
     if status != "all" {
         query.push_str(&format!(" AND status='{}'", status));
     }
     query.push_str(" ORDER BY updated_at DESC");
-    
+
     let rows = sqlx::query(&query)
         .bind(issue_id)
         .bind(document_id)
         .fetch_all(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
         let thread_id: Uuid = row.get("id");
@@ -587,7 +695,7 @@ async fn get_issue_document_annotations(
             "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
             "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
         });
-        
+
         if include_comments {
             let comments = sqlx::query(
                 "SELECT id, body, author_type, author_agent_id, author_user_id, created_at, updated_at \
@@ -597,7 +705,7 @@ async fn get_issue_document_annotations(
             .fetch_all(&state.pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            
+
             let comments_json: Vec<serde_json::Value> = comments
                 .into_iter()
                 .map(|c| {
@@ -612,13 +720,13 @@ async fn get_issue_document_annotations(
                     })
                 })
                 .collect();
-            
+
             thread_json["comments"] = serde_json::json!(comments_json);
         }
-        
+
         result.push(thread_json);
     }
-    
+
     Ok(Json(result))
 }
 
@@ -630,22 +738,21 @@ async fn get_issue_document_annotation_thread(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    let document_id: Uuid = sqlx::query_scalar(
-        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
-    )
-    .bind(issue_id)
-    .bind(&key)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-    
+    let document_id: Uuid =
+        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
     let row = sqlx::query(
         "SELECT id, status, anchor_state, selected_text, anchor_selector, anchor_confidence, \
          prefix_text, suffix_text, normalized_start, normalized_end, markdown_start, markdown_end, \
          original_revision_number, current_revision_number, created_at, updated_at \
          FROM document_annotation_threads \
-         WHERE id=$1 AND issue_id=$2 AND document_id=$3"
+         WHERE id=$1 AND issue_id=$2 AND document_id=$3",
     )
     .bind(thread_id)
     .bind(issue_id)
@@ -654,15 +761,15 @@ async fn get_issue_document_annotation_thread(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
-       let comments = sqlx::query(
+    let comments = sqlx::query(
         "SELECT id, body, author_type, author_agent_id, author_user_id, created_at, updated_at \
-         FROM document_annotation_comments WHERE thread_id=$1 ORDER BY created_at ASC"
+         FROM document_annotation_comments WHERE thread_id=$1 ORDER BY created_at ASC",
     )
     .bind(thread_id)
     .fetch_all(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     let comments_json: Vec<serde_json::Value> = comments
         .into_iter()
         .map(|c| {
@@ -677,7 +784,7 @@ async fn get_issue_document_annotation_thread(
             })
         })
         .collect();
-    
+
     Ok(Json(serde_json::json!({
         "id": thread_id,
         "threadId": thread_id,
@@ -711,36 +818,45 @@ async fn create_issue_document_annotation(
 ) -> Result<impl IntoResponse, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    let document_id: Uuid = sqlx::query_scalar(
-        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
-    )
-    .bind(issue_id)
-    .bind(&key)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-    
-    let selected_text = payload.get("selectedText").and_then(|v| v.as_str()).unwrap_or_default();
-    let selector = payload.get("anchorSelector").or_else(|| payload.get("selector")).cloned().unwrap_or_else(|| serde_json::json!({}));
-    let body = payload.get("body").and_then(|v| v.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
-    
+    let document_id: Uuid =
+        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
+    let selected_text = payload
+        .get("selectedText")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let selector = payload
+        .get("anchorSelector")
+        .or_else(|| payload.get("selector"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let body = payload
+        .get("body")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
     // 获取当前 revision number
     let revision_number: i32 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(revision_number), 0) FROM document_revisions WHERE document_id=$1"
+        "SELECT COALESCE(MAX(revision_number), 0) FROM document_revisions WHERE document_id=$1",
     )
     .bind(document_id)
     .fetch_one(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     let thread_id: Uuid = sqlx::query_scalar(
         "INSERT INTO document_annotation_threads \
          (company_id, issue_id, document_id, document_key, selected_text, anchor_selector, \
           original_revision_number, current_revision_number, normalized_start, normalized_end, \
           markdown_start, markdown_end, prefix_text, suffix_text) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 0, 0, 0, 0, '', '') \
-         RETURNING id"
+         RETURNING id",
     )
     .bind(company_id)
     .bind(issue_id)
@@ -752,17 +868,17 @@ async fn create_issue_document_annotation(
     .fetch_one(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     let author_user_id = match &actor {
         AuthorizationActor::Board { user_id, .. } => Some(*user_id),
         _ => None,
     };
-    
+
     let comment_id: Uuid = sqlx::query_scalar(
         "INSERT INTO document_annotation_comments \
          (company_id, thread_id, issue_id, document_id, body, author_type, author_user_id) \
          VALUES ($1, $2, $3, $4, $5, 'user', $6) \
-         RETURNING id"
+         RETURNING id",
     )
     .bind(company_id)
     .bind(thread_id)
@@ -773,7 +889,7 @@ async fn create_issue_document_annotation(
     .fetch_one(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -803,23 +919,25 @@ async fn reply_issue_document_annotation(
 ) -> Result<impl IntoResponse, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    let document_id: Uuid = sqlx::query_scalar(
-        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
-    )
-    .bind(issue_id)
-    .bind(&key)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-    
-    let body = payload.get("body").and_then(|v| v.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
-    
+    let document_id: Uuid =
+        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
+    let body = payload
+        .get("body")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
     let author_user_id = match &actor {
         AuthorizationActor::Board { user_id, .. } => Some(*user_id),
         _ => None,
     };
-    
+
     let comment_id: Uuid = sqlx::query_scalar(
         "INSERT INTO document_annotation_comments \
          (company_id, thread_id, issue_id, document_id, body, author_type, author_user_id) \
@@ -837,13 +955,13 @@ async fn reply_issue_document_annotation(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
-    
+
     sqlx::query("UPDATE document_annotation_threads SET updated_at=NOW() WHERE id=$1")
         .bind(thread_id)
         .execute(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -865,21 +983,23 @@ async fn update_issue_document_annotation(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    let document_id: Uuid = sqlx::query_scalar(
-        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
-    )
-    .bind(issue_id)
-    .bind(&key)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-    
-    let status = payload.get("status").and_then(|v| v.as_str()).unwrap_or("open");
+    let document_id: Uuid =
+        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
+    let status = payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("open");
     if !matches!(status, "open" | "resolved") {
         return Err(StatusCode::BAD_REQUEST);
     }
-    
+
     let updated = sqlx::query(
         "UPDATE document_annotation_threads \
          SET status=$1, resolved_at=CASE WHEN $1='resolved' THEN NOW() ELSE NULL END, updated_at=NOW() \
@@ -894,7 +1014,7 @@ async fn update_issue_document_annotation(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
-    
+
     Ok(Json(serde_json::json!({
         "threadId": updated.get::<Uuid, _>("id"),
         "issueId": issue_id,
@@ -913,17 +1033,16 @@ async fn lock_issue_document(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
-    
-    let document_id: Uuid = sqlx::query_scalar(
-        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
-    )
-    .bind(issue_id)
-    .bind(&key)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-    
+
+    let document_id: Uuid =
+        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
     sqlx::query(
         "UPDATE documents SET locked_by_type=$2, locked_by_id=$3, locked_at=NOW(), locked_run_id=$4 \
          WHERE id=$1 AND locked_at IS NULL"
@@ -935,7 +1054,7 @@ async fn lock_issue_document(
     .execute(&state.pool)
     .await
     .map_err(|_| StatusCode::CONFLICT)?;
-    
+
     Ok(Json(serde_json::json!({
         "issueId": issue_id,
         "key": key,
@@ -952,17 +1071,16 @@ async fn unlock_issue_document(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
-    
-    let document_id: Uuid = sqlx::query_scalar(
-        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2"
-    )
-    .bind(issue_id)
-    .bind(&key)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-    
+
+    let document_id: Uuid =
+        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
     sqlx::query(
         "UPDATE documents SET locked_by_type=NULL, locked_by_id=NULL, locked_at=NULL, locked_run_id=NULL \
          WHERE id=$1"
@@ -971,7 +1089,7 @@ async fn unlock_issue_document(
     .execute(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     Ok(Json(serde_json::json!({
         "issueId": issue_id,
         "key": key,
@@ -987,10 +1105,10 @@ async fn delete_issue_document(
 ) -> Result<StatusCode, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    
+
     sqlx::query(
         "DELETE FROM issue_documents WHERE issue_id=$1 AND key=$2 AND EXISTS \
-         (SELECT 1 FROM issues WHERE id=$1 AND company_id=$3)"
+         (SELECT 1 FROM issues WHERE id=$1 AND company_id=$3)",
     )
     .bind(issue_id)
     .bind(key)
@@ -998,7 +1116,7 @@ async fn delete_issue_document(
     .execute(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1016,7 +1134,7 @@ async fn resolve_issue_id(pool: &sqlx::PgPool, reference: &str) -> Result<Uuid, 
     if let Ok(uuid) = Uuid::parse_str(reference) {
         return Ok(uuid);
     }
-    
+
     // 作为 identifier 查询
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM issues WHERE identifier = $1")
         .bind(reference)
@@ -1028,7 +1146,9 @@ async fn resolve_issue_id(pool: &sqlx::PgPool, reference: &str) -> Result<Uuid, 
 
 async fn issue_company_id(state: &AppState, issue_id: Uuid) -> Result<Uuid, StatusCode> {
     sqlx::query_scalar("SELECT company_id FROM issues WHERE id=$1")
-        .bind(issue_id).fetch_optional(&state.pool).await
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -1054,11 +1174,10 @@ async fn list_issues(
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
     let service = state.issue_service.clone();
     let company_id = actor.company_id().ok_or(StatusCode::FORBIDDEN)?;
-    let touched_by_user_id =
-        resolve_user_filter(query.touched_by_user_id.as_deref(), &actor)?;
+    let touched_by_user_id = resolve_user_filter(query.touched_by_user_id.as_deref(), &actor)?;
     let inbox_archived_by_user_id =
         resolve_user_filter(query.inbox_archived_by_user_id.as_deref(), &actor)?;
-    
+
     let filter = IssueQueryFilter {
         status: parse_issue_statuses(query.status.as_deref()),
         priority: parse_issue_priorities(query.priority.as_deref()),
@@ -1077,13 +1196,13 @@ async fn list_issues(
         origin_kind: query.origin_kind.clone(),
         origin_id: query.origin_id.clone(),
     };
-    
+
     let pagination = Pagination {
         limit: query.limit.unwrap_or(50),
         offset: query.offset.unwrap_or(0),
         cursor: None,
     };
-    
+
     service
         .list(company_id, &filter, &pagination)
         .await
@@ -1165,14 +1284,11 @@ async fn create_issue(
             return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
     }
-    let discovery_scope = resolve_watchdog_discovery_scope(
-        &state,
-        &actor,
-        company_id,
-        requested_discovery.is_some(),
-    )
-    .await?;
-    if let (Some(discovery), Some(scope)) = (requested_discovery.as_ref(), discovery_scope.as_ref()) {
+    let discovery_scope =
+        resolve_watchdog_discovery_scope(&state, &actor, company_id, requested_discovery.is_some())
+            .await?;
+    if let (Some(discovery), Some(scope)) = (requested_discovery.as_ref(), discovery_scope.as_ref())
+    {
         let source_issue = state
             .issue_service
             .get(scope.watched_issue_id, company_id)
@@ -1188,7 +1304,10 @@ async fn create_issue(
             None => None,
         };
         let run_id = match actor {
-            AuthorizationActor::Agent { run_id: Some(run_id), .. } => run_id,
+            AuthorizationActor::Agent {
+                run_id: Some(run_id),
+                ..
+            } => run_id,
             _ => return Err(StatusCode::FORBIDDEN),
         };
         input.parent_id = None;
@@ -1205,9 +1324,7 @@ async fn create_issue(
             input.description.take(),
             &source_issue,
             watchdog_issue.as_ref(),
-            discovery
-                .get("evidenceMarkdown")
-                .and_then(Value::as_str),
+            discovery.get("evidenceMarkdown").and_then(Value::as_str),
             scope.stop_fingerprint.as_deref(),
             run_id,
         ));
@@ -1216,9 +1333,7 @@ async fn create_issue(
         input.origin_run_id = Some(run_id);
         input.origin_fingerprint = Some(format!(
             "{}:{}:{}",
-            TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
-            source_issue.id,
-            run_id
+            TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND, source_issue.id, run_id
         ));
         input.watchdog_discovery_audit = Some(models::WatchdogDiscoveryAuditInput {
             actor_id: actor.principal_id().ok_or(StatusCode::FORBIDDEN)?,
@@ -1255,16 +1370,18 @@ async fn create_issue(
         AuthorizationActor::Agent { run_id, .. } => *run_id,
         _ => None,
     };
-    
+
     // ✅ Paperclip pattern: Force override creator fields from actor (issues.ts:6963-6968)
     // Sanitize: strip any createdByUserId if actor is Agent (prevents spoofing)
     if matches!(actor, AuthorizationActor::Agent { .. }) {
         input.created_by_user_id = None;
     }
-    
+
     // Force set creator fields based on actor type
     match &actor {
-        AuthorizationActor::Agent { agent_id, run_id, .. } => {
+        AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => {
             input.created_by_agent_id = Some(*agent_id);
             input.origin_run_id = *run_id;
             // Set origin_kind only if not already set by watchdog discovery
@@ -1283,27 +1400,23 @@ async fn create_issue(
             // Anonymous actor - should not reach here due to auth middleware
         }
     }
-    
+
     // Paperclip takes the company scope from the URL. The body must not need
     // to repeat companyId, and the path is authoritative if it is supplied.
     input.company_id = company_id;
     let service = state.issue_service.clone();
-    let created = service
-        .create(input)
-        .await
-        .map_err(|error| {
-            tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
-            issue_service_status(&error)
-        })?;
+    let created = service.create(input).await.map_err(|error| {
+        tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
+        issue_service_status(&error)
+    })?;
 
     // Queue issue assignment wakeup (matches paperclip: routes/issues.ts:7054-7062)
     // Skip if no assignee or backlog status
     if let Some(assignee_agent_id) = created.issue.assignee_agent_id {
         if !matches!(created.issue.status, models::IssueStatus::Backlog) {
-            let wakeup_service = services::IssueAssignmentWakeupService::new(
-                state.heartbeat_service.clone()
-            );
-            
+            let wakeup_service =
+                services::IssueAssignmentWakeupService::new(state.heartbeat_service.clone());
+
             let wakeup_input = services::issue_assignment_wakeup::QueueWakeupInput {
                 company_id,
                 issue_id: created.issue.id,
@@ -1316,7 +1429,7 @@ async fn create_issue(
                 requested_by_actor_id: actor.principal_id(),
                 rethrow_on_error: false, // Swallow error to avoid blocking response
             };
-            
+
             if let Err(e) = wakeup_service.queue_wakeup(wakeup_input).await {
                 tracing::warn!(
                     error = %e,
@@ -1349,8 +1462,7 @@ async fn list_company_issues(
     Query(query): Query<ListIssuesQuery>,
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
     crate::routes::assert_company_access(&actor, company_id, true)?;
-    let touched_by_user_id =
-        resolve_user_filter(query.touched_by_user_id.as_deref(), &actor)?;
+    let touched_by_user_id = resolve_user_filter(query.touched_by_user_id.as_deref(), &actor)?;
     let inbox_archived_by_user_id =
         resolve_user_filter(query.inbox_archived_by_user_id.as_deref(), &actor)?;
     let filter = IssueQueryFilter {
@@ -1441,8 +1553,10 @@ async fn update_issue(
             Err(services::InfluenceLimitError::LimitExceeded { .. }) => {
                 return Err(StatusCode::TOO_MANY_REQUESTS);
             }
-            Err(services::InfluenceLimitError::RunNotFound(_)
-            | services::InfluenceLimitError::RunContextRequired) => {
+            Err(
+                services::InfluenceLimitError::RunNotFound(_)
+                | services::InfluenceLimitError::RunContextRequired,
+            ) => {
                 return Err(StatusCode::FORBIDDEN);
             }
             Err(services::InfluenceLimitError::DatabaseError(_)) => {
@@ -1488,7 +1602,10 @@ async fn count_issues(
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM issues WHERE company_id=$1")
-        .bind(company_id).fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .bind(company_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({"count": count})))
 }
 
@@ -1505,7 +1622,7 @@ async fn search_issues(
         offset: 0,
         cursor: None,
     };
-    
+
     service
         .search(company_id, &query.q, &filter, &pagination)
         .await
@@ -1523,8 +1640,13 @@ async fn checkout_issue(
     let service = state.issue_service.clone();
     let company_id = scoped_issue_company(&state, &actor, id).await?;
 
-    if let AuthorizationActor::Agent { agent_id, run_id, .. } = &actor {
-        if input.agent_id.is_some_and(|requested| requested != *agent_id)
+    if let AuthorizationActor::Agent {
+        agent_id, run_id, ..
+    } = &actor
+    {
+        if input
+            .agent_id
+            .is_some_and(|requested| requested != *agent_id)
             || run_id.is_some_and(|current| current != input.checkout_run_id)
         {
             return Err(StatusCode::FORBIDDEN);
@@ -1652,7 +1774,14 @@ async fn batch_update_issues(
     }
 
     service
-        .batch_update(company_id, input.issue_ids, input.status, input.priority, input.assignee_agent_id, input.assignee_user_id)
+        .batch_update(
+            company_id,
+            input.issue_ids,
+            input.status,
+            input.priority,
+            input.assignee_agent_id,
+            input.assignee_user_id,
+        )
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -1684,7 +1813,12 @@ async fn get_issue_cases(
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    state.issue_service.get_cases(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    state
+        .issue_service
+        .get_cases(id, company_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// I3: GET /issues/:id/active-run
@@ -1704,9 +1838,15 @@ async fn get_issue_active_run(
     .fetch_one(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let execution_run_id: Option<Uuid> = issue.try_get("execution_run_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let assignee_agent_id: Option<Uuid> = issue.try_get("assignee_agent_id").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let status: String = issue.try_get("status").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let execution_run_id: Option<Uuid> = issue
+        .try_get("execution_run_id")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let assignee_agent_id: Option<Uuid> = issue
+        .try_get("assignee_agent_id")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let status: String = issue
+        .try_get("status")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Paperclip first follows the issue's execution lock, then falls back to
     // the assignee's live run for an in-progress issue. In both cases the run
@@ -1782,7 +1922,12 @@ async fn get_issue_live_runs(
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    state.issue_service.get_live_runs(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    state
+        .issue_service
+        .get_live_runs(id, company_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// I6: GET /issues/:id/accepted-plan-decompositions
@@ -1791,7 +1936,12 @@ async fn list_plan_decompositions(
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    state.issue_service.get_accepted_plan_decompositions(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    state
+        .issue_service
+        .get_accepted_plan_decompositions(id, company_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// I7: POST /issues/:id/accepted-plan-decompositions
@@ -1801,7 +1951,11 @@ async fn submit_plan_decomposition(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    let result = state.issue_service.submit_plan_decomposition(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = state
+        .issue_service
+        .submit_plan_decomposition(id, company_id, payload)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -1812,7 +1966,12 @@ async fn list_issue_approvals(
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    state.issue_service.get_approvals(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    state
+        .issue_service
+        .get_approvals(id, company_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// I9: POST /issues/:id/approvals
@@ -1823,7 +1982,11 @@ async fn create_issue_approval(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    let result = state.issue_service.create_approval(id, company_id, payload).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = state
+        .issue_service
+        .create_approval(id, company_id, payload)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -1834,7 +1997,11 @@ async fn delete_issue_approval(
     Path((id, approval_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    state.issue_service.delete_approval(id, approval_id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .issue_service
+        .delete_approval(id, approval_id, company_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1845,7 +2012,8 @@ async fn list_work_products(
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<models::issue_auxiliary::WorkProduct>>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    state.work_product_service
+    state
+        .work_product_service
         .list_work_products(id, company_id)
         .await
         .map(Json)
@@ -1860,7 +2028,8 @@ async fn create_work_product(
     Json(input): Json<models::issue_auxiliary::CreateWorkProductInput>,
 ) -> Result<Json<models::issue_auxiliary::WorkProduct>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    state.work_product_service
+    state
+        .work_product_service
         .create_work_product(id, company_id, input)
         .await
         .map(Json)
@@ -1874,7 +2043,7 @@ async fn list_child_issues(
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<Issue>>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    
+
     // Query child issues from database
     let children = sqlx::query_as::<_, Issue>(
         "SELECT * FROM issues WHERE parent_issue_id = $1 AND company_id = $2 ORDER BY created_at DESC"
@@ -1884,7 +2053,7 @@ async fn list_child_issues(
     .fetch_all(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     Ok(Json(children))
 }
 
@@ -1895,29 +2064,30 @@ async fn get_issue_transcript(
     IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    
+
     // Query activity log for transcript events
     let events = sqlx::query(
         "SELECT id, action, details, created_at, agent_id, user_id 
          FROM activity_log 
          WHERE entity_type = 'issue' AND entity_id = $1 AND company_id = $2
          AND action IN ('issue.comment', 'issue.status_changed', 'issue.assigned', 'issue.created')
-         ORDER BY created_at ASC"
+         ORDER BY created_at ASC",
     )
     .bind(id.to_string())
     .bind(company_id)
     .fetch_all(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     let mut transcript = Vec::new();
     for row in events {
         let action: String = row.try_get("action").unwrap_or_default();
         let details: Option<serde_json::Value> = row.try_get("details").ok();
-        let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at").unwrap_or_default();
+        let created_at: chrono::DateTime<chrono::Utc> =
+            row.try_get("created_at").unwrap_or_default();
         let agent_id: Option<Uuid> = row.try_get("agent_id").ok().flatten();
         let user_id: Option<Uuid> = row.try_get("user_id").ok().flatten();
-        
+
         transcript.push(serde_json::json!({
             "action": action,
             "details": details,
@@ -1926,7 +2096,7 @@ async fn get_issue_transcript(
             "userId": user_id,
         }));
     }
-    
+
     Ok(Json(serde_json::json!({
         "issueId": id,
         "transcript": transcript,
@@ -1940,11 +2110,11 @@ async fn delete_issue_relation(
     Path((issue_id, relation_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    
+
     // Delete the relation
     let result = sqlx::query(
         "DELETE FROM issue_relations 
-         WHERE id = $1 AND company_id = $2 AND (issue_id = $3 OR related_issue_id = $3)"
+         WHERE id = $1 AND company_id = $2 AND (issue_id = $3 OR related_issue_id = $3)",
     )
     .bind(relation_id)
     .bind(company_id)
@@ -1952,11 +2122,11 @@ async fn delete_issue_relation(
     .execute(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
-    
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1968,16 +2138,18 @@ async fn create_child_issue(
     Json(mut input): Json<CreateIssueInput>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let service = state.issue_service.clone();
-    
+
     // ✅ Paperclip pattern: Force override creator fields from actor (issues.ts:7139-7146)
     // Sanitize: strip any createdByUserId if actor is Agent (prevents spoofing)
     if matches!(actor, AuthorizationActor::Agent { .. }) {
         input.created_by_user_id = None;
     }
-    
+
     // Force set creator fields based on actor type
     match &actor {
-        AuthorizationActor::Agent { agent_id, run_id, .. } => {
+        AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => {
             input.created_by_agent_id = Some(*agent_id);
             input.origin_run_id = *run_id;
             // Set origin_kind only if not already set
@@ -1996,21 +2168,23 @@ async fn create_child_issue(
             // Anonymous actor - should not reach here due to auth middleware
         }
     }
-    
+
     let input_with_parent = CreateIssueInput {
         parent_id: Some(parent_id),
         ..input
     };
-    let result = service.create(input_with_parent).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+    let result = service
+        .create(input_with_parent)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     // Queue issue assignment wakeup (matches Paperclip: issues.ts:7221-7229)
     if let Some(assignee_agent_id) = result.issue.assignee_agent_id {
         // Only wake if not backlog status
         if !matches!(result.issue.status, models::IssueStatus::Backlog) {
-            let wakeup_service = services::IssueAssignmentWakeupService::new(
-                state.heartbeat_service.clone()
-            );
-            
+            let wakeup_service =
+                services::IssueAssignmentWakeupService::new(state.heartbeat_service.clone());
+
             let wakeup_input = services::issue_assignment_wakeup::QueueWakeupInput {
                 company_id: result.issue.company_id,
                 issue_id: result.issue.id,
@@ -2023,7 +2197,7 @@ async fn create_child_issue(
                 requested_by_actor_id: actor.principal_id(),
                 rethrow_on_error: false, // Don't block child creation on wakeup failure
             };
-            
+
             if let Err(e) = wakeup_service.queue_wakeup(wakeup_input).await {
                 tracing::warn!(
                     error = %e,
@@ -2035,7 +2209,7 @@ async fn create_child_issue(
             }
         }
     }
-    
+
     Ok((StatusCode::CREATED, Json(result.issue)))
 }
 
@@ -2095,7 +2269,11 @@ async fn unmark_issue_read(
     IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    state.issue_service.unmark_read(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .issue_service
+        .unmark_read(id, company_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2105,7 +2283,11 @@ async fn archive_issue_inbox(
     IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    state.issue_service.archive_inbox(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .issue_service
+        .archive_inbox(id, company_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2115,7 +2297,11 @@ async fn unarchive_issue_inbox(
     IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    state.issue_service.unarchive_inbox(id, company_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .issue_service
+        .unarchive_inbox(id, company_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2124,7 +2310,9 @@ async fn monitor_check_now(
     State(_state): State<AppState>,
     IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "monitorCheckTriggered": true})))
+    Ok(Json(
+        serde_json::json!({"issueId": id, "monitorCheckTriggered": true}),
+    ))
 }
 
 /// I17: POST /issues/:id/scheduled-retry/retry-now
@@ -2132,7 +2320,9 @@ async fn scheduled_retry_now(
     State(_state): State<AppState>,
     IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "retryTriggered": true})))
+    Ok(Json(
+        serde_json::json!({"issueId": id, "retryTriggered": true}),
+    ))
 }
 
 /// I18: GET /issues/:id/external-objects
@@ -2148,7 +2338,9 @@ async fn get_external_object_summary(
     State(_state): State<AppState>,
     IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "externalObjectCount": 0})))
+    Ok(Json(
+        serde_json::json!({"issueId": id, "externalObjectCount": 0}),
+    ))
 }
 
 /// I20: POST /issues/:id/external-objects/refresh
@@ -2156,7 +2348,9 @@ async fn refresh_external_objects(
     State(_state): State<AppState>,
     IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({"issueId": id, "refreshTriggered": true})))
+    Ok(Json(
+        serde_json::json!({"issueId": id, "refreshTriggered": true}),
+    ))
 }
 
 /// I21: GET /issues/:id/file-resources/list
@@ -2176,19 +2370,29 @@ async fn check_file_resource_availability(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let project_id: Option<Uuid> = sqlx::query_scalar("SELECT project_id FROM issues WHERE id = $1 AND company_id = $2")
-        .bind(issue_id)
-        .bind(company_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let project_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT project_id FROM issues WHERE id = $1 AND company_id = $2")
+            .bind(issue_id)
+            .bind(company_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut results = Vec::with_capacity(queries.len());
     for query in queries {
         let path = query.get("path").and_then(Value::as_str).unwrap_or("");
-        let workspace = query.get("workspace").and_then(Value::as_str).unwrap_or("auto");
-        let project_filter = query.get("projectId").and_then(Value::as_str).and_then(|v| Uuid::parse_str(v).ok());
-        let workspace_filter = query.get("workspaceId").and_then(Value::as_str).and_then(|v| Uuid::parse_str(v).ok());
+        let workspace = query
+            .get("workspace")
+            .and_then(Value::as_str)
+            .unwrap_or("auto");
+        let project_filter = query
+            .get("projectId")
+            .and_then(Value::as_str)
+            .and_then(|v| Uuid::parse_str(v).ok());
+        let workspace_filter = query
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .and_then(|v| Uuid::parse_str(v).ok());
         let normalized_query = json!({
             "projectId": project_filter,
             "workspaceId": workspace_filter,
@@ -2199,7 +2403,9 @@ async fn check_file_resource_availability(
         let invalid_path = path.is_empty()
             || path.starts_with('/')
             || path.starts_with('\\')
-            || path.split(['/', '\\']).any(|part| part == ".." || part.contains('\0') || part.chars().any(|c| c.is_control()));
+            || path.split(['/', '\\']).any(|part| {
+                part == ".." || part.contains('\0') || part.chars().any(|c| c.is_control())
+            });
         if invalid_path || !matches!(workspace, "auto" | "execution" | "project") {
             results.push(json!({
                 "query": normalized_query,
@@ -2271,14 +2477,26 @@ async fn check_file_resource_availability(
             results.push(json!({ "query": normalized_query, "openable": false, "unavailableReason": "not_found", "resource": null }));
             continue;
         };
-        if !canonical.starts_with(&root_path) || canonical.components().any(|part| part.as_os_str() == ".git" || part.as_os_str() == ".env") {
+        if !canonical.starts_with(&root_path)
+            || canonical
+                .components()
+                .any(|part| part.as_os_str() == ".git" || part.as_os_str() == ".env")
+        {
             results.push(json!({ "query": normalized_query, "openable": false, "unavailableReason": "permission_denied", "resource": null }));
             continue;
         }
-        let metadata = tokio::fs::metadata(&canonical).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let metadata = tokio::fs::metadata(&canonical)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let is_dir = metadata.is_dir();
         let extension = canonical.extension().and_then(|v| v.to_str()).unwrap_or("");
-        let preview_kind = if is_dir { "unsupported" } else if ["png", "jpg", "jpeg", "gif", "webp"].contains(&extension) { "image" } else { "text" };
+        let preview_kind = if is_dir {
+            "unsupported"
+        } else if ["png", "jpg", "jpeg", "gif", "webp"].contains(&extension) {
+            "image"
+        } else {
+            "text"
+        };
         let project_name: String = row.get("project_name");
         let resource = json!({
             "kind": if is_dir { "directory" } else { "file" },
@@ -2299,7 +2517,9 @@ async fn check_file_resource_availability(
         results.push(json!({ "query": normalized_query, "openable": true, "resource": resource }));
     }
 
-    Ok(Json(json!({ "kind": "workspace_file_availability", "results": results })))
+    Ok(Json(
+        json!({ "kind": "workspace_file_availability", "results": results }),
+    ))
 }
 
 async fn list_file_resources(
@@ -2327,27 +2547,185 @@ async fn get_file_resource_content(
 
 /// I24: GET /issues/:id/feedback-votes
 async fn list_feedback_votes(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
+    let user_id = match &actor {
+        AuthorizationActor::Board { user_id, .. } => *user_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let rows = sqlx::query(
+        "SELECT id, company_id, issue_id, target_type, target_id, author_user_id, vote, reason,
+                shared_with_labs, created_at, updated_at
+         FROM feedback_votes
+         WHERE company_id = $1 AND issue_id = $2 AND author_user_id = $3
+         ORDER BY updated_at DESC",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(user_id.to_string())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to list issue feedback votes");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(rows.into_iter().map(feedback_vote_json).collect()))
 }
 
 /// I25: POST /issues/:id/feedback-votes
 async fn create_feedback_vote(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    Ok((StatusCode::CREATED, Json(serde_json::json!({"issueId": id, "vote": payload, "created": true}))))
+    let user_id = match actor {
+        AuthorizationActor::Board { user_id, .. } => user_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+    let company_id = sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM issues WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let target_type = payload
+        .get("targetType")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let target_id = payload
+        .get("targetId")
+        .and_then(Value::as_str)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let vote = payload
+        .get("vote")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "up" | "down"))
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let reason = payload.get("reason").and_then(Value::as_str);
+    if reason.is_some_and(|value| value.chars().count() > 1000) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let allow_sharing = payload
+        .get("allowSharing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let author_user_id = user_id.to_string();
+    let row = sqlx::query(
+        "INSERT INTO feedback_votes
+            (company_id, issue_id, target_type, target_id, author_user_id, voter_id, voter_type,
+             vote, reason, shared_with_labs)
+         VALUES ($1, $2, $3, $4, $5, $6, 'user', $7, $8, $9)
+         ON CONFLICT (company_id, target_type, target_id, author_user_id)
+         DO UPDATE SET vote = EXCLUDED.vote, reason = EXCLUDED.reason,
+                       shared_with_labs = EXCLUDED.shared_with_labs, updated_at = NOW()
+         RETURNING id, company_id, issue_id, target_type, target_id, author_user_id, vote, reason,
+                   shared_with_labs, created_at, updated_at",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(&author_user_id)
+    .bind(user_id)
+    .bind(vote)
+    .bind(reason)
+    .bind(allow_sharing)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to save issue feedback vote");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let vote_id = row.get::<Uuid, _>("id");
+    sqlx::query(
+        "INSERT INTO feedback_traces
+            (company_id, issue_id, vote_id, target_type, target_id, payload, status, shared_with_labs)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(vote_id)
+    .bind(target_type)
+    .bind(Uuid::parse_str(target_id).ok())
+    .bind(json!({
+        "targetType": target_type,
+        "targetId": target_id,
+        "vote": vote,
+        "reason": reason,
+    }))
+    .bind(if allow_sharing { "pending" } else { "local_only" })
+    .bind(allow_sharing)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, vote_id = %vote_id, "failed to persist feedback trace");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((StatusCode::CREATED, Json(feedback_vote_json(row))))
 }
 
 /// I26: GET /issues/:id/feedback-traces
 async fn list_feedback_traces(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    Ok(Json(vec![]))
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    if !matches!(actor, AuthorizationActor::Board { .. }) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let rows = sqlx::query(
+        "SELECT id, company_id, issue_id, vote_id, target_type, target_id, payload, status,
+                failure_reason, shared_with_labs, created_at, updated_at
+         FROM feedback_traces
+         WHERE company_id = $1 AND issue_id = $2
+         ORDER BY created_at DESC",
+    )
+    .bind(company_id)
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(rows.into_iter().map(feedback_trace_json).collect()))
+}
+
+fn feedback_vote_json(row: sqlx::postgres::PgRow) -> serde_json::Value {
+    json!({
+        "id": row.get::<Uuid, _>("id"),
+        "companyId": row.get::<Uuid, _>("company_id"),
+        "issueId": row.get::<Uuid, _>("issue_id"),
+        "targetType": row.get::<String, _>("target_type"),
+        "targetId": row.get::<String, _>("target_id"),
+        "authorUserId": row.get::<String, _>("author_user_id"),
+        "vote": row.get::<String, _>("vote"),
+        "reason": row.get::<Option<String>, _>("reason"),
+        "sharedWithLabs": row.get::<bool, _>("shared_with_labs"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })
+}
+
+fn feedback_trace_json(row: sqlx::postgres::PgRow) -> serde_json::Value {
+    json!({
+        "id": row.get::<Uuid, _>("id"),
+        "companyId": row.get::<Uuid, _>("company_id"),
+        "issueId": row.get::<Uuid, _>("issue_id"),
+        "voteId": row.get::<Uuid, _>("vote_id"),
+        "targetType": row.get::<String, _>("target_type"),
+        "targetId": row.get::<Option<Uuid>, _>("target_id"),
+        "payload": row.get::<serde_json::Value, _>("payload"),
+        "status": row.get::<String, _>("status"),
+        "failureReason": row.get::<Option<String>, _>("failure_reason"),
+        "sharedWithLabs": row.get::<bool, _>("shared_with_labs"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })
 }
 
 /// I27: GET /issues/:id/recovery-actions
@@ -2356,7 +2734,12 @@ async fn list_recovery_actions(
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    state.issue_service.get_recovery_actions(id, company_id).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    state
+        .issue_service
+        .get_recovery_actions(id, company_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// I28: POST /issues/:id/recovery-actions/resolve
@@ -2366,20 +2749,27 @@ async fn resolve_recovery_action(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = issue_company_id(&state, id).await?;
-    let action_id = payload.get("actionId")
+    let action_id = payload
+        .get("actionId")
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
-    state.issue_service.resolve_recovery_action(id, company_id, action_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .issue_service
+        .resolve_recovery_action(id, company_id, action_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
-
 
 /// Create issue routes
 pub fn issue_routes() -> Router<AppState> {
     Router::new()
         .route("/issues", get(list_issues))
-        .route("/issues/:id", get(get_issue).patch(update_issue).delete(delete_issue))
+        .route(
+            "/issues/:id",
+            get(get_issue).patch(update_issue).delete(delete_issue),
+        )
         .route(
             "/companies/:companyId/issues",
             get(list_company_issues).post(create_issue),
@@ -2389,42 +2779,113 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/checkout", post(checkout_issue))
         .route("/issues/:id/release", post(release_issue))
         .route("/issues/:id/admin/force-release", post(force_release_issue))
-        .route("/companies/:companyId/issues/batch-update", post(batch_update_issues))
+        .route(
+            "/companies/:companyId/issues/batch-update",
+            post(batch_update_issues),
+        )
         .route("/issues/:id/heartbeat-context", get(get_heartbeat_context))
         // --- P1: Issue 子资源补齐 (I1-I44) ---
         .route("/issues/:id/cases", get(get_issue_cases))
         .route("/issues/:id/active-run", get(get_issue_active_run))
         .route("/issues/:id/live-runs", get(get_issue_live_runs))
-        .route("/issues/:id/work-products", get(list_work_products).post(create_work_product))
-        .route("/issues/:id/children", get(list_child_issues).post(create_child_issue))
+        .route(
+            "/issues/:id/work-products",
+            get(list_work_products).post(create_work_product),
+        )
+        .route(
+            "/issues/:id/children",
+            get(list_child_issues).post(create_child_issue),
+        )
         .route("/issues/:id/transcript", get(get_issue_transcript))
-        .route("/issues/:id/read", post(mark_issue_read).delete(unmark_issue_read))
-        .route("/issues/:id/inbox-archive", post(archive_issue_inbox).delete(unarchive_issue_inbox))
+        .route(
+            "/issues/:id/read",
+            post(mark_issue_read).delete(unmark_issue_read),
+        )
+        .route(
+            "/issues/:id/inbox-archive",
+            post(archive_issue_inbox).delete(unarchive_issue_inbox),
+        )
         .route("/issues/:id/monitor/check-now", post(monitor_check_now))
-        .route("/issues/:id/scheduled-retry/retry-now", post(scheduled_retry_now))
+        .route(
+            "/issues/:id/scheduled-retry/retry-now",
+            post(scheduled_retry_now),
+        )
         .route("/issues/:id/external-objects", get(list_external_objects))
-        .route("/issues/:id/external-object-summary", get(get_external_object_summary))
-        .route("/issues/:id/external-objects/refresh", post(refresh_external_objects))
+        .route(
+            "/issues/:id/external-object-summary",
+            get(get_external_object_summary),
+        )
+        .route(
+            "/issues/:id/external-objects/refresh",
+            post(refresh_external_objects),
+        )
         .route("/issues/:id/documents", get(list_issue_documents))
-        .route("/issues/:id/documents/:key", get(get_issue_document).put(upsert_issue_document).delete(delete_issue_document))
-        .route("/issues/:id/documents/:key/revisions", get(list_issue_document_revisions))
-        .route("/issues/:id/documents/:key/revisions/:revision_id/restore", post(restore_issue_document_revision))
-        .route("/issues/:id/documents/:key/annotations", get(get_issue_document_annotations).post(create_issue_document_annotation))
-        .route("/issues/:id/documents/:key/annotations/:thread_id", get(get_issue_document_annotation_thread).patch(update_issue_document_annotation))
-        .route("/issues/:id/documents/:key/annotations/:thread_id/reply", post(reply_issue_document_annotation))
+        .route(
+            "/issues/:id/documents/:key",
+            get(get_issue_document)
+                .put(upsert_issue_document)
+                .delete(delete_issue_document),
+        )
+        .route(
+            "/issues/:id/documents/:key/revisions",
+            get(list_issue_document_revisions),
+        )
+        .route(
+            "/issues/:id/documents/:key/revisions/:revision_id/restore",
+            post(restore_issue_document_revision),
+        )
+        .route(
+            "/issues/:id/documents/:key/annotations",
+            get(get_issue_document_annotations).post(create_issue_document_annotation),
+        )
+        .route(
+            "/issues/:id/documents/:key/annotations/:thread_id",
+            get(get_issue_document_annotation_thread).patch(update_issue_document_annotation),
+        )
+        .route(
+            "/issues/:id/documents/:key/annotations/:thread_id/reply",
+            post(reply_issue_document_annotation),
+        )
         .route("/issues/:id/documents/:key/lock", post(lock_issue_document))
-        .route("/issues/:id/documents/:key/unlock", post(unlock_issue_document))
+        .route(
+            "/issues/:id/documents/:key/unlock",
+            post(unlock_issue_document),
+        )
         .route("/issues/:id/file-resources/list", get(list_file_resources))
-        .route("/issues/:id/file-resources/availability", post(check_file_resource_availability))
-        .route("/issues/:id/file-resources/resolve", get(resolve_file_resource))
-        .route("/issues/:id/file-resources/content", get(get_file_resource_content))
-        .route("/issues/:id/feedback-votes", get(list_feedback_votes).post(create_feedback_vote))
+        .route(
+            "/issues/:id/file-resources/availability",
+            post(check_file_resource_availability),
+        )
+        .route(
+            "/issues/:id/file-resources/resolve",
+            get(resolve_file_resource),
+        )
+        .route(
+            "/issues/:id/file-resources/content",
+            get(get_file_resource_content),
+        )
+        .route(
+            "/issues/:id/feedback-votes",
+            get(list_feedback_votes).post(create_feedback_vote),
+        )
         .route("/issues/:id/feedback-traces", get(list_feedback_traces))
         .route("/issues/:id/recovery-actions", get(list_recovery_actions))
-        .route("/issues/:id/recovery-actions/resolve", post(resolve_recovery_action))
-        .route("/issues/:id/accepted-plan-decompositions", get(list_plan_decompositions).post(submit_plan_decomposition))
-        .route("/issues/:id/approvals", get(list_issue_approvals).post(create_issue_approval))
-        .route("/issues/:id/approvals/:approval_id", axum::routing::delete(delete_issue_approval))
+        .route(
+            "/issues/:id/recovery-actions/resolve",
+            post(resolve_recovery_action),
+        )
+        .route(
+            "/issues/:id/accepted-plan-decompositions",
+            get(list_plan_decompositions).post(submit_plan_decomposition),
+        )
+        .route(
+            "/issues/:id/approvals",
+            get(list_issue_approvals).post(create_issue_approval),
+        )
+        .route(
+            "/issues/:id/approvals/:approval_id",
+            axum::routing::delete(delete_issue_approval),
+        )
 }
 
 #[cfg(test)]
@@ -2449,14 +2910,23 @@ mod user_filter_tests {
         let actor = AuthorizationActor::board(Uuid::new_v4(), Uuid::new_v4());
         let user_id = Uuid::new_v4();
 
-        assert_eq!(resolve_user_filter(Some(&user_id.to_string()), &actor), Ok(Some(user_id)));
-        assert_eq!(resolve_user_filter(Some("not-a-uuid"), &actor), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            resolve_user_filter(Some(&user_id.to_string()), &actor),
+            Ok(Some(user_id))
+        );
+        assert_eq!(
+            resolve_user_filter(Some("not-a-uuid"), &actor),
+            Err(StatusCode::BAD_REQUEST)
+        );
     }
 
     #[test]
     fn rejects_me_for_agent_without_user_delegation() {
         let actor = AuthorizationActor::agent(Uuid::new_v4(), Uuid::new_v4(), None);
 
-        assert_eq!(resolve_user_filter(Some("me"), &actor), Err(StatusCode::FORBIDDEN));
+        assert_eq!(
+            resolve_user_filter(Some("me"), &actor),
+            Err(StatusCode::FORBIDDEN)
+        );
     }
 }
