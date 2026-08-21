@@ -1007,26 +1007,62 @@ async fn update_pipeline(
 
 /// POST /projects/:project_id/workspaces/:workspace_id/runtime-commands/:cmd_id
 async fn project_runtime_command(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((project_id, _workspace_id, cmd_id)): Path<(Uuid, Uuid, String)>,
+    Path((project_id, workspace_id, cmd_id)): Path<(Uuid, Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "projectId": project_id, "commandId": cmd_id, "status": "accepted" })))
+    if cmd_id.trim().is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let exists: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT p.company_id
+           FROM projects p
+           JOIN project_workspaces w ON w.project_id = p.id
+          WHERE p.id = $1 AND w.id = $2 AND p.company_id = $3",
+    )
+    .bind(project_id)
+    .bind(workspace_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if exists.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!({ "projectId": project_id, "workspaceId": workspace_id, "commandId": cmd_id, "status": "accepted" })))
 }
 
 /// POST /projects/:project_id/workspaces/:workspace_id/runtime-services/:service_id
 async fn project_runtime_service(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((project_id, _workspace_id, service_id)): Path<(Uuid, Uuid, String)>,
+    Path((project_id, workspace_id, service_id)): Path<(Uuid, Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "projectId": project_id, "serviceId": service_id, "status": "accepted" })))
+    if service_id.trim().is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let exists: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT p.company_id
+           FROM projects p
+           JOIN project_workspaces w ON w.project_id = p.id
+          WHERE p.id = $1 AND w.id = $2 AND p.company_id = $3",
+    )
+    .bind(project_id)
+    .bind(workspace_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if exists.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!({ "projectId": project_id, "workspaceId": workspace_id, "serviceId": service_id, "status": "accepted" })))
 }
 
 /// GET /_plugins/:plugin_id/ui/*file_path —— plugin UI 静态文件（基础：404）。
