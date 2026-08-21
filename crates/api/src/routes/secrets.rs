@@ -19,7 +19,7 @@
 //! `models::CompanySecret`（其字段不全且被别处引用）。
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -31,6 +31,26 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::routes::{require_company_access, AccessMode};
+use services::auth::AuthorizationActor;
+
+async fn authorize_secret(
+    pool: &sqlx::PgPool,
+    id: Uuid,
+    actor: &AuthorizationActor,
+    mode: AccessMode,
+) -> Result<Uuid, SecretError> {
+    let company_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT company_id FROM company_secrets WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| SecretError::Database(e.to_string()))?;
+    let company_id = company_id.ok_or(SecretError::NotFound)?;
+    require_company_access(actor, company_id, mode).map_err(|_| SecretError::NotFound)?;
+    Ok(company_id)
+}
 
 pub fn secret_routes() -> Router<AppState> {
     Router::new()
@@ -73,7 +93,9 @@ const KNOWN_PROVIDERS: &[(&str, &str)] = &[
 async fn list_secret_providers(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<Value>>, SecretError> {
+    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| SecretError::NotFound)?;
     let pool = &state.pool;
     // Determine which providers have a configured config row for this company.
     let configured: Vec<String> = sqlx::query_scalar(
@@ -152,7 +174,9 @@ fn secret_to_json(r: &sqlx::postgres::PgRow) -> Value {
 async fn list_company_secrets(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<Value>>, SecretError> {
+    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| SecretError::NotFound)?;
     let pool = &state.pool;
     let rows = sqlx::query(&format!(
         "{} WHERE company_id = $1 AND scope = 'company' AND deleted_at IS NULL ORDER BY created_at DESC",
@@ -173,7 +197,9 @@ async fn list_company_secrets(
 async fn list_secret_catalog(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<Value>>, SecretError> {
+    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| SecretError::NotFound)?;
     let rows = sqlx::query(
         "SELECT id, name, key, status FROM company_secrets \
          WHERE company_id = $1 AND scope = 'company' AND deleted_at IS NULL \
@@ -212,8 +238,10 @@ struct CreateSecretBody {
 async fn create_company_secret(
     State(state): State<AppState>,
     Path(company_id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<CreateSecretBody>,
 ) -> Result<(StatusCode, Json<Value>), SecretError> {
+    require_company_access(&actor, company_id, AccessMode::Write).map_err(|_| SecretError::NotFound)?;
     let pool = &state.pool;
 
     let managed_mode = body.managed_mode.as_deref().unwrap_or("paperclip_managed");
@@ -303,8 +331,10 @@ async fn create_company_secret(
 async fn get_secret(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Value>, SecretError> {
     let pool = &state.pool;
+    authorize_secret(pool, id, &actor, AccessMode::Read).await?;
     let row = sqlx::query(&format!("{} WHERE id = $1", SECRET_SELECT))
         .bind(id)
         .fetch_optional(pool)
@@ -332,9 +362,11 @@ struct UpdateSecretBody {
 async fn update_secret(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<UpdateSecretBody>,
 ) -> Result<Json<Value>, SecretError> {
     let pool = &state.pool;
+    authorize_secret(pool, id, &actor, AccessMode::Write).await?;
     let row = sqlx::query(
         r#"UPDATE company_secrets
               SET updated_at = NOW(),
@@ -376,8 +408,10 @@ async fn update_secret(
 async fn delete_secret(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<StatusCode, SecretError> {
     let pool = &state.pool;
+    authorize_secret(pool, id, &actor, AccessMode::Write).await?;
     let res = sqlx::query(
         r#"UPDATE company_secrets
               SET status = 'deleted', deleted_at = NOW(), updated_at = NOW()
@@ -407,9 +441,11 @@ struct RotateSecretBody {
 async fn rotate_secret(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<RotateSecretBody>,
 ) -> Result<Json<Value>, SecretError> {
     let pool = &state.pool;
+    authorize_secret(pool, id, &actor, AccessMode::Write).await?;
 
     // Validate rotation input (requireSecretRotationInput).
     let has_input = body.value.as_deref().map_or(false, |s| !s.trim().is_empty())
@@ -498,8 +534,10 @@ async fn rotate_secret(
 async fn get_secret_usage(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Value>, SecretError> {
     let pool = &state.pool;
+    authorize_secret(pool, id, &actor, AccessMode::Read).await?;
     let rows = sqlx::query(
         r#"SELECT id, company_id, secret_id, target_type, target_id, config_path,
                   version_selector, required, label, created_at, updated_at
@@ -538,8 +576,10 @@ async fn get_secret_usage(
 async fn get_secret_access_events(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<Value>>, SecretError> {
     let pool = &state.pool;
+    authorize_secret(pool, id, &actor, AccessMode::Read).await?;
     let rows = sqlx::query(
         r#"SELECT id, company_id, secret_id, version, provider, actor_type, actor_id,
                   consumer_type, consumer_id, config_path, secret_scope,
