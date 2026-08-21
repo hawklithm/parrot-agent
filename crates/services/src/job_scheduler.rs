@@ -643,7 +643,39 @@ impl JobScheduler {
     pub async fn trigger_job(&self, job_name: &str) -> Result<String, String> {
         let job = self.get_job(job_name).await;
         match job {
-            Some(j) => j.execute().await,
+            Some(job) => {
+                if !self.running_jobs.write().await.insert(job_name.to_string()) {
+                    return Err(format!("Job '{}' is already running", job_name));
+                }
+                if !self.try_acquire_lease(job_name, 60).await {
+                    self.running_jobs.write().await.remove(job_name);
+                    return Err(format!("Job '{}' is owned by another scheduler", job_name));
+                }
+
+                let started_at = Utc::now();
+                let result = AssertUnwindSafe(job.execute()).catch_unwind().await;
+                let completed_at = Utc::now();
+                let (status, error_message, output) = match result {
+                    Ok(Ok(output)) => (JobStatus::Succeeded, None, Ok(output)),
+                    Ok(Err(error)) => (JobStatus::Failed, Some(error.clone()), Err(error)),
+                    Err(_) => {
+                        let error = "scheduled job panicked during execution".to_string();
+                        (JobStatus::Failed, Some(error.clone()), Err(error))
+                    }
+                };
+                self.record_execution(JobExecutionRecord {
+                    id: Uuid::new_v4().to_string(),
+                    job_name: job_name.to_string(),
+                    started_at,
+                    completed_at: Some(completed_at),
+                    status,
+                    error_message,
+                })
+                .await;
+                self.running_jobs.write().await.remove(job_name);
+                self.release_lease(job_name).await;
+                output
+            }
             None => Err(format!("Job '{}' not found", job_name)),
         }
     }
@@ -929,6 +961,25 @@ mod scheduler_tests {
 
         let executions = scheduler.get_recent_executions(10).await;
         assert!(executions.iter().any(|record| record.status == JobStatus::Succeeded));
+    }
+
+    #[tokio::test]
+    async fn manual_trigger_records_execution_and_rejects_panics() {
+        let scheduler = JobScheduler::new();
+        scheduler.register(std::sync::Arc::new(SuccessfulJob)).await;
+        assert_eq!(scheduler.trigger_job("successful_scheduler_test").await.unwrap(), "ok");
+        assert!(scheduler
+            .get_recent_executions(10)
+            .await
+            .iter()
+            .any(|record| record.status == JobStatus::Succeeded));
+
+        scheduler.register(std::sync::Arc::new(PanickingJob)).await;
+        assert_eq!(
+            scheduler.trigger_job("panicking_scheduler_test").await,
+            Err("scheduled job panicked during execution".to_string())
+        );
+        assert!(scheduler.running_jobs.read().await.is_empty());
     }
 
     struct PanickingJob;
