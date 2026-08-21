@@ -1961,6 +1961,19 @@ async fn checkout_issue(
     let service = state.issue_service.clone();
     let company_id = scoped_issue_company(&state, &actor, id).await?;
 
+    if state
+        .issue_tree_control_service
+        .get_pause_state(id)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, issue_id = %id, "failed to evaluate issue tree pause hold");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .is_some()
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+
     if let AuthorizationActor::Agent {
         agent_id, run_id, ..
     } = &actor
