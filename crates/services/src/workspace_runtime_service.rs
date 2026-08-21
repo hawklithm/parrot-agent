@@ -1,7 +1,6 @@
 /// Workspace Runtime Service
-/// 
+///
 /// Workspace生命周期管理、进程隔离和资源清理
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,16 +10,16 @@ use uuid::Uuid;
 pub enum WorkspaceRuntimeError {
     #[error("workspace not found: {0}")]
     NotFound(Uuid),
-    
+
     #[error("workspace already exists: {0}")]
     AlreadyExists(Uuid),
-    
+
     #[error("process error: {0}")]
     ProcessError(String),
-    
+
     #[error("resource error: {0}")]
     ResourceError(String),
-    
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -61,11 +60,11 @@ impl WorkspaceRuntime {
             metadata: HashMap::new(),
         }
     }
-    
+
     pub fn is_active(&self) -> bool {
         self.status == WorkspaceStatus::Active
     }
-    
+
     pub fn mark_accessed(&mut self) {
         self.last_accessed = chrono::Utc::now();
     }
@@ -128,7 +127,7 @@ impl WorkspaceRuntimeService {
             config,
         }
     }
-    
+
     /// 创建workspace
     pub fn create_workspace(
         &mut self,
@@ -141,78 +140,88 @@ impl WorkspaceRuntimeService {
                 return Err(WorkspaceRuntimeError::AlreadyExists(ws.id));
             }
         }
-        
+
         // 创建目录
         std::fs::create_dir_all(&root_path)?;
-        
+
         let mut workspace = WorkspaceRuntime::new(name, root_path);
         workspace.status = WorkspaceStatus::Active;
-        
+
         let id = workspace.id;
         self.workspaces.insert(id, workspace);
-        
+
         Ok(id)
     }
-    
+
     /// 获取workspace
     pub fn get_workspace(&self, id: Uuid) -> WorkspaceRuntimeResult<&WorkspaceRuntime> {
-        self.workspaces.get(&id)
+        self.workspaces
+            .get(&id)
             .ok_or(WorkspaceRuntimeError::NotFound(id))
     }
-    
+
     /// 获取可变workspace
     pub fn get_workspace_mut(&mut self, id: Uuid) -> WorkspaceRuntimeResult<&mut WorkspaceRuntime> {
-        self.workspaces.get_mut(&id)
+        self.workspaces
+            .get_mut(&id)
             .ok_or(WorkspaceRuntimeError::NotFound(id))
     }
-    
+
     /// 暂停workspace
     pub fn pause_workspace(&mut self, id: Uuid) -> WorkspaceRuntimeResult<()> {
+        let process_ids = self.get_workspace(id)?.process_ids.clone();
+        for pid in process_ids {
+            pause_process(pid)?;
+        }
         let workspace = self.get_workspace_mut(id)?;
         workspace.status = WorkspaceStatus::Paused;
-        
+
         // 暂停关联的进程
         // TODO: 实现进程暂停逻辑
-        
+
         Ok(())
     }
-    
+
     /// 恢复workspace
     pub fn resume_workspace(&mut self, id: Uuid) -> WorkspaceRuntimeResult<()> {
+        let process_ids = self.get_workspace(id)?.process_ids.clone();
+        for pid in process_ids {
+            resume_process(pid)?;
+        }
         let workspace = self.get_workspace_mut(id)?;
         workspace.status = WorkspaceStatus::Active;
         workspace.mark_accessed();
-        
+
         Ok(())
     }
-    
+
     /// 销毁workspace
     pub fn destroy_workspace(&mut self, id: Uuid) -> WorkspaceRuntimeResult<()> {
         // 1. 先提取配置值
         let auto_cleanup = self.config.auto_cleanup;
-        
+
         // 2. 更新状态为 Terminating
         {
             let workspace = self.get_workspace_mut(id)?;
             workspace.status = WorkspaceStatus::Terminating;
         }
-        
+
         // 3. 终止所有进程
         self.terminate_processes(id)?;
-        
+
         // 4. 清理资源
         if auto_cleanup {
             self.cleanup_resources(id)?;
         }
-        
+
         // 5. 更新为 Terminated 并移除
         if let Some(mut workspace) = self.workspaces.remove(&id) {
             workspace.status = WorkspaceStatus::Terminated;
         }
-        
+
         Ok(())
     }
-    
+
     /// 终止workspace的所有进程
     fn terminate_processes(&mut self, workspace_id: Uuid) -> WorkspaceRuntimeResult<()> {
         let process_ids = self.get_workspace(workspace_id)?.process_ids.clone();
@@ -238,7 +247,9 @@ impl WorkspaceRuntimeService {
                             ));
                         }
                     }
-                    Err(error) => return Err(WorkspaceRuntimeError::ProcessError(error.to_string())),
+                    Err(error) => {
+                        return Err(WorkspaceRuntimeError::ProcessError(error.to_string()))
+                    }
                 }
             }
             #[cfg(windows)]
@@ -257,89 +268,163 @@ impl WorkspaceRuntimeService {
                     && !diagnostics.contains("not found")
                     && !diagnostics.contains("不存在")
                 {
-                    return Err(WorkspaceRuntimeError::ProcessError(diagnostics.trim().to_string()));
+                    return Err(WorkspaceRuntimeError::ProcessError(
+                        diagnostics.trim().to_string(),
+                    ));
                 }
             }
         }
 
         Ok(())
     }
-    
+
     /// 清理workspace资源
     fn cleanup_resources(&mut self, workspace_id: Uuid) -> WorkspaceRuntimeResult<()> {
         let workspace = self.get_workspace(workspace_id)?;
-        
+
         // 删除workspace目录
         if workspace.root_path.exists() {
             std::fs::remove_dir_all(&workspace.root_path)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// 注册进程到workspace
     pub fn register_process(&mut self, workspace_id: Uuid, pid: u32) -> WorkspaceRuntimeResult<()> {
         let workspace = self.get_workspace_mut(workspace_id)?;
-        
+
         if !workspace.process_ids.contains(&pid) {
             workspace.process_ids.push(pid);
         }
-        
+
         workspace.mark_accessed();
         Ok(())
     }
-    
+
     /// 取消注册进程
-    pub fn unregister_process(&mut self, workspace_id: Uuid, pid: u32) -> WorkspaceRuntimeResult<()> {
+    pub fn unregister_process(
+        &mut self,
+        workspace_id: Uuid,
+        pid: u32,
+    ) -> WorkspaceRuntimeResult<()> {
         let workspace = self.get_workspace_mut(workspace_id)?;
         workspace.process_ids.retain(|&p| p != pid);
         Ok(())
     }
-    
+
     /// 检查并清理空闲workspace
     pub fn cleanup_idle_workspaces(&mut self) -> WorkspaceRuntimeResult<Vec<Uuid>> {
         let timeout_secs = match self.config.idle_timeout_secs {
             Some(s) => s,
             None => return Ok(Vec::new()),
         };
-        
+
         let now = chrono::Utc::now();
         let mut to_destroy = Vec::new();
-        
+
         for (id, workspace) in &self.workspaces {
             let idle_duration = now.signed_duration_since(workspace.last_accessed);
-            
+
             if idle_duration.num_seconds() > timeout_secs as i64 {
                 to_destroy.push(*id);
             }
         }
-        
+
         for id in &to_destroy {
             let _ = self.destroy_workspace(*id);
         }
-        
+
         Ok(to_destroy)
     }
-    
+
     /// 列出所有workspace
     pub fn list_workspaces(&self) -> Vec<&WorkspaceRuntime> {
         self.workspaces.values().collect()
     }
-    
+
     /// 获取workspace统计
     pub fn get_statistics(&self) -> WorkspaceStatistics {
         let total = self.workspaces.len();
         let mut by_status = HashMap::new();
-        
+
         for workspace in self.workspaces.values() {
             *by_status.entry(workspace.status.clone()).or_insert(0) += 1;
         }
-        
+
         WorkspaceStatistics {
             total_workspaces: total,
             by_status,
         }
     }
+}
+
+fn pause_process(pid: u32) -> WorkspaceRuntimeResult<()> {
+    #[cfg(unix)]
+    {
+        run_process_signal("kill", &["-STOP", &pid.to_string()], pid, "pause")
+    }
+    #[cfg(windows)]
+    {
+        run_process_signal(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("Suspend-Process -Id {} -ErrorAction Stop", pid),
+            ],
+            pid,
+            "pause",
+        )
+    }
+}
+
+fn resume_process(pid: u32) -> WorkspaceRuntimeResult<()> {
+    #[cfg(unix)]
+    {
+        run_process_signal("kill", &["-CONT", &pid.to_string()], pid, "resume")
+    }
+    #[cfg(windows)]
+    {
+        run_process_signal(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("Resume-Process -Id {} -ErrorAction Stop", pid),
+            ],
+            pid,
+            "resume",
+        )
+    }
+}
+
+fn run_process_signal(
+    program: &str,
+    args: &[&str],
+    pid: u32,
+    operation: &str,
+) -> WorkspaceRuntimeResult<()> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| WorkspaceRuntimeError::ProcessError(error.to_string()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let details = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Err(WorkspaceRuntimeError::ProcessError(format!(
+        "failed to {} process {}: {}",
+        operation,
+        pid,
+        details.trim()
+    )))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -352,68 +437,82 @@ pub struct WorkspaceStatistics {
 mod tests {
     use super::*;
     use std::path::Path;
-    
+
     #[test]
     fn test_create_workspace() {
         let mut service = WorkspaceRuntimeService::new(WorkspaceConfig::default());
         let temp_dir = std::env::temp_dir().join("test_workspace");
-        
-        let id = service.create_workspace("test".to_string(), temp_dir.clone()).unwrap();
-        
+
+        let id = service
+            .create_workspace("test".to_string(), temp_dir.clone())
+            .unwrap();
+
         assert!(temp_dir.exists());
         assert_eq!(service.workspaces.len(), 1);
-        
+
         let workspace = service.get_workspace(id).unwrap();
         assert_eq!(workspace.name, "test");
         assert_eq!(workspace.status, WorkspaceStatus::Active);
-        
+
         // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
-    
+
     #[test]
     fn test_pause_resume() {
         let mut service = WorkspaceRuntimeService::new(WorkspaceConfig::default());
         let temp_dir = std::env::temp_dir().join("test_pause");
-        
-        let id = service.create_workspace("test".to_string(), temp_dir.clone()).unwrap();
-        
+
+        let id = service
+            .create_workspace("test".to_string(), temp_dir.clone())
+            .unwrap();
+
         service.pause_workspace(id).unwrap();
-        assert_eq!(service.get_workspace(id).unwrap().status, WorkspaceStatus::Paused);
-        
+        assert_eq!(
+            service.get_workspace(id).unwrap().status,
+            WorkspaceStatus::Paused
+        );
+
         service.resume_workspace(id).unwrap();
-        assert_eq!(service.get_workspace(id).unwrap().status, WorkspaceStatus::Active);
-        
+        assert_eq!(
+            service.get_workspace(id).unwrap().status,
+            WorkspaceStatus::Active
+        );
+
         // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
-    
+
     #[test]
     fn test_destroy_workspace() {
         let mut service = WorkspaceRuntimeService::new(WorkspaceConfig::default());
         let temp_dir = std::env::temp_dir().join("test_destroy");
-        
-        let id = service.create_workspace("test".to_string(), temp_dir.clone()).unwrap();
-        
+
+        let id = service
+            .create_workspace("test".to_string(), temp_dir.clone())
+            .unwrap();
+
         service.destroy_workspace(id).unwrap();
-        
+
         assert!(!temp_dir.exists());
         assert_eq!(service.workspaces.len(), 0);
     }
-    
+
     #[test]
     fn test_process_registration() {
         let mut service = WorkspaceRuntimeService::new(WorkspaceConfig::default());
         let temp_dir = std::env::temp_dir().join("test_process");
-        
-        let id = service.create_workspace("test".to_string(), temp_dir.clone()).unwrap();
-        
+
+        let id = service
+            .create_workspace("test".to_string(), temp_dir.clone())
+            .unwrap();
+
         service.register_process(id, 1234).unwrap();
         assert_eq!(service.get_workspace(id).unwrap().process_ids.len(), 1);
-        
+
         service.unregister_process(id, 1234).unwrap();
         assert_eq!(service.get_workspace(id).unwrap().process_ids.len(), 0);
-        
+
         // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
