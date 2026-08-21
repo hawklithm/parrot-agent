@@ -14,6 +14,7 @@
 
 use crate::DefaultHeartbeatService;
 use crate::RoutineExecutionService;
+use crate::secret_provider::encrypt_secret_material;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::FutureExt;
@@ -213,6 +214,79 @@ pub struct RecoveryActionRetryJob {
 /// Remove deleted issue comments from retained decision-training snapshots.
 pub struct DecisionTrainingCommentScrubJob {
     pool: PgPool,
+}
+
+/// Re-encrypt legacy plaintext company-secret version material in bounded batches.
+pub struct SecretMaterialBackfillJob {
+    pool: PgPool,
+}
+
+impl SecretMaterialBackfillJob {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for SecretMaterialBackfillJob {
+    fn job_name(&self) -> &str {
+        "secret_material_backfill"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(300)
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| format!("failed to start secret material backfill: {error}"))?;
+        let rows = sqlx::query(
+            "SELECT id, material
+               FROM company_secret_versions
+              WHERE material ? 'value'
+                AND jsonb_typeof(material->'value') = 'string'
+              ORDER BY created_at, id
+              LIMIT 100
+              FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| format!("failed to load legacy secret material: {error}"))?;
+
+        let mut migrated = 0usize;
+        for row in rows {
+            let id: Uuid = row.get("id");
+            let material: serde_json::Value = row.get("material");
+            let Some(plaintext) = material.get("value").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let (encrypted, digest) = encrypt_secret_material(plaintext)
+                .map_err(|error| format!("failed to encrypt legacy secret material: {error}"))?;
+            let result = sqlx::query(
+                "UPDATE company_secret_versions
+                    SET material = $2,
+                        value_sha256 = COALESCE(value_sha256, $3),
+                        fingerprint_sha256 = COALESCE(fingerprint_sha256, $3)
+                  WHERE id = $1 AND material = $4",
+            )
+            .bind(id)
+            .bind(encrypted)
+            .bind(digest)
+            .bind(material)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| format!("failed to update legacy secret material: {error}"))?;
+            migrated += result.rows_affected() as usize;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| format!("failed to commit secret material backfill: {error}"))?;
+        Ok(format!("re-encrypted {migrated} legacy secret versions"))
+    }
 }
 
 impl DecisionTrainingCommentScrubJob {

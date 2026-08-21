@@ -267,6 +267,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )))
         .await;
     job_scheduler
+        .register(Arc::new(services::SecretMaterialBackfillJob::new(
+            pool.clone(),
+        )))
+        .await;
+    job_scheduler
         .register(Arc::new(services::LeaseExpiryScanner::new(pool.clone())))
         .await;
     job_scheduler
