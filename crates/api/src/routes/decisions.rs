@@ -3923,6 +3923,7 @@ async fn patch_decision_retention(
             "unknown sourceKind '{source_kind}'"
         )));
     }
+    require_decision_source_read(&state.pool, &actor, company_id, &source_kind, &source_id).await?;
     let pool = &state.pool;
     let row = sqlx::query(&format!(
         "INSERT INTO decision_retention (company_id, source_kind, source_id, source_activity_at, keep) \
