@@ -336,7 +336,47 @@ impl BuiltInAgentMetadataRegistry {
                 default_manager: Some("single_root_agent".to_string()),
                 allowed_adapter_types: Some(vec!["claude_local".to_string(), "process".to_string()]),
                 default_budget_monthly_cents: Some(30000), // $300
-                bundle: None,
+                bundle: Some(BuiltInAgentBundleDefinition {
+                    stock_version: "2026-08-21".to_string(),
+                    instructions: BundleInstructionsDefinition {
+                        entry_file: "AGENTS.md".to_string(),
+                        files: HashMap::from([(
+                            "AGENTS.md".to_string(),
+                            "You are Learning Assistant, a company-scoped onboarding and learning agent. Answer from verified project context, explain unfamiliar concepts clearly, and identify when a question needs a human owner or an explicit source.".to_string(),
+                        )]),
+                    },
+                    skill: BundleSkillDefinition {
+                        skill_key: "learning-assistant".to_string(),
+                        display_name: "Learning Assistant".to_string(),
+                        slug: "learning-assistant".to_string(),
+                        canonical_key: "parrot/bundled/learning-assistant".to_string(),
+                        files: HashMap::from([(
+                            "learning-assistant/SKILL.md".to_string(),
+                            "# Learning Assistant\n\nExplain project concepts with links to evidence, preserve company scope, and turn unresolved questions into reviewable follow-up tasks.".to_string(),
+                        )]),
+                    },
+                    routine: BundleRoutineDefinition {
+                        routine_key: "learning-follow-up-review".to_string(),
+                        title: "Review open learning follow-ups".to_string(),
+                        description: "Review unresolved onboarding questions and prepare evidence-backed follow-ups.".to_string(),
+                        status: RoutineStatus::Paused,
+                        priority: RoutinePriority::Medium,
+                        concurrency_policy: RoutineConcurrencyPolicy::CoalesceIfActive,
+                        catch_up_policy: RoutineCatchUpPolicy::SkipMissed,
+                        variables: vec![RoutineVariable {
+                            key: "lookbackDays".to_string(),
+                            label: "Lookback days".to_string(),
+                            default_value: Some(serde_json::json!(14)),
+                        }],
+                        triggers: vec![RoutineTrigger {
+                            kind: "schedule".to_string(),
+                            label: Some("Weekly learning follow-up review".to_string()),
+                            enabled: false,
+                            cron_expression: "0 10 * * 1".to_string(),
+                            timezone: "UTC".to_string(),
+                        }],
+                    },
+                }),
             },
         );
 
@@ -357,7 +397,47 @@ impl BuiltInAgentMetadataRegistry {
                 default_manager: Some("single_root_agent".to_string()),
                 allowed_adapter_types: Some(vec!["claude_local".to_string(), "process".to_string()]),
                 default_budget_monthly_cents: Some(20000), // $200
-                bundle: None,
+                bundle: Some(BuiltInAgentBundleDefinition {
+                    stock_version: "2026-08-21".to_string(),
+                    instructions: BundleInstructionsDefinition {
+                        entry_file: "AGENTS.md".to_string(),
+                        files: HashMap::from([(
+                            "AGENTS.md".to_string(),
+                            "You are Briefs Generator, a company-scoped reporting agent. Produce concise factual briefs from current project and issue evidence, call out uncertainty, and never mutate business state while preparing a brief.".to_string(),
+                        )]),
+                    },
+                    skill: BundleSkillDefinition {
+                        skill_key: "briefs-generator".to_string(),
+                        display_name: "Briefs Generator".to_string(),
+                        slug: "briefs-generator".to_string(),
+                        canonical_key: "parrot/bundled/briefs-generator".to_string(),
+                        files: HashMap::from([(
+                            "briefs-generator/SKILL.md".to_string(),
+                            "# Briefs Generator\n\nSummarize recent company work using identifiers, current status, risks, and explicit evidence boundaries.".to_string(),
+                        )]),
+                    },
+                    routine: BundleRoutineDefinition {
+                        routine_key: "generate-company-brief".to_string(),
+                        title: "Generate the company brief".to_string(),
+                        description: "Generate a concise evidence-backed brief for the current company state.".to_string(),
+                        status: RoutineStatus::Paused,
+                        priority: RoutinePriority::Medium,
+                        concurrency_policy: RoutineConcurrencyPolicy::CoalesceIfActive,
+                        catch_up_policy: RoutineCatchUpPolicy::SkipMissed,
+                        variables: vec![RoutineVariable {
+                            key: "lookbackDays".to_string(),
+                            label: "Lookback days".to_string(),
+                            default_value: Some(serde_json::json!(7)),
+                        }],
+                        triggers: vec![RoutineTrigger {
+                            kind: "schedule".to_string(),
+                            label: Some("Daily company brief".to_string()),
+                            enabled: false,
+                            cron_expression: "0 7 * * *".to_string(),
+                            timezone: "UTC".to_string(),
+                        }],
+                    },
+                }),
             },
         );
 
@@ -553,7 +633,7 @@ mod tests {
     #[test]
     fn bundled_agents_have_concrete_instruction_skill_and_routine_defaults() {
         let registry = BuiltInAgentMetadataRegistry::new();
-        for key in [BuiltInAgentKey::ReflectionCoach, BuiltInAgentKey::Summarizer] {
+        for key in BuiltInAgentKey::all() {
             let definition = registry.get_definition(key).unwrap();
             let bundle = definition.bundle.as_ref().unwrap();
             assert!(!bundle.stock_version.is_empty());
@@ -562,11 +642,6 @@ mod tests {
             assert!(!bundle.routine.routine_key.is_empty());
             assert!(!bundle.routine.triggers.is_empty());
         }
-        assert!(registry
-            .get_definition(BuiltInAgentKey::LearningAssistant)
-            .unwrap()
-            .bundle
-            .is_none());
     }
 
     #[test]
