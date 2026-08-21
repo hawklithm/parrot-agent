@@ -2007,6 +2007,33 @@ async fn checkout_issue(
     .execute(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Paperclip wakes the assignee after a successful checkout so the agent
+    // can continue with the newly-owned execution context.
+    if let Some(assignee_agent_id) = checkout_agent_id {
+        let wakeup_service =
+            services::IssueAssignmentWakeupService::new(state.heartbeat_service.clone());
+        let wakeup_input = services::issue_assignment_wakeup::QueueWakeupInput {
+            company_id,
+            issue_id: id,
+            assignee_agent_id: Some(assignee_agent_id),
+            status: "in_progress".to_string(),
+            reason: "issue_checked_out".to_string(),
+            mutation: "checkout".to_string(),
+            context_source: "issue.checkout".to_string(),
+            requested_by_actor_type: Some(actor.actor_type().to_string()),
+            requested_by_actor_id: actor.principal_id(),
+            rethrow_on_error: false,
+        };
+        if let Err(error) = wakeup_service.queue_wakeup(wakeup_input).await {
+            tracing::warn!(
+                error = %error,
+                issue_id = %id,
+                assignee_agent_id = %assignee_agent_id,
+                "Failed to wake assignee after issue checkout"
+            );
+        }
+    }
     service
         .get(id, company_id)
         .await
