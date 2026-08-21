@@ -129,6 +129,14 @@ pub struct PersistSnapshotInput {
     pub created_by_user_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct UpdateInput {
+    pub notes: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub quality_score: Option<f32>,
+    pub updated_by_user_id: Uuid,
+}
+
 /// 决策训练服务
 #[async_trait]
 pub trait DecisionTrainingService: Send + Sync {
@@ -162,6 +170,13 @@ pub trait DecisionTrainingService: Send + Sync {
         example_id: Uuid,
         notes: String,
         updated_by_user_id: Uuid,
+    ) -> Result<DecisionTrainingExample, TrainingError>;
+
+    /// Atomically update notes, tags, and quality metadata.
+    async fn update_example(
+        &self,
+        example_id: Uuid,
+        input: UpdateInput,
     ) -> Result<DecisionTrainingExample, TrainingError>;
 
     /// 添加标签到训练样本
@@ -436,6 +451,26 @@ impl PgDecisionTrainingService {
     }
 }
 
+fn normalize_update_tags(tags: Vec<String>) -> Result<Vec<String>, TrainingError> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.len() > 64 {
+            return Err(TrainingError::InvalidSnapshot(
+                "training tag is too long".to_string(),
+            ));
+        }
+        if !normalized.iter().any(|existing| existing == tag) {
+            normalized.push(tag.to_string());
+        }
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
 #[async_trait]
 impl DecisionTrainingService for PgDecisionTrainingService {
     async fn persist_snapshot(&self, input: PersistSnapshotInput) -> Result<Uuid, TrainingError> {
@@ -634,6 +669,76 @@ impl DecisionTrainingService for PgDecisionTrainingService {
         .await
         .map_err(Self::db_error)?;
         rows.into_iter().map(|row| self.row_to_example(row)).collect()
+    }
+
+    async fn update_example(
+        &self,
+        example_id: Uuid,
+        input: UpdateInput,
+    ) -> Result<DecisionTrainingExample, TrainingError> {
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let current = sqlx::query(
+            "SELECT notes, notes_history FROM decision_training_examples WHERE id = $1 FOR UPDATE",
+        )
+        .bind(example_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Self::db_error)?
+        .ok_or(TrainingError::ExampleNotFound(example_id))?;
+        let previous_notes: String = current.get("notes");
+        let notes = input.notes.unwrap_or_else(|| previous_notes.clone());
+        if notes.len() > 100_000 {
+            return Err(TrainingError::InvalidSnapshot(
+                "notes must be at most 100000 characters".to_string(),
+            ));
+        }
+        let tags = input.tags.map(normalize_update_tags).transpose()?;
+        if input
+            .quality_score
+            .is_some_and(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
+        {
+            return Err(TrainingError::InvalidSnapshot(
+                "quality score must be between 0 and 1".to_string(),
+            ));
+        }
+        if notes == previous_notes && tags.is_none() && input.quality_score.is_none() {
+            tx.commit().await.map_err(Self::db_error)?;
+            return self
+                .load_example(example_id)
+                .await?
+                .ok_or(TrainingError::ExampleNotFound(example_id));
+        }
+
+        let mut history: Value = current.get("notes_history");
+        if !history.is_array() {
+            history = Value::Array(vec![]);
+        }
+        if notes != previous_notes {
+            history.as_array_mut().expect("history normalized").push(serde_json::json!({
+                "author": input.updated_by_user_id,
+                "at": Utc::now(),
+                "body": previous_notes,
+            }));
+        }
+        sqlx::query(
+            "UPDATE decision_training_examples
+                SET notes = $1, notes_history = $2,
+                    tags = COALESCE($3, tags), quality_score = COALESCE($4, quality_score),
+                    updated_at = NOW()
+              WHERE id = $5",
+        )
+        .bind(notes)
+        .bind(history)
+        .bind(tags.map(|value| serde_json::to_value(value)).transpose().map_err(|error| TrainingError::SerializationError(error.to_string()))?)
+        .bind(input.quality_score)
+        .bind(example_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Self::db_error)?;
+        tx.commit().await.map_err(Self::db_error)?;
+        self.load_example(example_id)
+            .await?
+            .ok_or(TrainingError::ExampleNotFound(example_id))
     }
 
     async fn update_notes(&self, example_id: Uuid, notes: String, updated_by_user_id: Uuid) -> Result<DecisionTrainingExample, TrainingError> {
@@ -931,6 +1036,49 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
         let offset = input.offset.unwrap_or(0).max(0) as usize;
         let limit = input.limit.unwrap_or(100).clamp(1, 1000) as usize;
         Ok(examples.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn update_example(
+        &self,
+        example_id: Uuid,
+        input: UpdateInput,
+    ) -> Result<DecisionTrainingExample, TrainingError> {
+        if input.notes.as_ref().is_some_and(|notes| notes.len() > 100_000) {
+            return Err(TrainingError::InvalidSnapshot(
+                "notes must be at most 100000 characters".to_string(),
+            ));
+        }
+        let tags = input.tags.map(normalize_update_tags).transpose()?;
+        if input
+            .quality_score
+            .is_some_and(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
+        {
+            return Err(TrainingError::InvalidSnapshot(
+                "quality score must be between 0 and 1".to_string(),
+            ));
+        }
+        let mut examples = self.examples.lock().await;
+        let example = examples
+            .get_mut(&example_id)
+            .ok_or(TrainingError::ExampleNotFound(example_id))?;
+        let previous_notes = example.notes.clone().unwrap_or_default();
+        let notes = input.notes.unwrap_or_else(|| previous_notes.clone());
+        if notes != previous_notes {
+            example.notes_history.push(DecisionTrainingNotesHistoryEntry {
+                notes: previous_notes,
+                updated_by_user_id: Some(input.updated_by_user_id),
+                updated_at: Utc::now(),
+            });
+        }
+        example.notes = Some(notes);
+        if let Some(tags) = tags {
+            example.tags = tags;
+        }
+        if let Some(score) = input.quality_score {
+            example.quality_score = Some(score);
+        }
+        example.updated_at = Utc::now();
+        Ok(example.clone())
     }
 
     async fn update_notes(

@@ -30,7 +30,7 @@ use crate::app_state::AppState;
 use crate::errors::AppError;
 use services::auth::{decide_access, AuthorizationAction, AuthorizationActor};
 use services::decision_training_service::{
-    DecisionTrainingSourceKind, ListInput, PersistSnapshotInput, TrainingError,
+    DecisionTrainingSourceKind, ListInput, PersistSnapshotInput, TrainingError, UpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -4881,27 +4881,6 @@ fn training_not_found() -> AppError {
     AppError::NotFound("Decision training example not found".to_string())
 }
 
-/// Loads an example and enforces that the caller can see its company.
-async fn load_training_example(
-    pool: &PgPool,
-    actor: &AuthorizationActor,
-    example_id: Uuid,
-) -> Result<PgRow, AppError> {
-    let row = sqlx::query(&format!("{TRAINING_SELECT} WHERE id = $1"))
-        .bind(example_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(db_err)?
-        .ok_or_else(training_not_found)?;
-
-    let company_id: Uuid = row.get("company_id");
-    // Paperclip masks cross-company reads as 404 rather than 403.
-    if crate::routes::assert_company_access(actor, company_id, true).is_err() {
-        return Err(training_not_found());
-    }
-    Ok(row)
-}
-
 fn require_example_owner(user_id: &str, created_by_user_id: &str) -> Result<(), AppError> {
     if user_id != created_by_user_id {
         return Err(forbid(
@@ -4965,76 +4944,44 @@ async fn update_decision_training(
     Json(input): Json<UpdateDecisionTrainingInput>,
 ) -> Result<Json<Value>, AppError> {
     let pool = &state.pool;
-    let existing = load_training_example(pool, &actor, example_id).await?;
+    let existing = state
+        .decision_training_service
+        .get_example(example_id)
+        .await
+        .map_err(training_service_err)?
+        .ok_or_else(training_not_found)?;
+    if crate::routes::assert_company_access(&actor, existing.company_id, true).is_err() {
+        return Err(training_not_found());
+    }
     let user_id = require_human(&actor)?;
-    let created_by: String = existing.get("created_by_user_id");
-    require_example_owner(&user_id, &created_by)?;
-    let tags = match input.tags {
-        Some(tags) => Some(normalize_training_tags(tags)?),
-        None => None,
-    };
-    validate_training_quality(input.quality_score)?;
-
-    let previous_notes: String = existing.get("notes");
-    let notes = input.notes.unwrap_or_else(|| previous_notes.clone());
-    if notes == previous_notes && tags.is_none() && input.quality_score.is_none() {
-        return Ok(Json(training_example_to_json(&existing)));
-    }
-
-    if notes.len() > 100_000 {
-        return Err(AppError::Validation(
-            "notes must be at most 100000 characters".to_string(),
-        ));
-    }
-
-    let mut history = existing
-        .try_get::<Value, _>("notes_history")
-        .unwrap_or_else(|_| json!([]));
-    if !history.is_array() {
-        history = json!([]);
-    }
-    if notes != previous_notes {
-        if let Some(entries) = history.as_array_mut() {
-            entries.push(json!({
-                "author": user_id,
-                "at": iso(Utc::now()),
-                "body": previous_notes,
-            }));
-        }
-    }
-
-    let updated = sqlx::query(&format!(
-        "UPDATE decision_training_examples \
-            SET notes = $1, notes_history = $2, \
-                tags = COALESCE($3, tags), quality_score = COALESCE($4, quality_score), updated_at = NOW() \
-          WHERE id = $5 \
-      RETURNING {}",
-        TRAINING_SELECT
-            .trim_start_matches("SELECT ")
-            .replace(" FROM decision_training_examples", "")
-    ))
-    .bind(&notes)
-    .bind(&history)
-    .bind(tags.as_ref().map(|value| serde_json::to_value(value)).transpose().map_err(|error| AppError::InternalServerError(error.to_string()))?)
-    .bind(input.quality_score)
-    .bind(example_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(db_err)?
-    .ok_or_else(training_not_found)?;
+    require_example_owner(&user_id, &existing.created_by_user_id)?;
+    let updated = state
+        .decision_training_service
+        .update_example(
+            example_id,
+            UpdateInput {
+                notes: input.notes,
+                tags: input.tags.map(normalize_training_tags).transpose()?,
+                quality_score: input.quality_score,
+                updated_by_user_id: Uuid::parse_str(&user_id)
+                    .map_err(|_| AppError::InternalServerError("Invalid user id".to_string()))?,
+            },
+        )
+        .await
+        .map_err(training_service_err)?;
 
     log_activity(
         pool,
-        updated.get::<Uuid, _>("company_id"),
+        updated.company_id,
         &actor,
         "decision_training.notes_updated",
         "decision_training_example",
-        updated.get::<Uuid, _>("id"),
-        json!({ "issueId": updated.get::<Uuid, _>("issue_id") }),
+        updated.id,
+        json!({ "issueId": updated.snapshot.issue_id }),
     )
     .await;
 
-    Ok(Json(training_example_to_json(&updated)))
+    Ok(Json(training_service_example_to_json(&updated)))
 }
 
 /// DELETE /decision-training/:example_id
