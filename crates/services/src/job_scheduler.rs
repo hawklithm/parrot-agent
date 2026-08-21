@@ -102,6 +102,7 @@ pub struct JobExecutionRecord {
 pub enum JobStatus {
     Idle,
     Running,
+    Succeeded,
     Failed,
     Disabled,
 }
@@ -314,7 +315,7 @@ impl JobScheduler {
                         let completed_at = Utc::now();
 
                         let (status, error_message) = match result {
-                            Ok(_) => (JobStatus::Running, None),
+                            Ok(_) => (JobStatus::Succeeded, None),
                             Err(e) => (JobStatus::Failed, Some(e)),
                         };
 
@@ -354,7 +355,8 @@ impl Default for JobScheduler {
 
 #[cfg(test)]
 mod scheduler_tests {
-    use super::{schedule_is_due, JobSchedule, JobScheduler};
+    use super::{schedule_is_due, JobSchedule, JobScheduler, JobStatus, ScheduledJob};
+    use async_trait::async_trait;
     use sqlx::postgres::PgPoolOptions;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
@@ -410,6 +412,35 @@ mod scheduler_tests {
             .await
             .expect("cleanup scheduler lease test row");
         pool.close().await;
+    }
+
+    struct SuccessfulJob;
+
+    #[async_trait]
+    impl ScheduledJob for SuccessfulJob {
+        fn job_name(&self) -> &str {
+            "successful_scheduler_test"
+        }
+
+        fn schedule(&self) -> JobSchedule {
+            JobSchedule::IntervalSeconds(0)
+        }
+
+        async fn execute(&self) -> Result<String, String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_execution_is_recorded_as_succeeded() {
+        let scheduler = std::sync::Arc::new(JobScheduler::new());
+        scheduler.register(std::sync::Arc::new(SuccessfulJob)).await;
+        let handle = scheduler.clone().start(5).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        handle.abort();
+
+        let executions = scheduler.get_recent_executions(10).await;
+        assert!(executions.iter().any(|record| record.status == JobStatus::Succeeded));
     }
 }
 
