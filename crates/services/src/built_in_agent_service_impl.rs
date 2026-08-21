@@ -260,7 +260,7 @@ where
     /// Agent 模型没有独立的工作区文件表，因此使用同等语义的
     /// `instructions_bundle` 持久化文件树，并通过 `instructions_path`
     /// 暴露入口文件。
-    async fn materialize_instructions(
+    async fn materialize_bundle(
         &self,
         agent: &mut models::Agent,
         definition: &BuiltInAgentDefinition,
@@ -277,10 +277,25 @@ where
             (entry_file, files)
         };
 
-        let bundle = serde_json::json!({
-            "stockVersion": definition.bundle.as_ref().map(|b| b.stock_version.clone()),
+        let (skill, routine) = definition
+            .bundle
+            .as_ref()
+            .map(|bundle| {
+                (
+                    serde_json::to_value(&bundle.skill).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(&bundle.routine).unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .unwrap_or((serde_json::Value::Null, serde_json::Value::Null));
+        let instructions = serde_json::json!({
             "entryFile": entry_file,
             "files": files,
+        });
+        let bundle = serde_json::json!({
+            "stockVersion": definition.bundle.as_ref().map(|b| b.stock_version.clone()),
+            "instructions": instructions,
+            "skill": skill,
+            "routine": routine,
         });
         let changed = agent.metadata.0.instructions_path.as_deref() != Some(entry_file.as_str())
             || agent.metadata.0.instructions_bundle.as_ref() != Some(&bundle);
@@ -333,7 +348,7 @@ where
                     .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
 
                 let mut saved = saved;
-                self.materialize_instructions(&mut saved, definition).await?;
+                self.materialize_bundle(&mut saved, definition).await?;
                 return self
                     .agent_repo
                     .update(saved)
@@ -341,7 +356,7 @@ where
                     .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()));
             }
             let mut existing = existing;
-            self.materialize_instructions(&mut existing, definition).await?;
+            self.materialize_bundle(&mut existing, definition).await?;
             return self
                 .agent_repo
                 .update(existing)
@@ -355,7 +370,7 @@ where
             .await?;
 
         // 物化指令文件
-        self.materialize_instructions(&mut agent, definition).await?;
+        self.materialize_bundle(&mut agent, definition).await?;
         self.agent_repo
             .update(agent)
             .await
@@ -404,8 +419,6 @@ where
             .await
             .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
 
-        // TODO: 清理指令文件、技能、例程资源
-
         Ok(())
     }
 
@@ -430,16 +443,38 @@ where
             .registry
             .get_definition(key)
             .ok_or(BuiltInAgentError::NotFound(key))?;
-        self.materialize_instructions(&mut agent, definition).await?;
+        self.materialize_bundle(&mut agent, definition).await?;
+        let after_bundle = agent.metadata.0.instructions_bundle.as_ref();
+        let before_instructions = before_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.get("instructions"))
+            .or_else(|| before_bundle.as_ref());
+        let after_instructions = after_bundle.and_then(|bundle| bundle.get("instructions"));
         result.instructions_materialized = before_path != agent.metadata.0.instructions_path
-            || before_bundle != agent.metadata.0.instructions_bundle;
-        if result.instructions_materialized {
+            || before_instructions != after_instructions;
+        result.skills_synced = before_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.get("skill"))
+            != after_bundle.and_then(|bundle| bundle.get("skill"));
+        result.routines_synced = before_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.get("routine"))
+            != after_bundle.and_then(|bundle| bundle.get("routine"));
+        if result.instructions_materialized || result.skills_synced || result.routines_synced {
             self.agent_repo
                 .update(agent)
                 .await
                 .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
             result.agent_updated = true;
-            result.changes.push("Synchronized managed instruction bundle".to_string());
+            if result.instructions_materialized {
+                result.changes.push("Synchronized managed instruction bundle".to_string());
+            }
+            if result.skills_synced {
+                result.changes.push("Synchronized managed skill bundle metadata".to_string());
+            }
+            if result.routines_synced {
+                result.changes.push("Synchronized managed routine bundle metadata".to_string());
+            }
         }
         Ok(result)
     }
