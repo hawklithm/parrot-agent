@@ -4737,6 +4737,46 @@ mod tests {
         assert!(!is_valid_source_kind("nope"));
     }
 
+    #[test]
+    fn retention_mutation_company_access_matches_role_matrix() {
+        use services::auth::{CompanyMembership, MembershipRole, PrincipalType};
+
+        let company_id = Uuid::new_v4();
+        let other_company_id = Uuid::new_v4();
+        let viewer_id = Uuid::new_v4();
+        let operator_id = Uuid::new_v4();
+        let viewer = AuthorizationActor::board_with_memberships(
+            viewer_id,
+            company_id,
+            vec![CompanyMembership::new(
+                company_id,
+                PrincipalType::User,
+                viewer_id,
+                MembershipRole::Viewer,
+            )],
+            false,
+        );
+        let operator = AuthorizationActor::board_with_memberships(
+            operator_id,
+            company_id,
+            vec![CompanyMembership::new(
+                company_id,
+                PrincipalType::User,
+                operator_id,
+                MembershipRole::Operator,
+            )],
+            false,
+        );
+        let agent = AuthorizationActor::agent(Uuid::new_v4(), company_id, None);
+        let foreign_agent = AuthorizationActor::agent(Uuid::new_v4(), other_company_id, None);
+
+        assert!(require_company_access(&operator, company_id, false).is_ok());
+        assert!(require_company_access(&viewer, company_id, false).is_err());
+        assert!(require_company_access(&agent, company_id, false).is_ok());
+        assert!(require_company_access(&foreign_agent, company_id, false).is_err());
+        assert!(require_company_access(&AuthorizationActor::none(), company_id, false).is_err());
+    }
+
     #[tokio::test]
     async fn retention_source_guard_enforces_existence_visibility_and_company_scope() {
         let Ok(database_url) = std::env::var("DATABASE_URL") else {
