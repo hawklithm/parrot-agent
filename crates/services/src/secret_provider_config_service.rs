@@ -140,6 +140,52 @@ impl DefaultSecretProviderConfigServiceImpl {
             SecretProvider::Vault => models::SecretProviderType::Vault,
         }
     }
+
+    fn health_response(
+        config: &models::SecretProviderConfig,
+    ) -> SecretProviderConfigHealthResponse {
+        let provider = match config.provider_type.as_str() {
+            "aws_secrets_manager" | "AwsSecretsManager" => SecretProvider::AwsSecretsManager,
+            "gcp_secret_manager" | "GcpSecretManager" => SecretProvider::GcpSecretManager,
+            "vault" | "Vault" => SecretProvider::Vault,
+            _ => SecretProvider::LocalEncrypted,
+        };
+        let (status, code, message, guidance) = if !config.enabled {
+            (
+                SecretProviderConfigHealthStatus::Disabled,
+                "disabled",
+                "Provider configuration is disabled",
+                Some(vec!["Enable the provider configuration before using it".to_string()]),
+            )
+        } else if matches!(&provider, SecretProvider::LocalEncrypted) {
+            (
+                SecretProviderConfigHealthStatus::Ready,
+                "healthy",
+                "Local encrypted provider is available",
+                None,
+            )
+        } else {
+            (
+                SecretProviderConfigHealthStatus::ComingSoon,
+                "driver_unavailable",
+                "This provider is configured but its runtime driver is not installed",
+                Some(vec!["Install and configure the provider driver before importing secrets".to_string()]),
+            )
+        };
+        SecretProviderConfigHealthResponse {
+            config_id: config.id,
+            provider,
+            status,
+            message: message.to_string(),
+            details: SecretProviderConfigHealthDetails {
+                code: code.to_string(),
+                message: message.to_string(),
+                missing_fields: None,
+                guidance,
+            },
+            checked_at: chrono::Utc::now(),
+        }
+    }
 }
 
 #[async_trait]
@@ -157,14 +203,21 @@ impl SecretProviderConfigService for DefaultSecretProviderConfigServiceImpl {
         _company_id: Uuid,
         request: SecretProviderConfigDiscoveryPreviewRequest,
     ) -> ServiceResult<SecretProviderConfigDiscoveryPreviewResult> {
-        // Simplified preview result. Real implementation would scan the external provider.
+        if !matches!(request.provider, SecretProvider::LocalEncrypted) {
+            return Err(ServiceError::NotImplemented(format!(
+                "secret provider discovery driver for {:?} is not configured",
+                request.provider
+            )));
+        }
         Ok(SecretProviderConfigDiscoveryPreviewResult {
-            provider: request.provider.clone(),
+            provider: request.provider,
             next_token: None,
             sampled_secret_count: 0,
             skipped_foreign_paperclip_sample_count: 0,
             candidates: vec![],
-            warnings: vec![],
+            warnings: vec![
+                "local_encrypted stores Parrot-managed values and does not expose remote discovery".to_string(),
+            ],
         })
     }
 
@@ -248,28 +301,7 @@ impl SecretProviderConfigService for DefaultSecretProviderConfigServiceImpl {
             .map_err(Self::map_err)?
             .ok_or_else(|| ServiceError::NotFound(format!("Secret provider config {} not found", config_id)))?;
 
-        let provider = match db_config.provider_type.as_str() {
-            "local_encrypted" | "LocalEncrypted" => SecretProvider::LocalEncrypted,
-            "aws_secrets_manager" | "AwsSecretsManager" => SecretProvider::AwsSecretsManager,
-            "gcp_secret_manager" | "GcpSecretManager" => SecretProvider::GcpSecretManager,
-            "vault" | "Vault" => SecretProvider::Vault,
-            _ => SecretProvider::LocalEncrypted,
-        };
-
-        use chrono::Utc;
-        Ok(SecretProviderConfigHealthResponse {
-            config_id,
-            provider,
-            status: SecretProviderConfigHealthStatus::Ready,
-            message: "Health check passed".to_string(),
-            details: SecretProviderConfigHealthDetails {
-                code: "healthy".to_string(),
-                message: "Provider is operational".to_string(),
-                missing_fields: None,
-                guidance: None,
-            },
-            checked_at: Utc::now(),
-        })
+        Ok(Self::health_response(&db_config))
     }
 
     async fn company_health(
@@ -281,31 +313,51 @@ impl SecretProviderConfigService for DefaultSecretProviderConfigServiceImpl {
             .await
             .map_err(Self::map_err)?;
 
-        use chrono::Utc;
-        Ok(configs.into_iter().map(|cfg| {
-            let provider = match cfg.provider_type.as_str() {
-                "local_encrypted" | "LocalEncrypted" => SecretProvider::LocalEncrypted,
-                "aws_secrets_manager" | "AwsSecretsManager" => SecretProvider::AwsSecretsManager,
-                "gcp_secret_manager" | "GcpSecretManager" => SecretProvider::GcpSecretManager,
-                "vault" | "Vault" => SecretProvider::Vault,
-                _ => SecretProvider::LocalEncrypted,
-            };
-            SecretProviderConfigHealthResponse {
-                config_id: cfg.id,
-                provider,
-                status: SecretProviderConfigHealthStatus::Ready,
-                message: "Operational".to_string(),
-                details: SecretProviderConfigHealthDetails {
-                    code: "healthy".to_string(),
-                    message: "Provider is operational".to_string(),
-                    missing_fields: None,
-                    guidance: None,
-                },
-                checked_at: Utc::now(),
-            }
-        }).collect())
+        Ok(configs
+            .iter()
+            .map(Self::health_response)
+            .collect())
     }
 }
 
 /// Mock implementation for testing
 pub struct MockSecretProviderConfigService;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(provider_type: &str, enabled: bool) -> models::SecretProviderConfig {
+        let now = chrono::Utc::now();
+        models::SecretProviderConfig {
+            id: Uuid::new_v4(),
+            company_id: Uuid::new_v4(),
+            provider_type: provider_type.to_string(),
+            config: sqlx::types::Json(serde_json::json!({})),
+            is_default: false,
+            enabled,
+            created_at: now,
+            updated_at: now,
+            created_by_user_id: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn health_does_not_report_unimplemented_providers_as_ready() {
+        let local = DefaultSecretProviderConfigServiceImpl::health_response(
+            &config("local_encrypted", true),
+        );
+        assert_eq!(local.status, SecretProviderConfigHealthStatus::Ready);
+
+        let cloud = DefaultSecretProviderConfigServiceImpl::health_response(
+            &config("aws_secrets_manager", true),
+        );
+        assert_eq!(cloud.status, SecretProviderConfigHealthStatus::ComingSoon);
+        assert_eq!(cloud.details.code, "driver_unavailable");
+
+        let disabled = DefaultSecretProviderConfigServiceImpl::health_response(
+            &config("local_encrypted", false),
+        );
+        assert_eq!(disabled.status, SecretProviderConfigHealthStatus::Disabled);
+    }
+}
