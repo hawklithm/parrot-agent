@@ -43,10 +43,15 @@ pub fn encrypt_secret_material(
 
 /// Decrypt a persisted local-encrypted material envelope.
 pub fn decrypt_secret_material(material: &JsonValue) -> Result<String, ProviderError> {
-    let ciphertext = material
-        .get("ciphertext")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| ProviderError::Decryption("missing ciphertext in material".into()))?;
+    let Some(ciphertext) = material.get("ciphertext").and_then(|value| value.as_str()) else {
+        // Read-only compatibility for rows written before encrypted material
+        // became mandatory. All current writers use the ciphertext branch.
+        return material
+            .get("value")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| ProviderError::Decryption("missing ciphertext in material".into()));
+    };
     let provider = LocalEncryptedProvider::new(load_secret_encryption_key())?;
     provider.decrypt(ciphertext)
 }
@@ -240,5 +245,11 @@ mod tests {
         assert_eq!(digest, sha256_hex("persisted-value"));
         assert!(material.get("ciphertext").and_then(|v| v.as_str()).is_some());
         assert_eq!(decrypt_secret_material(&material).unwrap(), "persisted-value");
+    }
+
+    #[test]
+    fn test_legacy_material_is_read_only_compatible() {
+        let material = serde_json::json!({ "value": "legacy-value" });
+        assert_eq!(decrypt_secret_material(&material).unwrap(), "legacy-value");
     }
 }
