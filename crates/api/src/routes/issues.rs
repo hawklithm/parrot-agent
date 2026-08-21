@@ -1,5 +1,6 @@
 use crate::app_state::AppState;
 use crate::extractors::IssueId;
+use crate::routes::log_activity;
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
@@ -2008,6 +2009,17 @@ async fn checkout_issue(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.checked_out",
+        &actor,
+        "issue",
+        id,
+        json!({ "agentId": checkout_agent_id, "runId": checkout_run_id }),
+    )
+    .await;
+
     // Paperclip wakes the assignee after a successful checkout so the agent
     // can continue with the newly-owned execution context.
     if let Some(assignee_agent_id) = checkout_agent_id {
@@ -2056,6 +2068,7 @@ async fn release_issue(
             return Err(StatusCode::FORBIDDEN);
         }
     }
+    let release_run_id = input.release_run_id;
     service
         .release(id, company_id, input)
         .await
@@ -2071,6 +2084,16 @@ async fn release_issue(
     .execute(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.released",
+        &actor,
+        "issue",
+        id,
+        json!({ "releaseRunId": release_run_id }),
+    )
+    .await;
     service
         .get(id, company_id)
         .await
