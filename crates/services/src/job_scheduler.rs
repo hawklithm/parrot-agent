@@ -307,6 +307,28 @@ impl JobScheduler {
         .await;
     }
 
+    async fn renew_lease(&self, job_name: &str, lease_seconds: i64) -> bool {
+        let Some(pool) = self.pool.as_ref() else {
+            return true;
+        };
+        sqlx::query(
+            "UPDATE scheduler_job_leases
+                SET leased_until = NOW() + ($3 * INTERVAL '1 second'),
+                    heartbeat_at = NOW(),
+                    updated_at = NOW()
+              WHERE job_name = $1
+                AND owner_id = $2
+                AND leased_until > NOW()",
+        )
+        .bind(job_name)
+        .bind(self.owner_id)
+        .bind(lease_seconds.max(1))
+        .execute(pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .unwrap_or(false)
+    }
+
     pub async fn register(&self, job: Arc<dyn ScheduledJob>) {
         let name = job.job_name().to_string();
         self.jobs.write().await.insert(name, job);
@@ -459,10 +481,25 @@ impl JobScheduler {
                     let scheduler = Arc::clone(&self);
                     let name = name.clone();
                     let running_jobs = Arc::clone(&self.running_jobs);
+                    let lease_scheduler = Arc::clone(&self);
 
                     tokio::spawn(async move {
                         let started_at = Utc::now();
+                        let renewal_interval = Duration::from_secs((lease_seconds / 3).max(1) as u64);
+                        let renewal_name = name.clone();
+                        let renewal_task = tokio::spawn(async move {
+                            loop {
+                                time::sleep(renewal_interval).await;
+                                if !lease_scheduler
+                                    .renew_lease(&renewal_name, lease_seconds)
+                                    .await
+                                {
+                                    break;
+                                }
+                            }
+                        });
                         let result = job.execute().await;
+                        renewal_task.abort();
                         let completed_at = Utc::now();
 
                         let (status, error_message) = match result {
@@ -591,6 +628,39 @@ mod scheduler_tests {
             .execute(&pool)
             .await
             .expect("cleanup scheduler lease test row");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_lease_renewal_extends_long_running_job_ownership() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("database required for scheduler lease renewal test");
+        let name = format!("scheduler_renewal_test_{}", Uuid::new_v4());
+        let scheduler = JobScheduler::new().with_pool(pool.clone());
+
+        assert!(scheduler.try_acquire_lease(&name, 1).await);
+        assert!(scheduler.renew_lease(&name, 60).await);
+        let leased_until: chrono::DateTime<Utc> = sqlx::query_scalar(
+            "SELECT leased_until FROM scheduler_job_leases WHERE job_name = $1",
+        )
+        .bind(&name)
+        .fetch_one(&pool)
+        .await
+        .expect("read renewed scheduler lease");
+        assert!(leased_until > Utc::now() + ChronoDuration::seconds(30));
+
+        scheduler.release_lease(&name).await;
+        sqlx::query("DELETE FROM scheduler_job_leases WHERE job_name = $1")
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("cleanup scheduler lease renewal test row");
         pool.close().await;
     }
 
