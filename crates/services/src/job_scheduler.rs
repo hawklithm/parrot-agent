@@ -15,7 +15,7 @@ use crate::RoutineExecutionService;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::{PgPool, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -186,6 +186,7 @@ impl ScheduledJob for HeartbeatRecoveryJob {
 pub struct JobScheduler {
     jobs: Arc<RwLock<HashMap<String, Arc<dyn ScheduledJob>>>>,
     executions: Arc<RwLock<Vec<JobExecutionRecord>>>,
+    running_jobs: Arc<RwLock<HashSet<String>>>,
 }
 
 impl JobScheduler {
@@ -193,6 +194,7 @@ impl JobScheduler {
         Self {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             executions: Arc::new(RwLock::new(Vec::new())),
+            running_jobs: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -238,10 +240,14 @@ impl JobScheduler {
                     if !schedule_is_due(&job.schedule(), last_started.get(name).copied(), now) {
                         continue;
                     }
+                    if !self.running_jobs.write().await.insert(name.clone()) {
+                        continue;
+                    }
                     last_started.insert(name.clone(), now);
                     let job = Arc::clone(job);
                     let scheduler = Arc::clone(&self);
                     let name = name.clone();
+                    let running_jobs = Arc::clone(&self.running_jobs);
 
                     tokio::spawn(async move {
                         let started_at = Utc::now();
@@ -256,13 +262,14 @@ impl JobScheduler {
                         scheduler
                             .record_execution(JobExecutionRecord {
                                 id: Uuid::new_v4().to_string(),
-                                job_name: name,
+                                job_name: name.clone(),
                                 started_at,
                                 completed_at: Some(completed_at),
                                 status,
                                 error_message,
                             })
                             .await;
+                        running_jobs.write().await.remove(&name);
                     });
                 }
             }
