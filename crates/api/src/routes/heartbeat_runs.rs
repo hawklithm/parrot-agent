@@ -741,9 +741,18 @@ async fn get_workspace_operation_log(
 /// `execution_run_id`.
 async fn list_issue_runs(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let pool = &state.pool;
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?
+        .ok_or(HeartbeatRunError::NotFound(id))?;
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| HeartbeatRunError::NotFound(id))?;
     // Keep one projection for both discovery paths.  The previous UNION used
     // `hr.*` for the second branch, which made the enum `status` disagree with
     // the `status::text` projection in RUN_SELECT and caused PostgreSQL to
