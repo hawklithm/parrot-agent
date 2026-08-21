@@ -2367,7 +2367,7 @@ impl DefaultHeartbeatService {
     /// lost between the blocker transition and the normal fan-out path.
     pub async fn reconcile_dependency_wakeups(&self) -> Result<usize, HeartbeatError> {
         let rows = sqlx::query(
-            "SELECT DISTINCT dependent.id, dependent.assignee_agent_id,
+            "SELECT DISTINCT ON (dependent.id) dependent.id, dependent.assignee_agent_id,
                     dependent.company_id, relation.issue_id AS blocker_issue_id
              FROM issue_relations relation
              JOIN issues dependent ON dependent.id = relation.related_issue_id
@@ -2403,7 +2403,7 @@ impl DefaultHeartbeatService {
                          'issue_graph_liveness_backstop:' || dependent.id::text || ':' || relation.issue_id::text
                      AND wake.status IN ('queued', 'dispatched', 'running', 'completed')
                )
-             ORDER BY dependent.id
+             ORDER BY dependent.id, relation.issue_id
              LIMIT 500",
         )
         .fetch_all(&self.pool)
