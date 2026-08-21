@@ -468,7 +468,7 @@ async fn company_recovery_observability(
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let active_recoveries: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM issue_recovery_actions WHERE company_id = $1 AND status NOT IN ('resolved','failed')",
+        "SELECT COUNT(*) FROM recovery_actions WHERE company_id = $1 AND status NOT IN ('resolved','failed')",
     )
     .bind(company_id)
     .fetch_one(&state.pool)

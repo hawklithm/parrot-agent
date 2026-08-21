@@ -489,13 +489,12 @@ impl RecoveryActionRepository for PgRecoveryActionRepository {
                 SELECT i.id, i.parent_id FROM issues i
                 INNER JOIN issue_tree t ON i.id = t.parent_id
             )
-            UPDATE recovery_actions ra
-            SET status = 'resolved', resolved_at = NOW(), updated_at = NOW()
-            FROM issue_tree it
-            WHERE ra.issue_id = it.id
-              AND ra.company_id = $1
+            SELECT ra.*
+            FROM recovery_actions ra
+            INNER JOIN issue_tree it ON ra.issue_id = it.id
+            WHERE ra.company_id = $1
               AND ra.status IN ('pending', 'in_progress')
-            RETURNING ra.*
+            ORDER BY ra.triggered_at ASC
             "#,
         )
         .bind(company_id)

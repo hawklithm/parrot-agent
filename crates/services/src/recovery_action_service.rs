@@ -116,12 +116,16 @@ impl RecoveryActionService for DefaultRecoveryActionService {
         input: &CreateRecoveryActionInput,
     ) -> Result<RecoveryAction, String> {
         // Verify issue exists
-        let _issue = self
+        let issue = self
             .issue_repo
             .get_by_id(issue_id)
             .await
             .map_err(|e| format!("Failed to verify issue: {}", e))?
             .ok_or_else(|| format!("Issue {} not found", issue_id))?;
+
+        if issue.company_id != company_id {
+            return Err(format!("Issue {} does not belong to company {}", issue_id, company_id));
+        }
 
         self.recovery_repo
             .create(company_id, issue_id, input)
