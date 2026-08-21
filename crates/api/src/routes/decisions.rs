@@ -4248,10 +4248,47 @@ async fn load_source_decision(
                 exact_run_id: None,
             })
         }
-        // Parrot has no `issue_execution_decisions` table (see report deviations).
-        _ => Err(AppError::BadRequest(
-            "sourceKind 'execution_decision' is not available in this deployment".to_string(),
-        )),
+        "execution_decision" => {
+            let row = sqlx::query(
+                "SELECT id, origin_agent_id, origin_issue_id, title, body, options, inputs,
+                        status::text AS status, execution_status, chosen_option_id, input_values,
+                        decided_by_user_id, decided_at, origin_run_id
+                   FROM decisions
+                  WHERE id = $1 AND company_id = $2 AND origin_issue_id = $3",
+            )
+            .bind(source_id)
+            .bind(company_id)
+            .bind(issue_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| AppError::NotFound("Execution decision not found".to_string()))?;
+
+            let status: String = row.get("status");
+            let decided_at: Option<DateTime<Utc>> = row.try_get("decided_at").unwrap_or(None);
+            let resolved = matches!(status.as_str(), "decided" | "cancelled" | "expired")
+                && decided_at.is_some();
+            Ok(SourceDecision {
+                cutoff_at: if resolved { decided_at.unwrap() } else { captured_at },
+                outcome: resolved.then_some(status),
+                payload: json!({
+                    "title": row.get::<String, _>("title"),
+                    "body": row.get::<String, _>("body"),
+                    "options": row.get::<Value, _>("options"),
+                    "inputs": row.try_get::<Option<Value>, _>("inputs").unwrap_or(None),
+                    "executionStatus": row.try_get::<Option<String>, _>("execution_status").unwrap_or(None),
+                    "chosenOptionId": if resolved { row.try_get::<Option<String>, _>("chosen_option_id").unwrap_or(None) } else { None },
+                    "inputValues": if resolved { row.try_get::<Option<Value>, _>("input_values").unwrap_or(None) } else { None },
+                }),
+                actor: if resolved {
+                    json!({ "userId": row.try_get::<Option<String>, _>("decided_by_user_id").unwrap_or(None) })
+                } else {
+                    json!({ "agentId": row.try_get::<Option<Uuid>, _>("origin_agent_id").unwrap_or(None) })
+                },
+                exact_run_id: row.try_get("origin_run_id").unwrap_or(None),
+            })
+        }
+        _ => Err(AppError::BadRequest("Unsupported decision training source".to_string())),
     }
 }
 
