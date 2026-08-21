@@ -183,6 +183,15 @@ pub trait HeartbeatService: Send + Sync {
         reason: &str,
     ) -> Result<(), HeartbeatError>;
 
+    /// Cancel only a pending scheduled retry for an issue.
+    async fn cancel_scheduled_retry(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        reason: &str,
+    ) -> Result<bool, HeartbeatError>;
+
     /// Get heartbeat context for an issue (diagnostics/monitoring)
     async fn get_heartbeat_context(
         &self,
@@ -1939,6 +1948,37 @@ impl HeartbeatService for DefaultHeartbeatService {
         Ok(())
     }
 
+    async fn cancel_scheduled_retry(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        reason: &str,
+    ) -> Result<bool, HeartbeatError> {
+        let result = sqlx::query(
+            "UPDATE heartbeat_runs
+             SET status = 'cancelled', error = $4, finished_at = NOW(), updated_at = NOW()
+             WHERE id = (
+                 SELECT id FROM heartbeat_runs
+                 WHERE company_id = $1
+                   AND agent_id = $2
+                   AND status = 'scheduled_retry'
+                   AND (context_snapshot->>'issueId' = $3 OR context_snapshot->>'taskId' = $3)
+                 ORDER BY scheduled_retry_at ASC NULLS LAST, created_at ASC
+                 LIMIT 1
+             )",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(issue_id.to_string())
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| HeartbeatError::CancelRunFailed(error.to_string()))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn get_heartbeat_context(
         &self,
         issue_id: Uuid,
@@ -2242,6 +2282,16 @@ pub mod mock {
         ) -> Result<(), HeartbeatError> {
             self.cancel_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+
+        async fn cancel_scheduled_retry(
+            &self,
+            _agent_id: Uuid,
+            _issue_id: Uuid,
+            _company_id: Uuid,
+            _reason: &str,
+        ) -> Result<bool, HeartbeatError> {
+            Ok(true)
         }
 
         async fn get_heartbeat_context(

@@ -309,6 +309,16 @@ mod tests {
             Ok(())
         }
 
+        async fn cancel_scheduled_retry(
+            &self,
+            _agent_id: Uuid,
+            _issue_id: Uuid,
+            _company_id: Uuid,
+            _reason: &str,
+        ) -> Result<bool, HeartbeatError> {
+            Ok(true)
+        }
+
         async fn get_heartbeat_context(
             &self,
             issue_id: Uuid,

@@ -2317,12 +2317,84 @@ async fn monitor_check_now(
 
 /// I17: POST /issues/:id/scheduled-retry/retry-now
 async fn scheduled_retry_now(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(
-        serde_json::json!({"issueId": id, "retryTriggered": true}),
-    ))
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let row = sqlx::query(
+        "SELECT r.agent_id, r.scheduled_retry_at, r.scheduled_retry_attempt,
+                r.scheduled_retry_reason, r.error, a.name AS agent_name
+         FROM heartbeat_runs r
+         JOIN agents a ON a.id = r.agent_id AND a.company_id = r.company_id
+         WHERE r.company_id = $1
+           AND r.status = 'scheduled_retry'
+           AND (r.context_snapshot->>'issueId' = $2 OR r.context_snapshot->>'taskId' = $2)
+         ORDER BY r.scheduled_retry_at ASC NULLS LAST, r.created_at ASC
+         LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(id.to_string())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to find scheduled retry");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let Some(row) = row else {
+        return Ok(Json(json!({
+            "outcome": "no_scheduled_retry",
+            "message": "No scheduled retry is waiting for this issue.",
+            "scheduledRetry": null,
+        })));
+    };
+
+    let agent_id = row.get::<Uuid, _>("agent_id");
+    let scheduled_retry = json!({
+        "status": "scheduled_retry",
+        "agentId": agent_id,
+        "agentName": row.get::<String, _>("agent_name"),
+        "retryOfRunId": Value::Null,
+        "scheduledRetryAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("scheduled_retry_at"),
+        "scheduledRetryAttempt": row.get::<Option<i32>, _>("scheduled_retry_attempt").unwrap_or(0),
+        "scheduledRetryReason": row.get::<Option<String>, _>("scheduled_retry_reason"),
+        "error": row.get::<Option<String>, _>("error"),
+    });
+
+    let cancelled = state
+        .heartbeat_service
+        .cancel_scheduled_retry(
+            agent_id,
+            id,
+            company_id,
+            "Scheduled retry promoted by operator",
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, issue_id = %id, agent_id = %agent_id, "failed to cancel scheduled retry");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if !cancelled {
+        return Ok(Json(json!({
+            "outcome": "no_scheduled_retry",
+            "message": "Scheduled retry was already handled.",
+            "scheduledRetry": null,
+        })));
+    }
+    state
+        .heartbeat_service
+        .wakeup(agent_id, id, company_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, issue_id = %id, agent_id = %agent_id, "failed to wake promoted retry");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(json!({
+        "outcome": "promoted",
+        "message": "Scheduled retry promoted and queued now.",
+        "scheduledRetry": scheduled_retry,
+    })))
 }
 
 /// I18: GET /issues/:id/external-objects
