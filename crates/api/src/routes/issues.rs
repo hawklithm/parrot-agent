@@ -2345,15 +2345,15 @@ async fn get_issue_transcript(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
 
-    // Query activity log for transcript events
+    // Transcript events are stored in the canonical activity_logs table.
     let events = sqlx::query(
-        "SELECT id, action, details, created_at, agent_id, user_id 
-         FROM activity_log 
-         WHERE entity_type = 'issue' AND entity_id = $1 AND company_id = $2
-         AND action IN ('issue.comment', 'issue.status_changed', 'issue.assigned', 'issue.created')
+        "SELECT id, event_type, actor_type, actor_id, metadata,
+                created_at, agent_id
+         FROM activity_logs
+         WHERE resource_type = 'issue' AND resource_id = $1 AND company_id = $2
          ORDER BY created_at ASC",
     )
-    .bind(id.to_string())
+    .bind(id)
     .bind(company_id)
     .fetch_all(&state.pool)
     .await
@@ -2361,19 +2361,26 @@ async fn get_issue_transcript(
 
     let mut transcript = Vec::new();
     for row in events {
-        let action: String = row.try_get("action").unwrap_or_default();
-        let details: Option<serde_json::Value> = row.try_get("details").ok();
+        let action: String = row.try_get("event_type").unwrap_or_default();
+        let actor_type: String = row.try_get("actor_type").unwrap_or_default();
+        let actor_id: Uuid = row
+            .try_get("actor_id")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let details: serde_json::Value = row
+            .try_get("metadata")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let created_at: chrono::DateTime<chrono::Utc> =
-            row.try_get("created_at").unwrap_or_default();
+            row.try_get("created_at")
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let agent_id: Option<Uuid> = row.try_get("agent_id").ok().flatten();
-        let user_id: Option<Uuid> = row.try_get("user_id").ok().flatten();
 
         transcript.push(serde_json::json!({
             "action": action,
             "details": details,
             "createdAt": created_at,
+            "actorType": actor_type,
+            "actorId": actor_id,
             "agentId": agent_id,
-            "userId": user_id,
         }));
     }
 
