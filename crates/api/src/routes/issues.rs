@@ -2596,12 +2596,58 @@ async fn unarchive_issue_inbox(
 
 /// I16: POST /issues/:id/monitor/check-now
 async fn monitor_check_now(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(
-        serde_json::json!({"issueId": id, "monitorCheckTriggered": true}),
-    ))
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let scheduled_by = if actor.is_board() { "board" } else { "assignee" };
+    let row = sqlx::query(
+        "UPDATE issues
+         SET monitor_next_check_at = NOW(),
+             monitor_notes = 'manual monitor check requested',
+             monitor_scheduled_by = $3::issue_monitor_scheduled_by,
+             updated_at = NOW()
+         WHERE id = $1 AND company_id = $2
+         RETURNING monitor_next_check_at, monitor_attempt_count",
+    )
+    .bind(id)
+    .bind(company_id)
+    .bind(scheduled_by)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to schedule manual monitor check");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let actor_id = actor.principal_id().ok_or(StatusCode::UNAUTHORIZED)?;
+    sqlx::query(
+        "INSERT INTO activity_logs
+             (company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata, agent_id)
+         VALUES ($1, 'monitor_check_requested', $2, $3, 'issue', $4, $5, $6)",
+    )
+    .bind(company_id)
+    .bind(actor.actor_type())
+    .bind(actor_id)
+    .bind(id)
+    .bind(json!({ "scheduledBy": scheduled_by }))
+    .bind(match actor {
+        AuthorizationActor::Agent { agent_id, .. } => Some(agent_id),
+        _ => None,
+    })
+    .execute(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to record monitor check request");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({
+        "ok": true,
+        "issueId": id,
+        "monitorCheckTriggered": true,
+        "monitorNextCheckAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("monitor_next_check_at"),
+        "monitorAttemptCount": row.get::<i32, _>("monitor_attempt_count"),
+    })))
 }
 
 /// I17: POST /issues/:id/scheduled-retry/retry-now
