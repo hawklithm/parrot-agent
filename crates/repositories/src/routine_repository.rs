@@ -38,27 +38,44 @@ impl RoutineRepository for PostgresRoutineRepository {
     async fn create(&self, routine: Routine) -> RepositoryResult<Routine> {
         sqlx::query(
             r#"INSERT INTO routines
-               (id, company_id, goal_id, agent_id, name, description, trigger_config,
-                status, last_run_at, next_run_at, run_count, success_count, failure_count,
-                created_at, updated_at, created_by_user_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"#
+               (id, company_id, project_id, goal_id, parent_issue_id, name, title, description,
+                agent_id, assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
+                trigger_config, variables, env, latest_revision_id, latest_revision_number,
+                responsible_user_id, created_by_user_id, last_run_at, next_run_at, run_count,
+                success_count, failure_count, last_triggered_at, last_enqueued_at, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                       $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)"#
         )
         .bind(routine.id)
         .bind(routine.company_id)
+        .bind(routine.project_id)
         .bind(routine.goal_id)
-        .bind(routine.agent_id)
+        .bind(routine.parent_issue_id)
         .bind(&routine.name)
+        .bind(&routine.title)
         .bind(&routine.description)
-        .bind(&routine.trigger_config)
+        .bind(routine.agent_id)
+        .bind(routine.assignee_agent_id)
+        .bind(routine.priority)
         .bind(&routine.status)
+        .bind(&routine.concurrency_policy)
+        .bind(&routine.catch_up_policy)
+        .bind(&routine.trigger_config)
+        .bind(&routine.variables)
+        .bind(&routine.env)
+        .bind(routine.latest_revision_id)
+        .bind(routine.latest_revision_number)
+        .bind(routine.responsible_user_id)
+        .bind(routine.created_by_user_id)
         .bind(routine.last_run_at)
         .bind(routine.next_run_at)
         .bind(routine.run_count)
         .bind(routine.success_count)
         .bind(routine.failure_count)
+        .bind(routine.last_triggered_at)
+        .bind(routine.last_enqueued_at)
         .bind(routine.created_at)
         .bind(routine.updated_at)
-        .bind(routine.created_by_user_id)
         .execute(&self.pool)
         .await?;
         Ok(routine)
@@ -66,10 +83,11 @@ impl RoutineRepository for PostgresRoutineRepository {
 
     async fn get(&self, routine_id: Uuid) -> RepositoryResult<Option<Routine>> {
         let routine = sqlx::query_as::<_, Routine>(
-            r#"SELECT id, company_id, project_id, goal_id, parent_issue_id, title, description,
-                      assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
-                      variables, env, latest_revision_id, latest_revision_number, responsible_user_id,
-                      last_triggered_at, last_enqueued_at, created_at, updated_at
+            r#"SELECT id, company_id, project_id, goal_id, parent_issue_id, name, title, description,
+                      agent_id, assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
+                      trigger_config, variables, env, latest_revision_id, latest_revision_number,
+                      responsible_user_id, created_by_user_id, last_run_at, next_run_at, run_count,
+                      success_count, failure_count, last_triggered_at, last_enqueued_at, created_at, updated_at
                FROM routines WHERE id = $1"#
         )
         .bind(routine_id)
@@ -80,10 +98,11 @@ impl RoutineRepository for PostgresRoutineRepository {
 
     async fn list_by_company(&self, company_id: Uuid) -> RepositoryResult<Vec<Routine>> {
         let routines = sqlx::query_as::<_, Routine>(
-            r#"SELECT id, company_id, project_id, goal_id, parent_issue_id, title, description,
-                      assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
-                      variables, env, latest_revision_id, latest_revision_number, responsible_user_id,
-                      last_triggered_at, last_enqueued_at, created_at, updated_at
+            r#"SELECT id, company_id, project_id, goal_id, parent_issue_id, name, title, description,
+                      agent_id, assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
+                      trigger_config, variables, env, latest_revision_id, latest_revision_number,
+                      responsible_user_id, created_by_user_id, last_run_at, next_run_at, run_count,
+                      success_count, failure_count, last_triggered_at, last_enqueued_at, created_at, updated_at
                FROM routines WHERE company_id = $1 ORDER BY created_at DESC"#
         )
         .bind(company_id)
@@ -94,10 +113,11 @@ impl RoutineRepository for PostgresRoutineRepository {
 
     async fn list_by_agent(&self, agent_id: Uuid) -> RepositoryResult<Vec<Routine>> {
         let routines = sqlx::query_as::<_, Routine>(
-            r#"SELECT id, company_id, project_id, goal_id, parent_issue_id, title, description,
-                      assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
-                      variables, env, latest_revision_id, latest_revision_number, responsible_user_id,
-                      last_triggered_at, last_enqueued_at, created_at, updated_at
+            r#"SELECT id, company_id, project_id, goal_id, parent_issue_id, name, title, description,
+                      agent_id, assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
+                      trigger_config, variables, env, latest_revision_id, latest_revision_number,
+                      responsible_user_id, created_by_user_id, last_run_at, next_run_at, run_count,
+                      success_count, failure_count, last_triggered_at, last_enqueued_at, created_at, updated_at
                FROM routines WHERE assignee_agent_id = $1 ORDER BY created_at DESC"#
         )
         .bind(agent_id)
@@ -108,10 +128,11 @@ impl RoutineRepository for PostgresRoutineRepository {
 
     async fn list_by_goal(&self, goal_id: Uuid) -> RepositoryResult<Vec<Routine>> {
         let routines = sqlx::query_as::<_, Routine>(
-            r#"SELECT id, company_id, project_id, goal_id, parent_issue_id, title, description,
-                      assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
-                      variables, env, latest_revision_id, latest_revision_number, responsible_user_id,
-                      last_triggered_at, last_enqueued_at, created_at, updated_at
+            r#"SELECT id, company_id, project_id, goal_id, parent_issue_id, name, title, description,
+                      agent_id, assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
+                      trigger_config, variables, env, latest_revision_id, latest_revision_number,
+                      responsible_user_id, created_by_user_id, last_run_at, next_run_at, run_count,
+                      success_count, failure_count, last_triggered_at, last_enqueued_at, created_at, updated_at
                FROM routines WHERE goal_id = $1 ORDER BY created_at DESC"#
         )
         .bind(goal_id)
@@ -123,26 +144,37 @@ impl RoutineRepository for PostgresRoutineRepository {
     async fn update(&self, routine: Routine) -> RepositoryResult<Routine> {
         sqlx::query(
             r#"UPDATE routines
-               SET title = $2, description = $3, status = $4, priority = $5,
-                   assignee_agent_id = $6, concurrency_policy = $7, catch_up_policy = $8,
-                   variables = $9, env = $10, latest_revision_id = $11,
-                   latest_revision_number = $12, responsible_user_id = $13,
-                   last_triggered_at = $14, last_enqueued_at = $15, updated_at = $16
+               SET name = $2, title = $3, description = $4, status = $5, priority = $6,
+                   agent_id = $7, assignee_agent_id = $8, concurrency_policy = $9,
+                   catch_up_policy = $10, trigger_config = $11, variables = $12, env = $13,
+                   latest_revision_id = $14, latest_revision_number = $15,
+                   responsible_user_id = $16, created_by_user_id = $17, last_run_at = $18,
+                   next_run_at = $19, run_count = $20, success_count = $21, failure_count = $22,
+                   last_triggered_at = $23, last_enqueued_at = $24, updated_at = $25
                WHERE id = $1"#
         )
         .bind(routine.id)
+        .bind(&routine.name)
         .bind(&routine.title)
         .bind(&routine.description)
         .bind(&routine.status)
         .bind(routine.priority)
+        .bind(routine.agent_id)
         .bind(routine.assignee_agent_id)
         .bind(&routine.concurrency_policy)
         .bind(&routine.catch_up_policy)
+        .bind(&routine.trigger_config)
         .bind(&routine.variables)
         .bind(&routine.env)
         .bind(routine.latest_revision_id)
         .bind(routine.latest_revision_number)
         .bind(routine.responsible_user_id)
+        .bind(routine.created_by_user_id)
+        .bind(routine.last_run_at)
+        .bind(routine.next_run_at)
+        .bind(routine.run_count)
+        .bind(routine.success_count)
+        .bind(routine.failure_count)
         .bind(routine.last_triggered_at)
         .bind(routine.last_enqueued_at)
         .bind(Utc::now())
@@ -161,10 +193,11 @@ impl RoutineRepository for PostgresRoutineRepository {
 
     async fn list_pending_cron_routines(&self) -> RepositoryResult<Vec<Routine>> {
         let routines = sqlx::query_as::<_, Routine>(
-            r#"SELECT r.id, r.company_id, r.project_id, r.goal_id, r.parent_issue_id, r.title, r.description,
-                      r.assignee_agent_id, r.priority, r.status, r.concurrency_policy, r.catch_up_policy,
-                      r.variables, r.env, r.latest_revision_id, r.latest_revision_number, r.responsible_user_id,
-                      r.last_triggered_at, r.last_enqueued_at, r.created_at, r.updated_at
+            r#"SELECT r.id, r.company_id, r.project_id, r.goal_id, r.parent_issue_id, r.name, r.title, r.description,
+                      r.agent_id, r.assignee_agent_id, r.priority, r.status, r.concurrency_policy, r.catch_up_policy,
+                      r.trigger_config, r.variables, r.env, r.latest_revision_id, r.latest_revision_number,
+                      r.responsible_user_id, r.created_by_user_id, r.last_run_at, r.next_run_at, r.run_count,
+                      r.success_count, r.failure_count, r.last_triggered_at, r.last_enqueued_at, r.created_at, r.updated_at
                FROM routines r
                INNER JOIN routine_triggers rt ON r.id = rt.routine_id
                WHERE r.status = 'active'

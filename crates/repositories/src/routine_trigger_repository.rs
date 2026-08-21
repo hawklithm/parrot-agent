@@ -32,10 +32,12 @@ impl RoutineTriggerRepository for PostgresRoutineTriggerRepository {
     async fn create(&self, trigger: RoutineTrigger) -> RepositoryResult<RoutineTrigger> {
         sqlx::query(
             r#"INSERT INTO routine_triggers
-               (id, company_id, routine_id, kind, label, enabled, cron_expression, timezone,
-                next_run_at, last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
+               (id, company_id, routine_id, kind, label, enabled, trigger_type, config, status,
+                next_trigger_at, last_triggered_at, cron_expression, timezone, next_run_at,
+                last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
                 last_rotated_at, last_result, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"#
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                       $16, $17, $18, $19, $20, $21, $22, $23)"#
         )
         .bind(trigger.id)
         .bind(trigger.company_id)
@@ -43,6 +45,11 @@ impl RoutineTriggerRepository for PostgresRoutineTriggerRepository {
         .bind(trigger.kind)
         .bind(&trigger.label)
         .bind(trigger.enabled)
+        .bind(trigger.trigger_type)
+        .bind(&trigger.config)
+        .bind(trigger.status)
+        .bind(trigger.next_trigger_at)
+        .bind(trigger.last_triggered_at)
         .bind(&trigger.cron_expression)
         .bind(&trigger.timezone)
         .bind(trigger.next_run_at)
@@ -62,8 +69,9 @@ impl RoutineTriggerRepository for PostgresRoutineTriggerRepository {
 
     async fn find_by_id(&self, id: Uuid) -> RepositoryResult<Option<RoutineTrigger>> {
         let trigger = sqlx::query_as::<_, RoutineTrigger>(
-            r#"SELECT id, company_id, routine_id, kind, label, enabled, cron_expression, timezone,
-                      next_run_at, last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
+            r#"SELECT id, company_id, routine_id, kind, label, enabled, trigger_type, config, status,
+                      next_trigger_at, last_triggered_at, cron_expression, timezone, next_run_at,
+                      last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
                       last_rotated_at, last_result, created_at, updated_at
                FROM routine_triggers WHERE id = $1"#
         )
@@ -75,8 +83,9 @@ impl RoutineTriggerRepository for PostgresRoutineTriggerRepository {
 
     async fn find_by_routine_id(&self, routine_id: Uuid) -> RepositoryResult<Vec<RoutineTrigger>> {
         let triggers = sqlx::query_as::<_, RoutineTrigger>(
-            r#"SELECT id, company_id, routine_id, kind, label, enabled, cron_expression, timezone,
-                      next_run_at, last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
+            r#"SELECT id, company_id, routine_id, kind, label, enabled, trigger_type, config, status,
+                      next_trigger_at, last_triggered_at, cron_expression, timezone, next_run_at,
+                      last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
                       last_rotated_at, last_result, created_at, updated_at
                FROM routine_triggers WHERE routine_id = $1 ORDER BY created_at ASC"#
         )
@@ -88,8 +97,9 @@ impl RoutineTriggerRepository for PostgresRoutineTriggerRepository {
 
     async fn find_by_type(&self, trigger_type: TriggerKind) -> RepositoryResult<Vec<RoutineTrigger>> {
         let triggers = sqlx::query_as::<_, RoutineTrigger>(
-            r#"SELECT id, company_id, routine_id, kind, label, enabled, cron_expression, timezone,
-                      next_run_at, last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
+            r#"SELECT id, company_id, routine_id, kind, label, enabled, trigger_type, config, status,
+                      next_trigger_at, last_triggered_at, cron_expression, timezone, next_run_at,
+                      last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
                       last_rotated_at, last_result, created_at, updated_at
                FROM routine_triggers WHERE kind = $1 ORDER BY created_at ASC"#
         )
@@ -101,8 +111,9 @@ impl RoutineTriggerRepository for PostgresRoutineTriggerRepository {
 
     async fn find_enabled(&self) -> RepositoryResult<Vec<RoutineTrigger>> {
         let triggers = sqlx::query_as::<_, RoutineTrigger>(
-            r#"SELECT id, company_id, routine_id, kind, label, enabled, cron_expression, timezone,
-                      next_run_at, last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
+            r#"SELECT id, company_id, routine_id, kind, label, enabled, trigger_type, config, status,
+                      next_trigger_at, last_triggered_at, cron_expression, timezone, next_run_at,
+                      last_fired_at, public_id, secret_id, signing_mode, replay_window_sec,
                       last_rotated_at, last_result, created_at, updated_at
                FROM routine_triggers WHERE enabled = true ORDER BY next_run_at ASC NULLS LAST"#
         )
@@ -114,16 +125,22 @@ impl RoutineTriggerRepository for PostgresRoutineTriggerRepository {
     async fn update(&self, trigger: RoutineTrigger) -> RepositoryResult<RoutineTrigger> {
         sqlx::query(
             r#"UPDATE routine_triggers
-               SET kind = $2, label = $3, enabled = $4, cron_expression = $5, timezone = $6,
-                   next_run_at = $7, last_fired_at = $8, public_id = $9, secret_id = $10,
-                   signing_mode = $11, replay_window_sec = $12, last_rotated_at = $13,
-                   last_result = $14, updated_at = $15
+               SET kind = $2, label = $3, enabled = $4, trigger_type = $5, config = $6,
+                   status = $7, next_trigger_at = $8, last_triggered_at = $9,
+                   cron_expression = $10, timezone = $11, next_run_at = $12, last_fired_at = $13,
+                   public_id = $14, secret_id = $15, signing_mode = $16, replay_window_sec = $17,
+                   last_rotated_at = $18, last_result = $19, updated_at = $20
                WHERE id = $1"#
         )
         .bind(trigger.id)
         .bind(trigger.kind)
         .bind(&trigger.label)
         .bind(trigger.enabled)
+        .bind(trigger.trigger_type)
+        .bind(&trigger.config)
+        .bind(trigger.status)
+        .bind(trigger.next_trigger_at)
+        .bind(trigger.last_triggered_at)
         .bind(&trigger.cron_expression)
         .bind(&trigger.timezone)
         .bind(trigger.next_run_at)
