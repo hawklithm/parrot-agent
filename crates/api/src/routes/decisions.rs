@@ -3936,6 +3936,174 @@ pub struct UpdateDecisionRetentionInput {
     pub keep: bool,
 }
 
+async fn patch_decision_retention_row(
+    pool: &PgPool,
+    company_id: Uuid,
+    actor: &AuthorizationActor,
+    source_kind: &str,
+    source_id: &str,
+    keep: bool,
+) -> Result<Value, AppError> {
+    let row = sqlx::query(&format!(
+        "INSERT INTO decision_retention (company_id, source_kind, source_id, source_activity_at, keep) \
+         VALUES ($1, $2, $3, NOW(), $4) \
+         ON CONFLICT (company_id, source_kind, source_id) DO UPDATE SET \
+             keep = EXCLUDED.keep, version = decision_retention.version + 1, updated_at = NOW() \
+         RETURNING {}",
+        retention_returning()
+    ))
+    .bind(company_id)
+    .bind(source_kind)
+    .bind(source_id)
+    .bind(keep)
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+
+    record_triage_event(
+        pool,
+        company_id,
+        actor,
+        None,
+        Some(source_kind),
+        Some(source_id),
+        if keep { "kept" } else { "unkept" },
+        json!({ "keep": keep }),
+    )
+    .await?;
+
+    Ok(retention_to_json(&row))
+}
+
+async fn archive_decision_retention_row(
+    pool: &PgPool,
+    company_id: Uuid,
+    actor: &AuthorizationActor,
+    source_kind: &str,
+    source_id: &str,
+    reason: String,
+) -> Result<Value, AppError> {
+    let attr = attribution(actor);
+    let row = sqlx::query(&format!(
+        "UPDATE decision_retention SET \
+             archived_at = NOW(), archived_reason = $4, archived_by_type = $5, \
+             archived_by_agent_id = $6, archived_by_user_id = $7, archived_by_run_id = $8, \
+             archive_version = archive_version + 1, version = version + 1, updated_at = NOW() \
+         WHERE company_id = $1 AND source_kind = $2 AND source_id = $3 AND archived_at IS NULL \
+         RETURNING {}",
+        retention_returning()
+    ))
+    .bind(company_id)
+    .bind(source_kind)
+    .bind(source_id)
+    .bind(&reason)
+    .bind(attr.actor_type)
+    .bind(attr.agent_id)
+    .bind(&attr.user_id)
+    .bind(attr.run_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+
+    let row = match row {
+        Some(row) => row,
+        None => {
+            let existing = sqlx::query(&format!(
+                "{RETENTION_SELECT} WHERE company_id = $1 AND source_kind = $2 AND source_id = $3"
+            ))
+            .bind(company_id)
+            .bind(source_kind)
+            .bind(source_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+            match existing {
+                Some(row) => return Ok(retention_to_json(&row)),
+                None => {
+                    return Err(AppError::NotFound(
+                        "Retention record not found for this source".to_string(),
+                    ))
+                }
+            }
+        }
+    };
+
+    record_triage_event(
+        pool,
+        company_id,
+        actor,
+        None,
+        Some(source_kind),
+        Some(source_id),
+        "archived",
+        json!({ "reason": reason }),
+    )
+    .await?;
+
+    Ok(retention_to_json(&row))
+}
+
+async fn revive_decision_retention_row(
+    pool: &PgPool,
+    company_id: Uuid,
+    actor: &AuthorizationActor,
+    source_kind: &str,
+    source_id: &str,
+) -> Result<Value, AppError> {
+    let row = sqlx::query(&format!(
+        "UPDATE decision_retention SET \
+             archived_at = NULL, archived_reason = NULL, archived_by_type = NULL, \
+             archived_by_agent_id = NULL, archived_by_user_id = NULL, archived_by_run_id = NULL, \
+             version = version + 1, updated_at = NOW() \
+         WHERE company_id = $1 AND source_kind = $2 AND source_id = $3 AND archived_at IS NOT NULL \
+         RETURNING {}",
+        retention_returning()
+    ))
+    .bind(company_id)
+    .bind(source_kind)
+    .bind(source_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+
+    let row = match row {
+        Some(row) => row,
+        None => {
+            let existing = sqlx::query(&format!(
+                "{RETENTION_SELECT} WHERE company_id = $1 AND source_kind = $2 AND source_id = $3"
+            ))
+            .bind(company_id)
+            .bind(source_kind)
+            .bind(source_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+            match existing {
+                Some(row) => return Ok(retention_to_json(&row)),
+                None => {
+                    return Err(AppError::NotFound(
+                        "Retention record not found for this source".to_string(),
+                    ))
+                }
+            }
+        }
+    };
+
+    record_triage_event(
+        pool,
+        company_id,
+        actor,
+        None,
+        Some(source_kind),
+        Some(source_id),
+        "revived",
+        json!({}),
+    )
+    .await?;
+
+    Ok(retention_to_json(&row))
+}
+
 /// PATCH /companies/:company_id/decision-retention/:source_kind/:source_id
 async fn patch_decision_retention(
     State(state): State<AppState>,
@@ -3950,36 +4118,16 @@ async fn patch_decision_retention(
         )));
     }
     require_decision_source_read(&state.pool, &actor, company_id, &source_kind, &source_id).await?;
-    let pool = &state.pool;
-    let row = sqlx::query(&format!(
-        "INSERT INTO decision_retention (company_id, source_kind, source_id, source_activity_at, keep) \
-         VALUES ($1, $2, $3, NOW(), $4) \
-         ON CONFLICT (company_id, source_kind, source_id) DO UPDATE SET \
-             keep = EXCLUDED.keep, version = decision_retention.version + 1, updated_at = NOW() \
-         RETURNING {}",
-        retention_returning()
-    ))
-    .bind(company_id)
-    .bind(&source_kind)
-    .bind(&source_id)
-    .bind(input.keep)
-    .fetch_one(pool)
-    .await
-    .map_err(db_err)?;
-
-    record_triage_event(
-        pool,
+    let retention = patch_decision_retention_row(
+        &state.pool,
         company_id,
         &actor,
-        None,
-        Some(&source_kind),
-        Some(&source_id),
-        if input.keep { "kept" } else { "unkept" },
-        json!({ "keep": input.keep }),
+        &source_kind,
+        &source_id,
+        input.keep,
     )
     .await?;
-
-    Ok(Json(retention_to_json(&row)))
+    Ok(Json(retention))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4001,69 +4149,18 @@ async fn archive_decision_retention(
         )));
     }
     require_decision_source_read(&state.pool, &actor, company_id, &source_kind, &source_id).await?;
-    let attr = attribution(&actor);
     let reason = input.reason.unwrap_or_else(|| "manual".to_string());
-    let pool = &state.pool;
-
-    let row = sqlx::query(&format!(
-        "UPDATE decision_retention SET \
-             archived_at = NOW(), archived_reason = $4, archived_by_type = $5, \
-             archived_by_agent_id = $6, archived_by_user_id = $7, archived_by_run_id = $8, \
-             archive_version = archive_version + 1, version = version + 1, updated_at = NOW() \
-         WHERE company_id = $1 AND source_kind = $2 AND source_id = $3 AND archived_at IS NULL \
-         RETURNING {}",
-        retention_returning()
-    ))
-    .bind(company_id)
-    .bind(&source_kind)
-    .bind(&source_id)
-    .bind(&reason)
-    .bind(attr.actor_type)
-    .bind(attr.agent_id)
-    .bind(&attr.user_id)
-    .bind(attr.run_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(db_err)?;
-
-    let row = match row {
-        Some(row) => row,
-        None => {
-            // Either the source has no retention row yet, or it is already archived.
-            let existing = sqlx::query(&format!(
-                "{RETENTION_SELECT} WHERE company_id = $1 AND source_kind = $2 AND source_id = $3"
-            ))
-            .bind(company_id)
-            .bind(&source_kind)
-            .bind(&source_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(db_err)?;
-            match existing {
-                // Already archived → idempotent success.
-                Some(row) => return Ok(Json(retention_to_json(&row))),
-                None => {
-                    return Err(AppError::NotFound(
-                        "Retention record not found for this source".to_string(),
-                    ))
-                }
-            }
-        }
-    };
-
-    record_triage_event(
-        pool,
+    let retention = archive_decision_retention_row(
+        &state.pool,
         company_id,
         &actor,
-        None,
-        Some(&source_kind),
-        Some(&source_id),
-        "archived",
-        json!({ "reason": reason }),
+        &source_kind,
+        &source_id,
+        reason,
     )
     .await?;
-
-    Ok(Json(retention_to_json(&row)))
+                // Already archived → idempotent success.
+    Ok(Json(retention))
 }
 
 /// POST /companies/:company_id/decision-retention/:source_kind/:source_id/revive
@@ -4079,59 +4176,15 @@ async fn revive_decision_retention(
         )));
     }
     require_decision_source_read(&state.pool, &actor, company_id, &source_kind, &source_id).await?;
-    let pool = &state.pool;
-    let row = sqlx::query(&format!(
-        "UPDATE decision_retention SET \
-             archived_at = NULL, archived_reason = NULL, archived_by_type = NULL, \
-             archived_by_agent_id = NULL, archived_by_user_id = NULL, archived_by_run_id = NULL, \
-             version = version + 1, updated_at = NOW() \
-         WHERE company_id = $1 AND source_kind = $2 AND source_id = $3 AND archived_at IS NOT NULL \
-         RETURNING {}",
-        retention_returning()
-    ))
-    .bind(company_id)
-    .bind(&source_kind)
-    .bind(&source_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(db_err)?;
-
-    let row = match row {
-        Some(row) => row,
-        None => {
-            let existing = sqlx::query(&format!(
-                "{RETENTION_SELECT} WHERE company_id = $1 AND source_kind = $2 AND source_id = $3"
-            ))
-            .bind(company_id)
-            .bind(&source_kind)
-            .bind(&source_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(db_err)?;
-            match existing {
-                Some(row) => return Ok(Json(retention_to_json(&row))),
-                None => {
-                    return Err(AppError::NotFound(
-                        "Retention record not found for this source".to_string(),
-                    ))
-                }
-            }
-        }
-    };
-
-    record_triage_event(
-        pool,
+    let retention = revive_decision_retention_row(
+        &state.pool,
         company_id,
         &actor,
-        None,
-        Some(&source_kind),
-        Some(&source_id),
-        "revived",
-        json!({}),
+        &source_kind,
+        &source_id,
     )
     .await?;
-
-    Ok(Json(retention_to_json(&row)))
+    Ok(Json(retention))
 }
 
 // ---------------------------------------------------------------------------
@@ -4879,6 +4932,97 @@ mod tests {
             .await,
             Err(AppError::NotFound(_))
         ));
+
+        let kept = patch_decision_retention_row(
+            &pool,
+            company_id,
+            &actor,
+            "productivity_review",
+            &readable_issue_id.to_string(),
+            true,
+        )
+        .await
+        .expect("keep retention");
+        assert_eq!(kept["keep"], true);
+        assert_eq!(kept["version"], 1);
+        assert!(kept["archivedAt"].is_null());
+
+        let unkept = patch_decision_retention_row(
+            &pool,
+            company_id,
+            &actor,
+            "productivity_review",
+            &readable_issue_id.to_string(),
+            false,
+        )
+        .await
+        .expect("unkeep retention");
+        assert_eq!(unkept["keep"], false);
+        assert_eq!(unkept["version"], 2);
+
+        let archived = archive_decision_retention_row(
+            &pool,
+            company_id,
+            &actor,
+            "productivity_review",
+            &readable_issue_id.to_string(),
+            "test archive".to_string(),
+        )
+        .await
+        .expect("archive retention");
+        assert!(!archived["archivedAt"].is_null());
+        assert_eq!(archived["archivedReason"], "test archive");
+        assert_eq!(archived["archivedByType"], "user");
+        assert_eq!(archived["version"], 3);
+        assert_eq!(archived["archiveVersion"], 1);
+
+        let repeated_archive = archive_decision_retention_row(
+            &pool,
+            company_id,
+            &actor,
+            "productivity_review",
+            &readable_issue_id.to_string(),
+            "ignored second reason".to_string(),
+        )
+        .await
+        .expect("repeat archive retention");
+        assert_eq!(repeated_archive["version"], 3);
+        assert_eq!(repeated_archive["archivedReason"], "test archive");
+
+        let revived = revive_decision_retention_row(
+            &pool,
+            company_id,
+            &actor,
+            "productivity_review",
+            &readable_issue_id.to_string(),
+        )
+        .await
+        .expect("revive retention");
+        assert!(revived["archivedAt"].is_null());
+        assert!(revived["archivedByType"].is_null());
+        assert_eq!(revived["version"], 4);
+        assert_eq!(revived["archiveVersion"], 1);
+
+        let repeated_revive = revive_decision_retention_row(
+            &pool,
+            company_id,
+            &actor,
+            "productivity_review",
+            &readable_issue_id.to_string(),
+        )
+        .await
+        .expect("repeat revive retention");
+        assert_eq!(repeated_revive["version"], 4);
+        let triage_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM decision_triage_events
+             WHERE company_id = $1 AND source_kind = 'productivity_review' AND source_id = $2",
+        )
+        .bind(company_id)
+        .bind(readable_issue_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("count retention triage events");
+        assert_eq!(triage_events, 4);
 
         sqlx::query("DELETE FROM issues WHERE id IN ($1, $2)")
             .bind(readable_issue_id)
