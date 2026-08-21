@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use models::issue_auxiliary::{Attachment, UploadAttachmentInput};
 use uuid::Uuid;
 
-use crate::asset_storage::{LocalStorageService, PutFileRequest, StorageService};
+use crate::asset_storage::{PutFileRequest, StorageProviderRegistry, StorageService};
 use crate::attachment_types::{
     is_allowed_content_type, max_attachment_bytes, normalize_upload_attachment_content_type,
 };
@@ -108,7 +108,7 @@ impl LocalAttachmentService {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            storage: Arc::new(LocalStorageService::from_env()),
+            storage: StorageProviderRegistry::from_env().provider_or_unavailable(None),
         }
     }
 

@@ -53,6 +53,25 @@ pub struct StorageProviderRegistry {
     local: Arc<LocalStorageService>,
 }
 
+struct UnavailableStorageService {
+    message: String,
+}
+
+#[async_trait]
+impl StorageService for UnavailableStorageService {
+    async fn put_file(&self, _req: PutFileRequest) -> ServiceResult<StoredObject> {
+        Err(ServiceError::NotImplemented(self.message.clone()))
+    }
+
+    async fn get_object(&self, _company_id: Uuid, _object_key: &str) -> ServiceResult<Vec<u8>> {
+        Err(ServiceError::NotImplemented(self.message.clone()))
+    }
+
+    async fn delete_object(&self, _company_id: Uuid, _object_key: &str) -> ServiceResult<()> {
+        Err(ServiceError::NotImplemented(self.message.clone()))
+    }
+}
+
 impl StorageProviderRegistry {
     pub fn from_env() -> Self {
         Self {
@@ -67,6 +86,15 @@ impl StorageProviderRegistry {
             other => Err(ServiceError::NotImplemented(format!(
                 "storage provider '{other}' is not configured"
             ))),
+        }
+    }
+
+    pub fn provider_or_unavailable(&self, name: Option<&str>) -> Arc<dyn StorageService> {
+        match self.provider(name) {
+            Ok(provider) => provider,
+            Err(error) => Arc::new(UnavailableStorageService {
+                message: error.to_string(),
+            }),
         }
     }
 }
