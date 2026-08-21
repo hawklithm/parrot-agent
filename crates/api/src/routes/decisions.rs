@@ -360,13 +360,16 @@ async fn require_decision_source_read(
         return Err(AppError::NotFound("Attention source not found".to_string()));
     };
     let context_snapshot: Option<Value> = source.try_get("context_snapshot").map_err(db_err)?;
-    let issue_id: Option<Uuid> = source.try_get("issue_id").map_err(db_err)?.or_else(|| {
-        context_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.get("issueId").or_else(|| snapshot.get("taskId")))
-            .and_then(Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok())
-    });
+    let issue_id: Option<Uuid> = source
+        .try_get::<Option<Uuid>, _>("issue_id")
+        .map_err(db_err)?
+        .or_else(|| {
+            context_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("issueId").or_else(|| snapshot.get("taskId")))
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+        });
     if let Some(issue_id) = issue_id {
         let issue_exists = sqlx::query(
             "SELECT 1 FROM issues WHERE company_id = $1 AND id = $2 AND hidden_at IS NULL",
