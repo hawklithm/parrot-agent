@@ -17,6 +17,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
@@ -114,6 +115,18 @@ pub enum JobSchedule {
     CronExpression(String),
     /// 事件驱动(预留)
     OnEvent,
+}
+
+fn schedule_is_due(schedule: &JobSchedule, last_started: Option<Instant>, now: Instant) -> bool {
+    match schedule {
+        JobSchedule::IntervalSeconds(seconds) => last_started
+            .map(|started| now.duration_since(started).as_secs() >= *seconds)
+            .unwrap_or(true),
+        // Cron parsing is not part of this scheduler yet; preserve the existing
+        // tick-driven behavior until a cron engine is wired in.
+        JobSchedule::CronExpression(_) => true,
+        JobSchedule::OnEvent => false,
+    }
 }
 
 /// 后台任务 trait
@@ -214,12 +227,18 @@ impl JobScheduler {
     pub async fn start(self: Arc<Self>, interval_ms: u64) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_millis(interval_ms));
+            let mut last_started: HashMap<String, Instant> = HashMap::new();
 
             loop {
                 interval.tick().await;
 
                 let jobs = self.jobs.read().await;
                 for (name, job) in jobs.iter() {
+                    let now = Instant::now();
+                    if !schedule_is_due(&job.schedule(), last_started.get(name).copied(), now) {
+                        continue;
+                    }
+                    last_started.insert(name.clone(), now);
                     let job = Arc::clone(job);
                     let scheduler = Arc::clone(&self);
                     let name = name.clone();
@@ -263,6 +282,38 @@ impl JobScheduler {
 impl Default for JobScheduler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::{schedule_is_due, JobSchedule};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn interval_schedule_runs_once_then_waits_for_interval() {
+        let started = Instant::now();
+        assert!(schedule_is_due(
+            &JobSchedule::IntervalSeconds(60),
+            None,
+            started,
+        ));
+        assert!(!schedule_is_due(
+            &JobSchedule::IntervalSeconds(60),
+            Some(started),
+            started + Duration::from_secs(30),
+        ));
+        assert!(schedule_is_due(
+            &JobSchedule::IntervalSeconds(60),
+            Some(started),
+            started + Duration::from_secs(60),
+        ));
+    }
+
+    #[test]
+    fn event_schedule_is_not_tick_driven() {
+        let now = Instant::now();
+        assert!(!schedule_is_due(&JobSchedule::OnEvent, None, now));
     }
 }
 
