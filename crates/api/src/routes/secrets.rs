@@ -89,6 +89,24 @@ const KNOWN_PROVIDERS: &[(&str, &str)] = &[
     ("vault", "HashiCorp Vault"),
 ];
 
+fn validate_secret_name_key(name: &str, key: &str) -> Result<(), SecretError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 255 || name.chars().any(|c| c.is_control()) {
+        return Err(SecretError::BadRequest("Secret name must be 1-255 characters".into()));
+    }
+    if key.is_empty()
+        || key.len() > 255
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    {
+        return Err(SecretError::BadRequest(
+            "Secret key may contain only letters, numbers, '_', '-', '.', and '/'".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// SE5: GET /companies/:company_id/secret-providers
 async fn list_secret_providers(
     State(state): State<AppState>,
@@ -246,6 +264,9 @@ async fn create_company_secret(
 
     let managed_mode = body.managed_mode.as_deref().unwrap_or("paperclip_managed");
     let is_external = managed_mode == "external" || managed_mode == "external_reference";
+    if !matches!(managed_mode, "paperclip_managed" | "external" | "external_reference") {
+        return Err(SecretError::BadRequest("Unsupported managedMode".into()));
+    }
 
     // Validate per createSecretSchema superRefine.
     if is_external && body.external_ref.as_deref().map_or(true, |s| s.trim().is_empty()) {
@@ -272,6 +293,10 @@ async fn create_company_secret(
 
     let key = body.key.unwrap_or_else(|| body.name.replace(' ', "_"));
     let provider = body.provider.unwrap_or_else(|| "local_encrypted".to_string());
+    if !KNOWN_PROVIDERS.iter().any(|(id, _)| *id == provider) {
+        return Err(SecretError::BadRequest("Unsupported secret provider".into()));
+    }
+    validate_secret_name_key(&body.name, &key)?;
     let db_managed_mode = if is_external { "external" } else { "paperclip_managed" };
 
     let row = sqlx::query(
@@ -367,6 +392,22 @@ async fn update_secret(
 ) -> Result<Json<Value>, SecretError> {
     let pool = &state.pool;
     authorize_secret(pool, id, &actor, AccessMode::Write).await?;
+    if let Some(name) = body.name.as_deref() {
+        let key = body.key.as_deref().unwrap_or("");
+        if body.key.is_some() {
+            validate_secret_name_key(name, key)?;
+        } else if name.trim().is_empty() || name.len() > 255 || name.chars().any(|c| c.is_control()) {
+            return Err(SecretError::BadRequest("Secret name must be 1-255 characters".into()));
+        }
+    }
+    if let Some(key) = body.key.as_deref() {
+        if key.is_empty()
+            || key.len() > 255
+            || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+        {
+            return Err(SecretError::BadRequest("Invalid secret key".into()));
+        }
+    }
     let row = sqlx::query(
         r#"UPDATE company_secrets
               SET updated_at = NOW(),
@@ -758,5 +799,13 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn secret_name_and_key_validation_rejects_ambiguous_paths() {
+        assert!(validate_secret_name_key("Database URL", "DATABASE_URL").is_ok());
+        assert!(validate_secret_name_key("", "DATABASE_URL").is_err());
+        assert!(validate_secret_name_key("Database URL", "DATABASE URL").is_err());
+        assert!(validate_secret_name_key("Database\nURL", "DATABASE_URL").is_err());
     }
 }
