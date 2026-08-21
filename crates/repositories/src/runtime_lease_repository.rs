@@ -251,12 +251,15 @@ impl RuntimeLeaseRepository for PgRuntimeLeaseRepository {
     }
 
     async fn cleanup(&self, lease_id: Uuid) -> Result<(), RepositoryError> {
-        // Mark cleanup as in progress
-        sqlx::query(
+        // Claim only terminal leases. An active lease must be released by the
+        // runtime service before a cleanup worker can touch its resources.
+        let claimed = sqlx::query(
             r#"
             UPDATE environment_leases
-            SET cleanup_status = _at = NOW()
+            SET cleanup_status = $1, updated_at = NOW()
             WHERE id = $2
+              AND status IN ('released', 'expired', 'failed')
+              AND cleanup_status IN ('pending', 'failed')
             "#
         )
         .bind("in_progress")
@@ -264,8 +267,24 @@ impl RuntimeLeaseRepository for PgRuntimeLeaseRepository {
         .execute(&self.pool)
         .await?;
 
-        // TODO: Actual cleanup logic (e.g., terminate workspace, cleanup resources)
-        // For now, just mark as completed
+        if claimed.rows_affected() == 0 {
+            let exists: Option<(EnvironmentLeaseStatus, Option<String>)> = sqlx::query_as(
+                "SELECT status, cleanup_status FROM environment_leases WHERE id = $1",
+            )
+            .bind(lease_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            return match exists {
+                None => Err(RepositoryError::NotFound(lease_id)),
+                Some((status, _)) if status == EnvironmentLeaseStatus::Active => Err(
+                    RepositoryError::InvalidData("cannot clean up an active runtime lease".into()),
+                ),
+                Some(_) => Ok(()),
+            };
+        }
+
+        // Provider-specific resource teardown is owned by the runtime service;
+        // this repository records the durable completion state.
 
         sqlx::query(
             r#"
