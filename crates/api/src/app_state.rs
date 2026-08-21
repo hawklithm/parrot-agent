@@ -45,6 +45,8 @@ pub struct AppState {
     pub adapter_registry: Arc<AdapterRegistry>,
     pub adapter_registry_state: Arc<AdapterRegistryState>,
     pub environment_runtime_service: Arc<dyn EnvironmentRuntimeService>,
+    pub workspace_runtime_authz_service:
+        Arc<dyn services::authorization_service::WorkspaceRuntimeServiceAuthzService>,
 
     // Phase 2: Issue/Case Management
     pub issue_service: Arc<dyn IssueService>,
@@ -146,6 +148,8 @@ impl AppState {
         adapter_registry: Arc<AdapterRegistry>,
         adapter_registry_state: Arc<AdapterRegistryState>,
         environment_runtime_service: Arc<dyn EnvironmentRuntimeService>,
+        workspace_runtime_authz_service:
+            Arc<dyn services::authorization_service::WorkspaceRuntimeServiceAuthzService>,
         issue_service: Arc<dyn IssueService>,
         case_service: Arc<dyn CaseService>,
         issue_comment_service: Arc<dyn IssueCommentService>,
@@ -205,6 +209,7 @@ impl AppState {
             adapter_registry,
             adapter_registry_state,
             environment_runtime_service,
+            workspace_runtime_authz_service,
             issue_service,
             case_service,
             issue_comment_service,

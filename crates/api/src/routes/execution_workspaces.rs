@@ -29,6 +29,9 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
+use services::authorization_service::{
+    RuntimeServiceAction, RuntimeServiceAuthzRequest,
+};
 
 pub fn execution_workspace_routes() -> Router<AppState> {
     Router::new()
@@ -462,6 +465,54 @@ async fn runtime_command(
     require_company_access(&actor, company_id, AccessMode::Write).map_err(|_| {
         ExecutionWorkspaceError::Forbidden("Workspace company access denied".to_string())
     })?;
+
+    if actor.is_agent() {
+        let agent_id = match &actor {
+            AuthorizationActor::Agent { agent_id, .. } => *agent_id,
+            _ => unreachable!("agent actor must contain an agent id"),
+        };
+        let runtime_action = match action.as_str() {
+            "start" => RuntimeServiceAction::Start,
+            "stop" => RuntimeServiceAction::Stop,
+            "restart" => RuntimeServiceAction::Restart,
+            "run" => RuntimeServiceAction::Run,
+            _ => unreachable!("runtime action was validated above"),
+        };
+        state
+            .workspace_runtime_authz_service
+            .check_runtime_service_permission(RuntimeServiceAuthzRequest {
+                workspace_id: id,
+                service_name: body
+                    .runtime_service_id
+                    .clone()
+                    .or_else(|| body.workspace_command_id.clone())
+                    .unwrap_or_else(|| "workspace-runtime".to_string()),
+                action: runtime_action,
+                agent_id: Some(agent_id),
+            })
+            .await
+            .map_err(|error| match error {
+                services::authorization_service::AuthorizationError::WorkspaceNotFound(id) => {
+                    ExecutionWorkspaceError::NotFound(id)
+                }
+                services::authorization_service::AuthorizationError::AgentNotFound(agent_id) => {
+                    ExecutionWorkspaceError::Forbidden(format!(
+                        "Runtime Agent not found: {agent_id}"
+                    ))
+                }
+                services::authorization_service::AuthorizationError::DatabaseError(error) => {
+                    ExecutionWorkspaceError::Database(error.to_string())
+                }
+                other => ExecutionWorkspaceError::Forbidden(other.to_string()),
+            })
+            .and_then(|decision| {
+                if decision.allowed {
+                    Ok(())
+                } else {
+                    Err(ExecutionWorkspaceError::Forbidden(decision.reason))
+                }
+            })?;
+    }
 
     Ok(Json(json!({
         "workspaceId": id,

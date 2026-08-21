@@ -489,6 +489,8 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
     let server_adapter_registry = Arc::new(services::create_default_server_adapter_registry());
     let environment_runtime_service: Arc<dyn EnvironmentRuntimeService> =
         Arc::new(DefaultEnvironmentRuntimeService::with_pool(pool.clone()));
+    let workspace_runtime_authz_service: Arc<dyn services::authorization_service::WorkspaceRuntimeServiceAuthzService> =
+        Arc::new(services::authorization_service::DefaultRuntimeServiceAuthzService::with_default_policy_and_pool(pool.clone()));
     let issue_comment_service: Arc<dyn IssueCommentService> = Arc::new(
         IssueCommentServiceImpl::new(issue_comment_repo.clone(), issue_repo.clone()),
     );
@@ -733,6 +735,7 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         adapter_registry,
         adapter_registry_state,
         environment_runtime_service,
+        workspace_runtime_authz_service,
         issue_service,
         case_service,
         issue_comment_service,
