@@ -53,6 +53,7 @@ use repositories::{
 };
 use services::event_listeners::{
     ApprovalApprovedToIssueUnblockListener, CompleteIssueServiceAdapter,
+    IssueCheckedOutToRecoveryReconcileListener, IssueCompletedToRecoveryResolveListener,
     RoutineTriggeredToIssueCreationListener,
 };
 use services::{
@@ -642,12 +643,24 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
     let recovery_action_repository = Arc::new(
         repositories::PgRecoveryActionRepository::new(pool.clone()),
     );
-    let recovery_action_service: Arc<dyn services::RecoveryActionService> = Arc::new(
-        services::DefaultRecoveryActionService::new(
-            recovery_action_repository,
-            issue_repo.clone(),
-        ),
-    );
+    let recovery_action_service_impl = Arc::new(services::DefaultRecoveryActionService::new(
+        recovery_action_repository,
+        issue_repo.clone(),
+    ));
+    event_bus
+        .subscribe(Box::new(IssueCheckedOutToRecoveryReconcileListener::new(
+            recovery_action_service_impl.clone(),
+        )))
+        .await
+        .map_err(|error| format!("failed to subscribe recovery reconcile listener: {error}"))?;
+    event_bus
+        .subscribe(Box::new(IssueCompletedToRecoveryResolveListener::new(
+            recovery_action_service_impl.clone(),
+        )))
+        .await
+        .map_err(|error| format!("failed to subscribe recovery resolve listener: {error}"))?;
+    let recovery_action_service: Arc<dyn services::RecoveryActionService> =
+        recovery_action_service_impl;
     // Label service
     let label_repo: Arc<repositories::label_repository::PgLabelRepository> = Arc::new(
         repositories::label_repository::PgLabelRepository::new(pool.clone()),

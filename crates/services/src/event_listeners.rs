@@ -328,15 +328,9 @@ impl<R: RecoveryActionService> EventHandler for IssueCompletedToRecoveryResolveL
 
 // ==================== Listener service contracts ====================
 
-// RecoveryActionService trait used by the listeners above
-#[async_trait]
-pub trait RecoveryActionService: Send + Sync {
-    async fn reconcile_for_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, String>;
-    async fn resolve_active_for_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, String>;
-}
-
-// Re-export RecoveryAction for use in trait
-use models::RecoveryAction;
+// Use the production recovery service contract so event listeners cannot drift
+// from the service wired into the server.
+pub use crate::recovery_action_service::RecoveryActionService;
 
 // WatchdogService trait — re-exported from task_watchdog module
 pub use crate::task_watchdog::WatchdogService;
