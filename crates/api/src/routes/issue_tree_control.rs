@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -8,12 +8,32 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{app_state::AppState, errors::ApiError};
+use crate::{app_state::AppState, errors::ApiError, routes::{require_company_access, AccessMode}};
 use models::{
     ActiveIssueTreePauseHoldGate, CreateIssueTreeHoldInput, IssueTreeControlMode, IssueTreeHold,
     IssueTreeHoldMember, IssueTreeHoldReleasePolicy, IssueTreeHoldReleasePolicyStrategy,
 };
 use services::TreeControlServiceError;
+use services::auth::AuthorizationActor;
+
+async fn authorized_issue_company(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    issue_id: Uuid,
+    mode: AccessMode,
+) -> Result<Uuid, ApiError> {
+    let company_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT company_id FROM issues WHERE id = $1",
+    )
+    .bind(issue_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| ApiError::InternalServerError(error.to_string()))?
+    .ok_or_else(|| ApiError::NotFound(format!("Issue not found: {}", issue_id)))?;
+    require_company_access(actor, company_id, mode)
+        .map_err(|_| ApiError::Forbidden("Issue tree control access denied".to_string()))?;
+    Ok(company_id)
+}
 
 /// Preview tree control request
 #[derive(Debug, Deserialize)]
@@ -89,9 +109,11 @@ impl From<TreeControlServiceError> for ApiError {
 /// POST /issues/:id/tree-control/preview - Preview tree control effect
 pub async fn preview_tree_control(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(issue_id): Path<Uuid>,
     Json(req): Json<PreviewTreeControlRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
     let preview = state
         .issue_tree_control_service
         .preview_tree_hold(issue_id, req.mode)
@@ -103,16 +125,12 @@ pub async fn preview_tree_control(
 /// POST /issues/:id/tree-holds - Create a tree hold
 pub async fn create_tree_hold(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(issue_id): Path<Uuid>,
     Json(req): Json<CreateTreeHoldRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue to determine company_id
-    let company_id = sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM issues WHERE id = $1")
-        .bind(issue_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|error| ApiError::InternalServerError(error.to_string()))?
-        .ok_or_else(|| ApiError::NotFound(format!("Issue not found: {}", issue_id)))?;
+    let company_id = authorized_issue_company(&state, &actor, issue_id, AccessMode::Write).await?;
 
     let input = CreateIssueTreeHoldInput {
         mode: req.mode,
@@ -128,7 +146,13 @@ pub async fn create_tree_hold(
 
     let hold = state
         .issue_tree_control_service
-        .create_tree_hold(company_id, issue_id, input, req.actor_type, req.actor_id)
+        .create_tree_hold(
+            company_id,
+            issue_id,
+            input,
+            Some(actor.actor_type().to_string()),
+            actor.principal_id(),
+        )
         .await?;
 
     Ok((StatusCode::CREATED, Json(TreeHoldResponse { hold })))
@@ -137,8 +161,10 @@ pub async fn create_tree_hold(
 /// GET /issues/:id/tree-holds - List tree holds for an issue
 pub async fn list_tree_holds(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
+    authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
     let holds = state
         .issue_tree_control_service
         .list_tree_holds(issue_id)
@@ -150,8 +176,10 @@ pub async fn list_tree_holds(
 /// GET /issues/:id/tree-holds/:hold_id - Get a tree hold
 pub async fn get_tree_hold(
     State(state): State<AppState>,
-    Path((_issue_id, hold_id)): Path<(Uuid, Uuid)>,
-) -> Result<impl IntoResponse, ApiError> {
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, hold_id)): Path<(Uuid, Uuid)>,
+    ) -> Result<impl IntoResponse, ApiError> {
+    authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
     let hold = state
         .issue_tree_control_service
         .get_tree_hold(hold_id)
@@ -163,12 +191,17 @@ pub async fn get_tree_hold(
 /// POST /issues/:id/tree-holds/:hold_id/release - Release a tree hold
 pub async fn release_tree_hold(
     State(state): State<AppState>,
-    Path((_issue_id, hold_id)): Path<(Uuid, Uuid)>,
-    Json(req): Json<ReleaseTreeHoldRequest>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, hold_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
+    authorized_issue_company(&state, &actor, issue_id, AccessMode::Write).await?;
     let hold = state
         .issue_tree_control_service
-        .release_tree_hold(hold_id, req.released_by_type, req.released_by_id)
+        .release_tree_hold(
+            hold_id,
+            Some(actor.actor_type().to_string()),
+            actor.principal_id(),
+        )
         .await?;
 
     Ok(Json(TreeHoldResponse { hold }))
@@ -177,8 +210,10 @@ pub async fn release_tree_hold(
 /// GET /issues/:id/tree-control/state - Get current pause state
 pub async fn get_pause_state(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
+    authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
     let gate = state
         .issue_tree_control_service
         .get_pause_state(issue_id)
@@ -192,8 +227,10 @@ pub async fn get_pause_state(
 /// GET /issues/:id/tree-holds/:hold_id/members - Get hold members
 pub async fn get_hold_members(
     State(state): State<AppState>,
-    Path((_issue_id, hold_id)): Path<(Uuid, Uuid)>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, hold_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
+    authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
     let members = state
         .issue_tree_control_service
         .get_hold_members(hold_id)
