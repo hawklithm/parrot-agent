@@ -129,6 +129,7 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
     let company_id = Uuid::new_v4();
     let issue_id = Uuid::new_v4();
     let source_id = Uuid::new_v4();
+    let approval_id = Uuid::new_v4();
     let comment_id = Uuid::new_v4();
     let creator_id = Uuid::new_v4();
     let agent_id = Uuid::new_v4();
@@ -187,6 +188,30 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
     .execute(&pool)
     .await
     .expect("insert interaction");
+    sqlx::query(
+        "INSERT INTO approvals
+            (id, company_id, approval_type, requested_by_agent_id, status,
+             payload, decided_by_user_id, decided_at)
+         VALUES ($1, $2, 'deploy_agent', $3, 'approved', $4, $5, NOW())",
+    )
+    .bind(approval_id)
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(serde_json::json!({"decision": "approved"}))
+    .bind(creator_id)
+    .execute(&pool)
+    .await
+    .expect("insert resolved approval");
+    sqlx::query(
+        "INSERT INTO issue_approvals (approval_id, issue_id, company_id)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(approval_id)
+    .bind(issue_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("link approval to issue");
     sqlx::query(
         "INSERT INTO issue_comments (id, company_id, issue_id, body, actor_type, metadata)
          VALUES ($1, $2, $3, $4, 'system', $5)",
@@ -287,6 +312,33 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
         .await
         .expect_err("same user/source capture must be rejected");
     assert!(duplicate.to_string().contains("duplicate decision training example"));
+
+    let approval_example = service
+        .capture_snapshot(CaptureInput {
+            company_id,
+            source_kind: DecisionTrainingSourceKind::IssueApproval,
+            source_id: approval_id.to_string(),
+            issue_id: Some(issue_id),
+            notes: Some("approved source".to_string()),
+            tags: vec!["approval".to_string()],
+            quality_score: Some(0.9),
+            retention_policy: Some("scrub_deleted_comments_v1".to_string()),
+            created_by_user_id: Some(Uuid::new_v4().to_string()),
+            persist: true,
+        })
+        .await
+        .expect("capture resolved approval");
+    assert_eq!(
+        approval_example.raw_snapshot["decision"]["actor"]["userId"],
+        creator_id.to_string()
+    );
+    assert!(approval_example.raw_snapshot["decision"]["actor"]["agentId"].is_null());
+    assert_eq!(approval_example.raw_snapshot["decision"]["outcome"], "approved");
+    assert_eq!(
+        approval_example.raw_snapshot["code"]["commitSha"],
+        "abcdef1234567890"
+    );
+    assert_eq!(approval_example.raw_snapshot["code"]["resolution"], "nearest_run");
 
     sqlx::query("DELETE FROM issues WHERE id = $1")
         .bind(issue_id)
