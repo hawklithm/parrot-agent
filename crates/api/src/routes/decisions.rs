@@ -4703,6 +4703,10 @@ mod tests {
         let user_id = Uuid::new_v4();
         let readable_issue_id = Uuid::new_v4();
         let hidden_issue_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let interaction_id = Uuid::new_v4();
+        let approval_id = Uuid::new_v4();
         let prefix = format!("RT{}", &company_id.simple().to_string()[..8]);
         let other_prefix = format!("RT{}", &other_company_id.simple().to_string()[..8]);
 
@@ -4735,6 +4739,60 @@ mod tests {
             .await
             .expect("insert hidden issue");
 
+        sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, $3)")
+            .bind(agent_id)
+            .bind(company_id)
+            .bind("Retention Authorization Agent")
+            .execute(&pool)
+            .await
+            .expect("insert authorization agent");
+        sqlx::query(
+            "INSERT INTO heartbeat_runs (id, company_id, agent_id, context_snapshot)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(run_id)
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(json!({"issueId": readable_issue_id}))
+        .execute(&pool)
+        .await
+        .expect("insert authorization run");
+        sqlx::query(
+            "INSERT INTO issue_thread_interactions
+                (id, company_id, issue_id, kind, status, created_by_agent_id, payload)
+             VALUES ($1, $2, $3, 'question', 'pending', $4, $5)",
+        )
+        .bind(interaction_id)
+        .bind(company_id)
+        .bind(readable_issue_id)
+        .bind(agent_id)
+        .bind(json!({"question": "retention access"}))
+        .execute(&pool)
+        .await
+        .expect("insert authorization interaction");
+        sqlx::query(
+            "INSERT INTO approvals
+                (id, company_id, approval_type, requested_by_agent_id, status, payload)
+             VALUES ($1, $2, 'deploy_agent', $3, 'pending', $4)",
+        )
+        .bind(approval_id)
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(json!({"request": "retention access"}))
+        .execute(&pool)
+        .await
+        .expect("insert authorization approval");
+        sqlx::query(
+            "INSERT INTO issue_approvals (approval_id, issue_id, company_id)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(approval_id)
+        .bind(readable_issue_id)
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .expect("link authorization approval");
+
         let actor = AuthorizationActor::board(user_id, company_id);
         assert!(
             require_decision_source_read(
@@ -4747,6 +4805,25 @@ mod tests {
             .await
             .is_ok()
         );
+        for (source_kind, source_id) in [
+            ("approval", approval_id),
+            ("issue_thread_interaction", interaction_id),
+            ("failed_run", run_id),
+            ("agent_error_alert", agent_id),
+        ] {
+            assert!(
+                require_decision_source_read(
+                    &pool,
+                    &actor,
+                    company_id,
+                    source_kind,
+                    &source_id.to_string(),
+                )
+                .await
+                .is_ok(),
+                "source kind {source_kind} should be readable"
+            );
+        }
         assert!(matches!(
             require_decision_source_read(
                 &pool,
@@ -4754,6 +4831,28 @@ mod tests {
                 company_id,
                 "productivity_review",
                 &hidden_issue_id.to_string(),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            require_decision_source_read(
+                &pool,
+                &actor,
+                other_company_id,
+                "agent_error_alert",
+                &agent_id.to_string(),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            require_decision_source_read(
+                &pool,
+                &actor,
+                company_id,
+                "failed_run",
+                &Uuid::new_v4().to_string(),
             )
             .await,
             Err(AppError::NotFound(_))
