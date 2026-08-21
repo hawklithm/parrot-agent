@@ -227,6 +227,44 @@ impl SecretMaterialBackfillJob {
     }
 }
 
+/// Mark expired pending secret proposals so they cannot be approved later.
+pub struct SecretProposalExpirationJob {
+    pool: PgPool,
+}
+
+impl SecretProposalExpirationJob {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for SecretProposalExpirationJob {
+    fn job_name(&self) -> &str {
+        "secret_proposal_expiration"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(300)
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        let expired = sqlx::query(
+            "UPDATE company_secret_proposals
+                SET status = 'expired',
+                    resolved_at = COALESCE(resolved_at, NOW()),
+                    resolution_reason = COALESCE(resolution_reason, 'proposal expired'),
+                    updated_at = NOW()
+              WHERE status = 'pending' AND expires_at <= NOW()
+              RETURNING id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("failed to expire secret proposals: {error}"))?;
+        Ok(format!("expired {} secret proposals", expired.len()))
+    }
+}
+
 #[async_trait]
 impl ScheduledJob for SecretMaterialBackfillJob {
     fn job_name(&self) -> &str {
