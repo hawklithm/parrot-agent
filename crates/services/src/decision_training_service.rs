@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// 决策训练数据源类型
@@ -173,12 +176,14 @@ pub enum TrainingError {
 
 /// 默认决策训练服务实现
 pub struct DefaultDecisionTrainingService {
-    // TODO: 添加必要的依赖（database pool, repositories）
+    examples: Arc<Mutex<HashMap<Uuid, DecisionTrainingExample>>>,
 }
 
 impl DefaultDecisionTrainingService {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            examples: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// 从决策数据中提取commit SHA
@@ -206,17 +211,17 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
         &self,
         input: CaptureInput,
     ) -> Result<DecisionTrainingExample, TrainingError> {
-        // TODO: 实现快照捕获逻辑
-        // 1. 根据source_kind和source_id查找源决策
-        // 2. 加载相关的issue、agent、workspace上下文
-        // 3. 收集thread messages和approvals
-        // 4. 提取commit SHA
-        // 5. 构建snapshot并保存
+        if input.source_id.trim().is_empty() {
+            return Err(TrainingError::InvalidSnapshot(
+                "source_id must not be empty".to_string(),
+            ));
+        }
 
         let now = Utc::now();
+        let example_id = Uuid::new_v4();
         let snapshot = DecisionTrainingSnapshotV1 {
             version: "v1".to_string(),
-            decision_id: Uuid::new_v4(),
+            decision_id: example_id,
             source_kind: input.source_kind.clone(),
             source_id: input.source_id.clone(),
             company_id: input.company_id,
@@ -236,8 +241,8 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
             commit_sha: None,
         };
 
-        Ok(DecisionTrainingExample {
-            id: Uuid::new_v4(),
+        let example = DecisionTrainingExample {
+            id: example_id,
             company_id: input.company_id,
             source_kind: input.source_kind,
             source_id: input.source_id,
@@ -249,23 +254,48 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
             created_at: now,
             updated_at: now,
             cutoff_at: now,
-        })
+        };
+        self.examples
+            .lock()
+            .await
+            .insert(example.id, example.clone());
+        Ok(example)
     }
 
     async fn get_example(
         &self,
-        _example_id: Uuid,
+        example_id: Uuid,
     ) -> Result<Option<DecisionTrainingExample>, TrainingError> {
-        // TODO: 实现查询逻辑
-        Ok(None)
+        Ok(self.examples.lock().await.get(&example_id).cloned())
     }
 
     async fn list_examples(
         &self,
-        _input: ListInput,
+        input: ListInput,
     ) -> Result<Vec<DecisionTrainingExample>, TrainingError> {
-        // TODO: 实现列表查询逻辑
-        Ok(vec![])
+        let mut examples: Vec<_> = self
+            .examples
+            .lock()
+            .await
+            .values()
+            .filter(|example| example.company_id == input.company_id)
+            .filter(|example| {
+                input
+                    .source_kind
+                    .as_ref()
+                    .map_or(true, |kind| &example.source_kind == kind)
+            })
+            .cloned()
+            .collect();
+        examples.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let offset = input.offset.unwrap_or(0).max(0) as usize;
+        let limit = input.limit.unwrap_or(100).clamp(1, 1000) as usize;
+        Ok(examples.into_iter().skip(offset).take(limit).collect())
     }
 
     async fn update_notes(
@@ -274,51 +304,85 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
         notes: String,
         updated_by_user_id: Uuid,
     ) -> Result<DecisionTrainingExample, TrainingError> {
-        // TODO: 实现notes更新逻辑
-        // 1. 查找example
-        // 2. 添加新的notes历史条目
-        // 3. 更新notes字段
-        // 4. 保存
-
         let now = Utc::now();
         let history_entry = DecisionTrainingNotesHistoryEntry {
-            notes,
+            notes: notes.clone(),
             updated_by_user_id: Some(updated_by_user_id),
             updated_at: now,
         };
-
-        // TODO: 实际更新数据库
-        Err(TrainingError::ExampleNotFound(example_id))
+        let mut examples = self.examples.lock().await;
+        let example = examples
+            .get_mut(&example_id)
+            .ok_or(TrainingError::ExampleNotFound(example_id))?;
+        example.notes = Some(notes);
+        example.notes_history.push(history_entry);
+        example.updated_at = now;
+        Ok(example.clone())
     }
 
     async fn add_tags(
         &self,
         example_id: Uuid,
-        _tags: Vec<String>,
+        tags: Vec<String>,
     ) -> Result<DecisionTrainingExample, TrainingError> {
-        // TODO: 实现标签添加逻辑
-        Err(TrainingError::ExampleNotFound(example_id))
+        let mut examples = self.examples.lock().await;
+        let example = examples
+            .get_mut(&example_id)
+            .ok_or(TrainingError::ExampleNotFound(example_id))?;
+        for tag in tags {
+            let tag = tag.trim();
+            if !tag.is_empty() && !example.tags.iter().any(|existing| existing == tag) {
+                example.tags.push(tag.to_string());
+            }
+        }
+        example.tags.sort();
+        example.updated_at = Utc::now();
+        Ok(example.clone())
     }
 
     async fn set_quality_score(
         &self,
         example_id: Uuid,
-        _score: f32,
+        score: f32,
     ) -> Result<DecisionTrainingExample, TrainingError> {
-        // TODO: 实现质量分数设置逻辑
-        Err(TrainingError::ExampleNotFound(example_id))
+        if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+            return Err(TrainingError::InvalidSnapshot(
+                "quality score must be between 0 and 1".to_string(),
+            ));
+        }
+        let mut examples = self.examples.lock().await;
+        let example = examples
+            .get_mut(&example_id)
+            .ok_or(TrainingError::ExampleNotFound(example_id))?;
+        example.quality_score = Some(score);
+        example.updated_at = Utc::now();
+        Ok(example.clone())
     }
 
     async fn scrub_deleted_comments(
         &self,
-        _company_id: Uuid,
-        _older_than_days: i64,
+        company_id: Uuid,
+        older_than_days: i64,
     ) -> Result<usize, TrainingError> {
-        // TODO: 实现清理逻辑
-        // 1. 找到所有包含已删除评论的训练样本
-        // 2. 从snapshot中移除这些评论
-        // 3. 返回清理数量
-        Ok(0)
+        let cutoff = Utc::now() - chrono::Duration::days(older_than_days.max(0));
+        let mut scrubbed = 0;
+        let mut examples = self.examples.lock().await;
+        for example in examples
+            .values_mut()
+            .filter(|example| example.company_id == company_id && example.cutoff_at <= cutoff)
+        {
+            let before = example.snapshot.context.thread_messages.len();
+            example
+                .snapshot
+                .context
+                .thread_messages
+                .retain(|message| !message.content.trim().is_empty());
+            if before != example.snapshot.context.thread_messages.len() {
+                scrubbed += before - example.snapshot.context.thread_messages.len();
+                example.updated_at = Utc::now();
+            }
+        }
+        Ok(scrubbed)
     }
 }
 
@@ -329,14 +393,69 @@ mod tests {
     #[tokio::test]
     async fn test_capture_snapshot() {
         let service = DefaultDecisionTrainingService::new();
+        let company_id = Uuid::new_v4();
         let input = CaptureInput {
-            company_id: Uuid::new_v4(),
+            company_id,
             source_kind: DecisionTrainingSourceKind::IssueExecutionDecision,
             source_id: "test-123".to_string(),
         };
 
-        let result = service.capture_snapshot(input).await;
-        assert!(result.is_ok());
+        let result = service.capture_snapshot(input).await.unwrap();
+        assert_eq!(
+            service.get_example(result.id).await.unwrap().unwrap().id,
+            result.id
+        );
+        assert_eq!(
+            service
+                .list_examples(ListInput {
+                    company_id,
+                    source_kind: None,
+                    limit: None,
+                    offset: None,
+                })
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_tags_and_quality_are_idempotent_and_validated() {
+        let service = DefaultDecisionTrainingService::new();
+        let example = service
+            .capture_snapshot(CaptureInput {
+                company_id: Uuid::new_v4(),
+                source_kind: DecisionTrainingSourceKind::IssueApproval,
+                source_id: "approval-1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let updated = service
+            .update_notes(example.id, "reviewed".to_string(), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(updated.notes.as_deref(), Some("reviewed"));
+        assert_eq!(updated.notes_history.len(), 1);
+
+        let tagged = service
+            .add_tags(
+                example.id,
+                vec![" important ".to_string(), "important".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(tagged.tags, vec!["important"]);
+        assert!(service.set_quality_score(example.id, 1.1).await.is_err());
+        assert_eq!(
+            service
+                .set_quality_score(example.id, 0.75)
+                .await
+                .unwrap()
+                .quality_score,
+            Some(0.75)
+        );
     }
 
     #[test]
