@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use chrono::{Datelike, Utc};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::errors::{ServiceError, ServiceResult};
@@ -43,6 +44,31 @@ pub trait StorageService: Send + Sync {
     async fn put_file(&self, req: PutFileRequest) -> ServiceResult<StoredObject>;
     async fn get_object(&self, company_id: Uuid, object_key: &str) -> ServiceResult<Vec<u8>>;
     async fn delete_object(&self, company_id: Uuid, object_key: &str) -> ServiceResult<()>;
+}
+
+/// Storage provider registry. Local disk is currently the only configured
+/// provider; unsupported provider names fail explicitly instead of silently
+/// writing objects to the wrong backend.
+pub struct StorageProviderRegistry {
+    local: Arc<LocalStorageService>,
+}
+
+impl StorageProviderRegistry {
+    pub fn from_env() -> Self {
+        Self {
+            local: Arc::new(LocalStorageService::from_env()),
+        }
+    }
+
+    pub fn provider(&self, name: Option<&str>) -> ServiceResult<Arc<dyn StorageService>> {
+        let configured = std::env::var("PARROT_STORAGE_PROVIDER").ok();
+        match name.or(configured.as_deref()).unwrap_or("local").trim().to_ascii_lowercase().as_str() {
+            "local" | "local_disk" => Ok(self.local.clone()),
+            other => Err(ServiceError::NotImplemented(format!(
+                "storage provider '{other}' is not configured"
+            ))),
+        }
+    }
 }
 
 /// 存储根目录：`PARROT_ASSET_STORAGE_DIR`，默认 `data/assets`。
@@ -327,6 +353,16 @@ mod tests {
         assert!(!object_key_belongs_to_company(
             &format!("{}/../{}/x.png", a, b),
             a
+        ));
+    }
+
+    #[test]
+    fn provider_registry_is_explicit() {
+        let registry = StorageProviderRegistry::from_env();
+        assert!(registry.provider(Some("local")).is_ok());
+        assert!(matches!(
+            registry.provider(Some("s3")),
+            Err(ServiceError::NotImplemented(_))
         ));
     }
 

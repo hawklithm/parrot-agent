@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use crate::routes::attachments::{build_content_response, read_single_file_field};
-use services::asset_storage::{LocalStorageService, PutFileRequest, StorageService};
+use services::asset_storage::{PutFileRequest, StorageProviderRegistry};
 use services::attachment_types::{
     is_allowed_content_type, is_safe_svg, max_attachment_bytes,
     normalize_upload_attachment_content_type, ALLOWED_COMPANY_LOGO_CONTENT_TYPES, SVG_CONTENT_TYPE,
@@ -165,7 +165,7 @@ async fn get_asset_content(
     crate::routes::assert_company_access(&actor, company_id, true)
         .map_err(|_| AppError::Forbidden("No access to this company".to_string()))?;
 
-    let storage = LocalStorageService::from_env();
+    let storage = StorageProviderRegistry::from_env().provider(None)?;
     let data = storage.get_object(company_id, &object_key).await?;
 
     let force_download = matches!(
@@ -209,7 +209,7 @@ async fn store_asset(
     original_filename: Option<&str>,
     body: Vec<u8>,
 ) -> Result<serde_json::Value, AppError> {
-    let storage = LocalStorageService::from_env();
+    let storage = StorageProviderRegistry::from_env().provider(None)?;
     let stored = storage
         .put_file(PutFileRequest {
             company_id,
