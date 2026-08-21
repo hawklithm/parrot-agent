@@ -418,6 +418,7 @@ pub use job_scheduler::{
     StatusCardSchedulerJob, SummarySlotFinalizerJob,
     HeartbeatRecoveryJob, SchedulerExecutionHistoryCleanupJob, SchedulerLeaseRepairJob,
     RecoveryActionRetryJob,
+    DecisionTrainingCommentScrubJob,
     monitor_backoff_seconds, is_env_stale, is_run_stuck, ENV_IDLE_TIMEOUT,
 };
 pub mod status_card_worker;

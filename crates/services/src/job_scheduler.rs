@@ -10,6 +10,7 @@
 //! - EnvironmentHealthProber: 探测环境健康（每 5 分钟）
 //! - ConsistencyCheckJob: 一致性检查（每小时）
 //! - RecoveryActionRetryJob: 恢复动作巡检与指数退避（每分钟）
+//! - DecisionTrainingCommentScrubJob: 清理训练快照中的已删除评论（每天）
 
 use crate::DefaultHeartbeatService;
 use crate::RoutineExecutionService;
@@ -207,6 +208,108 @@ pub struct HeartbeatRecoveryJob {
 /// Reconcile pending recovery actions and persist retry/backoff state.
 pub struct RecoveryActionRetryJob {
     pool: PgPool,
+}
+
+/// Remove deleted issue comments from retained decision-training snapshots.
+pub struct DecisionTrainingCommentScrubJob {
+    pool: PgPool,
+}
+
+impl DecisionTrainingCommentScrubJob {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for DecisionTrainingCommentScrubJob {
+    fn job_name(&self) -> &str {
+        "decision_training_comment_scrub"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(86_400)
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        let rows = sqlx::query(
+            "SELECT id, company_id, snapshot
+               FROM decision_training_examples
+              WHERE cutoff_at <= NOW() - INTERVAL '30 days'
+              ORDER BY cutoff_at ASC
+              LIMIT 500",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("failed to list training snapshots: {error}"))?;
+
+        let mut scrubbed_comments = 0usize;
+        let mut updated_examples = 0usize;
+        for row in rows {
+            let example_id: Uuid = row.try_get("id").map_err(|error| error.to_string())?;
+            let company_id: Uuid = row.try_get("company_id").map_err(|error| error.to_string())?;
+            let mut snapshot: serde_json::Value = row.try_get("snapshot").map_err(|error| error.to_string())?;
+            let Some(comments) = snapshot.get_mut("comments").and_then(|value| value.as_array_mut()) else {
+                continue;
+            };
+
+            let comment_ids: Vec<Uuid> = comments
+                .iter()
+                .filter_map(|comment| comment.get("id").and_then(|id| id.as_str()))
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect();
+            if comment_ids.is_empty() {
+                continue;
+            }
+
+            let existing_ids: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM issue_comments WHERE id = ANY($1::uuid[])",
+            )
+            .bind(&comment_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| format!("failed to inspect comments for training example {example_id}: {error}"))?;
+            let existing_ids: std::collections::HashSet<Uuid> = existing_ids.into_iter().collect();
+            let before = comments.len();
+            comments.retain(|comment| {
+                comment
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .is_none_or(|id| existing_ids.contains(&id))
+            });
+            let removed = before.saturating_sub(comments.len());
+            if removed == 0 {
+                continue;
+            }
+
+            sqlx::query(
+                "UPDATE decision_training_examples
+                    SET snapshot = $1, updated_at = NOW()
+                  WHERE id = $2",
+            )
+            .bind(&snapshot)
+            .bind(example_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| format!("failed to scrub training example {example_id}: {error}"))?;
+            record_activity(
+                &self.pool,
+                company_id,
+                "decision_training.comments_scrubbed",
+                "system",
+                Uuid::nil(),
+                "decision_training_example",
+                example_id,
+                serde_json::json!({ "removedComments": removed }),
+            )
+            .await;
+            scrubbed_comments += removed;
+            updated_examples += 1;
+        }
+
+        Ok(format!("scrubbed {scrubbed_comments} comments in {updated_examples} training examples"))
+    }
 }
 
 impl RecoveryActionRetryJob {
