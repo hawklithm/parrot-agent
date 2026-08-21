@@ -9,6 +9,7 @@
 //! - LeaseExpiryScanner: 扫描过期租约（每分钟）
 //! - EnvironmentHealthProber: 探测环境健康（每 5 分钟）
 //! - ConsistencyCheckJob: 一致性检查（每小时）
+//! - RecoveryActionRetryJob: 恢复动作巡检与指数退避（每分钟）
 
 use crate::DefaultHeartbeatService;
 use crate::RoutineExecutionService;
@@ -201,6 +202,151 @@ pub trait ScheduledJob: Send + Sync {
 
 pub struct HeartbeatRecoveryJob {
     heartbeat: Arc<DefaultHeartbeatService>,
+}
+
+/// Reconcile pending recovery actions and persist retry/backoff state.
+pub struct RecoveryActionRetryJob {
+    pool: PgPool,
+}
+
+impl RecoveryActionRetryJob {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for RecoveryActionRetryJob {
+    fn job_name(&self) -> &str {
+        "recovery_action_retry"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(60)
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        const BATCH_SIZE: i64 = 100;
+        const MAX_RETRIES: i32 = 5;
+        const BASE_BACKOFF_SECONDS: i64 = 300;
+        const MAX_BACKOFF_SECONDS: i64 = 7_200;
+
+        let rows = sqlx::query(
+            "SELECT id FROM recovery_actions
+              WHERE status IN ('pending', 'in_progress')
+                AND next_retry_at <= NOW()
+              ORDER BY next_retry_at ASC
+              LIMIT $1",
+        )
+        .bind(BATCH_SIZE)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("failed to list due recovery actions: {error}"))?;
+
+        let mut resolved = 0usize;
+        let mut deferred = 0usize;
+        let mut failed = 0usize;
+
+        for row in rows {
+            let id: Uuid = row.try_get("id").map_err(|error| error.to_string())?;
+            let Some(claimed) = sqlx::query(
+                "UPDATE recovery_actions
+                    SET status = 'in_progress',
+                        retry_count = retry_count + 1,
+                        last_attempt_at = NOW(),
+                        next_retry_at = NOW() + INTERVAL '1 year',
+                        last_error = NULL,
+                        updated_at = NOW()
+                  WHERE id = $1
+                    AND status IN ('pending', 'in_progress')
+                    AND next_retry_at <= NOW()
+               RETURNING company_id, issue_id, retry_count, action_type",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| format!("failed to claim recovery action {id}: {error}"))?
+            else {
+                continue;
+            };
+
+            let company_id: Uuid = claimed.try_get("company_id").map_err(|error| error.to_string())?;
+            let issue_id: Uuid = claimed.try_get("issue_id").map_err(|error| error.to_string())?;
+            let retry_count: i32 = claimed.try_get("retry_count").map_err(|error| error.to_string())?;
+            let action_type: String = claimed.try_get("action_type").map_err(|error| error.to_string())?;
+
+            let issue = sqlx::query(
+                "SELECT status, execution_locked_at, assignee_agent_id, assignee_user_id
+                   FROM issues WHERE id = $1 AND company_id = $2",
+            )
+            .bind(issue_id)
+            .bind(company_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| format!("failed to load issue for recovery action {id}: {error}"))?;
+
+            let should_resolve = issue.as_ref().is_some_and(|issue| {
+                let status: String = issue.try_get("status").unwrap_or_default();
+                let locked: Option<chrono::DateTime<Utc>> = issue.try_get("execution_locked_at").ok();
+                let agent: Option<Uuid> = issue.try_get("assignee_agent_id").ok();
+                let user: Option<Uuid> = issue.try_get("assignee_user_id").ok();
+                match action_type.as_str() {
+                    "unblock" => status != "blocked",
+                    "stale_execution" => status != "in_progress" || locked.is_none(),
+                    "missing_assignee" => agent.is_some() || user.is_some(),
+                    "general" => status == "done" || status == "cancelled",
+                    _ => false,
+                }
+            });
+
+            if should_resolve {
+                sqlx::query(
+                    "UPDATE recovery_actions
+                        SET status = 'resolved', resolved_at = NOW(), next_retry_at = NOW(), updated_at = NOW()
+                      WHERE id = $1",
+                )
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|error| format!("failed to resolve recovery action {id}: {error}"))?;
+                resolved += 1;
+                continue;
+            }
+
+            if retry_count >= MAX_RETRIES {
+                sqlx::query(
+                    "UPDATE recovery_actions
+                        SET status = 'failed',
+                            last_error = 'recovery retry limit exceeded',
+                            updated_at = NOW()
+                      WHERE id = $1",
+                )
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|error| format!("failed to mark recovery action {id}: {error}"))?;
+                failed += 1;
+            } else {
+                let backoff = (BASE_BACKOFF_SECONDS * (1_i64 << (retry_count - 1).min(5) as u32))
+                    .min(MAX_BACKOFF_SECONDS);
+                sqlx::query(
+                    "UPDATE recovery_actions
+                        SET status = 'pending',
+                            next_retry_at = NOW() + ($2 * INTERVAL '1 second'),
+                            updated_at = NOW()
+                      WHERE id = $1",
+                )
+                .bind(id)
+                .bind(backoff)
+                .execute(&self.pool)
+                .await
+                .map_err(|error| format!("failed to defer recovery action {id}: {error}"))?;
+                deferred += 1;
+            }
+        }
+
+        Ok(format!("resolved {resolved}, deferred {deferred}, failed {failed} recovery actions"))
+    }
 }
 
 /// Periodic cleanup for durable scheduler history.
