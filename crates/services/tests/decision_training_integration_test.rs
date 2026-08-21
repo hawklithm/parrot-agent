@@ -1,7 +1,7 @@
 use chrono::Utc;
 use services::decision_training_service::{
-    DecisionTrainingService, DecisionTrainingSourceKind, ListInput, PersistSnapshotInput,
-    PgDecisionTrainingService, UpdateInput,
+    CaptureInput, DecisionTrainingService, DecisionTrainingSourceKind, ListInput,
+    PersistSnapshotInput, PgDecisionTrainingService, UpdateInput,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -101,6 +101,106 @@ async fn decision_training_service_round_trip_is_durable_and_scoped() {
 
     assert!(service.delete_example(example_id).await.expect("delete example"));
     assert!(service.get_example(example_id).await.unwrap().is_none());
+
+    sqlx::query("DELETE FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup issue");
+    sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup company");
+}
+
+#[tokio::test]
+async fn decision_training_capture_preserves_paperclip_context_shape() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping decision training capture integration test: DATABASE_URL is not set");
+        return;
+    };
+    let pool = PgPool::connect(&database_url).await.expect("connect database");
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .expect("run migrations");
+
+    let company_id = Uuid::new_v4();
+    let issue_id = Uuid::new_v4();
+    let source_id = Uuid::new_v4();
+    let comment_id = Uuid::new_v4();
+    let prefix = format!("DC{}", &company_id.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Decision Capture Integration Company")
+        .bind(&prefix)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+    sqlx::query("INSERT INTO issues (id, company_id, title, identifier) VALUES ($1, $2, $3, $4)")
+        .bind(issue_id)
+        .bind(company_id)
+        .bind("Capture integration issue")
+        .bind(format!("{prefix}-1"))
+        .execute(&pool)
+        .await
+        .expect("insert issue");
+    sqlx::query(
+        "INSERT INTO issue_thread_interactions
+            (id, company_id, issue_id, kind, status, payload, title, summary)
+         VALUES ($1, $2, $3, 'question', 'pending', $4, $5, $6)",
+    )
+    .bind(source_id)
+    .bind(company_id)
+    .bind(issue_id)
+    .bind(serde_json::json!({"question": "Should this be reviewed?"}))
+    .bind("Review question")
+    .bind("Capture source summary")
+    .execute(&pool)
+    .await
+    .expect("insert interaction");
+    sqlx::query(
+        "INSERT INTO issue_comments (id, company_id, issue_id, body, actor_type, metadata)
+         VALUES ($1, $2, $3, $4, 'system', $5)",
+    )
+    .bind(comment_id)
+    .bind(company_id)
+    .bind(issue_id)
+    .bind("A retained decision-training comment")
+    .bind(serde_json::json!({"source": "integration"}))
+    .execute(&pool)
+    .await
+    .expect("insert comment");
+
+    let service = PgDecisionTrainingService::new(pool.clone());
+    let example = service
+        .capture_snapshot(CaptureInput {
+            company_id,
+            source_kind: DecisionTrainingSourceKind::IssueThreadInteraction,
+            source_id: source_id.to_string(),
+        })
+        .await
+        .expect("capture snapshot");
+
+    assert_eq!(example.raw_snapshot["version"], 1);
+    assert_eq!(
+        example.raw_snapshot["issue"]["title"],
+        "Capture integration issue"
+    );
+    assert_eq!(
+        example.raw_snapshot["comments"][0]["id"],
+        comment_id.to_string()
+    );
+    assert_eq!(
+        example.raw_snapshot["comments"][0]["body"],
+        "A retained decision-training comment"
+    );
+    assert_eq!(example.raw_snapshot["decision"]["kind"], "interaction");
+    assert_eq!(
+        example.snapshot.context.thread_messages[0].content,
+        "A retained decision-training comment"
+    );
 
     sqlx::query("DELETE FROM issues WHERE id = $1")
         .bind(issue_id)

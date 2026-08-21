@@ -340,6 +340,23 @@ impl PgDecisionTrainingService {
         })
     }
 
+    fn find_commit_sha(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(map) => {
+                for key in ["commitSha", "commit_sha", "commit"] {
+                    if let Some(sha) = map.get(key).and_then(Value::as_str) {
+                        if sha.len() >= 7 && sha.chars().all(|character| character.is_ascii_hexdigit()) {
+                            return Some(sha.to_string());
+                        }
+                    }
+                }
+                map.values().find_map(Self::find_commit_sha)
+            }
+            Value::Array(values) => values.iter().find_map(Self::find_commit_sha),
+            _ => None,
+        }
+    }
+
     async fn load_example(&self, example_id: Uuid) -> Result<Option<DecisionTrainingExample>, TrainingError> {
         let row = sqlx::query(
             "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, notes,
@@ -548,7 +565,12 @@ impl DecisionTrainingService for PgDecisionTrainingService {
 
         let (issue_id, agent_id, source_payload, outcome, cutoff_at) = self.source_context(&input).await?;
         let now = Utc::now();
-        let issue = sqlx::query("SELECT title, status::text AS status FROM issues WHERE id = $1 AND company_id = $2")
+        let issue = sqlx::query(
+            "SELECT id, company_id, project_id, parent_id, title, description, status::text AS status,
+                    work_mode::text AS work_mode, priority::text AS priority, assignee_agent_id,
+                    assignee_user_id, responsible_user_id, identifier, issue_number, created_at, updated_at
+               FROM issues WHERE id = $1 AND company_id = $2",
+        )
             .bind(issue_id)
             .bind(input.company_id)
             .fetch_optional(&self.pool)
@@ -559,48 +581,125 @@ impl DecisionTrainingService for PgDecisionTrainingService {
                 id: input.source_id.clone(),
             })?;
         let comments = sqlx::query(
-            "SELECT id, actor_type::text AS actor_type, body, created_at
-               FROM issue_comments WHERE issue_id = $1 AND created_at <= $2
+            "SELECT id, issue_id, body, actor_type::text AS actor_type, actor_id, actor_run_id,
+                    metadata, created_at, updated_at
+               FROM issue_comments WHERE company_id = $3 AND issue_id = $1 AND created_at <= $2
               ORDER BY created_at ASC, id ASC",
         )
-        .bind(issue_id)
+            .bind(issue_id)
+            .bind(cutoff_at)
+            .bind(input.company_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Self::db_error)?;
+        let comments: Vec<Value> = comments
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "issueId": row.get::<Uuid, _>("issue_id"),
+                    "body": row.try_get::<Option<String>, _>("body").unwrap_or(None),
+                    "actorType": row.try_get::<Option<String>, _>("actor_type").unwrap_or(None),
+                    "actorId": row.try_get::<Option<Uuid>, _>("actor_id").unwrap_or(None),
+                    "actorRunId": row.try_get::<Option<Uuid>, _>("actor_run_id").unwrap_or(None),
+                    "metadata": row.try_get::<Option<Value>, _>("metadata").unwrap_or(None),
+                    "createdAt": row.get::<DateTime<Utc>, _>("created_at"),
+                    "updatedAt": row.get::<DateTime<Utc>, _>("updated_at"),
+                })
+            })
+            .collect();
+        let runs = sqlx::query(
+            "SELECT id, agent_id, status::text AS status, invocation_source, context_snapshot,
+                    error, started_at, finished_at, created_at, updated_at
+               FROM heartbeat_runs
+              WHERE company_id = $1 AND context_snapshot->>'issueId' = $2 AND updated_at <= $3
+              ORDER BY created_at ASC",
+        )
+        .bind(input.company_id)
+        .bind(issue_id.to_string())
         .bind(cutoff_at)
         .fetch_all(&self.pool)
         .await
         .map_err(Self::db_error)?;
-        let thread_messages: Vec<ThreadMessage> = comments
-            .into_iter()
-            .filter_map(|row| {
-                Some(ThreadMessage {
-                    id: row.try_get("id").ok()?,
-                    role: row.try_get::<String, _>("actor_type").ok()?,
-                    content: row.try_get::<Option<String>, _>("body").ok()?.unwrap_or_default(),
-                    created_at: row.try_get("created_at").ok()?,
+        let runs: Vec<Value> = runs
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "agentId": row.get::<Uuid, _>("agent_id"),
+                    "status": row.get::<String, _>("status"),
+                    "invocationSource": row.try_get::<Option<String>, _>("invocation_source").unwrap_or(None),
+                    "contextSnapshot": row.try_get::<Option<Value>, _>("context_snapshot").unwrap_or(None),
+                    "error": row.try_get::<Option<String>, _>("error").unwrap_or(None),
+                    "startedAt": row.try_get::<Option<DateTime<Utc>>, _>("started_at").unwrap_or(None),
+                    "finishedAt": row.try_get::<Option<DateTime<Utc>>, _>("finished_at").unwrap_or(None),
+                    "createdAt": row.get::<DateTime<Utc>, _>("created_at"),
+                    "updatedAt": row.get::<DateTime<Utc>, _>("updated_at"),
                 })
             })
             .collect();
-        let snapshot = serde_json::to_value(DecisionTrainingSnapshotV1 {
-            version: "v1".to_string(),
-            decision_id: source_id,
-            source_kind: input.source_kind.clone(),
-            source_id: input.source_id.clone(),
-            company_id: input.company_id,
-            issue_id: Some(issue_id),
-            agent_id,
-            decision_spec: source_payload,
-            decision_outcome: outcome.clone(),
-            context: DecisionContext {
-                issue_title: issue.try_get("title").unwrap_or(None),
-                issue_status: issue.try_get("status").unwrap_or(None),
-                workspace_type: None,
-                agent_role: None,
-                thread_messages,
-                related_approvals: vec![],
+        let nearest_commit = runs
+            .iter()
+            .rev()
+            .find_map(|run| run.pointer("/contextSnapshot").and_then(Self::find_commit_sha));
+        let commit_sha = nearest_commit.clone();
+        let resolution = if nearest_commit.is_some() { "nearest_run" } else { "none" };
+        let issue_json = serde_json::json!({
+            "id": issue.get::<Uuid, _>("id"),
+            "companyId": issue.get::<Uuid, _>("company_id"),
+            "projectId": issue.try_get::<Option<Uuid>, _>("project_id").unwrap_or(None),
+            "parentId": issue.try_get::<Option<Uuid>, _>("parent_id").unwrap_or(None),
+            "title": issue.get::<String, _>("title"),
+            "description": issue.try_get::<Option<String>, _>("description").unwrap_or(None),
+            "status": issue.try_get::<Option<String>, _>("status").unwrap_or(None),
+            "workMode": issue.try_get::<Option<String>, _>("work_mode").unwrap_or(None),
+            "priority": issue.try_get::<Option<String>, _>("priority").unwrap_or(None),
+            "assigneeAgentId": issue.try_get::<Option<Uuid>, _>("assignee_agent_id").unwrap_or(None),
+            "assigneeUserId": issue.try_get::<Option<Uuid>, _>("assignee_user_id").unwrap_or(None),
+            "responsibleUserId": issue.try_get::<Option<Uuid>, _>("responsible_user_id").unwrap_or(None),
+            "identifier": issue.try_get::<Option<String>, _>("identifier").unwrap_or(None),
+            "issueNumber": issue.try_get::<Option<i32>, _>("issue_number").unwrap_or(None),
+            "createdAt": issue.get::<DateTime<Utc>, _>("created_at"),
+            "updatedAt": issue.get::<DateTime<Utc>, _>("updated_at"),
+        });
+        let snapshot = serde_json::json!({
+            "version": 1,
+            "retention": {
+                "policy": "scrub_deleted_comments_v1",
+                "commentDeletion": "redact",
+                "issueDeletion": "cascade",
             },
-            captured_at: now,
-            commit_sha: None,
-        })
-        .map_err(|e| TrainingError::SerializationError(e.to_string()))?;
+            "capturedAt": now,
+            "cutoff": {
+                "at": cutoff_at,
+                "lastCommentId": comments.last().and_then(|comment| comment.get("id")).cloned(),
+                "commentCount": comments.len(),
+            },
+            "issue": issue_json,
+            "comments": comments,
+            "runs": runs,
+            "decision": {
+                "kind": Self::source_kind_name(&input.source_kind),
+                "payload": source_payload,
+                "actor": { "agentId": agent_id },
+                "outcome": outcome,
+            },
+            "code": {
+                "repoUrl": Value::Null,
+                "ref": Value::Null,
+                "commitSha": commit_sha,
+                "resolution": resolution,
+            },
+        });
+        let _ = Self::parse_snapshot(
+            snapshot.clone(),
+            Self::source_kind_name(&input.source_kind),
+            source_id,
+            input.company_id,
+            issue_id,
+            outcome.clone(),
+            now,
+        )?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO decision_training_examples
                 (company_id, source_kind, source_id, issue_id, cutoff_at, notes,
