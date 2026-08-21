@@ -48,8 +48,9 @@ pub mod decision_retention_sweep_job;
 pub mod decision_signing_service;
 pub mod decision_training_service;
 pub use decision_training_service::{
-    DecisionTrainingExample, DecisionTrainingService, DecisionTrainingSourceKind, DefaultDecisionTrainingService,
-    PersistSnapshotInput, PgDecisionTrainingService, TrainingError, UpdateInput,
+    CaptureInput, DecisionTrainingExample, DecisionTrainingService, DecisionTrainingSourceKind,
+    DefaultDecisionTrainingService, PersistSnapshotInput, PgDecisionTrainingService, PreviewInput,
+    PreviewSnapshot, TrainingError, UpdateInput,
 };
 pub mod decision_wakeup_service;
 pub mod cross_issue_influence_limit_service;

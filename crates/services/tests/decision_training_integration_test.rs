@@ -1,7 +1,7 @@
 use chrono::Utc;
 use services::decision_training_service::{
     CaptureInput, DecisionTrainingService, DecisionTrainingSourceKind, ListInput,
-    PersistSnapshotInput, PgDecisionTrainingService, UpdateInput,
+    PersistSnapshotInput, PgDecisionTrainingService, PreviewInput, UpdateInput,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -186,6 +186,7 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
             quality_score: Some(0.75),
             retention_policy: Some("scrub_deleted_comments_v1".to_string()),
             created_by_user_id: Some(creator_id.to_string()),
+            persist: true,
         })
         .await
         .expect("capture snapshot");
@@ -208,6 +209,31 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
         example.snapshot.context.thread_messages[0].content,
         "A retained decision-training comment"
     );
+    let persisted_before_preview: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM decision_training_examples WHERE company_id = $1",
+    )
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count persisted examples");
+    let preview = service
+        .preview_snapshot(PreviewInput {
+            company_id,
+            source_kind: DecisionTrainingSourceKind::IssueThreadInteraction,
+            source_id: source_id.to_string(),
+            issue_id: Some(issue_id),
+        })
+        .await
+        .expect("preview snapshot");
+    assert_eq!(preview.snapshot["comments"][0]["id"], comment_id.to_string());
+    let persisted_after_preview: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM decision_training_examples WHERE company_id = $1",
+    )
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count examples after preview");
+    assert_eq!(persisted_after_preview, persisted_before_preview);
     let duplicate = service
         .capture_snapshot(CaptureInput {
             company_id,
@@ -219,6 +245,7 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
             quality_score: Some(0.75),
             retention_policy: Some("scrub_deleted_comments_v1".to_string()),
             created_by_user_id: Some(creator_id.to_string()),
+            persist: true,
         })
         .await
         .expect_err("same user/source capture must be rejected");

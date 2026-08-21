@@ -30,7 +30,7 @@ use crate::app_state::AppState;
 use crate::errors::AppError;
 use services::auth::{decide_access, AuthorizationAction, AuthorizationActor};
 use services::decision_training_service::{
-    CaptureInput, DecisionTrainingSourceKind, ListInput, TrainingError, UpdateInput,
+    CaptureInput, DecisionTrainingSourceKind, ListInput, PreviewInput, TrainingError, UpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -4603,6 +4603,7 @@ async fn create_decision_training(
             quality_score: input.quality_score,
             retention_policy: Some(DECISION_TRAINING_RETENTION_POLICY.to_string()),
             created_by_user_id: Some(user_id.clone()),
+            persist: true,
         })
         .await
         .map_err(|error| match error {
@@ -4662,14 +4663,16 @@ async fn preview_decision_training(
         )));
     }
 
-    let captured = capture_decision_snapshot(
-        &state.pool,
-        company_id,
-        &input.source_kind,
-        input.source_id,
-        input.issue_id,
-    )
-    .await?;
+    let captured = state
+        .decision_training_service
+        .preview_snapshot(PreviewInput {
+            company_id,
+            source_kind: training_source_kind(&input.source_kind)?,
+            source_id: input.source_id.to_string(),
+            issue_id: Some(input.issue_id),
+        })
+        .await
+        .map_err(training_service_err)?;
 
     Ok(Json(json!({
         "cutoffAt": iso(captured.cutoff_at),
