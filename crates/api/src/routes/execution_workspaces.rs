@@ -209,6 +209,7 @@ async fn get_workspace_overview(
 /// GET /execution-workspaces/:id
 async fn get_execution_workspace(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ExecutionWorkspaceError> {
     let pool = &state.pool;
@@ -224,7 +225,12 @@ async fn get_execution_workspace(
     .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
 
     match row {
-        Some(r) => Ok(Json(json!({
+        Some(r) => {
+            let company_id: Uuid = r.get("company_id");
+            require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| {
+                ExecutionWorkspaceError::Forbidden("Workspace company access denied".to_string())
+            })?;
+            Ok(Json(json!({
             "id": r.get::<Uuid, _>("id"),
             "companyId": r.get::<Uuid, _>("company_id"),
             "projectId": r.get::<Option<Uuid>, _>("project_id"),
@@ -242,7 +248,8 @@ async fn get_execution_workspace(
             "metadata": r.get::<Option<Value>, _>("metadata"),
             "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
             "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
-        }))),
+            })))
+        }
         None => Err(ExecutionWorkspaceError::NotFound(id)),
     }
 }
@@ -253,6 +260,7 @@ async fn get_execution_workspace(
 /// runs reference it and it is not currently `running`.
 async fn get_close_readiness(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ExecutionWorkspaceError> {
     let pool = &state.pool;
@@ -272,6 +280,9 @@ async fn get_close_readiness(
 
     let status: String = ws.get("status");
     let company_id: Uuid = ws.get("company_id");
+    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| {
+        ExecutionWorkspaceError::Forbidden("Workspace company access denied".to_string())
+    })?;
 
     // Count live runs whose context references this workspace.
     let live_count: (i64,) = sqlx::query_as(

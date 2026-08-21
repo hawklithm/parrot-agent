@@ -31,6 +31,7 @@ use uuid::Uuid;
 use sqlx::Row;
 
 use crate::app_state::AppState;
+use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
 
 pub fn heartbeat_run_routes() -> Router<AppState> {
@@ -638,8 +639,17 @@ async fn submit_watchdog_decision(
 /// X10: GET /heartbeat-runs/:run_id/workspace-operations
 async fn list_run_workspace_operations(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM heartbeat_runs WHERE id = $1")
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?
+        .ok_or(HeartbeatRunError::NotFound(run_id))?;
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| HeartbeatRunError::Forbidden("Heartbeat run access denied".to_string()))?;
     let rows = sqlx::query("SELECT id, company_id, execution_workspace_id, heartbeat_run_id, issue_id, phase, command, cwd, status, exit_code, log_store, log_ref, log_bytes, log_sha256, log_compressed, stdout_excerpt, stderr_excerpt, metadata, started_at, finished_at, created_at, updated_at FROM workspace_operations WHERE heartbeat_run_id = $1 ORDER BY started_at ASC")
         .bind(run_id).fetch_all(&state.pool).await.map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
     let operations: Vec<Value> = rows.into_iter().map(|r| json!({
@@ -659,15 +669,19 @@ async fn list_run_workspace_operations(
 /// X11: GET /workspace-operations/:operation_id/log
 async fn get_workspace_operation_log(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(operation_id): Path<Uuid>,
     Query(q): Query<RunLogQuery>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let offset = q.offset.unwrap_or(0).max(0);
     let limit_bytes = q.limit_bytes.unwrap_or(256 * 1024).clamp(1, 16 * 1024 * 1024);
-    let row = sqlx::query("SELECT log_store, log_ref, stdout_excerpt, stderr_excerpt FROM workspace_operations WHERE id = $1")
+    let row = sqlx::query("SELECT company_id, log_store, log_ref, stdout_excerpt, stderr_excerpt FROM workspace_operations WHERE id = $1")
         .bind(operation_id).fetch_optional(&state.pool).await
         .map_err(|e| HeartbeatRunError::Database(e.to_string()))?
         .ok_or(HeartbeatRunError::NotFound(operation_id))?;
+    let company_id: Uuid = row.get("company_id");
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| HeartbeatRunError::Forbidden("Workspace operation access denied".to_string()))?;
     let store = row.get::<Option<String>, _>("log_store").unwrap_or_else(|| "database".into());
     let reference = row.get::<Option<String>, _>("log_ref");
     let content = match (&store[..], reference.as_deref()) {
@@ -737,6 +751,7 @@ pub enum HeartbeatRunError {
     NotFound(Uuid),
     Database(String),
     BadRequest(String),
+    Forbidden(String),
 }
 
 impl IntoResponse for HeartbeatRunError {
@@ -748,6 +763,7 @@ impl IntoResponse for HeartbeatRunError {
             ),
             HeartbeatRunError::Database(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             HeartbeatRunError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            HeartbeatRunError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
