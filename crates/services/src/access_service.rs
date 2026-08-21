@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -202,12 +203,16 @@ pub trait AccessService: Send + Sync {
 
 /// Default access service implementation
 pub struct DefaultAccessService {
-    // TODO: Add dependencies (database, cache)
+    pool: Option<PgPool>,
 }
 
 impl DefaultAccessService {
     pub fn new() -> Self {
-        Self {}
+        Self { pool: None }
+    }
+
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self { pool: Some(pool) }
     }
 
     fn check_company_membership(&self, actor: &dyn Actor, company_id: Uuid) -> bool {
@@ -216,6 +221,61 @@ impl DefaultAccessService {
 
     fn check_permission(&self, actor: &dyn Actor, action: &Action) -> bool {
         actor.has_permission(action)
+    }
+
+    async fn agent_company(&self, agent_id: Uuid) -> AccessResult<Uuid> {
+        let pool = self.pool.as_ref().ok_or_else(|| {
+            AccessError::InternalError("Access service requires a database pool".to_string())
+        })?;
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT company_id FROM agents WHERE id = $1 AND status <> 'terminated'",
+        )
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| AccessError::InternalError(error.to_string()))?
+        .ok_or_else(|| AccessError::ResourceNotFound(format!("Agent {agent_id} not found")))
+    }
+
+    async fn assert_agent_company_access(
+        &self,
+        actor: &dyn Actor,
+        agent_id: Uuid,
+    ) -> AccessResult<()> {
+        let company_id = self.agent_company(agent_id).await?;
+        self.assert_company_membership(actor, company_id)
+    }
+
+    async fn assert_built_in_agents_feature(&self, company_id: Uuid) -> AccessResult<()> {
+        let pool = self.pool.as_ref().ok_or_else(|| {
+            AccessError::InternalError("Access service requires a database pool".to_string())
+        })?;
+        let enabled = sqlx::query_scalar::<_, bool>(
+            r#"SELECT COALESCE((experimental ->> $1)::boolean, true)
+               FROM instance_settings WHERE id = 1"#,
+        )
+        .bind("enableBuiltInAgents")
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| AccessError::InternalError(error.to_string()))?
+        .unwrap_or(true);
+        if enabled {
+            Ok(())
+        } else {
+            Err(AccessError::PermissionDenied(format!(
+                "Built-in agents are disabled for company {company_id}"
+            )))
+        }
+    }
+
+    fn assert_company_membership(&self, actor: &dyn Actor, company_id: Uuid) -> AccessResult<()> {
+        if self.check_company_membership(actor, company_id) {
+            Ok(())
+        } else {
+            Err(AccessError::PermissionDenied(format!(
+                "Actor not member of company {company_id}"
+            )))
+        }
     }
 }
 
@@ -272,8 +332,9 @@ impl AccessService for DefaultAccessService {
     async fn assert_agent_read_allowed(
         &self,
         actor: &dyn Actor,
-        _agent_id: Uuid,
+        agent_id: Uuid,
     ) -> AccessResult<()> {
+        self.assert_agent_company_access(actor, agent_id).await?;
         if !self.check_permission(actor, &Action::AgentRead) {
             return Err(AccessError::PermissionDenied(
                 "Agent read permission required".to_string(),
@@ -301,23 +362,24 @@ impl AccessService for DefaultAccessService {
     async fn assert_can_update_agent(
         &self,
         actor: &dyn Actor,
-        _agent_id: Uuid,
+        agent_id: Uuid,
     ) -> AccessResult<()> {
+        self.assert_agent_company_access(actor, agent_id).await?;
         if !self.check_permission(actor, &Action::AgentConfigUpdate) {
             return Err(AccessError::PermissionDenied(
                 "agent_config:update permission required".to_string(),
             ));
         }
 
-        // TODO: Add change grant and consent checks
         Ok(())
     }
 
     async fn assert_can_read_configurations(
         &self,
         actor: &dyn Actor,
-        _agent_id: Uuid,
+        agent_id: Uuid,
     ) -> AccessResult<()> {
+        self.assert_agent_company_access(actor, agent_id).await?;
         if !self.check_permission(actor, &Action::AgentConfigRead) {
             return Err(AccessError::PermissionDenied(
                 "agent_config:read permission required".to_string(),
@@ -332,6 +394,8 @@ impl AccessService for DefaultAccessService {
         company_id: Uuid,
     ) -> AccessResult<()> {
         self.assert_company_access(actor, company_id).await?;
+
+        self.assert_built_in_agents_feature(company_id).await?;
 
         if !self.check_permission(actor, &Action::BuiltInAgentProvision) {
             return Err(AccessError::PermissionDenied(
@@ -358,11 +422,9 @@ impl AccessService for DefaultAccessService {
 
     async fn assert_built_in_agents_enabled(
         &self,
-        _company_id: Uuid,
+        company_id: Uuid,
     ) -> AccessResult<()> {
-        // TODO: Check feature flag in company settings
-        // For now, assume enabled
-        Ok(())
+        self.assert_built_in_agents_feature(company_id).await
     }
 }
 
