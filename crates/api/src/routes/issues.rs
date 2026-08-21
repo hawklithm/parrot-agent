@@ -1525,11 +1525,111 @@ async fn create_issue(
     // Paperclip takes the company scope from the URL. The body must not need
     // to repeat companyId, and the path is authoritative if it is supplied.
     input.company_id = company_id;
+    let idempotency_key = input
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned);
+    if idempotency_key.as_ref().is_some_and(|key| key.len() > 255) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    // Keep a session-level advisory lock on a checked-out connection while the
+    // service creates the Issue, then persist the key. This closes the race
+    // between replay lookup and creation without changing the repository API.
+    let mut idempotency_connection = if let Some(key) = idempotency_key.as_deref() {
+        let mut connection = state
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let lock_key = format!("issue-create:{company_id}:{key}");
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(&lock_key)
+            .execute(&mut *connection)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let existing_issue_id: Option<Uuid> = match sqlx::query_scalar(
+            "SELECT issue_id FROM issue_create_idempotency_keys WHERE company_id = $1 AND idempotency_key = $2",
+        )
+        .bind(company_id)
+        .bind(key)
+        .fetch_optional(&mut *connection)
+        .await
+        {
+            Ok(issue_id) => issue_id,
+            Err(_) => {
+                let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .execute(&mut *connection)
+                    .await;
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        if let Some(existing_issue_id) = existing_issue_id {
+            let existing_issue = match state
+                .issue_service
+                .get(existing_issue_id, company_id)
+                .await
+            {
+                Ok(Some(issue)) => issue,
+                Ok(None) => {
+                    let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                        .bind(&lock_key)
+                        .execute(&mut *connection)
+                        .await;
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                Err(_) => {
+                    let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                        .bind(&lock_key)
+                        .execute(&mut *connection)
+                        .await;
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
+            sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                .bind(&lock_key)
+                .execute(&mut *connection)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(Json(existing_issue));
+        }
+        Some((connection, lock_key))
+    } else {
+        None
+    };
     let service = state.issue_service.clone();
-    let created = service.create(input).await.map_err(|error| {
-        tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
-        issue_service_status(&error)
-    })?;
+    let created = match service.create(input).await {
+        Ok(created) => created,
+        Err(error) => {
+            if let Some((mut connection, lock_key)) = idempotency_connection.take() {
+                let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .execute(&mut *connection)
+                    .await;
+            }
+            tracing::error!(error = %error, company_id = %company_id, "issue creation failed");
+            return Err(issue_service_status(&error));
+        }
+    };
+    if let Some((mut connection, lock_key)) = idempotency_connection.take() {
+        let insert_result = sqlx::query(
+            "INSERT INTO issue_create_idempotency_keys (company_id, idempotency_key, issue_id) VALUES ($1, $2, $3)",
+        )
+        .bind(company_id)
+        .bind(idempotency_key.as_deref().expect("idempotency key is present"))
+        .bind(created.issue.id)
+        .execute(&mut *connection)
+        .await;
+        let unlock_result = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&lock_key)
+            .execute(&mut *connection)
+            .await;
+        if insert_result.is_err() || unlock_result.is_err() {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
 
     // Queue issue assignment wakeup (matches paperclip: routes/issues.ts:7054-7062)
     // Skip if no assignee or backlog status

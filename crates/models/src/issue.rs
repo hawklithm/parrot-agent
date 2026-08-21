@@ -335,6 +335,8 @@ pub struct CreateIssueInput {
     pub project_workspace_id: Option<Uuid>,
     pub goal_id: Option<Uuid>,
     pub title: String,
+    /// Optional caller-provided key used to replay a create request safely.
+    pub idempotency_key: Option<String>,
     pub description: Option<String>,
     pub status: Option<IssueStatus>,
     pub priority: Option<IssuePriority>,
