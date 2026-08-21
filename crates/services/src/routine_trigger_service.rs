@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use cron::Schedule;
 use repositories::{RoutineRepository, RoutineTriggerRepository};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -114,17 +116,33 @@ impl DefaultRoutineTriggerService {
 
     /// Parse cron expression
     fn validate_cron_expression(&self, cron_expr: &str) -> Result<(), ServiceError> {
-        // Basic validation - check format (5 or 6 fields)
-        let parts: Vec<&str> = cron_expr.split_whitespace().collect();
-        if parts.len() != 5 && parts.len() != 6 {
-            return Err(ServiceError::InvalidInput(format!(
-                "Invalid cron expression format: expected 5 or 6 fields, got {}",
-                parts.len()
-            )));
-        }
-
-        // TODO: Use a proper cron parser library for full validation
+        Schedule::from_str(cron_expr).map_err(|error| {
+            ServiceError::InvalidInput(format!("Invalid cron expression: {error}"))
+        })?;
         Ok(())
+    }
+
+    fn next_cron_trigger_at(
+        &self,
+        cron_expr: &str,
+        timezone: Option<&str>,
+        after: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, ServiceError> {
+        let schedule = Schedule::from_str(cron_expr).map_err(|error| {
+            ServiceError::InvalidInput(format!("Invalid cron expression: {error}"))
+        })?;
+        let next = if let Some(timezone) = timezone {
+            let tz = timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+                ServiceError::InvalidInput(format!("Invalid trigger timezone: {timezone}"))
+            })?;
+            schedule
+                .after(&after.with_timezone(&tz))
+                .next()
+                .map(|value| value.with_timezone(&Utc))
+        } else {
+            schedule.after(&after).next()
+        };
+        next.ok_or_else(|| ServiceError::InvalidInput("Cron has no next occurrence".into()))
     }
 
     /// Validate webhook config
@@ -406,9 +424,11 @@ impl RoutineTriggerService for DefaultRoutineTriggerService {
                 .get("cron_expression")
                 .and_then(|v| v.as_str())
             {
-                // TODO: Use cron parser to calculate next execution time
-                // For now, set it to 1 hour from now as a placeholder
-                trigger.next_trigger_at = Some(Utc::now() + chrono::Duration::hours(1));
+                trigger.next_trigger_at = Some(self.next_cron_trigger_at(
+                    _cron_expr,
+                    trigger.timezone.as_deref(),
+                    Utc::now(),
+                )?);
             }
         }
 
