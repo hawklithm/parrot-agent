@@ -4,7 +4,7 @@
 //! 提供活动日志的查询和创建端点。
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::get,
     Json, Router,
@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
+use crate::routes::{require_company_access, AccessMode};
+use services::auth::AuthorizationActor;
 
 /// 活动查询参数
 #[derive(Debug, Deserialize)]
@@ -86,9 +88,12 @@ pub fn activity_routes() -> Router<AppState> {
 /// 对应 Paperclip: activityRoutes -> GET /companies/:companyId/activity
 async fn list_company_activity(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Query(params): Query<ActivityQueryParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Company activity access denied".to_string()))?;
     let limit = params.limit.unwrap_or(50);
 
     let rows = sqlx::query_as::<_, ActivityRow>(
@@ -122,9 +127,12 @@ SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type
 /// 对应 Paperclip: activityRoutes -> POST /companies/:companyId/activity
 async fn create_activity(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(body): Json<CreateActivityRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Company activity write denied".to_string()))?;
     let id = Uuid::new_v4();
     let now = Utc::now();
 
@@ -159,8 +167,16 @@ INSERT INTO activity_logs (id, company_id, actor_type, actor_id, event_type, res
 /// 对应 Paperclip: activityRoutes -> GET /issues/:id/activity
 async fn get_issue_activity(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Issue not found: {id}")))?;
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::NotFound(format!("Issue not found: {id}")))?;
     let rows = sqlx::query_as::<_, ActivityRow>(
         r#"
 SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
