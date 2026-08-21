@@ -47,3 +47,4 @@ parking_lot = "0.12"
 sysinfo = "0.30"
 
 tempfile = "3.8"
+flate2 = "1"

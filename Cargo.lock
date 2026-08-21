@@ -2450,6 +2450,7 @@ dependencies = [
  "csv",
  "dashmap",
  "ed25519-dalek",
+ "flate2",
  "futures",
  "hex",
  "hmac",

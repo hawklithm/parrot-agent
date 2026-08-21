@@ -3,14 +3,21 @@
 //! 管理实例级别的配置项：通用设置、实验性功能、数据库备份等。
 //! 当前使用内存存储，后续可迁移到数据库。
 
-use crate::task_watchdog::WatchdogService;
 use crate::database_backup_health_service::{
     inspect_database_backup_health, DatabaseBackupHealthStatus, InspectDatabaseBackupHealthOptions,
 };
+use crate::task_watchdog::WatchdogService;
 use async_trait::async_trait;
+use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use std::{path::{Path, PathBuf}, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -130,8 +137,7 @@ fn apply_general_updates(
     {
         if !matches!(v, "allowed" | "not_allowed" | "prompt") {
             return Err(
-                "feedbackDataSharingPreference must be allowed, not_allowed, or prompt"
-                    .to_string(),
+                "feedbackDataSharingPreference must be allowed, not_allowed, or prompt".to_string(),
             );
         }
         settings.feedback_data_sharing_preference = v.to_string();
@@ -309,7 +315,7 @@ impl DefaultInstanceSettingsService {
             .pool
             .as_ref()
             .ok_or_else(|| "instance settings persistence is not configured".to_string())?;
-        
+
         // 尝试查询现有数据
         let row = sqlx::query(
             "SELECT instance_name,version,general,experimental FROM instance_settings WHERE id=1",
@@ -317,7 +323,7 @@ impl DefaultInstanceSettingsService {
         .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
-        
+
         if let Some(row) = row {
             // 数据存在，直接返回
             Ok(InstanceSettings {
@@ -341,7 +347,7 @@ impl DefaultInstanceSettingsService {
             .pool
             .as_ref()
             .ok_or_else(|| "instance settings persistence is not configured".to_string())?;
-        
+
         // 使用INSERT ... ON CONFLICT来处理初次插入和后续更新
         sqlx::query(
             "INSERT INTO instance_settings (id, instance_name, version, general, experimental) 
@@ -351,7 +357,7 @@ impl DefaultInstanceSettingsService {
                version = EXCLUDED.version,
                general = EXCLUDED.general,
                experimental = EXCLUDED.experimental,
-               updated_at = now()"
+               updated_at = now()",
         )
         .bind(&settings.instance_name)
         .bind(&settings.version)
@@ -360,7 +366,7 @@ impl DefaultInstanceSettingsService {
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-        
+
         Ok(())
     }
 
@@ -483,7 +489,10 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
             if let Some(v) = updates.get("enableCases").and_then(|v| v.as_bool()) {
                 settings.experimental.enable_cases = v;
             }
-            if let Some(v) = updates.get("enableConferenceRoomChat").and_then(|v| v.as_bool()) {
+            if let Some(v) = updates
+                .get("enableConferenceRoomChat")
+                .and_then(|v| v.as_bool())
+            {
                 settings.experimental.enable_conference_room_chat = v;
             }
             self.persist(&settings).await?;
@@ -503,7 +512,10 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         if let Some(val) = updates.get("enableCases").and_then(|v| v.as_bool()) {
             settings.experimental.enable_cases = val;
         }
-        if let Some(val) = updates.get("enableConferenceRoomChat").and_then(|v| v.as_bool()) {
+        if let Some(val) = updates
+            .get("enableConferenceRoomChat")
+            .and_then(|v| v.as_bool())
+        {
             settings.experimental.enable_conference_room_chat = val;
         }
 
@@ -559,7 +571,9 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         let connection_string = std::env::var("DATABASE_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "database backup is not configured; DATABASE_URL is required".to_string())?;
+            .ok_or_else(|| {
+                "database backup is not configured; DATABASE_URL is required".to_string()
+            })?;
         let backup_dir = std::env::var("PARROT_DATABASE_BACKUP_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -570,47 +584,83 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
             .map_err(|error| format!("failed to create database backup directory: {}", error))?;
 
         let backup_id = Uuid::new_v4();
-        let file_name = format!(
-            "parrot-{}-{}.sql",
+        let file_stem = format!(
+            "parrot-{}-{}",
             chrono::Utc::now().format("%Y%m%d-%H%M%S"),
             backup_id.simple()
         );
-        let backup_path = backup_dir.join(file_name);
-        let pg_dump = std::env::var("PARROT_PG_DUMP")
-            .unwrap_or_else(|_| "pg_dump".to_string());
+        let plain_path = backup_dir.join(format!("{}.sql", file_stem));
+        let backup_path = backup_dir.join(format!("{}.sql.gz", file_stem));
+        let compressed_tmp_path = backup_dir.join(format!("{}.sql.gz.tmp", file_stem));
+        let pg_dump = std::env::var("PARROT_PG_DUMP").unwrap_or_else(|_| "pg_dump".to_string());
         let output = Command::new(pg_dump)
             .args(["--no-owner", "--no-privileges", "--format=plain", "--file"])
-            .arg(&backup_path)
+            .arg(&plain_path)
             .arg(&connection_string)
             .output()
             .await
             .map_err(|error| format!("failed to start pg_dump: {}", error))?;
         if !output.status.success() {
-            let _ = tokio::fs::remove_file(&backup_path).await;
+            let _ = tokio::fs::remove_file(&plain_path).await;
             let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(format!(
                 "pg_dump exited with code {}{}",
                 output.status.code().unwrap_or(-1),
-                if diagnostics.is_empty() { String::new() } else { format!(": {}", diagnostics) }
+                if diagnostics.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", diagnostics)
+                }
             ));
         }
+
+        let plain_sql = tokio::fs::read(&plain_path)
+            .await
+            .map_err(|error| format!("failed to read database backup: {}", error))?;
+        let compressed = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(&plain_sql)
+                .map_err(|error| format!("failed to compress database backup: {}", error))?;
+            encoder
+                .finish()
+                .map_err(|error| format!("failed to finish database backup compression: {}", error))
+        })
+        .await
+        .map_err(|error| format!("database backup compression task failed: {}", error))??;
+        tokio::fs::write(&compressed_tmp_path, compressed)
+            .await
+            .map_err(|error| format!("failed to write compressed database backup: {}", error))?;
+        tokio::fs::rename(&compressed_tmp_path, &backup_path)
+            .await
+            .map_err(|error| format!("failed to commit compressed database backup: {}", error))?;
+        let _ = tokio::fs::remove_file(&plain_path).await;
 
         let size_bytes = tokio::fs::metadata(&backup_path)
             .await
             .map_err(|error| format!("failed to stat database backup: {}", error))?
             .len();
-        let configured_daily_retention = self
-            .get_general_settings()
-            .await
-            .ok()
+        let settings = self.get_general_settings().await.ok();
+        let configured_daily_retention = settings
+            .as_ref()
             .map(|settings| settings.backup_retention.daily_days)
             .unwrap_or(7);
-        let retention_days = std::env::var("PARROT_DATABASE_BACKUP_RETENTION_DAYS")
+        let retention_days_override = std::env::var("PARROT_DATABASE_BACKUP_RETENTION_DAYS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(configured_daily_retention as u64);
-        let pruned_count = prune_database_backups(&backup_dir, retention_days)
+            .filter(|value| *value > 0);
+        let retention = BackupRetentionPolicy {
+            daily_days: retention_days_override.unwrap_or(configured_daily_retention as u64) as u32,
+            weekly_weeks: settings
+                .as_ref()
+                .map(|settings| settings.backup_retention.weekly_weeks)
+                .unwrap_or(4),
+            monthly_months: settings
+                .as_ref()
+                .map(|settings| settings.backup_retention.monthly_months)
+                .unwrap_or(1),
+        };
+        let pruned_count = prune_database_backups_with_policy(&backup_dir, &retention)
             .await
             .map_err(|error| format!("failed to prune database backups: {}", error))?;
         Ok(DatabaseBackupResult {
@@ -630,19 +680,70 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
 }
 
 async fn prune_database_backups(directory: &Path, retention_days: u64) -> std::io::Result<u32> {
+    prune_database_backups_with_policy(
+        directory,
+        &BackupRetentionPolicy {
+            daily_days: retention_days as u32,
+            weekly_weeks: 0,
+            monthly_months: 0,
+        },
+    )
+    .await
+}
+
+async fn prune_database_backups_with_policy(
+    directory: &Path,
+    policy: &BackupRetentionPolicy,
+) -> std::io::Result<u32> {
     let mut entries = tokio::fs::read_dir(directory).await?;
-    let cutoff = SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(retention_days.saturating_mul(86_400)))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    let mut removed = 0;
+    let now = SystemTime::now();
+    let mut latest_by_bucket: HashMap<(char, u64), SystemTime> = HashMap::new();
+    let mut candidates = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("parrot-") || !name.ends_with(".sql") {
+        if !name.starts_with("parrot-") || (!name.ends_with(".sql") && !name.ends_with(".sql.gz")) {
             continue;
         }
-        let metadata = entry.metadata().await?;
-        if metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH) < cutoff {
-            tokio::fs::remove_file(entry.path()).await?;
+        let modified = entry
+            .metadata()
+            .await?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let age_seconds = now.duration_since(modified).unwrap_or_default().as_secs();
+        let age_days = age_seconds / 86_400;
+        let bucket = if age_days < policy.daily_days as u64 {
+            Some(('d', age_days))
+        } else if age_days < policy.weekly_weeks as u64 * 7 {
+            Some(('w', age_seconds / 604_800))
+        } else if age_days < policy.monthly_months as u64 * 31 {
+            Some(('m', age_seconds / 2_592_000))
+        } else {
+            None
+        };
+        if let Some(bucket) = bucket {
+            let replace = latest_by_bucket
+                .get(&bucket)
+                .map(|latest| modified > *latest)
+                .unwrap_or(true);
+            if replace {
+                latest_by_bucket.insert(bucket, modified);
+            }
+        }
+        candidates.push((entry.path(), modified, age_days));
+    }
+    let mut removed = 0;
+    for (path, modified, age_days) in candidates {
+        let keep = if age_days < policy.daily_days as u64 {
+            true
+        } else if age_days < policy.weekly_weeks as u64 * 7 {
+            latest_by_bucket.values().any(|value| *value == modified)
+        } else if age_days < policy.monthly_months as u64 * 31 {
+            latest_by_bucket.values().any(|value| *value == modified)
+        } else {
+            false
+        };
+        if !keep {
+            tokio::fs::remove_file(path).await?;
             removed += 1;
         }
     }
@@ -656,9 +757,12 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn prune_removes_only_parrot_sql_backups() {
+    async fn prune_removes_only_parrot_backup_files() {
         let directory = tempdir().unwrap();
         tokio::fs::write(directory.path().join("parrot-old.sql"), "old")
+            .await
+            .unwrap();
+        tokio::fs::write(directory.path().join("parrot-old.sql.gz"), "old")
             .await
             .unwrap();
         tokio::fs::write(directory.path().join("keep.txt"), "keep")
@@ -666,8 +770,9 @@ mod tests {
             .unwrap();
 
         let removed = prune_database_backups(directory.path(), 0).await.unwrap();
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 2);
         assert!(!directory.path().join("parrot-old.sql").exists());
+        assert!(!directory.path().join("parrot-old.sql.gz").exists());
         assert!(directory.path().join("keep.txt").exists());
     }
 
