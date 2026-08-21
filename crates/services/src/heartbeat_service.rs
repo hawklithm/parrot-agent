@@ -1046,6 +1046,68 @@ impl DefaultHeartbeatService {
     }
 
     async fn execute_run(&self, run_id: Uuid, agent_id: Uuid, issue_id: Uuid, company_id: Uuid) {
+        let pause_blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+               SELECT 1
+               FROM issue_tree_holds h
+               JOIN issue_tree_hold_members m ON m.hold_id = h.id
+              WHERE h.company_id = $1 AND m.issue_id = $2
+                AND h.mode = 'pause' AND h.status = 'active'
+            )",
+        )
+        .bind(company_id)
+        .bind(issue_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if pause_blocked {
+            let interaction_wake: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                   SELECT 1 FROM heartbeat_runs
+                   WHERE id = $1 AND company_id = $2
+                     AND context_snapshot->>'wakeReason' = 'issue_reopened_via_comment'
+                     AND context_snapshot->>'source' = 'issue.comment.reopen'
+                     AND context_snapshot ? 'commentId'
+                     AND context_snapshot ? 'requestedByActorId'
+                )",
+            )
+            .bind(run_id)
+            .bind(company_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(false);
+            if !interaction_wake {
+                let _ = sqlx::query(
+                    "UPDATE heartbeat_runs
+                     SET status = 'cancelled', error = 'cancelled by active issue pause hold',
+                         finished_at = NOW(), updated_at = NOW()
+                     WHERE id = $1 AND status IN ('queued','running')",
+                )
+                .bind(run_id)
+                .execute(&self.pool)
+                .await;
+                let _ = sqlx::query(
+                    "UPDATE agent_wakeup_requests
+                     SET status = 'cancelled', reason = 'issue_pause_hold',
+                         finished_at = NOW(), updated_at = NOW()
+                     WHERE company_id = $1 AND agent_id = $2
+                       AND status IN ('queued','dispatched','running')
+                       AND payload->>'runId' = $3",
+                )
+                .bind(company_id)
+                .bind(agent_id)
+                .bind(run_id.to_string())
+                .execute(&self.pool)
+                .await;
+                let _ = sqlx::query(
+                    "UPDATE agents SET status = 'idle', updated_at = NOW() WHERE id = $1",
+                )
+                .bind(agent_id)
+                .execute(&self.pool)
+                .await;
+                return;
+            }
+        }
         let result = self.run_command(run_id, agent_id, issue_id, company_id).await;
         let (status, exit_code, error, output, outcome) = match result {
             Ok(command_output) => {
