@@ -122,6 +122,13 @@ pub struct SchedulerLeaseRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Stable scheduler inventory entry used by diagnostics and startup checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledJobMetadata {
+    pub job_name: String,
+    pub schedule: JobSchedule,
+}
+
 /// 任务状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
@@ -145,7 +152,7 @@ impl JobStatus {
 }
 
 /// 任务调度配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobSchedule {
     /// 固定间隔(秒)
     IntervalSeconds(u64),
@@ -392,6 +399,22 @@ impl JobScheduler {
 
     pub async fn list_jobs(&self) -> Vec<String> {
         self.jobs.read().await.keys().cloned().collect()
+    }
+
+    /// Return the registered jobs and their schedules in deterministic order.
+    pub async fn list_job_metadata(&self) -> Vec<ScheduledJobMetadata> {
+        let mut jobs: Vec<_> = self
+            .jobs
+            .read()
+            .await
+            .values()
+            .map(|job| ScheduledJobMetadata {
+                job_name: job.job_name().to_string(),
+                schedule: job.schedule(),
+            })
+            .collect();
+        jobs.sort_by(|left, right| left.job_name.cmp(&right.job_name));
+        jobs
     }
 
     pub async fn get_job(&self, name: &str) -> Option<Arc<dyn ScheduledJob>> {
@@ -691,7 +714,7 @@ impl Default for JobScheduler {
 mod scheduler_tests {
     use super::{
         parse_scheduler_execution_retention_days, schedule_is_due, JobSchedule, JobScheduler,
-        JobStatus, ScheduledJob,
+        JobStatus, ScheduledJob, ScheduledJobMetadata,
     };
     use async_trait::async_trait;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -961,6 +984,27 @@ mod scheduler_tests {
 
         let executions = scheduler.get_recent_executions(10).await;
         assert!(executions.iter().any(|record| record.status == JobStatus::Succeeded));
+    }
+
+    #[tokio::test]
+    async fn scheduler_inventory_is_sorted_and_includes_schedule() {
+        let scheduler = JobScheduler::new();
+        scheduler.register(std::sync::Arc::new(PanickingJob)).await;
+        scheduler.register(std::sync::Arc::new(SuccessfulJob)).await;
+
+        assert_eq!(
+            scheduler.list_job_metadata().await,
+            vec![
+                ScheduledJobMetadata {
+                    job_name: "panicking_scheduler_test".to_string(),
+                    schedule: JobSchedule::IntervalSeconds(60),
+                },
+                ScheduledJobMetadata {
+                    job_name: "successful_scheduler_test".to_string(),
+                    schedule: JobSchedule::IntervalSeconds(0),
+                },
+            ]
+        );
     }
 
     #[tokio::test]

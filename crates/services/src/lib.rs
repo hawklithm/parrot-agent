@@ -412,7 +412,7 @@ pub use routine_template::{
 pub mod job_scheduler;
 pub use job_scheduler::{
     JobScheduler, ScheduledJob, JobSchedule, JobStatus, JobExecutionRecord,
-    SchedulerLeaseRecord,
+    SchedulerLeaseRecord, ScheduledJobMetadata,
     RoutineCronTrigger, MonitorCheckJob, LeaseExpiryScanner,
     EnvironmentHealthProber, StuckRunDetector, ConsistencyCheckJob,
     StatusCardSchedulerJob, SummarySlotFinalizerJob,
