@@ -661,6 +661,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_built_in_agent_provision_rejects_disabled_feature() {
+        let Some(database_url) = std::env::var_os("DATABASE_URL") else {
+            eprintln!("skipping feature gate integration test: DATABASE_URL is not set");
+            return;
+        };
+        let pool = PgPool::connect(
+            database_url
+                .to_str()
+                .expect("DATABASE_URL must be valid UTF-8"),
+        )
+        .await
+        .expect("connect database");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let original: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT experimental FROM instance_settings WHERE id = 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("load instance settings");
+        if original.is_none() {
+            sqlx::query("INSERT INTO instance_settings (id) VALUES (1)")
+                .execute(&pool)
+                .await
+                .expect("insert instance settings");
+        }
+        sqlx::query(
+            "UPDATE instance_settings SET experimental = jsonb_set(experimental, '{enableBuiltInAgents}', 'false'::jsonb, true) WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("disable built-in agents");
+
+        let company_id = Uuid::new_v4();
+        let actor = AgentActor {
+            agent_id: Uuid::new_v4(),
+            company_id,
+            permissions: serde_json::json!({
+                "can_provision_built_in_agents": true
+            }),
+        };
+        let result = DefaultAccessService::with_pool(pool.clone())
+            .assert_can_provision_built_in_agents(&actor, company_id)
+            .await;
+
+        if let Some(original) = original {
+            sqlx::query("UPDATE instance_settings SET experimental = $1 WHERE id = 1")
+                .bind(original)
+                .execute(&pool)
+                .await
+                .expect("restore instance settings");
+        } else {
+            sqlx::query("DELETE FROM instance_settings WHERE id = 1")
+                .execute(&pool)
+                .await
+                .expect("remove test instance settings");
+        }
+
+        assert!(matches!(result, Err(AccessError::FeatureNotEnabled(_))));
+    }
+
+    #[tokio::test]
     async fn test_project_scope_is_checked_against_database() {
         let Some(database_url) = std::env::var_os("DATABASE_URL") else {
             eprintln!("skipping project scope integration test: DATABASE_URL is not set");
