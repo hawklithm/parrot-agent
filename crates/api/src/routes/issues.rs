@@ -2122,6 +2122,58 @@ async fn get_issue_live_runs(
     ))
 }
 
+/// I5: GET /issues/:id/runs
+async fn get_issue_run_history(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    IssueId(id): IssueId,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let rows = sqlx::query(
+        "SELECT hr.id, hr.status::text AS status, hr.invocation_source,
+                hr.responsible_user_id, hr.started_at, hr.finished_at,
+                hr.error, hr.exit_code, hr.context_snapshot, hr.created_at,
+                hr.updated_at, hr.agent_id, a.name AS agent_name, a.adapter_type
+         FROM heartbeat_runs hr
+         JOIN agents a ON a.id = hr.agent_id AND a.company_id = hr.company_id
+         WHERE hr.company_id = $1
+           AND (hr.context_snapshot->>'issueId' = $2 OR hr.context_snapshot->>'taskId' = $2)
+         ORDER BY COALESCE(hr.started_at, hr.created_at) DESC, hr.created_at DESC
+         LIMIT 100",
+    )
+    .bind(company_id)
+    .bind(id.to_string())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to list issue run history");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "status": row.get::<String, _>("status"),
+                    "invocationSource": row.get::<String, _>("invocation_source"),
+                    "responsibleUserId": row.get::<Option<String>, _>("responsible_user_id"),
+                    "startedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at"),
+                    "finishedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"),
+                    "error": row.get::<Option<String>, _>("error"),
+                    "exitCode": row.get::<Option<i32>, _>("exit_code"),
+                    "contextSnapshot": row.get::<Option<Value>, _>("context_snapshot"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                    "agentId": row.get::<Uuid, _>("agent_id"),
+                    "agentName": row.get::<String, _>("agent_name"),
+                    "adapterType": row.get::<String, _>("adapter_type"),
+                    "issueId": id,
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// I6: GET /issues/:id/accepted-plan-decompositions
 async fn list_plan_decompositions(
     State(state): State<AppState>,
@@ -3624,6 +3676,7 @@ pub fn issue_routes() -> Router<AppState> {
         .route("/issues/:id/cases", get(get_issue_cases))
         .route("/issues/:id/active-run", get(get_issue_active_run))
         .route("/issues/:id/live-runs", get(get_issue_live_runs))
+        .route("/issues/:id/runs", get(get_issue_run_history))
         .route(
             "/issues/:id/work-products",
             get(list_work_products).post(create_work_product),
