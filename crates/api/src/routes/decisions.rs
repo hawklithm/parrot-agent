@@ -4161,6 +4161,32 @@ fn training_example_to_json(r: &PgRow) -> Value {
     })
 }
 
+fn training_service_example_to_json(example: &services::DecisionTrainingExample) -> Value {
+    json!({
+        "id": example.id,
+        "companyId": example.company_id,
+        "sourceKind": match &example.source_kind {
+            DecisionTrainingSourceKind::IssueThreadInteraction => "interaction",
+            DecisionTrainingSourceKind::IssueApproval => "approval",
+            DecisionTrainingSourceKind::IssueExecutionDecision => "execution_decision",
+            DecisionTrainingSourceKind::HeartbeatDecision => "interaction",
+        },
+        "sourceId": example.source_id,
+        "issueId": example.snapshot.issue_id,
+        "cutoffAt": iso(example.cutoff_at),
+        "notes": example.notes.clone().unwrap_or_default(),
+        "notesHistory": serde_json::to_value(&example.notes_history).unwrap_or_else(|_| json!([])),
+        "tags": example.tags.clone(),
+        "qualityScore": example.quality_score,
+        "decisionOutcome": example.snapshot.decision_outcome.clone(),
+        "retentionPolicy": example.retention_policy,
+        "snapshot": example.snapshot.clone(),
+        "createdByUserId": example.created_by_user_id.clone(),
+        "createdAt": iso(example.created_at),
+        "updatedAt": iso(example.updated_at),
+    })
+}
+
 const TRAINING_SELECT: &str =
     "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, \
      notes, notes_history, tags, quality_score, decision_outcome, retention_policy, snapshot, created_by_user_id, \
@@ -4874,20 +4900,28 @@ async fn get_decision_training(
 ) -> Result<Json<Value>, AppError> {
     require_board(&actor)?;
     let pool = &state.pool;
-    let row = load_training_example(pool, &actor, example_id).await?;
-    let example = training_example_to_json(&row);
+    let service_example = state
+        .decision_training_service
+        .get_example(example_id)
+        .await
+        .map_err(training_service_err)?
+        .ok_or_else(training_not_found)?;
+    if crate::routes::assert_company_access(&actor, service_example.company_id, true).is_err() {
+        return Err(training_not_found());
+    }
+    let example = training_service_example_to_json(&service_example);
 
     log_activity(
         pool,
-        row.get::<Uuid, _>("company_id"),
+        service_example.company_id,
         &actor,
         "decision_training.read",
         "decision_training_example",
-        row.get::<Uuid, _>("id"),
+        service_example.id,
         json!({
-            "sourceKind": row.get::<String, _>("source_kind"),
-            "sourceId": row.get::<Uuid, _>("source_id"),
-            "issueId": row.get::<Uuid, _>("issue_id"),
+            "sourceKind": example.get("sourceKind"),
+            "sourceId": example.get("sourceId"),
+            "issueId": example.get("issueId"),
         }),
     )
     .await;
@@ -4991,30 +5025,36 @@ async fn delete_decision_training(
     Path(example_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let pool = &state.pool;
-    let existing = load_training_example(pool, &actor, example_id).await?;
+    let existing = state
+        .decision_training_service
+        .get_example(example_id)
+        .await
+        .map_err(training_service_err)?
+        .ok_or_else(training_not_found)?;
+    if crate::routes::assert_company_access(&actor, existing.company_id, true).is_err() {
+        return Err(training_not_found());
+    }
     let user_id = require_human(&actor)?;
-    let created_by: String = existing.get("created_by_user_id");
-    require_example_owner(&user_id, &created_by)?;
+    require_example_owner(&user_id, &existing.created_by_user_id)?;
 
-    let deleted: Vec<Uuid> =
-        sqlx::query_scalar("DELETE FROM decision_training_examples WHERE id = $1 RETURNING id")
-            .bind(example_id)
-            .fetch_all(pool)
-            .await
-            .map_err(db_err)?;
-    if deleted.is_empty() {
+    if !state
+        .decision_training_service
+        .delete_example(example_id)
+        .await
+        .map_err(training_service_err)?
+    {
         return Err(training_not_found());
     }
 
     log_activity(
         pool,
-        existing.get::<Uuid, _>("company_id"),
+        existing.company_id,
         &actor,
         "decision_training.deleted",
         "decision_training_example",
         example_id,
         json!({
-            "issueId": existing.get::<Uuid, _>("issue_id"),
+            "issueId": existing.snapshot.issue_id,
             "deletedByUserId": user_id,
         }),
     )

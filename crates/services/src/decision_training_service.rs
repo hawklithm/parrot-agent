@@ -65,8 +65,11 @@ pub struct RelatedApproval {
 /// 决策训练notes历史条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionTrainingNotesHistoryEntry {
+    #[serde(rename = "body", alias = "notes")]
     pub notes: String,
+    #[serde(rename = "author", alias = "updated_by_user_id")]
     pub updated_by_user_id: Option<Uuid>,
+    #[serde(rename = "at", alias = "updated_at")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -85,6 +88,8 @@ pub struct DecisionTrainingExample {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub cutoff_at: DateTime<Utc>,
+    pub retention_policy: String,
+    pub created_by_user_id: String,
 }
 
 /// 捕获输入
@@ -138,6 +143,9 @@ pub trait DecisionTrainingService: Send + Sync {
         &self,
         example_id: Uuid,
     ) -> Result<Option<DecisionTrainingExample>, TrainingError>;
+
+    /// Delete a training example and report whether it existed.
+    async fn delete_example(&self, example_id: Uuid) -> Result<bool, TrainingError>;
 
     /// 列出训练样本
     async fn list_examples(
@@ -316,8 +324,8 @@ impl PgDecisionTrainingService {
     async fn load_example(&self, example_id: Uuid) -> Result<Option<DecisionTrainingExample>, TrainingError> {
         let row = sqlx::query(
             "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, notes,
-                    notes_history, tags, quality_score, decision_outcome, snapshot,
-                    created_at, updated_at
+                    notes_history, tags, quality_score, decision_outcome, retention_policy,
+                    snapshot, created_by_user_id, created_at, updated_at
                FROM decision_training_examples WHERE id = $1",
         )
         .bind(example_id)
@@ -419,6 +427,8 @@ impl PgDecisionTrainingService {
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             cutoff_at: row.get("cutoff_at"),
+            retention_policy: row.get("retention_policy"),
+            created_by_user_id: row.get("created_by_user_id"),
         })
     }
 }
@@ -576,14 +586,25 @@ impl DecisionTrainingService for PgDecisionTrainingService {
         self.load_example(example_id).await
     }
 
+    async fn delete_example(&self, example_id: Uuid) -> Result<bool, TrainingError> {
+        let deleted: Option<Uuid> = sqlx::query_scalar(
+            "DELETE FROM decision_training_examples WHERE id = $1 RETURNING id",
+        )
+        .bind(example_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Self::db_error)?;
+        Ok(deleted.is_some())
+    }
+
     async fn list_examples(&self, input: ListInput) -> Result<Vec<DecisionTrainingExample>, TrainingError> {
         let limit = input.limit.unwrap_or(100).clamp(1, 1000);
         let offset = input.offset.unwrap_or(0).max(0);
         let rows = if let Some(kind) = input.source_kind.as_ref() {
             sqlx::query(
                 "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, notes,
-                        notes_history, tags, quality_score, decision_outcome, snapshot,
-                        created_at, updated_at FROM decision_training_examples
+                        notes_history, tags, quality_score, decision_outcome, retention_policy,
+                        snapshot, created_by_user_id, created_at, updated_at FROM decision_training_examples
                   WHERE company_id = $1 AND source_kind = $2
                   ORDER BY created_at DESC, id ASC LIMIT $3 OFFSET $4",
             )
@@ -597,8 +618,8 @@ impl DecisionTrainingService for PgDecisionTrainingService {
         } else {
             sqlx::query(
                 "SELECT id, company_id, source_kind, source_id, issue_id, cutoff_at, notes,
-                        notes_history, tags, quality_score, decision_outcome, snapshot,
-                        created_at, updated_at FROM decision_training_examples
+                        notes_history, tags, quality_score, decision_outcome, retention_policy,
+                        snapshot, created_by_user_id, created_at, updated_at FROM decision_training_examples
                   WHERE company_id = $1 ORDER BY created_at DESC, id ASC LIMIT $2 OFFSET $3",
             )
             .bind(input.company_id)
@@ -791,6 +812,8 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
                 created_at: now,
                 updated_at: now,
                 cutoff_at: input.cutoff_at,
+                retention_policy: input.retention_policy,
+                created_by_user_id: input.created_by_user_id,
             },
         );
         Ok(id)
@@ -843,6 +866,8 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
             created_at: now,
             updated_at: now,
             cutoff_at: now,
+            retention_policy: "scrub_deleted_comments_v1".to_string(),
+            created_by_user_id: "system".to_string(),
         };
         self.examples
             .lock()
@@ -856,6 +881,10 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
         example_id: Uuid,
     ) -> Result<Option<DecisionTrainingExample>, TrainingError> {
         Ok(self.examples.lock().await.get(&example_id).cloned())
+    }
+
+    async fn delete_example(&self, example_id: Uuid) -> Result<bool, TrainingError> {
+        Ok(self.examples.lock().await.remove(&example_id).is_some())
     }
 
     async fn list_examples(
