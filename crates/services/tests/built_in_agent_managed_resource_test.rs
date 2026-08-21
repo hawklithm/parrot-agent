@@ -53,7 +53,8 @@ async fn provision_binds_skill_and_routine_managed_resources_idempotently() {
     let managed_repo = std::sync::Arc::new(
         repositories::PgBuiltInManagedResourceRepository::new(pool.clone()),
     );
-    let service = DefaultBuiltInAgentService::new(agent_repo.clone(), managed_repo.clone());
+    let service = DefaultBuiltInAgentService::new(agent_repo.clone(), managed_repo.clone())
+        .with_resource_pool(pool.clone());
 
     let key = BuiltInAgentKey::ReflectionCoach;
     let agent = service.provision(company_id, key, None).await.unwrap();
@@ -73,6 +74,22 @@ async fn provision_binds_skill_and_routine_managed_resources_idempotently() {
         );
         assert!(!r.drift_detected);
     }
+    let skill_binding = rows
+        .iter()
+        .find(|row| row.resource_type == "skill")
+        .expect("skill binding");
+    let skill_id = skill_binding
+        .target_resource_id
+        .expect("skill binding must point to a company skill");
+    let file_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM skill_files WHERE company_id = $1 AND skill_id = $2",
+    )
+    .bind(company_id)
+    .bind(skill_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(file_count > 0, "managed skill files must be materialized");
 
     // Second provision must be idempotent: no extra rows, no error.
     let _ = service.provision(company_id, key, None).await.unwrap();
@@ -98,7 +115,8 @@ async fn reconcile_repairs_stock_version_drift() {
     let managed_repo = std::sync::Arc::new(
         repositories::PgBuiltInManagedResourceRepository::new(pool.clone()),
     );
-    let service = DefaultBuiltInAgentService::new(agent_repo.clone(), managed_repo.clone());
+    let service = DefaultBuiltInAgentService::new(agent_repo.clone(), managed_repo.clone())
+        .with_resource_pool(pool.clone());
 
     let key = BuiltInAgentKey::LearningAssistant;
     let agent = service.provision(company_id, key, None).await.unwrap();
@@ -150,7 +168,8 @@ async fn reset_removes_managed_resource_bindings() {
     let managed_repo = std::sync::Arc::new(
         repositories::PgBuiltInManagedResourceRepository::new(pool.clone()),
     );
-    let service = DefaultBuiltInAgentService::new(agent_repo.clone(), managed_repo.clone());
+    let service = DefaultBuiltInAgentService::new(agent_repo.clone(), managed_repo.clone())
+        .with_resource_pool(pool.clone());
 
     let key = BuiltInAgentKey::BriefsGenerator;
     let agent = service.provision(company_id, key, None).await.unwrap();
@@ -162,6 +181,14 @@ async fn reset_removes_managed_resource_bindings() {
             .len(),
         2
     );
+    let skill_id = managed_repo
+        .list_by_company_and_key(company_id, key.as_str())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|binding| binding.resource_type == "skill")
+        .and_then(|binding| binding.target_resource_id)
+        .expect("managed skill id");
 
     service.reset(company_id, key).await.unwrap();
     assert_eq!(
@@ -173,6 +200,15 @@ async fn reset_removes_managed_resource_bindings() {
         0,
         "reset must remove managed resource bindings"
     );
+    let skill_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM company_skills WHERE id = $1 AND company_id = $2)",
+    )
+    .bind(skill_id)
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!skill_exists, "reset must delete the managed company skill");
 
     cleanup(&pool, company_id, Some(agent.id)).await;
 }

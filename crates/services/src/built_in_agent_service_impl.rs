@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use uuid::Uuid;
+use sqlx::PgPool;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::built_in_agent_service::{
     BuiltInAgentDefinition, BuiltInAgentKey, BuiltInAgentMetadataRegistry, BuiltInAgentStatus,
@@ -120,6 +121,7 @@ where
     registry: BuiltInAgentMetadataRegistry,
     agent_repo: std::sync::Arc<A>,
     managed_repo: std::sync::Arc<dyn BuiltInManagedResourceRepository>,
+    resource_pool: Option<PgPool>,
 }
 
 impl<A> DefaultBuiltInAgentService<A>
@@ -134,7 +136,13 @@ where
             registry: BuiltInAgentMetadataRegistry::new(),
             agent_repo,
             managed_repo,
+            resource_pool: None,
         }
+    }
+
+    pub fn with_resource_pool(mut self, resource_pool: PgPool) -> Self {
+        self.resource_pool = Some(resource_pool);
+        self
     }
 
     /// 将内置 Agent 的 Skill/Routine 受管资源绑定同步到 `builtin_managed_resources`
@@ -155,12 +163,14 @@ where
             None => return Ok((changed, changes)),
         };
 
+        let skill_id = self.materialize_skill(company_id, key, definition).await?;
         let (skill_changed, skill_msg) = self
             .sync_one_resource(
                 company_id,
                 key,
                 "skill",
                 &bundle.skill.canonical_key,
+                skill_id,
                 &bundle.stock_version,
             )
             .await?;
@@ -175,6 +185,7 @@ where
                 key,
                 "routine",
                 &bundle.routine.routine_key,
+                None,
                 &bundle.stock_version,
             )
             .await?;
@@ -192,6 +203,7 @@ where
         key: BuiltInAgentKey,
         resource_type: &str,
         canonical_key: &str,
+        target_resource_id: Option<Uuid>,
         stock_version: &str,
     ) -> BuiltInAgentResult<(bool, String)> {
         let existing = self
@@ -207,7 +219,7 @@ where
                         key.as_str(),
                         resource_type,
                         canonical_key,
-                        None,
+                        target_resource_id,
                         stock_version,
                         stock_version,
                     )
@@ -225,10 +237,20 @@ where
                 if row.stock_version != stock_version
                     || row.current_version != stock_version
                     || row.drift_detected
-                    || row.status != "active" =>
+                    || row.status != "active"
+                    || (target_resource_id.is_some()
+                        && row.target_resource_id != target_resource_id) =>
             {
                 self.managed_repo
-                    .repair_drift(row.id, stock_version)
+                    .upsert(
+                        company_id,
+                        key.as_str(),
+                        resource_type,
+                        canonical_key,
+                        target_resource_id,
+                        stock_version,
+                        stock_version,
+                    )
                     .await
                     .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
                 Ok((
@@ -241,6 +263,142 @@ where
             }
             Some(_) => Ok((false, String::new())),
         }
+    }
+
+    async fn materialize_skill(
+        &self,
+        company_id: Uuid,
+        key: BuiltInAgentKey,
+        definition: &BuiltInAgentDefinition,
+    ) -> BuiltInAgentResult<Option<Uuid>> {
+        let Some(pool) = &self.resource_pool else {
+            return Ok(None);
+        };
+        let Some(bundle) = &definition.bundle else {
+            return Ok(None);
+        };
+
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+        let config = serde_json::json!({
+            "managedBy": "built_in_agent",
+            "builtInKey": key.as_str(),
+            "canonicalKey": bundle.skill.canonical_key,
+            "stockVersion": bundle.stock_version,
+        });
+        let skill_id: Uuid = sqlx::query_scalar(
+            r#"INSERT INTO company_skills
+               (company_id, name, slug, description, version, config, is_paperclip_managed, status)
+               VALUES ($1, $2, $3, $4, $5, $6, TRUE, 'active')
+               ON CONFLICT (company_id, slug) DO UPDATE SET
+                   name = EXCLUDED.name,
+                   description = EXCLUDED.description,
+                   version = EXCLUDED.version,
+                   config = EXCLUDED.config,
+                   is_paperclip_managed = TRUE,
+                   status = 'active',
+                   updated_at = now()
+               RETURNING id"#,
+        )
+        .bind(company_id)
+        .bind(&bundle.skill.display_name)
+        .bind(&bundle.skill.slug)
+        .bind(&definition.short_purpose)
+        .bind(&bundle.stock_version)
+        .bind(config)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+
+        let paths: Vec<&str> = bundle.skill.files.keys().map(String::as_str).collect();
+        sqlx::query(
+            r#"DELETE FROM skill_files
+               WHERE company_id = $1 AND skill_id = $2
+                 AND path <> ALL($3::text[])"#,
+        )
+        .bind(company_id)
+        .bind(skill_id)
+        .bind(&paths)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+
+        for (path, content) in &bundle.skill.files {
+            sqlx::query(
+                r#"INSERT INTO skill_files (company_id, skill_id, path, content, mime_type, size_bytes)
+                   VALUES ($1, $2, $3, $4, 'text/markdown', LENGTH($4))
+                   ON CONFLICT (skill_id, path) DO UPDATE SET
+                       content = EXCLUDED.content,
+                       mime_type = EXCLUDED.mime_type,
+                       size_bytes = EXCLUDED.size_bytes,
+                       updated_at = now()"#,
+            )
+            .bind(company_id)
+            .bind(skill_id)
+            .bind(path)
+            .bind(content)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+        Ok(Some(skill_id))
+    }
+
+    async fn clear_managed_resource_bindings(
+        &self,
+        company_id: Uuid,
+        key: BuiltInAgentKey,
+    ) -> BuiltInAgentResult<()> {
+        let bindings = self
+            .managed_repo
+            .list_by_company_and_key(company_id, key.as_str())
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+
+        if let Some(pool) = &self.resource_pool {
+            let mut transaction = pool
+                .begin()
+                .await
+                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+            for binding in bindings.iter().filter(|binding| binding.resource_type == "skill") {
+                if let Some(skill_id) = binding.target_resource_id {
+                    sqlx::query(
+                        "DELETE FROM company_skills WHERE id = $1 AND company_id = $2",
+                    )
+                    .bind(skill_id)
+                    .bind(company_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                }
+            }
+            sqlx::query(
+                "DELETE FROM builtin_managed_resources WHERE company_id = $1 AND built_in_key = $2",
+            )
+            .bind(company_id)
+            .bind(key.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+            transaction
+                .commit()
+                .await
+                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+            return Ok(());
+        }
+
+        self.managed_repo
+            .delete_by_company_and_key(company_id, key.as_str())
+            .await
+            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+        Ok(())
     }
 
     /// 查找公司的唯一根Agent
@@ -509,10 +667,7 @@ where
             .ok_or(BuiltInAgentError::NotFound(key))?;
 
         // 回滚边界：先清理受管资源绑定，失败则不应宣称 Agent 已重置。
-        self.managed_repo
-            .delete_by_company_and_key(company_id, key.as_str())
-            .await
-            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+        self.clear_managed_resource_bindings(company_id, key).await?;
 
         // 重置为初始状态
         let mut updated_agent = agent;
