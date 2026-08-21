@@ -242,6 +242,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 创建 RoutineExecutionService
     let routine_execution_service = Arc::new(services::RoutineExecutionService::new(pool.clone()));
+    // Share one scheduler heartbeat runtime with recovery and decision-retention
+    // notification jobs so archive notifications use the real wake path.
+    let scheduler_heartbeat = Arc::new(services::DefaultHeartbeatService::new(pool.clone()));
 
     // 注册后台任务
     job_scheduler
@@ -281,9 +284,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )))
         .await;
     job_scheduler
-        .register(Arc::new(services::HeartbeatRecoveryJob::new(Arc::new(
-            services::DefaultHeartbeatService::new(pool.clone()),
-        ))))
+        .register(Arc::new(services::HeartbeatRecoveryJob::new(
+            scheduler_heartbeat.clone(),
+        )))
+        .await;
+    let decision_wakeup = Arc::new(
+        services::decision_wakeup_service::DefaultDecisionWakeupService::new(true)
+            .with_heartbeat_service(scheduler_heartbeat),
+    );
+    job_scheduler
+        .register(Arc::new(
+            services::decision_retention_sweep_job::DecisionRetentionSweepJob::new(pool.clone())
+                .with_wakeup(decision_wakeup),
+        ))
         .await;
 
     // 启动调度器（30 秒间隔，对应 paperclip 的 heartbeatSchedulerIntervalMs）
