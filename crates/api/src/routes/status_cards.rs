@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
-use services::status_card_worker::StatusCardWorker;
+use services::{status_card_worker::StatusCardWorker, HeartbeatWakeupOptions};
 
 fn card_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
     use sqlx::Row;
@@ -203,7 +203,17 @@ async fn create_status_card(
             if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id, None).await {
                 let _ = state
                     .heartbeat_service
-                    .wakeup(summarizer, compile.generating_issue_id, company_id)
+                    .wakeup_with_options(
+                        summarizer,
+                        compile.generating_issue_id,
+                        company_id,
+                        HeartbeatWakeupOptions {
+                            source: Some("on_demand".to_string()),
+                            trigger_detail: Some("system".to_string()),
+                            reason: Some("status_card_generation".to_string()),
+                            ..Default::default()
+                        },
+                    )
                     .await;
             }
         }
@@ -300,7 +310,17 @@ async fn patch_status_card(
                 if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id, None).await {
                     let _ = state
                         .heartbeat_service
-                        .wakeup(summarizer, compile.generating_issue_id, company_id)
+                        .wakeup_with_options(
+                            summarizer,
+                            compile.generating_issue_id,
+                            company_id,
+                            HeartbeatWakeupOptions {
+                                source: Some("on_demand".to_string()),
+                                trigger_detail: Some("system".to_string()),
+                                reason: Some("status_card_generation".to_string()),
+                                ..Default::default()
+                            },
+                        )
                         .await;
                 }
             }
@@ -443,7 +463,17 @@ async fn recompile_status_card(
         if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id, None).await {
             let _ = state
                 .heartbeat_service
-                .wakeup(summarizer, result.generating_issue_id, company_id)
+                .wakeup_with_options(
+                    summarizer,
+                    result.generating_issue_id,
+                    company_id,
+                    HeartbeatWakeupOptions {
+                        source: Some("on_demand".to_string()),
+                        trigger_detail: Some("system".to_string()),
+                        reason: Some("status_card_generation".to_string()),
+                        ..Default::default()
+                    },
+                )
                 .await;
         }
     }
@@ -513,7 +543,17 @@ async fn refresh_status_card(
         if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id, None).await {
             let _ = state
                 .heartbeat_service
-                .wakeup(summarizer, result.generating_issue_id, company_id)
+                .wakeup_with_options(
+                    summarizer,
+                    result.generating_issue_id,
+                    company_id,
+                    HeartbeatWakeupOptions {
+                        source: Some("on_demand".to_string()),
+                        trigger_detail: Some("system".to_string()),
+                        reason: Some("status_card_generation".to_string()),
+                        ..Default::default()
+                    },
+                )
                 .await;
         }
     }

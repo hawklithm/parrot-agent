@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
-use services::summary_slot_worker::SummarySlotWorker;
+use services::{summary_slot_worker::SummarySlotWorker, HeartbeatWakeupOptions};
 
 fn slot_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
     use sqlx::Row;
@@ -193,7 +193,17 @@ async fn generate_summary_slot(
         if let Ok(summarizer) = worker.resolve_summarizer_agent_id(company_id).await {
             let _ = state
                 .heartbeat_service
-                .wakeup(summarizer, result.generating_issue_id, company_id)
+                .wakeup_with_options(
+                    summarizer,
+                    result.generating_issue_id,
+                    company_id,
+                    HeartbeatWakeupOptions {
+                        source: Some("on_demand".to_string()),
+                        trigger_detail: Some("system".to_string()),
+                        reason: Some("summary_slot_generation".to_string()),
+                        ..Default::default()
+                    },
+                )
                 .await;
         }
     }
