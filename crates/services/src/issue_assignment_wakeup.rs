@@ -1,4 +1,4 @@
-use crate::heartbeat_service::HeartbeatService;
+use crate::heartbeat_service::{HeartbeatService, HeartbeatWakeupOptions};
 use models::AppError;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -59,7 +59,27 @@ impl IssueAssignmentWakeupService {
         // Call heartbeat service to wake the agent
         let result = self
             .heartbeat
-            .wakeup(agent_id, input.issue_id, input.company_id)
+            .wakeup_with_options(
+                agent_id,
+                input.issue_id,
+                input.company_id,
+                HeartbeatWakeupOptions {
+                    source: Some("assignment".to_string()),
+                    trigger_detail: Some("system".to_string()),
+                    reason: Some(input.reason.clone()),
+                    requested_by_actor_type: input.requested_by_actor_type.clone(),
+                    requested_by_actor_id: input.requested_by_actor_id,
+                    payload: Some(serde_json::json!({
+                        "issueId": input.issue_id,
+                        "mutation": input.mutation,
+                    })),
+                    context_snapshot: Some(serde_json::json!({
+                        "issueId": input.issue_id,
+                        "source": input.context_source,
+                    })),
+                    idempotency_key: None,
+                },
+            )
             .await;
 
         match result {

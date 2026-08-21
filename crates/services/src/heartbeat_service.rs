@@ -173,6 +173,19 @@ pub trait HeartbeatService: Send + Sync {
         company_id: Uuid,
     ) -> Result<(), HeartbeatError>;
 
+    /// Wake an agent with Paperclip-compatible event context. Existing callers
+    /// can keep using `wakeup`; context-aware callers opt into rewake policy.
+    async fn wakeup_with_options(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        options: HeartbeatWakeupOptions,
+    ) -> Result<(), HeartbeatError> {
+        let _ = options;
+        self.wakeup(agent_id, issue_id, company_id).await
+    }
+
     /// Cancel an active run for an issue
     /// Called after force_release to stop ongoing execution
     async fn cancel_run(
@@ -198,6 +211,18 @@ pub trait HeartbeatService: Send + Sync {
         issue_id: Uuid,
         company_id: Uuid,
     ) -> Result<HeartbeatContext, HeartbeatError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HeartbeatWakeupOptions {
+    pub source: Option<String>,
+    pub trigger_detail: Option<String>,
+    pub reason: Option<String>,
+    pub requested_by_actor_type: Option<String>,
+    pub requested_by_actor_id: Option<Uuid>,
+    pub idempotency_key: Option<String>,
+    pub payload: Option<Value>,
+    pub context_snapshot: Option<Value>,
 }
 
 /// Heartbeat context information for an issue
@@ -1791,6 +1816,151 @@ impl DefaultHeartbeatService {
 
 #[async_trait]
 impl HeartbeatService for DefaultHeartbeatService {
+    async fn wakeup_with_options(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        options: HeartbeatWakeupOptions,
+    ) -> Result<(), HeartbeatError> {
+        let throttle_candidate = matches!(
+            options.reason.as_deref(),
+            None
+                | Some(
+                    "issue_assigned"
+                        | "issue_continuation_needed"
+                        | "issue_assignment_recovery"
+                        | "issue_graph_liveness_backstop"
+                )
+        );
+
+        if throttle_candidate {
+            const LOOKBACK_HOURS: i64 = 6;
+            const SAMPLE_LIMIT: i64 = 8;
+            const THRESHOLD: i64 = 2;
+            const BASE_COOLDOWN_SECONDS: i64 = 120;
+            const MAX_COOLDOWN_SECONDS: i64 = 30 * 60;
+            const PROGRESS_EVENTS: &[&str] = &[
+                "issue.updated",
+                "issue.comment_added",
+                "issue.created",
+                "issue.child_created",
+                "issue.assigned",
+                "issue.released",
+                "issue.blockers_updated",
+                "issue.document_upserted",
+                "issue.document_updated",
+                "issue.work_product_created",
+                "issue.work_product_updated",
+                "issue.thread_interaction_created",
+                "issue.monitor_scheduled",
+                "issue.approval_linked",
+            ];
+            let recent_runs = sqlx::query(
+                "SELECT id, status::text AS status, finished_at
+                 FROM heartbeat_runs
+                 WHERE company_id = $1 AND agent_id = $2
+                   AND finished_at IS NOT NULL
+                   AND finished_at >= NOW() - ($3 * INTERVAL '1 hour')
+                   AND (context_snapshot->>'issueId' = $4 OR context_snapshot->>'taskId' = $4)
+                 ORDER BY finished_at DESC
+                 LIMIT $5",
+            )
+            .bind(company_id)
+            .bind(agent_id)
+            .bind(LOOKBACK_HOURS)
+            .bind(issue_id.to_string())
+            .bind(SAMPLE_LIMIT)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+
+            let mut no_progress_streak = 0i64;
+            let mut latest_finished_at = None;
+            for run in recent_runs {
+                let status: String = run
+                    .try_get("status")
+                    .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                let finished_at: DateTime<Utc> = run
+                    .try_get("finished_at")
+                    .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                if status != "succeeded" {
+                    break;
+                }
+                if latest_finished_at.is_none() {
+                    latest_finished_at = Some(finished_at);
+                }
+                let run_id: Uuid = run
+                    .try_get("id")
+                    .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                let made_progress: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM activity_logs
+                       WHERE company_id = $1 AND resource_type = 'issue'
+                         AND resource_id = $2 AND run_id = $3
+                         AND event_type = ANY($4)
+                     )",
+                )
+                .bind(company_id)
+                .bind(issue_id)
+                .bind(run_id)
+                .bind(PROGRESS_EVENTS)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                if made_progress {
+                    break;
+                }
+                no_progress_streak += 1;
+            }
+
+            if no_progress_streak >= THRESHOLD {
+                if let Some(last_finished_at) = latest_finished_at {
+                    let doublings = (no_progress_streak - THRESHOLD).min(16) as u32;
+                    let cooldown_seconds = (BASE_COOLDOWN_SECONDS * 2_i64.pow(doublings))
+                        .min(MAX_COOLDOWN_SECONDS);
+                    let next_allowed_at = last_finished_at
+                        + chrono::Duration::seconds(cooldown_seconds);
+                    if Utc::now() < next_allowed_at {
+                        let payload = serde_json::json!({
+                            "issueId": issue_id,
+                            "heartbeatSkip": {
+                                "reason": "issue_rewake_throttled",
+                                "requestedReason": options.reason,
+                                "noProgressStreak": no_progress_streak,
+                                "cooldownSeconds": cooldown_seconds,
+                                "lastRunFinishedAt": last_finished_at,
+                                "nextAllowedAt": next_allowed_at,
+                            }
+                        });
+                        sqlx::query(
+                            "INSERT INTO agent_wakeup_requests
+                             (company_id, agent_id, status, payload, source, trigger_detail,
+                              reason, requested_by_actor_type, requested_by_actor_id,
+                              idempotency_key, finished_at, updated_at)
+                             VALUES ($1, $2, 'skipped', $3, $4, $5, 'issue_rewake_throttled',
+                                     $6, $7, $8, NOW(), NOW())",
+                        )
+                        .bind(company_id)
+                        .bind(agent_id)
+                        .bind(payload)
+                        .bind(options.source.as_deref())
+                        .bind(options.trigger_detail.as_deref())
+                        .bind(options.requested_by_actor_type.as_deref())
+                        .bind(options.requested_by_actor_id)
+                        .bind(options.idempotency_key.as_deref())
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        self.wakeup(agent_id, issue_id, company_id).await
+    }
+
     async fn wakeup(
         &self,
         agent_id: Uuid,
