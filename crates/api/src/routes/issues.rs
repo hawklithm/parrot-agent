@@ -1534,8 +1534,23 @@ async fn create_issue(
     if idempotency_key.as_ref().is_some_and(|key| key.len() > 255) {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
-    if idempotency_key.is_none() && !input.allow_duplicate {
-        let duplicate_issue_id: Option<Uuid> = sqlx::query_scalar(
+    let mut title_connection = if idempotency_key.is_none() && !input.allow_duplicate {
+        let mut connection = state
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let title_lock_key = format!(
+            "issue-create-title:{company_id}:{}:{}",
+            input.parent_id.map(|parent| parent.to_string()).unwrap_or_else(|| "root".to_string()),
+            input.title.trim()
+        );
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(&title_lock_key)
+            .execute(&mut *connection)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let duplicate_issue_id: Option<Uuid> = match sqlx::query_scalar(
             "SELECT id
              FROM issues
              WHERE company_id = $1
@@ -1550,13 +1565,24 @@ async fn create_issue(
         .bind(company_id)
         .bind(input.parent_id)
         .bind(&input.title)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut *connection)
         .await
-        .map_err(|error| {
-            tracing::error!(error = %error, company_id = %company_id, "failed to check duplicate issue title");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        {
+            Ok(issue_id) => issue_id,
+            Err(error) => {
+                let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                    .bind(&title_lock_key)
+                    .execute(&mut *connection)
+                    .await;
+                tracing::error!(error = %error, company_id = %company_id, "failed to check duplicate issue title");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
         if let Some(duplicate_issue_id) = duplicate_issue_id {
+            let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                .bind(&title_lock_key)
+                .execute(&mut *connection)
+                .await;
             let duplicate_issue = state
                 .issue_service
                 .get(duplicate_issue_id, company_id)
@@ -1565,7 +1591,10 @@ async fn create_issue(
                 .ok_or(StatusCode::NOT_FOUND)?;
             return Ok(Json(duplicate_issue));
         }
-    }
+        Some((connection, title_lock_key))
+    } else {
+        None
+    };
     // Keep a session-level advisory lock on a checked-out connection while the
     // service creates the Issue, then persist the key. This closes the race
     // between replay lookup and creation without changing the repository API.
@@ -1656,6 +1685,12 @@ async fn create_issue(
     let created = match service.create(input).await {
         Ok(created) => created,
         Err(error) => {
+            if let Some((mut connection, title_lock_key)) = title_connection.take() {
+                let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                    .bind(&title_lock_key)
+                    .execute(&mut *connection)
+                    .await;
+            }
             if let Some((mut connection, lock_key)) = idempotency_connection.take() {
                 let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
                     .bind(&lock_key)
@@ -1666,6 +1701,15 @@ async fn create_issue(
             return Err(issue_service_status(&error));
         }
     };
+    if let Some((mut connection, title_lock_key)) = title_connection.take() {
+        let unlock_result = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&title_lock_key)
+            .execute(&mut *connection)
+            .await;
+        if unlock_result.is_err() {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
     if let Some((mut connection, lock_key)) = idempotency_connection.take() {
         let insert_result = sqlx::query(
             "INSERT INTO issue_create_idempotency_keys (company_id, idempotency_key, issue_id) VALUES ($1, $2, $3)",
