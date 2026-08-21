@@ -17,7 +17,6 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
@@ -130,14 +129,26 @@ pub enum JobSchedule {
     OnEvent,
 }
 
-fn schedule_is_due(schedule: &JobSchedule, last_started: Option<Instant>, now: Instant) -> bool {
+fn schedule_is_due(
+    schedule: &JobSchedule,
+    last_started: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
     match schedule {
         JobSchedule::IntervalSeconds(seconds) => last_started
-            .map(|started| now.duration_since(started).as_secs() >= *seconds)
+            .map(|started| now.signed_duration_since(started).num_seconds() >= *seconds as i64)
             .unwrap_or(true),
-        // Cron parsing is not part of this scheduler yet; preserve the existing
-        // tick-driven behavior until a cron engine is wired in.
-        JobSchedule::CronExpression(_) => true,
+        JobSchedule::CronExpression(expression) => {
+            let Ok(schedule) = expression.parse::<cron::Schedule>() else {
+                return false;
+            };
+            let baseline = last_started.unwrap_or(now - ChronoDuration::minutes(2));
+            schedule
+                .after(&baseline)
+                .next()
+                .map(|next| next <= now)
+                .unwrap_or(false)
+        }
         JobSchedule::OnEvent => false,
     }
 }
@@ -353,14 +364,14 @@ impl JobScheduler {
     pub async fn start(self: Arc<Self>, interval_ms: u64) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_millis(interval_ms));
-            let mut last_started: HashMap<String, Instant> = HashMap::new();
+            let mut last_started: HashMap<String, DateTime<Utc>> = HashMap::new();
 
             loop {
                 interval.tick().await;
 
                 let jobs = self.jobs.read().await;
                 for (name, job) in jobs.iter() {
-                    let now = Instant::now();
+                    let now = Utc::now();
                     if !schedule_is_due(&job.schedule(), last_started.get(name).copied(), now) {
                         continue;
                     }
@@ -429,13 +440,14 @@ impl Default for JobScheduler {
 mod scheduler_tests {
     use super::{schedule_is_due, JobSchedule, JobScheduler, JobStatus, ScheduledJob};
     use async_trait::async_trait;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use sqlx::postgres::PgPoolOptions;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use uuid::Uuid;
 
     #[test]
     fn interval_schedule_runs_once_then_waits_for_interval() {
-        let started = Instant::now();
+        let started = Utc::now();
         assert!(schedule_is_due(
             &JobSchedule::IntervalSeconds(60),
             None,
@@ -444,19 +456,47 @@ mod scheduler_tests {
         assert!(!schedule_is_due(
             &JobSchedule::IntervalSeconds(60),
             Some(started),
-            started + Duration::from_secs(30),
+            started + ChronoDuration::seconds(30),
         ));
         assert!(schedule_is_due(
             &JobSchedule::IntervalSeconds(60),
             Some(started),
-            started + Duration::from_secs(60),
+            started + ChronoDuration::seconds(60),
         ));
     }
 
     #[test]
     fn event_schedule_is_not_tick_driven() {
-        let now = Instant::now();
+        let now = Utc::now();
         assert!(!schedule_is_due(&JobSchedule::OnEvent, None, now));
+    }
+
+    #[test]
+    fn cron_schedule_runs_only_after_an_occurrence() {
+        let now = DateTime::parse_from_rfc3339("2026-08-21T10:00:05Z")
+            .expect("valid test timestamp")
+            .with_timezone(&Utc);
+        let schedule = JobSchedule::CronExpression("0 * * * * * *".to_string());
+        assert!(schedule_is_due(&schedule, None, now));
+        assert!(!schedule_is_due(
+            &schedule,
+            Some(now),
+            now + ChronoDuration::seconds(5),
+        ));
+        assert!(schedule_is_due(
+            &schedule,
+            Some(now),
+            now + ChronoDuration::minutes(1),
+        ));
+    }
+
+    #[test]
+    fn invalid_cron_schedule_is_not_due() {
+        assert!(!schedule_is_due(
+            &JobSchedule::CronExpression("not a cron expression".to_string()),
+            None,
+            Utc::now(),
+        ));
     }
 
     #[tokio::test]
