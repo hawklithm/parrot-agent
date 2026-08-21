@@ -309,6 +309,21 @@ impl ScheduledJob for RecoveryActionRetryJob {
                 .execute(&self.pool)
                 .await
                 .map_err(|error| format!("failed to resolve recovery action {id}: {error}"))?;
+                record_activity(
+                    &self.pool,
+                    company_id,
+                    "recovery_action.resolved",
+                    "system",
+                    Uuid::nil(),
+                    "recovery_action",
+                    id,
+                    serde_json::json!({
+                        "issueId": issue_id,
+                        "actionType": action_type,
+                        "attempt": retry_count,
+                    }),
+                )
+                .await;
                 resolved += 1;
                 continue;
             }
@@ -325,6 +340,22 @@ impl ScheduledJob for RecoveryActionRetryJob {
                 .execute(&self.pool)
                 .await
                 .map_err(|error| format!("failed to mark recovery action {id}: {error}"))?;
+                record_activity(
+                    &self.pool,
+                    company_id,
+                    "recovery_action.failed",
+                    "system",
+                    Uuid::nil(),
+                    "recovery_action",
+                    id,
+                    serde_json::json!({
+                        "issueId": issue_id,
+                        "actionType": action_type,
+                        "attempt": retry_count,
+                        "reason": "retry_limit_exceeded",
+                    }),
+                )
+                .await;
                 failed += 1;
             } else {
                 let backoff = (BASE_BACKOFF_SECONDS * (1_i64 << (retry_count - 1).min(5) as u32))
@@ -341,6 +372,22 @@ impl ScheduledJob for RecoveryActionRetryJob {
                 .execute(&self.pool)
                 .await
                 .map_err(|error| format!("failed to defer recovery action {id}: {error}"))?;
+                record_activity(
+                    &self.pool,
+                    company_id,
+                    "recovery_action.retry_scheduled",
+                    "system",
+                    Uuid::nil(),
+                    "recovery_action",
+                    id,
+                    serde_json::json!({
+                        "issueId": issue_id,
+                        "actionType": action_type,
+                        "attempt": retry_count,
+                        "backoffSeconds": backoff,
+                    }),
+                )
+                .await;
                 deferred += 1;
             }
         }
