@@ -33,6 +33,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
+use services::secret_provider::encrypt_secret_material;
 
 async fn authorize_secret(
     pool: &sqlx::PgPool,
@@ -331,6 +332,14 @@ async fn create_company_secret(
     }
     validate_provider_config(&state.pool, company_id, &provider, body.provider_config_id).await?;
     validate_secret_name_key(&body.name, &key)?;
+    let encrypted_value = if is_external {
+        None
+    } else {
+        Some(
+            encrypt_secret_material(body.value.as_deref().expect("managed value validated"))
+                .map_err(|e| SecretError::Database(e.to_string()))?,
+        )
+    };
     let db_managed_mode = if is_external { "external" } else { "paperclip_managed" };
     let mut tx = state
         .pool
@@ -365,24 +374,17 @@ async fn create_company_secret(
 
     let secret = secret_to_json(&row);
 
-    // Record the initial version row for managed secrets (value material).
-    // NOTE: the plaintext `value` is NOT persisted in plaintext here; a real
-    // implementation would encrypt it via the configured provider. We store a
-    // redacted material envelope so the version audit row exists.
+    // Record the initial encrypted version row for managed secrets.
     if !is_external {
         if let Some(id) = secret.get("id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok()) {
+            let (material, value_sha) = encrypted_value.expect("managed value was encrypted");
             sqlx::query(
                 r#"INSERT INTO company_secret_versions (secret_id, version, material, value_sha256, status)
                    VALUES ($1, 1, $2, $3, 'current')"#,
             )
             .bind(id)
-            .bind(json!({"redacted": true}))
-            .bind(
-                body.value
-                    .as_deref()
-                    .map(|s| sha256_hex(s.as_bytes()))
-                    .unwrap_or_default(),
-            )
+            .bind(material)
+            .bind(value_sha)
             .execute(&mut *tx)
             .await
             .map_err(|e| SecretError::Database(e.to_string()))?;
@@ -599,12 +601,11 @@ async fn rotate_secret(
     .execute(&mut *tx)
     .await
     .map_err(|e| SecretError::Database(e.to_string()))?;
-    let material = body.value.as_ref().map(|_| json!({"redacted": true})).unwrap_or(json!({}));
-    let value_sha = body
-        .value
-        .as_deref()
-        .map(|s| sha256_hex(s.as_bytes()))
-        .unwrap_or_else(|| sha256_hex(format!("{:?}", body).as_bytes()));
+    let (material, value_sha) = if let Some(value) = body.value.as_deref() {
+        encrypt_secret_material(value).map_err(|e| SecretError::Database(e.to_string()))?
+    } else {
+        (json!({}), sha256_hex(format!("{:?}", body).as_bytes()))
+    };
     sqlx::query(
         r#"INSERT INTO company_secret_versions
              (secret_id, version, material, value_sha256, provider_version_ref, status)

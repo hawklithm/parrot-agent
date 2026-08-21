@@ -30,6 +30,27 @@ pub fn sha256_hex(value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Encrypt a managed secret for persistence and return its plaintext digest.
+/// The digest is used only for change detection/fingerprinting; the value itself
+/// never belongs in a database JSON envelope.
+pub fn encrypt_secret_material(
+    plaintext: &str,
+) -> Result<(JsonValue, String), ProviderError> {
+    let provider = LocalEncryptedProvider::new(load_secret_encryption_key())?;
+    let ciphertext = provider.encrypt(plaintext)?;
+    Ok((serde_json::json!({ "ciphertext": ciphertext }), sha256_hex(plaintext)))
+}
+
+/// Decrypt a persisted local-encrypted material envelope.
+pub fn decrypt_secret_material(material: &JsonValue) -> Result<String, ProviderError> {
+    let ciphertext = material
+        .get("ciphertext")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| ProviderError::Decryption("missing ciphertext in material".into()))?;
+    let provider = LocalEncryptedProvider::new(load_secret_encryption_key())?;
+    provider.decrypt(ciphertext)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("Encryption error: {0}")]
@@ -211,5 +232,13 @@ mod tests {
         let rotated_value = provider.retrieve(&rotated_ref).await.unwrap();
         assert!(rotated_value.contains("original"));
         assert!(rotated_value.contains("-rotated-"));
+    }
+
+    #[test]
+    fn test_persisted_material_roundtrip() {
+        let (material, digest) = encrypt_secret_material("persisted-value").unwrap();
+        assert_eq!(digest, sha256_hex("persisted-value"));
+        assert!(material.get("ciphertext").and_then(|v| v.as_str()).is_some());
+        assert_eq!(decrypt_secret_material(&material).unwrap(), "persisted-value");
     }
 }

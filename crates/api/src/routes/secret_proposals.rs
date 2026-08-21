@@ -25,6 +25,7 @@ use sqlx::Row;
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
+use services::secret_provider::encrypt_secret_material;
 
 fn proposal_json(
     row: &sqlx::postgres::PgRow,
@@ -134,13 +135,24 @@ async fn create_agent_proposal(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    let value_ciphertext = request.value.clone();
-    let value_fingerprint = value_ciphertext
-        .as_ref()
-        .map(json_fingerprint);
-    let value_length: Option<i32> = value_ciphertext
-        .as_ref()
-        .and_then(|v| v.to_string().len().try_into().ok());
+    let encrypted_value = request.value.as_ref().map(|value| {
+        let plaintext = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string());
+        (plaintext, value)
+    });
+    let (value_ciphertext, value_fingerprint, value_length) = if let Some((plaintext, _)) = encrypted_value.as_ref() {
+        let (material, fingerprint) = encrypt_secret_material(plaintext)
+            .map_err(|error| {
+                tracing::error!("Failed to encrypt secret proposal value: {}", error);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let length: Option<i32> = plaintext.len().try_into().ok();
+        (Some(material), Some(fingerprint), length)
+    } else {
+        (None, None, None)
+    };
 
     let id = Uuid::new_v4();
     let expires_at = chrono::Utc::now() + chrono::Duration::days(7);

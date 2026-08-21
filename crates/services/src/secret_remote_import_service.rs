@@ -5,10 +5,10 @@ use models::{
 };
 use uuid::Uuid;
 use sqlx::{PgPool, Row};
-use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 use crate::errors::ServiceResult;
+use crate::secret_provider::encrypt_secret_material;
 
 /// Service for remote secret import (batch import from external providers)
 #[async_trait]
@@ -153,12 +153,18 @@ impl SecretRemoteImportService for ProviderSecretRemoteImportService {
             }).unwrap_or_default();
             if existing.is_some() && !request.overwrite_conflicts { results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Skipped,secret_id:None,error:Some("secret already exists".into()),conflicts}); continue; }
             let value=match self.value(&provider,&config,&name,&external_ref).await {Ok(v)=>v,Err(e)=>{results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Error,secret_id:None,error:Some(e.to_string()),conflicts});continue;}};
-            let mut h=Sha256::new();h.update(value.as_bytes());let sha=format!("{:x}",h.finalize());
+            let (material, sha) = match encrypt_secret_material(&value) {
+                Ok(encrypted) => encrypted,
+                Err(error) => {
+                    results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Error,secret_id:None,error:Some(format!("failed to encrypt imported secret: {error}")),conflicts});
+                    continue;
+                }
+            };
             let mut tx = self.pool.begin().await?;
             let secret_id=if let Some(row) = existing { let id: Uuid = row.get("id"); sqlx::query("UPDATE company_secrets SET provider=$2,provider_config_id=$3,external_ref=$4,managed_mode='external_reference',latest_version=latest_version+1,updated_at=NOW() WHERE id=$1").bind(id).bind(&provider).bind(request.provider_config_id).bind(&external_ref).execute(&mut *tx).await?; id } else { sqlx::query_scalar("INSERT INTO company_secrets (company_id,key,name,provider,provider_config_id,managed_mode,external_ref,latest_version) VALUES ($1,$2,$3,$4,$5,'external_reference',$6,1) RETURNING id").bind(company_id).bind(&key).bind(&name).bind(&provider).bind(request.provider_config_id).bind(&external_ref).fetch_one(&mut *tx).await? };
             let version:i32=sqlx::query_scalar("SELECT latest_version FROM company_secrets WHERE id=$1").bind(secret_id).fetch_one(&mut *tx).await?;
             sqlx::query("UPDATE company_secret_versions SET status='superseded', revoked_at=NOW() WHERE secret_id=$1 AND status='current'").bind(secret_id).execute(&mut *tx).await?;
-            sqlx::query("INSERT INTO company_secret_versions (secret_id,version,material,value_sha256,provider_version_ref,status,fingerprint_sha256) VALUES ($1,$2,$3,$4,$5,'current',$4)").bind(secret_id).bind(version).bind(serde_json::json!({"value":value})).bind(&sha).bind(&external_ref).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO company_secret_versions (secret_id,version,material,value_sha256,provider_version_ref,status,fingerprint_sha256) VALUES ($1,$2,$3,$4,$5,'current',$4)").bind(secret_id).bind(version).bind(material).bind(&sha).bind(&external_ref).execute(&mut *tx).await?;
             tx.commit().await?;
             results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Imported,secret_id:Some(secret_id),error:None,conflicts});
         }

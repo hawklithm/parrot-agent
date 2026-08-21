@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 use uuid::Uuid;
 use sqlx::{PgPool, Row};
-use sha2::{Digest, Sha256};
+use crate::secret_provider::{decrypt_secret_material, encrypt_secret_material};
 
 /// 密钥服务错误
 #[derive(Debug, Error)]
@@ -467,7 +467,9 @@ impl SecretService for DefaultSecretService {
                                 let parsed: i32 = version.parse().map_err(|_| SecretServiceError::ResolutionFailed(format!("invalid secret version '{}'", version)))?;
                                 sqlx::query_scalar("SELECT v.material FROM company_secret_versions v JOIN company_secrets s ON s.id=v.secret_id WHERE s.id=$1 AND s.company_id=$2 AND s.deleted_at IS NULL AND v.version=$3").bind(secret_id).bind(company_id).bind(parsed).fetch_optional(pool).await?
                             };
-                            let value = material.and_then(|m| m.get("value").and_then(|v| v.as_str()).map(str::to_owned)).ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
+                            let material = material.ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
+                            let value = decrypt_secret_material(&material)
+                                .map_err(|error| SecretServiceError::ResolutionFailed(error.to_string()))?;
                             resolved_env.insert(key.clone(), JsonValue::String(value));
 
                             secret_keys.push(key.clone());
@@ -551,9 +553,11 @@ impl SecretService for DefaultSecretService {
         let pool = self.pool()?;
         let row = sqlx::query("INSERT INTO company_secrets (company_id,key,name,description) VALUES ($1,$2,$2,$3) RETURNING id,company_id,key,name,provider,status,scope,description,latest_version,created_at,updated_at")
             .bind(company_id).bind(&input.key).bind(&input.description).fetch_one(pool).await?;
-        let id: Uuid = row.get("id"); let mut h=Sha256::new(); h.update(input.value.as_bytes()); let digest=format!("{:x}",h.finalize());
+        let id: Uuid = row.get("id");
+        let (material, digest) = encrypt_secret_material(&input.value)
+            .map_err(|error| SecretServiceError::ResolutionFailed(error.to_string()))?;
         sqlx::query("INSERT INTO company_secret_versions (secret_id,version,material,value_sha256,fingerprint_sha256) VALUES ($1,1,$2,$3,$3)")
-            .bind(id).bind(serde_json::json!({"value": input.value})).bind(digest).execute(pool).await?;
+            .bind(id).bind(material).bind(digest).execute(pool).await?;
         Ok(Self::row_to_secret(&row, None))
     }
 
@@ -578,7 +582,18 @@ impl SecretService for DefaultSecretService {
         let pool = self.pool()?;
         let row = sqlx::query("UPDATE company_secrets SET description=COALESCE($3,description), latest_version=CASE WHEN $4::text IS NULL THEN latest_version ELSE latest_version+1 END, updated_at=now() WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL RETURNING id,company_id,key,name,provider,status,scope,description,latest_version,created_at,updated_at")
             .bind(secret_id).bind(company_id).bind(input.description).bind(input.value.as_deref()).fetch_optional(pool).await?.ok_or_else(|| SecretServiceError::SecretNotFound(secret_id.to_string()))?;
-        if let Some(value) = input.value { let version:i32=row.get("latest_version"); let mut h=Sha256::new(); h.update(value.as_bytes()); let digest=format!("{:x}",h.finalize()); sqlx::query("INSERT INTO company_secret_versions (secret_id,version,material,value_sha256,fingerprint_sha256) VALUES ($1,$2,$3,$4,$4)").bind(secret_id).bind(version).bind(serde_json::json!({"value":value})).bind(digest).execute(pool).await?; }
+        if let Some(value) = input.value {
+            let version: i32 = row.get("latest_version");
+            let (material, digest) = encrypt_secret_material(&value)
+                .map_err(|error| SecretServiceError::ResolutionFailed(error.to_string()))?;
+            sqlx::query("INSERT INTO company_secret_versions (secret_id,version,material,value_sha256,fingerprint_sha256) VALUES ($1,$2,$3,$4,$4)")
+                .bind(secret_id)
+                .bind(version)
+                .bind(material)
+                .bind(digest)
+                .execute(pool)
+                .await?;
+        }
         Ok(Self::row_to_secret(&row, None))
     }
 
