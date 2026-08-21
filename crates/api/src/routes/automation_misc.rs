@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -1035,7 +1036,20 @@ async fn project_runtime_command(
         return Err(StatusCode::NOT_FOUND);
     }
     require_runtime_manage_for_agent(&state, &actor, company_id, workspace_id).await?;
-    Ok(Json(json!({ "projectId": project_id, "workspaceId": workspace_id, "commandId": cmd_id, "status": "accepted" })))
+    let (operation_id, operation_status, started_at) = record_project_runtime_operation(
+        &state,
+        company_id,
+        "command_execution",
+        Some(cmd_id.clone()),
+        json!({
+            "projectId": project_id,
+            "projectWorkspaceId": workspace_id,
+            "commandId": cmd_id,
+            "providerExecution": "pending",
+        }),
+    )
+    .await?;
+    Ok(Json(json!({ "projectId": project_id, "workspaceId": workspace_id, "commandId": cmd_id, "status": "accepted", "operationId": operation_id, "operationStatus": operation_status, "startedAt": started_at })))
 }
 
 async fn require_runtime_manage_for_agent(
@@ -1063,6 +1077,29 @@ async fn require_runtime_manage_for_agent(
     } else {
         Err(StatusCode::FORBIDDEN)
     }
+}
+
+async fn record_project_runtime_operation(
+    state: &AppState,
+    company_id: Uuid,
+    phase: &str,
+    command: Option<String>,
+    metadata: Value,
+) -> Result<(Uuid, String, chrono::DateTime<chrono::Utc>), StatusCode> {
+    let row = sqlx::query(
+        r#"INSERT INTO workspace_operations
+              (company_id, execution_workspace_id, phase, command, metadata)
+           VALUES ($1, NULL, $2, $3, $4)
+           RETURNING id, status, started_at"#,
+    )
+    .bind(company_id)
+    .bind(phase)
+    .bind(command)
+    .bind(metadata)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((row.get("id"), row.get("status"), row.get("started_at")))
 }
 
 /// POST /projects/:project_id/workspaces/:workspace_id/runtime-services/:service_id
@@ -1093,7 +1130,20 @@ async fn project_runtime_service(
         return Err(StatusCode::NOT_FOUND);
     }
     require_runtime_manage_for_agent(&state, &actor, company_id, workspace_id).await?;
-    Ok(Json(json!({ "projectId": project_id, "workspaceId": workspace_id, "serviceId": service_id, "status": "accepted" })))
+    let (operation_id, operation_status, started_at) = record_project_runtime_operation(
+        &state,
+        company_id,
+        "runtime_start",
+        None,
+        json!({
+            "projectId": project_id,
+            "projectWorkspaceId": workspace_id,
+            "runtimeServiceId": service_id,
+            "providerExecution": "pending",
+        }),
+    )
+    .await?;
+    Ok(Json(json!({ "projectId": project_id, "workspaceId": workspace_id, "serviceId": service_id, "status": "accepted", "operationId": operation_id, "operationStatus": operation_status, "startedAt": started_at })))
 }
 
 /// GET /_plugins/:plugin_id/ui/*file_path —— plugin UI 静态文件（基础：404）。
