@@ -293,6 +293,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             job_scheduler.clone(),
         )))
         .await;
+    job_scheduler
+        .register(Arc::new(services::SchedulerLeaseRepairJob::new(
+            job_scheduler.clone(),
+        )))
+        .await;
     let decision_wakeup = Arc::new(
         services::decision_wakeup_service::DefaultDecisionWakeupService::new(true)
             .with_heartbeat_service(scheduler_heartbeat),

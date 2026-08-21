@@ -412,10 +412,11 @@ pub use routine_template::{
 pub mod job_scheduler;
 pub use job_scheduler::{
     JobScheduler, ScheduledJob, JobSchedule, JobStatus, JobExecutionRecord,
+    SchedulerLeaseRecord,
     RoutineCronTrigger, MonitorCheckJob, LeaseExpiryScanner,
     EnvironmentHealthProber, StuckRunDetector, ConsistencyCheckJob,
     StatusCardSchedulerJob, SummarySlotFinalizerJob,
-    HeartbeatRecoveryJob, SchedulerExecutionHistoryCleanupJob,
+    HeartbeatRecoveryJob, SchedulerExecutionHistoryCleanupJob, SchedulerLeaseRepairJob,
     monitor_backoff_seconds, is_env_stale, is_run_stuck, ENV_IDLE_TIMEOUT,
 };
 pub mod status_card_worker;

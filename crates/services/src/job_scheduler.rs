@@ -97,6 +97,15 @@ pub struct JobExecutionRecord {
     pub error_message: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SchedulerLeaseRecord {
+    pub job_name: String,
+    pub owner_id: Uuid,
+    pub leased_until: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// 任务状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
@@ -174,6 +183,33 @@ pub struct HeartbeatRecoveryJob {
 /// Periodic cleanup for durable scheduler history.
 pub struct SchedulerExecutionHistoryCleanupJob {
     scheduler: Arc<JobScheduler>,
+}
+
+/// Periodic repair for leases left by crashed scheduler processes.
+pub struct SchedulerLeaseRepairJob {
+    scheduler: Arc<JobScheduler>,
+}
+
+impl SchedulerLeaseRepairJob {
+    pub fn new(scheduler: Arc<JobScheduler>) -> Self {
+        Self { scheduler }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for SchedulerLeaseRepairJob {
+    fn job_name(&self) -> &str {
+        "scheduler_lease_repair"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(300)
+    }
+
+    async fn execute(&self) -> Result<String, String> {
+        let removed = self.scheduler.reap_expired_leases(1_000).await?;
+        Ok(format!("removed {removed} expired scheduler leases"))
+    }
 }
 
 impl SchedulerExecutionHistoryCleanupJob {
@@ -344,6 +380,64 @@ impl JobScheduler {
 
     pub async fn get_job(&self, name: &str) -> Option<Arc<dyn ScheduledJob>> {
         self.jobs.read().await.get(name).cloned()
+    }
+
+    /// Load current database-backed lease state for scheduler observability.
+    pub async fn load_persisted_leases(&self) -> Result<Vec<SchedulerLeaseRecord>, String> {
+        let Some(pool) = self.pool.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT job_name, owner_id, leased_until, heartbeat_at, updated_at
+               FROM scheduler_job_leases
+              ORDER BY job_name ASC",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(SchedulerLeaseRecord {
+                    job_name: row.try_get("job_name").map_err(|error| error.to_string())?,
+                    owner_id: row.try_get("owner_id").map_err(|error| error.to_string())?,
+                    leased_until: row
+                        .try_get("leased_until")
+                        .map_err(|error| error.to_string())?,
+                    heartbeat_at: row
+                        .try_get("heartbeat_at")
+                        .map_err(|error| error.to_string())?,
+                    updated_at: row
+                        .try_get("updated_at")
+                        .map_err(|error| error.to_string())?,
+                })
+            })
+            .collect()
+    }
+
+    /// Remove a bounded batch of leases that are still expired at delete time.
+    pub async fn reap_expired_leases(&self, batch_size: i64) -> Result<u64, String> {
+        let Some(pool) = self.pool.as_ref() else {
+            return Ok(0);
+        };
+        let deleted = sqlx::query(
+            "WITH expired AS (
+                 SELECT job_name
+                   FROM scheduler_job_leases
+                  WHERE leased_until <= NOW()
+                  ORDER BY leased_until ASC
+                  LIMIT $1
+             )
+             DELETE FROM scheduler_job_leases lease
+              USING expired
+              WHERE lease.job_name = expired.job_name
+                AND lease.leased_until <= NOW()
+             RETURNING lease.job_name",
+        )
+        .bind(batch_size.clamp(1, 10_000))
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(deleted.len() as u64)
     }
 
     pub async fn record_execution(&self, record: JobExecutionRecord) {
@@ -661,6 +755,35 @@ mod scheduler_tests {
             .execute(&pool)
             .await
             .expect("cleanup scheduler lease renewal test row");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_lease_state_is_observable_and_expired_rows_are_repaired() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("database required for scheduler lease repair test");
+        let name = format!("scheduler_repair_test_{}", Uuid::new_v4());
+        let scheduler = JobScheduler::new().with_pool(pool.clone());
+
+        assert!(scheduler.try_acquire_lease(&name, 60).await);
+        let leases = scheduler
+            .load_persisted_leases()
+            .await
+            .expect("load scheduler leases");
+        assert!(leases.iter().any(|lease| lease.job_name == name));
+        scheduler.release_lease(&name).await;
+        assert_eq!(scheduler.reap_expired_leases(10).await.unwrap(), 1);
+        let leases = scheduler
+            .load_persisted_leases()
+            .await
+            .expect("load scheduler leases after repair");
+        assert!(!leases.iter().any(|lease| lease.job_name == name));
         pool.close().await;
     }
 
