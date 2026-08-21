@@ -51,6 +51,10 @@ use repositories::{
     PgSkillTestInputRepository, PgSkillTestRunRepository, PgSkillTestRunTemplateRepository,
     PgSkillVersionRepository,
 };
+use services::event_listeners::{
+    ApprovalApprovedToIssueUnblockListener, CompleteIssueServiceAdapter,
+    RoutineTriggeredToIssueCreationListener,
+};
 use services::{
     issue_comment_service::IssueCommentServiceImpl,
     // Namespaced impls (avoid root-level name collisions)
@@ -75,12 +79,12 @@ use services::{
     DefaultGoalService,
     DefaultHeartbeatService,
     DefaultInstanceSettingsService,
+    DefaultIssueService,
     DefaultLowTrustService,
     DefaultOrgChartService,
     DefaultPipelineService,
     DefaultSkillRegistryServiceImpl,
     DefaultWatchdogService,
-    DefaultIssueService,
     EnvironmentDiagnosticsService,
     EnvironmentRuntimeService,
     EnvironmentService,
@@ -113,7 +117,6 @@ use services::{
     WatchdogService,
     WorkProductService,
 };
-use services::event_listeners::{ApprovalApprovedToIssueUnblockListener, CompleteIssueServiceAdapter, RoutineTriggeredToIssueCreationListener};
 
 async fn ensure_local_trusted_principal(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let configured_user_id = std::env::var("LOCAL_TRUSTED_USER_ID")
@@ -152,9 +155,10 @@ async fn ensure_local_trusted_principal(pool: &PgPool) -> Result<(), Box<dyn std
         }
     };
 
-    let company_ids = sqlx::query_scalar::<_, Uuid>("SELECT id FROM companies ORDER BY created_at ASC, id ASC")
-        .fetch_all(pool)
-        .await?;
+    let company_ids =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM companies ORDER BY created_at ASC, id ASC")
+            .fetch_all(pool)
+            .await?;
     // Paperclip's local trusted actor is an instance-level Board principal;
     // it is deliberately not bound to one company. Resource routes resolve
     // the target company from their path or the resource itself.
@@ -194,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Panic occurred: {:?}", panic_info);
         eprintln!("\nBacktrace:\n{}", backtrace);
         eprintln!("{}\n", "=".repeat(80));
-        
+
         // 也尝试写入tracing日志（如果已初始化）
         tracing::error!(
             panic_info = ?panic_info,
@@ -202,7 +206,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "APPLICATION PANIC - Service crashed"
         );
     }));
-
 
     // 加载 .env 文件（优先级：环境变量 > .env）
     let _ = dotenvy::dotenv();
@@ -236,29 +239,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化并启动 Job Scheduler
     tracing::info!("initializing job scheduler...");
     let job_scheduler = Arc::new(services::JobScheduler::new());
-    
+
     // 创建 RoutineExecutionService
     let routine_execution_service = Arc::new(services::RoutineExecutionService::new(pool.clone()));
-    
+
     // 注册后台任务
-    job_scheduler.register(Arc::new(services::RoutineCronTrigger::new(
-        pool.clone(),
-        routine_execution_service,
-    ))).await;
-    
-    job_scheduler.register(Arc::new(services::MonitorCheckJob::new(pool.clone()))).await;
-    job_scheduler.register(Arc::new(services::LeaseExpiryScanner::new(pool.clone()))).await;
-    job_scheduler.register(Arc::new(services::EnvironmentHealthProber::new(pool.clone()))).await;
-    job_scheduler.register(Arc::new(services::StuckRunDetector::new(pool.clone()))).await;
-    job_scheduler.register(Arc::new(services::ConsistencyCheckJob::new(pool.clone()))).await;
+    job_scheduler
+        .register(Arc::new(services::RoutineCronTrigger::new(
+            pool.clone(),
+            routine_execution_service,
+        )))
+        .await;
+
+    job_scheduler
+        .register(Arc::new(services::MonitorCheckJob::new(pool.clone())))
+        .await;
+    job_scheduler
+        .register(Arc::new(services::LeaseExpiryScanner::new(pool.clone())))
+        .await;
+    job_scheduler
+        .register(Arc::new(services::EnvironmentHealthProber::new(
+            pool.clone(),
+        )))
+        .await;
+    job_scheduler
+        .register(Arc::new(services::StuckRunDetector::new(pool.clone())))
+        .await;
+    job_scheduler
+        .register(Arc::new(services::ConsistencyCheckJob::new(pool.clone())))
+        .await;
     // 后台任务链：status-card scheduler tick + summary-slot 终态 finalizer
     // （对应 paperclip heartbeatSchedulerInterval 中的 status-card tick）
-    job_scheduler.register(Arc::new(services::StatusCardSchedulerJob::new(pool.clone()))).await;
-    job_scheduler.register(Arc::new(services::SummarySlotFinalizerJob::new(pool.clone()))).await;
-    
+    job_scheduler
+        .register(Arc::new(services::StatusCardSchedulerJob::new(
+            pool.clone(),
+        )))
+        .await;
+    job_scheduler
+        .register(Arc::new(services::SummarySlotFinalizerJob::new(
+            pool.clone(),
+        )))
+        .await;
+    job_scheduler
+        .register(Arc::new(services::HeartbeatRecoveryJob::new(Arc::new(
+            services::DefaultHeartbeatService::new(pool.clone()),
+        ))))
+        .await;
+
     // 启动调度器（30 秒间隔，对应 paperclip 的 heartbeatSchedulerIntervalMs）
     let _scheduler_handle = job_scheduler.clone().start(30000).await;
     tracing::info!("job scheduler started with 30s interval");
+
+    let plugin_worker_manager = Arc::new(services::PluginWorkerManager::new());
+    let plugin_job_scheduler = Arc::new(services::PluginJobScheduler::new(
+        services::PluginJobSchedulerOptions {
+            db: pool.clone(),
+            worker_manager: plugin_worker_manager,
+            tick_interval_ms: None,
+            job_timeout_ms: None,
+            max_concurrent_jobs: None,
+        },
+    ));
+    plugin_job_scheduler.start().await;
+    tracing::info!("plugin job scheduler started");
 
     let state = build_app_state(pool.clone()).await?;
 
@@ -381,11 +424,15 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
 
     // --- Services ---
     let agent_service: Arc<dyn AgentService> = Arc::new(
-        DefaultAgentService::new(agent_repo.clone(), Arc::new(agent_api_key_repo.clone()), pool.clone())
-            .with_heartbeat_pool(pool.clone())
-            .with_config_revision_repo(config_revision_repo.clone())
-            .with_cost_event_repo(cost_event_repo.clone())
-            .with_activity_log_repo(activity_log_repo.clone()),
+        DefaultAgentService::new(
+            agent_repo.clone(),
+            Arc::new(agent_api_key_repo.clone()),
+            pool.clone(),
+        )
+        .with_heartbeat_pool(pool.clone())
+        .with_config_revision_repo(config_revision_repo.clone())
+        .with_cost_event_repo(cost_event_repo.clone())
+        .with_activity_log_repo(activity_log_repo.clone()),
     );
     let access_service: Arc<dyn access::AccessService> =
         Arc::new(DefaultAccessService::with_pool(pool.clone()));
@@ -418,7 +465,8 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         Arc::new(DefaultLowTrustService::new(issue_repo.clone()));
     let company_service: Arc<CompanyService> = Arc::new(CompanyService::new(company_repo));
     let project_service: Arc<ProjectService> = Arc::new(ProjectService::new(project_repo));
-    let routine_service: Arc<dyn RoutineService> = Arc::new(RoutineServiceImpl::new(routine_repo.clone()));
+    let routine_service: Arc<dyn RoutineService> =
+        Arc::new(RoutineServiceImpl::new(routine_repo.clone()));
     let goal_service: Arc<dyn GoalService> = Arc::new(DefaultGoalService::new(goal_repo));
     let environment_service: Arc<dyn EnvironmentService> =
         Arc::new(services::environment_service::DefaultEnvironmentService::new(environment_repo));
@@ -509,27 +557,31 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
             issue_comment_service.clone(),
             work_product_service.clone(),
             attachment_service.clone(),
-        ).with_routine_repo(routine_repo.clone()),
+        )
+        .with_routine_repo(routine_repo.clone()),
     );
     let event_issue_adapter = Arc::new(CompleteIssueServiceAdapter::new(event_issue_service));
     event_bus
-        .subscribe(Box::new(ApprovalApprovedToIssueUnblockListener::new(event_issue_adapter.clone())))
+        .subscribe(Box::new(ApprovalApprovedToIssueUnblockListener::new(
+            event_issue_adapter.clone(),
+        )))
         .await
         .map_err(|error| format!("failed to subscribe approval listener: {error}"))?;
     event_bus
-        .subscribe(Box::new(RoutineTriggeredToIssueCreationListener::new(event_issue_adapter)))
+        .subscribe(Box::new(RoutineTriggeredToIssueCreationListener::new(
+            event_issue_adapter,
+        )))
         .await
         .map_err(|error| format!("failed to subscribe routine listener: {error}"))?;
     // 创建 Approval Executor
-    let approval_executor: Arc<dyn services::approval_execution::ApprovalExecutor> = Arc::new(
-        services::approval_execution::DefaultApprovalExecutor::new(
+    let approval_executor: Arc<dyn services::approval_execution::ApprovalExecutor> =
+        Arc::new(services::approval_execution::DefaultApprovalExecutor::new(
             pool.clone(),
             agent_service.clone(),
             Arc::new(agent_repo.clone()),
             budget_policy_repo.clone(),
-        ),
-    );
-    
+        ));
+
     let approval_service: Arc<dyn ApprovalService> = Arc::new(
         DefaultApprovalService::new(approval_repo.clone(), issue_repo.clone())
             .with_event_bus(event_bus.clone())
@@ -547,7 +599,7 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         wakeup_repo,
         interaction_repo,
     ));
-    
+
     // Create cost service before heartbeat service (heartbeat needs it for cost event tracking)
     let cost_service: Arc<dyn services::CostService> = Arc::new(
         services::DefaultCostService::new(
@@ -557,13 +609,22 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         )
         .with_adapter_registry(adapter_registry.clone()),
     );
-    
+
     let heartbeat_coordinator = Arc::new(
         DefaultHeartbeatService::new(pool.clone())
             .with_sse_service(sse_service.clone())
             .with_cost_service(cost_service.clone()),
     );
     let heartbeat_service: Arc<dyn services::HeartbeatService> = heartbeat_coordinator.clone();
+    let recovery_action_repository = Arc::new(
+        repositories::PgRecoveryActionRepository::new(pool.clone()),
+    );
+    let recovery_action_service: Arc<dyn services::RecoveryActionService> = Arc::new(
+        services::DefaultRecoveryActionService::new(
+            recovery_action_repository,
+            issue_repo.clone(),
+        ),
+    );
     // Label service
     let label_repo: Arc<repositories::label_repository::PgLabelRepository> = Arc::new(
         repositories::label_repository::PgLabelRepository::new(pool.clone()),
@@ -588,6 +649,7 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         work_product_service.clone(),
         attachment_service.clone(),
         heartbeat_service.clone(),
+        recovery_action_service,
     ));
 
     match heartbeat_coordinator.reconcile_pending_issues().await {
@@ -603,7 +665,7 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
     // 初始化适配器注册状态管理
     let adapter_registry_state = Arc::new(
         services::AdapterRegistryState::new()
-            .map_err(|e| format!("Failed to initialize adapter registry state: {}", e))?
+            .map_err(|e| format!("Failed to initialize adapter registry state: {}", e))?,
     );
 
     Ok(AppState::new(

@@ -14,6 +14,7 @@ use crate::issue_comment_service::IssueCommentService;
 use crate::work_product_service::WorkProductService;
 use crate::attachment_service::AttachmentService;
 use crate::heartbeat_service::HeartbeatService;
+use crate::recovery_action_service::RecoveryActionService;
 
 /// Issue mutation result
 #[derive(Debug, Clone, Serialize)]
@@ -840,6 +841,7 @@ pub struct LegacyIssueService {
     #[allow(dead_code)]
     attachment_service: Arc<dyn AttachmentService>,
     heartbeat_service: Arc<dyn HeartbeatService>,
+    recovery_action_service: Arc<dyn RecoveryActionService>,
 }
 
 impl LegacyIssueService {
@@ -851,6 +853,7 @@ impl LegacyIssueService {
         work_product_service: Arc<dyn WorkProductService>,
         attachment_service: Arc<dyn AttachmentService>,
         heartbeat_service: Arc<dyn HeartbeatService>,
+        recovery_action_service: Arc<dyn RecoveryActionService>,
     ) -> Self {
         Self {
             inner: DefaultIssueService::new(
@@ -866,6 +869,7 @@ impl LegacyIssueService {
             work_product_service,
             attachment_service,
             heartbeat_service,
+            recovery_action_service,
         }
     }
 
@@ -1157,12 +1161,32 @@ impl issue_service::IssueService for LegacyIssueService {
         Ok(())
     }
 
-    async fn get_recovery_actions(&self, _id: Uuid, _company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
-        Ok(vec![])
+    async fn get_recovery_actions(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
+        let actions = self
+            .recovery_action_service
+            .list_by_issue(company_id, id)
+            .await?;
+        actions
+            .into_iter()
+            .map(|action| serde_json::to_value(action).map_err(|error| error.to_string()))
+            .collect()
     }
 
-    async fn resolve_recovery_action(&self, _id: Uuid, _company_id: Uuid, _action_id: Uuid) -> Result<(), String> {
-        Ok(())
+    async fn resolve_recovery_action(&self, id: Uuid, company_id: Uuid, action_id: Uuid) -> Result<(), String> {
+        let actions = self
+            .recovery_action_service
+            .list_by_issue(company_id, id)
+            .await?;
+        if !actions.iter().any(|action| action.id == action_id) {
+            return Err("Recovery action not found for issue".to_string());
+        }
+        self.recovery_action_service
+            .resolve(
+                action_id,
+                &models::ResolveRecoveryActionInput { resolved_at: None },
+            )
+            .await
+            .map(|_| ())
     }
 
     async fn create_work_product(&self, id: Uuid, _company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> {
