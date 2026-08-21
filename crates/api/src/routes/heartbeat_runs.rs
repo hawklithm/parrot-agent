@@ -128,6 +128,23 @@ pub struct RunEventsQuery {
     pub limit: Option<i64>,
 }
 
+async fn authorize_run_access(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    run_id: Uuid,
+    mode: AccessMode,
+) -> Result<Uuid, HeartbeatRunError> {
+    let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM heartbeat_runs WHERE id = $1")
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?
+        .ok_or(HeartbeatRunError::NotFound(run_id))?;
+    require_company_access(actor, company_id, mode)
+        .map_err(|_| HeartbeatRunError::NotFound(run_id))?;
+    Ok(company_id)
+}
+
 /// Watchdog decision submission body (Paperclip).
 #[derive(Debug, Deserialize)]
 pub struct WatchdogDecisionInput {
@@ -186,9 +203,12 @@ const RUN_SELECT: &str = r#"SELECT id, company_id, agent_id, invocation_source, 
 /// X1: GET /companies/:company_id/heartbeat-runs
 async fn list_company_heartbeat_runs(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Query(q): Query<HeartbeatRunListQuery>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| HeartbeatRunError::Forbidden("Heartbeat run access denied".to_string()))?;
     let pool = &state.pool;
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
 
@@ -241,9 +261,12 @@ async fn list_company_heartbeat_runs(
 /// runs up to `min_count` (Paperclip dashboard semantics).
 async fn list_company_live_runs(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Query(q): Query<LiveRunsQuery>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| HeartbeatRunError::Forbidden("Heartbeat run access denied".to_string()))?;
     let pool = &state.pool;
     let limit = q.limit.unwrap_or(50).clamp(1, 1000);
     let min_count = q.min_count.unwrap_or(0).max(0).min(limit);
@@ -298,8 +321,10 @@ async fn list_company_live_runs(
 /// X3: GET /heartbeat-runs/:run_id
 async fn get_heartbeat_run(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
+    authorize_run_access(&state, &actor, run_id, AccessMode::Read).await?;
     let pool = &state.pool;
     let row = sqlx::query(&format!("{} WHERE id = $1", RUN_SELECT))
         .bind(run_id)
@@ -321,8 +346,10 @@ async fn get_heartbeat_run(
 /// X4: POST /heartbeat-runs/:run_id/cancel
 async fn cancel_heartbeat_run(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
+    authorize_run_access(&state, &actor, run_id, AccessMode::Write).await?;
     let pool = &state.pool;
     if let Some(row) = sqlx::query("SELECT company_id, agent_id, context_snapshot FROM heartbeat_runs WHERE id = $1")
         .bind(run_id).fetch_optional(pool).await.map_err(|e| HeartbeatRunError::Database(e.to_string()))? {
@@ -371,9 +398,11 @@ async fn cancel_heartbeat_run(
 /// cursor-shaped projection consumed by Paperclip's run detail page.
 async fn list_run_events(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(run_id): Path<Uuid>,
     Query(q): Query<RunEventsQuery>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
+    authorize_run_access(&state, &actor, run_id, AccessMode::Read).await?;
     let after_seq = q.after_seq.unwrap_or(0);
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let rows = sqlx::query(
@@ -400,9 +429,11 @@ async fn list_run_events(
 /// X6: GET /heartbeat-runs/:run_id/log
 async fn get_run_log(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(run_id): Path<Uuid>,
     Query(q): Query<RunLogQuery>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
+    authorize_run_access(&state, &actor, run_id, AccessMode::Read).await?;
     let offset = q.offset.unwrap_or(0).max(0) as usize;
     let limit = q.limit_bytes.unwrap_or(256 * 1024).clamp(1, 16 * 1024 * 1024) as usize;
     // A run can exist before its adapter has emitted any output.  The
@@ -434,6 +465,7 @@ async fn get_run_log(
 /// points at this run.
 async fn list_run_issues(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let pool = &state.pool;
@@ -450,6 +482,8 @@ async fn list_run_issues(
         None => return Err(HeartbeatRunError::NotFound(run_id)),
     };
     let company_id: Uuid = run.get("company_id");
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| HeartbeatRunError::NotFound(run_id))?;
     let context: Option<Value> = run.try_get("context_snapshot").unwrap_or(None);
     let context_issue_id = context
         .as_ref()
@@ -537,7 +571,7 @@ async fn list_watchdog_decisions(
         .map_err(|e| HeartbeatRunError::Database(e.to_string()))?
         .ok_or(HeartbeatRunError::NotFound(run_id))?;
     // Paperclip's getAccessibleResource returns 404 for inaccessible runs.
-    crate::routes::assert_company_access(&actor, company_id, true)
+    require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| HeartbeatRunError::NotFound(run_id))?;
 
     let rows = sqlx::query(
