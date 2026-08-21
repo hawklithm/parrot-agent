@@ -2418,6 +2418,8 @@ async fn create_child_issue(
     Json(mut input): Json<CreateIssueInput>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let service = state.issue_service.clone();
+    let parent_company_id = scoped_issue_company(&state, &actor, parent_id).await?;
+    input.company_id = parent_company_id;
 
     // ✅ Paperclip pattern: Force override creator fields from actor (issues.ts:7139-7146)
     // Sanitize: strip any createdByUserId if actor is Agent (prevents spoofing)
