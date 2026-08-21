@@ -2555,42 +2555,73 @@ async fn mark_issue_read(
 /// I13: DELETE /issues/:id/read
 async fn unmark_issue_read(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
-    state
-        .issue_service
-        .unmark_read(id, company_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let user_id = match actor {
+        AuthorizationActor::Board { user_id, .. } => user_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+    sqlx::query(
+        "DELETE FROM issue_read_status WHERE company_id = $1 AND issue_id = $2 AND user_id = $3",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// I14: POST /issues/:id/inbox-archive
 async fn archive_issue_inbox(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
-    state
-        .issue_service
-        .archive_inbox(id, company_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let user_id = match actor {
+        AuthorizationActor::Board { user_id, .. } => user_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+    sqlx::query(
+        "INSERT INTO issue_inbox_archives (company_id, issue_id, user_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (issue_id, user_id) DO UPDATE
+         SET archived_at = NOW(), updated_at = NOW()",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// I15: DELETE /issues/:id/inbox-archive
 async fn unarchive_issue_inbox(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
-    state
-        .issue_service
-        .unarchive_inbox(id, company_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let user_id = match actor {
+        AuthorizationActor::Board { user_id, .. } => user_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+    sqlx::query(
+        "DELETE FROM issue_inbox_archives
+         WHERE company_id = $1 AND issue_id = $2 AND user_id = $3",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
