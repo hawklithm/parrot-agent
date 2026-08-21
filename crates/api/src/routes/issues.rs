@@ -1534,6 +1534,38 @@ async fn create_issue(
     if idempotency_key.as_ref().is_some_and(|key| key.len() > 255) {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
+    if idempotency_key.is_none() && !input.allow_duplicate {
+        let duplicate_issue_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id
+             FROM issues
+             WHERE company_id = $1
+               AND (($2::uuid IS NULL AND parent_id IS NULL) OR parent_id = $2)
+               AND hidden_at IS NULL
+               AND status::text NOT IN ('done', 'cancelled')
+               AND created_at >= NOW() - INTERVAL '48 hours'
+               AND lower(regexp_replace(btrim(title), '\\s+', ' ', 'g')) = lower(regexp_replace(btrim($3), '\\s+', ' ', 'g'))
+             ORDER BY created_at ASC, id ASC
+             LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(input.parent_id)
+        .bind(&input.title)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, company_id = %company_id, "failed to check duplicate issue title");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if let Some(duplicate_issue_id) = duplicate_issue_id {
+            let duplicate_issue = state
+                .issue_service
+                .get(duplicate_issue_id, company_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .ok_or(StatusCode::NOT_FOUND)?;
+            return Ok(Json(duplicate_issue));
+        }
+    }
     // Keep a session-level advisory lock on a checked-out connection while the
     // service creates the Issue, then persist the key. This closes the race
     // between replay lookup and creation without changing the repository API.

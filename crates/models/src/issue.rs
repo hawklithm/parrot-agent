@@ -337,6 +337,8 @@ pub struct CreateIssueInput {
     pub title: String,
     /// Optional caller-provided key used to replay a create request safely.
     pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub allow_duplicate: bool,
     pub description: Option<String>,
     pub status: Option<IssueStatus>,
     pub priority: Option<IssuePriority>,
