@@ -5065,6 +5065,117 @@ mod tests {
         assert!(!is_valid_source_kind("nope"));
     }
 
+    #[tokio::test]
+    async fn retention_source_guard_enforces_existence_visibility_and_company_scope() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping retention authorization integration test: DATABASE_URL is not set");
+            return;
+        };
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect database");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let company_id = Uuid::new_v4();
+        let other_company_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let readable_issue_id = Uuid::new_v4();
+        let hidden_issue_id = Uuid::new_v4();
+        let prefix = format!("RT{}", &company_id.simple().to_string()[..8]);
+        let other_prefix = format!("RT{}", &other_company_id.simple().to_string()[..8]);
+
+        for (id, name, issue_prefix) in [
+            (company_id, "Retention Authorization Company", prefix),
+            (other_company_id, "Other Retention Company", other_prefix),
+        ] {
+            sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(name)
+                .bind(issue_prefix)
+                .execute(&pool)
+                .await
+                .expect("insert company");
+        }
+        sqlx::query("INSERT INTO issues (id, company_id, title, identifier) VALUES ($1, $2, $3, $4)")
+            .bind(readable_issue_id)
+            .bind(company_id)
+            .bind("Readable retention issue")
+            .bind(format!("{}-1", &company_id.simple().to_string()[..8]))
+            .execute(&pool)
+            .await
+            .expect("insert readable issue");
+        sqlx::query("INSERT INTO issues (id, company_id, title, identifier, hidden_at) VALUES ($1, $2, $3, $4, NOW())")
+            .bind(hidden_issue_id)
+            .bind(company_id)
+            .bind("Hidden retention issue")
+            .bind(format!("{}-2", &company_id.simple().to_string()[..8]))
+            .execute(&pool)
+            .await
+            .expect("insert hidden issue");
+
+        let actor = AuthorizationActor::board(user_id, company_id);
+        assert!(
+            require_decision_source_read(
+                &pool,
+                &actor,
+                company_id,
+                "productivity_review",
+                &readable_issue_id.to_string(),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(matches!(
+            require_decision_source_read(
+                &pool,
+                &actor,
+                company_id,
+                "productivity_review",
+                &hidden_issue_id.to_string(),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            require_decision_source_read(
+                &pool,
+                &actor,
+                other_company_id,
+                "productivity_review",
+                &readable_issue_id.to_string(),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            require_decision_source_read(
+                &pool,
+                &actor,
+                company_id,
+                "productivity_review",
+                &Uuid::new_v4().to_string(),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+
+        sqlx::query("DELETE FROM issues WHERE id IN ($1, $2)")
+            .bind(readable_issue_id)
+            .bind(hidden_issue_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup issues");
+        sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup companies");
+    }
+
     #[test]
     fn training_tags_are_normalized_and_quality_is_bounded() {
         assert_eq!(
