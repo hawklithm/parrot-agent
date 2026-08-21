@@ -18,7 +18,8 @@ use models::{CreateIssueInput, Issue, IssuePriority, IssueStatus, UpdateIssueInp
 use services::auth::AuthorizationActor;
 use services::{
     CheckoutInput, CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
-    DefaultCrossIssueInfluenceLimitService, IssueQueryFilter, Pagination, ReleaseInput,
+    DefaultCrossIssueInfluenceLimitService, HeartbeatWakeupOptions, IssueQueryFilter, Pagination,
+    ReleaseInput,
 };
 
 // Issue relations handlers
@@ -3194,7 +3195,25 @@ async fn scheduled_retry_now(
     }
     state
         .heartbeat_service
-        .wakeup(agent_id, id, company_id)
+        .wakeup_with_options(
+            agent_id,
+            id,
+            company_id,
+            HeartbeatWakeupOptions {
+                source: Some("on_demand".to_string()),
+                trigger_detail: Some("system".to_string()),
+                reason: Some("scheduled_retry_retry_now".to_string()),
+                payload: Some(json!({
+                    "issueId": id,
+                    "mutation": "scheduled_retry_retry_now",
+                })),
+                context_snapshot: Some(json!({
+                    "issueId": id,
+                    "source": "issue.retry_now",
+                })),
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|error| {
             tracing::error!(error = %error, issue_id = %id, agent_id = %agent_id, "failed to wake promoted retry");

@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use models::{IssueComment, CommentActorType};
-use services::{CommentServiceError, CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
-    DefaultCrossIssueInfluenceLimitService};
+use services::{
+    CommentServiceError, CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
+    DefaultCrossIssueInfluenceLimitService, HeartbeatWakeupOptions,
+};
 use crate::errors::ApiError;
 use crate::app_state::AppState;
 use crate::routes::log_activity;
@@ -319,7 +321,25 @@ pub async fn add_comment(
         if let Some(assignee_agent_id) = issue.assignee_agent_id {
             if let Err(error) = state
                 .heartbeat_service
-                .wakeup(assignee_agent_id, issue_id, company_id)
+                .wakeup_with_options(
+                    assignee_agent_id,
+                    issue_id,
+                    company_id,
+                    HeartbeatWakeupOptions {
+                        source: Some("on_demand".to_string()),
+                        trigger_detail: Some("system".to_string()),
+                        reason: Some("issue_comment_added".to_string()),
+                        payload: Some(serde_json::json!({
+                            "issueId": issue_id,
+                            "mutation": "comment_reopen",
+                        })),
+                        context_snapshot: Some(serde_json::json!({
+                            "issueId": issue_id,
+                            "source": "issue.comment",
+                        })),
+                        ..Default::default()
+                    },
+                )
                 .await
             {
                 tracing::warn!(
