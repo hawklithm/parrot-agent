@@ -25,7 +25,21 @@ use uuid::Uuid;
 
 /// 最大补发运行次数（对应 paperclip MAX_CATCH_UP_RUNS）
 const MAX_CATCH_UP_RUNS: usize = 25;
-const SCHEDULER_EXECUTION_RETENTION_DAYS: i64 = 30;
+const DEFAULT_SCHEDULER_EXECUTION_RETENTION_DAYS: i64 = 30;
+const MAX_SCHEDULER_EXECUTION_RETENTION_DAYS: i64 = 3_650;
+
+fn scheduler_execution_retention_days() -> i64 {
+    parse_scheduler_execution_retention_days(
+        std::env::var("PARROT_SCHEDULER_EXECUTION_RETENTION_DAYS").ok().as_deref(),
+    )
+}
+
+fn parse_scheduler_execution_retention_days(value: Option<&str>) -> i64 {
+    value
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|days| (1..=MAX_SCHEDULER_EXECUTION_RETENTION_DAYS).contains(days))
+        .unwrap_or(DEFAULT_SCHEDULER_EXECUTION_RETENTION_DAYS)
+}
 
 /// Monitor 调度：单次检查失败后指数退避（基础 60s，封顶 24h）。
 pub fn monitor_backoff_seconds(attempt: i32) -> i64 {
@@ -234,7 +248,7 @@ impl ScheduledJob for SchedulerExecutionHistoryCleanupJob {
         let removed = self
             .scheduler
             .prune_persisted_executions(
-                ChronoDuration::days(SCHEDULER_EXECUTION_RETENTION_DAYS),
+                ChronoDuration::days(scheduler_execution_retention_days()),
                 1_000,
             )
             .await?;
@@ -643,7 +657,10 @@ impl Default for JobScheduler {
 
 #[cfg(test)]
 mod scheduler_tests {
-    use super::{schedule_is_due, JobSchedule, JobScheduler, JobStatus, ScheduledJob};
+    use super::{
+        parse_scheduler_execution_retention_days, schedule_is_due, JobSchedule, JobScheduler,
+        JobStatus, ScheduledJob,
+    };
     use async_trait::async_trait;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use sqlx::postgres::PgPoolOptions;
@@ -702,6 +719,15 @@ mod scheduler_tests {
             None,
             Utc::now(),
         ));
+    }
+
+    #[test]
+    fn scheduler_history_retention_uses_bounded_configuration() {
+        assert_eq!(parse_scheduler_execution_retention_days(None), 30);
+        assert_eq!(parse_scheduler_execution_retention_days(Some("90")), 90);
+        assert_eq!(parse_scheduler_execution_retention_days(Some("0")), 30);
+        assert_eq!(parse_scheduler_execution_retention_days(Some("4000")), 30);
+        assert_eq!(parse_scheduler_execution_retention_days(Some("invalid")), 30);
     }
 
     #[tokio::test]
