@@ -104,9 +104,29 @@ pub struct ListInput {
     pub offset: Option<i64>,
 }
 
+/// Persistence input for an already captured API snapshot.
+#[derive(Debug, Clone)]
+pub struct PersistSnapshotInput {
+    pub company_id: Uuid,
+    pub source_kind: DecisionTrainingSourceKind,
+    pub source_id: Uuid,
+    pub issue_id: Uuid,
+    pub cutoff_at: DateTime<Utc>,
+    pub notes: String,
+    pub tags: Vec<String>,
+    pub quality_score: Option<f32>,
+    pub decision_outcome: Option<String>,
+    pub retention_policy: String,
+    pub snapshot: Value,
+    pub created_by_user_id: String,
+}
+
 /// 决策训练服务
 #[async_trait]
 pub trait DecisionTrainingService: Send + Sync {
+    /// Persist a snapshot assembled by an API or another trusted caller.
+    async fn persist_snapshot(&self, input: PersistSnapshotInput) -> Result<Uuid, TrainingError>;
+
     /// 捕获决策训练快照
     async fn capture_snapshot(
         &self,
@@ -405,6 +425,53 @@ impl PgDecisionTrainingService {
 
 #[async_trait]
 impl DecisionTrainingService for PgDecisionTrainingService {
+    async fn persist_snapshot(&self, input: PersistSnapshotInput) -> Result<Uuid, TrainingError> {
+        if input.notes.len() > 100_000 {
+            return Err(TrainingError::InvalidSnapshot(
+                "notes must be at most 100000 characters".to_string(),
+            ));
+        }
+        if input.tags.iter().any(|tag| tag.len() > 64) {
+            return Err(TrainingError::InvalidSnapshot(
+                "training tag is too long".to_string(),
+            ));
+        }
+        if input
+            .quality_score
+            .is_some_and(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
+        {
+            return Err(TrainingError::InvalidSnapshot(
+                "quality score must be between 0 and 1".to_string(),
+            ));
+        }
+
+        sqlx::query_scalar(
+            "INSERT INTO decision_training_examples
+                (company_id, source_kind, source_id, issue_id, cutoff_at, notes,
+                 notes_history, tags, quality_score, decision_outcome, retention_policy,
+                 snapshot, created_by_user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, $7, $8, $9, $10, $11, $12)
+             ON CONFLICT (source_kind, source_id, created_by_user_id) DO NOTHING
+             RETURNING id",
+        )
+        .bind(input.company_id)
+        .bind(Self::source_kind_name(&input.source_kind))
+        .bind(input.source_id)
+        .bind(input.issue_id)
+        .bind(input.cutoff_at)
+        .bind(input.notes)
+        .bind(serde_json::to_value(input.tags).map_err(|error| TrainingError::SerializationError(error.to_string()))?)
+        .bind(input.quality_score)
+        .bind(input.decision_outcome)
+        .bind(input.retention_policy)
+        .bind(input.snapshot)
+        .bind(input.created_by_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Self::db_error)?
+        .ok_or_else(|| TrainingError::InvalidSnapshot("duplicate decision training example".to_string()))
+    }
+
     async fn capture_snapshot(&self, input: CaptureInput) -> Result<DecisionTrainingExample, TrainingError> {
         let source_id = Uuid::parse_str(&input.source_id).map_err(|_| TrainingError::SourceNotFound {
             kind: input.source_kind.clone(),
@@ -667,6 +734,68 @@ impl Default for DefaultDecisionTrainingService {
 
 #[async_trait]
 impl DecisionTrainingService for DefaultDecisionTrainingService {
+    async fn persist_snapshot(&self, input: PersistSnapshotInput) -> Result<Uuid, TrainingError> {
+        if input.notes.len() > 100_000 {
+            return Err(TrainingError::InvalidSnapshot(
+                "notes must be at most 100000 characters".to_string(),
+            ));
+        }
+        if input.tags.iter().any(|tag| tag.len() > 64) {
+            return Err(TrainingError::InvalidSnapshot(
+                "training tag is too long".to_string(),
+            ));
+        }
+        if input
+            .quality_score
+            .is_some_and(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
+        {
+            return Err(TrainingError::InvalidSnapshot(
+                "quality score must be between 0 and 1".to_string(),
+            ));
+        }
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let snapshot = DecisionTrainingSnapshotV1 {
+            version: "v1".to_string(),
+            decision_id: input.source_id,
+            source_kind: input.source_kind.clone(),
+            source_id: input.source_id.to_string(),
+            company_id: input.company_id,
+            issue_id: Some(input.issue_id),
+            agent_id: None,
+            decision_spec: input.snapshot.clone(),
+            decision_outcome: input.decision_outcome,
+            context: DecisionContext {
+                issue_title: None,
+                issue_status: None,
+                workspace_type: None,
+                agent_role: None,
+                thread_messages: vec![],
+                related_approvals: vec![],
+            },
+            captured_at: now,
+            commit_sha: None,
+        };
+        self.examples.lock().await.insert(
+            id,
+            DecisionTrainingExample {
+                id,
+                company_id: input.company_id,
+                source_kind: input.source_kind,
+                source_id: input.source_id.to_string(),
+                snapshot,
+                notes: Some(input.notes),
+                notes_history: vec![],
+                tags: input.tags,
+                quality_score: input.quality_score,
+                created_at: now,
+                updated_at: now,
+                cutoff_at: input.cutoff_at,
+            },
+        );
+        Ok(id)
+    }
+
     async fn capture_snapshot(
         &self,
         input: CaptureInput,

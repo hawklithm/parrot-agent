@@ -715,6 +715,9 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
     let company_portability_service = Arc::new(services::DefaultCompanyPortabilityService::new(
         pool.clone(),
     ));
+    let decision_training_service: Arc<dyn services::DecisionTrainingService> = Arc::new(
+        services::PgDecisionTrainingService::new(pool.clone()),
+    );
 
     // 初始化适配器注册状态管理
     let adapter_registry_state = Arc::new(
@@ -785,6 +788,7 @@ async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::error::E
         Arc::new(
             services::work_timeline_service::DefaultWorkTimelineService { pool: pool.clone() },
         ),
+        decision_training_service,
         event_bus,
         pool,
     ))

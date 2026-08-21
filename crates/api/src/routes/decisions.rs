@@ -29,6 +29,9 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use services::auth::{decide_access, AuthorizationAction, AuthorizationActor};
+use services::decision_training_service::{
+    DecisionTrainingSourceKind, PersistSnapshotInput, TrainingError,
+};
 
 // ---------------------------------------------------------------------------
 // Constants (ported verbatim from Paperclip)
@@ -185,6 +188,29 @@ pub fn decision_routes() -> Router<AppState> {
 /// collapsing everything to 500. See `impl From<sqlx::Error> for AppError`.
 fn db_err(e: sqlx::Error) -> AppError {
     e.into()
+}
+
+fn training_service_err(error: TrainingError) -> AppError {
+    match error {
+        TrainingError::InvalidSnapshot(message) => AppError::Validation(message),
+        TrainingError::ExampleNotFound(_) | TrainingError::SourceNotFound { .. } => {
+            training_not_found()
+        }
+        TrainingError::DatabaseError(message) | TrainingError::SerializationError(message) => {
+            AppError::InternalServerError(message)
+        }
+    }
+}
+
+fn training_source_kind(value: &str) -> Result<DecisionTrainingSourceKind, AppError> {
+    match value {
+        "interaction" => Ok(DecisionTrainingSourceKind::IssueThreadInteraction),
+        "approval" => Ok(DecisionTrainingSourceKind::IssueApproval),
+        "execution_decision" => Ok(DecisionTrainingSourceKind::IssueExecutionDecision),
+        _ => Err(AppError::Validation(format!(
+            "sourceKind must be one of {TRAINING_SOURCE_KINDS:?}"
+        ))),
+    }
 }
 
 fn forbid(msg: &str) -> AppError {
@@ -4571,38 +4597,35 @@ async fn create_decision_training(
     let tags = normalize_training_tags(input.tags.unwrap_or_default())?;
     validate_training_quality(input.quality_score)?;
 
-    let inserted = sqlx::query(&format!(
-        "INSERT INTO decision_training_examples (company_id, source_kind, source_id, issue_id, \
-             cutoff_at, notes, notes_history, tags, quality_score, decision_outcome, retention_policy, snapshot, \
-             created_by_user_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, $7, $8, $9, $10, $11, $12) \
-         ON CONFLICT (source_kind, source_id, created_by_user_id) DO NOTHING \
-         RETURNING {}",
-        TRAINING_SELECT
-            .trim_start_matches("SELECT ")
-            .replace(" FROM decision_training_examples", "")
-    ))
-    .bind(company_id)
-    .bind(&input.source_kind)
-    .bind(input.source_id)
-    .bind(input.issue_id)
-    .bind(captured.cutoff_at)
-    .bind(&notes)
-    .bind(serde_json::to_value(&tags).map_err(|error| AppError::InternalServerError(error.to_string()))?)
-    .bind(input.quality_score)
-    .bind(&captured.decision_outcome)
-    .bind(DECISION_TRAINING_RETENTION_POLICY)
-    .bind(&captured.snapshot)
-    .bind(&user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(db_err)?;
-
-    // Conflict target is (source_kind, source_id, created_by_user_id): a user may
-    // only train the same decision once.
-    let row = inserted.ok_or_else(|| {
-        AppError::Conflict("This decision is already trained by this user".to_string())
-    })?;
+    let example_id = state
+        .decision_training_service
+        .persist_snapshot(PersistSnapshotInput {
+            company_id,
+            source_kind: training_source_kind(&input.source_kind)?,
+            source_id: input.source_id,
+            issue_id: input.issue_id,
+            cutoff_at: captured.cutoff_at,
+            notes,
+            tags,
+            quality_score: input.quality_score,
+            decision_outcome: captured.decision_outcome.clone(),
+            retention_policy: DECISION_TRAINING_RETENTION_POLICY.to_string(),
+            snapshot: captured.snapshot,
+            created_by_user_id: user_id,
+        })
+        .await
+        .map_err(|error| match error {
+            TrainingError::InvalidSnapshot(message)
+                if message == "duplicate decision training example" => {
+                    AppError::Conflict("This decision is already trained by this user".to_string())
+                }
+            other => training_service_err(other),
+        })?;
+    let row = sqlx::query(&format!("{TRAINING_SELECT} WHERE id = $1"))
+        .bind(example_id)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
     let example = training_example_to_json(&row);
 
     log_activity(

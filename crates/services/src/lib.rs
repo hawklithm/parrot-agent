@@ -47,6 +47,10 @@ pub mod decision_retention_runtime;
 pub mod decision_retention_sweep_job;
 pub mod decision_signing_service;
 pub mod decision_training_service;
+pub use decision_training_service::{
+    DecisionTrainingService, DecisionTrainingSourceKind, DefaultDecisionTrainingService,
+    PersistSnapshotInput, PgDecisionTrainingService, TrainingError,
+};
 pub mod decision_wakeup_service;
 pub mod cross_issue_influence_limit_service;
 pub mod project_workspace_runtime_config_service;

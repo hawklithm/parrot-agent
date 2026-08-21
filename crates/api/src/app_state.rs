@@ -7,7 +7,7 @@ use crate::routes::health::health_check;
 pub use services::{
     AdapterRegistry, AdapterRegistryState, AgentService, ApprovalService, AttachmentService, BudgetService,
     BuiltInAgentService, CaseService, CloudUpstreamService, CompanyService, ConfigRevisionService,
-    CostService, CustomImageSetupService, EnvironmentDiagnosticsService,
+    CostService, CustomImageSetupService, DecisionTrainingService, EnvironmentDiagnosticsService,
     EnvironmentRuntimeService, EnvironmentService, ExportService, ImportService, InboxService,
     FinanceService, GoalService, InstanceSettingsService, InviteResourceService, InviteService,
     IssueCommentService, IssueService, IssueTreeControlService, LabelService, LowTrustService,
@@ -126,6 +126,9 @@ pub struct AppState {
     pub cloud_upstream_service: Arc<dyn CloudUpstreamService>,
     pub work_timeline_service: Arc<dyn WorkTimelineService>,
 
+    // Decision training persistence
+    pub decision_training_service: Arc<dyn DecisionTrainingService>,
+
     // Event bus
     pub event_bus: Arc<dyn EventBus>,
 
@@ -190,6 +193,7 @@ impl AppState {
         inbox_service: Arc<dyn InboxService>,
         cloud_upstream_service: Arc<dyn CloudUpstreamService>,
         work_timeline_service: Arc<dyn WorkTimelineService>,
+        decision_training_service: Arc<dyn DecisionTrainingService>,
         event_bus: Arc<dyn EventBus>,
         pool: PgPool,
     ) -> Self {
@@ -246,6 +250,7 @@ impl AppState {
             inbox_service,
             cloud_upstream_service,
             work_timeline_service,
+            decision_training_service,
             event_bus,
             pool,
         }
