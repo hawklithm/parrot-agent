@@ -18,6 +18,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use sqlx::Row;
 
@@ -95,6 +96,21 @@ struct RejectProposalRequest {
     reason: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ApproveProposalRequest {
+    #[serde(default)]
+    cascade: bool,
+    overrides: Option<ApproveProposalOverrides>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApproveProposalOverrides {
+    name: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "providerConfigId")]
+    provider_config_id: Option<Uuid>,
+}
+
 /// POST /agents/me/secret-proposals
 async fn create_agent_proposal(
     State(state): State<AppState>,
@@ -121,7 +137,7 @@ async fn create_agent_proposal(
     let value_ciphertext = request.value.clone();
     let value_fingerprint = value_ciphertext
         .as_ref()
-        .map(|v| format!("{:x}", json_fingerprint(v)));
+        .map(json_fingerprint);
     let value_length: Option<i32> = value_ciphertext
         .as_ref()
         .and_then(|v| v.to_string().len().try_into().ok());
@@ -275,6 +291,7 @@ async fn approve_proposal(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, proposal_id)): Path<(Uuid, Uuid)>,
+    request: Option<Json<ApproveProposalRequest>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let user_id = match &actor {
         AuthorizationActor::Board { user_id, .. } => *user_id,
@@ -304,21 +321,43 @@ async fn approve_proposal(
     let value_ciphertext: Option<Value> = row.get("value_ciphertext");
     let fingerprint: Option<String> = row.get("value_fingerprint_sha256");
     let proposed_by: Uuid = row.get("proposed_by_agent_id");
+    let request = request.map(|Json(value)| value).unwrap_or_default();
+    if request.cascade {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
 
+    let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut created_secret_id: Option<Uuid> = None;
     if kind == "secret" {
         let secret_id = Uuid::new_v4();
+        let name = request
+            .overrides
+            .as_ref()
+            .and_then(|value| value.name.as_deref())
+            .or(proposed_name.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+        let description = request
+            .overrides
+            .as_ref()
+            .and_then(|value| value.description.clone())
+            .or(proposed_description);
+        let provider_config_id = request
+            .overrides
+            .as_ref()
+            .and_then(|value| value.provider_config_id);
         sqlx::query(
-            "INSERT INTO company_secrets (id, company_id, key, name, provider, status, managed_mode, description, created_by_agent_id) \
-             VALUES ($1,$2,$3,$4,'local_encrypted','active','paperclip_managed',$5,$6)",
+            "INSERT INTO company_secrets (id, company_id, key, name, provider, provider_config_id, status, managed_mode, description, created_by_agent_id) \
+             VALUES ($1,$2,$3,$4,'local_encrypted',$5,'active','paperclip_managed',$6,$7)",
         )
         .bind(secret_id)
         .bind(company_id)
         .bind(proposed_key.unwrap_or_default())
-        .bind(proposed_name.unwrap_or_default())
-        .bind(proposed_description)
+        .bind(name)
+        .bind(provider_config_id)
+        .bind(description)
         .bind(proposed_by)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("Failed to create secret from proposal: {}", e);
@@ -331,13 +370,51 @@ async fn approve_proposal(
         .bind(secret_id)
         .bind(value_ciphertext.unwrap_or_else(|| json!({})))
         .bind(fingerprint.unwrap_or_default())
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("Failed to create secret version: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
         created_secret_id = Some(secret_id);
+    } else if kind == "binding" {
+        let secret_id: Uuid = row.get("secret_id");
+        let target_type: String = row.get("target_type");
+        let target_id: Uuid = row.get("target_id");
+        let config_path: String = row.get("config_path");
+        if target_type != "agent" || config_path.trim().is_empty() {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let secret_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM company_secrets WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL)",
+        )
+        .bind(secret_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let target_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND company_id = $2 AND status <> 'terminated')",
+        )
+        .bind(target_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !secret_exists || !target_exists {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        sqlx::query(
+            "INSERT INTO company_secret_bindings (company_id, secret_id, target_type, target_id, config_path) VALUES ($1,$2,$3,$4,$5)",
+        )
+        .bind(company_id)
+        .bind(secret_id)
+        .bind(target_type)
+        .bind(target_id.to_string())
+        .bind(config_path)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
 
     sqlx::query(
@@ -349,7 +426,7 @@ async fn approve_proposal(
     .bind(company_id)
     .bind(created_secret_id)
     .bind(user_id.to_string())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!("Failed to approve proposal: {}", e);
@@ -375,6 +452,8 @@ async fn approve_proposal(
             tracing::error!("Failed to reload proposal: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(proposal_json(&updated)))
 }
 
@@ -389,7 +468,7 @@ async fn reject_proposal(
         AuthorizationActor::Board { user_id, .. } => *user_id,
         _ => return Err(StatusCode::FORBIDDEN),
     };
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let reason = request.reason.unwrap_or_default().trim().to_string();
     if reason.is_empty() {
@@ -477,12 +556,24 @@ async fn list_agent_secrets(
     Ok(Json(json!({ "secrets": secrets })))
 }
 
-fn json_fingerprint(v: &Value) -> u128 {
-    // 轻量指纹：JSON 字符串简单哈希，仅供展示（真实指纹应由加密层负责）。
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    v.to_string().hash(&mut h);
-    h.finish() as u128
+fn json_fingerprint(v: &Value) -> String {
+    Sha256::digest(v.to_string().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposal_fingerprint_is_deterministic_and_changes_with_value() {
+        let value = json!({"token": "redacted"});
+        assert_eq!(json_fingerprint(&value), json_fingerprint(&value));
+        assert_ne!(json_fingerprint(&value), json_fingerprint(&json!({"token": "other"})));
+        assert_eq!(json_fingerprint(&value).len(), 64);
+    }
 }
 
 pub fn secret_proposal_routes() -> Router<AppState> {
@@ -505,7 +596,33 @@ pub fn secret_proposal_routes() -> Router<AppState> {
             post(approve_proposal),
         )
         .route(
+            "/companies/:company_id/secret-proposals/:id",
+            get(get_board_proposal),
+        )
+        .route(
             "/companies/:company_id/secret-proposals/:id/reject",
             post(reject_proposal),
         )
+}
+
+async fn get_board_proposal(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, proposal_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !matches!(actor, AuthorizationActor::Board { .. }) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let row = sqlx::query(
+        "SELECT * FROM company_secret_proposals WHERE id = $1 AND company_id = $2",
+    )
+    .bind(proposal_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(proposal_json(&row)))
 }
