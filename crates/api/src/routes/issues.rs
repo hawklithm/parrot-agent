@@ -2107,12 +2107,25 @@ async fn list_issue_approvals(
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    state
-        .issue_service
-        .get_approvals(id, company_id)
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let rows = sqlx::query(
+        "SELECT a.id, a.company_id, a.approval_type::text AS approval_type,
+                a.requested_by_agent_id, a.requested_by_user_id, a.status::text AS status,
+                a.payload, a.decision_note, a.decided_by_user_id, a.decided_at,
+                a.created_at, a.updated_at
+         FROM approvals a
+         JOIN issue_approvals ia ON ia.approval_id = a.id
+         WHERE ia.issue_id = $1 AND a.company_id = $2
+         ORDER BY a.created_at DESC",
+    )
+    .bind(id)
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to list issue approvals");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(rows.into_iter().map(approval_json).collect()))
 }
 
 /// I9: POST /issues/:id/approvals
@@ -2123,12 +2136,69 @@ async fn create_issue_approval(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    let result = state
-        .issue_service
-        .create_approval(id, company_id, payload)
+    let approval_type = payload
+        .get("type")
+        .or_else(|| payload.get("approvalType"))
+        .cloned()
+        .ok_or(StatusCode::BAD_REQUEST)
+        .and_then(|value| {
+            serde_json::from_value::<models::approval::ApprovalType>(value)
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })?;
+    let approval_payload = payload
+        .get("payload")
+        .cloned()
+        .unwrap_or_else(|| payload.clone());
+    let (requested_by_agent_id, requested_by_user_id) = match actor {
+        AuthorizationActor::Board { user_id, .. } => (None, Some(user_id)),
+        AuthorizationActor::Agent { agent_id, .. } => (Some(agent_id), None),
+        AuthorizationActor::None => return Err(StatusCode::UNAUTHORIZED),
+    };
+    let mut transaction = state
+        .pool
+        .begin()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok((StatusCode::CREATED, Json(result)))
+    let approval = sqlx::query(
+        "INSERT INTO approvals
+             (company_id, approval_type, requested_by_agent_id, requested_by_user_id,
+              status, payload)
+         VALUES ($1, $2, $3, $4, 'pending', $5)
+         RETURNING id, company_id, approval_type::text AS approval_type,
+                   requested_by_agent_id, requested_by_user_id, status::text AS status,
+                   payload, decision_note, decided_by_user_id, decided_at,
+                   created_at, updated_at",
+    )
+    .bind(company_id)
+    .bind(approval_type)
+    .bind(requested_by_agent_id)
+    .bind(requested_by_user_id)
+    .bind(approval_payload)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to create issue approval");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    sqlx::query(
+        "INSERT INTO issue_approvals (approval_id, issue_id, company_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (approval_id, issue_id) DO NOTHING",
+    )
+    .bind(approval.get::<Uuid, _>("id"))
+    .bind(id)
+    .bind(company_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to link issue approval");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(approval_json(approval))))
 }
 
 /// I10: DELETE /issues/:id/approvals/:approval_id
@@ -2138,12 +2208,43 @@ async fn delete_issue_approval(
     Path((id, approval_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    state
-        .issue_service
-        .delete_approval(id, approval_id, company_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = sqlx::query(
+        "DELETE FROM issue_approvals ia
+         USING approvals a
+         WHERE ia.approval_id = $1 AND ia.issue_id = $2
+           AND ia.company_id = $3 AND a.id = ia.approval_id
+           AND a.company_id = $3",
+    )
+    .bind(approval_id)
+    .bind(id)
+    .bind(company_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, approval_id = %approval_id, "failed to delete issue approval link");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn approval_json(row: sqlx::postgres::PgRow) -> serde_json::Value {
+    json!({
+        "id": row.get::<Uuid, _>("id"),
+        "companyId": row.get::<Uuid, _>("company_id"),
+        "type": row.get::<String, _>("approval_type"),
+        "requestedByAgentId": row.get::<Option<Uuid>, _>("requested_by_agent_id"),
+        "requestedByUserId": row.get::<Option<Uuid>, _>("requested_by_user_id"),
+        "status": row.get::<String, _>("status"),
+        "payload": row.get::<Value, _>("payload"),
+        "decisionNote": row.get::<Option<String>, _>("decision_note"),
+        "decidedByUserId": row.get::<Option<Uuid>, _>("decided_by_user_id"),
+        "decidedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("decided_at"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })
 }
 
 /// I5: GET /issues/:id/work-products - List work products for issue
