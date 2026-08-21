@@ -15,18 +15,20 @@
 //!   POST   /execution-workspaces/:id/runtime-commands/:action
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use sqlx::Row;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::routes::{require_company_access, AccessMode};
+use services::auth::AuthorizationActor;
 
 pub fn execution_workspace_routes() -> Router<AppState> {
     Router::new()
@@ -38,7 +40,10 @@ pub fn execution_workspace_routes() -> Router<AppState> {
             "/companies/:company_id/workspace-overview",
             get(get_workspace_overview),
         )
-        .route("/execution-workspaces/:id", get(get_execution_workspace).patch(update_execution_workspace))
+        .route(
+            "/execution-workspaces/:id",
+            get(get_execution_workspace).patch(update_execution_workspace),
+        )
         .route(
             "/execution-workspaces/:id/close-readiness",
             get(get_close_readiness),
@@ -304,7 +309,9 @@ async fn list_workspace_operations(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ExecutionWorkspaceError> {
     let workspace = sqlx::query("SELECT company_id FROM execution_workspaces WHERE id = $1")
-        .bind(id).fetch_optional(&state.pool).await
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
         .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?
         .ok_or(ExecutionWorkspaceError::NotFound(id))?;
     let company_id: Uuid = workspace.get("company_id");
@@ -312,28 +319,33 @@ async fn list_workspace_operations(
         "SELECT id, phase, command, cwd, status, exit_code, log_store, log_ref, log_bytes, log_sha256, log_compressed, stdout_excerpt, stderr_excerpt, metadata, started_at, finished_at, created_at, updated_at FROM workspace_operations WHERE execution_workspace_id = $1 ORDER BY started_at DESC",
     ).bind(id).fetch_all(&state.pool).await
         .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
-    let operations = rows.into_iter().map(|row| json!({
-        "id": row.get::<Uuid, _>("id"),
-        "companyId": company_id,
-        "executionWorkspaceId": id,
-        "phase": row.get::<String, _>("phase"),
-        "command": row.get::<Option<String>, _>("command"),
-        "cwd": row.get::<Option<String>, _>("cwd"),
-        "status": row.get::<String, _>("status"),
-        "exitCode": row.get::<Option<i32>, _>("exit_code"),
-        "logStore": row.get::<Option<String>, _>("log_store"),
-        "logRef": row.get::<Option<String>, _>("log_ref"),
-        "logBytes": row.get::<Option<i64>, _>("log_bytes"),
-        "logSha256": row.get::<Option<String>, _>("log_sha256"),
-        "logCompressed": row.get::<bool, _>("log_compressed"),
-        "stdoutExcerpt": row.get::<Option<String>, _>("stdout_excerpt"),
-        "stderrExcerpt": row.get::<Option<String>, _>("stderr_excerpt"),
-        "metadata": row.get::<Option<Value>, _>("metadata"),
-        "startedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("started_at"),
-        "finishedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"),
-        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
-    })).collect::<Vec<_>>();
+    let operations = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<Uuid, _>("id"),
+                "companyId": company_id,
+                "executionWorkspaceId": id,
+                "phase": row.get::<String, _>("phase"),
+                "command": row.get::<Option<String>, _>("command"),
+                "cwd": row.get::<Option<String>, _>("cwd"),
+                "status": row.get::<String, _>("status"),
+                "exitCode": row.get::<Option<i32>, _>("exit_code"),
+                "logStore": row.get::<Option<String>, _>("log_store"),
+                "logRef": row.get::<Option<String>, _>("log_ref"),
+                "logBytes": row.get::<Option<i64>, _>("log_bytes"),
+                "logSha256": row.get::<Option<String>, _>("log_sha256"),
+                "logCompressed": row.get::<bool, _>("log_compressed"),
+                "stdoutExcerpt": row.get::<Option<String>, _>("stdout_excerpt"),
+                "stderrExcerpt": row.get::<Option<String>, _>("stderr_excerpt"),
+                "metadata": row.get::<Option<Value>, _>("metadata"),
+                "startedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("started_at"),
+                "finishedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"),
+                "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(Json(Value::Array(operations)))
 }
 
@@ -377,13 +389,12 @@ async fn reconcile_branch(
     Json(body): Json<ReconcileBranchInput>,
 ) -> Result<Json<Value>, ExecutionWorkspaceError> {
     let pool = &state.pool;
-    let exists: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM execution_workspaces WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
+    let exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM execution_workspaces WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
 
     if exists.is_none() {
         return Err(ExecutionWorkspaceError::NotFound(id));
@@ -423,6 +434,7 @@ pub struct RuntimeControlTarget {
 /// `action` is one of `start|stop|restart|run` (Paperclip).
 async fn runtime_command(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((id, action)): Path<(Uuid, String)>,
     Json(body): Json<RuntimeControlTarget>,
 ) -> Result<Json<Value>, ExecutionWorkspaceError> {
@@ -432,17 +444,24 @@ async fn runtime_command(
     }
 
     let pool = &state.pool;
-    let exists: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM execution_workspaces WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
+    let exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT company_id FROM execution_workspaces WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
 
-    if exists.is_none() {
+    let Some((company_id,)) = exists else {
         return Err(ExecutionWorkspaceError::NotFound(id));
+    };
+    if !actor.is_board() && !actor.is_agent() {
+        return Err(ExecutionWorkspaceError::Forbidden(
+            "Board or Agent actor required for runtime control".to_string(),
+        ));
     }
+    require_company_access(&actor, company_id, AccessMode::Write).map_err(|_| {
+        ExecutionWorkspaceError::Forbidden("Workspace company access denied".to_string())
+    })?;
 
     Ok(Json(json!({
         "workspaceId": id,
@@ -527,6 +546,7 @@ async fn update_execution_workspace(
 #[derive(Debug)]
 pub enum ExecutionWorkspaceError {
     NotFound(Uuid),
+    Forbidden(String),
     Database(String),
 }
 
@@ -537,9 +557,8 @@ impl IntoResponse for ExecutionWorkspaceError {
                 StatusCode::NOT_FOUND,
                 format!("Execution workspace not found: {}", id),
             ),
-            ExecutionWorkspaceError::Database(msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, msg)
-            }
+            ExecutionWorkspaceError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
+            ExecutionWorkspaceError::Database(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
