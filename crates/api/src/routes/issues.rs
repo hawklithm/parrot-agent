@@ -1999,15 +1999,42 @@ async fn get_issue_live_runs(
 /// I6: GET /issues/:id/accepted-plan-decompositions
 async fn list_plan_decompositions(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
-    state
-        .issue_service
-        .get_accepted_plan_decompositions(id, company_id)
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let rows = sqlx::query(
+        "SELECT id, company_id, issue_id, plan, accepted_at,
+                accepted_by_type, accepted_by_id, created_at, updated_at
+         FROM plan_decompositions
+         WHERE company_id = $1 AND issue_id = $2 AND accepted_at IS NOT NULL
+         ORDER BY accepted_at DESC, created_at DESC",
+    )
+    .bind(company_id)
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to list accepted plan decompositions");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "companyId": row.get::<Uuid, _>("company_id"),
+                    "issueId": row.get::<Uuid, _>("issue_id"),
+                    "plan": row.get::<Value, _>("plan"),
+                    "acceptedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("accepted_at"),
+                    "acceptedByType": row.get::<Option<String>, _>("accepted_by_type"),
+                    "acceptedById": row.get::<Option<Uuid>, _>("accepted_by_id"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// I7: POST /issues/:id/accepted-plan-decompositions
