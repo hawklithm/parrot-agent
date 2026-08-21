@@ -2,6 +2,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// 决策保留策略常量
@@ -116,12 +119,14 @@ fn canonical_manifest(
 
 /// 默认决策保留服务实现
 pub struct DefaultDecisionRetentionService {
-    // TODO: 添加必要的依赖（database pool, repositories, notification service）
+    states: Arc<Mutex<HashMap<Uuid, DecisionRetentionState>>>,
 }
 
 impl DefaultDecisionRetentionService {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            states: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// 计算决策的shelf截止时间
@@ -140,100 +145,117 @@ impl DecisionRetentionService for DefaultDecisionRetentionService {
     async fn shelf_decision(
         &self,
         decision_id: Uuid,
-        _company_id: Uuid,
+        company_id: Uuid,
     ) -> Result<DecisionRetentionState, RetentionError> {
-        // TODO: 实现shelving逻辑
-        // 1. 检查决策是否存在
-        // 2. 更新或创建retention record，设置shelved_at
-        // 3. 记录activity log
-
         let now = Utc::now();
-        Ok(DecisionRetentionState {
+        let mut states = self.states.lock().await;
+        if let Some(state) = states.get_mut(&decision_id) {
+            if state.company_id != company_id {
+                return Err(RetentionError::DecisionNotFound(decision_id));
+            }
+            if state.shelved_at.is_none() {
+                state.shelved_at = Some(now);
+                state.updated_at = now;
+            }
+            return Ok(state.clone());
+        }
+        let state = DecisionRetentionState {
             id: Uuid::new_v4(),
-            company_id: _company_id,
+            company_id,
             decision_id,
             shelved_at: Some(now),
             archived_at: None,
             archive_manifest_hash: None,
             created_at: now,
             updated_at: now,
-        })
+        };
+        states.insert(decision_id, state.clone());
+        Ok(state)
     }
 
     async fn archive_decision(
         &self,
         decision_id: Uuid,
-        _company_id: Uuid,
+        company_id: Uuid,
         manifest: Vec<AttentionArchiveManifestEntry>,
     ) -> Result<DecisionRetentionState, RetentionError> {
-        // TODO: 实现archiving逻辑
-        // 1. 验证决策已经shelved
-        // 2. 计算manifest hash
-        // 3. 更新retention record，设置archived_at和manifest_hash
-        // 4. 创建归档通知
-        // 5. 记录activity log
-
         let now = Utc::now();
         let manifest_hash = hash_attention_archive_manifest(&manifest);
-
-        Ok(DecisionRetentionState {
-            id: Uuid::new_v4(),
-            company_id: _company_id,
-            decision_id,
-            shelved_at: Some(now - Duration::days(DEFAULT_DECISION_SHELF_DAYS)),
-            archived_at: Some(now),
-            archive_manifest_hash: Some(manifest_hash),
-            created_at: now - Duration::days(DEFAULT_DECISION_SHELF_DAYS),
-            updated_at: now,
-        })
+        let mut states = self.states.lock().await;
+        let state = states
+            .get_mut(&decision_id)
+            .ok_or(RetentionError::DecisionNotFound(decision_id))?;
+        if state.company_id != company_id {
+            return Err(RetentionError::DecisionNotFound(decision_id));
+        }
+        if state.shelved_at.is_none() {
+            return Err(RetentionError::InvalidState(
+                "decision must be shelved before archive".to_string(),
+            ));
+        }
+        if state.archived_at.is_none() {
+            state.archived_at = Some(now);
+            state.archive_manifest_hash = Some(manifest_hash);
+            state.updated_at = now;
+        }
+        Ok(state.clone())
     }
 
     async fn get_retention_state(
         &self,
-        _decision_id: Uuid,
+        decision_id: Uuid,
     ) -> Result<Option<DecisionRetentionState>, RetentionError> {
-        // TODO: 实现查询逻辑
-        Ok(None)
+        Ok(self.states.lock().await.get(&decision_id).cloned())
     }
 
     async fn process_expired_for_shelving(
         &self,
-        _company_id: Uuid,
+        company_id: Uuid,
         shelf_days: i64,
     ) -> Result<usize, RetentionError> {
-        // TODO: 实现批量shelving逻辑
-        // 1. 查找所有超过shelf_days且未shelved的决策
-        // 2. 批量更新为shelved状态
-        // 3. 返回处理数量
-
-        let _cutoff = self.calculate_shelf_cutoff(shelf_days);
-        Ok(0)
+        let cutoff = self.calculate_shelf_cutoff(shelf_days);
+        let now = Utc::now();
+        let mut count = 0;
+        for state in self.states.lock().await.values_mut().filter(|state| {
+            state.company_id == company_id
+                && state.shelved_at.is_none()
+                && state.created_at <= cutoff
+        }) {
+            state.shelved_at = Some(now);
+            state.updated_at = now;
+            count += 1;
+        }
+        Ok(count)
     }
 
     async fn process_expired_for_archiving(
         &self,
-        _company_id: Uuid,
+        company_id: Uuid,
         archive_days: i64,
     ) -> Result<usize, RetentionError> {
-        // TODO: 实现批量archiving逻辑
-        // 1. 查找所有超过archive_days且已shelved但未archived的决策
-        // 2. 对每个决策构建attention archive manifest
-        // 3. 批量归档
-        // 4. 返回处理数量
-
-        let _cutoff = self.calculate_archive_cutoff(archive_days);
-        Ok(0)
+        let cutoff = self.calculate_archive_cutoff(archive_days);
+        let now = Utc::now();
+        let mut count = 0;
+        for state in self.states.lock().await.values_mut().filter(|state| {
+            state.company_id == company_id
+                && state
+                    .shelved_at
+                    .is_some_and(|shelved_at| shelved_at <= cutoff)
+                && state.archived_at.is_none()
+        }) {
+            state.archived_at = Some(now);
+            state.archive_manifest_hash = Some(hash_attention_archive_manifest(&[]));
+            state.updated_at = now;
+            count += 1;
+        }
+        Ok(count)
     }
 
     async fn send_archive_notifications(
         &self,
     ) -> Result<Vec<ArchiveNotificationBatch>, RetentionError> {
-        // TODO: 实现归档通知逻辑
-        // 1. 从notification outbox中读取待发送的通知
-        // 2. 按agent_id分组
-        // 3. 调用notification service发送
-        // 4. 标记为已发送
-
+        // The local fallback has no origin-agent/outbox store. Production
+        // delivery is provided by PgDecisionRetentionRuntime.
         Ok(vec![])
     }
 }
@@ -279,5 +301,117 @@ mod tests {
         let canonical = canonical_manifest(&manifest);
         assert_eq!(canonical[0].source_id, "a");
         assert_eq!(canonical[1].source_id, "z");
+    }
+
+    #[tokio::test]
+    async fn test_shelf_archive_are_stateful_and_idempotent() {
+        let service = DefaultDecisionRetentionService::new();
+        let company_id = Uuid::new_v4();
+        let decision_id = Uuid::new_v4();
+
+        assert!(matches!(
+            service
+                .archive_decision(decision_id, company_id, Vec::new())
+                .await,
+            Err(RetentionError::DecisionNotFound(_))
+        ));
+        let shelved = service
+            .shelf_decision(decision_id, company_id)
+            .await
+            .unwrap();
+        let shelved_again = service
+            .shelf_decision(decision_id, company_id)
+            .await
+            .unwrap();
+        assert_eq!(shelved.id, shelved_again.id);
+        assert_eq!(shelved.shelved_at, shelved_again.shelved_at);
+
+        let archived = service
+            .archive_decision(decision_id, company_id, Vec::new())
+            .await
+            .unwrap();
+        let archived_again = service
+            .archive_decision(decision_id, company_id, Vec::new())
+            .await
+            .unwrap();
+        assert!(archived.archived_at.is_some());
+        assert_eq!(
+            archived.archive_manifest_hash,
+            archived_again.archive_manifest_hash
+        );
+        assert_eq!(
+            service
+                .get_retention_state(decision_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            shelved.id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_processing_is_scoped_and_counted() {
+        let service = DefaultDecisionRetentionService::new();
+        let company_id = Uuid::new_v4();
+        let other_company_id = Uuid::new_v4();
+        let old_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let now = Utc::now();
+        service.states.lock().await.insert(
+            old_id,
+            DecisionRetentionState {
+                id: Uuid::new_v4(),
+                company_id,
+                decision_id: old_id,
+                shelved_at: None,
+                archived_at: None,
+                archive_manifest_hash: None,
+                created_at: now - Duration::days(60),
+                updated_at: now,
+            },
+        );
+        service.states.lock().await.insert(
+            other_id,
+            DecisionRetentionState {
+                id: Uuid::new_v4(),
+                company_id: other_company_id,
+                decision_id: other_id,
+                shelved_at: None,
+                archived_at: None,
+                archive_manifest_hash: None,
+                created_at: now - Duration::days(60),
+                updated_at: now,
+            },
+        );
+
+        assert_eq!(
+            service
+                .process_expired_for_shelving(company_id, 30)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            service
+                .process_expired_for_archiving(company_id, -1)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(service
+            .get_retention_state(old_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some());
+        assert!(service
+            .get_retention_state(other_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none());
     }
 }
