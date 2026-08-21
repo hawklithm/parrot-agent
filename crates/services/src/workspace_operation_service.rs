@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use thiserror::Error;
-use uuid::Uuid;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum WorkspaceOperationError {
@@ -78,7 +78,7 @@ pub struct WorkspaceOperation {
     pub id: Uuid,
     pub company_id: Uuid,
     pub execution_workspace_id: Uuid,
- pub phase: OperationPhase,
+    pub phase: OperationPhase,
     pub command: Option<String>,
     pub status: OperationStatus,
     pub started_at: DateTime<Utc>,
@@ -160,7 +160,10 @@ pub trait WorkspaceOperationService: Send + Sync {
     ) -> WorkspaceOperationResult<WorkspaceOperation>;
 
     /// Get operation by ID
-    async fn get_operation(&self, operation_id: Uuid) -> WorkspaceOperationResult<WorkspaceOperation>;
+    async fn get_operation(
+        &self,
+        operation_id: Uuid,
+    ) -> WorkspaceOperationResult<WorkspaceOperation>;
 
     /// List operations for a workspace
     async fn list_operations(
@@ -260,25 +263,63 @@ pub struct DefaultWorkspaceOperationService {
 
 impl DefaultWorkspaceOperationService {
     pub fn new() -> Self {
-        Self { pool: None, memory: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            pool: None,
+            memory: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
     pub fn with_pool(pool: PgPool) -> Self {
-        Self { pool: Some(pool), memory: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            pool: Some(pool),
+            memory: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
     fn pool(&self) -> WorkspaceOperationResult<&PgPool> {
-        self.pool.as_ref().ok_or_else(|| WorkspaceOperationError::InternalError("database pool is not configured".into()))
+        self.pool.as_ref().ok_or_else(|| {
+            WorkspaceOperationError::InternalError("database pool is not configured".into())
+        })
     }
     fn from_row(row: &sqlx::postgres::PgRow) -> WorkspaceOperationResult<WorkspaceOperation> {
         let phase = match row.get::<String, _>("phase").as_str() {
-            "workspace_provision" => OperationPhase::WorkspaceProvision, "workspace_teardown" => OperationPhase::WorkspaceTeardown,
-            "runtime_start" => OperationPhase::RuntimeStart, "runtime_stop" => OperationPhase::RuntimeStop,
-            "runtime_restart" => OperationPhase::RuntimeRestart, "command_execution" => OperationPhase::CommandExecution,
-            "branch_reconcile" => OperationPhase::BranchReconcile, other => return Err(WorkspaceOperationError::InternalError(format!("unknown operation phase {other}"))),
+            "workspace_provision" => OperationPhase::WorkspaceProvision,
+            "workspace_teardown" => OperationPhase::WorkspaceTeardown,
+            "runtime_start" => OperationPhase::RuntimeStart,
+            "runtime_stop" => OperationPhase::RuntimeStop,
+            "runtime_restart" => OperationPhase::RuntimeRestart,
+            "command_execution" => OperationPhase::CommandExecution,
+            "branch_reconcile" => OperationPhase::BranchReconcile,
+            other => {
+                return Err(WorkspaceOperationError::InternalError(format!(
+                    "unknown operation phase {other}"
+                )))
+            }
         };
-        let status = match row.get::<String, _>("status").as_str() { "running" | "in_progress" => OperationStatus::InProgress, "completed" | "succeeded" => OperationStatus::Completed, "failed" => OperationStatus::Failed, other => return Err(WorkspaceOperationError::InternalError(format!("unknown operation status {other}"))) };
+        let status = match row.get::<String, _>("status").as_str() {
+            "running" | "in_progress" => OperationStatus::InProgress,
+            "completed" | "succeeded" => OperationStatus::Completed,
+            "failed" => OperationStatus::Failed,
+            other => {
+                return Err(WorkspaceOperationError::InternalError(format!(
+                    "unknown operation status {other}"
+                )))
+            }
+        };
         let started_at = row.get::<DateTime<Utc>, _>("started_at");
         let completed_at = row.get::<Option<DateTime<Utc>>, _>("finished_at");
-        Ok(WorkspaceOperation { id: row.get("id"), company_id: row.get("company_id"), execution_workspace_id: row.get("execution_workspace_id"), phase, command: row.get("command"), status, started_at, completed_at, duration_ms: completed_at.map(|v| v.signed_duration_since(started_at).num_milliseconds()), metadata: row.get("metadata"), error_message: row.get("stderr_excerpt") })
+        Ok(WorkspaceOperation {
+            id: row.get("id"),
+            company_id: row.get("company_id"),
+            execution_workspace_id: row.get("execution_workspace_id"),
+            phase,
+            command: row.get("command"),
+            status,
+            started_at,
+            completed_at,
+            duration_ms: completed_at
+                .map(|v| v.signed_duration_since(started_at).num_milliseconds()),
+            metadata: row.get("metadata"),
+            error_message: row.get("stderr_excerpt"),
+        })
     }
 }
 
@@ -312,7 +353,10 @@ impl WorkspaceOperationService for DefaultWorkspaceOperationService {
                 metadata: request.metadata,
                 error_message: None,
             };
-            self.memory.lock().await.insert(operation.id, operation.clone());
+            self.memory
+                .lock()
+                .await
+                .insert(operation.id, operation.clone());
             return Ok(operation);
         }
         let pool = self.pool()?;
@@ -324,12 +368,39 @@ impl WorkspaceOperationService for DefaultWorkspaceOperationService {
         &self,
         request: CompleteOperationRequest,
     ) -> WorkspaceOperationResult<WorkspaceOperation> {
+        if self.pool.is_none() {
+            let mut memory = self.memory.lock().await;
+            let operation = memory.get_mut(&request.operation_id).ok_or(
+                WorkspaceOperationError::OperationNotFound(request.operation_id),
+            )?;
+            operation.status = if request.success {
+                OperationStatus::Completed
+            } else {
+                OperationStatus::Failed
+            };
+            operation.completed_at = Some(Utc::now());
+            operation.duration_ms = operation.calculate_duration();
+            operation.error_message = request.error_message;
+            return Ok(operation.clone());
+        }
         let pool = self.pool()?;
         let row = sqlx::query("UPDATE workspace_operations SET status = $2, exit_code = $3, stderr_excerpt = $4, finished_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING id, company_id, execution_workspace_id, phase, command, status, metadata, started_at, finished_at, stderr_excerpt").bind(request.operation_id).bind(if request.success { "completed" } else { "failed" }).bind(if request.success { Some(0i32) } else { Some(1i32) }).bind(request.error_message).fetch_optional(pool).await?.ok_or(WorkspaceOperationError::OperationNotFound(request.operation_id))?;
         Self::from_row(&row)
     }
 
-    async fn get_operation(&self, operation_id: Uuid) -> WorkspaceOperationResult<WorkspaceOperation> {
+    async fn get_operation(
+        &self,
+        operation_id: Uuid,
+    ) -> WorkspaceOperationResult<WorkspaceOperation> {
+        if self.pool.is_none() {
+            return self
+                .memory
+                .lock()
+                .await
+                .get(&operation_id)
+                .cloned()
+                .ok_or(WorkspaceOperationError::OperationNotFound(operation_id));
+        }
         let pool = self.pool()?;
         let row = sqlx::query("SELECT id, company_id, execution_workspace_id, phase, command, status, metadata, started_at, finished_at, stderr_excerpt FROM workspace_operations WHERE id = $1").bind(operation_id).fetch_optional(pool).await?.ok_or(WorkspaceOperationError::OperationNotFound(operation_id))?;
         Self::from_row(&row)
@@ -339,6 +410,34 @@ impl WorkspaceOperationService for DefaultWorkspaceOperationService {
         &self,
         query: ListOperationsQuery,
     ) -> WorkspaceOperationResult<Vec<WorkspaceOperation>> {
+        if self.pool.is_none() {
+            let mut operations: Vec<_> = self
+                .memory
+                .lock()
+                .await
+                .values()
+                .filter(|operation| {
+                    operation.execution_workspace_id == query.execution_workspace_id
+                })
+                .filter(|operation| {
+                    query
+                        .phase
+                        .as_ref()
+                        .map_or(true, |phase| &operation.phase == phase)
+                })
+                .filter(|operation| {
+                    query
+                        .status
+                        .as_ref()
+                        .map_or(true, |status| &operation.status == status)
+                })
+                .cloned()
+                .collect();
+            operations.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+            let offset = query.offset.unwrap_or(0).max(0) as usize;
+            let limit = query.limit.unwrap_or(100).clamp(1, 1000) as usize;
+            return Ok(operations.into_iter().skip(offset).take(limit).collect());
+        }
         let pool = self.pool()?;
         let rows = sqlx::query("SELECT id, company_id, execution_workspace_id, phase, command, status, metadata, started_at, finished_at, stderr_excerpt FROM workspace_operations WHERE execution_workspace_id = $1 AND ($2::text IS NULL OR phase = $2) AND ($3::text IS NULL OR status = $3) ORDER BY started_at DESC LIMIT $4 OFFSET $5").bind(query.execution_workspace_id).bind(query.phase.map(|p| p.to_string())).bind(query.status.map(|s| s.to_string())).bind(query.limit.unwrap_or(100).clamp(1, 1000)).bind(query.offset.unwrap_or(0).max(0)).fetch_all(pool).await?;
         rows.iter().map(Self::from_row).collect()
@@ -349,9 +448,69 @@ impl WorkspaceOperationService for DefaultWorkspaceOperationService {
         execution_workspace_id: Uuid,
         phase: Option<OperationPhase>,
     ) -> WorkspaceOperationResult<OperationStatistics> {
+        if self.pool.is_none() {
+            let operations: Vec<_> = self
+                .memory
+                .lock()
+                .await
+                .values()
+                .filter(|operation| operation.execution_workspace_id == execution_workspace_id)
+                .filter(|operation| {
+                    phase
+                        .as_ref()
+                        .map_or(true, |phase| &operation.phase == phase)
+                })
+                .cloned()
+                .collect();
+            let total_count = operations.len() as i64;
+            let completed_count = operations
+                .iter()
+                .filter(|operation| operation.is_success())
+                .count() as i64;
+            let failed_count = operations
+                .iter()
+                .filter(|operation| operation.is_failed())
+                .count() as i64;
+            let in_progress_count = operations
+                .iter()
+                .filter(|operation| operation.is_in_progress())
+                .count() as i64;
+            let durations: Vec<i64> = operations
+                .iter()
+                .filter_map(|operation| {
+                    operation
+                        .duration_ms
+                        .or_else(|| operation.calculate_duration())
+                })
+                .collect();
+            let avg_duration_ms = if durations.is_empty() {
+                None
+            } else {
+                Some(durations.iter().sum::<i64>() as f64 / durations.len() as f64)
+            };
+            return Ok(OperationStatistics {
+                total_count,
+                completed_count,
+                failed_count,
+                in_progress_count,
+                avg_duration_ms,
+                p50_duration_ms: None,
+                p95_duration_ms: None,
+                p99_duration_ms: None,
+            });
+        }
         let pool = self.pool()?;
         let row = sqlx::query("SELECT COUNT(*)::bigint AS total_count, COUNT(*) FILTER (WHERE status IN ('completed','succeeded'))::bigint AS completed_count, COUNT(*) FILTER (WHERE status='failed')::bigint AS failed_count, COUNT(*) FILTER (WHERE status IN ('running','in_progress'))::bigint AS in_progress_count, AVG(EXTRACT(EPOCH FROM (finished_at - started_at)) * 1000) FILTER (WHERE finished_at IS NOT NULL) AS avg_duration_ms FROM workspace_operations WHERE execution_workspace_id = $1 AND ($2::text IS NULL OR phase = $2)").bind(execution_workspace_id).bind(phase.map(|p| p.to_string())).fetch_one(pool).await?;
-        Ok(OperationStatistics { total_count: row.get("total_count"), completed_count: row.get("completed_count"), failed_count: row.get("failed_count"), in_progress_count: row.get("in_progress_count"), avg_duration_ms: row.get("avg_duration_ms"), p50_duration_ms: None, p95_duration_ms: None, p99_duration_ms: None })
+        Ok(OperationStatistics {
+            total_count: row.get("total_count"),
+            completed_count: row.get("completed_count"),
+            failed_count: row.get("failed_count"),
+            in_progress_count: row.get("in_progress_count"),
+            avg_duration_ms: row.get("avg_duration_ms"),
+            p50_duration_ms: None,
+            p95_duration_ms: None,
+            p99_duration_ms: None,
+        })
     }
 }
 
@@ -387,6 +546,81 @@ mod tests {
             .unwrap();
 
         assert_eq!(recorder.current_operation_id(), Some(operation_id));
+
+        recorder
+            .complete(&service, false, Some("runtime failed".to_string()))
+            .await
+            .unwrap();
+        let operation = service.get_operation(operation_id).await.unwrap();
+        assert_eq!(operation.status, OperationStatus::Failed);
+        assert_eq!(operation.error_message.as_deref(), Some("runtime failed"));
+        assert!(operation.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_memory_list_and_statistics_follow_filters() {
+        let service = DefaultWorkspaceOperationService::new();
+        let company_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let other_workspace_id = Uuid::new_v4();
+
+        let first = service
+            .record_operation(CreateOperationRequest {
+                company_id,
+                execution_workspace_id: workspace_id,
+                phase: OperationPhase::RuntimeStart,
+                command: Some("start".to_string()),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        service
+            .complete_operation(CompleteOperationRequest {
+                operation_id: first.id,
+                success: true,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+        service
+            .record_operation(CreateOperationRequest {
+                company_id,
+                execution_workspace_id: workspace_id,
+                phase: OperationPhase::RuntimeStop,
+                command: Some("stop".to_string()),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        service
+            .record_operation(CreateOperationRequest {
+                company_id,
+                execution_workspace_id: other_workspace_id,
+                phase: OperationPhase::RuntimeStart,
+                command: Some("other".to_string()),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        let runtime_starts = service
+            .list_operations(ListOperationsQuery {
+                execution_workspace_id: workspace_id,
+                phase: Some(OperationPhase::RuntimeStart),
+                status: None,
+                limit: None,
+                offset: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(runtime_starts.len(), 1);
+        assert_eq!(runtime_starts[0].id, first.id);
+
+        let stats = service.get_statistics(workspace_id, None).await.unwrap();
+        assert_eq!(stats.total_count, 2);
+        assert_eq!(stats.completed_count, 1);
+        assert_eq!(stats.in_progress_count, 1);
+        assert_eq!(stats.failed_count, 0);
     }
 
     #[test]
