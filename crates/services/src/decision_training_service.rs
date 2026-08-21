@@ -81,6 +81,7 @@ pub struct DecisionTrainingExample {
     pub source_kind: DecisionTrainingSourceKind,
     pub source_id: String,
     pub snapshot: DecisionTrainingSnapshotV1,
+    pub raw_snapshot: Value,
     pub notes: Option<String>,
     pub notes_history: Vec<DecisionTrainingNotesHistoryEntry>,
     pub tags: Vec<String>,
@@ -418,11 +419,12 @@ impl PgDecisionTrainingService {
         let source_kind = Self::parse_source_kind(&source_kind_name).ok_or_else(|| {
             TrainingError::InvalidSnapshot(format!("unsupported source kind {source_kind_name}"))
         })?;
+        let raw_snapshot: Value = row.get("snapshot");
         let source_id: Uuid = row.get("source_id");
         let company_id: Uuid = row.get("company_id");
         let issue_id: Uuid = row.get("issue_id");
         let snapshot = Self::parse_snapshot(
-            row.get("snapshot"),
+            raw_snapshot.clone(),
             &source_kind_name,
             source_id,
             company_id,
@@ -436,6 +438,7 @@ impl PgDecisionTrainingService {
             source_kind,
             source_id: source_id.to_string(),
             snapshot,
+            raw_snapshot,
             notes: row.get("notes"),
             notes_history: serde_json::from_value(row.get("notes_history"))
                 .map_err(|e| TrainingError::SerializationError(e.to_string()))?,
@@ -914,6 +917,7 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
                 source_kind: input.source_kind,
                 source_id: input.source_id.to_string(),
                 snapshot,
+                raw_snapshot: input.snapshot.clone(),
                 notes: Some(input.notes),
                 notes_history: vec![],
                 tags: input.tags,
@@ -961,6 +965,8 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
             captured_at: now,
             commit_sha: None,
         };
+        let raw_snapshot = serde_json::to_value(&snapshot)
+            .map_err(|error| TrainingError::SerializationError(error.to_string()))?;
 
         let example = DecisionTrainingExample {
             id: example_id,
@@ -968,6 +974,7 @@ impl DecisionTrainingService for DefaultDecisionTrainingService {
             source_kind: input.source_kind,
             source_id: input.source_id,
             snapshot,
+            raw_snapshot,
             notes: None,
             notes_history: vec![],
             tags: vec![],

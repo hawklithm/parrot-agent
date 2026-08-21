@@ -4180,7 +4180,7 @@ fn training_service_example_to_json(example: &services::DecisionTrainingExample)
         "qualityScore": example.quality_score,
         "decisionOutcome": example.snapshot.decision_outcome.clone(),
         "retentionPolicy": example.retention_policy,
-        "snapshot": example.snapshot.clone(),
+        "snapshot": example.raw_snapshot.clone(),
         "createdByUserId": example.created_by_user_id.clone(),
         "createdAt": iso(example.created_at),
         "updatedAt": iso(example.updated_at),
