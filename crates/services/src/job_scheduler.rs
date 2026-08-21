@@ -10,15 +10,16 @@
 //! - EnvironmentHealthProber: 探测环境健康（每 5 分钟）
 //! - ConsistencyCheckJob: 一致性检查（每小时）
 
+use crate::DefaultHeartbeatService;
+use crate::RoutineExecutionService;
 use async_trait::async_trait;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
-use sqlx::{PgPool, Row};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use crate::RoutineExecutionService;
 
 /// 最大补发运行次数（对应 paperclip MAX_CATCH_UP_RUNS）
 const MAX_CATCH_UP_RUNS: usize = 25;
@@ -42,7 +43,11 @@ pub fn is_env_stale(last_used_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
 }
 
 /// 运行卡住判定：started_at 早于 timeout 且仍在运行/排队。
-pub fn is_run_stuck(started_at: Option<DateTime<Utc>>, now: DateTime<Utc>, timeout: ChronoDuration) -> bool {
+pub fn is_run_stuck(
+    started_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    timeout: ChronoDuration,
+) -> bool {
     match started_at {
         Some(s) => s < now - timeout,
         None => false,
@@ -116,12 +121,52 @@ pub enum JobSchedule {
 pub trait ScheduledJob: Send + Sync {
     /// 任务名称
     fn job_name(&self) -> &str;
-    
+
     /// 调度配置
     fn schedule(&self) -> JobSchedule;
-    
+
     /// 执行任务
     async fn execute(&self) -> Result<String, String>;
+}
+
+pub struct HeartbeatRecoveryJob {
+    heartbeat: Arc<DefaultHeartbeatService>,
+}
+
+impl HeartbeatRecoveryJob {
+    pub fn new(heartbeat: Arc<DefaultHeartbeatService>) -> Self {
+        Self { heartbeat }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for HeartbeatRecoveryJob {
+    fn job_name(&self) -> &str {
+        "heartbeat_recovery"
+    }
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(60)
+    }
+    async fn execute(&self) -> Result<String, String> {
+        let orphaned = self
+            .heartbeat
+            .reconcile_orphaned_runs(300)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pending = self
+            .heartbeat
+            .reconcile_pending_issues()
+            .await
+            .map_err(|e| e.to_string())?;
+        let dependency_wakes = self
+            .heartbeat
+            .reconcile_dependency_wakeups()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "reconciled {orphaned} orphaned runs, {pending} pending issues, and {dependency_wakes} dependency wakes"
+        ))
+    }
 }
 
 /// Job Scheduler 主调度器
@@ -166,40 +211,39 @@ impl JobScheduler {
 
     /// 启动调度器主循环
     /// 对应 paperclip: server/src/index.ts:931-1040
-    pub async fn start(
-        self: Arc<Self>,
-        interval_ms: u64,
-    ) -> tokio::task::JoinHandle<()> {
+    pub async fn start(self: Arc<Self>, interval_ms: u64) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_millis(interval_ms));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 let jobs = self.jobs.read().await;
                 for (name, job) in jobs.iter() {
                     let job = Arc::clone(job);
                     let scheduler = Arc::clone(&self);
                     let name = name.clone();
-                    
+
                     tokio::spawn(async move {
                         let started_at = Utc::now();
                         let result = job.execute().await;
                         let completed_at = Utc::now();
-                        
+
                         let (status, error_message) = match result {
                             Ok(_) => (JobStatus::Running, None),
                             Err(e) => (JobStatus::Failed, Some(e)),
                         };
-                        
-                        scheduler.record_execution(JobExecutionRecord {
-                            id: Uuid::new_v4().to_string(),
-                            job_name: name,
-                            started_at,
-                            completed_at: Some(completed_at),
-                            status,
-                            error_message,
-                        }).await;
+
+                        scheduler
+                            .record_execution(JobExecutionRecord {
+                                id: Uuid::new_v4().to_string(),
+                                job_name: name,
+                                started_at,
+                                completed_at: Some(completed_at),
+                                status,
+                                error_message,
+                            })
+                            .await;
                     });
                 }
             }
@@ -253,8 +297,8 @@ impl RoutineCronTrigger {
         use cron::Schedule;
         use std::str::FromStr;
 
-        let schedule = Schedule::from_str(cron_expr)
-            .map_err(|e| format!("Invalid cron expression: {}", e))?;
+        let schedule =
+            Schedule::from_str(cron_expr).map_err(|e| format!("Invalid cron expression: {}", e))?;
 
         let tz: Tz = timezone
             .parse()
@@ -322,26 +366,40 @@ impl ScheduledJob for RoutineCronTrigger {
         let mut triggered = 0;
 
         for trigger in due_triggers {
-            let trigger_id: Uuid = trigger.try_get("trigger_id")
+            let trigger_id: Uuid = trigger
+                .try_get("trigger_id")
                 .map_err(|e| format!("Failed to get trigger_id: {}", e))?;
-            let routine_id: Uuid = trigger.try_get("routine_id")
+            let routine_id: Uuid = trigger
+                .try_get("routine_id")
                 .map_err(|e| format!("Failed to get routine_id: {}", e))?;
-            let cron_expr: Option<String> = trigger.try_get("cron_expression")
+            let cron_expr: Option<String> = trigger
+                .try_get("cron_expression")
                 .map_err(|e| format!("Failed to get cron_expression: {}", e))?;
-            let timezone: Option<String> = trigger.try_get("timezone")
+            let timezone: Option<String> = trigger
+                .try_get("timezone")
                 .map_err(|e| format!("Failed to get timezone: {}", e))?;
-            let next_run_at: Option<DateTime<Utc>> = trigger.try_get("next_run_at")
+            let next_run_at: Option<DateTime<Utc>> = trigger
+                .try_get("next_run_at")
                 .map_err(|e| format!("Failed to get next_run_at: {}", e))?;
-            let company_id: Uuid = trigger.try_get("company_id")
+            let company_id: Uuid = trigger
+                .try_get("company_id")
                 .map_err(|e| format!("Failed to get company_id: {}", e))?;
-            let catch_up_policy: Option<String> = trigger.try_get("catch_up_policy")
+            let catch_up_policy: Option<String> = trigger
+                .try_get("catch_up_policy")
                 .map_err(|e| format!("Failed to get catch_up_policy: {}", e))?;
-            let project_paused_at: Option<DateTime<Utc>> = trigger.try_get("project_paused_at")
+            let project_paused_at: Option<DateTime<Utc>> = trigger
+                .try_get("project_paused_at")
                 .map_err(|e| format!("Failed to get project_paused_at: {}", e))?;
 
-            let Some(next_run_at) = next_run_at else { continue; };
-            let Some(ref cron_expr) = cron_expr else { continue; };
-            let Some(ref timezone) = timezone else { continue; };
+            let Some(next_run_at) = next_run_at else {
+                continue;
+            };
+            let Some(ref cron_expr) = cron_expr else {
+                continue;
+            };
+            let Some(ref timezone) = timezone else {
+                continue;
+            };
 
             // 2. 检查项目是否暂停（对应 paperclip L2759-2763）
             let project_paused = project_paused_at.is_some();

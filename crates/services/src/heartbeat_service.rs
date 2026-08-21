@@ -2363,6 +2363,100 @@ impl DefaultHeartbeatService {
         Ok(reconciled)
     }
 
+    /// Heal blocked Issues whose dependency graph is ready but whose wake was
+    /// lost between the blocker transition and the normal fan-out path.
+    pub async fn reconcile_dependency_wakeups(&self) -> Result<usize, HeartbeatError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT dependent.id, dependent.assignee_agent_id,
+                    dependent.company_id, relation.issue_id AS blocker_issue_id
+             FROM issue_relations relation
+             JOIN issues dependent ON dependent.id = relation.related_issue_id
+             JOIN issues blocker ON blocker.id = relation.issue_id
+             WHERE relation.type = 'blocks'
+               AND blocker.status = 'done'
+               AND dependent.status = 'blocked'
+               AND dependent.assignee_agent_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM issue_relations remaining
+                   JOIN issues unresolved ON unresolved.id = remaining.issue_id
+                   WHERE remaining.company_id = relation.company_id
+                     AND remaining.related_issue_id = dependent.id
+                     AND remaining.type = 'blocks'
+                     AND unresolved.status <> 'done'
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM heartbeat_runs live
+                   WHERE live.company_id = dependent.company_id
+                     AND live.agent_id = dependent.assignee_agent_id
+                     AND live.status IN ('queued', 'running')
+                     AND (live.context_snapshot->>'issueId' = dependent.id::text
+                          OR live.context_snapshot->>'taskId' = dependent.id::text)
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM agent_wakeup_requests wake
+                   WHERE wake.company_id = dependent.company_id
+                     AND wake.agent_id = dependent.assignee_agent_id
+                     AND wake.idempotency_key =
+                         'issue_graph_liveness_backstop:' || dependent.id::text || ':' || relation.issue_id::text
+                     AND wake.status IN ('queued', 'dispatched', 'running', 'completed')
+               )
+             ORDER BY dependent.id
+             LIMIT 500",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+        let mut healed = 0;
+        for row in rows {
+            let issue_id: Uuid = row
+                .try_get("id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let agent_id: Uuid = row
+                .try_get("assignee_agent_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let company_id: Uuid = row
+                .try_get("company_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let blocker_issue_id: Uuid = row
+                .try_get("blocker_issue_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let idempotency_key = format!(
+                "issue_graph_liveness_backstop:{}:{}",
+                issue_id, blocker_issue_id
+            );
+            self.wakeup_with_options(
+                agent_id,
+                issue_id,
+                company_id,
+                HeartbeatWakeupOptions {
+                    source: Some("automation".to_string()),
+                    trigger_detail: Some("system".to_string()),
+                    reason: Some("issue_graph_liveness_backstop".to_string()),
+                    idempotency_key: Some(idempotency_key),
+                    payload: Some(serde_json::json!({
+                        "issueId": issue_id,
+                        "resolvedBlockerIssueId": blocker_issue_id,
+                        "backstop": "issue_graph_liveness_reconciliation",
+                    })),
+                    context_snapshot: Some(serde_json::json!({
+                        "issueId": issue_id,
+                        "taskId": issue_id,
+                        "source": "issue_graph_liveness.backstop",
+                        "resolvedBlockerIssueId": blocker_issue_id,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            healed += 1;
+        }
+        Ok(healed)
+    }
+
     fn clone_for_task(&self) -> Self {
         Self {
             pool: self.pool.clone(),
