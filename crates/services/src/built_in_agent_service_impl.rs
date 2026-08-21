@@ -4,7 +4,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::built_in_agent_service::{
-    BuiltInAgentDefinition, BuiltInAgentKey, BuiltInAgentMetadataRegistry, BuiltInAgentStatus,
+    BuiltInAgentBundleDefinition, BuiltInAgentDefinition, BuiltInAgentKey,
+    BuiltInAgentMetadataRegistry, BuiltInAgentStatus, RoutineCatchUpPolicy,
+    RoutineConcurrencyPolicy, RoutinePriority, RoutineStatus,
 };
 use repositories;
 use repositories::BuiltInManagedResourceRepository;
@@ -145,9 +147,12 @@ where
         self
     }
 
-    /// 将内置 Agent 的 Skill/Routine 受管资源绑定同步到 `builtin_managed_resources`
-    /// 表：按 (company, built_in_key, resource_type, canonical_key) 幂等 upsert；
-    /// 若存量行的 `stock_version` 落后于定义版本，则修复漂移并清除 `drift_detected`。
+    /// 将内置 Agent 的 Skill/Routine 受管资源同步到数据库：
+    /// - 先在 `resource_pool` 的**同一事务**中幂等物化 `company_skills`/`skill_files` 与
+    ///   `routines`/`routine_triggers`，保证技能与例程数据行（以及触发器）要么一起成功、
+    ///   要么一起回滚（跨资源原子回滚）。
+    /// - 再按 (company, built_in_key, resource_type, canonical_key) 幂等 upsert 到
+    ///   `builtin_managed_resources` ledger；若存量行的 `stock_version` 落后，则修复漂移。
     ///
     /// 返回 (是否有变更, 变更说明)。
     async fn sync_managed_resources(
@@ -155,6 +160,7 @@ where
         company_id: Uuid,
         key: BuiltInAgentKey,
         definition: &BuiltInAgentDefinition,
+        agent_id: Uuid,
     ) -> BuiltInAgentResult<(bool, Vec<String>)> {
         let mut changed = false;
         let mut changes = Vec::new();
@@ -163,7 +169,33 @@ where
             None => return Ok((changed, changes)),
         };
 
-        let skill_id = self.materialize_skill(company_id, key, definition).await?;
+        // 在 resource_pool 的同一事务内原子物化 Skill + Routine 数据行。
+        let (skill_id, routine_id) = if let Some(pool) = &self.resource_pool {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+            let skill_id = self
+                .materialize_skill_in_tx(&mut tx, company_id, definition)
+                .await?;
+            let existing_routine_id = self
+                .managed_repo
+                .get(company_id, key.as_str(), "routine", &bundle.routine.routine_key)
+                .await
+                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?
+                .and_then(|row| row.target_resource_id);
+            let routine_id = self
+                .materialize_routine_in_tx(&mut tx, company_id, bundle, agent_id, existing_routine_id)
+                .await?;
+            tx.commit()
+                .await
+                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+            (skill_id, routine_id)
+        } else {
+            (None, None)
+        };
+
+        // Ledger 绑定（自身幂等 upsert）。
         let (skill_changed, skill_msg) = self
             .sync_one_resource(
                 company_id,
@@ -185,7 +217,7 @@ where
                 key,
                 "routine",
                 &bundle.routine.routine_key,
-                None,
+                routine_id,
                 &bundle.stock_version,
             )
             .await?;
@@ -265,26 +297,20 @@ where
         }
     }
 
-    async fn materialize_skill(
+    async fn materialize_skill_in_tx(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         company_id: Uuid,
-        key: BuiltInAgentKey,
         definition: &BuiltInAgentDefinition,
     ) -> BuiltInAgentResult<Option<Uuid>> {
-        let Some(pool) = &self.resource_pool else {
-            return Ok(None);
-        };
-        let Some(bundle) = &definition.bundle else {
-            return Ok(None);
+        let bundle = match &definition.bundle {
+            Some(b) => b,
+            None => return Ok(None),
         };
 
-        let mut transaction = pool
-            .begin()
-            .await
-            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
         let config = serde_json::json!({
             "managedBy": "built_in_agent",
-            "builtInKey": key.as_str(),
+            "builtInKey": definition.key.as_str(),
             "canonicalKey": bundle.skill.canonical_key,
             "stockVersion": bundle.stock_version,
         });
@@ -308,7 +334,7 @@ where
         .bind(&definition.short_purpose)
         .bind(&bundle.stock_version)
         .bind(config)
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
 
@@ -321,7 +347,7 @@ where
         .bind(company_id)
         .bind(skill_id)
         .bind(&paths)
-        .execute(&mut *transaction)
+        .execute(&mut **tx)
         .await
         .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
 
@@ -339,16 +365,190 @@ where
             .bind(skill_id)
             .bind(path)
             .bind(content)
-            .execute(&mut *transaction)
+            .execute(&mut **tx)
             .await
             .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
         }
 
-        transaction
-            .commit()
+        Ok(Some(skill_id))
+    }
+
+    /// 物化内置 Agent 的受管 Routine 数据行（以及其触发器），在传入的事务内幂等执行。
+    ///
+    /// - 第一次 provision：按 `(company_id, routine_key)` 通过 ledger 解析既有的 routine id；
+    ///   不存在则新建 `routines` 行（默认沿用定义中的 `status`，内置均为 `paused`），并写入
+    ///   对应的 `routine_triggers`（内置均为 `enabled=false` 的 schedule 触发器）。
+    /// - 重复 provision / stock 升级：原地 UPDATE routine 内容与触发器，保证幂等且修复内容漂移。
+    async fn materialize_routine_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        company_id: Uuid,
+        bundle: &BuiltInAgentBundleDefinition,
+        agent_id: Uuid,
+        existing_routine_id: Option<Uuid>,
+    ) -> BuiltInAgentResult<Option<Uuid>> {
+        let routine_def = &bundle.routine;
+
+        let priority: i32 = match routine_def.priority {
+            RoutinePriority::Critical => 0,
+            RoutinePriority::High => 1,
+            RoutinePriority::Medium => 2,
+            RoutinePriority::Low => 3,
+        };
+        let status_str: &str = match routine_def.status {
+            RoutineStatus::Active => "active",
+            RoutineStatus::Paused => "paused",
+        };
+        let concurrency_str: &str = match routine_def.concurrency_policy {
+            RoutineConcurrencyPolicy::AlwaysEnqueue => "parallel",
+            RoutineConcurrencyPolicy::CoalesceIfActive => "coalesce_if_active",
+            RoutineConcurrencyPolicy::SkipIfActive => "skip_if_active",
+        };
+        let catch_up_str: &str = match routine_def.catch_up_policy {
+            RoutineCatchUpPolicy::EnqueueMissedWithCap => "run_missed",
+            RoutineCatchUpPolicy::SkipMissed => "skip_missed",
+        };
+        let variables: serde_json::Value =
+            serde_json::to_value(&routine_def.variables).unwrap_or(serde_json::Value::Null);
+
+        let routine_id = match existing_routine_id {
+            Some(id) => {
+                sqlx::query(
+                    r#"UPDATE routines SET
+                       title=$2, description=$3, status=$4::routine_status, priority=$5,
+                       concurrency_policy=$6::concurrency_policy,
+                       catch_up_policy=$7::catch_up_policy, trigger_config=$8, variables=$9,
+                       env=$10, assignee_agent_id=$11, updated_at=now()
+                       WHERE id=$1 AND company_id=$12"#,
+                )
+                .bind(id)
+                .bind(&routine_def.title)
+                .bind(&routine_def.description)
+                .bind(status_str)
+                .bind(priority)
+                .bind(concurrency_str)
+                .bind(catch_up_str)
+                .bind(serde_json::json!({}))
+                .bind(&variables)
+                .bind(serde_json::json!({}))
+                .bind(agent_id)
+                .bind(company_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                id
+            }
+            None => {
+                let new_id = Uuid::new_v4();
+                sqlx::query(
+                    r#"INSERT INTO routines
+                       (id, company_id, project_id, goal_id, parent_issue_id, name, title, description,
+                        agent_id, assignee_agent_id, priority, status, concurrency_policy, catch_up_policy,
+                        trigger_config, variables, env, latest_revision_id, latest_revision_number,
+                        responsible_user_id, created_by_user_id, last_run_at, next_run_at, run_count,
+                        success_count, failure_count, last_triggered_at, last_enqueued_at, created_at, updated_at)
+                       VALUES ($1, $2, NULL, NULL, NULL, $3, $4, $5, $6, $7, $8, $9::routine_status,
+                               $10::concurrency_policy, $11::catch_up_policy, $12, $13, $14, NULL, 0,
+                               NULL, NULL, NULL, NULL, 0, 0, 0, NULL, NULL, now(), now())
+                       RETURNING id"#,
+                )
+                .bind(new_id)
+                .bind(company_id)
+                .bind(&routine_def.routine_key)
+                .bind(&routine_def.title)
+                .bind(&routine_def.description)
+                .bind(agent_id)
+                .bind(agent_id)
+                .bind(priority)
+                .bind(status_str)
+                .bind(concurrency_str)
+                .bind(catch_up_str)
+                .bind(serde_json::json!({}))
+                .bind(&variables)
+                .bind(serde_json::json!({}))
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                new_id
+            }
+        };
+
+        // 幂等物化触发器：按 (routine_id, kind, cron_expression, timezone) 匹配，存在则更新，不存在则插入。
+        for (idx, trigger) in routine_def.triggers.iter().enumerate() {
+            let kind_str = trigger.kind.as_str();
+            let trigger_type_str = "schedule";
+            let trigger_status_str: &str = if trigger.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let config = serde_json::json!({
+                "cronExpression": trigger.cron_expression,
+                "timezone": trigger.timezone,
+            });
+            let existing = sqlx::query_scalar::<_, Uuid>(
+                r#"SELECT id FROM routine_triggers
+                   WHERE routine_id = $1 AND kind = $2::trigger_kind
+                     AND cron_expression = $3 AND timezone = $4"#,
+            )
+            .bind(routine_id)
+            .bind(kind_str)
+            .bind(&trigger.cron_expression)
+            .bind(&trigger.timezone)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
-        Ok(Some(skill_id))
+
+            match existing {
+                Some(tid) => {
+                    sqlx::query(
+                        r#"UPDATE routine_triggers SET label=$2, enabled=$3, status=$4::trigger_status,
+                           config=$5, cron_expression=$6, timezone=$7, updated_at=now()
+                           WHERE id=$1"#,
+                    )
+                    .bind(tid)
+                    .bind(&trigger.label)
+                    .bind(trigger.enabled)
+                    .bind(trigger_status_str)
+                    .bind(&config)
+                    .bind(&trigger.cron_expression)
+                    .bind(&trigger.timezone)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                }
+                None => {
+                    let tid = Uuid::new_v4();
+                    sqlx::query(
+                        r#"INSERT INTO routine_triggers
+                           (id, company_id, routine_id, kind, label, enabled, trigger_type, config,
+                            status, next_trigger_at, last_triggered_at, cron_expression, timezone,
+                            next_run_at, last_fired_at, public_id, secret_id, signing_mode,
+                            replay_window_sec, last_rotated_at, last_result, created_at, updated_at)
+                           VALUES ($1, $2, $3, $4::trigger_kind, $5, $6, $7::trigger_type, $8,
+                                   $9::trigger_status, NULL, NULL, $10, $11, NULL, NULL,
+                                   $12, NULL, NULL, NULL, NULL, NULL, now(), now())"#,
+                    )
+                    .bind(tid)
+                    .bind(company_id)
+                    .bind(routine_id)
+                    .bind(kind_str)
+                    .bind(&trigger.label)
+                    .bind(trigger.enabled)
+                    .bind(trigger_type_str)
+                    .bind(&config)
+                    .bind(trigger_status_str)
+                    .bind(&trigger.cron_expression)
+                    .bind(&trigger.timezone)
+                    .bind(format!("builtin-{}-{}", routine_id, idx))
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                }
+            }
+        }
+
+        Ok(Some(routine_id))
     }
 
     async fn clear_managed_resource_bindings(
@@ -367,16 +567,34 @@ where
                 .begin()
                 .await
                 .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
-            for binding in bindings.iter().filter(|binding| binding.resource_type == "skill") {
-                if let Some(skill_id) = binding.target_resource_id {
-                    sqlx::query(
-                        "DELETE FROM company_skills WHERE id = $1 AND company_id = $2",
-                    )
-                    .bind(skill_id)
-                    .bind(company_id)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+            for binding in bindings.iter() {
+                if binding.resource_type == "skill" {
+                    if let Some(skill_id) = binding.target_resource_id {
+                        sqlx::query(
+                            "DELETE FROM company_skills WHERE id = $1 AND company_id = $2",
+                        )
+                        .bind(skill_id)
+                        .bind(company_id)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                    }
+                } else if binding.resource_type == "routine" {
+                    if let Some(routine_id) = binding.target_resource_id {
+                        sqlx::query("DELETE FROM routine_triggers WHERE routine_id = $1")
+                            .bind(routine_id)
+                            .execute(&mut *transaction)
+                            .await
+                            .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                        sqlx::query(
+                            "DELETE FROM routines WHERE id = $1 AND company_id = $2",
+                        )
+                        .bind(routine_id)
+                        .bind(company_id)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
+                    }
                 }
             }
             sqlx::query(
@@ -628,7 +846,7 @@ where
             .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
 
         // 同步受管资源绑定；若绑定失败则回滚新建的 Agent，避免留下半预置的孤立 Agent。
-        if let Err(e) = self.sync_managed_resources(company_id, key, definition).await {
+        if let Err(e) = self.sync_managed_resources(company_id, key, definition, saved.id).await {
             if is_new {
                 let _ = self.agent_repo.delete(saved.id).await;
             }
@@ -719,7 +937,7 @@ where
 
         // 同步受管资源绑定并检测/修复漂移。
         let (managed_changed, managed_changes) =
-            self.sync_managed_resources(company_id, key, definition).await?;
+            self.sync_managed_resources(company_id, key, definition, agent.id).await?;
         result.changes.extend(managed_changes);
 
         let bindings = self
