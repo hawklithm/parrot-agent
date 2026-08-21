@@ -8,12 +8,12 @@ use crate::database_backup_health_service::{
 };
 use crate::task_watchdog::WatchdogService;
 use async_trait::async_trait;
-use flate2::{write::GzEncoder, Compression};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::{
     collections::HashMap,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
@@ -232,6 +232,15 @@ pub struct DatabaseBackupResult {
     pub pruned_count: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseRestoreResult {
+    pub backup_id: Uuid,
+    pub status: String,
+    pub target_database: String,
+    pub restored_bytes: u64,
+}
+
 /// 实例设置服务接口
 #[async_trait]
 pub trait InstanceSettingsService: Send + Sync {
@@ -273,6 +282,13 @@ pub trait InstanceSettingsService: Send + Sync {
 
     /// 查询数据库备份健康状态
     async fn get_database_backup_health(&self) -> Result<DatabaseBackupHealthStatus, String>;
+
+    /// Restore a selected backup only to an explicitly configured target.
+    async fn restore_database_backup(
+        &self,
+        backup_id: Uuid,
+        confirmation: String,
+    ) -> Result<DatabaseRestoreResult, String>;
 }
 
 /// 内存实现的实例设置服务
@@ -676,6 +692,106 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         Ok(inspect_database_backup_health(
             Self::database_backup_health_options(),
         ))
+    }
+
+    async fn restore_database_backup(
+        &self,
+        backup_id: Uuid,
+        confirmation: String,
+    ) -> Result<DatabaseRestoreResult, String> {
+        if std::env::var("PARROT_DATABASE_RESTORE_ENABLED")
+            .ok()
+            .as_deref()
+            != Some("true")
+        {
+            return Err("database restore is disabled; set PARROT_DATABASE_RESTORE_ENABLED=true after review".to_string());
+        }
+        let expected_confirmation = format!("restore:{backup_id}");
+        if confirmation.trim() != expected_confirmation {
+            return Err("database restore confirmation does not match the selected backup".to_string());
+        }
+        let target_database = std::env::var("PARROT_DATABASE_RESTORE_TARGET_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "database restore target is not configured".to_string())?;
+        if std::env::var("DATABASE_URL").ok().as_deref() == Some(target_database.as_str())
+            && std::env::var("PARROT_DATABASE_RESTORE_ALLOW_SAME_DATABASE").ok().as_deref()
+                != Some("true")
+        {
+            return Err("database restore refuses the current database unless PARROT_DATABASE_RESTORE_ALLOW_SAME_DATABASE=true".to_string());
+        }
+
+        let backup_dir = std::env::var("PARROT_DATABASE_BACKUP_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("data/backups"));
+        let mut entries = tokio::fs::read_dir(&backup_dir)
+            .await
+            .map_err(|error| format!("failed to read database backup directory: {error}"))?;
+        let suffix = format!("-{backup_id}.sql.gz");
+        let mut backup_path = None;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| format!("failed to enumerate database backups: {error}"))?
+        {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("parrot-") && name.ends_with(&suffix) {
+                backup_path = Some(entry.path());
+                break;
+            }
+        }
+        let backup_path = backup_path.ok_or_else(|| format!("database backup {backup_id} was not found"))?;
+        let compressed = tokio::fs::read(&backup_path)
+            .await
+            .map_err(|error| format!("failed to read database backup: {error}"))?;
+        let sql = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            let mut decoder = GzDecoder::new(compressed.as_slice());
+            let mut sql = Vec::new();
+            decoder
+                .read_to_end(&mut sql)
+                .map_err(|error| format!("failed to decompress database backup: {error}"))?;
+            if sql.is_empty() {
+                return Err("database backup is empty".to_string());
+            }
+            Ok(sql)
+        })
+        .await
+        .map_err(|error| format!("database restore decompression task failed: {error}"))??;
+        let restore_path = backup_dir.join(format!("restore-{backup_id}-{}.sql", Uuid::new_v4()));
+        tokio::fs::write(&restore_path, &sql)
+            .await
+            .map_err(|error| format!("failed to stage database restore: {error}"))?;
+        let psql = std::env::var("PARROT_PSQL").unwrap_or_else(|_| "psql".to_string());
+        let output = Command::new(psql)
+            .args(["--set", "ON_ERROR_STOP=1", "--dbname"])
+            .arg(&target_database)
+            .arg("--file")
+            .arg(&restore_path)
+            .output()
+            .await
+            .map_err(|error| format!("failed to start psql restore: {error}"));
+        let _ = tokio::fs::remove_file(&restore_path).await;
+        let output = output?;
+        if !output.status.success() {
+            let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!(
+                "psql restore exited with code {}{}",
+                output.status.code().unwrap_or(-1),
+                if diagnostics.is_empty() { String::new() } else { format!(": {diagnostics}") }
+            ));
+        }
+        Ok(DatabaseRestoreResult {
+            backup_id,
+            status: "completed".to_string(),
+            target_database: target_database
+                .split('@')
+                .next_back()
+                .unwrap_or("configured target")
+                .to_string(),
+            restored_bytes: sql.len() as u64,
+        })
     }
 }
 

@@ -1,7 +1,7 @@
 //! Instance Settings routes — 实例级设置管理 (IS1-IS9)
 
 use axum::{
-    extract::{Extension, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -19,6 +19,7 @@ pub fn instance_settings_routes() -> Router<AppState> {
         .route("/instance/settings/experimental/issue-graph-liveness-auto-recovery/preview", post(preview_auto_recovery))
         .route("/instance/settings/experimental/issue-graph-liveness-auto-recovery/run", post(run_auto_recovery))
         .route("/instance/database-backups", get(get_database_backup_health).post(create_database_backup))
+        .route("/instance/database-backups/:backup_id/restore", post(restore_database_backup))
 }
 
 /// IS1: GET /instance/settings
@@ -187,6 +188,50 @@ async fn get_database_backup_health(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+}
+
+/// POST /instance/database-backups/:backup_id/restore
+async fn restore_database_backup(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(backup_id): Path<uuid::Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
+    let confirmation = body
+        .get("confirmation")
+        .and_then(|value| value.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .to_string();
+    let result = state
+        .instance_settings_service
+        .restore_database_backup(backup_id, confirmation)
+        .await
+        .map_err(|error| {
+            if error.contains("disabled")
+                || error.contains("confirmation")
+                || error.contains("target")
+                || error.contains("current database")
+            {
+                StatusCode::PRECONDITION_FAILED
+            } else if error.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                tracing::error!("Failed to restore database backup: {}", error);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    log_activity(
+        &state.pool,
+        uuid::Uuid::nil(),
+        "instance.database_backup_restored",
+        &actor,
+        "instance",
+        uuid::Uuid::nil(),
+        serde_json::json!({ "backupId": result.backup_id, "target": result.target_database }),
+    )
+    .await;
+    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
 #[cfg(test)]
