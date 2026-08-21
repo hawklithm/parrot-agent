@@ -1843,15 +1843,53 @@ async fn get_heartbeat_context(
 /// I2: GET /issues/:id/cases
 async fn get_issue_cases(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
-    state
-        .issue_service
-        .get_cases(id, company_id)
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let rows = sqlx::query(
+        "SELECT c.id, c.company_id, c.project_id, c.case_number, c.identifier,
+                c.case_type, c.key, c.title, c.summary, c.status::text AS status,
+                c.fields, c.parent_case_id, c.created_at, c.updated_at,
+                l.id AS link_id, l.role::text AS link_role, l.created_at AS linked_at
+         FROM case_issue_links l
+         JOIN cases c ON c.id = l.case_id AND c.company_id = l.company_id
+         WHERE l.issue_id = $1 AND l.company_id = $2
+         ORDER BY l.created_at DESC",
+    )
+    .bind(id)
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to list issue cases");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "companyId": row.get::<Uuid, _>("company_id"),
+                    "projectId": row.get::<Option<Uuid>, _>("project_id"),
+                    "caseNumber": row.get::<i32, _>("case_number"),
+                    "identifier": row.get::<String, _>("identifier"),
+                    "caseType": row.get::<String, _>("case_type"),
+                    "key": row.get::<Option<String>, _>("key"),
+                    "title": row.get::<String, _>("title"),
+                    "summary": row.get::<Option<String>, _>("summary"),
+                    "status": row.get::<String, _>("status"),
+                    "fields": row.get::<Value, _>("fields"),
+                    "parentCaseId": row.get::<Option<Uuid>, _>("parent_case_id"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                    "linkId": row.get::<Uuid, _>("link_id"),
+                    "linkRole": row.get::<String, _>("link_role"),
+                    "linkedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("linked_at"),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// I3: GET /issues/:id/active-run
