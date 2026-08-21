@@ -107,6 +107,18 @@ pub enum JobStatus {
     Disabled,
 }
 
+impl JobStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 /// 任务调度配置
 #[derive(Debug, Clone)]
 pub enum JobSchedule {
@@ -268,12 +280,74 @@ impl JobScheduler {
     }
 
     pub async fn record_execution(&self, record: JobExecutionRecord) {
+        if let Some(pool) = self.pool.as_ref() {
+            if let Err(error) = sqlx::query(
+                "INSERT INTO scheduler_job_executions
+                    (id, job_name, owner_id, started_at, completed_at, status, error_message)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(Uuid::parse_str(&record.id).unwrap_or_else(|_| Uuid::new_v4()))
+            .bind(&record.job_name)
+            .bind(self.owner_id)
+            .bind(record.started_at)
+            .bind(record.completed_at)
+            .bind(record.status.as_str())
+            .bind(&record.error_message)
+            .execute(pool)
+            .await
+            {
+                tracing::warn!(job_name = %record.job_name, error = %error, "failed to persist scheduler execution");
+            }
+        }
         self.executions.write().await.push(record);
     }
 
     pub async fn get_recent_executions(&self, limit: usize) -> Vec<JobExecutionRecord> {
         let executions = self.executions.read().await;
         executions.iter().rev().take(limit).cloned().collect()
+    }
+
+    /// Load durable execution history, if the scheduler is database-backed.
+    pub async fn load_persisted_executions(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<JobExecutionRecord>, String> {
+        let Some(pool) = self.pool.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT id, job_name, started_at, completed_at, status, error_message
+               FROM scheduler_job_executions
+              WHERE owner_id = $1
+              ORDER BY created_at DESC
+              LIMIT $2",
+        )
+        .bind(self.owner_id)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let status = match row.try_get::<String, _>("status").ok()?.as_str() {
+                    "idle" => JobStatus::Idle,
+                    "running" => JobStatus::Running,
+                    "succeeded" => JobStatus::Succeeded,
+                    "failed" => JobStatus::Failed,
+                    "disabled" => JobStatus::Disabled,
+                    _ => return None,
+                };
+                Some(JobExecutionRecord {
+                    id: row.try_get::<Uuid, _>("id").ok()?.to_string(),
+                    job_name: row.try_get("job_name").ok()?,
+                    started_at: row.try_get("started_at").ok()?,
+                    completed_at: row.try_get("completed_at").ok()?,
+                    status,
+                    error_message: row.try_get("error_message").ok()?,
+                })
+            })
+            .collect())
     }
 
     /// 启动调度器主循环
@@ -411,6 +485,41 @@ mod scheduler_tests {
             .execute(&pool)
             .await
             .expect("cleanup scheduler lease test row");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_execution_history_round_trips() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("database required for scheduler history test");
+        let scheduler = JobScheduler::new().with_pool(pool.clone());
+        let id = Uuid::new_v4();
+        scheduler
+            .record_execution(super::JobExecutionRecord {
+                id: id.to_string(),
+                job_name: "scheduler_history_test".to_string(),
+                started_at: chrono::Utc::now(),
+                completed_at: Some(chrono::Utc::now()),
+                status: JobStatus::Succeeded,
+                error_message: None,
+            })
+            .await;
+        let rows = scheduler
+            .load_persisted_executions(10)
+            .await
+            .expect("load persisted scheduler history");
+        assert!(rows.iter().any(|row| row.id == id.to_string()));
+        sqlx::query("DELETE FROM scheduler_job_executions WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("cleanup scheduler history test row");
         pool.close().await;
     }
 
