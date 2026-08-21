@@ -84,15 +84,84 @@ impl ProviderSecretRemoteImportService {
 #[async_trait]
 impl SecretRemoteImportService for ProviderSecretRemoteImportService {
     async fn preview(&self, company_id: Uuid, request: RemoteSecretImportPreviewRequest) -> ServiceResult<RemoteSecretImportPreviewResult> {
+        if request.max_results == 0 || request.max_results > 500 {
+            return Err(crate::errors::ServiceError::Validation(
+                "maxResults must be between 1 and 500".into(),
+            ));
+        }
         let (provider, config)=self.config(company_id,request.provider_config_id).await?;
-        let listed=self.list(&provider,&config,request.max_results.min(500)).await?;
+        let listed=self.list(&provider,&config,request.max_results).await?;
         let mut candidates=Vec::with_capacity(listed.len());
-        for (name,external_ref) in listed { let existing:Option<Uuid>=sqlx::query_scalar("SELECT id FROM company_secrets WHERE company_id=$1 AND (name=$2 OR key=$3 OR external_ref=$4) AND deleted_at IS NULL LIMIT 1").bind(company_id).bind(&name).bind(Self::key(&name)).bind(&external_ref).fetch_optional(&self.pool).await?; let status=if existing.is_some(){models::RemoteSecretImportCandidateStatus::Duplicate}else{models::RemoteSecretImportCandidateStatus::Ready}; candidates.push(models::RemoteSecretImportCandidate{name,external_ref,status,existing_secret_id:existing,conflicts:vec![]}); }
+        for (name, external_ref) in listed {
+            let existing = sqlx::query(
+                "SELECT id, provider, external_ref, managed_mode FROM company_secrets WHERE company_id=$1 AND (name=$2 OR key=$3 OR external_ref=$4) AND deleted_at IS NULL LIMIT 1",
+            )
+            .bind(company_id)
+            .bind(&name)
+            .bind(Self::key(&name))
+            .bind(&external_ref)
+            .fetch_optional(&self.pool)
+            .await?;
+            let (status, existing_secret_id, conflicts) = if let Some(row) = existing {
+                let id: Uuid = row.get("id");
+                let local_provider: String = row.get("provider");
+                let local_ref: Option<String> = row.get("external_ref");
+                let local_mode: String = row.get("managed_mode");
+                let mut conflicts = Vec::new();
+                if local_provider != provider {
+                    conflicts.push(models::RemoteSecretImportConflict { field: "provider".into(), remote_value: provider.clone(), local_value: local_provider });
+                }
+                if local_ref.as_deref() != Some(external_ref.as_str()) {
+                    conflicts.push(models::RemoteSecretImportConflict { field: "externalRef".into(), remote_value: external_ref.clone(), local_value: local_ref.unwrap_or_default() });
+                }
+                if local_mode != "external_reference" {
+                    conflicts.push(models::RemoteSecretImportConflict { field: "managedMode".into(), remote_value: "external_reference".into(), local_value: local_mode });
+                }
+                let status = if conflicts.is_empty() { models::RemoteSecretImportCandidateStatus::Duplicate } else { models::RemoteSecretImportCandidateStatus::Conflict };
+                (status, Some(id), conflicts)
+            } else {
+                (models::RemoteSecretImportCandidateStatus::Ready, None, Vec::new())
+            };
+            candidates.push(models::RemoteSecretImportCandidate { name, external_ref, status, existing_secret_id, conflicts });
+        }
         Ok(RemoteSecretImportPreviewResult{provider_config_id:request.provider_config_id,provider,next_token:None,candidates})
     }
     async fn execute(&self, company_id: Uuid, request: RemoteSecretImportRequest) -> ServiceResult<RemoteSecretImportResult> {
-        let (provider,config)=self.config(company_id,request.provider_config_id).await?; let listed=self.list(&provider,&config,1000).await?; let map=listed.into_iter().collect::<std::collections::HashMap<_,_>>(); let mut results=vec![];
-        for name in request.secret_names { let external_ref=map.get(&name).cloned().unwrap_or_else(||name.clone()); let key=Self::key(&name); let existing:Option<Uuid>=sqlx::query_scalar("SELECT id FROM company_secrets WHERE company_id=$1 AND (name=$2 OR key=$3 OR external_ref=$4) AND deleted_at IS NULL LIMIT 1").bind(company_id).bind(&name).bind(&key).bind(&external_ref).fetch_optional(&self.pool).await?; if existing.is_some() && !request.overwrite_conflicts { results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Skipped,secret_id:None,error:Some("secret already exists".into()),conflicts:vec![]}); continue; } let value=match self.value(&provider,&config,&name,&external_ref).await {Ok(v)=>v,Err(e)=>{results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Error,secret_id:None,error:Some(e.to_string()),conflicts:vec![]});continue;}}; let mut h=Sha256::new();h.update(value.as_bytes());let sha=format!("{:x}",h.finalize()); let secret_id=if let Some(id)=existing { sqlx::query("UPDATE company_secrets SET provider=$2,provider_config_id=$3,external_ref=$4,managed_mode='external_reference',latest_version=latest_version+1,updated_at=NOW() WHERE id=$1").bind(id).bind(&provider).bind(request.provider_config_id).bind(&external_ref).execute(&self.pool).await?; id } else { sqlx::query_scalar("INSERT INTO company_secrets (company_id,key,name,provider,provider_config_id,managed_mode,external_ref,latest_version) VALUES ($1,$2,$3,$4,$5,'external_reference',$6,1) RETURNING id").bind(company_id).bind(&key).bind(&name).bind(&provider).bind(request.provider_config_id).bind(&external_ref).fetch_one(&self.pool).await? }; let version:i32=sqlx::query_scalar("SELECT latest_version FROM company_secrets WHERE id=$1").bind(secret_id).fetch_one(&self.pool).await?; sqlx::query("INSERT INTO company_secret_versions (secret_id,version,material,value_sha256,provider_version_ref,status,fingerprint_sha256) VALUES ($1,$2,$3,$4,$5,'current',$4)").bind(secret_id).bind(version).bind(serde_json::json!({"value":value})).bind(&sha).bind(&external_ref).execute(&self.pool).await?; results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Imported,secret_id:Some(secret_id),error:None,conflicts:vec![]}); }
+        if request.secret_names.is_empty() || request.secret_names.len() > 500 {
+            return Err(crate::errors::ServiceError::Validation("secretNames must contain between 1 and 500 names".into()));
+        }
+        let (provider,config)=self.config(company_id,request.provider_config_id).await?;
+        let listed=self.list(&provider,&config,500).await?;
+        let map=listed.into_iter().collect::<std::collections::HashMap<_,_>>();
+        let mut results=vec![];
+        for name in request.secret_names {
+            let Some(external_ref) = map.get(&name).cloned() else {
+                results.push(models::RemoteSecretImportRowResult{name,external_ref:String::new(),status:models::RemoteSecretImportRowStatus::Error,secret_id:None,error:Some("secret name was not returned by the provider listing".into()),conflicts:vec![]});
+                continue;
+            };
+            let key=Self::key(&name);
+            let existing=sqlx::query("SELECT id, provider, external_ref, managed_mode FROM company_secrets WHERE company_id=$1 AND (name=$2 OR key=$3 OR external_ref=$4) AND deleted_at IS NULL LIMIT 1").bind(company_id).bind(&name).bind(&key).bind(&external_ref).fetch_optional(&self.pool).await?;
+            let conflicts = existing.as_ref().map(|row| {
+                let mut conflicts = Vec::new();
+                let local_provider: String = row.get("provider");
+                let local_ref: Option<String> = row.get("external_ref");
+                let local_mode: String = row.get("managed_mode");
+                if local_provider != provider { conflicts.push(models::RemoteSecretImportConflict { field: "provider".into(), remote_value: provider.clone(), local_value: local_provider }); }
+                if local_ref.as_deref() != Some(external_ref.as_str()) { conflicts.push(models::RemoteSecretImportConflict { field: "externalRef".into(), remote_value: external_ref.clone(), local_value: local_ref.unwrap_or_default() }); }
+                if local_mode != "external_reference" { conflicts.push(models::RemoteSecretImportConflict { field: "managedMode".into(), remote_value: "external_reference".into(), local_value: local_mode }); }
+                conflicts
+            }).unwrap_or_default();
+            if existing.is_some() && !request.overwrite_conflicts { results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Skipped,secret_id:None,error:Some("secret already exists".into()),conflicts}); continue; }
+            let value=match self.value(&provider,&config,&name,&external_ref).await {Ok(v)=>v,Err(e)=>{results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Error,secret_id:None,error:Some(e.to_string()),conflicts});continue;}};
+            let mut h=Sha256::new();h.update(value.as_bytes());let sha=format!("{:x}",h.finalize());
+            let mut tx = self.pool.begin().await?;
+            let secret_id=if let Some(row) = existing { let id: Uuid = row.get("id"); sqlx::query("UPDATE company_secrets SET provider=$2,provider_config_id=$3,external_ref=$4,managed_mode='external_reference',latest_version=latest_version+1,updated_at=NOW() WHERE id=$1").bind(id).bind(&provider).bind(request.provider_config_id).bind(&external_ref).execute(&mut *tx).await?; id } else { sqlx::query_scalar("INSERT INTO company_secrets (company_id,key,name,provider,provider_config_id,managed_mode,external_ref,latest_version) VALUES ($1,$2,$3,$4,$5,'external_reference',$6,1) RETURNING id").bind(company_id).bind(&key).bind(&name).bind(&provider).bind(request.provider_config_id).bind(&external_ref).fetch_one(&mut *tx).await? };
+            let version:i32=sqlx::query_scalar("SELECT latest_version FROM company_secrets WHERE id=$1").bind(secret_id).fetch_one(&mut *tx).await?;
+            sqlx::query("UPDATE company_secret_versions SET status='superseded', revoked_at=NOW() WHERE secret_id=$1 AND status='current'").bind(secret_id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO company_secret_versions (secret_id,version,material,value_sha256,provider_version_ref,status,fingerprint_sha256) VALUES ($1,$2,$3,$4,$5,'current',$4)").bind(secret_id).bind(version).bind(serde_json::json!({"value":value})).bind(&sha).bind(&external_ref).execute(&mut *tx).await?;
+            tx.commit().await?;
+            results.push(models::RemoteSecretImportRowResult{name,external_ref,status:models::RemoteSecretImportRowStatus::Imported,secret_id:Some(secret_id),error:None,conflicts});
+        }
         let imported=results.iter().filter(|r|r.status==models::RemoteSecretImportRowStatus::Imported).count();let skipped=results.iter().filter(|r|r.status==models::RemoteSecretImportRowStatus::Skipped).count();let errors=results.len()-imported-skipped;Ok(RemoteSecretImportResult{provider_config_id:request.provider_config_id,provider,imported_count:imported,skipped_count:skipped,error_count:errors,results})
     }
 }

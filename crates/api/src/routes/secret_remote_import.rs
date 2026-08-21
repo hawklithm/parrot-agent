@@ -9,6 +9,19 @@ use models::{RemoteSecretImportPreviewRequest, RemoteSecretImportRequest};
 use services::auth::AuthorizationActor;
 use uuid::Uuid;
 
+fn service_error_status(error: &services::errors::ServiceError) -> StatusCode {
+    use services::errors::ServiceError;
+    match error {
+        ServiceError::NotFound(_) => StatusCode::NOT_FOUND,
+        ServiceError::Validation(_) | ServiceError::InvalidInput(_) | ServiceError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        ServiceError::Conflict(_) => StatusCode::CONFLICT,
+        ServiceError::Forbidden(_) => StatusCode::FORBIDDEN,
+        ServiceError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+        ServiceError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// POST /companies/:companyId/secrets/remote-import/preview
 /// Preview secrets from external provider (scan and detect conflicts)
 pub async fn preview_remote_import(
@@ -27,7 +40,7 @@ pub async fn preview_remote_import(
         .await
     {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (service_error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -49,7 +62,7 @@ pub async fn execute_remote_import(
         .await
     {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (service_error_status(&e), e.to_string()).into_response(),
     }
 }
 
