@@ -258,15 +258,29 @@ impl EnvironmentRepository for PgEnvironmentRepository {
         };
 
         let affected_agents: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM agents WHERE metadata->>'environmentId' = $1 ORDER BY id",
+            "SELECT id FROM (
+                SELECT id FROM agents WHERE metadata->>'environmentId' = $1
+                UNION
+                SELECT hr.agent_id
+                  FROM environment_leases l
+                  JOIN heartbeat_runs hr ON hr.id = l.heartbeat_run_id
+                 WHERE l.environment_id = $2 AND hr.agent_id IS NOT NULL
+            ) refs ORDER BY id",
         )
         .bind(id.to_string())
+        .bind(id)
         .fetch_all(&self.pool)
         .await?;
         let affected_issues: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM issues WHERE execution_workspace_settings->>'environmentId' = $1 ORDER BY id",
+            "SELECT id FROM (
+                SELECT id FROM issues WHERE execution_workspace_settings->>'environmentId' = $1
+                UNION
+                SELECT issue_id FROM environment_leases
+                 WHERE environment_id = $2 AND issue_id IS NOT NULL
+            ) refs ORDER BY id",
         )
         .bind(id.to_string())
+        .bind(id)
         .fetch_all(&self.pool)
         .await?;
         let active_leases: Vec<Uuid> = sqlx::query_scalar(
@@ -278,15 +292,27 @@ impl EnvironmentRepository for PgEnvironmentRepository {
 
         let agent_default_count = affected_agents.len() as i32;
         let workspace_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM execution_workspaces WHERE metadata->'config'->>'environmentId' = $1",
+            "SELECT COUNT(*) FROM (
+                SELECT id FROM execution_workspaces WHERE metadata->'config'->>'environmentId' = $1
+                UNION
+                SELECT execution_workspace_id FROM environment_leases
+                 WHERE environment_id = $2 AND execution_workspace_id IS NOT NULL
+            ) refs",
         )
         .bind(id.to_string())
+        .bind(id)
         .fetch_one(&self.pool)
         .await?;
         let issue_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM issues WHERE execution_workspace_settings->>'environmentId' = $1",
+            "SELECT COUNT(*) FROM (
+                SELECT id FROM issues WHERE execution_workspace_settings->>'environmentId' = $1
+                UNION
+                SELECT issue_id FROM environment_leases
+                 WHERE environment_id = $2 AND issue_id IS NOT NULL
+            ) refs",
         )
         .bind(id.to_string())
+        .bind(id)
         .fetch_one(&self.pool)
         .await?;
         let project_count: i64 = sqlx::query_scalar(
