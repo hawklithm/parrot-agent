@@ -232,6 +232,12 @@ async fn decision_training_capture_preserves_paperclip_context_shape() {
     );
     assert_eq!(example.raw_snapshot["decision"]["kind"], "interaction");
     assert_eq!(
+        example.raw_snapshot["decision"]["actor"]["agentId"],
+        agent_id.to_string()
+    );
+    assert!(example.raw_snapshot["decision"]["actor"]["userId"].is_null());
+    assert!(example.raw_snapshot["decision"]["outcome"].is_null());
+    assert_eq!(
         example.raw_snapshot["code"]["commitSha"],
         "abcdef1234567890"
     );

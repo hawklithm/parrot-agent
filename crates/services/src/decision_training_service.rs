@@ -405,7 +405,7 @@ impl PgDecisionTrainingService {
     ) -> Result<
         (
             Uuid,
-            Option<Uuid>,
+            Value,
             Value,
             Option<String>,
             DateTime<Utc>,
@@ -420,8 +420,12 @@ impl PgDecisionTrainingService {
         })?;
         let source = match kind {
             "execution_decision" => sqlx::query(
-                "SELECT origin_issue_id AS issue_id, origin_agent_id AS agent_id,
-                        to_jsonb(d) AS payload, status::text AS outcome,
+                "SELECT origin_issue_id AS issue_id, origin_agent_id AS origin_agent_id,
+                        decided_by_user_id AS decided_by_user_id,
+                        to_jsonb(d) AS payload,
+                        CASE WHEN status IN ('decided', 'cancelled', 'expired')
+                                  AND decided_at IS NOT NULL
+                             THEN status::text END AS outcome,
                         COALESCE(decided_at, NOW()) AS cutoff_at,
                         origin_run_id AS exact_run_id
                    FROM decisions d WHERE id = $1 AND company_id = $2",
@@ -432,8 +436,12 @@ impl PgDecisionTrainingService {
             .await
             .map_err(Self::db_error)?,
             "approval" => sqlx::query(
-                "SELECT ia.issue_id, a.requested_by_agent_id AS agent_id,
-                        to_jsonb(a) AS payload, a.status::text AS outcome,
+                "SELECT ia.issue_id, a.requested_by_agent_id AS requested_by_agent_id,
+                        a.requested_by_user_id AS requested_by_user_id,
+                        a.decided_by_user_id AS decided_by_user_id,
+                        to_jsonb(a) AS payload,
+                        CASE WHEN a.decided_at IS NOT NULL AND a.status <> 'pending'
+                             THEN a.status::text END AS outcome,
                         COALESCE(a.decided_at, NOW()) AS cutoff_at,
                         NULL::uuid AS exact_run_id
                    FROM approvals a
@@ -446,8 +454,13 @@ impl PgDecisionTrainingService {
             .await
             .map_err(Self::db_error)?,
             _ => sqlx::query(
-                "SELECT issue_id, created_by_agent_id AS agent_id,
-                        to_jsonb(i) AS payload, i.status::text AS outcome,
+                "SELECT issue_id, created_by_agent_id AS created_by_agent_id,
+                        created_by_user_id AS created_by_user_id,
+                        resolved_by_agent_id AS resolved_by_agent_id,
+                        resolved_by_user_id AS resolved_by_user_id,
+                        to_jsonb(i) AS payload,
+                        CASE WHEN i.resolved_at IS NOT NULL AND i.status <> 'pending'
+                             THEN i.status::text END AS outcome,
                         COALESCE(i.resolved_at, NOW()) AS cutoff_at,
                         source_run_id AS exact_run_id
                    FROM issue_thread_interactions i
@@ -463,11 +476,50 @@ impl PgDecisionTrainingService {
             kind: input.source_kind.clone(),
             id: input.source_id.clone(),
         })?;
+        let outcome: Option<String> = row.try_get("outcome").unwrap_or(None);
+        let actor = match kind {
+            "execution_decision" => serde_json::json!({
+                "userId": if outcome.is_some() {
+                    row.try_get::<Option<String>, _>("decided_by_user_id").unwrap_or(None)
+                } else {
+                    None
+                },
+                "agentId": if outcome.is_none() {
+                    row.try_get::<Option<Uuid>, _>("origin_agent_id").unwrap_or(None)
+                } else {
+                    None
+                },
+            }),
+            "approval" => serde_json::json!({
+                "userId": if outcome.is_some() {
+                    row.try_get::<Option<Uuid>, _>("decided_by_user_id").unwrap_or(None)
+                } else {
+                    row.try_get::<Option<Uuid>, _>("requested_by_user_id").unwrap_or(None)
+                },
+                "agentId": if outcome.is_none() {
+                    row.try_get::<Option<Uuid>, _>("requested_by_agent_id").unwrap_or(None)
+                } else {
+                    None
+                },
+            }),
+            _ => serde_json::json!({
+                "userId": if outcome.is_some() {
+                    row.try_get::<Option<String>, _>("resolved_by_user_id").unwrap_or(None)
+                } else {
+                    row.try_get::<Option<String>, _>("created_by_user_id").unwrap_or(None)
+                },
+                "agentId": if outcome.is_some() {
+                    row.try_get::<Option<Uuid>, _>("resolved_by_agent_id").unwrap_or(None)
+                } else {
+                    row.try_get::<Option<Uuid>, _>("created_by_agent_id").unwrap_or(None)
+                },
+            }),
+        };
         Ok((
             row.get("issue_id"),
-            row.try_get("agent_id").unwrap_or(None),
+            actor,
             row.get("payload"),
-            row.try_get("outcome").unwrap_or(None),
+            outcome,
             row.get("cutoff_at"),
             row.try_get("exact_run_id").unwrap_or(None),
         ))
@@ -611,7 +663,7 @@ impl DecisionTrainingService for PgDecisionTrainingService {
             }
         }
 
-        let (issue_id, agent_id, source_payload, outcome, cutoff_at, exact_run_id) =
+        let (issue_id, source_actor, source_payload, outcome, cutoff_at, exact_run_id) =
             self.source_context(&input).await?;
         if let Some(expected_issue_id) = input.issue_id {
             if expected_issue_id != issue_id {
@@ -772,7 +824,7 @@ impl DecisionTrainingService for PgDecisionTrainingService {
             "decision": {
                 "kind": Self::source_kind_name(&input.source_kind),
                 "payload": source_payload.clone(),
-                "actor": { "agentId": agent_id },
+                "actor": source_actor.clone(),
                 "outcome": outcome.clone(),
             },
             "code": {
