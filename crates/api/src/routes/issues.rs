@@ -1952,15 +1952,48 @@ async fn get_issue_active_run(
 /// I4: GET /issues/:id/live-runs
 async fn get_issue_live_runs(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
-    state
-        .issue_service
-        .get_live_runs(id, company_id)
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    let rows = sqlx::query(
+        "SELECT hr.id, hr.status::text AS status, hr.invocation_source,
+                hr.started_at, hr.finished_at, hr.created_at, hr.agent_id,
+                a.name AS agent_name, a.adapter_type
+         FROM heartbeat_runs hr
+         JOIN agents a ON a.id = hr.agent_id AND a.company_id = hr.company_id
+         WHERE hr.company_id = $1
+           AND hr.status IN ('queued', 'running')
+           AND (hr.context_snapshot->>'issueId' = $2 OR hr.context_snapshot->>'taskId' = $2)
+         ORDER BY hr.created_at DESC",
+    )
+    .bind(company_id)
+    .bind(id.to_string())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to list live issue runs");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "status": row.get::<String, _>("status"),
+                    "invocationSource": row.get::<String, _>("invocation_source"),
+                    "startedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at"),
+                    "finishedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "agentId": row.get::<Uuid, _>("agent_id"),
+                    "agentName": row.get::<String, _>("agent_name"),
+                    "adapterType": row.get::<String, _>("adapter_type"),
+                    "issueId": id,
+                    "outputSilence": null,
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// I6: GET /issues/:id/accepted-plan-decompositions
