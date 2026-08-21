@@ -5024,6 +5024,87 @@ mod tests {
         .expect("count retention triage events");
         assert_eq!(triage_events, 4);
 
+        sqlx::query("UPDATE heartbeat_runs SET context_snapshot = '{}'::jsonb WHERE id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .expect("clear run issue context");
+        let agent_actor = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+        assert!(
+            require_decision_source_read(
+                &pool,
+                &agent_actor,
+                company_id,
+                "failed_run",
+                &run_id.to_string(),
+            )
+            .await
+            .is_ok()
+        );
+        let other_agent_actor = AuthorizationActor::agent(Uuid::new_v4(), company_id, Some(run_id));
+        assert!(matches!(
+            require_decision_source_read(
+                &pool,
+                &other_agent_actor,
+                company_id,
+                "failed_run",
+                &run_id.to_string(),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+
+        let agent_kept = patch_decision_retention_row(
+            &pool,
+            company_id,
+            &agent_actor,
+            "failed_run",
+            &run_id.to_string(),
+            true,
+        )
+        .await
+        .expect("keep agent retention");
+        assert_eq!(agent_kept["keep"], true);
+        let agent_archived = archive_decision_retention_row(
+            &pool,
+            company_id,
+            &agent_actor,
+            "failed_run",
+            &run_id.to_string(),
+            "agent archive".to_string(),
+        )
+        .await
+        .expect("archive agent retention");
+        assert_eq!(agent_archived["archivedByType"], "agent");
+        assert_eq!(agent_archived["archivedByAgentId"], agent_id.to_string());
+        assert_eq!(agent_archived["archivedByRunId"], run_id.to_string());
+        assert!(agent_archived["archivedByUserId"].is_null());
+
+        let agent_revived = revive_decision_retention_row(
+            &pool,
+            company_id,
+            &agent_actor,
+            "failed_run",
+            &run_id.to_string(),
+        )
+        .await
+        .expect("revive agent retention");
+        assert!(agent_revived["archivedAt"].is_null());
+        assert!(agent_revived["archivedByType"].is_null());
+        assert!(agent_revived["archivedByAgentId"].is_null());
+        assert!(agent_revived["archivedByRunId"].is_null());
+
+        let agent_triage_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM decision_triage_events
+             WHERE company_id = $1 AND source_kind = 'failed_run' AND source_id = $2",
+        )
+        .bind(company_id)
+        .bind(run_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("count agent retention triage events");
+        assert_eq!(agent_triage_events, 3);
+
         sqlx::query("DELETE FROM issues WHERE id IN ($1, $2)")
             .bind(readable_issue_id)
             .bind(hidden_issue_id)
