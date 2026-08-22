@@ -34,6 +34,25 @@ async fn counts(pool: &PgPool, company_id: Uuid) -> Result<Value, sqlx::Error> {
     )
 }
 
+/// Parse the Paperclip `include` object (company/agents/projects/issues/
+/// skills booleans), defaulting to everything included.
+fn include_flags(input: &Value) -> (bool, bool, bool, bool, bool) {
+    let include = input.get("include").and_then(Value::as_object);
+    let flag = |key: &str, default: bool| -> bool {
+        include
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(default)
+    };
+    (
+        flag("company", true),
+        flag("agents", true),
+        flag("projects", true),
+        flag("issues", true),
+        flag("skills", true),
+    )
+}
+
 /// Extract the inline source root path and reject paths that escape the
 /// portable workspace (absolute paths or `..` traversal). Mirrors the
 /// Paperclip portable-path normalisation used for import roots.
@@ -108,12 +127,202 @@ fn entity_name(entry: &Value) -> Option<String> {
 #[async_trait]
 impl ExportService for DefaultCompanyPortabilityService {
     async fn export(&self, id: Uuid, input: Value) -> Result<Value, sqlx::Error> {
-        Ok(
-            json!({"companyId":id,"format":input.get("format").cloned().unwrap_or(json!("json")),"counts":counts(&self.pool,id).await?,"generatedAt":chrono::Utc::now()}),
+        let (include_company, include_agents, include_projects, include_issues, include_skills) =
+            include_flags(&input);
+        let company: Option<Value> = if include_company {
+            sqlx::query(
+                "SELECT name, issue_prefix, budget_monthly_cents, created_at FROM companies WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|r| {
+                json!({
+                    "id": id,
+                    "name": r.get::<String, _>("name"),
+                    "issuePrefix": r.get::<String, _>("issue_prefix"),
+                    "budgetMonthlyCents": r.get::<i64, _>("budget_monthly_cents"),
+                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+        } else {
+            None
+        };
+
+        let agents: Vec<Value> = if include_agents {
+            let rows = sqlx::query(
+                "SELECT id, name, role, status, adapter_type, metadata, created_at \
+                 FROM agents WHERE company_id = $1 AND status <> 'terminated' ORDER BY name",
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.iter()
+                .map(|r| {
+                    json!({
+                        "id": r.get::<Uuid, _>("id"),
+                        "name": r.get::<String, _>("name"),
+                        "role": r.get::<String, _>("role"),
+                        "status": r.get::<String, _>("status"),
+                        "adapterType": r.get::<String, _>("adapter_type"),
+                        "metadata": r.get::<Value, _>("metadata"),
+                        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let projects: Vec<Value> = if include_projects {
+            let rows = sqlx::query(
+                "SELECT id, name, goal_id, created_at FROM projects WHERE company_id = $1 ORDER BY name",
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.iter()
+                .map(|r| {
+                    json!({
+                        "id": r.get::<Uuid, _>("id"),
+                        "name": r.get::<String, _>("name"),
+                        "goalId": r.get::<Option<Uuid>, _>("goal_id"),
+                        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let issues: Vec<Value> = if include_issues {
+            let rows = sqlx::query(
+                "SELECT id, identifier, title, status::text AS status, priority::text AS priority, \
+                        assignee_agent_id, created_at \
+                 FROM issues WHERE company_id = $1 ORDER BY identifier NULLS LAST, created_at",
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.iter()
+                .map(|r| {
+                    json!({
+                        "id": r.get::<Uuid, _>("id"),
+                        "identifier": r.get::<Option<String>, _>("identifier"),
+                        "title": r.get::<String, _>("title"),
+                        "status": r.get::<String, _>("status"),
+                        "priority": r.get::<Option<String>, _>("priority"),
+                        "assigneeAgentId": r.get::<Option<Uuid>, _>("assignee_agent_id"),
+                        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Routines are a Parrot-owned surface (Paperclip carries them through
+        // the skills/automations includes); we export them under `routines`.
+        let routine_rows = sqlx::query(
+            "SELECT id, name, description, status::text AS status, created_at \
+             FROM routines WHERE company_id = $1 ORDER BY name",
         )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        let routines: Vec<Value> = routine_rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.get::<Uuid, _>("id"),
+                    "name": r.get::<String, _>("name"),
+                    "description": r.get::<Option<String>, _>("description"),
+                    "status": r.get::<String, _>("status"),
+                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+            .collect();
+
+        let skills: Vec<Value> = if include_skills {
+            let rows = sqlx::query(
+                "SELECT id, name, slug, version, status, category, install_count, created_at \
+                 FROM company_skills WHERE company_id = $1 ORDER BY name",
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.iter()
+                .map(|r| {
+                    json!({
+                        "id": r.get::<Uuid, _>("id"),
+                        "name": r.get::<String, _>("name"),
+                        "slug": r.get::<String, _>("slug"),
+                        "version": r.get::<String, _>("version"),
+                        "status": r.get::<String, _>("status"),
+                        "category": r.get::<Option<String>, _>("category"),
+                        "installCount": r.get::<i32, _>("install_count"),
+                        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(json!({
+            "companyId": id,
+            "format": input.get("format").cloned().unwrap_or(json!("json")),
+            "include": {
+                "company": include_company,
+                "agents": include_agents,
+                "projects": include_projects,
+                "issues": include_issues,
+                "skills": include_skills,
+            },
+            "company": company,
+            "counts": {
+                "agents": agents.len(),
+                "projects": projects.len(),
+                "issues": issues.len(),
+                "skills": skills.len(),
+                "routines": routines.len(),
+            },
+            "agents": agents,
+            "projects": projects,
+            "issues": issues,
+            "skills": skills,
+            "routines": routines,
+            "generatedAt": chrono::Utc::now(),
+        }))
     }
     async fn preview(&self, id: Uuid, input: Value) -> Result<Value, sqlx::Error> {
-        Ok(json!({"companyId":id,"options":input,"counts":counts(&self.pool,id).await?}))
+        let (include_company, include_agents, include_projects, include_issues, include_skills) =
+            include_flags(&input);
+        let c = counts(&self.pool, id).await?;
+        let routines: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM routines WHERE company_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        let skills: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM company_skills WHERE company_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(json!({
+            "companyId": id,
+            "options": input,
+            "counts": {
+                "company": include_company,
+                "agents": if include_agents { c["agents"].clone() } else { json!(0) },
+                "projects": if include_projects { c["projects"].clone() } else { json!(0) },
+                "issues": if include_issues { c["issues"].clone() } else { json!(0) },
+                "skills": if include_skills { json!(skills) } else { json!(0) },
+                "routines": json!(routines),
+            },
+        }))
     }
 }
 

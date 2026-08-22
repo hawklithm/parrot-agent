@@ -77,6 +77,10 @@ pub fn company_routes() -> Router<AppState> {
             get(get_user_profile),
         )
         .route("/companies/:company_id/export", post(export_company))
+        .route(
+            "/companies/:company_id/export/fidelity",
+            get(company_export_fidelity),
+        )
         .route("/companies/:company_id/exports", post(export_company))
         .route(
             "/companies/:company_id/exports/preview",
@@ -610,9 +614,12 @@ async fn get_user_profile(
 /// POST /companies/:company_id/export
 async fn export_company(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Company export access denied".into()))?;
     Ok(Json(
         state
             .export_service
@@ -622,12 +629,77 @@ async fn export_company(
     ))
 }
 
+/// GET /companies/:company_id/export/fidelity — export fidelity report
+/// (Paperclip services/export-fidelity.ts): what related data exists for
+/// the company versus what the plain export carries.
+async fn company_export_fidelity(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Company export fidelity access denied".into()))?;
+    let pool = &state.pool;
+    let mut relation_counts = Vec::new();
+    for (key, table) in [
+        ("labels", "labels"),
+        ("issueLabels", "issue_labels"),
+        ("issueRelations", "issue_relations"),
+        ("issueDocuments", "issue_documents"),
+        ("approvals", "approvals"),
+        ("costEvents", "cost_events"),
+        ("activityLogs", "activity_logs"),
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE company_id = $1"
+        ))
+        .bind(company_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+        relation_counts.push(serde_json::json!({ "kind": key, "count": count }));
+    }
+    Ok(Json(serde_json::json!({
+        "companyId": company_id,
+        "counts": {
+            "relations": relation_counts,
+            "core": {
+                "agents": sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM agents WHERE company_id = $1 AND status <> 'terminated'",
+                )
+                .bind(company_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| AppError::InternalServerError(e.to_string()))?,
+                "projects": sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM projects WHERE company_id = $1",
+                )
+                .bind(company_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| AppError::InternalServerError(e.to_string()))?,
+                "issues": sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM issues WHERE company_id = $1",
+                )
+                .bind(company_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| AppError::InternalServerError(e.to_string()))?,
+            },
+        },
+        "generatedAt": chrono::Utc::now(),
+    })))
+}
+
 /// CM13: POST /companies/:company_id/exports/preview
 async fn preview_company_export(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Company export preview access denied".into()))?;
     Ok(Json(
         state
             .export_service
