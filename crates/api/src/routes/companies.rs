@@ -14,6 +14,7 @@ use sqlx::Row;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
+use crate::routes::{require_company_access, AccessMode};
 use models::{Company, CreateCompanyInput, UpdateCompanyInput};
 use services::auth::AuthorizationActor;
 
@@ -871,31 +872,46 @@ async fn get_external_object_summaries(
 /// CM17: POST /companies/:company_id/imports/preview
 async fn preview_company_import(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Company import preview access denied".into()))?;
     Ok(Json(
         state
             .import_service
             .preview(company_id, payload)
             .await
-            .map_err(|e| AppError::InternalServerError(e.to_string()))?,
+            .map_err(map_import_error)?,
     ))
 }
 
 /// CM18: POST /companies/:company_id/imports/apply
 async fn apply_company_import(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Company import apply access denied".into()))?;
     Ok(Json(
         state
             .import_service
             .apply(company_id, payload)
             .await
-            .map_err(|e| AppError::InternalServerError(e.to_string()))?,
+            .map_err(map_import_error)?,
     ))
+}
+
+/// Protocol errors carry validation failures (e.g. an invalid import root
+/// path) and map to 400; everything else is a server error.
+fn map_import_error(e: sqlx::Error) -> AppError {
+    match &e {
+        sqlx::Error::Protocol(message) => AppError::BadRequest(message.clone()),
+        _ => AppError::InternalServerError(e.to_string()),
+    }
 }
 
 /// CM19: GET /companies/:company_id/inbox-dismissals

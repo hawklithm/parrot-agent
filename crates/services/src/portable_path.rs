@@ -103,6 +103,10 @@ impl PortablePath {
     pub fn is_relative(&self) -> bool {
         !self.is_absolute
     }
+
+    pub fn components(&self) -> &[String] {
+        &self.components
+    }
     
     pub fn starts_with(&self, prefix: &PortablePath) -> bool {
         if self.is_absolute != prefix.is_absolute {

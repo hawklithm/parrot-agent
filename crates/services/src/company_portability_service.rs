@@ -3,6 +3,8 @@ use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::portable_path::PortablePath;
+
 #[async_trait]
 pub trait ExportService: Send + Sync {
     async fn export(&self, company_id: Uuid, input: Value) -> Result<Value, sqlx::Error>;
@@ -31,6 +33,78 @@ async fn counts(pool: &PgPool, company_id: Uuid) -> Result<Value, sqlx::Error> {
         json!({"issues":c.get::<i64,_>("issues"),"agents":c.get::<i64,_>("agents"),"projects":c.get::<i64,_>("projects")}),
     )
 }
+
+/// Extract the inline source root path and reject paths that escape the
+/// portable workspace (absolute paths or `..` traversal). Mirrors the
+/// Paperclip portable-path normalisation used for import roots.
+fn validated_root_path(input: &Value) -> Result<Option<String>, String> {
+    let source = input.get("source").and_then(Value::as_object);
+    let root_path = source
+        .and_then(|s| s.get("rootPath"))
+        .and_then(Value::as_str)
+        .or_else(|| input.get("rootPath").and_then(Value::as_str));
+    let Some(root) = root_path else {
+        return Ok(None);
+    };
+    let portable = PortablePath::new(root);
+    if portable.is_absolute() {
+        return Err("Import root path must be relative".into());
+    }
+    let normalized = portable.to_portable_string();
+    if normalized.starts_with("../") || normalized == ".." {
+        return Err("Import root path must stay inside the workspace".into());
+    }
+    Ok(Some(normalized))
+}
+
+/// Read the entity arrays from either the Paperclip-style `source.files`
+/// (a `manifest.json` entry) or the direct `entities` shape.
+fn entity_arrays(input: &Value) -> (Vec<&Value>, Vec<&Value>, Vec<&Value>) {
+    let manifest = input
+        .get("source")
+        .and_then(Value::as_object)
+        .and_then(|s| s.get("files"))
+        .and_then(Value::as_object)
+        .and_then(|files| files.get("manifest.json"))
+        .and_then(|v| v.get("manifest").or_else(|| Some(v)));
+    let container = input
+        .get("entities")
+        .or_else(|| manifest.map(|m| m.get("entities")).unwrap_or(None))
+        .or_else(|| manifest);
+    let container = match container {
+        Some(Value::Object(map)) => map,
+        _ => return (Vec::new(), Vec::new(), Vec::new()),
+    };
+    let agents = container
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let projects = container
+        .get("projects")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let issues = container
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    (agents, projects, issues)
+}
+
+fn entity_name(entry: &Value) -> Option<String> {
+    entry
+        .get("name")
+        .or_else(|| entry.get("slug"))
+        .or_else(|| entry.get("title"))
+        .or_else(|| entry.get("identifier"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 #[async_trait]
 impl ExportService for DefaultCompanyPortabilityService {
     async fn export(&self, id: Uuid, input: Value) -> Result<Value, sqlx::Error> {
@@ -42,21 +116,239 @@ impl ExportService for DefaultCompanyPortabilityService {
         Ok(json!({"companyId":id,"options":input,"counts":counts(&self.pool,id).await?}))
     }
 }
+
+fn plan_for(
+    existing: &std::collections::HashMap<String, Uuid>,
+    entries: &[&Value],
+    collision_strategy: &str,
+) -> (Vec<Value>, Vec<String>) {
+    let mut plans = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let Some(name) = entity_name(entry) else {
+            errors.push("Entity entry is missing a name/slug".into());
+            continue;
+        };
+        let action = if existing.contains_key(&name) {
+            if collision_strategy == "skip" { "skip" } else { "update" }
+        } else {
+            "create"
+        };
+        plans.push(json!({
+            "name": name,
+            "action": action,
+            "existingId": existing.get(&name).map(|id| id.to_string()),
+            "reason": if action == "skip" { Some("Already exists and collision strategy is skip".to_string()) } else { None },
+        }));
+    }
+    (plans, errors)
+}
+
+async fn load_existing(pool: &PgPool, company_id: Uuid) -> Result<(std::collections::HashMap<String, Uuid>, std::collections::HashMap<String, Uuid>, std::collections::HashMap<String, Uuid>), sqlx::Error> {
+    let agent_rows = sqlx::query("SELECT id, name FROM agents WHERE company_id = $1 AND status <> 'terminated'")
+        .bind(company_id)
+        .fetch_all(pool)
+        .await?;
+    let mut agents = std::collections::HashMap::new();
+    for r in agent_rows {
+        agents.insert(r.get::<String, _>("name"), r.get::<Uuid, _>("id"));
+    }
+    let project_rows = sqlx::query("SELECT id, name FROM projects WHERE company_id = $1")
+        .bind(company_id)
+        .fetch_all(pool)
+        .await?;
+    let mut projects = std::collections::HashMap::new();
+    for r in project_rows {
+        projects.insert(r.get::<String, _>("name"), r.get::<Uuid, _>("id"));
+    }
+    let issue_rows = sqlx::query("SELECT id, title FROM issues WHERE company_id = $1")
+        .bind(company_id)
+        .fetch_all(pool)
+        .await?;
+    let mut issues = std::collections::HashMap::new();
+    for r in issue_rows {
+        issues.insert(r.get::<String, _>("title"), r.get::<Uuid, _>("id"));
+    }
+    Ok((agents, projects, issues))
+}
+
 #[async_trait]
 impl ImportService for DefaultCompanyPortabilityService {
     async fn preview(&self, id: Uuid, input: Value) -> Result<Value, sqlx::Error> {
-        let n = input
-            .get("entities")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        Ok(json!({"companyId":id,"valid":true,"entityCount":n,"conflicts":[]}))
+        let root_path = validated_root_path(&input).map_err(|e| {
+            sqlx::Error::Protocol(format!("invalid import root: {e}"))
+        })?;
+        let (agent_entries, project_entries, issue_entries) = entity_arrays(&input);
+        let (existing_agents, existing_projects, existing_issues) = load_existing(&self.pool, id).await?;
+        let collision_strategy = input
+            .get("collisionStrategy")
+            .and_then(Value::as_str)
+            .unwrap_or("skip")
+            .to_string();
+
+        let mut errors: Vec<String> = Vec::new();
+        if let Some(root) = &root_path {
+            // Only reject traversal; a plain relative root is accepted.
+            let portable = PortablePath::new(root);
+            if portable.components().is_empty() {
+                errors.push("Import root path cannot be empty".into());
+            }
+        }
+        let (agent_plans, agent_errors) = plan_for(&existing_agents, &agent_entries, &collision_strategy);
+        let (project_plans, project_errors) = plan_for(&existing_projects, &project_entries, &collision_strategy);
+        let (issue_plans, issue_errors) = plan_for(&existing_issues, &issue_entries, &collision_strategy);
+        errors.extend(agent_errors);
+        errors.extend(project_errors);
+        errors.extend(issue_errors);
+
+        let conflicts: Vec<Value> = agent_plans
+            .iter()
+            .chain(project_plans.iter())
+            .chain(issue_plans.iter())
+            .filter(|p| p["action"] == "update" || p["action"] == "skip")
+            .cloned()
+            .collect();
+
+        Ok(json!({
+            "companyId": id,
+            "valid": errors.is_empty(),
+            "rootPath": root_path,
+            "collisionStrategy": collision_strategy,
+            "entityCount": agent_entries.len() + project_entries.len() + issue_entries.len(),
+            "conflicts": conflicts,
+            "errors": errors,
+            "plan": {
+                "companyAction": "update",
+                "agentPlans": agent_plans,
+                "projectPlans": project_plans,
+                "issuePlans": issue_plans,
+            },
+        }))
     }
+
     async fn apply(&self, id: Uuid, input: Value) -> Result<Value, sqlx::Error> {
-        let n = input
-            .get("entities")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        Ok(json!({"companyId":id,"applied":true,"entityCount":n,"conflicts":[]}))
+        let root_path = validated_root_path(&input).map_err(|e| {
+            sqlx::Error::Protocol(format!("invalid import root: {e}"))
+        })?;
+        let (agent_entries, project_entries, issue_entries) = entity_arrays(&input);
+        let (existing_agents, existing_projects, existing_issues) = load_existing(&self.pool, id).await?;
+        let collision_strategy = input
+            .get("collisionStrategy")
+            .and_then(Value::as_str)
+            .unwrap_or("skip")
+            .to_string();
+
+        let mut tx = self.pool.begin().await?;
+
+        let mut agent_results = Vec::new();
+        for entry in &agent_entries {
+            let Some(name) = entity_name(entry) else { continue };
+            let adapter_type = entry
+                .get("adapterType")
+                .or_else(|| entry.get("adapter_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("process");
+            let (agent_id, action) = match existing_agents.get(&name) {
+                Some(id) if collision_strategy == "skip" => (*id, "skipped"),
+                Some(id) => {
+                    sqlx::query("UPDATE agents SET name = $1, adapter_type = $2, updated_at = NOW() WHERE id = $3")
+                        .bind(&name)
+                        .bind(adapter_type)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    (*id, "updated")
+                }
+                None => {
+                    let agent_id = Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO agents (id, company_id, name, adapter_type) VALUES ($1, $2, $3, $4)",
+                    )
+                    .bind(agent_id)
+                    .bind(id)
+                    .bind(&name)
+                    .bind(adapter_type)
+                    .execute(&mut *tx)
+                    .await?;
+                    (agent_id, "created")
+                }
+            };
+            agent_results.push(json!({ "name": name, "id": agent_id, "action": action }));
+        }
+
+        let mut project_results = Vec::new();
+        for entry in &project_entries {
+            let Some(name) = entity_name(entry) else { continue };
+            let (project_id, action) = match existing_projects.get(&name) {
+                Some(id) if collision_strategy == "skip" => (*id, "skipped"),
+                Some(id) => {
+                    sqlx::query("UPDATE projects SET name = $1 WHERE id = $2")
+                        .bind(&name)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    (*id, "updated")
+                }
+                None => {
+                    let project_id = Uuid::new_v4();
+                    sqlx::query("INSERT INTO projects (id, company_id, name) VALUES ($1, $2, $3)")
+                        .bind(project_id)
+                        .bind(id)
+                        .bind(&name)
+                        .execute(&mut *tx)
+                        .await?;
+                    (project_id, "created")
+                }
+            };
+            project_results.push(json!({ "name": name, "id": project_id, "action": action }));
+        }
+
+        let mut issue_results = Vec::new();
+        for entry in &issue_entries {
+            let Some(title) = entity_name(entry) else { continue };
+            let status = entry
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("backlog");
+            let (issue_id, action) = match existing_issues.get(&title) {
+                Some(id) if collision_strategy == "skip" => (*id, "skipped"),
+                Some(id) => {
+                    sqlx::query("UPDATE issues SET title = $1, status = $2::issue_status WHERE id = $3")
+                        .bind(&title)
+                        .bind(status)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    (*id, "updated")
+                }
+                None => {
+                    let issue_id = Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO issues (id, company_id, title, status) VALUES ($1, $2, $3, $4::issue_status)",
+                    )
+                    .bind(issue_id)
+                    .bind(id)
+                    .bind(&title)
+                    .bind(status)
+                    .execute(&mut *tx)
+                    .await?;
+                    (issue_id, "created")
+                }
+            };
+            issue_results.push(json!({ "title": title, "id": issue_id, "action": action }));
+        }
+
+        tx.commit().await?;
+
+        Ok(json!({
+            "companyId": id,
+            "applied": true,
+            "rootPath": root_path,
+            "entityCount": agent_results.len() + project_results.len() + issue_results.len(),
+            "agents": agent_results,
+            "projects": project_results,
+            "issues": issue_results,
+        }))
     }
 }
 #[async_trait]
