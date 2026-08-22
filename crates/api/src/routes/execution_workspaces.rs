@@ -23,7 +23,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::postgres::PgRow;
+use sqlx::PgPool;
 use sqlx::Row;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
@@ -122,9 +125,32 @@ async fn list_company_execution_workspaces(
     .await
     .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
 
+    // Batch-load runtime services for the listed workspaces so each workspace
+    // carries its runtime-service state (provision status / ports / health).
+    let workspace_ids: Vec<Uuid> = rows.iter().map(|r| r.get("id")).collect();
+    let mut services_by_workspace: HashMap<Uuid, Vec<Value>> = HashMap::new();
+    if !workspace_ids.is_empty() {
+        let service_rows = sqlx::query(&format!(
+            "{RUNTIME_SERVICE_SELECT} WHERE execution_workspace_id = ANY($1) ORDER BY created_at, id"
+        ))
+        .bind(&workspace_ids)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
+        for service_row in &service_rows {
+            let workspace_id: Uuid = service_row.get("execution_workspace_id");
+            services_by_workspace
+                .entry(workspace_id)
+                .or_default()
+                .push(runtime_service_to_json(service_row));
+        }
+    }
+
     let workspaces: Vec<Value> = rows
         .into_iter()
         .map(|r| {
+            let id: Uuid = r.get("id");
+            let runtime_services = services_by_workspace.get(&id).cloned().unwrap_or_default();
             if summary {
                 json!({
                     "id": r.get::<Uuid, _>("id"),
@@ -156,6 +182,7 @@ async fn list_company_execution_workspaces(
                     "branchName": r.get::<Option<String>, _>("branch_name"),
                     "repoUrl": r.get::<Option<String>, _>("repo_url"),
                     "metadata": r.get::<Option<Value>, _>("metadata"),
+                    "runtimeServices": runtime_services,
                     "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
                     "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
                 })
@@ -230,6 +257,7 @@ async fn get_execution_workspace(
             require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| {
                 ExecutionWorkspaceError::Forbidden("Workspace company access denied".to_string())
             })?;
+            let runtime_services = load_runtime_services(pool, id).await?;
             Ok(Json(json!({
             "id": r.get::<Uuid, _>("id"),
             "companyId": r.get::<Uuid, _>("company_id"),
@@ -246,6 +274,7 @@ async fn get_execution_workspace(
             "branchName": r.get::<Option<String>, _>("branch_name"),
             "repoUrl": r.get::<Option<String>, _>("repo_url"),
             "metadata": r.get::<Option<Value>, _>("metadata"),
+            "runtimeServices": runtime_services,
             "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
             "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
             })))
@@ -438,11 +467,14 @@ async fn reconcile_branch(
 }
 
 /// Runtime command target — mirrors Paperclip's
-/// `workspaceRuntimeControlTargetSchema`.
+/// `workspaceRuntimeControlTargetSchema` (camelCase wire fields).
 #[derive(Debug, Deserialize)]
 pub struct RuntimeControlTarget {
+    #[serde(rename = "workspaceCommandId")]
     pub workspace_command_id: Option<String>,
+    #[serde(rename = "runtimeServiceId")]
     pub runtime_service_id: Option<String>,
+    #[serde(rename = "serviceIndex")]
     pub service_index: Option<i32>,
 }
 
@@ -450,6 +482,62 @@ pub struct RuntimeControlTarget {
 /// POST /execution-workspaces/:id/runtime-commands/:action
 ///
 /// `action` is one of `start|stop|restart|run` (Paperclip).
+const RUNTIME_SERVICE_SELECT: &str = "SELECT id, company_id, project_id, project_workspace_id, \
+     execution_workspace_id, issue_id, scope_type, scope_id, service_name, status, lifecycle, \
+     reuse_key, command, cwd, port, url, provider, provider_ref, owner_agent_id, \
+     started_by_run_id, last_used_at, started_at, stopped_at, stop_policy, exposure, \
+     health_status, created_at, updated_at FROM workspace_runtime_services";
+
+fn runtime_service_to_json(r: &PgRow) -> Value {
+    let started_at: chrono::DateTime<chrono::Utc> = r.get("started_at");
+    let stopped_at: Option<chrono::DateTime<chrono::Utc>> =
+        r.try_get("stopped_at").unwrap_or(None);
+    json!({
+        "id": r.get::<Uuid, _>("id"),
+        "companyId": r.get::<Uuid, _>("company_id"),
+        "projectId": r.try_get::<Option<Uuid>, _>("project_id").unwrap_or(None),
+        "projectWorkspaceId": r.try_get::<Option<Uuid>, _>("project_workspace_id").unwrap_or(None),
+        "executionWorkspaceId": r.try_get::<Option<Uuid>, _>("execution_workspace_id").unwrap_or(None),
+        "issueId": r.try_get::<Option<Uuid>, _>("issue_id").unwrap_or(None),
+        "scopeType": r.get::<String, _>("scope_type"),
+        "scopeId": r.try_get::<Option<String>, _>("scope_id").unwrap_or(None),
+        "serviceName": r.get::<String, _>("service_name"),
+        "status": r.get::<String, _>("status"),
+        "lifecycle": r.get::<String, _>("lifecycle"),
+        "reuseKey": r.try_get::<Option<String>, _>("reuse_key").unwrap_or(None),
+        "command": r.try_get::<Option<String>, _>("command").unwrap_or(None),
+        "cwd": r.try_get::<Option<String>, _>("cwd").unwrap_or(None),
+        "port": r.try_get::<Option<i32>, _>("port").unwrap_or(None),
+        "url": r.try_get::<Option<String>, _>("url").unwrap_or(None),
+        "provider": r.get::<String, _>("provider"),
+        "providerRef": r.try_get::<Option<String>, _>("provider_ref").unwrap_or(None),
+        "ownerAgentId": r.try_get::<Option<Uuid>, _>("owner_agent_id").unwrap_or(None),
+        "startedByRunId": r.try_get::<Option<Uuid>, _>("started_by_run_id").unwrap_or(None),
+        "lastUsedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("last_used_at").to_rfc3339(),
+        "startedAt": started_at.to_rfc3339(),
+        "stoppedAt": stopped_at.map(|v| v.to_rfc3339()),
+        "stopPolicy": r.try_get::<Option<Value>, _>("stop_policy").unwrap_or(None),
+        "exposure": r.try_get::<Option<Value>, _>("exposure").unwrap_or(None),
+        "healthStatus": r.get::<String, _>("health_status"),
+        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+        "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at").to_rfc3339(),
+    })
+}
+
+async fn load_runtime_services(
+    pool: &PgPool,
+    execution_workspace_id: Uuid,
+) -> Result<Vec<Value>, ExecutionWorkspaceError> {
+    let rows = sqlx::query(&format!(
+        "{RUNTIME_SERVICE_SELECT} WHERE execution_workspace_id = $1 ORDER BY created_at, id"
+    ))
+    .bind(execution_workspace_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
+    Ok(rows.iter().map(runtime_service_to_json).collect())
+}
+
 async fn runtime_command(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -561,6 +649,41 @@ async fn runtime_command(
     let operation_id: Uuid = operation.get("id");
     let operation_status: String = operation.get("status");
     let operation_started_at: chrono::DateTime<chrono::Utc> = operation.get("started_at");
+
+    // Declarative runtime-service state sync (#165/#172): without a real
+    // provider executor the service row transitions to reflect the accepted
+    // control action. Actual process/container execution stays on the Provider
+    // capability matrix; `providerExecution: "pending"` is recorded on the
+    // operation metadata above.
+    if let Some(service_id) = runtime_service_id.as_deref().and_then(|v| Uuid::parse_str(v).ok()) {
+        match action.as_str() {
+            "start" | "restart" => {
+                sqlx::query(
+                    "UPDATE workspace_runtime_services SET status = 'running', stopped_at = NULL, \
+                         last_used_at = NOW(), updated_at = NOW() \
+                     WHERE id = $1 AND company_id = $2",
+                )
+                .bind(service_id)
+                .bind(company_id)
+                .execute(pool)
+                .await
+                .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
+            }
+            "stop" => {
+                sqlx::query(
+                    "UPDATE workspace_runtime_services SET status = 'stopped', stopped_at = NOW(), \
+                         updated_at = NOW() \
+                     WHERE id = $1 AND company_id = $2",
+                )
+                .bind(service_id)
+                .bind(company_id)
+                .execute(pool)
+                .await
+                .map_err(|e| ExecutionWorkspaceError::Database(e.to_string()))?;
+            }
+            _ => {}
+        }
+    }
 
     Ok(Json(json!({
         "workspaceId": id,
