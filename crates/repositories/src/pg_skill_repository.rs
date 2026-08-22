@@ -130,6 +130,7 @@ impl CompanySkillRepository for PgCompanySkillRepository {
                 'status', cs.status,
                 'updateAvailable', cs.update_available,
                 'latestVersion', cs.latest_version,
+                'installCount', cs.install_count,
                 'createdAt', cs.created_at,
                 'updatedAt', cs.updated_at
             )
@@ -167,6 +168,7 @@ impl CompanySkillRepository for PgCompanySkillRepository {
                 'status', cs.status,
                 'updateAvailable', cs.update_available,
                 'latestVersion', cs.latest_version,
+                'installCount', cs.install_count,
                 'createdAt', cs.created_at,
                 'updatedAt', cs.updated_at
             )

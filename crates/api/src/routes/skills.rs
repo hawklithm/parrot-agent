@@ -1,5 +1,6 @@
 use crate::app_state::AppState;
 use crate::errors::AppError;
+use crate::routes::{require_company_access, AccessMode};
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
@@ -105,8 +106,11 @@ async fn get_skill_catalog_files(
 /// SK4: GET /companies/:company_id/skills/categories
 async fn list_skill_categories(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     state
         .skill_registry_service
         .get_categories(company_id)
@@ -118,8 +122,11 @@ async fn list_skill_categories(
 /// SK5: GET /companies/:company_id/skills/:skill_id
 async fn get_company_skill(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     state
         .skill_registry_service
         .get_skill_by_id(company_id, skill_id)
@@ -131,8 +138,11 @@ async fn get_company_skill(
 /// SK6: GET /companies/:company_id/skills/:skill_id/fork-precheck
 async fn fork_skill_precheck(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     state
         .skill_registry_service
         .fork_precheck(company_id, skill_id)
@@ -144,8 +154,11 @@ async fn fork_skill_precheck(
 /// SK7: GET /companies/:company_id/skills/:skill_id/versions
 async fn list_skill_versions(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     state
         .skill_registry_service
         .list_skill_versions(company_id, skill_id)
@@ -157,8 +170,11 @@ async fn list_skill_versions(
 /// SK8: GET /companies/:company_id/skills/:skill_id/versions/:version_id
 async fn get_skill_version(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, skill_id, version_id)): Path<(Uuid, Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     state
         .skill_registry_service
         .get_skill_version(company_id, skill_id, version_id)
@@ -321,8 +337,11 @@ async fn delete_skill_test_run(
 /// SK21: Star / SK22: Unstar
 async fn star_company_skill(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     state
         .skill_registry_service
         .star_skill(company_id, skill_id)
@@ -333,8 +352,11 @@ async fn star_company_skill(
 
 async fn unstar_company_skill(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     state
         .skill_registry_service
         .unstar_skill(company_id, skill_id)
@@ -621,8 +643,11 @@ async fn delete_company_skill(
 /// SK39: List all skills for a company
 async fn list_company_skills(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     state
         .skill_registry_service
         .list_company_skills(company_id)
