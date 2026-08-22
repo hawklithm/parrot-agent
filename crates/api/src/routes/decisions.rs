@@ -578,6 +578,16 @@ fn severity_rank(severity: &str) -> i32 {
     }
 }
 
+/// Paperclip `normalizeIssueThreadInteractionResolverPolicy`: legacy
+/// board-prefixed aliases map onto the canonical policies.
+fn canonical_resolver_policy(policy: &str) -> String {
+    match policy {
+        "board_or_agents" => "anyone".to_string(),
+        "board_only" => "human_only".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn source_rank(kind: &str) -> i32 {
     match kind {
         "failed_run" => 0,
@@ -747,7 +757,9 @@ async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<
     // -- issue thread interactions -----------------------------------------
     let interaction_rows = sqlx::query(
         "SELECT i.id, i.issue_id, i.kind, i.status::text AS status, i.title, i.summary, \
-                i.payload, i.created_by_agent_id, i.expires_at, i.created_at, i.updated_at \
+                i.payload, i.created_by_agent_id, i.addressee_agent_id, \
+                i.requested_resolver_policy, i.effective_resolver_policy, \
+                i.created_at, i.updated_at \
            FROM issue_thread_interactions i \
           WHERE i.company_id = $1 AND i.status = 'pending' \
           ORDER BY i.updated_at DESC LIMIT $2",
@@ -757,6 +769,17 @@ async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<
     .fetch_all(pool)
     .await
     .map_err(db_err)?;
+
+    // Agent display names for interaction resolver audiences.
+    let agent_rows = sqlx::query("SELECT id, name FROM agents WHERE company_id = $1")
+        .bind(company_id)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
+    let agent_names: HashMap<Uuid, String> = agent_rows
+        .iter()
+        .map(|r| (r.get("id"), r.get("name")))
+        .collect();
 
     // -- open decisions -----------------------------------------------------
     let decision_rows = sqlx::query(
@@ -954,6 +977,27 @@ async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<
                 ))
             })
             .unwrap_or(Value::Null);
+        // Paperclip `isPlanDocumentTarget`: an interaction addressed to the
+        // issue's plan document drives the `plans` seeded queue.
+        let payload: Option<Value> = r.try_get("payload").unwrap_or(None);
+        let is_plan_target = payload
+            .as_ref()
+            .and_then(|p| p.get("target"))
+            .is_some_and(|target| {
+                target.get("type").and_then(Value::as_str) == Some("issue_document")
+                    && target.get("key").and_then(Value::as_str) == Some("plan")
+            });
+        // Resolver audience (Paperclip `interactionResolverAudience`): the
+        // canonical resolver policies plus the named addressee/creator.
+        let requested_policy: String = r.get("requested_resolver_policy");
+        let effective_policy: String = r.get("effective_resolver_policy");
+        let provenance = if matches!(requested_policy.as_str(), "board_only" | "board_or_agents") {
+            "legacy_inherited_restriction"
+        } else {
+            "inherited"
+        };
+        let addressee_agent_id: Option<Uuid> = r.try_get("addressee_agent_id").unwrap_or(None);
+        let created_by_agent_id: Option<Uuid> = r.try_get("created_by_agent_id").unwrap_or(None);
         let verbs = match kind.as_str() {
             "approval" => vec![
                 verb("approve", "Approve", "Approve this request."),
@@ -983,9 +1027,9 @@ async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<
                 "metadata": {
                     "kind": kind,
                     "issueId": issue_id,
-                    "createdByAgentId": r.try_get::<Option<Uuid>, _>("created_by_agent_id").unwrap_or(None),
-                    "isPlanTarget": false,
-                    "targetDocumentKey": Value::Null,
+                    "createdByAgentId": created_by_agent_id,
+                    "isPlanTarget": is_plan_target,
+                    "targetDocumentKey": if is_plan_target { json!("plan") } else { Value::Null },
                 },
             }),
             &format!("{label} on an issue thread."),
@@ -1001,7 +1045,8 @@ async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<
             issue.map(|i| i.subject.clone()).unwrap_or(Value::Null),
             issue.map(|i| i.project.clone()).unwrap_or(Value::Null),
             Value::Null,
-            iso_opt(r.try_get::<Option<DateTime<Utc>>, _>("expires_at").unwrap_or(None)),
+            // Paperclip interactions carry no expiresAt (defaults to null).
+            Value::Null,
             Value::Null,
             json!({
                 "kind": "generic",
@@ -1009,6 +1054,23 @@ async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<
                 "images": [],
             }),
         ));
+        // Resolver audience rides on interaction items only (Paperclip
+        // `AttentionItem.resolverAudience`); every other source omits it.
+        if let Some(obj) = items.last_mut().and_then(|v| v.as_object_mut()) {
+            obj.insert(
+                "resolverAudience".into(),
+                json!({
+                    "requestedResolverPolicy": canonical_resolver_policy(&requested_policy),
+                    "effectiveResolverPolicy": canonical_resolver_policy(&effective_policy),
+                    "effectiveResolverPolicySource": "requested",
+                    "resolverPolicyProvenance": provenance,
+                    "addresseeAgentId": addressee_agent_id,
+                    "addresseeName": addressee_agent_id.and_then(|a| agent_names.get(&a)).cloned(),
+                    "createdByAgentId": created_by_agent_id,
+                    "createdByAgentName": created_by_agent_id.and_then(|a| agent_names.get(&a)).cloned(),
+                }),
+            );
+        }
     }
 
     // ---- decisions --------------------------------------------------------
@@ -1336,6 +1398,42 @@ async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<
     }
 
     Ok(items)
+}
+
+/// Paperclip `collectAttentionItems` feeds `materializeSeededQueues` with the
+/// deduped, sorted candidates before enrichment. Parrot routes its collected
+/// items through the same routine; subject metadata carries the `kind` /
+/// `isPlanTarget` signals the seed classifier reads, and the issue id is taken
+/// from the related issue or subject metadata (Paperclip `itemIssueId`).
+async fn seed_from_attention_items(
+    pool: &PgPool,
+    company_id: Uuid,
+    items: &[Value],
+) -> Result<(), AppError> {
+    let candidates: Vec<SeedCandidate> = items
+        .iter()
+        .map(|item| {
+            let source_kind = item["sourceKind"].as_str().unwrap_or("").to_string();
+            let source_id = item["subject"]["id"].as_str().unwrap_or("").to_string();
+            let issue_id = item["relatedIssue"]["id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .or_else(|| {
+                    item["subject"]["metadata"]["issueId"]
+                        .as_str()
+                        .or_else(|| item["subject"]["metadata"]["originIssueId"].as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                });
+            let metadata = item["subject"]["metadata"].clone();
+            SeedCandidate {
+                source_kind,
+                source_id,
+                issue_id,
+                metadata: Some(metadata),
+            }
+        })
+        .collect();
+    materialize_seeded_queues(pool, company_id, &candidates).await
 }
 
 fn item_source_key(item: &Value) -> String {
@@ -1875,6 +1973,9 @@ async fn get_attention_feed(
     };
 
     let mut items = collect_attention_items(pool, company_id).await?;
+    // Align Paperclip `collectAttentionItems`: seed the prs/plans/questions
+    // queues from the collected signals before enrichment.
+    seed_from_attention_items(pool, company_id, &items).await?;
     enrich_attention_items(pool, company_id, &mut items, now).await?;
 
     let want_archived = truthy(&q.archived);
