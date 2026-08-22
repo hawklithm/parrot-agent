@@ -19,6 +19,10 @@ use models::{Company, CreateCompanyInput, UpdateCompanyInput};
 use services::auth::AuthorizationActor;
 
 /// 对齐 Paperclip companies.ts:290：`/companies/issues` 缺 companyId 时的 400 守卫。
+fn row_key(row: &sqlx::postgres::PgRow, key: &str) -> i64 {
+    row.try_get::<i64, _>(key).unwrap_or(0)
+}
+
 async fn company_issues_guard() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
@@ -598,16 +602,101 @@ async fn update_sidebar_preferences(
 /// CM11: GET /companies/:company_id/users/:user_slug/profile
 async fn get_user_profile(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, user_slug)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let row = sqlx::query("SELECT id,name,email,avatar_url FROM auth_users WHERE id::text=$1 OR email=$1 OR name=$1 LIMIT 1").bind(&user_slug).fetch_optional(&state.pool).await.map_err(|e| AppError::InternalServerError(e.to_string()))?.ok_or_else(|| AppError::NotFound("User not found".into()))?;
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("User profile access denied".into()))?;
+    let pool = &state.pool;
+    let row = sqlx::query("SELECT id,name,email,avatar_url FROM auth_users WHERE id::text=$1 OR email=$1 OR name=$1 LIMIT 1").bind(&user_slug).fetch_optional(pool).await.map_err(|e| AppError::InternalServerError(e.to_string()))?.ok_or_else(|| AppError::NotFound("User not found".into()))?;
+    let user_id: Uuid = row.get("id");
     let email = row.get::<String, _>("email");
     let masked = email
         .split_once('@')
         .map(|(name, domain)| format!("{}***@{}", name.chars().next().unwrap_or('*'), domain))
         .unwrap_or_else(|| "***".into());
+
+    // Window stats mirror Paperclip PROFILE_WINDOWS (last7/last30/all).
+    // Parrot issues carry no created_by_user_id/completed_at, so created /
+    // completed counts are derived from assignment and the status + update
+    // window (documented delta vs Paperclip user-profiles.ts).
+    let window_rows = sqlx::query(
+        "SELECT \
+           (SELECT COUNT(*) FROM issues i WHERE i.company_id = $1 AND i.assignee_user_id = $2) AS touched_all, \
+           (SELECT COUNT(*) FROM issues i WHERE i.company_id = $1 AND i.assignee_user_id = $2 AND i.updated_at >= NOW() - INTERVAL '30 days') AS touched_30, \
+           (SELECT COUNT(*) FROM issues i WHERE i.company_id = $1 AND i.assignee_user_id = $2 AND i.updated_at >= NOW() - INTERVAL '7 days') AS touched_7, \
+           (SELECT COUNT(*) FROM issues i WHERE i.company_id = $1 AND i.assignee_user_id = $2 AND i.status NOT IN ('done','cancelled')) AS open_all, \
+           (SELECT COUNT(*) FROM issues i WHERE i.company_id = $1 AND i.assignee_user_id = $2 AND i.status NOT IN ('done','cancelled') AND i.updated_at >= NOW() - INTERVAL '7 days') AS open_7, \
+           (SELECT COUNT(*) FROM issues i WHERE i.company_id = $1 AND i.assignee_user_id = $2 AND i.status = 'done' AND i.updated_at >= NOW() - INTERVAL '30 days') AS done_30, \
+           (SELECT COUNT(*) FROM issues i WHERE i.company_id = $1 AND i.assignee_user_id = $2 AND i.status = 'done' AND i.updated_at >= NOW() - INTERVAL '7 days') AS done_7",
+    )
+    .bind(company_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let window_count = |key: &str| -> i64 { row_key(&window_rows, key) };
+    let stats = serde_json::json!([
+        { "key": "last7", "label": "Last 7 days", "touchedIssues": window_count("touched_7"), "assignedOpenIssues": window_count("open_7"), "completedIssues": window_count("done_7") },
+        { "key": "last30", "label": "Last 30 days", "touchedIssues": window_count("touched_30"), "assignedOpenIssues": window_count("open_all"), "completedIssues": window_count("done_30") },
+        { "key": "all", "label": "All time", "touchedIssues": window_count("touched_all"), "assignedOpenIssues": window_count("open_all"), "completedIssues": window_count("done_30") },
+    ]);
+
+    let recent_issues: Vec<serde_json::Value> = sqlx::query(
+        "SELECT id, identifier, title, status::text AS status, priority::text AS priority, updated_at \
+         FROM issues WHERE company_id = $1 AND assignee_user_id = $2 \
+         ORDER BY updated_at DESC LIMIT 5",
+    )
+    .bind(company_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?
+    .iter()
+    .map(|r| {
+        serde_json::json!({
+            "id": r.get::<Uuid, _>("id"),
+            "identifier": r.get::<Option<String>, _>("identifier"),
+            "title": r.get::<String, _>("title"),
+            "status": r.get::<String, _>("status"),
+            "priority": r.get::<Option<String>, _>("priority"),
+            "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+        })
+    })
+    .collect();
+
+    let recent_activity: Vec<serde_json::Value> = sqlx::query(
+        "SELECT event_type, resource_type, resource_id, metadata, created_at \
+         FROM activity_logs WHERE company_id = $1 AND actor_id = $2 \
+         ORDER BY created_at DESC LIMIT 5",
+    )
+    .bind(company_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?
+    .iter()
+    .map(|r| {
+        serde_json::json!({
+            "eventType": r.get::<String, _>("event_type"),
+            "resourceType": r.get::<Option<String>, _>("resource_type"),
+            "resourceId": r.get::<Option<Uuid>, _>("resource_id"),
+            "metadata": r.get::<serde_json::Value, _>("metadata"),
+            "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        })
+    })
+    .collect();
+
     Ok(Json(
-        serde_json::json!({"companyId": company_id, "userSlug": user_slug, "profile": {"id": row.get::<Uuid,_>("id"), "name": row.get::<String,_>("name"), "avatarUrl": row.get::<Option<String>,_>("avatar_url"), "email": masked}}),
+        serde_json::json!({
+            "companyId": company_id,
+            "userSlug": user_slug,
+            "canonicalSlug": user_slug,
+            "profile": {"id": user_id, "name": row.get::<String,_>("name"), "avatarUrl": row.get::<Option<String>,_>("avatar_url"), "email": masked},
+            "stats": stats,
+            "recentIssues": recent_issues,
+            "recentActivity": recent_activity,
+        }),
     ))
 }
 
