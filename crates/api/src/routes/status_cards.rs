@@ -128,7 +128,7 @@ async fn list_status_cards(
          ORDER BY created_at DESC",
     )
     .bind(company_id)
-    .bind(query.archived)
+    .bind(query.archived.unwrap_or(false))
     .fetch_all(&state.pool)
     .await
     .map_err(|e| {
