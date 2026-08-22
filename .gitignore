@@ -37,3 +37,7 @@ archive_*/
 **/*_STATUS.md
 **/*_SUMMARY.md
 .sqlx/
+
+# Python helper scripts
+__pycache__/
+*.pyc
