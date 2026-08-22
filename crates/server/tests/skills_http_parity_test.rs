@@ -77,6 +77,7 @@ struct Fixture {
 async fn seed_fixture(pool: &PgPool) -> Fixture {
     let company_a = Uuid::new_v4();
     let skill_a = Uuid::new_v4();
+    let project_a = Uuid::new_v4();
     let prefix = format!("SK{}", &company_a.simple().to_string()[..8]);
 
     sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
@@ -100,6 +101,25 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .await
     .expect("insert company skill");
 
+    // A project + workspace for the scan surface (#128).
+    sqlx::query("INSERT INTO projects (id, company_id, name) VALUES ($1, $2, $3)")
+        .bind(project_a)
+        .bind(company_a)
+        .bind("Scan project")
+        .execute(pool)
+        .await
+        .expect("insert project");
+    sqlx::query(
+        "INSERT INTO project_workspaces (id, company_id, project_id, name) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(company_a)
+    .bind(project_a)
+    .bind("Scan workspace")
+    .execute(pool)
+    .await
+    .expect("insert project workspace");
+
     Fixture {
         pool: pool.clone(),
         company_a,
@@ -108,6 +128,14 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
 }
 
 async fn cleanup_fixture(f: &Fixture) {
+    let _ = sqlx::query("DELETE FROM project_workspaces WHERE company_id = $1")
+        .bind(f.company_a)
+        .execute(&f.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM projects WHERE company_id = $1")
+        .bind(f.company_a)
+        .execute(&f.pool)
+        .await;
     let _ = sqlx::query("DELETE FROM company_skills WHERE company_id = $1")
         .bind(f.company_a)
         .execute(&f.pool)
@@ -231,6 +259,93 @@ async fn company_skills_list_detail_versions_and_authz_match_paperclip() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "cross-company skill versions → 403");
+
+    cleanup_fixture(&f).await;
+}
+
+/// #128 project-skill import / scan / catalog acceptance.
+#[tokio::test]
+async fn skill_import_scan_and_install_catalog_match_paperclip() {
+    let pool = connect_and_migrate().await;
+    let f = seed_fixture(&pool).await;
+    let state = build_app_state(pool.clone()).await.expect("build_app_state");
+    let app = skill_routes().with_state(state);
+    let board = board_actor(Uuid::new_v4(), f.company_a);
+
+    // 1. Import a skill → 201 and persisted in the company library.
+    let (status, body) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{}/skills/import", f.company_a),
+        Some(json!({
+            "name": "Imported skill",
+            "slug": "imported-skill",
+            "description": "From project.",
+            "category": "ops",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "import skill → 201");
+    let imported = parse(&body);
+    assert_eq!(imported["name"], "Imported skill");
+
+    // 2. Importing a platform-protected skill key is forbidden (403).
+    let (status, _) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{}/skills/import", f.company_a),
+        Some(json!({ "name": "system", "skillKey": "system" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "protected skill import → 403");
+
+    // 3. Scan projects reports the company scan surface.
+    let (status, body) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{}/skills/scan-projects", f.company_a),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "scan projects → 200");
+    let scan = parse(&body);
+    assert_eq!(scan["projectsScanned"], 1, "one project scanned");
+    assert_eq!(scan["workspaceCount"], 1, "one project workspace");
+
+    // 4. Install catalog is reachable (no catalogs seeded → resolves safely).
+    let (status, _) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{}/skills/install-catalog", f.company_a),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "install catalog → 200");
+
+    // 5. Cross-company board cannot import or scan.
+    let outsider = session_board_actor(Uuid::new_v4(), Uuid::new_v4());
+    let (status, _) = send(
+        &app,
+        &outsider,
+        "POST",
+        &format!("/companies/{}/skills/import", f.company_a),
+        Some(json!({ "name": "x", "slug": "x" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "cross-company import → 403");
+    let (status, _) = send(
+        &app,
+        &outsider,
+        "POST",
+        &format!("/companies/{}/skills/scan-projects", f.company_a),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "cross-company scan → 403");
 
     cleanup_fixture(&f).await;
 }

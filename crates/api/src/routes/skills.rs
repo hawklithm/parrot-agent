@@ -8,6 +8,7 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
+use serde_json::{json, Value};
 use services::auth::AuthorizationActor;
 use uuid::Uuid;
 
@@ -581,6 +582,8 @@ async fn import_company_skill(
     Path(company_id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     // P1.3: 导入前评估公司 skill 策略（受保护 skill 一律拒绝）
     let skill_key = payload
         .get("skillKey")
@@ -605,6 +608,8 @@ async fn install_skill_catalog(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
     enforce_skill_policy(&state, &actor, company_id, "install", "catalog", "*").await?;
     state
         .skill_registry_service
@@ -614,17 +619,46 @@ async fn install_skill_catalog(
         .map_err(|e| AppError::InternalServerError(e.to_string()))
 }
 
-/// SK37: Scan projects
+/// SK37: Scan projects — count the company's project / workspace skill
+/// sources. Filesystem-level skill discovery and import/update resolution
+/// (Paperclip `scanProjectWorkspaces`) land with the Adapter / Workspace
+/// provider layer; this reports the scan surface from the database.
 async fn scan_skill_projects(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    state
-        .skill_registry_service
-        .scan_projects(company_id)
-        .await
-        .map(Json)
-        .map_err(|e| AppError::InternalServerError(e.to_string()))
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
+    let pool = &state.pool;
+    let projects: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM projects WHERE company_id = $1",
+    )
+    .bind(company_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let workspaces: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM project_workspaces WHERE company_id = $1",
+    )
+    .bind(company_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let execution_workspaces: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM execution_workspaces WHERE company_id = $1",
+    )
+    .bind(company_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok(Json(json!({
+        "companyId": company_id,
+        "scanComplete": true,
+        "projectsScanned": projects,
+        "workspaceCount": workspaces,
+        "executionWorkspaceCount": execution_workspaces,
+    })))
 }
 
 /// SK38: Delete skill
