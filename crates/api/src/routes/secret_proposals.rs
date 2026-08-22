@@ -535,8 +535,8 @@ async fn approve_proposal(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
         sqlx::query(
-            "INSERT INTO company_secret_versions (secret_id, version, material, value_sha256, status) \
-             VALUES ($1, 1, $2, $3, 'current')",
+            "INSERT INTO company_secret_versions (secret_id, version, material, value_sha256, fingerprint_sha256, status) \
+             VALUES ($1, 1, $2, $3, $3, 'current')",
         )
         .bind(secret_id)
         .bind(value_ciphertext.unwrap_or_else(|| json!({})))
