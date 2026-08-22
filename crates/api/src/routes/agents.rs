@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use garde::Validate;
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::errors::AppError;
@@ -617,10 +618,17 @@ async fn rollback_config(
 }
 
 /// POST /agents/:id/skills/sync - 同步Agent技能列表
+#[derive(Debug, Deserialize)]
+struct SyncAgentSkillsInput {
+    #[serde(rename = "desiredSkills")]
+    desired_skills: Vec<serde_json::Value>,
+}
+
 async fn sync_agent_skills(
     State(state): State<AppState>,
     Extension(auth_actor): Extension<AuthorizationActor>,
     Path(agent_id): Path<Uuid>,
+    Json(body): Json<SyncAgentSkillsInput>,
 ) -> Result<impl IntoResponse, AppError> {
     // 查询现有Agent
     let agent = state.agent_service.get_by_id(agent_id).await?;
@@ -638,8 +646,23 @@ async fn sync_agent_skills(
         ));
     }
 
-    // 同步技能
-    let skills = state.agent_service.sync_skills(agent_id).await?;
+    // 同步技能：把 desiredSkills 写入 adapter_config.desired_skills 并返回最新快照。
+    // 元素支持字符串 key 或 { key } 对象（web-ui syncSkills 契约）。
+    let desired_skills: Vec<String> = body
+        .desired_skills
+        .iter()
+        .filter_map(|value| {
+            value
+                .as_str()
+                .map(String::from)
+                .or_else(|| value.get("key").and_then(|k| k.as_str()).map(String::from))
+        })
+        .collect();
+
+    let skills = state
+        .agent_service
+        .sync_skills(agent_id, desired_skills)
+        .await?;
 
     Ok(Json(skills))
 }

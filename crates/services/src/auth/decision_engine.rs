@@ -413,9 +413,16 @@ impl AuthorizationService {
         let principal_id = resolved.principal_id;
         let memberships = resolved.memberships;
 
-        // 角色默认权限检查。
+        // 角色默认权限检查。仅当 membership 属于资源公司（或资源无公司
+        // 作用域）时，其角色默认权限才适用——否则任一公司的 Operator
+        // membership 会误授权对另一公司的读/写（跨公司越权）。
         if allow_role_default {
             for m in &memberships {
+                if let Some(rc) = resource_company {
+                    if m.company_id != rc {
+                        continue;
+                    }
+                }
                 if let Some(role) = membership_role(&m) {
                     if role_has_permission(role, &permission_key) {
                         let reason = match role {

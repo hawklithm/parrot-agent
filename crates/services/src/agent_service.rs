@@ -123,9 +123,13 @@ pub trait AgentService: Send + Sync {
     /// 获取Agent技能快照
     async fn get_skills(&self, agent_id: Uuid) -> Result<models::AgentSkillSnapshot, ServiceError>;
 
-    /// 同步Agent技能列表
-    async fn sync_skills(&self, agent_id: Uuid)
-        -> Result<models::AgentSkillSnapshot, ServiceError>;
+    /// 同步Agent技能列表：将 desired_skills 写入 agent 的
+    /// `adapter_config.desired_skills`（并捕获配置快照以支持回滚），返回最新快照。
+    async fn sync_skills(
+        &self,
+        agent_id: Uuid,
+        desired_skills: Vec<String>,
+    ) -> Result<models::AgentSkillSnapshot, ServiceError>;
 
     /// Remove a skill from the agent's desired runtime skill configuration.
     /// This intentionally does not delete the company-level skill itself.
@@ -1064,7 +1068,21 @@ where
     async fn sync_skills(
         &self,
         agent_id: Uuid,
+        desired_skills: Vec<String>,
     ) -> Result<models::AgentSkillSnapshot, ServiceError> {
+        let mut agent = self.repository.get_by_id(agent_id).await?;
+        let mut adapter_config = agent.adapter_config.0;
+        adapter_config["desired_skills"] = serde_json::Value::Array(
+            desired_skills
+                .iter()
+                .map(|key| serde_json::Value::String(key.clone()))
+                .collect(),
+        );
+        agent.adapter_config = sqlx::types::Json(adapter_config);
+        agent.updated_at = Utc::now();
+        self.repository.update(agent).await?;
+        // 捕获配置快照，使配置回滚（config-revisions rollback）能恢复技能集。
+        self.capture_snapshot_if_enabled(agent_id).await;
         self.get_skills(agent_id).await
     }
 
