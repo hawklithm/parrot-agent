@@ -275,15 +275,22 @@ fn is_valid_source_kind(kind: &str) -> bool {
 /// Match Paperclip's `canReadDecisionSource`: retention mutations must not
 /// manufacture state for a missing attention source, and company membership
 /// alone is not enough for issue/agent-scoped sources.
-async fn require_decision_source_read(
+///
+/// Returns `Ok(true)` when the actor may read the source, `Ok(false)` when the
+/// source is missing or the actor lacks authority. Mirrors Paperclip's boolean
+/// `canReadDecisionSource` so callers can *filter* (e.g. queue item listings)
+/// without turning absence into an error.
+async fn can_read_decision_source(
     pool: &PgPool,
     actor: &AuthorizationActor,
     company_id: Uuid,
     source_kind: &str,
     source_id: &str,
-) -> Result<(), AppError> {
-    let source_uuid = Uuid::parse_str(source_id)
-        .map_err(|_| AppError::NotFound("Attention source not found".to_string()))?;
+) -> Result<bool, AppError> {
+    let source_uuid = match Uuid::parse_str(source_id) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(false),
+    };
 
     let source = match source_kind {
         "approval" => sqlx::query(
@@ -383,7 +390,7 @@ async fn require_decision_source_read(
     };
 
     let Some(source) = source else {
-        return Err(AppError::NotFound("Attention source not found".to_string()));
+        return Ok(false);
     };
     let context_snapshot: Option<Value> = source.try_get("context_snapshot").map_err(db_err)?;
     let issue_id: Option<Uuid> = source
@@ -415,15 +422,15 @@ async fn require_decision_source_read(
             )
             .await
         {
-            return Err(AppError::NotFound("Attention source not found".to_string()));
+            return Ok(false);
         }
-        return Ok(());
+        return Ok(true);
     }
 
     let agent_id: Option<Uuid> = source.try_get("agent_id").map_err(db_err)?;
     if source_kind == "agent_error_alert" {
         let Some(agent_id) = agent_id else {
-            return Err(AppError::NotFound("Attention source not found".to_string()));
+            return Ok(false);
         };
         if !decide_access(
             pool,
@@ -433,28 +440,43 @@ async fn require_decision_source_read(
         )
         .await
         {
-            return Err(AppError::NotFound("Attention source not found".to_string()));
+            return Ok(false);
         }
-        return Ok(());
+        return Ok(true);
     }
 
     if source_kind == "failed_run" {
         let Some(owner_agent_id) = agent_id else {
-            return Err(AppError::NotFound("Attention source not found".to_string()));
+            return Ok(false);
         };
         if let AuthorizationActor::Agent { agent_id, .. } = actor {
             if *agent_id != owner_agent_id {
-                return Err(AppError::NotFound("Attention source not found".to_string()));
+                return Ok(false);
             }
-            return Ok(());
+            return Ok(true);
         }
         if !actor.is_board() {
-            return Err(AppError::NotFound("Attention source not found".to_string()));
+            return Ok(false);
         }
-        return Ok(());
+        return Ok(true);
     }
 
     if !actor.is_board() {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Thin wrapper that turns a non-readable source into a 404, mirroring
+/// Paperclip's `requireSourceRead`.
+async fn require_decision_source_read(
+    pool: &PgPool,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    source_kind: &str,
+    source_id: &str,
+) -> Result<(), AppError> {
+    if !can_read_decision_source(pool, actor, company_id, source_kind, source_id).await? {
         return Err(AppError::NotFound("Attention source not found".to_string()));
     }
     Ok(())
@@ -3301,24 +3323,30 @@ async fn list_decision_queues(
     require_company_access(&actor, company_id, true)?;
     let pool = &state.pool;
     let rows = sqlx::query(&format!(
-        "{QUEUE_SELECT} WHERE company_id = $1 ORDER BY title ASC, key ASC"
+        "{QUEUE_SELECT} WHERE company_id = $1 ORDER BY updated_at DESC, id DESC"
     ))
     .bind(company_id)
     .fetch_all(pool)
     .await
     .map_err(db_err)?;
 
-    let counts = sqlx::query(
-        "SELECT queue_id, COUNT(*)::bigint AS item_count FROM decision_queue_items \
-          WHERE company_id = $1 GROUP BY queue_id",
-    )
-    .bind(company_id)
-    .fetch_all(pool)
-    .await
-    .map_err(db_err)?;
+    // Item counts are viewer-scoped: each queue reports how many of its items
+    // the *requesting* actor may actually see, matching Paperclip's
+    // `visibleItems`-derived itemCount (board-only sources are hidden from
+    // agents, so an agent's count differs from a board's).
+    let items = sqlx::query(&format!("{QUEUE_ITEM_SELECT} WHERE company_id = $1"))
+        .bind(company_id)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
     let mut count_map: HashMap<Uuid, i64> = HashMap::new();
-    for r in &counts {
-        count_map.insert(r.get("queue_id"), r.get("item_count"));
+    for row in &items {
+        let queue_id: Uuid = row.get("queue_id");
+        let sk: String = row.get("source_kind");
+        let sid: String = row.get("source_id");
+        if can_read_decision_source(pool, &actor, company_id, &sk, &sid).await? {
+            *count_map.entry(queue_id).or_insert(0) += 1;
+        }
     }
 
     let queues: Vec<Value> = rows
@@ -3383,11 +3411,19 @@ async fn create_decision_queue(
             .fetch_optional(pool)
             .await
             .map_err(db_err)?;
-    if existing.is_some() {
-        return Err(AppError::Conflict(format!(
-            "Queue '{}' already exists",
-            input.key
-        )));
+    if let Some(queue_id) = existing {
+        // Paperclip is idempotent: a repeated create returns the existing queue
+        // with 200 (not 409), preserving its current item count.
+        let row = sqlx::query(&format!(
+            "{QUEUE_SELECT} WHERE company_id = $1 AND key = $2"
+        ))
+        .bind(company_id)
+        .bind(&input.key)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+        let item_count = count_visible_queue_items(pool, &actor, company_id, queue_id).await?;
+        return Ok((StatusCode::OK, Json(queue_to_json(&row, item_count))));
     }
 
     let row = sqlx::query(&format!(
@@ -3480,12 +3516,8 @@ async fn update_decision_queue(
     .map_err(db_err)?
     .ok_or_else(|| AppError::NotFound(format!("Queue '{key}' not found")))?;
 
-    let item_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM decision_queue_items WHERE queue_id = $1")
-            .bind(row.get::<Uuid, _>("id"))
-            .fetch_one(pool)
-            .await
-            .map_err(db_err)?;
+    let queue_id = row.get::<Uuid, _>("id");
+    let item_count = count_visible_queue_items(pool, &actor, company_id, queue_id).await?;
 
     Ok(Json(queue_to_json(&row, item_count)))
 }
@@ -3520,6 +3552,30 @@ async fn resolve_queue_id(pool: &PgPool, company_id: Uuid, key: &str) -> Result<
         .ok_or_else(|| AppError::NotFound(format!("Queue '{key}' not found")))
 }
 
+/// Count the queue items the *requesting* actor is allowed to see, mirroring
+/// Paperclip's `visibleItems`-based itemCount.
+async fn count_visible_queue_items(
+    pool: &PgPool,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    queue_id: Uuid,
+) -> Result<i64, AppError> {
+    let rows = sqlx::query(&format!("{QUEUE_ITEM_SELECT} WHERE queue_id = $1"))
+        .bind(queue_id)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
+    let mut count: i64 = 0;
+    for row in &rows {
+        let sk: String = row.get("source_kind");
+        let sid: String = row.get("source_id");
+        if can_read_decision_source(pool, actor, company_id, &sk, &sid).await? {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// GET /companies/:company_id/decision-queues/:key/items
 async fn list_decision_queue_items(
     State(state): State<AppState>,
@@ -3530,15 +3586,24 @@ async fn list_decision_queue_items(
     let pool = &state.pool;
     let queue_id = resolve_queue_id(pool, company_id, &key).await?;
     let rows = sqlx::query(&format!(
-        "{QUEUE_ITEM_SELECT} WHERE queue_id = $1 ORDER BY created_at DESC"
+        "{QUEUE_ITEM_SELECT} WHERE queue_id = $1 ORDER BY created_at DESC, id DESC"
     ))
     .bind(queue_id)
     .fetch_all(pool)
     .await
     .map_err(db_err)?;
-    Ok(Json(Value::Array(
-        rows.iter().map(queue_item_to_json).collect(),
-    )))
+    // Paperclip's `visibleItems` filters each item by the caller's source
+    // readability: board-only sources (e.g. an approval with no linked issue)
+    // are hidden from agents.
+    let mut visible: Vec<Value> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let sk: String = row.get("source_kind");
+        let sid: String = row.get("source_id");
+        if can_read_decision_source(pool, &actor, company_id, &sk, &sid).await? {
+            visible.push(queue_item_to_json(row));
+        }
+    }
+    Ok(Json(Value::Array(visible)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3568,6 +3633,10 @@ async fn add_decision_queue_item(
             "sourceId must be 1-500 characters".to_string(),
         ));
     }
+
+    // Paperclip's `addItem` calls `requireSourceRead`: the attention source must
+    // actually exist and be readable before it can be enqueued.
+    require_decision_source_read(&state.pool, &actor, company_id, &input.source_kind, &input.source_id).await?;
 
     let pool = &state.pool;
     let queue_id = resolve_queue_id(pool, company_id, &key).await?;
@@ -3620,6 +3689,12 @@ async fn remove_decision_queue_item(
     require_company_access(&actor, company_id, false)?;
     let pool = &state.pool;
     let queue_id = resolve_queue_id(pool, company_id, &key).await?;
+    // Paperclip's `removeItem` requires source readability for non-board actors
+    // (so removal cannot be used to probe hidden membership), but lets a board
+    // operator clean up a sidecar after its *source* has disappeared.
+    if !actor.is_board() {
+        require_decision_source_read(pool, &actor, company_id, &source_kind, &source_id).await?;
+    }
     let result = sqlx::query(
         "DELETE FROM decision_queue_items \
           WHERE queue_id = $1 AND source_kind = $2 AND source_id = $3",
@@ -3764,16 +3839,37 @@ async fn get_decision_triage(
 
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateDecisionTriageInput {
+    /// Tri-state: `None` = field absent (preserve current value),
+    /// `Some(None)` = explicit JSON null (clear), `Some(Some(v))` = set.
+    /// Mirrors Paperclip's `undefined` / `null` / value distinction so that
+    /// partial PUTs merge instead of clobbering sibling fields.
     #[serde(rename = "decideBy")]
-    pub decide_by: Option<String>,
+    pub decide_by: Option<Option<String>>,
     #[serde(rename = "snoozedUntil")]
-    pub snoozed_until: Option<String>,
+    pub snoozed_until: Option<Option<String>>,
+}
+
+/// Parse a `decideBy` value into the stored `(decide_by, decide_by_date)` pair:
+/// a bucket keyword, or a calendar date stored with `decide_by = "date"`.
+fn parse_decide_by(value: &str) -> Result<(String, Option<NaiveDate>), AppError> {
+    if matches!(value, "today" | "this_week" | "whenever") {
+        Ok((value.to_string(), None))
+    } else {
+        let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+            AppError::Validation(
+                "decideBy must be 'today', 'this_week', 'whenever', or YYYY-MM-DD".to_string(),
+            )
+        })?;
+        Ok(("date".to_string(), Some(date)))
+    }
 }
 
 /// PUT /companies/:company_id/decision-triage/:source_kind/:source_id
 ///
 /// Concurrent updates on the same source serialize behind a transaction-scoped
-/// advisory lock, mirroring Paperclip's `decision-triage:${...}` lock.
+/// advisory lock, mirroring Paperclip's `decision-triage:${...}` lock. Partial
+/// updates merge with the current row (absent fields preserve current values),
+/// matching Paperclip's `updateTriage`.
 async fn put_decision_triage(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -3786,39 +3882,10 @@ async fn put_decision_triage(
             "unknown sourceKind '{source_kind}'"
         )));
     }
-
-    // decideBy is either a bucket keyword or a calendar date.
-    let (decide_by, decide_by_date) = match input.decide_by.as_deref() {
-        None => (None, None),
-        Some("") => (None, None),
-        Some(value) if matches!(value, "today" | "this_week" | "whenever") => {
-            (Some(value.to_string()), None)
-        }
-        Some(value) => {
-            let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
-                AppError::Validation(
-                    "decideBy must be 'today', 'this_week', 'whenever', or YYYY-MM-DD".to_string(),
-                )
-            })?;
-            (Some("date".to_string()), Some(date))
-        }
-    };
-
-    let snoozed_until = match input.snoozed_until.as_deref() {
-        None | Some("") => None,
-        Some(value) => {
-            let parsed = parse_iso(value).ok_or_else(|| {
-                AppError::Validation("snoozedUntil must be an ISO timestamp".to_string())
-            })?;
-            // Paperclip caps snoozes at 5 years out.
-            if parsed > Utc::now() + Duration::days(365 * 5) {
-                return Err(AppError::Validation(
-                    "snoozedUntil may not be more than 5 years in the future".to_string(),
-                ));
-            }
-            Some(parsed)
-        }
-    };
+    // Paperclip's `updateTriage` calls `requireSourceRead` unconditionally: the
+    // source must exist and be readable, so a board operator cannot triage a
+    // source whose backing attention item has disappeared.
+    require_decision_source_read(&state.pool, &actor, company_id, &source_kind, &source_id).await?;
 
     let attr = attribution(&actor);
     let mut tx = state.pool.begin().await.map_err(db_err)?;
@@ -3834,6 +3901,54 @@ async fn put_decision_triage(
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+
+    // Read the current row inside the advisory lock so that partial updates
+    // merge instead of overwriting fields the request did not mention.
+    let current = sqlx::query(&format!(
+        "{TRIAGE_SELECT} WHERE company_id = $1 AND source_kind = $2 AND source_id = $3"
+    ))
+    .bind(company_id)
+    .bind(&source_kind)
+    .bind(&source_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+
+    // decideBy: absent → preserve current; explicit null/"" → clear; value → set.
+    let (decide_by, decide_by_date) = match &input.decide_by {
+        None => (
+            current
+                .as_ref()
+                .and_then(|r| r.try_get::<Option<String>, _>("decide_by").ok().flatten()),
+            current
+                .as_ref()
+                .and_then(|r| r.try_get::<Option<NaiveDate>, _>("decide_by_date").ok().flatten()),
+        ),
+        Some(None) => (None, None),
+        Some(Some(value)) if value.is_empty() => (None, None),
+        Some(Some(value)) => parse_decide_by(value).map(|(db, dbd)| (Some(db), dbd))?,
+    };
+
+    // snoozedUntil: absent → preserve current; explicit null/"" → clear; value → set.
+    let snoozed_until = match &input.snoozed_until {
+        None => current
+            .as_ref()
+            .and_then(|r| r.try_get::<Option<DateTime<Utc>>, _>("snoozed_until").ok().flatten()),
+        Some(None) => None,
+        Some(Some(value)) if value.is_empty() => None,
+        Some(Some(value)) => {
+            let parsed = parse_iso(value).ok_or_else(|| {
+                AppError::Validation("snoozedUntil must be an ISO timestamp".to_string())
+            })?;
+            // Paperclip caps snoozes at 5 years out.
+            if parsed > Utc::now() + Duration::days(365 * 5) {
+                return Err(AppError::Validation(
+                    "snoozedUntil may not be more than 5 years in the future".to_string(),
+                ));
+            }
+            Some(parsed)
+        }
+    };
 
     let row = sqlx::query(&format!(
         "INSERT INTO decision_triage (company_id, source_kind, source_id, decide_by, \

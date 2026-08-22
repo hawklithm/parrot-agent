@@ -41,7 +41,6 @@ pub mod dashboard_service;
 pub mod feedback_service;
 pub mod recovery_observability_service;
 pub mod decision_service;
-pub mod decision_queue_service;
 pub mod decision_retention_service;
 pub mod decision_retention_runtime;
 pub mod decision_retention_sweep_job;
