@@ -13,6 +13,7 @@
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -25,7 +26,7 @@ use sqlx::Row;
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::{AuthorizationAction, AuthorizationActor};
-use services::secret_provider::encrypt_secret_material;
+use services::secret_provider::{decrypt_secret_material, encrypt_secret_material};
 
 fn proposal_json(
     row: &sqlx::postgres::PgRow,
@@ -809,6 +810,136 @@ fn json_fingerprint(v: &Value) -> String {
         .collect()
 }
 
+/// POST /agents/me/secrets/:key/value — resolve a bound secret value for the
+/// calling agent, mirroring Paperclip `POST /agents/me/secrets/:key/value`
+/// (routes/secrets.ts). Resolution follows the agent-scoped binding
+/// (company_secret_bindings target_type='agent', target_id=agent_id); a
+/// fallback to the agent's own approved secret proposal keeps the simpler
+/// proposal-driven surface working. The version selector on the binding is
+/// honored ('latest' resolves the current version row, a numeric string
+/// resolves that exact version). The response is no-store and the plaintext
+/// value only ever appears in the `value` field — never in activity logs.
+async fn resolve_agent_secret_value(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(key): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let (agent_id, company_id, _) = agent_context(&actor)?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // 1. Locate the secret the agent may read: binding first, then own approved proposal.
+    let binding_row: Option<(Uuid, String)> = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT s.id, b.version_selector \
+         FROM company_secret_bindings b \
+         JOIN company_secrets s ON s.id = b.secret_id \
+         WHERE b.company_id = $1 AND b.target_type = 'agent' AND b.target_id = $2 \
+           AND s.key = $3 AND s.status = 'active' AND s.deleted_at IS NULL \
+         ORDER BY b.created_at DESC \
+         LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(agent_id.to_string())
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to resolve agent secret binding: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let (secret_id, version_selector) = match binding_row {
+        Some((secret_id, selector)) => (secret_id, selector),
+        None => {
+            let proposal_secret_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT p.created_secret_id \
+                 FROM company_secret_proposals p \
+                 WHERE p.company_id = $1 AND p.proposed_by_agent_id = $2 \
+                   AND p.kind = 'secret' AND p.status = 'approved' \
+                   AND p.proposed_key = $3 AND p.created_secret_id IS NOT NULL \
+                 ORDER BY p.created_at DESC \
+                 LIMIT 1",
+            )
+            .bind(company_id)
+            .bind(agent_id)
+            .bind(&key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to resolve agent secret proposal: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .flatten();
+            let Some(id) = proposal_secret_id else {
+                return Err(StatusCode::FORBIDDEN);
+            };
+            (id, "latest".to_string())
+        }
+    };
+
+    // 2. Resolve the version and decrypt the material.
+    let version_row: Option<(i32, Value)> = if version_selector == "latest" {
+        sqlx::query_as::<_, (i32, Value)>(
+            "SELECT version, material FROM company_secret_versions \
+             WHERE secret_id = $1 AND status = 'current' \
+             ORDER BY version DESC LIMIT 1",
+        )
+        .bind(secret_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to load secret version: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    } else {
+        match version_selector.parse::<i32>() {
+            Ok(version) => sqlx::query_as::<_, (i32, Value)>(
+                "SELECT version, material FROM company_secret_versions \
+                 WHERE secret_id = $1 AND version = $2 AND revoked_at IS NULL \
+                 ORDER BY version DESC LIMIT 1",
+            )
+            .bind(secret_id)
+            .bind(version)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to load secret version: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?,
+            Err(_) => {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    };
+
+    let Some((version, material)) = version_row else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let plaintext = decrypt_secret_material(&material).map_err(|e| {
+        tracing::error!("Failed to decrypt secret material: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // 3. Log the access event (count only — the value never reaches the log).
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "secret.value.resolved",
+        &actor,
+        "agent",
+        agent_id,
+        json!({ "key": key, "version": version }),
+    )
+    .await;
+
+    Ok((
+        [("Cache-Control", "no-store")],
+        Json(json!({ "key": key, "value": plaintext, "version": version })),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,6 +964,10 @@ pub fn secret_proposal_routes() -> Router<AppState> {
             delete(withdraw_agent_proposal),
         )
         .route("/agents/me/secrets", get(list_agent_secrets))
+        .route(
+            "/agents/me/secrets/:key/value",
+            post(resolve_agent_secret_value),
+        )
         .route(
             "/companies/:company_id/secret-proposals",
             get(list_board_proposals),

@@ -49,6 +49,36 @@ fn parse(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("response body must be JSON")
 }
 
+async fn send_full(
+    app: &Router,
+    actor: &AuthorizationActor,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, String, Vec<u8>) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    let req_body = match body {
+        Some(ref value) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(serde_json::to_vec(value).expect("serialize request body"))
+        }
+        None => Body::empty(),
+    };
+    let mut req = builder.body(req_body).expect("build request");
+    req.extensions_mut().insert(actor.clone());
+    let resp = app.clone().oneshot(req).await.expect("dispatch request");
+    let status = resp.status();
+    let cache_control = resp
+        .headers()
+        .get("cache-control")
+        .map(|v| v.to_str().unwrap_or_default().to_string())
+        .unwrap_or_default();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    (status, cache_control, bytes.to_vec())
+}
+
 fn board_actor(user_id: Uuid, company_id: Uuid) -> AuthorizationActor {
     AuthorizationActor::board(user_id, company_id)
 }
@@ -287,6 +317,187 @@ async fn secret_proposal_lifecycle_matches_paperclip() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "agent board list → 403");
+
+    cleanup_fixture(&f).await;
+}
+
+/// #134 secret path name / agent binding / version update, plus #135 value
+/// redaction of the resolution response and the activity log.
+#[tokio::test]
+async fn agent_secret_binding_value_resolution_and_redaction_match_paperclip() {
+    let pool = connect_and_migrate().await;
+    let f = seed_fixture(&pool).await;
+    let state = build_app_state(pool.clone()).await.expect("build_app_state");
+    let app = secret_proposal_routes().with_state(state);
+    let board = board_actor(Uuid::new_v4(), f.company_a);
+    let agent = agent_actor(f.agent_a, f.company_a);
+    let secret_value = "sk-live-42-secret-value";
+
+    // 1. Agent proposes a secret and the board approves it → v1 version row.
+    let (status, body) = send(
+        &app,
+        &agent,
+        "POST",
+        "/agents/me/secret-proposals",
+        Some(json!({
+            "kind": "secret",
+            "name": "OPENAI_API_KEY",
+            "key": "OPENAI_API_KEY",
+            "value": secret_value,
+            "justification": "Needed for tool calls.",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "propose secret → 201");
+    let secret_proposal_id = parse(&body)["id"].as_str().expect("proposal id").to_string();
+    let (status, body) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{}/secret-proposals/{secret_proposal_id}/approve", f.company_a),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "approve secret → 200");
+    let secret_id = parse(&body)["createdSecretId"]
+        .as_str()
+        .expect("created secret id")
+        .to_string();
+
+    // 2. Agent proposes a binding (path name) to that secret and the board
+    //    approves it → company_secret_bindings row with the config path.
+    let (status, body) = send(
+        &app,
+        &agent,
+        "POST",
+        "/agents/me/secret-proposals",
+        Some(json!({
+            "kind": "binding",
+            "secretId": secret_id,
+            "targetAgentId": f.agent_a,
+            "configPath": "env.OPENAI_API_KEY",
+            "justification": "Expose at the env path.",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "propose binding → 201");
+    let binding_proposal_id = parse(&body)["id"].as_str().expect("binding id").to_string();
+    let (status, _) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{}/secret-proposals/{binding_proposal_id}/approve", f.company_a),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "approve binding → 200");
+
+    let (config_path, target_type): (String, String) = sqlx::query_as(
+        "SELECT config_path, target_type FROM company_secret_bindings \
+         WHERE company_id = $1 AND secret_id = $2 AND target_id = $3",
+    )
+    .bind(f.company_a)
+    .bind(Uuid::parse_str(&secret_id).expect("secret uuid"))
+    .bind(f.agent_a.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("binding row created on approve");
+    assert_eq!(config_path, "env.OPENAI_API_KEY", "path name persisted");
+    assert_eq!(target_type, "agent", "bound to the agent");
+
+    // 3. Agent resolves the value at the path → plaintext + version, no-store.
+    let (status, headers_text, body) = send_full(
+        &app,
+        &agent,
+        "POST",
+        "/agents/me/secrets/OPENAI_API_KEY/value",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resolve value → 200");
+    let resolved = parse(&body);
+    assert_eq!(resolved["key"], "OPENAI_API_KEY");
+    assert_eq!(resolved["value"], secret_value, "binding resolution returns the plaintext");
+    assert_eq!(resolved["version"], 1, "current version resolved");
+    assert!(
+        headers_text.contains("no-store"),
+        "resolution response is cache-control no-store"
+    );
+
+    // 4. Version update: promote a second version row → resolution picks it up.
+    sqlx::query(
+        "INSERT INTO company_secret_versions (secret_id, version, material, value_sha256, fingerprint_sha256, status) \
+         SELECT secret_id, 2, material, value_sha256, fingerprint_sha256, 'current' \
+         FROM company_secret_versions WHERE secret_id = $1 AND version = 1",
+    )
+    .bind(Uuid::parse_str(&secret_id).expect("secret uuid"))
+    .execute(&pool)
+    .await
+    .expect("insert second version row");
+    let (_, _, body) = send_full(
+        &app,
+        &agent,
+        "POST",
+        "/agents/me/secrets/OPENAI_API_KEY/value",
+        None,
+    )
+    .await;
+    assert_eq!(parse(&body)["version"], 2, "latest version resolved after update");
+
+    // 5. A pinned version selector resolves that exact version.
+    sqlx::query("UPDATE company_secret_bindings SET version_selector = '1' WHERE company_id = $1 AND secret_id = $2")
+        .bind(f.company_a)
+        .bind(Uuid::parse_str(&secret_id).expect("secret uuid"))
+        .execute(&pool)
+        .await
+        .expect("pin version selector");
+    let (_, _, body) = send_full(
+        &app,
+        &agent,
+        "POST",
+        "/agents/me/secrets/OPENAI_API_KEY/value",
+        None,
+    )
+    .await;
+    assert_eq!(parse(&body)["version"], 1, "pinned version resolved");
+
+    // 6. An agent with no grant cannot resolve the value (403).
+    let outsider_agent = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, $3)")
+        .bind(outsider_agent)
+        .bind(f.company_a)
+        .bind("Ungranted Agent")
+        .execute(&pool)
+        .await
+        .expect("insert outsider agent");
+    let (status, _, _) = send_full(
+        &app,
+        &agent_actor(outsider_agent, f.company_a),
+        "POST",
+        "/agents/me/secrets/OPENAI_API_KEY/value",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "ungranted agent resolve → 403");
+
+    // 7. #135: the plaintext never reaches the activity log — resolution
+    //    records only { key, version } metadata.
+    let log_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT metadata::text FROM activity_logs \
+         WHERE company_id = $1 AND event_type = 'secret.value.resolved' \
+         ORDER BY created_at DESC LIMIT 3",
+    )
+    .bind(f.company_a)
+    .fetch_all(&pool)
+    .await
+    .expect("read activity logs");
+    assert!(!log_rows.is_empty(), "resolution access events logged");
+    for row in &log_rows {
+        assert!(
+            !row.contains(secret_value),
+            "secret value must never appear in activity log metadata"
+        );
+    }
 
     cleanup_fixture(&f).await;
 }
