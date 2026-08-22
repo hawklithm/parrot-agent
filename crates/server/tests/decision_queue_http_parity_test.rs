@@ -19,6 +19,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use sqlx::Row;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
@@ -78,6 +79,7 @@ struct Fixture {
     run_1: Uuid,
     run_2: Uuid,
     approval_id: Uuid,
+    issue_a: Uuid,
 }
 
 async fn seed_fixture(pool: &PgPool) -> Fixture {
@@ -86,6 +88,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     let run_1 = Uuid::new_v4();
     let run_2 = Uuid::new_v4();
     let approval_id = Uuid::new_v4();
+    let issue_a = Uuid::new_v4();
     let prefix_a = format!("DQ{}", &company_a.simple().to_string()[..8]);
 
     sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
@@ -131,6 +134,32 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .await
     .expect("insert approval");
 
+    // An issue with a pull-request work product: the seed routine routes any
+    // candidate whose issue has a `pull_request` work product into the `prs`
+    // queue (mirrors Paperclip's issueWorkProducts query).
+    sqlx::query("INSERT INTO issues (id, company_id, title, identifier) VALUES ($1, $2, $3, $4)")
+        .bind(issue_a)
+        .bind(company_a)
+        .bind("Seed candidate issue")
+        .bind(format!("DQ{}", &company_a.simple().to_string()[..6]))
+        .execute(pool)
+        .await
+        .expect("insert issue");
+    sqlx::query(
+        "INSERT INTO issue_work_products \
+            (id, company_id, issue_id, name, artifact, type, provider, title, status) \
+         VALUES ($1, $2, $3, $4, $5, 'pull_request', 'github', $6, 'open')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(company_a)
+    .bind(issue_a)
+    .bind("PR 42")
+    .bind(json!({}))
+    .bind("PR 42")
+    .execute(pool)
+    .await
+    .expect("insert pull-request work product");
+
     Fixture {
         pool: pool.clone(),
         company_a,
@@ -138,6 +167,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         run_1,
         run_2,
         approval_id,
+        issue_a,
     }
 }
 
@@ -164,6 +194,14 @@ async fn cleanup_fixture(f: &Fixture) {
         .await;
     let _ = sqlx::query("DELETE FROM heartbeat_runs WHERE company_id = $1")
         .bind(f.company_a)
+        .execute(&f.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM issue_work_products WHERE company_id = $1")
+        .bind(f.company_a)
+        .execute(&f.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM issues WHERE id = $1")
+        .bind(f.issue_a)
         .execute(&f.pool)
         .await;
     let _ = sqlx::query("DELETE FROM agents WHERE id = $1")
@@ -493,6 +531,162 @@ async fn triage_version_increments_and_survives_concurrent_updates() {
     assert_eq!(final_state["decideBy"], "today");
     assert_eq!(final_state["snoozedUntil"], "2026-08-03T12:00:00.000Z");
     assert_eq!(final_state["version"], 2);
+
+    cleanup_fixture(&f).await;
+}
+
+/// Mirrors the Paperclip test "materializes data-backed starter queues from
+/// plan, question, and pull-request signals".
+#[tokio::test]
+async fn seed_materializes_prs_plans_questions_and_is_idempotent() {
+    let pool = connect_and_migrate().await;
+    let f = seed_fixture(&pool).await;
+    use api::routes::decisions::{materialize_seeded_queues, SeedCandidate};
+
+    let plan_id = Uuid::new_v4();
+    let question_id = Uuid::new_v4();
+    let candidates = vec![
+        // issue-linked review candidate: the issue has a pull_request work
+        // product, so it lands in `prs`.
+        SeedCandidate {
+            source_kind: "review".into(),
+            source_id: f.issue_a.to_string(),
+            issue_id: Some(f.issue_a),
+            metadata: None,
+        },
+        SeedCandidate {
+            source_kind: "issue_thread_interaction".into(),
+            source_id: plan_id.to_string(),
+            issue_id: Some(f.issue_a),
+            metadata: Some(json!({
+                "kind": "request_confirmation",
+                "isPlanTarget": true,
+                "issueId": f.issue_a,
+            })),
+        },
+        SeedCandidate {
+            source_kind: "issue_thread_interaction".into(),
+            source_id: question_id.to_string(),
+            issue_id: Some(f.issue_a),
+            metadata: Some(json!({ "kind": "ask_user_questions", "issueId": f.issue_a })),
+        },
+    ];
+
+    materialize_seeded_queues(&f.pool, f.company_a, &candidates)
+        .await
+        .expect("first seed materialization");
+
+    // 1. The three seeded queues exist with a single persisted rule each.
+    let rows = sqlx::query(
+        "SELECT key, seed_rules, seed_rules_enabled FROM decision_queues WHERE company_id = $1",
+    )
+    .bind(f.company_a)
+    .fetch_all(&f.pool)
+    .await
+    .expect("query seeded queues");
+    let mut keys: Vec<String> = rows.iter().map(|r| r.get("key")).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["plans", "prs", "questions"], "three seeded queues created");
+    for r in &rows {
+        let enabled: bool = r.get("seed_rules_enabled");
+        let rules: Value = r.get("seed_rules");
+        assert!(enabled, "seeded queue has seed_rules_enabled=true");
+        assert_eq!(
+            rules.as_array().map(|a| a.len()).unwrap_or(0),
+            1,
+            "each seed persists exactly one rule"
+        );
+    }
+
+    // 2. Items: all three candidates share the PR issue → 3 in prs, plus 1 in
+    //    plans and 1 in questions (5 total).
+    let counts = sqlx::query(
+        "SELECT q.key, COUNT(i.id)::bigint AS n \
+         FROM decision_queue_items i JOIN decision_queues q ON q.id = i.queue_id \
+         WHERE i.company_id = $1 GROUP BY q.key",
+    )
+    .bind(f.company_a)
+    .fetch_all(&f.pool)
+    .await
+    .expect("count seeded items");
+    let mut item_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for r in &counts {
+        item_counts.insert(r.get("key"), r.get("n"));
+    }
+    assert_eq!(item_counts.get("prs"), Some(&3), "prs holds every PR-linked candidate");
+    assert_eq!(item_counts.get("plans"), Some(&1), "plans holds the plan confirmation");
+    assert_eq!(item_counts.get("questions"), Some(&1), "questions holds the ask");
+
+    // 3. Idempotent re-run: no new audit events, queue updated_at unchanged.
+    let first_updated: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT key, updated_at FROM decision_queues WHERE company_id = $1 ORDER BY key",
+    )
+    .bind(f.company_a)
+    .fetch_all(&f.pool)
+    .await
+    .expect("snapshot updated_at");
+    let first_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM decision_triage_events WHERE company_id = $1",
+    )
+    .bind(f.company_a)
+    .fetch_one(&f.pool)
+    .await
+    .expect("count audit events");
+
+    materialize_seeded_queues(&f.pool, f.company_a, &candidates)
+        .await
+        .expect("idempotent re-run");
+
+    let second_updated: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT key, updated_at FROM decision_queues WHERE company_id = $1 ORDER BY key",
+    )
+    .bind(f.company_a)
+    .fetch_all(&f.pool)
+    .await
+    .expect("snapshot updated_at again");
+    assert_eq!(first_updated, second_updated, "re-run keeps queue updated_at stable");
+    let second_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM decision_triage_events WHERE company_id = $1",
+    )
+    .bind(f.company_a)
+    .fetch_one(&f.pool)
+    .await
+    .expect("count audit events again");
+    assert_eq!(first_events, second_events, "no duplicate audit events on re-run");
+
+    // 4. A disabled seed is skipped entirely: new matching candidates are not
+    //    enqueued while seed_rules_enabled = false.
+    sqlx::query(
+        "UPDATE decision_queues SET seed_rules_enabled = false \
+         WHERE company_id = $1 AND key = 'questions'",
+    )
+    .bind(f.company_a)
+    .execute(&f.pool)
+    .await
+    .expect("disable questions seed");
+    let new_question_id = Uuid::new_v4();
+    materialize_seeded_queues(
+        &f.pool,
+        f.company_a,
+        &[SeedCandidate {
+            source_kind: "issue_thread_interaction".into(),
+            source_id: new_question_id.to_string(),
+            issue_id: Some(f.issue_a),
+            metadata: Some(json!({ "kind": "ask_user_questions", "issueId": f.issue_a })),
+        }],
+    )
+    .await
+    .expect("seed with disabled questions");
+    let questions_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM decision_queue_items i \
+         JOIN decision_queues q ON q.id = i.queue_id \
+         WHERE i.company_id = $1 AND q.key = 'questions'",
+    )
+    .bind(f.company_a)
+    .fetch_one(&f.pool)
+    .await
+    .expect("count questions items");
+    assert_eq!(questions_count, 1, "disabled seed does not add items");
 
     cleanup_fixture(&f).await;
 }

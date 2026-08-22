@@ -3269,6 +3269,204 @@ async fn get_decision_queue_seed_rules(
     Ok(Json(decision_queue_seeds()))
 }
 
+/// Minimal projection of Paperclip's `AttentionItem` for seed materialization.
+///
+/// The Parrot attention pipeline does not yet produce Paperclip-shaped
+/// `AttentionItem`s, so the seed routine takes a flat candidate struct; the
+/// attention collector that feeds it is tracked as the #94 boundary.
+pub struct SeedCandidate {
+    pub source_kind: String,
+    pub source_id: String,
+    pub issue_id: Option<Uuid>,
+    pub metadata: Option<Value>,
+}
+
+/// Paperclip `decision-queues.ts` → `materializeSeededQueues`.
+///
+/// From attention signal candidates, create (or reuse) the `prs` / `plans` /
+/// `questions` seeded queues with `seed_rules` persisted and `created_by_type =
+/// 'system'`, then insert the matching items with composite-key dedup. Repeated
+/// runs are idempotent: no duplicate queues, items, or audit events, and queue
+/// `updated_at` only moves when a new item is actually inserted. A seeded queue
+/// with `seed_rules_enabled = false` is skipped entirely (no items added).
+pub async fn materialize_seeded_queues(
+    pool: &PgPool,
+    company_id: Uuid,
+    candidates: &[SeedCandidate],
+) -> Result<(), AppError> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    // 1. Resolve which candidate issues carry a pull-request work product.
+    let issue_ids: Vec<Uuid> = candidates.iter().filter_map(|c| c.issue_id).collect();
+    let pr_issue_ids: HashSet<Uuid> = if issue_ids.is_empty() {
+        HashSet::new()
+    } else {
+        let rows = sqlx::query(
+            "SELECT DISTINCT issue_id FROM issue_work_products \
+             WHERE company_id = $1 AND type = 'pull_request' AND issue_id = ANY($2)",
+        )
+        .bind(company_id)
+        .bind(&issue_ids)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(|r| r.get::<Uuid, _>("issue_id")).collect()
+    };
+
+    // 2. Classify each candidate into zero or more seeded queues (a candidate
+    //    may land in several, mirroring Paperclip's `matches` map).
+    let mut matches: HashMap<&'static str, Vec<&SeedCandidate>> = HashMap::new();
+    for c in candidates {
+        if c
+            .issue_id
+            .is_some_and(|id| pr_issue_ids.contains(&id))
+        {
+            matches.entry("prs").or_default().push(c);
+        }
+        if c.source_kind == "issue_thread_interaction" {
+            let md = c.metadata.as_ref();
+            let is_plan = md
+                .and_then(|m| m.get("isPlanTarget"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_plan {
+                matches.entry("plans").or_default().push(c);
+            }
+            let kind = md.and_then(|m| m.get("kind")).and_then(Value::as_str);
+            if kind == Some("ask_user_questions") {
+                matches.entry("questions").or_default().push(c);
+            }
+        }
+    }
+
+    // 3. Materialize each seed whose signals matched.
+    let seeds = decision_queue_seeds();
+    for seed in seeds.as_array().expect("seed rules are an array") {
+        let key = seed["key"].as_str().expect("seed key");
+        let Some(items) = matches.get(key) else { continue };
+        if items.is_empty() {
+            continue;
+        }
+        let title = seed["title"].as_str().unwrap_or(key);
+        let description = seed["description"].as_str().unwrap_or("");
+        let rule_keys: Vec<&str> = seed["rules"]
+            .as_array()
+            .map(|rules| rules.iter().filter_map(|r| r.get("key")).filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+
+        let mut tx = pool.begin().await.map_err(db_err)?;
+
+        // Upsert the queue row; the first creation emits a queue.seeded event.
+        let inserted_queue = sqlx::query(
+            "INSERT INTO decision_queues \
+                 (company_id, key, title, description, created_by_type, \
+                  created_by_agent_id, created_by_user_id, created_by_run_id, \
+                  created_by_agent_api_key_id, retention_days, seed_rules, seed_rules_enabled) \
+             VALUES ($1, $2, $3, $4, 'system', NULL, NULL, NULL, NULL, NULL, $5, true) \
+             ON CONFLICT (company_id, key) DO NOTHING RETURNING id",
+        )
+        .bind(company_id)
+        .bind(key)
+        .bind(title)
+        .bind(description)
+        .bind(seed["rules"].clone())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        let queue_id = match inserted_queue {
+            Some(row) => {
+                let queue_id = row.get::<Uuid, _>("id");
+                sqlx::query(
+                    "INSERT INTO decision_triage_events \
+                         (company_id, queue_id, action, actor_type, details) \
+                     VALUES ($1, $2, 'queue.seeded', 'system', $3)",
+                )
+                .bind(company_id)
+                .bind(queue_id)
+                .bind(json!({ "key": key, "rules": rule_keys }))
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                queue_id
+            }
+            None => {
+                // Existing queue: a disabled seed is skipped entirely.
+                let existing = sqlx::query_scalar::<_, Uuid>(
+                    "SELECT id FROM decision_queues WHERE company_id = $1 AND key = $2",
+                )
+                .bind(company_id)
+                .bind(key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                let Some(queue_id) = existing else { continue };
+                let enabled = sqlx::query_scalar::<_, bool>(
+                    "SELECT seed_rules_enabled FROM decision_queues WHERE id = $1",
+                )
+                .bind(queue_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                if !enabled {
+                    continue;
+                }
+                queue_id
+            }
+        };
+
+        // Insert matching items with composite-key dedup; new items emit
+        // queue_item.seeded events.
+        let mut inserted_any = false;
+        for item in items {
+            let inserted = sqlx::query(
+                "INSERT INTO decision_queue_items \
+                     (company_id, queue_id, source_kind, source_id, added_by_type) \
+                 VALUES ($1, $2, $3, $4, 'system') \
+                 ON CONFLICT (queue_id, source_kind, source_id) DO NOTHING RETURNING id",
+            )
+            .bind(company_id)
+            .bind(queue_id)
+            .bind(&item.source_kind)
+            .bind(&item.source_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if inserted.is_none() {
+                continue;
+            }
+            inserted_any = true;
+            sqlx::query(
+                "INSERT INTO decision_triage_events \
+                     (company_id, queue_id, source_kind, source_id, action, actor_type, details) \
+                 VALUES ($1, $2, $3, $4, 'queue_item.seeded', 'system', $5)",
+            )
+            .bind(company_id)
+            .bind(queue_id)
+            .bind(&item.source_kind)
+            .bind(&item.source_id)
+            .bind(json!({ "seedKey": key }))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+
+        if inserted_any {
+            sqlx::query("UPDATE decision_queues SET updated_at = NOW() WHERE id = $1")
+                .bind(queue_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
+
+        tx.commit().await.map_err(db_err)?;
+    }
+
+    Ok(())
+}
+
 fn queue_to_json(r: &PgRow, item_count: i64) -> Value {
     json!({
         "id": r.get::<Uuid, _>("id"),
