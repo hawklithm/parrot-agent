@@ -269,7 +269,6 @@ impl OrgChartService for MockOrgChartService {
         let tree = self.get_org_tree(company_id).await?;
         Ok(Self::render_svg(&tree, &options))
     }
-
     async fn build_org_tree(&self, _company_id: Uuid) -> Result<Vec<OrgNode>, OrgChartError> {
         Ok(Self::build_org_tree_mock())
     }
@@ -303,5 +302,138 @@ impl MockOrgChartService {
             }
         }
         None
+    }
+}
+
+/// 真实实现：从 agents 表（reports_to 层级）构建组织树并渲染 SVG。
+pub struct DefaultOrgChartService {
+    pool: sqlx::PgPool,
+}
+
+impl DefaultOrgChartService {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+
+}
+
+#[async_trait]
+impl OrgChartService for DefaultOrgChartService {
+    async fn get_org_tree(&self, company_id: Uuid) -> Result<Vec<OrgNode>, String> {
+        self.build_org_tree(company_id).await.map_err(|e| e.to_string())
+    }
+
+    async fn generate_org_chart_svg(
+        &self,
+        company_id: Uuid,
+        options: OrgChartOptions,
+    ) -> Result<String, String> {
+        let tree = self.get_org_tree(company_id).await?;
+        Ok(MockOrgChartService::render_svg(&tree, &options))
+    }
+
+    /// 从 agents 表构建组织树：roots 为 reports_to IS NULL 的 agent，
+    /// 其余按 reports_to 挂载；带循环检测。
+    async fn build_org_tree(&self, company_id: Uuid) -> Result<Vec<OrgNode>, OrgChartError> {
+        let rows = sqlx::query(
+            "SELECT id, name, role, status, reports_to \
+             FROM agents WHERE company_id = $1 AND status <> 'terminated' ORDER BY name",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| OrgChartError::Database(e.to_string()))?;
+        use sqlx::Row as _;
+
+        let mut by_id: std::collections::HashMap<Uuid, OrgNode> = std::collections::HashMap::new();
+        let mut parent_of: std::collections::HashMap<Uuid, Option<Uuid>> = std::collections::HashMap::new();
+        for row in &rows {
+            let id: Uuid = row.get("id");
+            by_id.insert(
+                id,
+                OrgNode {
+                    id: id.to_string(),
+                    name: row.get::<String, _>("name"),
+                    role: get_role_label(&row.get::<String, _>("role")),
+                    status: row.get::<String, _>("status"),
+                    reports: Vec::new(),
+                    collapsed_reports: None,
+                },
+            );
+            parent_of.insert(id, row.get::<Option<Uuid>, _>("reports_to"));
+        }
+
+        // 循环检测：从每个节点沿 reports_to 回溯，若回到已访问节点则成环。
+        for id in by_id.keys() {
+            let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+            let mut cursor = Some(*id);
+            while let Some(current) = cursor {
+                if !seen.insert(current) {
+                    return Err(OrgChartError::CircularDependency(current));
+                }
+                cursor = parent_of.get(&current).copied().flatten();
+            }
+        }
+
+        // 挂载：每个节点插入到其 reports_to 对应节点的 reports 中。
+        let mut roots: Vec<OrgNode> = Vec::new();
+        let mut tree: std::collections::HashMap<Uuid, OrgNode> = by_id.clone();
+        let ids: Vec<Uuid> = tree.keys().copied().collect();
+        for id in ids {
+            let node = tree.remove(&id).expect("node present");
+            match parent_of.get(&id).copied().flatten() {
+                Some(parent_id) => {
+                    if let Some(parent) = tree.get_mut(&parent_id) {
+                        parent.reports.push(node);
+                    } else {
+                        roots.push(node);
+                    }
+                }
+                None => roots.push(node),
+            }
+        }
+
+        Ok(roots)
+    }
+
+    async fn get_direct_reports(&self, agent_id: Uuid) -> Result<Vec<OrgNode>, OrgChartError> {
+        let rows = sqlx::query(
+            "SELECT id, name, role, status, reports_to FROM agents \
+             WHERE reports_to = $1 AND status <> 'terminated' ORDER BY name",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| OrgChartError::Database(e.to_string()))?;
+        use sqlx::Row as _;
+        Ok(rows
+            .iter()
+            .map(|row| OrgNode {
+                id: row.get::<Uuid, _>("id").to_string(),
+                name: row.get::<String, _>("name"),
+                role: get_role_label(&row.get::<String, _>("role")),
+                status: row.get::<String, _>("status"),
+                reports: Vec::new(),
+                collapsed_reports: None,
+            })
+            .collect())
+    }
+
+    async fn get_subtree(&self, agent_id: Uuid) -> Result<OrgNode, OrgChartError> {
+        let company_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT company_id FROM agents WHERE id = $1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| OrgChartError::Database(e.to_string()))?
+        .flatten();
+        let Some(company_id) = company_id else {
+            return Err(OrgChartError::AgentNotFound(agent_id));
+        };
+        let tree = self.build_org_tree(company_id).await?;
+        MockOrgChartService::find_node(&tree, agent_id.to_string())
+            .cloned()
+            .ok_or(OrgChartError::AgentNotFound(agent_id))
     }
 }

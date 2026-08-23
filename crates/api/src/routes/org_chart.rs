@@ -1,12 +1,14 @@
 use crate::app_state::AppState;
 use crate::errors::AppError;
+use crate::routes::{require_company_access, AccessMode};
 use axum::{Router,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use models::{OrgChartOptions, OrgChartStyle};
+use services::auth::AuthorizationActor;
 use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize)]
@@ -19,8 +21,13 @@ pub struct OrgChartQuery {
 /// GET /companies/:companyId/org - 获取组织树JSON
 pub async fn get_org_tree(
     Path(company_id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
     State(state): State<AppState>,
 ) -> Response {
+    if require_company_access(&actor, company_id, AccessMode::Read).is_err() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "Forbidden" })))
+            .into_response();
+    }
     match state.org_chart_service.get_org_tree(company_id).await {
         Ok(tree) => (StatusCode::OK, Json(tree)).into_response(),
         Err(e) => (
@@ -35,8 +42,13 @@ pub async fn get_org_tree(
 pub async fn generate_org_chart_svg(
     Path(company_id): Path<Uuid>,
     Query(query): Query<OrgChartQuery>,
+    Extension(actor): Extension<AuthorizationActor>,
     State(state): State<AppState>,
 ) -> Response {
+    if require_company_access(&actor, company_id, AccessMode::Read).is_err() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "Forbidden" })))
+            .into_response();
+    }
     let style = match query.style.as_deref() {
         Some("professional") => OrgChartStyle::Professional,
         Some("dark") => OrgChartStyle::Dark,
@@ -98,8 +110,11 @@ pub fn org_chart_routes() -> Router<AppState> {
 /// the same standards-compliant SVG bytes instead of a fake/501 response.
 async fn generate_org_png(
     Path(company_id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Org chart access denied".into()))?;
     let (company_name, agent_count) = sqlx::query_as::<_, (String, i64)>(
         "SELECT c.name, (SELECT COUNT(*) FROM agents a WHERE a.company_id=c.id) FROM companies c WHERE c.id=$1")
         .bind(company_id).fetch_optional(&state.pool).await
