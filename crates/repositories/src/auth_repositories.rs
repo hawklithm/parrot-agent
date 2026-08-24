@@ -167,7 +167,9 @@ impl PgAuthSessionRepository {
 impl AuthSessionRepository for PgAuthSessionRepository {
     async fn find_by_token(&self, token: &str) -> RepositoryResult<Option<AuthSession>> {
         let row = sqlx::query_as::<_, AuthSession>(
-            "SELECT * FROM auth_sessions WHERE session_token = $1 AND expires_at > NOW()"
+            "SELECT id, user_id, token AS session_token, NULL::text AS user_agent, \
+             NULL::text AS ip_address, expires_at, last_accessed_at AS last_activity_at, \
+             created_at FROM auth_sessions WHERE token = $1 AND expires_at > NOW()"
         )
         .bind(token)
         .fetch_optional(&self.pool)
@@ -177,13 +179,13 @@ impl AuthSessionRepository for PgAuthSessionRepository {
 
     async fn create(&self, session: AuthSession) -> RepositoryResult<AuthSession> {
         sqlx::query(
-            r#"INSERT INTO auth_sessions (id, user_id, session_token, user_agent, ip_address,
-               expires_at, last_activity_at, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#
+            r#"INSERT INTO auth_sessions (id, user_id, token, expires_at, created_at,
+               last_accessed_at)
+               VALUES ($1, $2, $3, $4, $5, $6)"#
         )
         .bind(session.id).bind(session.user_id).bind(&session.session_token)
-        .bind(&session.user_agent).bind(&session.ip_address).bind(session.expires_at)
-        .bind(session.last_activity_at).bind(session.created_at)
+        .bind(session.expires_at)
+        .bind(session.created_at).bind(session.last_activity_at)
         .execute(&self.pool)
         .await?;
         Ok(session)

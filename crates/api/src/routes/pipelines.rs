@@ -48,18 +48,18 @@ pub fn pipeline_routes() -> Router<AppState> {
         .route("/companies/:company_id/review-cases/bulk", post(bulk_review_cases))
         .route("/companies/:company_id/case-events", get(list_case_events))
         // --- P1: Pipeline runs management ---
-        .route("/pipelines/:id/runs", get(list_pipeline_runs).post(create_pipeline_run))
-        .route("/pipelines/:id/runs/:run_id", get(get_pipeline_run).delete(delete_pipeline_run))
-        .route("/pipelines/:id/runs/:run_id/cancel", post(cancel_pipeline_run))
-        .route("/pipelines/:id/runs/:run_id/retry", post(retry_pipeline_run))
+        .route("/pipelines/:pipeline_id/runs", get(list_pipeline_runs).post(create_pipeline_run))
+        .route("/pipelines/:pipeline_id/runs/:run_id", get(get_pipeline_run).delete(delete_pipeline_run))
+        .route("/pipelines/:pipeline_id/runs/:run_id/cancel", post(cancel_pipeline_run))
+        .route("/pipelines/:pipeline_id/runs/:run_id/retry", post(retry_pipeline_run))
         // --- P2: Pipeline stages detail ---
-        .route("/pipelines/:id/stages/:stage_id", get(get_pipeline_stage))
+        .route("/pipelines/:pipeline_id/stages/:stage_id", get(get_pipeline_stage))
         // --- P3: Pipeline triggers ---
-        .route("/pipelines/:id/triggers", get(list_pipeline_triggers).post(create_pipeline_trigger))
-        .route("/pipelines/:id/triggers/:trigger_id", axum::routing::delete(delete_pipeline_trigger))
+        .route("/pipelines/:pipeline_id/triggers", get(list_pipeline_triggers).post(create_pipeline_trigger))
+        .route("/pipelines/:pipeline_id/triggers/:trigger_id", axum::routing::delete(delete_pipeline_trigger))
         // --- P4: Pipeline metrics & logs ---
-        .route("/pipelines/:id/metrics", get(get_pipeline_metrics))
-        .route("/pipelines/:id/logs", get(get_pipeline_logs))
+        .route("/pipelines/:pipeline_id/metrics", get(get_pipeline_metrics))
+        .route("/pipelines/:pipeline_id/logs", get(get_pipeline_logs))
         .route("/pipelines/:pipeline_id/intake-form", get(get_intake_form))
         .route("/pipelines/:pipeline_id/stages", post(create_stage))
         .route(

@@ -442,26 +442,6 @@ async fn company_agent_actions_csv(
         .unwrap())
 }
 
-/// GET /companies/:company_id/export/fidelity —— 导出保真度摘要（聚合）。
-async fn company_export_fidelity(
-    State(state): State<AppState>,
-    Extension(actor): Extension<AuthorizationActor>,
-    Path(company_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    let agent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE company_id = $1")
-        .bind(company_id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0);
-    Ok(Json(json!({
-        "companyId": company_id,
-        "agentsExported": agent_count,
-        "fidelityScore": 1.0,
-    })))
-}
-
 /// GET /companies/:company_id/recovery-observability —— 恢复可观测性聚合。
 async fn company_recovery_observability(
     State(state): State<AppState>,
@@ -1168,7 +1148,6 @@ pub fn automation_misc_routes() -> Router<AppState> {
         .route("/cases/:id/automation/retry-plan", get(case_retry_plan))
         .route("/companies/:company_id/audit/agent-actions", get(company_agent_actions))
         .route("/companies/:company_id/audit/agent-actions.csv", get(company_agent_actions_csv))
-        .route("/companies/:company_id/export/fidelity", get(company_export_fidelity))
         .route("/companies/:company_id/recovery-observability", get(company_recovery_observability))
         .route("/companies/:company_id/search/extract", get(company_search_extract))
         .route(

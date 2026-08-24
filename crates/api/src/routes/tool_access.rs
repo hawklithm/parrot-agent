@@ -1091,7 +1091,6 @@ pub fn tool_access_routes() -> Router<AppState> {
             "/agents/me/connections/:connection_id/token",
             post(agent_connection_token),
         )
-        .route("/agents/me/secrets/:key/value", post(agent_secret_value))
         // ---- round 3 ----
         .route(
             "/tool-connections/:id/health-check",
@@ -1735,43 +1734,6 @@ async fn agent_connection_token(
     Ok(Json(
         json!({ "connectionId": connection_id, "accessToken": format!("mock-{}", Uuid::new_v4()) }),
     ))
-}
-
-/// POST /agents/me/secrets/:key/value —— 读取 agent 已获批 secret 的值。
-async fn agent_secret_value(
-    State(state): State<AppState>,
-    Extension(actor): Extension<AuthorizationActor>,
-    Path(key): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let (agent_id, company_id, _) = match &actor {
-        AuthorizationActor::Agent {
-            agent_id,
-            company_id,
-            run_id,
-            ..
-        } => (*agent_id, *company_id, *run_id),
-        _ => return Err(StatusCode::FORBIDDEN),
-    };
-    let material: Option<Value> = sqlx::query_scalar(
-        "SELECT v.material FROM company_secret_proposals p \
-         JOIN company_secret_versions v ON v.secret_id = p.created_secret_id \
-         WHERE p.company_id = $1 AND p.proposed_by_agent_id = $2 AND p.kind = 'secret' \
-           AND p.status = 'approved' AND p.proposed_key = $3 \
-         ORDER BY p.created_at DESC LIMIT 1",
-    )
-    .bind(company_id)
-    .bind(agent_id)
-    .bind(&key)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to resolve agent secret: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let Some(material) = material else {
-        return Err(StatusCode::FORBIDDEN);
-    };
-    Ok(Json(json!({ "key": key, "value": material })))
 }
 
 // ================= Round 3 =================
