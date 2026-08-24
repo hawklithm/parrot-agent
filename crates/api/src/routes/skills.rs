@@ -602,6 +602,32 @@ async fn import_company_skill(
     Ok((StatusCode::CREATED, Json(result)))
 }
 
+/// SK39: Create a standalone (independent) company skill that persists as a
+/// `company_skills` row. Distinct from import/fork/install: the caller supplies
+/// the skill's own name/slug/description/category/version/tags/config (and
+/// optional `files`), and the row is marked `is_paperclip_managed = false`.
+async fn create_company_skill(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
+    let skill_key = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    enforce_skill_policy(&state, &actor, company_id, "create", "company", &skill_key).await?;
+    let result = state
+        .skill_registry_service
+        .create_company_skill(company_id, payload)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
 /// SK36: Install catalog
 async fn install_skill_catalog(
     State(state): State<AppState>,
@@ -703,7 +729,10 @@ pub fn skill_routes() -> Router<AppState> {
         .route("/skills/catalog", get(get_skill_catalog))
         .route("/skills/catalog/:catalog_id", get(get_skill_catalog_detail))
         .route("/skills/catalog/files", get(get_skill_catalog_files))
-        .route("/companies/:company_id/skills", get(list_company_skills))
+        .route(
+            "/companies/:company_id/skills",
+            get(list_company_skills).post(create_company_skill),
+        )
         .route(
             "/companies/:company_id/skills/categories",
             get(list_skill_categories),

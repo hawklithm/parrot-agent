@@ -102,6 +102,11 @@ pub trait SkillRegistryService: Send + Sync {
     /// SK38: Delete skill
     async fn delete_skill(&self, company_id: Uuid, skill_id: Uuid) -> ServiceResult<()>;
 
+    /// SK39: Create a standalone (company-owned, non-catalog) skill that
+    /// persists as a `company_skills` row with `is_paperclip_managed = false`.
+    /// This is the independent-skill persistence path (vs. import / fork / install).
+    async fn create_company_skill(&self, company_id: Uuid, input: serde_json::Value) -> ServiceResult<serde_json::Value>;
+
     /// SK39: List all skills for a company
     async fn list_company_skills(&self, company_id: Uuid) -> ServiceResult<Vec<serde_json::Value>>;
 }
@@ -374,6 +379,10 @@ impl SkillRegistryService for MockSkillRegistryService {
 
     async fn import_skill(&self, _company_id: Uuid, input: serde_json::Value) -> ServiceResult<serde_json::Value> {
         Ok(serde_json::json!({"id": Uuid::new_v4(), "import": input, "imported": true}))
+    }
+
+    async fn create_company_skill(&self, _company_id: Uuid, input: serde_json::Value) -> ServiceResult<serde_json::Value> {
+        Ok(serde_json::json!({"id": Uuid::new_v4(), "create": input, "created": true, "isPaperclipManaged": false}))
     }
 
     async fn install_catalog(&self, _company_id: Uuid) -> ServiceResult<serde_json::Value> {

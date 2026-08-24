@@ -556,6 +556,38 @@ impl SkillRegistryService for DefaultSkillRegistryServiceImpl {
             .map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))
     }
 
+    // ─── SK39: Create standalone (independent) skill ────────
+
+    async fn create_company_skill(
+        &self,
+        company_id: Uuid,
+        input: serde_json::Value,
+    ) -> ServiceResult<serde_json::Value> {
+        // Independent skills are company-owned and explicitly NOT paperclip-managed.
+        let mut data = input.clone();
+        data["isPaperclipManaged"] = serde_json::json!(false);
+        let created = self
+            .company_skill_repo
+            .create(company_id, data)
+            .await
+            .map_err(|e| crate::errors::ServiceError::Internal(e.to_string()))?;
+
+        // Persist any bundled files into skill_files (independent skill content).
+        if let Some(skill_id_str) = created.get("id").and_then(|v| v.as_str()) {
+            if let Ok(skill_id) = Uuid::parse_str(skill_id_str) {
+                if let Some(files) = input.get("files").and_then(|v| v.as_array()) {
+                    if !files.is_empty() {
+                        let _ = self
+                            .file_repo
+                            .update(company_id, skill_id, serde_json::json!({ "files": files }))
+                            .await;
+                    }
+                }
+            }
+        }
+        Ok(created)
+    }
+
     // ─── SK36: Install catalog ─────────────────────────────
 
     async fn install_catalog(&self, company_id: Uuid) -> ServiceResult<serde_json::Value> {

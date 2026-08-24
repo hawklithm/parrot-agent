@@ -349,3 +349,89 @@ async fn skill_import_scan_and_install_catalog_match_paperclip() {
 
     cleanup_fixture(&f).await;
 }
+
+/// #124 follow-up — independent (standalone) skill creation must persist a
+/// `company_skills` row (and its bundled `skill_files`) instead of being a
+/// placeholder. This is the "独立 Skill 实际持久化" path (distinct from
+/// import / fork / install which read from a catalog).
+#[tokio::test]
+async fn create_independent_skill_persists_row_and_files() {
+    let pool = connect_and_migrate().await;
+    let f = seed_fixture(&pool).await;
+    let state = build_app_state(pool.clone()).await.expect("build_app_state");
+    let app = skill_routes().with_state(state);
+    let board = board_actor(Uuid::new_v4(), f.company_a);
+
+    let payload = json!({
+        "name": "Standalone lint skill",
+        "slug": "standalone-lint",
+        "description": "Company-owned skill, not sourced from a catalog.",
+        "category": "quality",
+        "version": "0.9.0",
+        "tags": ["lint", "ci"],
+        "config": { "enabled": true },
+        "files": [{ "path": "skill.md", "content": "# Lint", "mimeType": "text/markdown" }]
+    });
+
+    let (status, body) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{}/skills", f.company_a),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create independent skill → 201");
+    let created = parse(&body);
+    let new_id = created["id"].as_str().expect("created id").to_string();
+    assert_eq!(created["name"], "Standalone lint skill");
+    assert_eq!(created["slug"], "standalone-lint");
+    assert_eq!(created["category"], "quality");
+    assert_eq!(created["version"], "0.9.0");
+    assert_eq!(created["isPaperclipManaged"], false, "independent skill is not paperclip-managed");
+    assert_eq!(created["tags"], json!(["lint", "ci"]), "tags persisted");
+    assert_eq!(created["config"], json!({ "enabled": true }), "config persisted");
+
+    // Detail read-back proves the row actually landed.
+    let (status, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/skills/{}", f.company_a, new_id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "detail → 200");
+    let detail = parse(&body);
+    assert_eq!(detail["name"], "Standalone lint skill");
+    assert_eq!(detail["version"], "0.9.0");
+
+    // Bundled files persisted into skill_files.
+    let (status, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/skills/{}/files", f.company_a, new_id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "files → 200");
+    let files_body = parse(&body);
+    let files = files_body.as_array().expect("files is an array");
+    assert_eq!(files.len(), 1, "one bundled file persisted");
+    assert_eq!(files[0]["path"], "skill.md");
+
+    // Cross-company board cannot create a skill in this company.
+    let outsider = session_board_actor(Uuid::new_v4(), Uuid::new_v4());
+    let (status, _) = send(
+        &app,
+        &outsider,
+        "POST",
+        &format!("/companies/{}/skills", f.company_a),
+        Some(json!({ "name": "x", "slug": "x" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "cross-company create → 403");
+
+    cleanup_fixture(&f).await;
+}

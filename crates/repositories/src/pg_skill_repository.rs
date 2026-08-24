@@ -192,11 +192,16 @@ impl CompanySkillRepository for PgCompanySkillRepository {
         let category = data.get("category").and_then(|v| v.as_str());
         let catalog_id: Option<Uuid> = data.get("catalogId").and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
         let is_paperclip_managed = data.get("isPaperclipManaged").and_then(|v| v.as_bool()).unwrap_or(false);
+        let version = data.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0");
+        let tags = data.get("tags").cloned().unwrap_or(JsonValue::Array(vec![]));
+        let config = data.get("config").cloned().unwrap_or(JsonValue::Object(serde_json::Map::new()));
+        let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("active");
 
         let row: JsonValue = sqlx::query_scalar(
             r#"
-            INSERT INTO company_skills (company_id, catalog_id, name, slug, description, category, is_paperclip_managed)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO company_skills (company_id, catalog_id, name, slug, description, category,
+                                        version, tags, config, status, is_paperclip_managed)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING jsonb_build_object(
                 'id', id,
                 'companyId', company_id,
@@ -224,6 +229,10 @@ impl CompanySkillRepository for PgCompanySkillRepository {
         .bind(slug)
         .bind(description)
         .bind(category)
+        .bind(version)
+        .bind(&tags)
+        .bind(&config)
+        .bind(status)
         .bind(is_paperclip_managed)
         .fetch_one(&self.pool)
         .await
