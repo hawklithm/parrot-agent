@@ -194,20 +194,33 @@ async fn create_company(
         .create(input, creator_user_id)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    // 对齐 Paperclip autoProvisionBundledAgents：公司创建后自动 provision Summarizer，
-    // 使 status-card / summary-slot 后台任务链的 hidden issue 可被唤醒执行。
-    if let Ok(summarizer) = state
-        .built_in_agent_service
-        .provision(company.id, services::BuiltInAgentKey::Summarizer, None)
-        .await
-    {
-        tracing::info!(
-            company_id = %company.id,
-            agent_id = %summarizer.id,
-            "auto-provisioned built-in Summarizer agent"
-        );
-    } else {
-        tracing::warn!(company_id = %company.id, "failed to auto-provision built-in Summarizer agent");
+    // 对齐 Paperclip autoProvisionBundledAgents：公司创建后自动 provision 内置
+    // Agent，使其 Instructions / Routine / Managed Resource 生命周期被激活。Summarizer
+    // 供 status-card / summary-slot 后台任务链使用；Reflection Coach 供
+    // recent-agent-reflection 后台任务使用。两者均按相同模式预置（routine 默认 paused，
+    // 需显式 enable 才进入调度）。
+    for key in [
+        services::BuiltInAgentKey::Summarizer,
+        services::BuiltInAgentKey::ReflectionCoach,
+    ] {
+        match state
+            .built_in_agent_service
+            .provision(company.id, key, None)
+            .await
+        {
+            Ok(agent) => tracing::info!(
+                company_id = %company.id,
+                agent_id = %agent.id,
+                built_in_key = key.to_string(),
+                "auto-provisioned built-in agent"
+            ),
+            Err(e) => tracing::warn!(
+                company_id = %company.id,
+                built_in_key = key.to_string(),
+                error = %e,
+                "failed to auto-provision built-in agent"
+            ),
+        }
     }
     Ok((StatusCode::CREATED, Json(company)))
 }
