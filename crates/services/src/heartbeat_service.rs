@@ -1132,6 +1132,28 @@ impl DefaultHeartbeatService {
             }
         }
         let result = self.run_command(run_id, agent_id, issue_id, company_id).await;
+        // Heartbeat Start Lock contention: a second start for this agent raced in. This is not a
+        // run failure and must NOT be retried — cancel this run so exactly one adapter process
+        // owns the agent (PAPERCLIP_MIGRATION_PLAN §4B.2 line 324).
+        if let Err(error) = &result {
+            if error.contains("start_lock_contended") {
+                let _ = sqlx::query(
+                    "UPDATE heartbeat_runs
+                     SET status = 'cancelled', error = 'cancelled: start lock contended',
+                         finished_at = NOW(), updated_at = NOW()
+                     WHERE id = $1 AND status IN ('queued','running')",
+                )
+                .bind(run_id)
+                .execute(&self.pool)
+                .await;
+                tracing::warn!(
+                    run_id = %run_id,
+                    agent_id = %agent_id,
+                    "heartbeat run cancelled: another start for this agent already in progress"
+                );
+                return;
+            }
+        }
         let (status, exit_code, error, output, outcome) = match result {
             Ok(command_output) => {
                 let combined = format!("{}{}", command_output.stdout, command_output.stderr);
@@ -1368,6 +1390,21 @@ impl DefaultHeartbeatService {
         issue_id: Uuid,
         company_id: Uuid,
     ) -> Result<AdapterCommandOutput, String> {
+        // Heartbeat Start Lock (PAPERCLIP_MIGRATION_PLAN §4B.2 line 324): guarantee at most
+        // one adapter process starts per agent at a time. Acquire before building/launching the
+        // command; release immediately after the child is spawned and registered. The lock rows
+        // auto-expire (30s) so a crashed holder cannot wedge the agent.
+        let start_lock = crate::agent_start_lock_service::AgentStartLockService::new(self.pool.clone());
+        let lock_id = match start_lock.acquire_lock(agent_id, run_id.to_string()).await {
+            Ok(id) => id,
+            Err(_) => {
+                return Err(
+                    "another start for this agent is already in progress (start_lock_contended)"
+                        .to_string(),
+                );
+            }
+        };
+
         let agent = self.load_agent(agent_id).await.map_err(|e| e.to_string())?;
         let issue = sqlx::query("SELECT title, description FROM issues WHERE id = $1")
             .bind(issue_id)
@@ -1814,7 +1851,12 @@ impl DefaultHeartbeatService {
             }),
         ).await;
         let child_ref = Arc::new(Mutex::new(child));
-        self.children.lock().await.insert(run_id, child_ref.clone());
+        // Release the Heartbeat Start Lock now that the child process is spawned and tracked in
+        // self.children (which itself prevents a second concurrent child for this run). The lock
+        // only guarded the spawn race; a release failure is non-fatal (rows auto-expire).
+        if let Err(e) = start_lock.release_lock(lock_id).await {
+            tracing::warn!(run_id = %run_id, agent_id = %agent_id, error = %e, "failed to release agent start lock");
+        }
         let mut child = child_ref.lock().await;
         if stdin_prompt {
             if let Some(mut stdin) = child.stdin.take() {
