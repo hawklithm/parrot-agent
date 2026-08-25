@@ -5,6 +5,12 @@
 
 use services::HeartbeatService;
 use sqlx::PgPool;
+use repositories::{
+    budget_repository::{PgBudgetIncidentRepository, PgBudgetPolicyRepository},
+    company_repository::CompanyRepository,
+    cost_event_repository::PgCostEventRepository,
+};
+use std::sync::Arc;
 use uuid::Uuid;
 async fn connect() -> Option<PgPool> {
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -287,6 +293,132 @@ async fn run_records_responsible_user_from_issue() {
         .await
         .ok();
     sqlx::query("DELETE FROM agent_wakeup_requests WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM issues WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM agents WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// Build a `DefaultBudgetService` over the live pool (mirrors the production
+/// composition root) so the budget hard-stop path in `wakeup_with_options` can
+/// consult `get_invocation_block`.
+fn build_budget_service(pool: &PgPool) -> Arc<dyn services::BudgetService> {
+    Arc::new(services::DefaultBudgetService::new(
+        Arc::new(repositories::cost_event_repository::PgCostEventRepository::new(pool.clone())),
+        Arc::new(repositories::budget_repository::PgBudgetPolicyRepository::new(pool.clone())),
+        Arc::new(repositories::budget_repository::PgBudgetIncidentRepository::new(pool.clone())),
+        Arc::new(repositories::company_repository::CompanyRepository::new(pool.clone())),
+    ))
+}
+
+#[tokio::test]
+async fn wakeup_blocked_by_budget_hard_stop() {
+    let Some(pool) = connect().await else { return; };
+    let (company_id, agent_id, issue_id, _responsible_user_id) =
+        seed_with_issue_responsible(&pool).await;
+
+    // Simulate a budget hard-stop at the company scope: a hard-stop policy whose
+    // amount is dwarfed by observed month-to-date spend. get_invocation_block sums
+    // cost_events for the company window and returns a block when observed >= amount
+    // with hard_stop_enabled. This is the primary "硬停止" path Paperclip uses.
+    let policy_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO budget_policies (id, company_id, scope_type, scope_id, metric, window_kind, amount, hard_stop_enabled, is_active)
+         VALUES ($1, $2, 'company', $2, 'billed_cents', 'calendar_month_utc', 100, true, true)",
+    )
+    .bind(policy_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("insert budget policy");
+    // Observed spend far exceeds the 100-cent policy amount.
+    sqlx::query(
+        "INSERT INTO cost_events (company_id, agent_id, amount_cents, cost_cents, event_type, occurred_at)
+         VALUES ($1, $2, 10000000, 10000000, 'usage', NOW())",
+    )
+        .bind(company_id)
+        .bind(agent_id)
+        .execute(&pool)
+        .await
+        .expect("insert cost event");
+
+    let idempotency_key = format!("budget_hard_stop_test:{}", issue_id);
+    let svc = services::DefaultHeartbeatService::new(pool.clone())
+        .with_budget_service(build_budget_service(&pool));
+
+    svc.wakeup_with_options(
+        agent_id,
+        issue_id,
+        company_id,
+        services::HeartbeatWakeupOptions {
+            source: Some("test".to_string()),
+            reason: Some("budget_hard_stop_invariant".to_string()),
+            idempotency_key: Some(idempotency_key.clone()),
+            context_snapshot: Some(serde_json::json!({ "issueId": issue_id })),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("wakeup should not error even when blocked");
+
+    // No heartbeat run may have been created — the hard stop must prevent new work.
+    let run_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM heartbeat_runs WHERE company_id = $1 AND agent_id = $2 AND context_snapshot->>'issueId' = $3",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(issue_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count runs");
+    assert_eq!(run_count, 0, "budget hard-stop must not create a run");
+
+    // The wakeup request must be recorded as skipped for the budget hard stop.
+    let (status, reason, skip_reason): (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status::text, reason, payload->'heartbeatSkip'->>'reason' FROM agent_wakeup_requests WHERE company_id = $1 AND idempotency_key = $2",
+    )
+    .bind(company_id)
+    .bind(&idempotency_key)
+    .fetch_one(&pool)
+    .await
+    .expect("read wakeup request");
+    assert_eq!(status, "skipped", "blocked wakeup must be skipped");
+    assert_eq!(reason.as_deref(), Some("budget_hard_stop"));
+    assert_eq!(skip_reason.as_deref(), Some("budget_hard_stop"));
+    // Cleanup (cost_events / budget_policies before agents/company FKs)
+    sqlx::query("DELETE FROM cost_events WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM budget_policies WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+
+    // Cleanup
+    sqlx::query("DELETE FROM agent_wakeup_requests WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM heartbeat_runs WHERE company_id = $1")
         .bind(company_id)
         .execute(&pool)
         .await

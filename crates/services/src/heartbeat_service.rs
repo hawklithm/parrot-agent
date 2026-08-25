@@ -455,6 +455,7 @@ pub struct DefaultHeartbeatService {
     children: Arc<Mutex<HashMap<Uuid, Arc<Mutex<Child>>>>>,
     sse_service: Arc<dyn SseService>,
     cost_service: Option<Arc<dyn crate::CostService>>,
+    budget_service: Option<Arc<dyn crate::BudgetService>>,
 }
 
 async fn publish_live_event(
@@ -528,6 +529,7 @@ impl DefaultHeartbeatService {
             children: Arc::new(Mutex::new(HashMap::new())),
             sse_service: InMemorySseService::new(),
             cost_service: None,
+            budget_service: None,
         }
     }
 
@@ -541,6 +543,11 @@ impl DefaultHeartbeatService {
         self
     }
 
+    pub fn with_budget_service(mut self, budget_service: Arc<dyn crate::BudgetService>) -> Self {
+        self.budget_service = Some(budget_service);
+        self
+    }
+
     /// 克隆 service 用于后台任务
     fn clone_for_background(&self) -> Self {
         Self {
@@ -548,6 +555,7 @@ impl DefaultHeartbeatService {
             children: Arc::clone(&self.children),
             sse_service: Arc::clone(&self.sse_service),
             cost_service: self.cost_service.clone(),
+            budget_service: self.budget_service.clone(),
         }
     }
 
@@ -2027,6 +2035,56 @@ impl DefaultHeartbeatService {
         tokio::spawn(async move { service.execute_run(run_id, agent_id, issue_id, company_id).await; });
         Ok(())
     }
+
+    /// Mark an agent wakeup as `skipped` for an external gate (budget hard-stop),
+    /// reusing the idempotency row when present and otherwise inserting a fresh one.
+    /// Mirrors the throttle-skip path in `wakeup_with_options` so a blocked wakeup is
+    /// recorded consistently and is not retried by idempotent callers.
+    async fn mark_wakeup_skipped(
+        &self,
+        idempotency_row_id: Option<Uuid>,
+        company_id: Uuid,
+        agent_id: Uuid,
+        payload: &Value,
+        options: &HeartbeatWakeupOptions,
+        reason: &str,
+    ) -> Result<(), HeartbeatError> {
+        if let Some(row_id) = idempotency_row_id {
+            sqlx::query(
+                "UPDATE agent_wakeup_requests
+                 SET status = 'skipped', payload = $2, reason = $3,
+                     finished_at = NOW(), updated_at = NOW()
+                 WHERE id = $1",
+            )
+            .bind(row_id)
+            .bind(payload)
+            .bind(reason)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        } else {
+            sqlx::query(
+                "INSERT INTO agent_wakeup_requests
+                 (company_id, agent_id, status, payload, source, trigger_detail,
+                  reason, requested_by_actor_type, requested_by_actor_id,
+                  idempotency_key, finished_at, updated_at)
+                 VALUES ($1, $2, 'skipped', $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())",
+            )
+            .bind(company_id)
+            .bind(agent_id)
+            .bind(payload)
+            .bind(options.source.as_deref())
+            .bind(options.trigger_detail.as_deref())
+            .bind(reason)
+            .bind(options.requested_by_actor_type.as_deref())
+            .bind(options.requested_by_actor_id)
+            .bind(options.idempotency_key.as_deref())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2059,13 +2117,55 @@ impl HeartbeatService for DefaultHeartbeatService {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-            if row.is_none() {
-                return Ok(());
-            }
             row
         } else {
             None
         };
+
+        // ── Budget hard-stop enforcement ──────────────────────────────────────
+        // Hard-stop is the verifiable "硬停止" contract: when a company/agent budget
+        // hard-stop is reached (open hard-stop incident / scope paused for budget /
+        // observed spend >= policy amount with hard_stop_enabled), no new work may
+        // start. get_invocation_block already implements the full scoped check
+        // (company → agent → project). It was previously only reachable via the
+        // read-only GET /budgets/invocation-block route and never consulted here, so
+        // a hard-stop incident did NOT actually block runs. Wire it through the single
+        // wakeup funnel so every wakeup source (heartbeat, issue assignment, scheduled-
+        // retry promotion, recovery) honors the stop. Fail OPEN on billing-service
+        // errors: a billing DB hiccup must not deadlock every agent wakeup.
+        if let Some(budget_service) = &self.budget_service {
+            match budget_service
+                .get_invocation_block(company_id, agent_id, None)
+                .await
+            {
+                Ok(Some(block)) => {
+                    let payload = serde_json::json!({
+                        "issueId": issue_id,
+                        "heartbeatSkip": {
+                            "reason": "budget_hard_stop",
+                            "scopeType": block.scope_type,
+                            "scopeId": block.scope_id,
+                            "scopeName": block.scope_name,
+                            "detail": block.reason,
+                            "requestedReason": options.reason,
+                        }
+                    });
+                    self.mark_wakeup_skipped(idempotency_row_id, company_id, agent_id, &payload, &options, "budget_hard_stop")
+                        .await?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        company_id = %company_id,
+                        agent_id = %agent_id,
+                        error = %e,
+                        "budget invocation-block check failed; allowing wakeup (fail-open)"
+                    );
+                }
+            }
+        }
+
 
         let throttle_candidate = matches!(
             options.reason.as_deref(),
@@ -2861,6 +2961,7 @@ impl DefaultHeartbeatService {
             children: self.children.clone(),
             sse_service: self.sse_service.clone(),
             cost_service: self.cost_service.clone(),
+            budget_service: self.budget_service.clone(),
         }
     }
 }

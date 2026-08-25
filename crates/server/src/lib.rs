@@ -410,11 +410,21 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
         )
         .with_adapter_registry(adapter_registry.clone()),
     );
+    let budget_service: Arc<dyn services::BudgetService> = Arc::new(
+        services::DefaultBudgetService::new(
+            cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
+            budget_policy_repo.clone() as Arc<dyn repositories::BudgetPolicyRepository>,
+            budget_incident_repo.clone() as Arc<dyn repositories::BudgetIncidentRepository>,
+            Arc::new(company_repo_for_services.clone()),
+        ),
+    );
+
 
     let heartbeat_coordinator = Arc::new(
         DefaultHeartbeatService::new(pool.clone())
             .with_sse_service(sse_service.clone())
-            .with_cost_service(cost_service.clone()),
+            .with_cost_service(cost_service.clone())
+            .with_budget_service(budget_service.clone()),
     );
     let heartbeat_service: Arc<dyn services::HeartbeatService> = heartbeat_coordinator.clone();
     let recovery_action_repository = Arc::new(
@@ -530,12 +540,7 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
         label_service,
         instance_settings_service,
         cost_service.clone(),
-        Arc::new(services::DefaultBudgetService::new(
-            cost_event_repo.clone() as Arc<dyn repositories::CostEventRepository>,
-            budget_policy_repo.clone() as Arc<dyn repositories::BudgetPolicyRepository>,
-            budget_incident_repo.clone() as Arc<dyn repositories::BudgetIncidentRepository>,
-            Arc::new(company_repo_for_services.clone()),
-        )),
+        budget_service.clone(),
         Arc::new(services::DefaultFinanceService::new(
             finance_event_repo.clone() as Arc<dyn repositories::FinanceEventRepository>,
             Arc::new(company_repo_for_services.clone()),

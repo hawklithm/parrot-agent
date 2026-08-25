@@ -10,8 +10,13 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-
 use api::create_router;
+use repositories::{
+    budget_repository::{PgBudgetIncidentRepository, PgBudgetPolicyRepository},
+    cost_event_repository::PgCostEventRepository,
+    company_repository::CompanyRepository,
+};
+
 
 async fn ensure_local_trusted_principal(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let configured_user_id = std::env::var("LOCAL_TRUSTED_USER_ID")
@@ -135,11 +140,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("initializing job scheduler...");
     let job_scheduler = Arc::new(services::JobScheduler::new().with_pool(pool.clone()));
 
-    // 创建 RoutineExecutionService
-    let routine_execution_service = Arc::new(services::RoutineExecutionService::new(pool.clone()));
+    // RoutineExecutionService dispatches scheduled triggers through RoutineService
+    // (single source of truth for run creation: concurrency policy, idempotency,
+    // dispatch fingerprint) — see services::routine_execution_service.
+    let routine_repo: Arc<dyn repositories::RoutineRepository> =
+        Arc::new(repositories::routine_repository::PostgresRoutineRepository::new(pool.clone()));
+    let scheduler_budget_service: Arc<dyn services::BudgetService> = Arc::new(
+        services::DefaultBudgetService::new(
+            Arc::new(PgCostEventRepository::new(pool.clone())),
+            Arc::new(PgBudgetPolicyRepository::new(pool.clone())),
+            Arc::new(PgBudgetIncidentRepository::new(pool.clone())),
+            Arc::new(CompanyRepository::new(pool.clone())),
+        ),
+    );
+    let scheduler_heartbeat = Arc::new(
+        services::DefaultHeartbeatService::new(pool.clone())
+            .with_budget_service(scheduler_budget_service),
+    );
+    let routine_execution_service = Arc::new(services::RoutineExecutionService::new(Arc::new(
+        services::RoutineServiceImpl::new(routine_repo),
+    )));
     // Share one scheduler heartbeat runtime with recovery and decision-retention
     // notification jobs so archive notifications use the real wake path.
-    let scheduler_heartbeat = Arc::new(services::DefaultHeartbeatService::new(pool.clone()));
 
     // 注册后台任务
     job_scheduler
