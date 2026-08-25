@@ -261,7 +261,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     plugin_job_scheduler.start().await;
     tracing::info!("plugin job scheduler started");
 
-    let state = parrot_server::build_app_state(pool.clone()).await?;
+    let mut state = parrot_server::build_app_state(pool.clone()).await?;
+    state.scheduler = Some(job_scheduler.clone());
 
     let app: Router = create_router(state);
 

@@ -29,6 +29,7 @@ pub mod projects;
 pub mod resource_memberships;
 pub mod routine_annotations;
 pub mod routines;
+pub mod scheduler_routes;
 pub mod secret_provider_configs;
 pub mod secret_remote_import;
 pub mod secrets;

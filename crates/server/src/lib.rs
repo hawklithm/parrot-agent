@@ -556,5 +556,6 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
         decision_training_service,
         event_bus,
         pool,
+        None,
     ))
 }

@@ -134,6 +134,9 @@ pub struct AppState {
     // Event bus
     pub event_bus: Arc<dyn EventBus>,
 
+    // Background-task scheduler observability (None in test/embedded contexts)
+    pub scheduler: Option<Arc<services::JobScheduler>>,
+
     // Shared DB pool
     pub pool: PgPool,
 }
@@ -200,6 +203,7 @@ impl AppState {
         decision_training_service: Arc<dyn DecisionTrainingService>,
         event_bus: Arc<dyn EventBus>,
         pool: PgPool,
+        scheduler: Option<Arc<services::JobScheduler>>,
     ) -> Self {
         Self {
             agent_service,
@@ -258,6 +262,7 @@ impl AppState {
             decision_training_service,
             event_bus,
             pool,
+            scheduler,
         }
     }
 }
@@ -310,6 +315,8 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::secrets::secret_routes())
         // Pipeline routes
         .merge(crate::routes::pipelines::pipeline_routes())
+        // Background-task scheduler observability (job metadata / executions / leases / trigger)
+        .merge(crate::routes::scheduler_routes::scheduler_routes())
         // Routine/Goal routes
         .merge(crate::routes::routines::routine_routes())
         .merge(crate::routes::goals::goal_routes())
