@@ -1183,8 +1183,8 @@ impl DefaultHeartbeatService {
             "stderr": output.stderr,
         });
         if let Err(error) = sqlx::query(
-            "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, result_json = $6, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
-            .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output.stdout).bind(&result_json).execute(&self.pool).await
+            "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, result_json = $6, error_code = $7, error_family = $8, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
+            .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output.stdout).bind(&result_json).bind(outcome.error_code).bind(outcome.error_family).execute(&self.pool).await
         {
             tracing::error!(%run_id, %error, "failed to persist heartbeat run final status");
         }

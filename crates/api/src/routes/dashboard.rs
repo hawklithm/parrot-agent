@@ -5,10 +5,11 @@
 //! tasks（issue 状态桶）、costs（本月花费/预算/利用率）、pendingApprovals、
 //! budgets（open incidents / 预算审批）与 runActivity（最近 14 天运行分布）。
 //!
-//! Parrot 差异说明：`heartbeat_runs` 无 `error_code` / `retry_of_run_id` 列，
-//! 因此 runActivity 的 `failedByErrorCode` 为空、`recovered` 恒 0；
-//! `budget_policies` 无 Paperclip 的 `paused` 列，因此 pausedAgents /
-//! pausedProjects 恒 0（policy 级暂停语义未迁移）。
+//! Parrot 差异说明：`heartbeat_runs.error_code` 现已持久化（migration 58），runActivity 的
+//! `failedByErrorCode` 按日分组非空；`recovered` 仍恒 0（依赖 `retry_of_run_id` 回填，scheduled-retry
+//! 续跑链路尚未接通，见 §4B.2 Run Liveness/Continuation）。
+//! `budget_policies` 无 Paperclip 的 `paused` 列，因此 pausedAgents / pausedProjects 恒 0
+//! （policy 级暂停语义未迁移）。
 
 use crate::{app_state::AppState, errors::AppError};
 use axum::{
@@ -218,6 +219,20 @@ async fn run_activity(pool: &PgPool, company_id: Uuid) -> Result<Value, AppError
     .await
     .map_err(db_err)?;
 
+    // Per-day failure breakdown by classified error_code (Paperclip runActivity.failedByErrorCode).
+    let error_rows = sqlx::query(
+        "SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date, \
+                COALESCE(error_code, 'unknown') AS error_code, COUNT(*)::bigint AS count \
+           FROM heartbeat_runs \
+          WHERE company_id = $1 AND created_at >= $2 AND status IN ('failed','timed_out') \
+          GROUP BY date, error_code",
+    )
+    .bind(company_id)
+    .bind(window_start.date_naive().and_hms_opt(0, 0, 0).map(|d| d.and_utc()).unwrap_or(window_start))
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
     let mut buckets: Vec<Value> = Vec::with_capacity(RUN_ACTIVITY_DAYS as usize);
     for offset in 0..RUN_ACTIVITY_DAYS {
         let day = (now - Duration::days(offset)).date_naive();
@@ -252,6 +267,25 @@ async fn run_activity(pool: &PgPool, company_id: Uuid) -> Result<Value, AppError
             _ => bump(obj, "other"),
         }
         bump(obj, "total");
+    }
+    for row in &error_rows {
+        let date: String = row.get("date");
+        let error_code: String = row.get("error_code");
+        let count: i64 = row.get("count");
+        let Some(bucket) = buckets
+            .iter_mut()
+            .find(|b| b["date"].as_str() == Some(date.as_str()))
+        else {
+            continue;
+        };
+        let obj = bucket.as_object_mut().expect("bucket is an object");
+        let map = obj
+            .entry("failedByErrorCode")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .expect("failedByErrorCode is an object");
+        let next = map.get(&error_code).and_then(Value::as_i64).unwrap_or(0) + count;
+        map.insert(error_code, json!(next));
     }
     Ok(Value::Array(buckets))
 }
