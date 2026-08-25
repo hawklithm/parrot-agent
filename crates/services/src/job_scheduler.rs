@@ -701,8 +701,13 @@ impl ScheduledJob for HeartbeatRecoveryJob {
             .reconcile_dependency_wakeups()
             .await
             .map_err(|e| e.to_string())?;
+        let promoted = self
+            .heartbeat
+            .promote_due_scheduled_retries()
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(format!(
-            "reconciled {orphaned} orphaned runs, {pending} pending issues, and {dependency_wakes} dependency wakes"
+            "reconciled {orphaned} orphaned runs, {pending} pending issues, {dependency_wakes} dependency wakes, and promoted {promoted} scheduled retries"
         ))
     }
 }

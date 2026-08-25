@@ -322,6 +322,21 @@ fn classify_claude_error(message: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
+/// Human-readable reason recorded on a scheduled retry, derived from the
+/// adapter outcome. Falls back to the explicit failure reason, then to the
+/// classified error code, then a generic message.
+fn retry_reason(outcome: &AdapterOutcome) -> String {
+    if let Some(reason) = outcome.failure_reason.as_deref() {
+        if !reason.trim().is_empty() {
+            return reason.to_string();
+        }
+    }
+    if let Some(code) = outcome.error_code.as_deref() {
+        return format!("recoverable failure: {code}");
+    }
+    "recoverable failure".to_string()
+}
+
 fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: bool) {
     let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
     if matches!(kind, "tool_use" | "tool_call") || value.get("tool_name").is_some() {
@@ -1182,6 +1197,24 @@ impl DefaultHeartbeatService {
             "stdout": output.stdout,
             "stderr": output.stderr,
         });
+        // Self-healing: a recoverable failure is rescheduled instead of left
+        // terminal. maybe_schedule_retry transitions the run to `scheduled_retry`
+        // (finished_at cleared); the finalize UPDATE below is guarded by
+        // `status IN ('queued','running')` so it is a harmless no-op for the
+        // rescheduled run, while token-usage tracking still runs below.
+        if status == "failed" {
+            let _ = self
+                .maybe_schedule_retry(
+                    run_id,
+                    agent_id,
+                    issue_id,
+                    company_id,
+                    outcome.error_code.as_deref(),
+                    outcome.error_family.as_deref(),
+                    &retry_reason(&outcome),
+                )
+                .await;
+        }
         if let Err(error) = sqlx::query(
             "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, result_json = $6, error_code = $7, error_family = $8, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
             .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output.stdout).bind(&result_json).bind(outcome.error_code).bind(outcome.error_family).execute(&self.pool).await
@@ -1971,8 +2004,6 @@ impl DefaultHeartbeatService {
             .bind(options.source.as_deref())
             .bind(options.trigger_detail.as_deref())
             .bind(options.reason.as_deref())
-            .bind(options.requested_by_actor_type.as_deref())
-            .bind(options.requested_by_actor_id)
             .execute(&self.pool)
             .await
             .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
@@ -2005,7 +2036,7 @@ impl HeartbeatService for DefaultHeartbeatService {
                  (company_id, agent_id, status, payload, source, trigger_detail, reason,
                   requested_by_actor_type, requested_by_actor_id, idempotency_key, updated_at)
                  VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, NOW())
-                 ON CONFLICT (company_id, idempotency_key) DO NOTHING
+                 ON CONFLICT (company_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
                  RETURNING id",
             )
             .bind(company_id)
@@ -2614,6 +2645,206 @@ impl DefaultHeartbeatService {
             healed += 1;
         }
         Ok(healed)
+    }
+
+    /// Maximum automatic scheduled-retry attempts before a failed run is left
+    /// as a terminal `failed` (mirrors Paperclip's recoverable-run cap).
+    const MAX_SCHEDULED_RETRY_ATTEMPTS: i32 = 3;
+    /// Backoff (seconds) for the Nth scheduled retry (exponential, capped).
+    fn scheduled_retry_backoff_secs(attempt: i32) -> i64 {
+        let base: i64 = 60;
+        let doublings = (attempt.max(1) - 1).min(6) as u32;
+        (base * 2_i64.pow(doublings)).min(60 * 60)
+    }
+
+    /// A run is a self-healing candidate when it failed with a recoverable
+    /// error family: transient upstream (rate limits/overload), auth, or an
+    /// upstream protocol glitch. Permanent failures (explicit business logic
+    /// failure with no error_code) are not retried.
+    fn is_recoverable_failure(error_code: Option<&str>) -> bool {
+        matches!(
+            error_code,
+            Some("claude_auth_required")
+                | Some("claude_transient_upstream")
+                | Some("claude_malformed_response")
+                | Some("adapter_failed")
+        )
+    }
+
+    /// Decide whether a just-failed run should be auto-rescheduled instead of
+    /// left terminal, and if so transition it to `scheduled_retry`. Returns
+    /// `true` when the run was rescheduled.
+    pub async fn maybe_schedule_retry(
+        &self,
+        run_id: Uuid,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        error_code: Option<&str>,
+        error_family: Option<&str>,
+        reason: &str,
+    ) -> Result<bool, HeartbeatError> {
+        if !Self::is_recoverable_failure(error_code) {
+            return Ok(false);
+        }
+        let row: Option<(i32,)> = sqlx::query_as(
+            "SELECT COALESCE(scheduled_retry_attempt, 0) FROM heartbeat_runs WHERE id = $1",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+        let attempt = row.map(|r| (r.0 + 1).min(Self::MAX_SCHEDULED_RETRY_ATTEMPTS)).unwrap_or(1);
+        if attempt > Self::MAX_SCHEDULED_RETRY_ATTEMPTS {
+            return Ok(false);
+        }
+        let backoff = Self::scheduled_retry_backoff_secs(attempt);
+        let updated = sqlx::query(
+            "UPDATE heartbeat_runs
+             SET status = 'scheduled_retry'::heartbeat_run_status,
+                 scheduled_retry_at = NOW() + ($2 || ' seconds')::interval,
+                 scheduled_retry_attempt = $3,
+                 scheduled_retry_reason = $4,
+                 retry_of_run_id = $1,
+                 error_code = COALESCE($5, error_code),
+                 error_family = COALESCE($6, error_family),
+                 finished_at = NULL,
+                 result_json = COALESCE(result_json, '{}'::jsonb)
+                     || jsonb_build_object('scheduledRetry', true, 'scheduledRetryAttempt', $3),
+                 updated_at = NOW()
+             WHERE id = $1 AND status = 'failed'",
+        )
+        .bind(run_id)
+        .bind(backoff)
+        .bind(attempt)
+        .bind(reason)
+        .bind(error_code)
+        .bind(error_family)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+        if updated.rows_affected() > 0 {
+            tracing::info!(
+                run_id = %run_id,
+                attempt = %attempt,
+                backoff_secs = %backoff,
+                "scheduled recoverable run for retry"
+            );
+            let _ = publish_live_event(
+                &self.sse_service,
+                company_id,
+                "heartbeat.run.status",
+                serde_json::json!({
+                    "runId": run_id,
+                    "agentId": agent_id,
+                    "issueId": issue_id,
+                    "status": "scheduled_retry",
+                    "scheduledRetryAttempt": attempt,
+                    "scheduledRetryAt": (chrono::Utc::now() + chrono::Duration::seconds(backoff)),
+                    "errorCode": error_code,
+                }),
+            )
+            .await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Self-healing promotion: find `scheduled_retry` runs whose
+    /// `scheduled_retry_at` is due and re-wake them via the normal wakeup path
+    /// (which resets the run back to a queued wakeup request). Idempotent per
+    /// run; safe to call from the heartbeat_recovery scheduler job.
+    pub async fn promote_due_scheduled_retries(&self) -> Result<usize, HeartbeatError> {
+        let rows = sqlx::query(
+            "SELECT id, agent_id, company_id, context_snapshot, scheduled_retry_attempt
+             FROM heartbeat_runs
+             WHERE status = 'scheduled_retry'
+               AND scheduled_retry_at IS NOT NULL
+               AND scheduled_retry_at <= NOW()
+             ORDER BY scheduled_retry_at ASC
+             LIMIT 200",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+        let mut promoted = 0;
+        for row in rows {
+            let run_id: Uuid = row
+                .try_get("id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let agent_id: Uuid = row
+                .try_get("agent_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let company_id: Uuid = row
+                .try_get("company_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let attempt: i32 = row
+                .try_get("scheduled_retry_attempt")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let issue_id = row
+                .try_get::<Option<serde_json::Value>, _>("context_snapshot")
+                .ok()
+                .flatten()
+                .and_then(|snapshot| {
+                    snapshot
+                        .get("issueId")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                })
+                .and_then(|value| Uuid::parse_str(&value).ok());
+            let Some(issue_id) = issue_id else {
+                continue;
+            };
+
+            if let Err(e) = self
+                .wakeup_with_options(
+                    agent_id,
+                    issue_id,
+                    company_id,
+                    HeartbeatWakeupOptions {
+                        source: Some("recovery".to_string()),
+                        trigger_detail: Some("scheduled_retry".to_string()),
+                        reason: Some("scheduled_retry_promotion".to_string()),
+                        idempotency_key: Some(format!(
+                            "scheduled_retry_promotion:{}:{}",
+                            issue_id, attempt
+                        )),
+                        payload: Some(serde_json::json!({
+                            "issueId": issue_id,
+                            "scheduledRetry": true,
+                            "scheduledRetryAttempt": attempt,
+                        })),
+                        context_snapshot: Some(serde_json::json!({
+                            "issueId": issue_id,
+                            "source": "heartbeat.scheduled_retry",
+                            "reason": "scheduled_retry_promotion",
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                tracing::error!(
+                    run_id = %run_id,
+                    error = %e,
+                    "failed to promote scheduled retry"
+                );
+                continue;
+            }
+            // Clear the scheduled_retry marker now that a fresh wakeup exists.
+            let _ = sqlx::query(
+                "UPDATE heartbeat_runs
+                 SET scheduled_retry_at = NULL, updated_at = NOW()
+                 WHERE id = $1 AND status = 'scheduled_retry'",
+            )
+            .bind(run_id)
+            .execute(&self.pool)
+            .await;
+            promoted += 1;
+        }
+        Ok(promoted)
     }
 
     fn clone_for_task(&self) -> Self {
