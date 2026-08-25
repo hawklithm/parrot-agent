@@ -550,6 +550,8 @@ where
             }),
             budget_monthly_cents: input.budget_monthly_cents.unwrap_or(0),
             reports_to: input.reports_to,
+            pause_reason: None,
+            paused_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

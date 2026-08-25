@@ -37,6 +37,8 @@ fn map_agent_row(row: sqlx::postgres::PgRow) -> Agent {
         metadata: row.get("metadata"),
         budget_monthly_cents: row.get("budget_monthly_cents"),
         reports_to: row.get("reports_to"),
+        pause_reason: row.get("pause_reason"),
+        paused_at: row.get("paused_at"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }

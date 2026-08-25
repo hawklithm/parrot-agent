@@ -704,6 +704,8 @@ where
             }),
             budget_monthly_cents: budget,
             reports_to,
+            pause_reason: None,
+            paused_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

@@ -191,6 +191,8 @@ pub struct Agent {
     pub metadata: Json<AgentMetadata>,
     pub budget_monthly_cents: i32,
     pub reports_to: Option<Uuid>,
+    pub pause_reason: Option<String>,
+    pub paused_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

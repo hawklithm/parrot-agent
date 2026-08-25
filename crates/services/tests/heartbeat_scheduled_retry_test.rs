@@ -471,3 +471,73 @@ async fn wakeup_blocked_by_budget_hard_stop() {
         .await
         .ok();
 }
+
+/// Agent-scope budget hard-stop must persist pause_reason='budget' + paused_at on
+/// the agents row (PAPERCLIP_MIGRATION_PLAN §4B.2 line 316). The columns were
+/// missing from the live schema (companies/projects had them, agents did not), so
+/// this UPDATE used to fail with 42703 and was silently swallowed by `let _ =`.
+#[tokio::test]
+async fn budget_pause_writes_agent_pause_columns() {
+    let Some(pool) = connect().await else { return; };
+    let (company_id, agent_id) = seed(&pool).await;
+
+    let policy_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO budget_policies (id, company_id, scope_type, scope_id, metric, window_kind, amount, hard_stop_enabled, is_active)
+         VALUES ($1, $2, 'agent', $3, 'billed_cents', 'calendar_month_utc', 100, true, true)",
+    )
+    .bind(policy_id)
+    .bind(company_id)
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("insert agent-scope budget policy");
+    sqlx::query(
+        "INSERT INTO cost_events (company_id, agent_id, amount_cents, cost_cents, event_type, occurred_at)
+         VALUES ($1, $2, 10000000, 10000000, 'usage', NOW())",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("insert cost event");
+
+    let budget_service = build_budget_service(&pool);
+    budget_service
+        .evaluate_cost_event(company_id, agent_id, None)
+        .await
+        .expect("evaluate_cost_event");
+
+    let (status, pause_reason, paused_at): (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as(
+            "SELECT status, pause_reason, paused_at FROM agents WHERE id = $1",
+        )
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read agent");
+    assert_eq!(status, "paused", "agent must be paused by hard-stop enforcement");
+    assert_eq!(pause_reason.as_deref(), Some("budget"), "pause_reason must be 'budget'");
+    assert!(paused_at.is_some(), "paused_at must be set");
+
+    sqlx::query("DELETE FROM cost_events WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM budget_policies WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+}

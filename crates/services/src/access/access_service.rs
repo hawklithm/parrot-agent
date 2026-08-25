@@ -553,6 +553,8 @@ mod tests {
             }),
             budget_monthly_cents: 0,
             reports_to: None,
+            pause_reason: None,
+            paused_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -575,6 +577,8 @@ mod tests {
             }),
             budget_monthly_cents: 0,
             reports_to: None,
+            pause_reason: None,
+            paused_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -614,6 +618,8 @@ mod tests {
             }),
             budget_monthly_cents: 10000,
             reports_to: None,
+            pause_reason: None,
+            paused_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
