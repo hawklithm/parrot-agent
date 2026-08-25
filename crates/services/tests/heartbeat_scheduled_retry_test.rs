@@ -117,7 +117,9 @@ async fn maybe_schedule_retry_transitions_recoverable_failure() {
     assert_eq!(row.0, "scheduled_retry");
     assert!(row.1.is_some(), "scheduled_retry_at must be set");
     assert_eq!(row.2, 1, "first attempt");
-    assert_eq!(row.3.as_deref(), Some(run_id.to_string().as_str()));
+    // The parent run does not retry itself; the link to it is written on the
+    // promoted retry run (verified by the promotion test below).
+    assert_eq!(row.3, None, "parent run must NOT self-reference retry_of_run_id");
 
     cleanup(&pool, company_id, run_id).await;
 }
@@ -171,7 +173,7 @@ async fn promote_due_scheduled_retries_rewakes_run() {
     let run_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO heartbeat_runs (id, company_id, agent_id, invocation_source, status, context_snapshot, scheduled_retry_at, scheduled_retry_attempt, retry_of_run_id)
-         VALUES ($1, $2, $3, 'on_demand', 'scheduled_retry', $4::jsonb, NOW() - INTERVAL '1 minute', 2, $1)",
+         VALUES ($1, $2, $3, 'on_demand', 'scheduled_retry', $4::jsonb, NOW() - INTERVAL '1 minute', 2, NULL)",
     )
     .bind(run_id)
     .bind(company_id)
@@ -210,6 +212,36 @@ async fn promote_due_scheduled_retries_rewakes_run() {
     .await
     .expect("read marker");
     assert!(!still_due, "scheduled_retry_at cleared after promotion");
+
+    // The promoted retry run must carry retry_of_run_id = parent run id, so the
+    // dashboard `recovered` counter can identify retry-succeeded runs.
+    let linked: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+           SELECT 1 FROM heartbeat_runs
+           WHERE company_id = $1 AND agent_id = $2 AND retry_of_run_id = $3
+         )",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query promoted run link");
+    assert!(linked, "promoted retry run must point retry_of_run_id at the parent run");
+
+    // The run-continuation ledger must record the promotion (run -> parent).
+    let continuation: Option<(String,)> = sqlx::query_as(
+        "SELECT reason FROM run_continuations
+         WHERE parent_run_id = $1 AND continuation_point = 'scheduled_retry'",
+    )
+    .bind(run_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("query continuation");
+    assert!(
+        continuation.is_some(),
+        "promotion must write a run_continuations ledger row"
+    );
 
     cleanup(&pool, company_id, run_id).await;
 }

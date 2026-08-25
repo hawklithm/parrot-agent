@@ -223,6 +223,10 @@ pub struct HeartbeatWakeupOptions {
     pub idempotency_key: Option<String>,
     pub payload: Option<Value>,
     pub context_snapshot: Option<Value>,
+    /// When this wakeup is a scheduled-retry promotion, the run it continues
+    /// (the original failed run). Persisted on the created heartbeat run so the
+    /// dashboard `recovered` counter can identify retry-succeeded runs.
+    pub retry_of_run_id: Option<Uuid>,
 }
 
 /// Heartbeat context information for an issue
@@ -1991,11 +1995,11 @@ impl DefaultHeartbeatService {
             context = serde_json::json!({ "issueId": issue_id });
         }
         let run_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot, responsible_user_id)
-             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, i.responsible_user_id
+            "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot, responsible_user_id, retry_of_run_id)
+             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, i.responsible_user_id, $6
              FROM issues i WHERE i.id = $5
              UNION ALL
-             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, NULL::uuid
+             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, NULL::uuid, $6
              WHERE NOT EXISTS (SELECT 1 FROM issues WHERE id = $5)
              LIMIT 1
              RETURNING id",
@@ -2005,6 +2009,7 @@ impl DefaultHeartbeatService {
         .bind("on_demand")
         .bind(&context)
         .bind(issue_id)
+        .bind(options.retry_of_run_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
@@ -2855,7 +2860,6 @@ impl DefaultHeartbeatService {
                  scheduled_retry_at = NOW() + ($2 || ' seconds')::interval,
                  scheduled_retry_attempt = $3,
                  scheduled_retry_reason = $4,
-                 retry_of_run_id = $1,
                  error_code = COALESCE($5, error_code),
                  error_family = COALESCE($6, error_family),
                  finished_at = NULL,
@@ -2971,6 +2975,7 @@ impl DefaultHeartbeatService {
                             "source": "heartbeat.scheduled_retry",
                             "reason": "scheduled_retry_promotion",
                         })),
+                        retry_of_run_id: Some(run_id),
                         ..Default::default()
                     },
                 )
@@ -2992,6 +2997,38 @@ impl DefaultHeartbeatService {
             .bind(run_id)
             .execute(&self.pool)
             .await;
+
+            // Record the run-continuation ledger entry (PAPERCLIP_MIGRATION_PLAN
+            // §4B.2 line 325): the freshly created retry run continues the run
+            // being promoted. Best-effort — the promotion itself already
+            // succeeded; a failed ledger write must not fail the promotion.
+            let new_run_id = sqlx::query_scalar(
+                "SELECT payload->>'runId' FROM agent_wakeup_requests
+                 WHERE company_id = $1 AND agent_id = $2 AND payload->>'issueId' = $3
+                   AND payload->>'runId' IS NOT NULL
+                 ORDER BY updated_at DESC LIMIT 1",
+            )
+            .bind(company_id)
+            .bind(agent_id)
+            .bind(issue_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value: Option<String>| value.and_then(|v| Uuid::parse_str(&v).ok()));
+            if let Some(new_run_id) = new_run_id {
+                let _ = crate::run_continuations_service::RunContinuationsService::new(
+                    self.pool.clone(),
+                )
+                .create_continuation(
+                    new_run_id,
+                    Some(run_id),
+                    "scheduled_retry".to_string(),
+                    serde_json::json!({ "issueId": issue_id, "attempt": attempt }),
+                    format!("scheduled_retry_promotion attempt={attempt}"),
+                )
+                .await;
+            }
             promoted += 1;
         }
         Ok(promoted)

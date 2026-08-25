@@ -79,6 +79,7 @@ impl IssueAssignmentWakeupService {
                         "source": input.context_source,
                     })),
                     idempotency_key: input.idempotency_key.clone(),
+                    retry_of_run_id: None,
                 },
             )
             .await;

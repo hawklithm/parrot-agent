@@ -219,6 +219,28 @@ async fn run_activity(pool: &PgPool, company_id: Uuid) -> Result<Value, AppError
     .await
     .map_err(db_err)?;
 
+    // Recovered = succeeded runs that are retries (retry_of_run_id populated by the
+    // scheduled-retry promotion path). Paperclip splits these out of `succeeded`
+    // (UI renders effectiveSucceeded = succeeded + recovered), so a retry-succeeded
+    // run must NOT also count toward `succeeded`.
+    let retry_rows = sqlx::query(
+        "SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date, \
+                COUNT(*)::bigint AS count \
+           FROM heartbeat_runs \
+          WHERE company_id = $1 AND created_at >= $2 \
+            AND status = 'succeeded' AND retry_of_run_id IS NOT NULL \
+          GROUP BY date",
+    )
+    .bind(company_id)
+    .bind(window_start.date_naive().and_hms_opt(0, 0, 0).map(|d| d.and_utc()).unwrap_or(window_start))
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    let mut retry_counts: std::collections::HashMap<String, i64> = retry_rows
+        .iter()
+        .map(|row| (row.get::<String, _>("date"), row.get::<i64, _>("count")))
+        .collect();
+
     // Per-day failure breakdown by classified error_code (Paperclip runActivity.failedByErrorCode).
     let error_rows = sqlx::query(
         "SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date, \
@@ -257,16 +279,23 @@ async fn run_activity(pool: &PgPool, company_id: Uuid) -> Result<Value, AppError
             continue;
         };
         let obj = bucket.as_object_mut().expect("bucket is an object");
-        let bump = |obj: &mut serde_json::Map<String, Value>, key: &str| {
-            let next = obj.get(key).and_then(Value::as_i64).unwrap_or(0) + count;
+        let bump_by = |obj: &mut serde_json::Map<String, Value>, key: &str, delta: i64| {
+            if delta <= 0 {
+                return;
+            }
+            let next = obj.get(key).and_then(Value::as_i64).unwrap_or(0) + delta;
             obj.insert(key.to_string(), json!(next));
         };
         match status.as_str() {
-            "succeeded" => bump(obj, "succeeded"),
-            "failed" | "timed_out" => bump(obj, "failed"),
-            _ => bump(obj, "other"),
+            "succeeded" => {
+                let retry_count = retry_counts.remove(date.as_str()).unwrap_or(0);
+                bump_by(obj, "succeeded", count - retry_count);
+                bump_by(obj, "recovered", retry_count);
+            }
+            "failed" | "timed_out" => bump_by(obj, "failed", count),
+            _ => bump_by(obj, "other", count),
         }
-        bump(obj, "total");
+        bump_by(obj, "total", count);
     }
     for row in &error_rows {
         let date: String = row.get("date");

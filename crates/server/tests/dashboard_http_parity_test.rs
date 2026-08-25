@@ -143,8 +143,19 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .await
     .expect("insert cost event");
 
-    // Today's run activity: one succeeded, one failed.
-    for status in ["succeeded", "failed"] {
+    // Today's run activity: one succeeded, one failed, and one retry-succeeded
+    // (retry_of_run_id set — must surface as `recovered`, not `succeeded`).
+    let failed_run_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO heartbeat_runs (id, company_id, agent_id, status) VALUES ($1, $2, $3, 'failed'::heartbeat_run_status)",
+    )
+    .bind(failed_run_id)
+    .bind(company_a)
+    .bind(agent_running)
+    .execute(pool)
+    .await
+    .expect("insert failed heartbeat run");
+    for status in ["succeeded"] {
         sqlx::query(
             "INSERT INTO heartbeat_runs (id, company_id, agent_id, status) VALUES ($1, $2, $3, $4::heartbeat_run_status)",
         )
@@ -156,6 +167,16 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         .await
         .expect("insert heartbeat run");
     }
+    sqlx::query(
+        "INSERT INTO heartbeat_runs (id, company_id, agent_id, status, retry_of_run_id) VALUES ($1, $2, $3, 'succeeded'::heartbeat_run_status, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(company_a)
+    .bind(agent_running)
+    .bind(failed_run_id)
+    .execute(pool)
+    .await
+    .expect("insert retry-succeeded heartbeat run");
 
     // One open budget incident (no approval link).
     let policy_id = Uuid::new_v4();
@@ -285,13 +306,14 @@ async fn dashboard_summary_matches_paperclip() {
     assert_eq!(summary["budgets"]["pausedAgents"], 0);
     assert_eq!(summary["budgets"]["pausedProjects"], 0);
 
-    // Run activity: the newest day carries today's succeeded + failed runs.
+    // Run activity: the newest day carries today's succeeded + failed + recovered runs.
     let run_activity = summary["runActivity"].as_array().expect("runActivity array");
     assert_eq!(run_activity.len(), 14, "14-day window");
     let today = run_activity[0].clone();
     assert_eq!(today["succeeded"], 1);
+    assert_eq!(today["recovered"], 1, "retry-succeeded run must surface as recovered");
     assert_eq!(today["failed"], 1);
-    assert_eq!(today["total"], 2);
+    assert_eq!(today["total"], 3);
 
     // A board from another company cannot read the dashboard.
     let outsider = session_board_actor(Uuid::new_v4(), Uuid::new_v4());
