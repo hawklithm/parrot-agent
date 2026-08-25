@@ -1500,8 +1500,15 @@ impl RoutineCronTrigger {
         use cron::Schedule;
         use std::str::FromStr;
 
-        let schedule =
-            Schedule::from_str(cron_expr).map_err(|e| format!("Invalid cron expression: {}", e))?;
+        // 应用统一使用 5 字段 cron（分 时 日 月 周）；cron 0.12 需要 6 字段（含秒）。
+        // 5 字段时补秒字段 "0"，与全局约定对齐。
+        let normalized = if cron_expr.split_whitespace().count() == 5 {
+            format!("0 {}", cron_expr)
+        } else {
+            cron_expr.to_string()
+        };
+        let schedule = Schedule::from_str(&normalized)
+            .map_err(|e| format!("Invalid cron expression: {}", e))?;
 
         let tz: Tz = timezone
             .parse()
@@ -1547,7 +1554,7 @@ impl ScheduledJob for RoutineCronTrigger {
                 r.id as routine_id_check,
                 r.company_id,
                 r.status as routine_status,
-                r.catch_up_policy,
+                r.catch_up_policy::text as catch_up_policy,
                 r.project_id,
                 p.paused_at as project_paused_at
             FROM routine_triggers rt

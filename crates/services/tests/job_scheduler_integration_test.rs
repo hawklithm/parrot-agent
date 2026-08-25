@@ -6,48 +6,50 @@
 //! 3. 并发策略（skip_if_active, coalesce）正确处理
 //! 4. 乐观锁防止重复触发
 
-use services::{JobScheduler, RoutineCronTrigger, RoutineExecutionService, ScheduledJob};
+use services::{
+    JobScheduler, RoutineCronTrigger, RoutineExecutionService, RoutineServiceImpl, ScheduledJob,
+};
+use repositories::RoutineRepository;
 use std::sync::Arc;
 use sqlx::PgPool;
 use chrono::Utc;
 
 #[tokio::test]
-#[ignore] // 需要真实数据库环境
 async fn test_routine_cron_trigger_basic() {
-    // 设置测试数据库
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5433/parrot_agent_test".to_string());
+    // 使用回归数据库（与 parity 测试一致）；缺失则跳过而非失败。
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:admin123@127.0.0.1:5433/parrot_agent_compile".to_string()
+    });
+
+    let pool = match PgPool::connect(&database_url).await {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("skipping test_routine_cron_trigger_basic: no DATABASE_URL reachable");
+            return;
+        }
+    };
     
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("Failed to connect to test database");
-    
-    // 运行迁移
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("Failed to run migrations");
-    
-    // 清理测试数据
+    // 清理 routine 相关表（company/agent 用随机 UUID，不删除以免触碰共享库其他数据外键）
     sqlx::query("DELETE FROM routine_runs").execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM routine_triggers").execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM routines").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM companies").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM agents").execute(&pool).await.unwrap();
     
     // 创建测试数据
     let company_id = uuid::Uuid::new_v4();
+    let issue_prefix = format!("T{}", &company_id.simple().to_string()[..6]);
+
     sqlx::query(
-        "INSERT INTO companies (id, name) VALUES ($1, 'Test Company')"
+        "INSERT INTO companies (id, name, issue_prefix) VALUES ($1, 'Test Company', $2)"
     )
     .bind(company_id)
+    .bind(&issue_prefix)
     .execute(&pool)
     .await
     .unwrap();
     
     let agent_id = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO agents (id, company_id, name, adapter) VALUES ($1, $2, 'Test Agent', 'test_adapter')"
+        "INSERT INTO agents (id, company_id, name) VALUES ($1, $2, 'Test Agent')"
     )
     .bind(agent_id)
     .bind(company_id)
@@ -59,8 +61,8 @@ async fn test_routine_cron_trigger_basic() {
     sqlx::query(
         r#"
         INSERT INTO routines 
-        (id, company_id, title, status, assignee_agent_id, concurrency_policy, catch_up_policy)
-        VALUES ($1, $2, 'Test Routine', 'active', $3, 'always_enqueue', 'skip_to_latest')
+        (id, company_id, agent_id, assignee_agent_id, name, title, status, concurrency_policy, catch_up_policy)
+        VALUES ($1, $2, $3, $3, 'Test Routine', 'Test Routine', 'active', 'coalesce_if_active', 'skip_missed')
         "#
     )
     .bind(routine_id)
@@ -77,19 +79,24 @@ async fn test_routine_cron_trigger_basic() {
     sqlx::query(
         r#"
         INSERT INTO routine_triggers
-        (id, routine_id, kind, enabled, cron_expression, timezone, next_run_at)
-        VALUES ($1, $2, 'schedule', true, '*/5 * * * *', 'UTC', $3)
+        (id, routine_id, company_id, kind, trigger_type, status, enabled, cron_expression, timezone, next_run_at)
+        VALUES ($1, $2, $4, 'schedule', 'cron', 'active', true, '*/5 * * * *', 'UTC', $3)
         "#
     )
     .bind(trigger_id)
     .bind(routine_id)
     .bind(past)
+    .bind(company_id)
     .execute(&pool)
     .await
     .unwrap();
-    
-    // 创建服务
-    let routine_execution_service = Arc::new(RoutineExecutionService::new(pool.clone()));
+
+    // 创建服务（经 RoutineService 单一路径派发，复用并发策略/idempotency/fingerprint）
+    let routine_repo: Arc<dyn RoutineRepository> =
+        Arc::new(repositories::routine_repository::PostgresRoutineRepository::new(pool.clone()));
+    let routine_execution_service = Arc::new(RoutineExecutionService::new(Arc::new(
+        RoutineServiceImpl::new(routine_repo),
+    )));
     let cron_trigger = RoutineCronTrigger::new(pool.clone(), routine_execution_service);
     
     // 执行触发
@@ -110,6 +117,20 @@ async fn test_routine_cron_trigger_basic() {
     .unwrap();
     
     assert_eq!(run_count, 1, "Should have 1 routine run");
+    // 验证派发的 run 经过 RoutineService 单一路径：状态为 queued（always_enqueue 且无活跃 run），
+    // 且写入了 dispatch_fingerprint（并发策略/idempotency 模型的一部分）。
+    let (status, dispatch_fingerprint): (String, Option<String>) = sqlx::query_as(
+        "SELECT status::text, dispatch_fingerprint FROM routine_runs WHERE routine_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(routine_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "queued", "scheduled run via fire_routine should be queued");
+    assert!(
+        dispatch_fingerprint.is_some(),
+        "scheduled run should carry a dispatch_fingerprint (dispatch path aligned)"
+    );
     
     // 验证 trigger 的 next_run_at 已更新
     let updated_next_run: chrono::DateTime<Utc> = sqlx::query_scalar(
@@ -174,7 +195,11 @@ async fn test_routine_catch_up_policy() {
     .bind(trigger_id).bind(routine_id).bind(past).execute(&pool).await.unwrap();
     
     // 执行触发
-    let routine_execution_service = Arc::new(RoutineExecutionService::new(pool.clone()));
+    let routine_repo: Arc<dyn RoutineRepository> =
+        Arc::new(repositories::routine_repository::PostgresRoutineRepository::new(pool.clone()));
+    let routine_execution_service = Arc::new(RoutineExecutionService::new(Arc::new(
+        RoutineServiceImpl::new(routine_repo),
+    )));
     let cron_trigger = RoutineCronTrigger::new(pool.clone(), routine_execution_service);
     let result = cron_trigger.execute().await;
     
@@ -251,7 +276,11 @@ async fn test_routine_project_paused() {
     .bind(trigger_id).bind(routine_id).bind(past).execute(&pool).await.unwrap();
     
     // 执行触发
-    let routine_execution_service = Arc::new(RoutineExecutionService::new(pool.clone()));
+    let routine_repo: Arc<dyn RoutineRepository> =
+        Arc::new(repositories::routine_repository::PostgresRoutineRepository::new(pool.clone()));
+    let routine_execution_service = Arc::new(RoutineExecutionService::new(Arc::new(
+        RoutineServiceImpl::new(routine_repo),
+    )));
     let cron_trigger = RoutineCronTrigger::new(pool.clone(), routine_execution_service);
     let result = cron_trigger.execute().await;
     

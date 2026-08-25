@@ -397,7 +397,7 @@ pub use text_utils::*;
 pub mod retry;
 pub use retry::*;
 pub mod routine_execution_service;
-pub use routine_execution_service::{RoutineExecutionService, DispatchRoutineRunInput, RoutineRun, RoutineRunSource};
+pub use routine_execution_service::{RoutineExecutionService, DispatchRoutineRunInput, RoutineRunSource};
 pub mod routine_variable_service;
 pub use routine_variable_service::{
     RoutineVariableValue, get_builtin_routine_variable_values, 
