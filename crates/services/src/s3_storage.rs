@@ -14,13 +14,10 @@
 //! provider, so company isolation is preserved on the S3 side.
 
 use crate::asset_storage::{build_object_key, PutFileRequest, StoredObject, StorageService};
+use crate::aws_sigv4::{hex_hmac, hex_sha256, hmac_sha256, urlencode, SigV4Signer};
 use crate::errors::{ServiceError, ServiceResult};
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// S3 provider configuration.
 #[derive(Debug, Clone)]
@@ -120,20 +117,17 @@ impl S3StorageService {
             .to_string()
     }
 
+    fn signer(&self) -> SigV4Signer {
+        SigV4Signer::new(
+            self.config.access_key.clone(),
+            self.config.secret_key.clone(),
+            self.config.region.clone(),
+            "s3".to_string(),
+        )
+    }
+
     fn signature(&self, canonical_request: &str, amz_date: &str, date_stamp: &str) -> String {
-        let scope = format!("{date_stamp}/{}/s3/aws4_request", self.config.region);
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-            hex_sha256(canonical_request.as_bytes())
-        );
-        let date_key = hmac_sha256(
-            format!("AWS4{}", self.config.secret_key).as_bytes(),
-            date_stamp.as_bytes(),
-        );
-        let region_key = hmac_sha256(&date_key, self.config.region.as_bytes());
-        let service_key = hmac_sha256(&region_key, b"s3");
-        let signing_key = hmac_sha256(&service_key, b"aws4_request");
-        hex_hmac(&signing_key, string_to_sign.as_bytes())
+        self.signer().signature(canonical_request, amz_date, date_stamp)
     }
 
     async fn send_signed(
@@ -268,33 +262,6 @@ impl StorageService for S3StorageService {
     }
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-fn hex_hmac(key: &[u8], data: &[u8]) -> String {
-    let bytes = hmac_sha256(key, data);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn urlencode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,11 +333,5 @@ mod tests {
         assert!(url.contains("X-Amz-SignedHeaders=host"), "signed headers param");
         // Host is bucket.s3.amazonaws.com in virtual-hosted style.
         assert!(url.starts_with("https://parrot-assets.s3.amazonaws.com/c1/ns/file.txt"), "virtual-host URL: {url}");
-    }
-
-    #[test]
-    fn urlencode_escapes_non_unreserved() {
-        assert_eq!(urlencode("AKIA/key"), "AKIA%2Fkey");
-        assert_eq!(urlencode("a~b_c-d.e"), "a~b_c-d.e");
     }
 }

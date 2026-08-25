@@ -190,6 +190,8 @@ pub mod approval_service;
 pub use approval_service::{ApprovalService, DefaultApprovalService};
 pub mod activity_log_service;
 pub mod asset_storage;
+pub mod aws_secrets_manager_provider;
+pub mod aws_sigv4;
 pub mod s3_storage;
 pub mod attachment_service;
 pub mod attachment_types;

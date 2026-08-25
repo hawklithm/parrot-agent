@@ -62,7 +62,7 @@ pub struct UpdateSecretInput {
     pub provider_config_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum SecretProviderType {
     LocalEncrypted,

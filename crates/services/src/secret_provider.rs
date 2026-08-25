@@ -23,6 +23,27 @@ pub fn load_secret_encryption_key() -> Vec<u8> {
     vec![0u8; 32]
 }
 
+/// Load the previous AES-256 key during a rotation window
+/// (`PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS`). Returns None when unset — normal
+/// steady-state operation. During rotation, decrypts fall back to this key so
+/// envelopes written under the old key remain readable until re-encrypted.
+pub fn load_previous_secret_encryption_key() -> Option<Vec<u8>> {
+    match env::var("PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS") {
+        Ok(s) if s.len() == 64 => match hex::decode(&s) {
+            Ok(bytes) if bytes.len() == 32 => Some(bytes),
+            _ => {
+                tracing::warn!("PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS is not valid 32-byte hex; ignored");
+                None
+            }
+        },
+        Ok(_) => {
+            tracing::warn!("PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS must be 64 hex chars; ignored");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 /// SHA-256 hex of a secret plaintext value (mirrors paperclip value_sha256).
 pub fn sha256_hex(value: &str) -> String {
     let mut hasher = Sha256::new();
@@ -32,16 +53,26 @@ pub fn sha256_hex(value: &str) -> String {
 
 /// Encrypt a managed secret for persistence and return its plaintext digest.
 /// The digest is used only for change detection/fingerprinting; the value itself
-/// never belongs in a database JSON envelope.
+/// never belongs in a database JSON envelope. The envelope carries a `version`
+/// field (currently 1) so future key-derivation or format changes can be
+/// detected and migrated per-envelope.
 pub fn encrypt_secret_material(
     plaintext: &str,
 ) -> Result<(JsonValue, String), ProviderError> {
     let provider = LocalEncryptedProvider::new(load_secret_encryption_key())?;
     let ciphertext = provider.encrypt(plaintext)?;
-    Ok((serde_json::json!({ "ciphertext": ciphertext }), sha256_hex(plaintext)))
+    Ok((
+        serde_json::json!({ "version": 1, "ciphertext": ciphertext }),
+        sha256_hex(plaintext),
+    ))
 }
 
 /// Decrypt a persisted local-encrypted material envelope.
+///
+/// Failure recovery during key rotation: when the current key cannot decrypt
+/// (the envelope was written under the previous key), falls back to
+/// `PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS` so old envelopes remain readable
+/// until re-encrypted by `rotate_secret_material`.
 pub fn decrypt_secret_material(material: &JsonValue) -> Result<String, ProviderError> {
     let Some(ciphertext) = material.get("ciphertext").and_then(|value| value.as_str()) else {
         // Read-only compatibility for rows written before encrypted material
@@ -52,8 +83,42 @@ pub fn decrypt_secret_material(material: &JsonValue) -> Result<String, ProviderE
             .map(str::to_owned)
             .ok_or_else(|| ProviderError::Decryption("missing ciphertext in material".into()));
     };
+    // `version` is informational (currently always 1); unknown future versions
+    // still attempt decryption — format migration is a per-envelope concern.
+    let current = LocalEncryptedProvider::new(load_secret_encryption_key());
+    match current {
+        Ok(provider) => match provider.decrypt(ciphertext) {
+            Ok(plaintext) => return Ok(plaintext),
+            Err(first_error) => {
+                // Rotation window: try the previous key before giving up.
+                if let Some(previous) = load_previous_secret_encryption_key() {
+                    if let Ok(previous_provider) = LocalEncryptedProvider::new(previous) {
+                        if let Ok(plaintext) = previous_provider.decrypt(ciphertext) {
+                            return Ok(plaintext);
+                        }
+                    }
+                }
+                return Err(first_error);
+            }
+        },
+        Err(config_error) => Err(config_error),
+    }
+}
+
+/// Re-encrypt a material envelope under the current key, bumping its version.
+///
+/// Key-rotation recovery: decrypts with the current key (or the previous key
+/// during a rotation window) and re-encrypts with the current key. Returns the
+/// new envelope; callers persist it in place of the old one.
+pub fn rotate_secret_material(material: &JsonValue) -> Result<JsonValue, ProviderError> {
+    let plaintext = decrypt_secret_material(material)?;
     let provider = LocalEncryptedProvider::new(load_secret_encryption_key())?;
-    provider.decrypt(ciphertext)
+    let ciphertext = provider.encrypt(&plaintext)?;
+    let version = material
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    Ok(serde_json::json!({ "version": version + 1, "ciphertext": ciphertext }))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -244,6 +309,7 @@ mod tests {
         let (material, digest) = encrypt_secret_material("persisted-value").unwrap();
         assert_eq!(digest, sha256_hex("persisted-value"));
         assert!(material.get("ciphertext").and_then(|v| v.as_str()).is_some());
+        assert_eq!(material.get("version").and_then(|v| v.as_u64()), Some(1), "envelope carries version");
         assert_eq!(decrypt_secret_material(&material).unwrap(), "persisted-value");
     }
 
@@ -251,5 +317,56 @@ mod tests {
     fn test_legacy_material_is_read_only_compatible() {
         let material = serde_json::json!({ "value": "legacy-value" });
         assert_eq!(decrypt_secret_material(&material).unwrap(), "legacy-value");
+    }
+
+    #[test]
+    fn test_rotation_window_and_key_change_failure() {
+        // Env mutation is process-global; keep the whole scenario in one test
+        // so parallel test threads cannot interleave key changes.
+        // Phase 1: write under old key, rotate to new key with PREVIOUS set.
+        unsafe {
+            std::env::set_var("PARROT_SECRET_ENCRYPTION_KEY", "0".repeat(64));
+            std::env::remove_var("PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS");
+        }
+        let (material, _) = encrypt_secret_material("rotation-value").unwrap();
+
+        unsafe {
+            std::env::set_var("PARROT_SECRET_ENCRYPTION_KEY", "1".repeat(64));
+            std::env::set_var("PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS", "0".repeat(64));
+        }
+        assert_eq!(
+            decrypt_secret_material(&material).unwrap(),
+            "rotation-value",
+            "previous-key fallback must decrypt old envelopes during rotation"
+        );
+
+        // rotate_secret_material re-encrypts under the CURRENT key (bumps version).
+        let rotated = rotate_secret_material(&material).unwrap();
+        assert_eq!(rotated.get("version").and_then(|v| v.as_u64()), Some(2), "version bumps on rotate");
+        // After rotation the previous key is no longer needed.
+        unsafe {
+            std::env::remove_var("PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS");
+        }
+        assert_eq!(
+            decrypt_secret_material(&rotated).unwrap(),
+            "rotation-value",
+            "rotated envelope decrypts with the current key alone"
+        );
+
+        // Phase 2: change the key WITHOUT a previous-key window — decrypt must
+        // fail loudly (never silently corrupt or return wrong plaintext).
+        unsafe {
+            std::env::set_var("PARROT_SECRET_ENCRYPTION_KEY", "2".repeat(64));
+            std::env::remove_var("PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS");
+        }
+        assert!(
+            decrypt_secret_material(&material).is_err(),
+            "without the previous key, changed-key envelopes must fail loudly (not corrupt)"
+        );
+
+        unsafe {
+            std::env::remove_var("PARROT_SECRET_ENCRYPTION_KEY");
+            std::env::remove_var("PARROT_SECRET_ENCRYPTION_KEY_PREVIOUS");
+        }
     }
 }
