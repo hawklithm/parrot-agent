@@ -1629,7 +1629,7 @@ impl ScheduledJob for RoutineCronTrigger {
                 })?;
 
             // 4. 处理 catch-up policy（补发错过的运行）
-            if !project_paused && catch_up_policy.as_deref() == Some("enqueue_missed_with_cap") {
+            if !project_paused && catch_up_policy.as_deref() == Some("run_missed") {
                 let mut cursor = next_run_at;
                 run_count = 0;
 
