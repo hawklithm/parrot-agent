@@ -10,12 +10,17 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
 use models::pipeline::{Pipeline, PipelineCase, PipelineStage, PipelineTransition};
 use services::CreateCaseInput;
+
+fn db_err(e: sqlx::Error) -> AppError {
+    AppError::InternalServerError(e.to_string())
+}
 
 pub fn pipeline_routes() -> Router<AppState> {
     Router::new()
@@ -381,106 +386,404 @@ async fn batch_create_cases(
 
 /// P16: GET /pipelines/:id/runs
 async fn list_pipeline_runs(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(pipeline_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    Ok(Json(vec![]))
+    let _pipeline = state
+        .pipeline_service
+        .get_pipeline(pipeline_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let rows = sqlx::query(
+        "SELECT id, pipeline_id, stage_id, case_id, status, attempt, retry_of_run_id,
+                trigger_type, trigger_detail, error, started_at, finished_at, created_at
+         FROM pipeline_runs WHERE pipeline_id = $1 ORDER BY created_at DESC LIMIT 100",
+    )
+    .bind(pipeline_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(db_err)?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| pipeline_run_json(row))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// P17: POST /pipelines/:id/runs
 async fn create_pipeline_run(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(pipeline_id): Path<Uuid>,
-    Json(_body): Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    Ok((StatusCode::CREATED, Json(serde_json::json!({"pipelineId": pipeline_id, "runId": Uuid::new_v4()}))))
+    let pipeline = state
+        .pipeline_service
+        .get_pipeline(pipeline_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let stage_id: Option<Uuid> = body
+        .get("stageId")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let case_id: Option<Uuid> = body
+        .get("caseId")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let run_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO pipeline_runs (id, company_id, pipeline_id, stage_id, case_id, status, trigger_type, trigger_detail)
+         VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7)
+         RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(pipeline.company_id)
+    .bind(pipeline_id)
+    .bind(stage_id)
+    .bind(case_id)
+    .bind(body.get("triggerType").and_then(|v| v.as_str()))
+    .bind(body.get("triggerDetail").and_then(|v| v.as_str()))
+    .fetch_one(&state.pool)
+    .await
+    .map_err(db_err)?;
+    write_pipeline_log(
+        &state,
+        pipeline.company_id,
+        Some(run_id),
+        "info",
+        "pipeline run queued",
+        serde_json::json!({ "pipelineId": pipeline_id }),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "pipelineId": pipeline_id, "runId": run_id, "status": "queued" })),
+    ))
 }
 
 /// P18: GET /pipelines/:id/runs/:run_id
 async fn get_pipeline_run(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path((pipeline_id, run_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    Ok(Json(serde_json::json!({"pipelineId": pipeline_id, "runId": run_id, "status": "completed"})))
+    let row = sqlx::query(
+        "SELECT id, pipeline_id, stage_id, case_id, status, attempt, retry_of_run_id,
+                trigger_type, trigger_detail, error, started_at, finished_at, created_at
+         FROM pipeline_runs WHERE id = $1 AND pipeline_id = $2",
+    )
+    .bind(run_id)
+    .bind(pipeline_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(db_err)?;
+    let row = row.ok_or_else(|| AppError::NotFound("pipeline run not found".to_string()))?;
+    Ok(Json(pipeline_run_json(&row)))
 }
 
 /// P19: DELETE /pipelines/:id/runs/:run_id
 async fn delete_pipeline_run(
-    State(_state): State<AppState>,
-    Path((_pipeline_id, _run_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Path((pipeline_id, run_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
+    let _ = sqlx::query("DELETE FROM pipeline_runs WHERE id = $1 AND pipeline_id = $2")
+        .bind(run_id)
+        .bind(pipeline_id)
+        .execute(&state.pool)
+        .await
+        .map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// P20: POST /pipelines/:id/runs/:run_id/cancel
 async fn cancel_pipeline_run(
-    State(_state): State<AppState>,
-    Path((_pipeline_id, run_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Path((pipeline_id, run_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    Ok(Json(serde_json::json!({"runId": run_id, "cancelled": true})))
+    let company_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT company_id FROM pipeline_runs WHERE id = $1 AND pipeline_id = $2",
+    )
+    .bind(run_id)
+    .bind(pipeline_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(db_err)?;
+    let Some(company_id) = company_id else {
+        return Err(AppError::NotFound("pipeline run not found".to_string()));
+    };
+    sqlx::query(
+        "UPDATE pipeline_runs SET status = 'cancelled', finished_at = NOW(), updated_at = NOW()
+         WHERE id = $1 AND status IN ('queued','running')",
+    )
+    .bind(run_id)
+    .execute(&state.pool)
+    .await
+    .map_err(db_err)?;
+    write_pipeline_log(
+        &state,
+        company_id,
+        Some(run_id),
+        "warn",
+        "pipeline run cancelled",
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "runId": run_id, "cancelled": true })))
 }
 
-/// P21: POST /pipelines/:id/runs/:run_id/retry
+/// P21: POST /pipelines/:id/runs/:run_id/retry — Automation Retry: create a fresh
+/// run linked to the retried one (retry_of_run_id), attempt + 1.
 async fn retry_pipeline_run(
-    State(_state): State<AppState>,
-    Path((_pipeline_id, run_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Path((pipeline_id, run_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    Ok(Json(serde_json::json!({"runId": run_id, "retried": true})))
+    let row = sqlx::query(
+        "SELECT company_id, stage_id, case_id, attempt FROM pipeline_runs WHERE id = $1 AND pipeline_id = $2",
+    )
+    .bind(run_id)
+    .bind(pipeline_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(db_err)?;
+    let row = row.ok_or_else(|| AppError::NotFound("pipeline run not found".to_string()))?;
+    let company_id: Uuid = row.get("company_id");
+    let stage_id: Option<Uuid> = row.get("stage_id");
+    let case_id: Option<Uuid> = row.get("case_id");
+    let attempt: i32 = row.get("attempt");
+    let new_run_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO pipeline_runs (id, company_id, pipeline_id, stage_id, case_id, status, attempt, retry_of_run_id, trigger_type)
+         VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, 'automation_retry')
+         RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(company_id)
+    .bind(pipeline_id)
+    .bind(stage_id)
+    .bind(case_id)
+    .bind(attempt + 1)
+    .bind(run_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(db_err)?;
+    write_pipeline_log(
+        &state,
+        company_id,
+        Some(new_run_id),
+        "info",
+        "pipeline run retried",
+        serde_json::json!({ "retryOfRunId": run_id, "attempt": attempt + 1 }),
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "runId": new_run_id, "retried": true, "retryOfRunId": run_id, "attempt": attempt + 1 })))
 }
 
 /// P22: GET /pipelines/:id/stages/:stage_id
 async fn get_pipeline_stage(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path((pipeline_id, stage_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    Ok(Json(serde_json::json!({"pipelineId": pipeline_id, "stageId": stage_id})))
+    let stages = state
+        .pipeline_service
+        .list_stages(pipeline_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let stage = stages
+        .into_iter()
+        .find(|s| s.id == stage_id)
+        .ok_or_else(|| AppError::NotFound("pipeline stage not found".to_string()))?;
+    Ok(Json(serde_json::to_value(stage).map_err(|e| AppError::InternalServerError(e.to_string()))?))
 }
-
 
 /// P23: GET /pipelines/:id/triggers
 async fn list_pipeline_triggers(
-    State(_state): State<AppState>,
-    Path(_pipeline_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(pipeline_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    Ok(Json(vec![]))
+    let _pipeline = state
+        .pipeline_service
+        .get_pipeline(pipeline_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let rows = sqlx::query(
+        "SELECT id, pipeline_id, trigger_type, config, is_active, created_at
+         FROM pipeline_triggers WHERE pipeline_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(pipeline_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(db_err)?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "pipelineId": row.get::<Uuid, _>("pipeline_id"),
+                    "triggerType": row.get::<String, _>("trigger_type"),
+                    "config": row.get::<serde_json::Value, _>("config"),
+                    "isActive": row.get::<bool, _>("is_active"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// P24: POST /pipelines/:id/triggers
 async fn create_pipeline_trigger(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(pipeline_id): Path<Uuid>,
-    Json(_body): Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    Ok((StatusCode::CREATED, Json(serde_json::json!({"pipelineId": pipeline_id, "triggerId": Uuid::new_v4()}))))
+    let pipeline = state
+        .pipeline_service
+        .get_pipeline(pipeline_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let trigger_type = body
+        .get("triggerType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("schedule")
+        .to_string();
+    let config = body.get("config").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let is_active = body.get("isActive").and_then(|v| v.as_bool()).unwrap_or(true);
+    let trigger_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO pipeline_triggers (id, company_id, pipeline_id, trigger_type, config, is_active)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(pipeline.company_id)
+    .bind(pipeline_id)
+    .bind(&trigger_type)
+    .bind(&config)
+    .bind(is_active)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(db_err)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "pipelineId": pipeline_id, "triggerId": trigger_id })),
+    ))
 }
 
 /// P25: DELETE /pipelines/:id/triggers/:trigger_id
 async fn delete_pipeline_trigger(
-    State(_state): State<AppState>,
-    Path((_pipeline_id, _trigger_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Path((pipeline_id, trigger_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
+    let _ = sqlx::query("DELETE FROM pipeline_triggers WHERE id = $1 AND pipeline_id = $2")
+        .bind(trigger_id)
+        .bind(pipeline_id)
+        .execute(&state.pool)
+        .await
+        .map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// P26: GET /pipelines/:id/metrics
+/// P26: GET /pipelines/:id/metrics — real aggregation over pipeline_runs.
 async fn get_pipeline_metrics(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(pipeline_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let _pipeline = state
+        .pipeline_service
+        .get_pipeline(pipeline_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let (total_runs, succeeded, avg_secs): (i64, i64, Option<f64>) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint,
+                COUNT(*) FILTER (WHERE status = 'succeeded')::bigint,
+                AVG(EXTRACT(EPOCH FROM (finished_at - started_at)))
+         FROM pipeline_runs WHERE pipeline_id = $1",
+    )
+    .bind(pipeline_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(db_err)?;
+    let success_rate = if total_runs > 0 {
+        succeeded as f64 / total_runs as f64
+    } else {
+        0.0
+    };
     Ok(Json(serde_json::json!({
         "pipelineId": pipeline_id,
-        "totalRuns": 0,
-        "successRate": 0.0,
-        "avgDuration": 0
+        "totalRuns": total_runs,
+        "successRate": (success_rate * 1000.0).round() / 1000.0,
+        "avgDuration": avg_secs.unwrap_or(0.0),
     })))
 }
 
 /// P27: GET /pipelines/:id/logs
 async fn get_pipeline_logs(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(pipeline_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    Ok(Json(vec![]))
+    let _pipeline = state
+        .pipeline_service
+        .get_pipeline(pipeline_id)
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let rows = sqlx::query(
+        "SELECT l.id, l.run_id, l.level, l.message, l.metadata, l.created_at
+         FROM pipeline_logs l
+         JOIN pipeline_runs r ON r.id = l.run_id
+         WHERE r.pipeline_id = $1
+         ORDER BY l.created_at DESC LIMIT 200",
+    )
+    .bind(pipeline_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(db_err)?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "runId": row.get::<Option<Uuid>, _>("run_id"),
+                    "level": row.get::<String, _>("level"),
+                    "message": row.get::<String, _>("message"),
+                    "metadata": row.get::<serde_json::Value, _>("metadata"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                })
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn pipeline_run_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.get::<Uuid, _>("id"),
+        "pipelineId": row.get::<Uuid, _>("pipeline_id"),
+        "stageId": row.get::<Option<Uuid>, _>("stage_id"),
+        "caseId": row.get::<Option<Uuid>, _>("case_id"),
+        "status": row.get::<String, _>("status"),
+        "attempt": row.get::<i32, _>("attempt"),
+        "retryOfRunId": row.get::<Option<Uuid>, _>("retry_of_run_id"),
+        "triggerType": row.get::<Option<String>, _>("trigger_type"),
+        "triggerDetail": row.get::<Option<String>, _>("trigger_detail"),
+        "error": row.get::<Option<String>, _>("error"),
+        "startedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at"),
+        "finishedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+    })
+}
+
+async fn write_pipeline_log(
+    state: &AppState,
+    company_id: Uuid,
+    run_id: Option<Uuid>,
+    level: &str,
+    message: &str,
+    metadata: serde_json::Value,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO pipeline_logs (id, company_id, run_id, level, message, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(company_id)
+    .bind(run_id)
+    .bind(level)
+    .bind(message)
+    .bind(metadata)
+    .execute(&state.pool)
+    .await;
 }
 
 /// Query params for listing cases

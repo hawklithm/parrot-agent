@@ -30,7 +30,7 @@ impl PostgresPipelineCaseRepository {
 
 const CASE_COLS: &str = "id, company_id, pipeline_id, stage_id, case_key, title, summary, fields, terminal_kind, version, pending_suggestion, created_at, updated_at";
 
-const EVENT_COLS: &str = "id, case_id, event_type, payload, actor_type, actor_id, created_at";
+const EVENT_COLS: &str = "id, company_id, case_id, event_type, payload, actor_type, actor_id, created_at";
 
 #[async_trait]
 impl PipelineCaseRepository for PostgresPipelineCaseRepository {
@@ -135,10 +135,11 @@ impl PipelineCaseRepository for PostgresPipelineCaseRepository {
     async fn create_event(&self, event: CaseEvent) -> RepositoryResult<CaseEvent> {
         sqlx::query(
             r#"INSERT INTO pipeline_case_events
-               (id, case_id, event_type, payload, actor_type, actor_id, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)"#
+               (id, company_id, case_id, event_type, payload, actor_type, actor_id, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#
         )
         .bind(event.id)
+        .bind(event.company_id)
         .bind(event.case_id)
         .bind(&event.event_type)
         .bind(&event.payload)

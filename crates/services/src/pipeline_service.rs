@@ -26,6 +26,7 @@ pub struct AdvanceCaseInput {
 
 /// Case creation input
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateCaseInput {
     pub pipeline_id: Uuid,
     pub stage_id: Uuid,
@@ -182,8 +183,16 @@ impl DefaultPipelineService {
         actor_type: Option<String>,
         actor_id: Option<Uuid>,
     ) -> Result<(), ServiceError> {
+        let company_id = self
+            .case_repo
+            .find_by_id(case_id)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to load case: {}", e)))?
+            .map(|case| case.company_id)
+            .ok_or_else(|| ServiceError::NotFound("case not found".to_string()))?;
         let event = CaseEvent {
             id: Uuid::new_v4(),
+            company_id,
             case_id,
             event_type,
             payload,
@@ -304,7 +313,7 @@ impl PipelineService for DefaultPipelineService {
         let mut sorted_stages = input.stages.clone();
         sorted_stages.sort_by_key(|s| s.position);
 
-        for i in 0..sorted_stages.len() - 1 {
+        for i in 0..sorted_stages.len().saturating_sub(1) {
             let from_stage_id = stage_ids[&sorted_stages[i].key];
             let to_stage_id = stage_ids[&sorted_stages[i + 1].key];
 

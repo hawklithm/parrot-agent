@@ -163,7 +163,156 @@ impl CaseService for PgCaseService {
     async fn get_children_tree(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { Ok(serde_json::json!({"caseId": id, "children": self.get_children(id, company_id).await?})) }
     async fn get_rollup(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { let children = self.get_children(id, company_id).await?; Ok(serde_json::json!({"caseId": id, "totalChildren": children.len(), "children": children})) }
     async fn get_context_pack(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { let detail = self.get_detail(id, company_id).await?.ok_or("case not found")?; Ok(serde_json::to_value(detail).map_err(|e| e.to_string())?) }
-    async fn get_outputs(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> { let c = self.load(id, company_id).await?; Ok(c.fields.get("outputs").cloned().unwrap_or(serde_json::json!([]))) }
+    async fn get_outputs(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> {
+        use sqlx::Row;
+        let c = self.load(id, company_id).await?;
+        let case_key: Option<&str> = c.key.as_deref();
+        let pipeline_id: Option<Uuid> = match case_key {
+            Some(key) => sqlx::query_scalar(
+                "SELECT pipeline_id FROM pipeline_cases WHERE company_id = $1 AND case_key = $2 LIMIT 1",
+            )
+            .bind(company_id)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?,
+            None => None,
+        };
+
+        // Sources: issue links on this case.
+        let links = self.links.list_by_case(id).await.map_err(|e| e.to_string())?;
+        let mut sources: Vec<serde_json::Value> = Vec::new();
+        let mut by_source_role: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        for link in &links {
+            let role = serde_json::to_string(&link.role)
+                .unwrap_or_else(|_| "\"work\"".to_string())
+                .trim_matches('"')
+                .to_string();
+            *by_source_role.entry(role.clone()).or_insert(0) += 1;
+            sources.push(serde_json::json!({
+                "linkId": link.id,
+                "role": role,
+                "issueId": link.issue_id,
+                "issueIdentifier": serde_json::Value::Null,
+                "issueTitle": serde_json::Value::Null,
+                "issueStatus": serde_json::Value::Null,
+                "createdByRunId": serde_json::Value::Null,
+                "linkedAt": link.created_at,
+            }));
+        }
+
+        // Document items.
+        let doc_rows = sqlx::query(
+            "SELECT d.id AS document_id, d.title, d.content, d.content_type, d.status,
+                    d.metadata, d.created_at, d.updated_at, d.version
+             FROM case_documents cd
+             JOIN documents d ON d.id = cd.document_id
+             WHERE cd.case_id = $1
+             ORDER BY d.updated_at DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut documents_items: Vec<serde_json::Value> = Vec::new();
+        for r in &doc_rows {
+            let document_id: Uuid = r.get("document_id");
+            let title: String = r.get("title");
+            let content: String = r.get("content");
+            let content_type: String = r.get("content_type");
+            let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
+            let updated_at: chrono::DateTime<chrono::Utc> = r.get("updated_at");
+            documents_items.push(serde_json::json!({
+                "id": document_id,
+                "kind": "document",
+                "title": title,
+                "documentId": document_id,
+                "documentKey": serde_json::Value::Null,
+                "documentTitle": title,
+                "format": content_type,
+                "latestRevisionId": serde_json::Value::Null,
+                "latestRevisionNumber": 1,
+                "documentPath": format!("{}/{}", id, document_id),
+                "sourceIssueId": serde_json::Value::Null,
+                "sourceIssueIdentifier": serde_json::Value::Null,
+                "sourceIssuePath": serde_json::Value::Null,
+                "sourceIssueTitle": serde_json::Value::Null,
+                "sourceIssueStatus": serde_json::Value::Null,
+                "sourceRole": "origin",
+                "sourceRunId": serde_json::Value::Null,
+                "sourceAgentId": serde_json::Value::Null,
+                "preview": content.chars().take(200).collect::<String>(),
+                "createdAt": created_at,
+                "updatedAt": updated_at,
+            }));
+        }
+
+        // Attachment items.
+        let att_rows = sqlx::query(
+            "SELECT a.id AS attachment_id, a.filename, a.content_type, a.size_bytes,
+                    a.created_at, a.asset_id
+             FROM case_attachments ca
+             JOIN attachments a ON a.id = ca.asset_id
+             WHERE ca.case_id = $1
+             ORDER BY a.created_at DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut attachment_items: Vec<serde_json::Value> = Vec::new();
+        for r in &att_rows {
+            let attachment_id: Uuid = r.get("attachment_id");
+            let asset_id: Uuid = r.get("asset_id");
+            let filename: String = r.get("filename");
+            let content_type: String = r.get("content_type");
+            let size_bytes: i64 = r.get("size_bytes");
+            let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
+            attachment_items.push(serde_json::json!({
+                "id": attachment_id,
+                "kind": "attachment",
+                "title": filename,
+                "attachmentId": attachment_id,
+                "assetId": asset_id,
+                "filename": filename,
+                "contentType": content_type,
+                "byteSize": size_bytes,
+                "contentPath": format!("attachment/{}", attachment_id),
+                "openPath": format!("attachment/{}/open", attachment_id),
+                "downloadPath": format!("attachment/{}/download", attachment_id),
+                "sourceIssueId": serde_json::Value::Null,
+                "sourceIssueIdentifier": serde_json::Value::Null,
+                "sourceIssuePath": serde_json::Value::Null,
+                "sourceIssueTitle": serde_json::Value::Null,
+                "sourceIssueStatus": serde_json::Value::Null,
+                "sourceRole": "origin",
+                "sourceRunId": serde_json::Value::Null,
+                "sourceAgentId": serde_json::Value::Null,
+                "preview": serde_json::Value::Null,
+                "createdAt": created_at,
+                "updatedAt": created_at,
+            }));
+        }
+
+        let documents = documents_items.len() as i64;
+        let attachments = attachment_items.len() as i64;
+        let mut items: Vec<serde_json::Value> = Vec::with_capacity(documents_items.len() + attachment_items.len());
+        items.extend(documents_items);
+        items.extend(attachment_items);
+        Ok(serde_json::json!({
+            "caseId": id,
+            "pipelineId": pipeline_id,
+            "generatedAt": chrono::Utc::now(),
+            "sources": sources,
+            "items": items,
+            "counts": {
+                "documents": documents,
+                "workProducts": 0,
+                "attachments": attachments,
+                "bySourceRole": by_source_role,
+            },
+        }))
+    }
     async fn get_issue_links(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String> { self.load(id, company_id).await?; Ok(self.links.list_by_case(id).await.map_err(|e| e.to_string())?.into_iter().map(|l| serde_json::to_value(l).unwrap_or_default()).collect()) }
     async fn create_issue_link(&self, id: Uuid, company_id: Uuid, issue_id: Uuid) -> Result<serde_json::Value, String> { self.load(id, company_id).await?; let l = self.links.create(CreateCaseIssueLinkInput { company_id, case_id: id, issue_id, role: models::CaseIssueLinkRole::Work, created_by_run_id: None }).await.map_err(|e| e.to_string())?; serde_json::to_value(l).map_err(|e| e.to_string()) }
     async fn delete_issue_link(&self, id: Uuid, link_id: Uuid, company_id: Uuid) -> Result<(), String> { self.load(id, company_id).await?; self.links.delete(link_id).await.map_err(|e| e.to_string()) }

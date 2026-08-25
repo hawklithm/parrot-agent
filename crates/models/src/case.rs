@@ -4,7 +4,7 @@ use uuid::Uuid;
 /// Case status enumeration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[sqlx(type_name = "case_status", rename_all = "snake_case")]
 pub enum CaseStatus {
     Draft,
     InProgress,

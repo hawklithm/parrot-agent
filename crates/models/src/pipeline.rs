@@ -127,6 +127,7 @@ pub struct PipelineTransition {
 #[serde(rename_all = "camelCase")]
 pub struct CaseEvent {
     pub id: Uuid,
+    pub company_id: Uuid,
     pub case_id: Uuid,
     pub event_type: String,
     pub payload: JsonValue,
@@ -256,9 +257,10 @@ impl PipelineCase {
 }
 
 impl CaseEvent {
-    pub fn new(case_id: Uuid, event_type: String, payload: JsonValue) -> Self {
+    pub fn new(company_id: Uuid, case_id: Uuid, event_type: String, payload: JsonValue) -> Self {
         Self {
             id: Uuid::new_v4(),
+            company_id,
             case_id,
             event_type,
             payload,
