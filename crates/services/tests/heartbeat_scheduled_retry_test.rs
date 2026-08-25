@@ -3,6 +3,7 @@
 //! recoverable `failed` run to `scheduled_retry`, and `promote_due_scheduled_retries`
 //! re-wakes due retries into a queued wakeup request. Skips when no live DB.
 
+use services::HeartbeatService;
 use sqlx::PgPool;
 use uuid::Uuid;
 async fn connect() -> Option<PgPool> {
@@ -205,4 +206,104 @@ async fn promote_due_scheduled_retries_rewakes_run() {
     assert!(!still_due, "scheduled_retry_at cleared after promotion");
 
     cleanup(&pool, company_id, run_id).await;
+}
+
+/// Insert an isolated company + agent + issue whose `responsible_user_id` is
+/// set, and return (company_id, agent_id, issue_id, responsible_user_id).
+async fn seed_with_issue_responsible(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
+    let company_id = Uuid::new_v4();
+    let issue_prefix = format!("U{}", &company_id.simple().to_string()[..6]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, 'RU Test Co', $2)")
+        .bind(company_id)
+        .bind(&issue_prefix)
+        .execute(pool)
+        .await
+        .expect("insert company");
+    let agent_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, 'RU Test Agent')")
+        .bind(agent_id)
+        .bind(company_id)
+        .execute(pool)
+        .await
+        .expect("insert agent");
+    let responsible_user_id = Uuid::new_v4();
+    let issue_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO issues (id, company_id, title, identifier, status, responsible_user_id) VALUES ($1, $2, 'RU Issue', $3, 'todo', $4)",
+    )
+    .bind(issue_id)
+    .bind(company_id)
+    .bind(format!("{}-1", &company_id.simple().to_string()[..8]))
+    .bind(responsible_user_id)
+    .execute(pool)
+    .await
+    .expect("insert issue");
+    (company_id, agent_id, issue_id, responsible_user_id)
+}
+
+#[tokio::test]
+async fn run_records_responsible_user_from_issue() {
+    let Some(pool) = connect().await else { return; };
+    let (company_id, agent_id, issue_id, responsible_user_id) =
+        seed_with_issue_responsible(&pool).await;
+
+    // Wake the agent for the issue; the heartbeat run must carry the issue's
+    // responsible_user_id (责任用户不变量: the run is accountable to the human
+    // responsible for the issue being worked).
+    let svc = services::DefaultHeartbeatService::new(pool.clone());
+    svc.wakeup_with_options(
+        agent_id,
+        issue_id,
+        company_id,
+        services::HeartbeatWakeupOptions {
+            source: Some("test".to_string()),
+            reason: Some("responsible_user_invariant".to_string()),
+            idempotency_key: Some(format!("responsible_user_test:{}", issue_id)),
+            context_snapshot: Some(serde_json::json!({ "issueId": issue_id })),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("wakeup");
+
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT responsible_user_id::text FROM heartbeat_runs WHERE company_id = $1 AND agent_id = $2 AND context_snapshot->>'issueId' = $3 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(issue_id.to_string())
+    .fetch_optional(&pool)
+    .await
+    .expect("read run");
+    assert_eq!(
+        recorded.as_deref(),
+        Some(responsible_user_id.to_string().as_str()),
+        "heartbeat run must carry the issue's responsible user"
+    );
+
+    sqlx::query("DELETE FROM heartbeat_runs WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM agent_wakeup_requests WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM issues WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM agents WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
 }

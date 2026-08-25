@@ -1941,12 +1941,20 @@ impl DefaultHeartbeatService {
             context = serde_json::json!({ "issueId": issue_id });
         }
         let run_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot) VALUES ($1,$2,$3,'queued',$4) RETURNING id",
+            "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot, responsible_user_id)
+             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, i.responsible_user_id
+             FROM issues i WHERE i.id = $5
+             UNION ALL
+             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, NULL::uuid
+             WHERE NOT EXISTS (SELECT 1 FROM issues WHERE id = $5)
+             LIMIT 1
+             RETURNING id",
         )
         .bind(company_id)
         .bind(agent_id)
         .bind("on_demand")
         .bind(&context)
+        .bind(issue_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
