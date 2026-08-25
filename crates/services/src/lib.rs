@@ -190,6 +190,7 @@ pub mod approval_service;
 pub use approval_service::{ApprovalService, DefaultApprovalService};
 pub mod activity_log_service;
 pub mod asset_storage;
+pub mod s3_storage;
 pub mod attachment_service;
 pub mod attachment_types;
 pub mod codex_local_isolation;

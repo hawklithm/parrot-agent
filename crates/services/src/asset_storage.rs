@@ -83,6 +83,10 @@ impl StorageProviderRegistry {
         let configured = std::env::var("PARROT_STORAGE_PROVIDER").ok();
         match name.or(configured.as_deref()).unwrap_or("local").trim().to_ascii_lowercase().as_str() {
             "local" | "local_disk" => Ok(self.local.clone()),
+            "s3" => match crate::s3_storage::S3StorageService::from_env() {
+                Ok(service) => Ok(Arc::new(service)),
+                Err(message) => Err(ServiceError::NotImplemented(message)),
+            },
             other => Err(ServiceError::NotImplemented(format!(
                 "storage provider '{other}' is not configured"
             ))),
@@ -456,5 +460,49 @@ mod tests {
         svc.delete_object(company, &stored.object_key).await.expect("idempotent delete");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn registry_selects_s3_when_configured_and_fails_explicitly_otherwise() {
+        unsafe {
+            std::env::set_var("PARROT_STORAGE_PROVIDER", "s3");
+            std::env::set_var("PARROT_S3_ENDPOINT", "http://127.0.0.1:1");
+            std::env::set_var("PARROT_S3_BUCKET", "test-bucket");
+            std::env::set_var("PARROT_S3_ACCESS_KEY", "key");
+            std::env::set_var("PARROT_S3_SECRET_KEY", "secret");
+        }
+        let registry = StorageProviderRegistry::from_env();
+        let provider = registry
+            .provider(None)
+            .expect("s3 provider must resolve when configured");
+        // The provider instance is an S3 service (not local, not unavailable).
+        assert!(
+            provider.put_file(PutFileRequest {
+                company_id: Uuid::new_v4(),
+                namespace: "n".into(),
+                original_filename: None,
+                content_type: "text/plain".into(),
+                body: b"x".to_vec(),
+            })
+            .await
+            .is_err(),
+            "S3 put against unconfigured endpoint must fail, not silently write to local disk"
+        );
+        unsafe {
+            std::env::remove_var("PARROT_S3_BUCKET");
+            std::env::remove_var("PARROT_S3_ACCESS_KEY");
+            std::env::remove_var("PARROT_S3_SECRET_KEY");
+        }
+        let registry = StorageProviderRegistry::from_env();
+        assert!(
+            matches!(registry.provider(Some("s3")), Err(ServiceError::NotImplemented(_))),
+            "s3 without credentials must be NotImplemented"
+        );
+        assert!(
+            matches!(registry.provider(Some("cos")), Err(ServiceError::NotImplemented(_))),
+            "unknown provider must be NotImplemented"
+        );
+        // Explicit local selection still works without env.
+        assert!(registry.provider(Some("local")).is_ok());
     }
 }
