@@ -4453,6 +4453,7 @@ async fn call_gateway_tool(
 async fn approve_gateway_action(
     Path(action_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let company_id = body
@@ -4465,20 +4466,109 @@ async fn approve_gateway_action(
             Json(serde_json::json!({"error":"companyId is required"})),
         );
     };
-    let row = sqlx::query("SELECT ar.invocation_id, ar.status, ar.signed_arguments, i.tool_name, i.agent_id, i.run_id FROM tool_action_requests ar JOIN tool_invocations i ON i.id = ar.invocation_id WHERE ar.id=$1 AND ar.company_id=$2")
-        .bind(action_id).bind(company_id).fetch_optional(&state.pool).await.unwrap_or(None);
-    let Some(row) = row else {
+    if crate::routes::assert_board(&actor).is_err() {
         return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"Action request not found"})),
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error":"Board authentication required",
+                "reasonCode":"authentication_required"
+            })),
         );
+    }
+    if crate::routes::assert_company_access(&actor, company_id, false).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error":"Company access denied",
+                "reasonCode":"company_access_denied"
+            })),
+        );
+    }
+    let candidate = match sqlx::query(
+        "SELECT ar.status, i.tool_name
+           FROM tool_action_requests ar
+           JOIN tool_invocations i ON i.id = ar.invocation_id
+          WHERE ar.id = $1 AND ar.company_id = $2",
+    )
+    .bind(action_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"Action request not found"})),
+            )
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":error.to_string()})),
+            )
+        }
     };
-    if row.get::<String, _>("status") != "pending" {
+    if candidate.get::<String, _>("status") != "pending" {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error":"Action request is not pending"})),
         );
     }
+    let tool_name: String = candidate.get("tool_name");
+    let plugin = sqlx::query("SELECT id FROM plugins WHERE status='ready' AND EXISTS (SELECT 1 FROM jsonb_array_elements(manifest->'tools') item WHERE item->>'name'=$1)")
+        .bind(&tool_name).fetch_optional(&state.pool).await.unwrap_or(None);
+    if plugin.is_none() && !tool_name.starts_with("mcp.") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"Tool not found"})),
+        );
+    }
+
+    // Claim the action and mark its invocation in one transaction. The
+    // pending predicate is the concurrency boundary: only one approval
+    // request can transition a row into executing and dispatch the tool.
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":error.to_string()})),
+            )
+        }
+    };
+    let row = match sqlx::query(
+        "UPDATE tool_action_requests AS ar
+            SET status = 'executing', decided_at = NOW(), updated_at = NOW()
+           FROM tool_invocations AS i
+          WHERE ar.id = $1
+            AND ar.company_id = $2
+            AND ar.status = 'pending'
+            AND i.id = ar.invocation_id
+            AND i.company_id = ar.company_id
+       RETURNING ar.invocation_id, ar.signed_arguments, i.tool_name, i.agent_id, i.run_id",
+    )
+    .bind(action_id)
+    .bind(company_id)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            let _ = tx.rollback().await;
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":"Action request has already been claimed"})),
+            )
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":error.to_string()})),
+            )
+        }
+    };
     let invocation_id: Uuid = row.get("invocation_id");
     let tool_name: String = row.get("tool_name");
     let agent_id: Uuid = row.get("agent_id");
@@ -4487,10 +4577,24 @@ async fn approve_gateway_action(
         .get::<Option<String>, _>("signed_arguments")
         .and_then(|value| serde_json::from_str::<Value>(&value).ok())
         .unwrap_or_else(|| serde_json::json!({}));
-    let plugin = sqlx::query("SELECT id FROM plugins WHERE status='ready' AND EXISTS (SELECT 1 FROM jsonb_array_elements(manifest->'tools') item WHERE item->>'name'=$1)")
-        .bind(&tool_name).fetch_optional(&state.pool).await.unwrap_or(None);
-    let _ = sqlx::query("UPDATE tool_action_requests SET status='executing', decided_at=NOW(), updated_at=NOW() WHERE id=$1").bind(action_id).execute(&state.pool).await;
-    let _ = sqlx::query("UPDATE tool_invocations SET status='executing', policy_decision='allow', started_at=COALESCE(started_at,NOW()), updated_at=NOW() WHERE id=$1").bind(invocation_id).execute(&state.pool).await;
+    if let Err(error) = sqlx::query("UPDATE tool_invocations SET status='executing', policy_decision='allow', started_at=COALESCE(started_at,NOW()), updated_at=NOW() WHERE id=$1 AND company_id=$2")
+        .bind(invocation_id)
+        .bind(company_id)
+        .execute(&mut *tx)
+        .await
+    {
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        );
+    }
+    if let Err(error) = tx.commit().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        );
+    }
     let result = if let Some(plugin) = plugin {
         let plugin_id: Uuid = plugin.get("id");
         state
@@ -4510,7 +4614,17 @@ async fn approve_gateway_action(
         Ok(value) => {
             let _ = sqlx::query("UPDATE tool_action_requests SET status='executed', resolved_at=NOW(), updated_at=NOW() WHERE id=$1").bind(action_id).execute(&state.pool).await;
             let _ = sqlx::query("UPDATE tool_invocations SET status='succeeded', result_summary=$2, completed_at=NOW(), updated_at=NOW() WHERE id=$1").bind(invocation_id).bind(serde_json::json!({"valueType":"json"})).execute(&state.pool).await;
-            let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,invocation_id,action_request_id,reason_code) VALUES ($1,'call_completed','board','board',$2,$3,$4,'allow','success',$5,$6,'approved_action_executed')").bind(company_id).bind(agent_id).bind(run_id).bind(&tool_name).bind(invocation_id).bind(action_id).execute(&state.pool).await;
+            let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,invocation_id,action_request_id,reason_code) VALUES ($1,'call_completed',$2,$3,$4,$5,$6,'allow','success',$7,$8,'approved_action_executed')")
+                .bind(company_id)
+                .bind(actor.actor_type())
+                .bind(actor.principal_id().map(|value| value.to_string()))
+                .bind(agent_id)
+                .bind(run_id)
+                .bind(&tool_name)
+                .bind(invocation_id)
+                .bind(action_id)
+                .execute(&state.pool)
+                .await;
             (
                 StatusCode::OK,
                 Json(
@@ -4535,6 +4649,7 @@ async fn approve_gateway_action(
 async fn decline_gateway_action(
     Path(action_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let company_id = body
@@ -4547,6 +4662,24 @@ async fn decline_gateway_action(
             Json(serde_json::json!({"error":"companyId is required"})),
         );
     };
+    if crate::routes::assert_board(&actor).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error":"Board authentication required",
+                "reasonCode":"authentication_required"
+            })),
+        );
+    }
+    if crate::routes::assert_company_access(&actor, company_id, false).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error":"Company access denied",
+                "reasonCode":"company_access_denied"
+            })),
+        );
+    }
     let updated = sqlx::query("UPDATE tool_action_requests SET status='declined', resolved_at=NOW(), updated_at=NOW() WHERE id=$1 AND company_id=$2 AND status='pending' RETURNING id, invocation_id")
         .bind(action_id).bind(company_id).fetch_optional(&state.pool).await.unwrap_or(None);
     let Some(row) = updated else {
