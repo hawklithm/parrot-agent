@@ -19,7 +19,7 @@ use std::{
     time::SystemTime,
 };
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 /// 实例设置
@@ -296,6 +296,7 @@ pub struct DefaultInstanceSettingsService {
     settings: Arc<RwLock<InstanceSettings>>,
     pool: Option<PgPool>,
     watchdog_service: Option<Arc<dyn WatchdogService>>,
+    database_backup_lock: Arc<Mutex<()>>,
 }
 
 impl DefaultInstanceSettingsService {
@@ -304,6 +305,7 @@ impl DefaultInstanceSettingsService {
             settings: Arc::new(RwLock::new(InstanceSettings::default())),
             pool: None,
             watchdog_service: None,
+            database_backup_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -312,6 +314,7 @@ impl DefaultInstanceSettingsService {
             settings: Arc::new(RwLock::new(InstanceSettings::default())),
             pool: Some(pool),
             watchdog_service: None,
+            database_backup_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -323,6 +326,7 @@ impl DefaultInstanceSettingsService {
             settings: Arc::new(RwLock::new(InstanceSettings::default())),
             pool: Some(pool),
             watchdog_service: Some(watchdog_service),
+            database_backup_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -584,12 +588,17 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
     }
 
     async fn create_database_backup(&self) -> Result<DatabaseBackupResult, String> {
-        let connection_string = std::env::var("DATABASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                "database backup is not configured; DATABASE_URL is required".to_string()
-            })?;
+        if !Self::database_backup_health_options().enabled {
+            return Err(
+                "database backup is not configured; PARROT_DATABASE_BACKUP_ENABLED is false"
+                    .to_string(),
+            );
+        }
+        let _backup_guard = self
+            .database_backup_lock
+            .try_lock()
+            .map_err(|_| "database backup already in progress".to_string())?;
+        let (connection_string, _) = resolve_database_connection_string()?;
         let backup_dir = std::env::var("PARROT_DATABASE_BACKUP_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -618,7 +627,10 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
             .map_err(|error| format!("failed to start pg_dump: {}", error))?;
         if !output.status.success() {
             let _ = tokio::fs::remove_file(&plain_path).await;
-            let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let diagnostics = redact_database_diagnostic(
+                String::from_utf8_lossy(&output.stderr).trim(),
+                &connection_string,
+            );
             return Err(format!(
                 "pg_dump exited with code {}{}",
                 output.status.code().unwrap_or(-1),
@@ -630,27 +642,43 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
             ));
         }
 
-        let plain_sql = tokio::fs::read(&plain_path)
+        let staging_result = async {
+            let plain_sql = tokio::fs::read(&plain_path)
+                .await
+                .map_err(|error| format!("failed to read database backup: {}", error))?;
+            let compressed = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder
+                    .write_all(&plain_sql)
+                    .map_err(|error| format!("failed to compress database backup: {}", error))?;
+                encoder.finish().map_err(|error| {
+                    format!("failed to finish database backup compression: {}", error)
+                })
+            })
             .await
-            .map_err(|error| format!("failed to read database backup: {}", error))?;
-        let compressed = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder
-                .write_all(&plain_sql)
-                .map_err(|error| format!("failed to compress database backup: {}", error))?;
-            encoder
-                .finish()
-                .map_err(|error| format!("failed to finish database backup compression: {}", error))
-        })
-        .await
-        .map_err(|error| format!("database backup compression task failed: {}", error))??;
-        tokio::fs::write(&compressed_tmp_path, compressed)
-            .await
-            .map_err(|error| format!("failed to write compressed database backup: {}", error))?;
-        tokio::fs::rename(&compressed_tmp_path, &backup_path)
-            .await
-            .map_err(|error| format!("failed to commit compressed database backup: {}", error))?;
-        let _ = tokio::fs::remove_file(&plain_path).await;
+            .map_err(|error| format!("database backup compression task failed: {}", error))??;
+            tokio::fs::write(&compressed_tmp_path, compressed)
+                .await
+                .map_err(|error| {
+                    format!("failed to write compressed database backup: {}", error)
+                })?;
+            tokio::fs::rename(&compressed_tmp_path, &backup_path)
+                .await
+                .map_err(|error| {
+                    format!("failed to commit compressed database backup: {}", error)
+                })?;
+            tokio::fs::remove_file(&plain_path)
+                .await
+                .map_err(|error| format!("failed to remove plain database backup: {}", error))?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = staging_result {
+            let _ = tokio::fs::remove_file(&plain_path).await;
+            let _ = tokio::fs::remove_file(&compressed_tmp_path).await;
+            let _ = tokio::fs::remove_file(&backup_path).await;
+            return Err(error);
+        }
 
         let size_bytes = tokio::fs::metadata(&backup_path)
             .await
@@ -708,14 +736,19 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         }
         let expected_confirmation = format!("restore:{backup_id}");
         if confirmation.trim() != expected_confirmation {
-            return Err("database restore confirmation does not match the selected backup".to_string());
+            return Err(
+                "database restore confirmation does not match the selected backup".to_string(),
+            );
         }
         let target_database = std::env::var("PARROT_DATABASE_RESTORE_TARGET_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| "database restore target is not configured".to_string())?;
-        if std::env::var("DATABASE_URL").ok().as_deref() == Some(target_database.as_str())
-            && std::env::var("PARROT_DATABASE_RESTORE_ALLOW_SAME_DATABASE").ok().as_deref()
+        let (current_database, _) = resolve_database_connection_string()?;
+        if database_targets_match(&current_database, &target_database)
+            && std::env::var("PARROT_DATABASE_RESTORE_ALLOW_SAME_DATABASE")
+                .ok()
+                .as_deref()
                 != Some("true")
         {
             return Err("database restore refuses the current database unless PARROT_DATABASE_RESTORE_ALLOW_SAME_DATABASE=true".to_string());
@@ -742,7 +775,8 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
                 break;
             }
         }
-        let backup_path = backup_path.ok_or_else(|| format!("database backup {backup_id} was not found"))?;
+        let backup_path =
+            backup_path.ok_or_else(|| format!("database backup {backup_id} was not found"))?;
         let compressed = tokio::fs::read(&backup_path)
             .await
             .map_err(|error| format!("failed to read database backup: {error}"))?;
@@ -775,23 +809,114 @@ impl InstanceSettingsService for DefaultInstanceSettingsService {
         let _ = tokio::fs::remove_file(&restore_path).await;
         let output = output?;
         if !output.status.success() {
-            let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let diagnostics = redact_database_diagnostic(
+                String::from_utf8_lossy(&output.stderr).trim(),
+                &target_database,
+            );
             return Err(format!(
                 "psql restore exited with code {}{}",
                 output.status.code().unwrap_or(-1),
-                if diagnostics.is_empty() { String::new() } else { format!(": {diagnostics}") }
+                if diagnostics.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {diagnostics}")
+                }
             ));
         }
         Ok(DatabaseRestoreResult {
             backup_id,
             status: "completed".to_string(),
-            target_database: target_database
-                .split('@')
-                .next_back()
-                .unwrap_or("configured target")
-                .to_string(),
+            target_database: safe_database_target_label(&target_database),
             restored_bytes: sql.len() as u64,
         })
+    }
+}
+
+fn resolve_database_connection_string() -> Result<(String, &'static str), String> {
+    resolve_database_connection_string_from(
+        std::env::var("PARROT_DATABASE_URL").ok(),
+        std::env::var("DATABASE_URL").ok(),
+    )
+    .ok_or_else(|| {
+        "database backup is not configured; PARROT_DATABASE_URL or DATABASE_URL is required"
+            .to_string()
+    })
+}
+
+fn resolve_database_connection_string_from(
+    parrot_database_url: Option<String>,
+    database_url: Option<String>,
+) -> Option<(String, &'static str)> {
+    parrot_database_url
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (value, "PARROT_DATABASE_URL"))
+        .or_else(|| {
+            database_url
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (value, "DATABASE_URL"))
+        })
+}
+
+fn redact_database_diagnostic(diagnostic: &str, connection_string: &str) -> String {
+    let mut redacted = diagnostic.replace(connection_string, "[REDACTED]");
+    if let Ok(url) = reqwest::Url::parse(connection_string) {
+        if let Some(password) = url.password().filter(|password| !password.is_empty()) {
+            redacted = redacted.replace(password, "[REDACTED]");
+        }
+        let username = url.username();
+        if !username.is_empty() {
+            redacted = redacted.replace(&format!("{}@", username), "[REDACTED]@");
+        }
+    }
+    redacted
+}
+
+fn database_targets_match(current: &str, target: &str) -> bool {
+    if current == target {
+        return true;
+    }
+    let Ok(current) = reqwest::Url::parse(current) else {
+        return false;
+    };
+    let Ok(target) = reqwest::Url::parse(target) else {
+        return false;
+    };
+    current.scheme().eq_ignore_ascii_case(target.scheme())
+        && current
+            .host_str()
+            .zip(target.host_str())
+            .map(|(left, right)| left.eq_ignore_ascii_case(right))
+            .unwrap_or(false)
+        && database_url_port(&current) == database_url_port(&target)
+        && current.path().trim_end_matches('/') == target.path().trim_end_matches('/')
+}
+
+fn database_url_port(url: &reqwest::Url) -> Option<u16> {
+    url.port()
+        .or_else(|| matches!(url.scheme(), "postgres" | "postgresql").then_some(5432))
+}
+
+fn safe_database_target_label(connection_string: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(connection_string) else {
+        return "configured target".to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return "configured target".to_string();
+    };
+    let mut label = host.to_string();
+    if let Some(port) = url.port() {
+        label.push(':');
+        label.push_str(&port.to_string());
+    }
+    let database = url.path().trim_matches('/');
+    if !database.is_empty() {
+        label.push('/');
+        label.push_str(database);
+    }
+    if label.is_empty() {
+        "configured target".to_string()
+    } else {
+        label
     }
 }
 
@@ -868,7 +993,11 @@ async fn prune_database_backups_with_policy(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_general_updates, prune_database_backups, GeneralSettings};
+    use super::{
+        apply_general_updates, database_targets_match, prune_database_backups,
+        redact_database_diagnostic, resolve_database_connection_string_from,
+        safe_database_target_label, GeneralSettings,
+    };
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -933,5 +1062,53 @@ mod tests {
         ] {
             assert!(apply_general_updates(&mut settings, &update).is_err());
         }
+    }
+
+    #[test]
+    fn database_connection_resolution_prefers_parrot_override() {
+        assert_eq!(
+            resolve_database_connection_string_from(
+                Some("postgres://parrot".to_string()),
+                Some("postgres://legacy".to_string()),
+            ),
+            Some(("postgres://parrot".to_string(), "PARROT_DATABASE_URL",)),
+        );
+        assert_eq!(
+            resolve_database_connection_string_from(
+                Some("  ".to_string()),
+                Some("postgres://legacy".to_string()),
+            ),
+            Some(("postgres://legacy".to_string(), "DATABASE_URL")),
+        );
+        assert_eq!(
+            resolve_database_connection_string_from(None, Some("  ".to_string())),
+            None,
+        );
+    }
+
+    #[test]
+    fn database_diagnostics_and_target_labels_do_not_expose_credentials() {
+        let connection = "postgres://backup-user:secret@db.example.test:5432/parrot";
+        let diagnostic =
+            redact_database_diagnostic(&format!("could not connect to {connection}"), connection);
+        assert!(!diagnostic.contains("secret"));
+        assert!(!diagnostic.contains("backup-user"));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert_eq!(
+            safe_database_target_label(connection),
+            "db.example.test:5432/parrot"
+        );
+    }
+
+    #[test]
+    fn restore_protection_compares_database_identity_without_credentials() {
+        assert!(database_targets_match(
+            "postgres://old-user:old-secret@db.example.test/parrot",
+            "postgres://new-user:new-secret@db.example.test:5432/parrot",
+        ));
+        assert!(!database_targets_match(
+            "postgres://user:secret@db.example.test/parrot",
+            "postgres://user:secret@other.example.test/parrot",
+        ));
     }
 }

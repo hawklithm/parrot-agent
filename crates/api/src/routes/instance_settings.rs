@@ -13,13 +13,34 @@ use services::auth::AuthorizationActor;
 
 pub fn instance_settings_routes() -> Router<AppState> {
     Router::new()
-        .route("/instance/settings", get(get_instance_settings).patch(update_instance_settings))
-        .route("/instance/settings/general", get(get_general_settings).patch(update_general_settings))
-        .route("/instance/settings/experimental", get(get_experimental_settings).patch(update_experimental_settings))
-        .route("/instance/settings/experimental/issue-graph-liveness-auto-recovery/preview", post(preview_auto_recovery))
-        .route("/instance/settings/experimental/issue-graph-liveness-auto-recovery/run", post(run_auto_recovery))
-        .route("/instance/database-backups", get(get_database_backup_health).post(create_database_backup))
-        .route("/instance/database-backups/:backup_id/restore", post(restore_database_backup))
+        .route(
+            "/instance/settings",
+            get(get_instance_settings).patch(update_instance_settings),
+        )
+        .route(
+            "/instance/settings/general",
+            get(get_general_settings).patch(update_general_settings),
+        )
+        .route(
+            "/instance/settings/experimental",
+            get(get_experimental_settings).patch(update_experimental_settings),
+        )
+        .route(
+            "/instance/settings/experimental/issue-graph-liveness-auto-recovery/preview",
+            post(preview_auto_recovery),
+        )
+        .route(
+            "/instance/settings/experimental/issue-graph-liveness-auto-recovery/run",
+            post(run_auto_recovery),
+        )
+        .route(
+            "/instance/database-backups",
+            get(get_database_backup_health).post(create_database_backup),
+        )
+        .route(
+            "/instance/database-backups/:backup_id/restore",
+            post(restore_database_backup),
+        )
 }
 
 /// IS1: GET /instance/settings
@@ -29,7 +50,9 @@ async fn get_instance_settings(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // 对齐 Paperclip：读实例设置需要 board 访问。
     assert_board(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
-    let settings = state.instance_settings_service.get_settings()
+    let settings = state
+        .instance_settings_service
+        .get_settings()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::to_value(settings).unwrap_or_default()))
@@ -43,7 +66,9 @@ async fn update_instance_settings(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // 对齐 Paperclip：写实例设置仅限实例管理员（或 local_implicit）。
     assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
-    let settings = state.instance_settings_service.update_settings(body)
+    let settings = state
+        .instance_settings_service
+        .update_settings(body)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::to_value(settings).unwrap_or_default()))
@@ -55,7 +80,9 @@ async fn get_general_settings(
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     assert_board(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
-    let settings = state.instance_settings_service.get_general_settings()
+    let settings = state
+        .instance_settings_service
+        .get_general_settings()
         .await
         .map_err(|e| {
             tracing::error!("Failed to get general settings: {}", e);
@@ -71,7 +98,9 @@ async fn update_general_settings(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
-    let settings = state.instance_settings_service.update_general_settings(body)
+    let settings = state
+        .instance_settings_service
+        .update_general_settings(body)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::to_value(settings).unwrap_or_default()))
@@ -83,7 +112,9 @@ async fn get_experimental_settings(
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     assert_board(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
-    let settings = state.instance_settings_service.get_experimental_settings()
+    let settings = state
+        .instance_settings_service
+        .get_experimental_settings()
         .await
         .map_err(|e| {
             tracing::error!("Failed to get experimental settings: {}", e);
@@ -99,7 +130,9 @@ async fn update_experimental_settings(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
-    let settings = state.instance_settings_service.update_experimental_settings(body)
+    let settings = state
+        .instance_settings_service
+        .update_experimental_settings(body)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::to_value(settings).unwrap_or_default()))
@@ -111,7 +144,9 @@ async fn preview_auto_recovery(
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
-    let result = state.instance_settings_service.preview_auto_recovery()
+    let result = state
+        .instance_settings_service
+        .preview_auto_recovery()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
@@ -123,7 +158,9 @@ async fn run_auto_recovery(
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
-    let result = state.instance_settings_service.run_auto_recovery()
+    let result = state
+        .instance_settings_service
+        .run_auto_recovery()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
@@ -134,7 +171,9 @@ async fn run_auto_recovery(
 /// 对齐 Paperclip：`not configured` 表示能力未启用，返回 501；
 /// 其余（IO/调度失败）归为 500。
 fn database_backup_error_status(err: &str) -> StatusCode {
-    if err.contains("not configured") {
+    if err.contains("already in progress") {
+        StatusCode::CONFLICT
+    } else if err.contains("not configured") {
         StatusCode::NOT_IMPLEMENTED
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -145,7 +184,7 @@ fn database_backup_error_status(err: &str) -> StatusCode {
 async fn create_database_backup(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     // 对齐 Paperclip：仅实例管理员可触发手动备份。
     assert_instance_admin(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
 
@@ -173,7 +212,10 @@ async fn create_database_backup(
     )
     .await;
 
-    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::to_value(result).unwrap_or_default()),
+    ))
 }
 
 /// IS10: GET /instance/database-backups
@@ -253,6 +295,14 @@ mod tests {
         assert_eq!(
             database_backup_error_status("pg_dump exited with code 1"),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn concurrent_backup_maps_to_conflict() {
+        assert_eq!(
+            database_backup_error_status("database backup already in progress"),
+            StatusCode::CONFLICT
         );
     }
 }
