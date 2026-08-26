@@ -137,6 +137,11 @@ async fn resolves_company_and_responsible_user_credentials_before_launch() {
         entry.user_secret_definition_id == Some(definition_id)
             && entry.outcome == services::SecretResolutionOutcome::Success
     }));
+    let manifest_json = serde_json::to_string(&resolved.manifest).expect("serialize manifest");
+    assert!(manifest_json.contains("configPath"));
+    assert!(manifest_json.contains("userSecretDefinitionId"));
+    assert!(!manifest_json.contains("company-token"));
+    assert!(!manifest_json.contains("user-token"));
 
     let missing_owner_error = resolver
         .resolve_adapter_config(
