@@ -385,15 +385,78 @@ async fn update_member_permissions(
 
 /// §4C.3 Company Search：对齐 Paperclip `GET /companies/:companyId/search`。
 ///
-/// 返回 `CompanySearchResponse`（issue 作用域全文/分词匹配本阶段落地）；
-/// 支持 `q`/`scope`/`limit`/`offset`/`sort` 查询参数，按 company_id 租户隔离。
+/// 返回 `CompanySearchResponse`；查询参数与 Paperclip `companySearchQuerySchema`
+/// 对齐，并在进入 service 前完成枚举、UUID、分页和时间值校验。
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchQuery {
     pub q: Option<String>,
     pub scope: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub status: Option<String>,
+    pub priority: Option<String>,
+    pub assignee_agent_id: Option<String>,
+    pub assignee_user_id: Option<String>,
+    pub project_id: Option<String>,
+    pub label_id: Option<String>,
+    pub updated_within: Option<String>,
+    pub updated_after: Option<String>,
     pub sort: Option<String>,
+}
+
+fn split_search_values(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|raw| raw.split(','))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn parse_search_enum_list(
+    value: Option<&str>,
+    field: &str,
+    allowed: &[&str],
+) -> Result<Vec<String>, AppError> {
+    let values = split_search_values(value);
+    if let Some(unsupported) = values.iter().find(|item| !allowed.contains(&item.as_str())) {
+        return Err(AppError::BadRequest(format!(
+            "{field} contains an unsupported value: {unsupported}"
+        )));
+    }
+    Ok(values)
+}
+
+fn parse_search_uuid(value: Option<&str>, field: &str) -> Result<Option<Uuid>, AppError> {
+    value
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| {
+            Uuid::parse_str(raw.trim())
+                .map_err(|_| AppError::BadRequest(format!("{field} must be a UUID")))
+        })
+        .transpose()
+}
+
+fn parse_search_updated_within(value: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(raw) = value.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let split_at = raw
+        .find(|character: char| character.is_ascii_alphabetic())
+        .ok_or_else(|| AppError::BadRequest("updatedWithin must be a duration like 24h".into()))?;
+    let (number, unit) = raw.split_at(split_at);
+    let valid_number = number
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value > 0 && *value <= 999);
+    if valid_number.is_none() || !matches!(unit, "h" | "d" | "w" | "m") {
+        return Err(AppError::BadRequest(
+            "updatedWithin must be a duration like 24h, 7d, 4w, or 3m".into(),
+        ));
+    }
+    Ok(Some(raw.to_string()))
 }
 
 async fn search_company(
@@ -408,34 +471,115 @@ async fn search_company(
     use services::company_search_service::{
         CompanySearchQuery, CompanySearchScope, CompanySearchService, CompanySearchSort,
     };
-    let scope = query
-        .scope
+    let scope_name = query.scope.as_deref().unwrap_or("all");
+    if !matches!(
+        scope_name,
+        "all" | "issues" | "comments" | "documents" | "artifacts" | "agents" | "projects"
+    ) {
+        return Err(AppError::BadRequest(
+            "scope must be a supported search scope".into(),
+        ));
+    }
+    let sort_name = query.sort.as_deref().unwrap_or("relevance");
+    if !matches!(sort_name, "relevance" | "updated" | "created" | "priority") {
+        return Err(AppError::BadRequest(
+            "sort must be relevance, updated, created, or priority".into(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=50).contains(&limit) {
+        return Err(AppError::BadRequest(
+            "limit must be between 1 and 50".into(),
+        ));
+    }
+    let offset = query.offset.unwrap_or(0);
+    if !(0..=200).contains(&offset) {
+        return Err(AppError::BadRequest(
+            "offset must be between 0 and 200".into(),
+        ));
+    }
+    let statuses = parse_search_enum_list(
+        query.status.as_deref(),
+        "status",
+        &[
+            "backlog",
+            "todo",
+            "in_progress",
+            "in_review",
+            "blocked",
+            "done",
+            "cancelled",
+        ],
+    )?;
+    let priorities = parse_search_enum_list(
+        query.priority.as_deref(),
+        "priority",
+        &["critical", "high", "medium", "low"],
+    )?;
+    let assignee_agent_id = match query.assignee_agent_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(value) if value.eq_ignore_ascii_case("null") => Some(None),
+        Some(value) => Some(Some(Uuid::parse_str(value).map_err(|_| {
+            AppError::BadRequest("assigneeAgentId must be a UUID or 'null'".into())
+        })?)),
+    };
+    let board_user_id = match &actor {
+        AuthorizationActor::Board { user_id, .. } => Some(*user_id),
+        _ => None,
+    };
+    let assignee_user_id = match query.assignee_user_id.as_deref().map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("me") => {
+            Some(board_user_id.ok_or_else(|| {
+                AppError::Forbidden("assigneeUserId=me requires board authentication".into())
+            })?)
+        }
+        _ => parse_search_uuid(query.assignee_user_id.as_deref(), "assigneeUserId")?,
+    };
+    let project_id = parse_search_uuid(query.project_id.as_deref(), "projectId")?;
+    let label_id = parse_search_uuid(query.label_id.as_deref(), "labelId")?;
+    let updated_within = parse_search_updated_within(query.updated_within.as_deref())?;
+    let updated_after = query
+        .updated_after
         .as_deref()
-        .map(CompanySearchScope::from_str)
-        .unwrap_or_default();
-    let sort = query
-        .sort
-        .as_deref()
-        .map(CompanySearchSort::from_str)
-        .unwrap_or_default();
-    let limit = query.limit.unwrap_or(20).clamp(1, 50);
-    let offset = query.offset.unwrap_or(0).clamp(0, 200);
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value.trim())
+                .map(|date| date.with_timezone(&chrono::Utc))
+                .map_err(|_| AppError::BadRequest("updatedAfter must be a valid date".into()))
+        })
+        .transpose()?;
 
+    let q = query
+        .q
+        .clone()
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect::<String>();
     let svc = CompanySearchService::new(state.pool.clone());
     let resp = svc
         .search(
             company_id,
             CompanySearchQuery {
-                q: query.q.clone().unwrap_or_default(),
-                scope,
-                sort,
+                q,
+                scope: CompanySearchScope::from_str(scope_name),
+                sort: CompanySearchSort::from_str(sort_name),
                 limit,
                 offset,
+                statuses,
+                priorities,
+                assignee_agent_id,
+                assignee_user_id,
+                project_id,
+                label_id,
+                updated_within,
+                updated_after,
             },
         )
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(serde_json::to_value(resp).map_err(|e| AppError::InternalServerError(e.to_string()))?))
+    Ok(Json(serde_json::to_value(resp).map_err(|e| {
+        AppError::InternalServerError(e.to_string())
+    })?))
 }
 
 /// CM8: GET /companies/:company_id/sidebar-badges

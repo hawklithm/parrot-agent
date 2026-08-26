@@ -1,17 +1,15 @@
 //! Company Search Service
 //!
 //! 对齐 Paperclip `services/company-search.ts` 的 `CompanySearchResponse`
-//! 形状（§4C.3）。本阶段落地 issue 作用域（标题/标识符/描述）的全文/分词
-//! 匹配、scope/limit/offset/sort 与租户隔离；评论/文档/artifact/agent/project
-//! 作用域、模糊匹配、snippet/高亮、facet 计数与 zero-result 建议、以及
-//! `/search/extract` 端点仍待后续阶段。
+//! 形状（§4C.3）。搜索候选在 company 租户内按 issue、artifact、agent、project
+//! 合并，再按统一排序键分页；issue 过滤器、facet 与 zero-result 建议共用同一
+//! SQL 条件，避免分页前后语义漂移。
 
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
-/// 搜索作用域。Paperclip 全量还包括 comments/documents/artifacts/agents/projects；
-/// 本阶段仅 issue 文本匹配可见，其余作用域按 scope 语义保留但仅返回 issue 命中。
+/// 搜索作用域。Paperclip 全量还包括 comments/documents/artifacts/agents/projects。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompanySearchScope {
     All,
@@ -65,6 +63,13 @@ impl CompanySearchScope {
     pub fn includes_projects(&self) -> bool {
         matches!(self, CompanySearchScope::All | CompanySearchScope::Projects)
     }
+
+    pub fn includes_artifacts(&self) -> bool {
+        matches!(
+            self,
+            CompanySearchScope::All | CompanySearchScope::Artifacts
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +84,14 @@ pub enum CompanySearchSort {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompanySearchIssueSummary {
-    pub id: Uuid,
+    pub id: String,
     pub identifier: Option<String>,
     pub title: String,
     pub status: String,
     pub priority: String,
-    pub assignee_agent_id: Option<Uuid>,
-    pub assignee_user_id: Option<Uuid>,
-    pub project_id: Option<Uuid>,
+    pub assignee_agent_id: Option<String>,
+    pub assignee_user_id: Option<String>,
+    pub project_id: Option<String>,
     pub updated_at: String,
 }
 
@@ -94,7 +99,7 @@ pub struct CompanySearchIssueSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompanySearchResult {
-    pub id: Uuid,
+    pub id: String,
     #[serde(rename = "type")]
     pub result_type: String,
     pub score: f64,
@@ -106,8 +111,43 @@ pub struct CompanySearchResult {
     pub snippets: Vec<CompanySearchSnippet>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<CompanySearchIssueSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<CompanySearchArtifactSummary>,
     pub updated_at: Option<String>,
     pub preview_image_url: Option<String>,
+}
+
+/// 对齐 Paperclip `CompanySearchArtifactSummary`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanySearchArtifactSummary {
+    pub id: String,
+    pub source: String,
+    pub media_kind: String,
+    pub issue_id: String,
+    pub issue_identifier: String,
+    pub issue_title: String,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub updated_at: String,
+}
+
+/// 对齐 Paperclip `CompanySearchZeroResultsLoosenSuggestion`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanySearchZeroResultsLoosenSuggestion {
+    pub filter: String,
+    pub values: Vec<String>,
+    pub result_count: i64,
+    pub additional_count: i64,
+}
+
+/// 对齐 Paperclip `CompanySearchZeroResults`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanySearchZeroResults {
+    pub unfiltered_total: i64,
+    pub loosen_suggestions: Vec<CompanySearchZeroResultsLoosenSuggestion>,
 }
 
 /// 对齐 Paperclip `CompanySearchHighlight`：原文中的命中区间（字符偏移）。
@@ -174,8 +214,76 @@ struct ProjectSearchRow {
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// 对齐 Paperclip `CompanySearchResponse`（countsByType/filterOptionCounts/
-/// zeroResults 在本阶段为最小实现，随作用域扩展补全）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchFacet {
+    All,
+    Status,
+    Priority,
+    AssigneeAgent,
+    AssigneeUser,
+    Project,
+    Label,
+    UpdatedWithin,
+    UpdatedAfter,
+}
+
+#[derive(Debug, Clone)]
+struct IssueSearchRow {
+    id: Uuid,
+    title: String,
+    identifier: Option<String>,
+    status: String,
+    priority: String,
+    assignee_agent_id: Option<Uuid>,
+    assignee_user_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    description: Option<String>,
+    identifier_similarity: f64,
+    fuzzy_title: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IssueSearchSources {
+    comments: Vec<String>,
+    documents: Vec<DocumentSearchSource>,
+}
+
+#[derive(Debug, Clone)]
+struct DocumentSearchSource {
+    key: String,
+    title: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactSearchRow {
+    id: Uuid,
+    source: String,
+    media_hint: Option<String>,
+    title: String,
+    body: String,
+    issue_id: Uuid,
+    issue_identifier: String,
+    issue_title: String,
+    project_id: Option<Uuid>,
+    project_name: Option<String>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    key: Option<String>,
+    url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchResultItem {
+    result: CompanySearchResult,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    priority_rank: i32,
+}
+
+/// 对齐 Paperclip `CompanySearchResponse`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompanySearchResponse {
@@ -188,7 +296,7 @@ pub struct CompanySearchResponse {
     pub results: Vec<CompanySearchResult>,
     pub counts_by_type: std::collections::HashMap<String, i64>,
     pub filter_option_counts: CompanySearchFilterOptionCounts,
-    pub zero_results: Option<serde_json::Value>,
+    pub zero_results: Option<CompanySearchZeroResults>,
     pub has_more: bool,
 }
 
@@ -199,6 +307,15 @@ pub struct CompanySearchQuery {
     pub sort: CompanySearchSort,
     pub limit: i64,
     pub offset: i64,
+    pub statuses: Vec<String>,
+    pub priorities: Vec<String>,
+    /// `None` means the filter is absent; `Some(None)` means unassigned.
+    pub assignee_agent_id: Option<Option<Uuid>>,
+    pub assignee_user_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    pub label_id: Option<Uuid>,
+    pub updated_within: Option<String>,
+    pub updated_after: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Default for CompanySearchScope {
@@ -220,6 +337,19 @@ impl CompanySearchSort {
             "priority" => CompanySearchSort::Priority,
             _ => CompanySearchSort::Relevance,
         }
+    }
+}
+
+impl CompanySearchQuery {
+    pub fn has_active_issue_filters(&self) -> bool {
+        !self.statuses.is_empty()
+            || !self.priorities.is_empty()
+            || self.assignee_agent_id.is_some()
+            || self.assignee_user_id.is_some()
+            || self.project_id.is_some()
+            || self.label_id.is_some()
+            || self.updated_within.is_some()
+            || self.updated_after.is_some()
     }
 }
 
@@ -352,11 +482,10 @@ impl CompanySearchService {
         Self { pool }
     }
 
-    /// 对齐 Paperclip `companySearchService.search`：issue 作用域全文/分词匹配。
+    /// 对齐 Paperclip `companySearchService.search`。
     ///
-    /// 命中规则（title/identifier/description 的短语 ILIKE + 分词 ILIKE ANY），
-    /// 经 company_id 租户隔离；排序按 relevance（命中字段加权）/ updated /
-    /// created / priority；分页 limit/offset；has_more 由 fetch+1 探测。
+    /// 各类候选先在租户内完整合并，再按统一排序键切片。这样 `scope=all` 的
+    /// offset 不会只作用于 issue，而 facet/zero-result 也能复用同一组过滤条件。
     pub async fn search(
         &self,
         company_id: Uuid,
@@ -373,9 +502,9 @@ impl CompanySearchService {
         } else {
             Vec::new()
         };
-        // 无查询文本且非 issue-only 过滤（本阶段无额外过滤）→ 空结果。
-        if !has_text {
-            return Ok(empty_response(&query.q, &normalized_query));
+        let has_issue_filters = query.has_active_issue_filters();
+        if !has_text && !has_issue_filters {
+            return Ok(empty_response(&query, &normalized_query));
         }
 
         let escaped_query = escape_like(&normalized_query);
@@ -389,436 +518,167 @@ impl CompanySearchService {
             .collect();
 
         // 模糊匹配开关：对齐 Paperclip MIN_FUZZY_QUERY_LENGTH=4 且无 LIKE 通配符。
-        // identifier 用 pg_trgm similarity（阈值 0.45）；标题用 Levenshtein 分词
-        // （levenshtein_less_equal，需 fuzzystrmatch 扩展，幂等创建）。
-        let fuzzy_enabled = normalized_query.len() >= 4 && !normalized_query.contains(['\\', '%', '_']);
+        // identifier 用 pg_trgm similarity（阈值 0.45）；标题用 Levenshtein 分词。
+        let fuzzy_enabled =
+            normalized_query.len() >= 4 && !normalized_query.contains(['\\', '%', '_']);
         const FUZZY_IDENTIFIER_SIMILARITY_THRESHOLD: f64 = 0.45;
-        // 标题模糊候选 token：≥4 字符（对齐 Paperclip MIN_FUZZY_TOKEN_LENGTH）。
-        let fuzzy_tokens: Vec<String> = tokens
-            .iter()
-            .filter(|t| t.len() >= 4)
-            .cloned()
-            .collect();
+        let fuzzy_tokens: Vec<String> = tokens.iter().filter(|t| t.len() >= 4).cloned().collect();
         let fuzzy_tokens_enabled = fuzzy_enabled && !fuzzy_tokens.is_empty();
-        if fuzzy_tokens_enabled {
-            // CREATE EXTENSION 不能在事务块内执行；sqlx::query().execute 默认 autocommit。
-            sqlx::query("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
-                .execute(&self.pool)
-                .await?;
-        }
-
-
         let scope_includes_issues = query.scope.includes_issues();
-        let scope_includes_agents = query.scope.includes_agents();
-        let scope_includes_projects = query.scope.includes_projects();
+        let issue_results_enabled = scope_includes_issues
+            && (has_text
+                || !matches!(
+                    query.scope,
+                    CompanySearchScope::Comments | CompanySearchScope::Documents
+                ));
+        let mut items: Vec<SearchResultItem> = Vec::new();
+        let mut source_counts = (0_i64, 0_i64);
 
-        // 专属 agent/project 作用域（不含 issue）：走独立实体搜索路径。
-        if !scope_includes_issues && (scope_includes_agents || scope_includes_projects) {
-            return self
-                .search_agent_project_scope(
+        if issue_results_enabled {
+            let issue_rows = self
+                .fetch_issue_rows(
                     company_id,
                     &query,
                     &normalized_query,
                     &contains_pattern,
                     &token_patterns,
-                    &tokens,
+                    &fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    None,
                 )
-                .await;
-        }
-
-        // 作用域不含 issue 命中时（如纯 agents/projects/artifacts），本阶段无数据返回。
-        if !scope_includes_issues {
-            return Ok(empty_response(&query.q, &normalized_query));
-        }
-
-        let fetch_limit = query.limit + 1;
-        let title_phrase = contains_pattern.clone();
-        let ident_phrase = contains_pattern.clone();
-        let desc_phrase = contains_pattern.clone();
-        let token_any: String = if token_patterns.is_empty() {
-            "%__paperclip_no_match__%".to_string()
-        } else {
-            token_patterns
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-
-        // 高亮术语集（对齐 Paperclip matchTerms）：normalized_query + 各 token，去重。
-        let terms: Vec<String> = {
-            let mut t = vec![normalized_query.clone()];
-            t.extend(token_patterns.iter().cloned());
-            t.retain(|s| !s.is_empty());
-            t.dedup();
-            t
-        };
-
-        // 命中字段权重（relevance 排序用）：title 短语 > identifier 短语 >
-        // title 分词 > description 短语 > identifier 分词 > description 分词。
-        let order_sql = match query.sort {
-            CompanySearchSort::Updated => "issues.updated_at DESC",
-            CompanySearchSort::Created => "issues.created_at DESC",
-            CompanySearchSort::Priority => "issues.priority DESC, issues.updated_at DESC",
-            CompanySearchSort::Relevance => {
-                "(CASE \
-                   WHEN lower(issues.title) = $1 THEN 6 \
-                   WHEN issues.title ILIKE $2 THEN 5 \
-                   WHEN coalesce(issues.identifier,'') ILIKE $2 THEN 4 \
-                   WHEN issues.title ILIKE ANY(string_to_array($3, ',')::text[]) THEN 3 \
-                   WHEN coalesce(issues.description,'') ILIKE $2 THEN 2 \
-                   WHEN coalesce(issues.identifier,'') ILIKE ANY(string_to_array($3, ',')::text[]) THEN 1 \
-                   ELSE 0 END) DESC, issues.updated_at DESC"
-            }
-        };
-
-        // 候选 WHERE 的 OR 命中条件：issue 文本匹配 +（作用域含 comments/documents 时）
-        // 评论/文档匹配的 EXISTS。Paperclip 的 anySearchMatch 不随 scope 收窄候选，
-        // 仅影响结果呈现，故 comment/document EXISTS 在 all/issues/comments/documents 作用域加入。
-        let mut match_conditions: Vec<String> = vec![
-            "issues.title ILIKE $2".to_string(),
-            "coalesce(issues.identifier,'') ILIKE $2".to_string(),
-            "coalesce(issues.description,'') ILIKE $2".to_string(),
-            "issues.title ILIKE ANY(string_to_array($3, ',')::text[])".to_string(),
-            "coalesce(issues.identifier,'') ILIKE ANY(string_to_array($3, ',')::text[])".to_string(),
-            "coalesce(issues.description,'') ILIKE ANY(string_to_array($3, ',')::text[])".to_string(),
-        ];
-        if fuzzy_enabled {
-            // 对齐 Paperclip fuzzyIdentifierMatch：identifier 与查询的 pg_trgm 相似度阈值。
-            match_conditions.push(
-                "similarity(lower(coalesce(issues.identifier,'')), $8) >= 0.45".to_string(),
-            );
-        }
-        if fuzzy_tokens_enabled {
-            // 对齐 Paperclip fuzzyTokenTitleMatch：每个模糊 token 需在标题分词中
-            // 有 levenshtein_less_equal 命中的词（≥6 字符 2 编辑、≥5 字符 1 编辑、否则 0）。
-            match_conditions.push(
-                "coalesce(( \
-                   SELECT bool_and( \
-                     EXISTS ( \
-                       SELECT 1 FROM regexp_split_to_table(lower(issues.title), '[^a-z0-9]+') AS title_word(value) \
-                       WHERE length(title_word.value) >= 4 \
-                         AND levenshtein_less_equal(qt.value, title_word.value, \
-                           CASE \
-                             WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
-                             WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
-                             ELSE 0 END \
-                         ) <= CASE \
-                           WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
-                           WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
-                           ELSE 0 END \
-                     ) \
-                   ) \
-                   FROM unnest($9) AS qt(value) \
-                 ), false)".to_string(),
-            );
-        }
-        if query.scope.includes_comments_or_documents() {
-            match_conditions.push(
-                "EXISTS (SELECT 1 FROM issue_comments sc WHERE sc.company_id = $4 \
-                 AND sc.issue_id = issues.id AND sc.body ILIKE $7)".to_string(),
-            );
-            match_conditions.push(
-                "EXISTS (SELECT 1 FROM issue_documents idoc \
-                 INNER JOIN documents d ON d.id = idoc.document_id AND d.company_id = idoc.company_id \
-                 WHERE idoc.company_id = $4 AND idoc.issue_id = issues.id \
-                 AND (d.title ILIKE $7 OR d.content ILIKE $7))".to_string(),
-            );
-        }
-        let where_sql = match_conditions.join(" OR ");
-
-        let sql = format!(
-            "SELECT \
-                issues.id, issues.title, issues.identifier, \
-                issues.status::text, issues.priority::text, \
-                issues.assignee_agent_id, issues.assignee_user_id, issues.project_id, \
-                issues.updated_at, issues.created_at, issues.description, \
-                similarity(lower(coalesce(issues.identifier,'')), $8)::double precision AS ident_sim, \
-                {fuzzy_title_expr} AS fuzzy_title \
-             FROM issues \
-             WHERE issues.company_id = $4 \
-               AND ({where_sql}) \
-             ORDER BY {order_sql} \
-             LIMIT $5 OFFSET $6",
-            fuzzy_title_expr = if fuzzy_tokens_enabled {
-                "coalesce(( \
-                   SELECT bool_and( \
-                     EXISTS ( \
-                       SELECT 1 FROM regexp_split_to_table(lower(issues.title), '[^a-z0-9]+') AS title_word(value) \
-                       WHERE length(title_word.value) >= 4 \
-                         AND levenshtein_less_equal(qt.value, title_word.value, \
-                           CASE \
-                             WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
-                             WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
-                             ELSE 0 END \
-                         ) <= CASE \
-                           WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
-                           WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
-                           ELSE 0 END \
-                     ) \
-                   ) \
-                   FROM unnest($9) AS qt(value) \
-                 ), false)"
-            } else {
-                "false"
-            }
-        );
-        // 评论/文档命中探测：对分页内的 issue 批量查询匹配的评论/文档原文，
-        // 用于补充 matchedFields / countsByType / snippets（对齐 Paperclip comment/document CTE）。
-        let mut comment_doc_hits: std::collections::HashMap<
-            Uuid,
-            (Option<String>, Option<(String, String)>),
-        > = std::collections::HashMap::new();
-        let mut q = sqlx::query(&sql)
-            .bind(&normalized_query)
-            .bind(&title_phrase)
-            .bind(&token_any)
-            .bind(company_id)
-            .bind(fetch_limit)
-            .bind(query.offset)
-            .bind(&contains_pattern)
-            .bind(&normalized_query);
-        // $9 仅在模糊 token 启用时被引用；未引用时绑定会导致参数数量不匹配。
-        if fuzzy_tokens_enabled {
-            q = q.bind(&fuzzy_tokens);
-        }
-        let rows = q.fetch_all(&self.pool).await?;
-
-        let mut has_more = rows.len() as i64 > query.limit;
-        let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
-
-        if query.scope.includes_comments_or_documents() && !page.is_empty() {
-            let page_ids: Vec<Uuid> = page.iter().map(|r| r.get::<Uuid, _>("id")).collect();
-            let crows = sqlx::query(
-                "SELECT issue_id, body FROM issue_comments \
-                 WHERE company_id = $1 AND issue_id = ANY($2) AND body ILIKE $3",
-            )
-            .bind(company_id)
-            .bind(&page_ids)
-            .bind(&contains_pattern)
-            .fetch_all(&self.pool)
-            .await?;
-            for r in crows {
-                let iid: Uuid = r.get("issue_id");
-                let body: String = r.get("body");
-                let entry = comment_doc_hits.entry(iid).or_insert((None, None));
-                entry.0 = Some(body);
-            }
-        let drows = sqlx::query(
-                "SELECT DISTINCT idoc.issue_id, d.title, d.content FROM issue_documents idoc \
-                 INNER JOIN documents d ON d.id = idoc.document_id AND d.company_id = idoc.company_id \
-                 WHERE idoc.company_id = $1 AND idoc.issue_id = ANY($2) \
-                 AND (d.title ILIKE $3 OR d.content ILIKE $3)",
-            )
-            .bind(company_id)
-            .bind(&page_ids)
-            .bind(&contains_pattern)
-            .fetch_all(&self.pool)
-            .await?;
-            for r in drows {
-                let iid: Uuid = r.get("issue_id");
-                let title: String = r.get("title");
-                let content: String = r.get("content");
-                let entry = comment_doc_hits.entry(iid).or_insert((None, None));
-                entry.1 = Some((title, content));
-            }
-        }
-
-
-        let mut results = Vec::with_capacity(page.len());
-        let mut counts: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        for row in page {
-            let id: Uuid = row.get("id");
-            let title: String = row.get("title");
-            let identifier: Option<String> = row.get("identifier");
-            let status: String = row.get("status");
-            let priority: String = row.get("priority");
-            let assignee_agent_id: Option<Uuid> = row.get("assignee_agent_id");
-            let assignee_user_id: Option<Uuid> = row.get("assignee_user_id");
-            let project_id: Option<Uuid> = row.get("project_id");
-            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
-            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-
-            // 命中字段探测（relevance 计分 + matchedFields）。
-            let mut matched_fields = Vec::new();
-            let mut score = 0.0f64;
-            if title.to_lowercase() == normalized_query {
-                score += 6.0;
-                matched_fields.push("title".to_string());
-            } else if title.to_lowercase().contains(&normalized_query) {
-                score += 5.0;
-                matched_fields.push("title".to_string());
-            }
-            if let Some(ident) = &identifier {
-                if ident.to_lowercase().contains(&normalized_query) {
-                    score += 4.0;
-                    matched_fields.push("identifier".to_string());
-                }
-            }
-            if fuzzy_enabled {
-                let ident_sim: f64 = row.try_get("ident_sim").unwrap_or(0.0);
-                if ident_sim >= FUZZY_IDENTIFIER_SIMILARITY_THRESHOLD && !matched_fields.contains(&"identifier".to_string()) {
-                    score += 4.0;
-                    matched_fields.push("identifier".to_string());
-                }
-            }
-            if fuzzy_tokens_enabled {
-                let fuzzy_title: bool = row.try_get("fuzzy_title").unwrap_or(false);
-                if fuzzy_title && !matched_fields.contains(&"title".to_string()) {
-                    score += 5.0;
-                    matched_fields.push("title".to_string());
-                }
-            }
-            if let Some(desc) = row.try_get::<String, _>("description").ok() {
-                if desc.to_lowercase().contains(&normalized_query) {
-                    score += 2.0;
-                    matched_fields.push("description".to_string());
-                }
-            }
-
-            let href = match &identifier {
-                Some(ident) => format!("/company/issues/{ident}"),
-                None => format!("/company/issues/{id}"),
-            };
-
-            // 评论/文档命中补充 matchedFields + 收集 snippet 源文本。
-            let mut snippet_sources: Vec<(String, String, String)> = Vec::new();
-            if let Some((comment_body, doc)) = comment_doc_hits.get(&id) {
-                if let Some(body) = comment_body {
-                    matched_fields.push("comment".to_string());
-                    snippet_sources.push(("comment".to_string(), "Comment".to_string(), body.clone()));
-                }
-                if let Some((doc_title, doc_content)) = doc {
-                    matched_fields.push("document".to_string());
-                    snippet_sources.push((
-                        "document".to_string(),
-                        doc_title.clone(),
-                        doc_content.clone(),
-                    ));
-                }
-            }
-
-            // 标题/描述命中也生成 snippet（对齐 Paperclip selectPrimarySnippets 优先级）。
-            if title.to_lowercase().contains(&normalized_query) {
-                snippet_sources.push(("title".to_string(), "Title".to_string(), title.clone()));
-            } else if fuzzy_tokens_enabled {
-                let fuzzy_title: bool = row.try_get("fuzzy_title").unwrap_or(false);
-                if fuzzy_title {
-                    snippet_sources.push(("title".to_string(), "Title".to_string(), title.clone()));
-                }
-            }
-            if let Some(desc) = row.try_get::<String, _>("description").ok() {
-                if desc.to_lowercase().contains(&normalized_query) {
-                    snippet_sources.push(("description".to_string(), "Description".to_string(), desc));
-                }
-            }
-            let snippets = build_issue_snippets(&snippet_sources, &terms);
-            let snippet = snippets.first().map(|s| s.text.clone());
-
-            // previewImageUrl：描述 → 评论 → 文档 的 markdown 首图（对齐 Paperclip
-            // extractFirstImageUrl 优先级；文档用 content 近似 latest_body）。
-            let desc_raw = row.try_get::<String, _>("description").ok();
-            let preview_image_url = desc_raw
-                .as_deref()
-                .and_then(extract_first_image_url)
-                .or_else(|| {
-                    comment_doc_hits.get(&id).and_then(|(cb, _)| {
-                        cb.as_deref().and_then(extract_first_image_url)
-                    })
-                })
-                .or_else(|| {
-                    comment_doc_hits.get(&id).and_then(|(_, doc)| {
-                        doc.as_ref().and_then(|(_, content)| extract_first_image_url(content))
-                    })
-                });
-
-            let updated_at_str = updated_at.to_rfc3339();
-
-            let issue_summary = CompanySearchIssueSummary {
-                id,
-                identifier: identifier.clone(),
-                title: title.clone(),
-                status,
-                priority,
-                assignee_agent_id,
-                assignee_user_id,
-                project_id,
-                updated_at: updated_at_str.clone(),
-            };
-            results.push(CompanySearchResult {
-                id,
-                result_type: "issue".to_string(),
-                score,
-                title,
-                href,
-                matched_fields,
-                source_label: identifier,
-                snippet,
-                snippets,
-                issue: Some(issue_summary),
-                updated_at: Some(updated_at_str),
-                preview_image_url,
-            });
-            *counts.entry("issue".to_string()).or_insert(0) += 1;
-            if let Some((comment_body, doc)) = comment_doc_hits.get(&id) {
-                if comment_body.is_some() {
-                    *counts.entry("comment".to_string()).or_insert(0) += 1;
-                }
-                if doc.is_some() {
-                    *counts.entry("document".to_string()).or_insert(0) += 1;
-                }
-            }
-        }
-
-        // scope=all 时追加 agent/project 命中（对齐 Paperclip 的多实体结果；
-        // 跨类型按 score 合并排序为后续阶段，当前 issue 在前、agent/project 在后）。
-        let token_any: String = if token_patterns.is_empty() {
-            "%__paperclip_no_match__%".to_string()
-        } else {
-            token_patterns
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        if scope_includes_agents {
-            let (rows, more) = self
-                .fetch_agent_rows(company_id, &contains_pattern, &token_any, fetch_limit, 0)
                 .await?;
-            let n = rows.len() as i64;
-            for r in rows {
-                results.push(agent_search_result(&r, &normalized_query, &tokens));
+            let issue_ids: Vec<Uuid> = issue_rows.iter().map(|row| row.id).collect();
+            let sources = if has_text && query.scope.includes_comments_or_documents() {
+                self.fetch_issue_sources(company_id, &issue_ids, &contains_pattern, &token_patterns)
+                    .await?
+        } else {
+                std::collections::HashMap::new()
+        };
+            for row in issue_rows {
+                if let Some(source) = sources.get(&row.id) {
+                    if !source.comments.is_empty() {
+                        source_counts.0 += 1;
             }
-            *counts.entry("agent".to_string()).or_insert(0) += n;
-            has_more |= more;
+                    if !source.documents.is_empty() {
+                        source_counts.1 += 1;
         }
-        if scope_includes_projects {
-            let (rows, more) = self
-                .fetch_project_rows(company_id, &contains_pattern, &token_any, fetch_limit, 0)
-                .await?;
-            let n = rows.len() as i64;
-            for r in rows {
-                results.push(project_search_result(&r, &normalized_query, &tokens));
+        }
+                items.push(issue_search_item(
+                    &row,
+                    sources.get(&row.id),
+                    &normalized_query,
+                    &token_patterns,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    FUZZY_IDENTIFIER_SIMILARITY_THRESHOLD,
+                ));
             }
-            *counts.entry("project".to_string()).or_insert(0) += n;
-            has_more |= more;
         }
 
-        // facet 计数：对全候选命中集（非仅分页）聚合，对齐 Paperclip filterOptionCounts。
-        // 参数重编号：where_sql 用 $2/$3/$4/$7/$8 → $1/$2/$3/$4/$5（见 fetch_filter_option_counts）。
-        let filter_option_counts = self
-            .fetch_filter_option_counts(
+        if query.scope.includes_artifacts() && has_text {
+            let artifacts = self
+                .fetch_artifact_rows(
+                    company_id,
+                    &query,
+                    &normalized_query,
+                    &contains_pattern,
+                    &token_patterns,
+            )
+            .await?;
+            for row in artifacts {
+                items.push(artifact_search_item(&row, &normalized_query, &tokens));
+            }
+        }
+
+        // Paperclip does not mix simple entities with issue-only filters. Their
+        // results are otherwise part of the same global result set for `all`.
+        if has_text && !has_issue_filters {
+            if query.scope.includes_agents() {
+                for row in self
+                    .fetch_all_agent_rows(company_id, &contains_pattern, &token_patterns)
+                    .await?
+                {
+                    let created_at = row.created_at;
+                    let updated_at = row.updated_at;
+                    items.push(SearchResultItem {
+                        result: agent_search_result(&row, &normalized_query, &tokens),
+                        created_at,
+                        updated_at,
+                        priority_rank: 0,
+                    });
+            }
+                }
+            if query.scope.includes_projects() {
+                for row in self
+                    .fetch_all_project_rows(company_id, &contains_pattern, &token_patterns)
+                    .await?
+                {
+                    let created_at = row.created_at;
+                    let updated_at = row.updated_at;
+                    items.push(SearchResultItem {
+                        result: project_search_result(&row, &normalized_query, &tokens),
+                        created_at,
+                        updated_at,
+                        priority_rank: 0,
+                    });
+            }
+                }
+            }
+
+        let filter_option_counts = if scope_includes_issues {
+            self.fetch_filter_option_counts(
                 company_id,
-                &where_sql,
-                &title_phrase,
-                &token_any,
-                &contains_pattern,
+                &query,
                 &normalized_query,
+                &contains_pattern,
+                &token_patterns,
                 &fuzzy_tokens,
+                fuzzy_enabled,
                 fuzzy_tokens_enabled,
             )
-            .await?;
+            .await?
+        } else {
+            CompanySearchFilterOptionCounts::default()
+        };
+
+        let mut counts = empty_counts_by_type();
+        for item in &items {
+            *counts.entry(item.result.result_type.clone()).or_insert(0) += 1;
+                }
+        counts.insert("comment".to_string(), source_counts.0);
+        counts.insert("document".to_string(), source_counts.1);
+
+        let total = items.len() as i64;
+        let zero_results = if total == 0 && has_issue_filters && scope_includes_issues {
+            Some(
+                self.build_zero_results(
+                    company_id,
+                    &query,
+                    &normalized_query,
+                    &contains_pattern,
+                    &token_patterns,
+                    &fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        items.sort_by(|a, b| compare_search_items(a, b, query.sort));
+        let start = query.offset.max(0) as usize;
+        let end = start.saturating_add(query.limit.max(0) as usize);
+        let page_start = start.min(items.len());
+        let page_end = end.min(items.len());
+        let results = items
+            .into_iter()
+            .skip(page_start)
+            .take(page_end.saturating_sub(page_start))
+            .map(|item| item.result)
+            .collect();
 
         Ok(CompanySearchResponse {
             query: query.q.clone(),
@@ -830,258 +690,781 @@ impl CompanySearchService {
             results,
             counts_by_type: counts,
             filter_option_counts,
-            zero_results: None,
-            has_more,
+            zero_results,
+            has_more: page_end < total as usize,
         })
-    }
-
-    /// 对齐 Paperclip `filterOptionCounts`：在候选命中集（同一 `match_conditions`）
-    /// 上聚合 status/priority/assigneeAgentId/assigneeUserId/projectId/labelId/
-    /// updatedWithin(24h/7d/30d/90d) 的计数。Parrot 尚无活动过滤器，
-    /// 故每个 facet 均不带 `optionCond`/`omit`（对齐 Paperclip 无过滤时的语义）。
-    async fn fetch_filter_option_counts(
-        &self,
-        company_id: Uuid,
-        where_sql: &str,
-        title_phrase: &str,
-        token_any: &str,
-        contains_pattern: &str,
-        normalized_query: &str,
-        fuzzy_tokens: &[String],
-        fuzzy_tokens_enabled: bool,
-    ) -> Result<CompanySearchFilterOptionCounts, sqlx::Error> {
-        // 重编号 where_sql 参数占位符（从高到低避免二次替换）：
-        // $9->$6, $8->$5, $7->$4, $4->$3, $3->$2, $2->$1
-        // 用哨兵占位符防止级联二次替换（$4->$3 后再被 $3->$2 命中）。
-        let mut ws = where_sql.to_string();
-        for (from, to) in [("$9", "$6"), ("$8", "$5"), ("$7", "$4"), ("$4", "$3"), ("$3", "$2"), ("$2", "$1")] {
-            ws = ws.replace(from, &format!("\u{0}{}", to.trim_start_matches('$')));
-        }
-        for n in 1..=6 {
-            ws = ws.replace(&format!("\u{0}{}", n), &format!("${}", n));
-        }
-        // 候选条件引用 `issues.` 表名；facet 查询以 `i` 为别名，需整体替换。
-        ws = ws.replace("issues.", "i.");
-        let sql = format!(
-            "SELECT 'status' AS kind, i.status::text AS value, count(*)::int8 AS count \
-             FROM issues i WHERE i.company_id = $3 AND ({ws}) GROUP BY 2 \
-             UNION ALL \
-             SELECT 'priority' AS kind, i.priority::text AS value, count(*)::int8 AS count \
-             FROM issues i WHERE i.company_id = $3 AND ({ws}) GROUP BY 2 \
-             UNION ALL \
-             SELECT 'assigneeAgentId' AS kind, i.assignee_agent_id::text AS value, count(*)::int8 AS count \
-             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.assignee_agent_id IS NOT NULL GROUP BY 2 \
-             UNION ALL \
-             SELECT 'assigneeUserId' AS kind, i.assignee_user_id::text AS value, count(*)::int8 AS count \
-             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.assignee_user_id IS NOT NULL GROUP BY 2 \
-             UNION ALL \
-             SELECT 'projectId' AS kind, i.project_id::text AS value, count(*)::int8 AS count \
-             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.project_id IS NOT NULL GROUP BY 2 \
-             UNION ALL \
-             SELECT 'labelId' AS kind, il.label_id::text AS value, count(*)::int8 AS count \
-             FROM issues i INNER JOIN issue_labels il ON il.issue_id = i.id \
-             WHERE i.company_id = $3 AND ({ws}) GROUP BY 2 \
-             UNION ALL \
-             SELECT 'updatedWithin' AS kind, '24h' AS value, count(*)::int8 AS count \
-             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.updated_at >= now() - interval '24 hours' \
-             UNION ALL \
-             SELECT 'updatedWithin' AS kind, '7d' AS value, count(*)::int8 AS count \
-             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.updated_at >= now() - interval '7 days' \
-             UNION ALL \
-             SELECT 'updatedWithin' AS kind, '30d' AS value, count(*)::int8 AS count \
-             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.updated_at >= now() - interval '30 days' \
-             UNION ALL \
-             SELECT 'updatedWithin' AS kind, '90d' AS value, count(*)::int8 AS count \
-             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.updated_at >= now() - interval '90 days'"
-        );
-        let mut q = sqlx::query(&sql)
-            .bind(title_phrase)      // $1（原 $2）
-            .bind(token_any)         // $2（原 $3）
-            .bind(company_id);       // $3
-        // Postgres 参数编号必须连续到最高引用位：where_sql 可能引用 $5 而不引用 $4
-        // （模糊开、评论/文档 EXISTS 关），此时 $4 位置仍需占位绑定。
-        let max_param = if ws.contains("$6") {
-            6
-        } else if ws.contains("$5") {
-            5
-        } else if ws.contains("$4") {
-            4
-        } else {
-            3
-        };
-        if max_param >= 4 {
-            q = q.bind(contains_pattern); // $4（原 $7；未引用时占位）
-        }
-        if max_param >= 5 {
-            q = q.bind(normalized_query); // $5（原 $8）
-        }
-        if max_param >= 6 {
-            q = q.bind(fuzzy_tokens);     // $6（原 $9；仅模糊 token 启用时引用）
-        }
-        let rows = q.fetch_all(&self.pool).await?;
-        let mut out = CompanySearchFilterOptionCounts::default();
-        for row in rows {
-            let kind: String = row.get("kind");
-            let value: String = row.get("value");
-            let count: i64 = row.get("count");
-            match kind.as_str() {
-                "status" => { out.status.insert(value, count); }
-                "priority" => { out.priority.insert(value, count); }
-                "assigneeAgentId" => { out.assignee_agent_id.insert(value, count); }
-                "assigneeUserId" => { out.assignee_user_id.insert(value, count); }
-                "projectId" => { out.project_id.insert(value, count); }
-                "labelId" => { out.label_id.insert(value, count); }
-                "updatedWithin" => { out.updated_within.insert(value, count); }
-                _ => {}
             }
-        }
-        Ok(out)
-    }
 
-    /// 专属 agent/project 作用域搜索（scope=agents/projects，不含 issue）。
-    /// 分页作用于实体本身（LIMIT/OFFSET + fetch+1 探测 has_more）；
-    /// countsByType 记 agent/project 命中数。
-    async fn search_agent_project_scope(
+    async fn fetch_issue_rows(
         &self,
         company_id: Uuid,
         query: &CompanySearchQuery,
         normalized_query: &str,
         contains_pattern: &str,
         token_patterns: &[String],
-        tokens: &[String],
-    ) -> Result<CompanySearchResponse, sqlx::Error> {
-        let fetch_limit = query.limit + 1;
-        let token_any: String = if token_patterns.is_empty() {
-            "%__paperclip_no_match__%".to_string()
+        fuzzy_tokens: &[String],
+        fuzzy_enabled: bool,
+        fuzzy_tokens_enabled: bool,
+        omit_filter: Option<SearchFacet>,
+    ) -> Result<Vec<IssueSearchRow>, sqlx::Error> {
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "SELECT i.id, i.title, i.identifier, i.status::text AS status, \
+                    i.priority::text AS priority, i.assignee_agent_id, i.assignee_user_id, \
+                    i.project_id, i.updated_at, i.created_at, i.description",
+        );
+        if fuzzy_enabled {
+            qb.push(", similarity(lower(coalesce(i.identifier,'')), ")
+                .push_bind(normalized_query.to_string())
+                .push(")::double precision AS ident_sim");
         } else {
-            token_patterns
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        let mut results: Vec<CompanySearchResult> = Vec::new();
-        let mut counts: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        let mut has_more = false;
-
-        if query.scope.includes_agents() {
-            let (rows, more) = self
-                .fetch_agent_rows(company_id, contains_pattern, &token_any, fetch_limit, query.offset)
-                .await?;
-            for r in rows {
-                results.push(agent_search_result(&r, normalized_query, tokens));
+            qb.push(", 0.0::double precision AS ident_sim");
+                }
+        if fuzzy_tokens_enabled {
+            qb.push(", ");
+            push_fuzzy_title_expression(&mut qb, "i", fuzzy_tokens);
+            qb.push(" AS fuzzy_title");
+        } else {
+            qb.push(", false AS fuzzy_title");
             }
-            counts.insert("agent".to_string(), results.len() as i64);
-            has_more |= more;
+        qb.push(" FROM issues i WHERE i.company_id = ")
+            .push_bind(company_id)
+            .push(" AND i.hidden_at IS NULL");
+
+        if !normalized_query.is_empty() {
+            qb.push(" AND ");
+            push_issue_search_match(
+                &mut qb,
+                query,
+                normalized_query,
+                contains_pattern,
+                token_patterns,
+                fuzzy_tokens,
+                fuzzy_enabled,
+                fuzzy_tokens_enabled,
+            );
+                }
+        push_issue_filters(&mut qb, "i", query, omit_filter);
+        qb.push(" ORDER BY i.updated_at DESC, i.id DESC");
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| IssueSearchRow {
+                id: row.get("id"),
+                title: row.get("title"),
+                identifier: row.get("identifier"),
+                status: row.get("status"),
+                priority: row.get("priority"),
+                assignee_agent_id: row.get("assignee_agent_id"),
+                assignee_user_id: row.get("assignee_user_id"),
+                project_id: row.get("project_id"),
+                updated_at: row.get("updated_at"),
+                created_at: row.get("created_at"),
+                description: row.get("description"),
+                identifier_similarity: row.try_get("ident_sim").unwrap_or(0.0),
+                fuzzy_title: row.try_get("fuzzy_title").unwrap_or(false),
+            })
+            .collect())
+                }
+
+    async fn fetch_issue_sources(
+        &self,
+        company_id: Uuid,
+        issue_ids: &[Uuid],
+        contains_pattern: &str,
+        token_patterns: &[String],
+    ) -> Result<std::collections::HashMap<Uuid, IssueSearchSources>, sqlx::Error> {
+        let mut sources = std::collections::HashMap::new();
+        if issue_ids.is_empty() {
+            return Ok(sources);
+            }
+
+        let mut comments = QueryBuilder::<Postgres>::new(
+            "SELECT issue_id, body FROM issue_comments WHERE company_id = ",
+        );
+        comments
+            .push_bind(company_id)
+            .push(" AND issue_id = ANY(")
+            .push_bind(issue_ids.to_vec())
+            .push(") AND (");
+        push_or_ilike_expression(
+            &mut comments,
+            "body",
+            contains_pattern,
+            token_patterns,
+            true,
+        );
+        comments.push(") ORDER BY created_at ASC, id ASC");
+        for row in comments.build().fetch_all(&self.pool).await? {
+            sources
+                .entry(row.get::<Uuid, _>("issue_id"))
+                .or_insert_with(IssueSearchSources::default)
+                .comments
+                .push(row.get("body"));
+        }
+
+        let mut documents = QueryBuilder::<Postgres>::new(
+            "SELECT idoc.issue_id, d.id AS document_id, idoc.key, d.title, d.content \
+             FROM issue_documents idoc INNER JOIN documents d ON d.id = idoc.document_id \
+             AND d.company_id = idoc.company_id WHERE idoc.company_id = ",
+        );
+        documents
+            .push_bind(company_id)
+            .push(" AND idoc.issue_id = ANY(")
+            .push_bind(issue_ids.to_vec())
+            .push(") AND (");
+        push_or_ilike_expression(
+            &mut documents,
+            "d.title",
+            contains_pattern,
+            token_patterns,
+            true,
+        );
+        documents.push(" OR ");
+        push_or_ilike_expression(
+            &mut documents,
+            "d.content",
+            contains_pattern,
+            token_patterns,
+            false,
+        );
+        documents.push(") ORDER BY idoc.key ASC, d.id ASC");
+        for row in documents.build().fetch_all(&self.pool).await? {
+            sources
+                .entry(row.get::<Uuid, _>("issue_id"))
+                .or_insert_with(IssueSearchSources::default)
+                .documents
+                .push(DocumentSearchSource {
+                    key: row.get("key"),
+                    title: row.get("title"),
+                    content: row.get("content"),
+                });
+                }
+        Ok(sources)
+    }
+
+    async fn fetch_artifact_rows(
+        &self,
+        company_id: Uuid,
+        query: &CompanySearchQuery,
+        normalized_query: &str,
+        contains_pattern: &str,
+        token_patterns: &[String],
+    ) -> Result<Vec<ArtifactSearchRow>, sqlx::Error> {
+        let has_text = !normalized_query.is_empty();
+        if !has_text {
+            return Ok(Vec::new());
+        }
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "SELECT d.id AS artifact_id, 'document'::text AS source, d.content_type::text AS media_hint, \
+                    d.title AS artifact_title, d.content AS artifact_body, i.id AS issue_id, \
+                    coalesce(i.identifier, i.id::text) AS issue_identifier, i.title AS issue_title, \
+                    i.project_id, p.name AS project_name, d.updated_at AS artifact_updated_at, \
+                    d.created_at AS artifact_created_at, idoc.key AS artifact_key, NULL::text AS artifact_url \
+             FROM issue_documents idoc \
+             INNER JOIN documents d ON d.id = idoc.document_id AND d.company_id = idoc.company_id \
+             INNER JOIN issues i ON i.id = idoc.issue_id AND i.company_id = idoc.company_id \
+             LEFT JOIN projects p ON p.id = i.project_id AND p.company_id = i.company_id \
+             WHERE idoc.company_id = ",
+        );
+        qb.push_bind(company_id).push(
+            " AND i.hidden_at IS NULL AND idoc.key NOT IN ('description', 'continuation-summary') \
+                    AND (d.created_by_agent_id IS NOT NULL OR d.updated_by_agent_id IS NOT NULL)",
+        );
+        if has_text {
+            qb.push(" AND (");
+            push_or_ilike_expression(&mut qb, "d.title", contains_pattern, token_patterns, true);
+            qb.push(" OR ");
+            push_or_ilike_expression(
+                &mut qb,
+                "d.content",
+                contains_pattern,
+                token_patterns,
+                false,
+            );
+            qb.push(" OR ");
+            push_or_ilike_expression(
+                &mut qb,
+                "coalesce(i.identifier, '')",
+                contains_pattern,
+                token_patterns,
+                false,
+            );
+            qb.push(" OR ");
+            push_or_ilike_expression(&mut qb, "i.title", contains_pattern, token_patterns, false);
+            qb.push(")");
+        }
+        push_issue_filters(&mut qb, "i", query, None);
+
+        qb.push(" UNION ALL SELECT wp.id AS artifact_id, 'work_product'::text AS source, \
+                    coalesce(wp.metadata->>'mediaKind', CASE WHEN wp.url IS NULL THEN 'text' ELSE 'file' END) AS media_hint, \
+                    coalesce(nullif(wp.title, ''), wp.name) AS artifact_title, \
+                    coalesce(wp.summary, wp.description, wp.artifact::text, '') AS artifact_body, \
+                    i.id AS issue_id, coalesce(i.identifier, i.id::text) AS issue_identifier, \
+                    i.title AS issue_title, i.project_id, p.name AS project_name, wp.updated_at AS artifact_updated_at, \
+                    wp.created_at AS artifact_created_at, NULL::text AS artifact_key, wp.url AS artifact_url \
+             FROM issue_work_products wp \
+             INNER JOIN issues i ON i.id = wp.issue_id AND i.company_id = wp.company_id \
+             LEFT JOIN projects p ON p.id = i.project_id AND p.company_id = i.company_id \
+             WHERE wp.company_id = ");
+        qb.push_bind(company_id)
+            .push(" AND wp.type = 'artifact' AND i.hidden_at IS NULL");
+        if has_text {
+            qb.push(" AND (");
+            for (index, expression) in [
+                "coalesce(nullif(wp.title, ''), wp.name)",
+                "coalesce(wp.summary, '')",
+                "coalesce(wp.description, '')",
+                "coalesce(wp.url, '')",
+                "coalesce(wp.artifact::text, '')",
+                "coalesce(i.identifier, '')",
+                "i.title",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if index > 0 {
+                    qb.push(" OR ");
+                }
+                push_or_ilike_expression(
+                    &mut qb,
+                    expression,
+                    contains_pattern,
+                    token_patterns,
+                    true,
+                );
+            }
+            qb.push(")");
+        }
+        push_issue_filters(&mut qb, "i", query, None);
+
+        qb.push(" UNION ALL SELECT a.id AS artifact_id, 'attachment'::text AS source, \
+                    a.content_type::text AS media_hint, a.filename AS artifact_title, \
+                    (a.filename || ' ' || coalesce(asset.object_key, '')) AS artifact_body, \
+                    i.id AS issue_id, coalesce(i.identifier, i.id::text) AS issue_identifier, \
+                    i.title AS issue_title, i.project_id, p.name AS project_name, a.updated_at AS artifact_updated_at, \
+                    a.created_at AS artifact_created_at, NULL::text AS artifact_key, NULL::text AS artifact_url \
+             FROM attachments a INNER JOIN assets asset ON asset.id = a.asset_id AND asset.company_id = a.company_id \
+             INNER JOIN issues i ON i.id = a.parent_id AND i.company_id = a.company_id \
+             LEFT JOIN projects p ON p.id = i.project_id AND p.company_id = i.company_id \
+             WHERE a.company_id = ");
+        qb.push_bind(company_id).push(
+            " AND a.parent_type = 'issue' AND i.hidden_at IS NULL \
+                    AND asset.created_by_agent_id IS NOT NULL",
+        );
+        if has_text {
+            qb.push(" AND (");
+            for (index, expression) in [
+                "a.filename",
+                "coalesce(asset.original_filename, '')",
+                "asset.object_key",
+                "coalesce(i.identifier, '')",
+                "i.title",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if index > 0 {
+                    qb.push(" OR ");
+                }
+                push_or_ilike_expression(
+                    &mut qb,
+                    expression,
+                    contains_pattern,
+                    token_patterns,
+                    true,
+                );
+                }
+            qb.push(")");
+            }
+        push_issue_filters(&mut qb, "i", query, None);
+        qb.push(" ORDER BY artifact_updated_at DESC, artifact_id DESC");
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ArtifactSearchRow {
+                id: row.get("artifact_id"),
+                source: row.get("source"),
+                media_hint: row.try_get("media_hint").ok(),
+                title: row.get("artifact_title"),
+                body: row.get("artifact_body"),
+                issue_id: row.get("issue_id"),
+                issue_identifier: row.get("issue_identifier"),
+                issue_title: row.get("issue_title"),
+                project_id: row.get("project_id"),
+                project_name: row.get("project_name"),
+                updated_at: row.get("artifact_updated_at"),
+                created_at: row.get("artifact_created_at"),
+                key: row.get("artifact_key"),
+                url: row.get("artifact_url"),
+                })
+            .collect())
+    }
+
+    async fn fetch_all_agent_rows(
+        &self,
+        company_id: Uuid,
+        contains_pattern: &str,
+        token_patterns: &[String],
+    ) -> Result<Vec<AgentSearchRow>, sqlx::Error> {
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "SELECT id, name, role, created_at, updated_at FROM agents WHERE company_id = ",
+        );
+        qb.push_bind(company_id).push(" AND (");
+        push_or_ilike_expression(&mut qb, "name", contains_pattern, token_patterns, true);
+        qb.push(" OR ");
+        push_or_ilike_expression(&mut qb, "role", contains_pattern, token_patterns, false);
+        qb.push(" OR ");
+        push_or_ilike_expression(
+            &mut qb,
+            "metadata::text",
+            contains_pattern,
+            token_patterns,
+            false,
+        );
+        qb.push(") ORDER BY updated_at DESC, id DESC");
+        Ok(qb
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| AgentSearchRow {
+                id: row.get("id"),
+                name: row.get("name"),
+                role: row.get("role"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+                    })
+            .collect())
+    }
+
+    async fn fetch_all_project_rows(
+        &self,
+        company_id: Uuid,
+        contains_pattern: &str,
+        token_patterns: &[String],
+    ) -> Result<Vec<ProjectSearchRow>, sqlx::Error> {
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "SELECT id, name, description, created_at, updated_at FROM projects \
+             WHERE company_id = ",
+        );
+        qb.push_bind(company_id)
+            .push(" AND archived_at IS NULL AND (");
+        push_or_ilike_expression(&mut qb, "name", contains_pattern, token_patterns, true);
+        qb.push(" OR ");
+        push_or_ilike_expression(
+            &mut qb,
+            "coalesce(description, '')",
+            contains_pattern,
+            token_patterns,
+            false,
+        );
+        qb.push(") ORDER BY updated_at DESC, id DESC");
+        Ok(qb
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| ProjectSearchRow {
+                id: row.get("id"),
+                name: row.get("name"),
+                description: row.get("description"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+            })
+            .collect())
+    }
+
+    async fn fetch_filter_option_counts(
+        &self,
+        company_id: Uuid,
+        query: &CompanySearchQuery,
+        normalized_query: &str,
+        contains_pattern: &str,
+        token_patterns: &[String],
+        fuzzy_tokens: &[String],
+        fuzzy_enabled: bool,
+        fuzzy_tokens_enabled: bool,
+    ) -> Result<CompanySearchFilterOptionCounts, sqlx::Error> {
+        let mut out = CompanySearchFilterOptionCounts::default();
+        if normalized_query.is_empty()
+            && matches!(
+                query.scope,
+                CompanySearchScope::Comments | CompanySearchScope::Documents
+            )
+        {
+            return Ok(out);
+        }
+        let fetch = |facet| async move {
+            self.fetch_issue_rows(
+                company_id,
+                query,
+                normalized_query,
+                contains_pattern,
+                token_patterns,
+                fuzzy_tokens,
+                fuzzy_enabled,
+                fuzzy_tokens_enabled,
+                Some(facet),
+            )
+            .await
+            };
+
+        for row in fetch(SearchFacet::Status).await? {
+            *out.status.entry(row.status).or_insert(0) += 1;
+                }
+        for row in fetch(SearchFacet::Priority).await? {
+            *out.priority.entry(row.priority).or_insert(0) += 1;
+                }
+        for row in fetch(SearchFacet::AssigneeAgent).await? {
+            if let Some(id) = row.assignee_agent_id {
+                *out.assignee_agent_id.entry(id.to_string()).or_insert(0) += 1;
+            }
+        }
+        for row in fetch(SearchFacet::AssigneeUser).await? {
+            if let Some(id) = row.assignee_user_id {
+                *out.assignee_user_id.entry(id.to_string()).or_insert(0) += 1;
+            }
+        }
+        for row in fetch(SearchFacet::Project).await? {
+            if let Some(id) = row.project_id {
+                *out.project_id.entry(id.to_string()).or_insert(0) += 1;
+            }
+        }
+        let label_rows = fetch(SearchFacet::Label).await?;
+        let label_issue_ids: Vec<Uuid> = label_rows.iter().map(|row| row.id).collect();
+        if !label_issue_ids.is_empty() {
+            for row in sqlx::query(
+                "SELECT label_id FROM issue_labels WHERE company_id = $1 AND issue_id = ANY($2)",
+            )
+            .bind(company_id)
+            .bind(&label_issue_ids)
+            .fetch_all(&self.pool)
+            .await?
+            {
+                let id: Uuid = row.get("label_id");
+                *out.label_id.entry(id.to_string()).or_insert(0) += 1;
+            }
+        }
+        // Paperclip computes the time buckets from the non-time-filtered match
+        // set, so an active updatedAfter must not skew updatedWithin counts.
+        let mut updated_query = query.clone();
+        updated_query.updated_within = None;
+        updated_query.updated_after = None;
+        for row in self
+            .fetch_issue_rows(
+                company_id,
+                &updated_query,
+                normalized_query,
+                contains_pattern,
+                token_patterns,
+                fuzzy_tokens,
+                fuzzy_enabled,
+                fuzzy_tokens_enabled,
+                None,
+            )
+            .await?
+        {
+            let age = chrono::Utc::now() - row.updated_at;
+            for (key, duration) in [
+                ("24h", chrono::Duration::hours(24)),
+                ("7d", chrono::Duration::days(7)),
+                ("30d", chrono::Duration::days(30)),
+                ("90d", chrono::Duration::days(90)),
+            ] {
+                if age <= duration {
+                    *out.updated_within.entry(key.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn fetch_non_issue_count(
+        &self,
+        company_id: Uuid,
+        query: &CompanySearchQuery,
+        normalized_query: &str,
+        contains_pattern: &str,
+        token_patterns: &[String],
+    ) -> Result<i64, sqlx::Error> {
+        if normalized_query.is_empty() || query.has_active_issue_filters() {
+            return Ok(0);
+        }
+        let mut total = 0_i64;
+        if query.scope.includes_artifacts() {
+            total += self
+                .fetch_artifact_rows(
+                    company_id,
+                    query,
+            normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                )
+                .await?
+                .len() as i64;
+        }
+        if query.scope.includes_agents() {
+            total += self
+                .fetch_all_agent_rows(company_id, contains_pattern, token_patterns)
+                .await?
+                .len() as i64;
         }
         if query.scope.includes_projects() {
-            let (rows, more) = self
-                .fetch_project_rows(company_id, contains_pattern, &token_any, fetch_limit, query.offset)
+            total += self
+                .fetch_all_project_rows(company_id, contains_pattern, token_patterns)
+                .await?
+                .len() as i64;
+        }
+        Ok(total)
+    }
+
+    async fn fetch_zero_result_count(
+        &self,
+        company_id: Uuid,
+        query: &CompanySearchQuery,
+        normalized_query: &str,
+        contains_pattern: &str,
+        token_patterns: &[String],
+        fuzzy_tokens: &[String],
+        fuzzy_enabled: bool,
+        fuzzy_tokens_enabled: bool,
+        omit_filter: SearchFacet,
+    ) -> Result<i64, sqlx::Error> {
+        let issue_results_enabled = query.scope.includes_issues()
+            && (!normalized_query.is_empty()
+                || !matches!(
+                    query.scope,
+                    CompanySearchScope::Comments | CompanySearchScope::Documents
+                ));
+        let issue_count = if issue_results_enabled {
+            self.fetch_issue_rows(
+                company_id,
+                query,
+                normalized_query,
+                contains_pattern,
+                token_patterns,
+                fuzzy_tokens,
+                fuzzy_enabled,
+                fuzzy_tokens_enabled,
+                Some(omit_filter),
+            )
+            .await?
+            .len() as i64
+        } else {
+            0
+        };
+        let candidate_query = query_without_filter(query, omit_filter);
+        Ok(issue_count
+            + self
+                .fetch_non_issue_count(
+                    company_id,
+                    &candidate_query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                )
+                .await?)
+    }
+
+    async fn build_zero_results(
+        &self,
+        company_id: Uuid,
+        query: &CompanySearchQuery,
+        normalized_query: &str,
+        contains_pattern: &str,
+        token_patterns: &[String],
+        fuzzy_tokens: &[String],
+        fuzzy_enabled: bool,
+        fuzzy_tokens_enabled: bool,
+    ) -> Result<CompanySearchZeroResults, sqlx::Error> {
+        let issue_results_enabled = query.scope.includes_issues()
+            && (!normalized_query.is_empty()
+                || !matches!(
+                    query.scope,
+                    CompanySearchScope::Comments | CompanySearchScope::Documents
+                ));
+        let unfiltered_query = query_without_issue_filters(query);
+        let unfiltered_issue_total = if issue_results_enabled {
+            self.fetch_issue_rows(
+                company_id,
+                &unfiltered_query,
+                normalized_query,
+                contains_pattern,
+                token_patterns,
+                fuzzy_tokens,
+                fuzzy_enabled,
+                fuzzy_tokens_enabled,
+                Some(SearchFacet::All),
+            )
+            .await?
+            .len() as i64
+        } else {
+            0
+        };
+        let unfiltered_total = unfiltered_issue_total
+            + self
+                .fetch_non_issue_count(
+                    company_id,
+                    &unfiltered_query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                )
                 .await?;
-            for r in rows {
-                results.push(project_search_result(&r, normalized_query, tokens));
+        let current_total = 0_i64;
+        let mut loosen_suggestions = Vec::new();
+        let mut add = |filter: &str, values: Vec<String>, count: i64| {
+            if !values.is_empty() {
+                loosen_suggestions.push(CompanySearchZeroResultsLoosenSuggestion {
+                    filter: filter.to_string(),
+                    values,
+                    result_count: count,
+                    additional_count: (count - current_total).max(0),
+                });
             }
-            counts.insert("project".to_string(), results.len() as i64);
-            has_more |= more;
+        };
+
+        if !query.statuses.is_empty() {
+            let count = self
+                .fetch_zero_result_count(
+                    company_id,
+                    query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                    fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    SearchFacet::Status,
+                )
+                .await?;
+            add("status", query.statuses.clone(), count);
+            }
+        if !query.priorities.is_empty() {
+            let count = self
+                .fetch_zero_result_count(
+                    company_id,
+                    query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                    fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    SearchFacet::Priority,
+                )
+                .await?;
+            add("priority", query.priorities.clone(), count);
+        }
+        if let Some(value) = &query.assignee_agent_id {
+            let count = self
+                .fetch_zero_result_count(
+                    company_id,
+                    query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                    fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    SearchFacet::AssigneeAgent,
+                )
+                .await?;
+            add(
+                "assigneeAgentId",
+                vec![value
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "null".to_string())],
+                count,
+            );
+            }
+        if let Some(value) = query.assignee_user_id {
+            let count = self
+                .fetch_zero_result_count(
+                    company_id,
+                    query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                    fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    SearchFacet::AssigneeUser,
+                )
+                .await?;
+            add("assigneeUserId", vec![value.to_string()], count);
+        }
+        if let Some(value) = query.project_id {
+            let count = self
+                .fetch_zero_result_count(
+                    company_id,
+                    query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                    fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    SearchFacet::Project,
+                )
+                .await?;
+            add("projectId", vec![value.to_string()], count);
+    }
+        if let Some(value) = query.label_id {
+            let count = self
+                .fetch_zero_result_count(
+                    company_id,
+                    query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                    fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    SearchFacet::Label,
+        )
+        .await?;
+            add("labelId", vec![value.to_string()], count);
+    }
+        if let Some(value) = &query.updated_within {
+            let count = self
+                .fetch_zero_result_count(
+                    company_id,
+                    query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                    fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    SearchFacet::UpdatedWithin,
+        )
+        .await?;
+            add("updatedWithin", vec![value.clone()], count);
+        }
+        if let Some(value) = &query.updated_after {
+            let count = self
+                .fetch_zero_result_count(
+                    company_id,
+                    query,
+                    normalized_query,
+                    contains_pattern,
+                    token_patterns,
+                    fuzzy_tokens,
+                    fuzzy_enabled,
+                    fuzzy_tokens_enabled,
+                    SearchFacet::UpdatedAfter,
+                )
+                .await?;
+            add("updatedAfter", vec![value.to_rfc3339()], count);
         }
 
-        Ok(CompanySearchResponse {
-            query: query.q.clone(),
-            normalized_query: normalized_query.to_string(),
-            scope: scope_name(&query.scope).to_string(),
-            sort: sort_name(&query.sort).to_string(),
-            limit: query.limit,
-            offset: query.offset,
-            results,
-            counts_by_type: counts,
-            filter_option_counts: CompanySearchFilterOptionCounts::default(),
-            zero_results: None,
-            has_more,
-        })
-    }
-
-    /// 拉取 agent 命中行（company 租户隔离；name/role ILIKE 短语或分词）。
-    /// fetch+1 探测 has_more；OFFSET 由调用方传入（专属作用域分页用）。
-    async fn fetch_agent_rows(
-        &self,
-        company_id: Uuid,
-        contains_pattern: &str,
-        token_any: &str,
-        fetch_limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<AgentSearchRow>, bool), sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT id, name, role, created_at, updated_at \
-             FROM agents \
-             WHERE company_id = $1 \
-               AND (name ILIKE $2 OR role ILIKE $2 \
-                    OR name ILIKE ANY(string_to_array($3, ',')::text[]) \
-                    OR role ILIKE ANY(string_to_array($3, ',')::text[])) \
-             ORDER BY updated_at DESC, id DESC \
-             LIMIT $4 OFFSET $5",
-        )
-        .bind(company_id)
-        .bind(contains_pattern)
-        .bind(token_any)
-        .bind(fetch_limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
-        let has_more = rows.len() as i64 > fetch_limit - 1;
-        let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
-        let out = page
-            .iter()
-            .map(|r| AgentSearchRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                role: r.get("role"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
+        Ok(CompanySearchZeroResults {
+            unfiltered_total,
+            loosen_suggestions,
             })
-            .collect();
-        Ok((out, has_more))
-    }
-
-    /// 拉取 project 命中行（company 租户隔离；name/description ILIKE；排除 archived）。
-    async fn fetch_project_rows(
-        &self,
-        company_id: Uuid,
-        contains_pattern: &str,
-        token_any: &str,
-        fetch_limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<ProjectSearchRow>, bool), sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT id, name, description, created_at, updated_at \
-             FROM projects \
-             WHERE company_id = $1 AND archived_at IS NULL \
-               AND (name ILIKE $2 OR coalesce(description,'') ILIKE $2 \
-                    OR name ILIKE ANY(string_to_array($3, ',')::text[]) \
-                    OR coalesce(description,'') ILIKE ANY(string_to_array($3, ',')::text[])) \
-             ORDER BY updated_at DESC, id DESC \
-             LIMIT $4 OFFSET $5",
-        )
-        .bind(company_id)
-        .bind(contains_pattern)
-        .bind(token_any)
-        .bind(fetch_limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
-        let has_more = rows.len() as i64 > fetch_limit - 1;
-        let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
-        let out = page
-            .iter()
-            .map(|r| ProjectSearchRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                description: r.get("description"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect();
-        Ok((out, has_more))
     }
 
     /// 对齐 Paperclip `companySearchExtractService.extract`：在 issue 标题/描述、
@@ -1139,7 +1522,10 @@ impl CompanySearchService {
                 .enumerate()
                 .map(|(i, _)| format!("${}", 7 + i))
                 .collect();
-            conditions.push(format!("issues.status::text = ANY(ARRAY[{}])", placeholders.join(",")));
+            conditions.push(format!(
+                "issues.status::text = ANY(ARRAY[{}])",
+                placeholders.join(",")
+            ));
         }
         if let Some(within) = &query.updated_within {
             if let Some(dt) = parse_updated_within(within) {
@@ -1173,12 +1559,17 @@ impl CompanySearchService {
         let rows = q.fetch_all(&self.pool).await?;
 
         let has_more = rows.len() as i64 > query.limit;
-        let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
+        let page = if has_more {
+            &rows[..rows.len() - 1]
+        } else {
+            &rows[..]
+        };
 
         // 收集每个 issue 的命中来源文本（使用模块级 SourceForMatch）。
         let mut sources_by_issue: std::collections::HashMap<Uuid, Vec<SourceForMatch>> =
             std::collections::HashMap::new();
-        let add_source = |map: &mut std::collections::HashMap<Uuid, Vec<SourceForMatch>>, s: SourceForMatch| {
+        let add_source = |map: &mut std::collections::HashMap<Uuid, Vec<SourceForMatch>>,
+                          s: SourceForMatch| {
             map.entry(s.issue_id).or_default().push(s);
         };
 
@@ -1378,16 +1769,578 @@ impl CompanySearchService {
     }
 }
 
+fn push_or_ilike_expression(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    expression: &str,
+    contains_pattern: &str,
+    token_patterns: &[String],
+    _first_expression: bool,
+) {
+    qb.push(expression)
+        .push(" ILIKE ")
+        .push_bind(contains_pattern.to_string());
+    for token in token_patterns {
+        qb.push(" OR ")
+            .push(expression)
+            .push(" ILIKE ")
+            .push_bind(token.clone());
+    }
+}
+
+fn push_fuzzy_title_expression(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    alias: &str,
+    fuzzy_tokens: &[String],
+) {
+    qb.push("coalesce((SELECT bool_and(EXISTS (SELECT 1 FROM regexp_split_to_table(lower(")
+        .push(alias)
+        .push(
+            ".title), '[^a-z0-9]+') AS title_word(value) \
+             WHERE length(title_word.value) >= 4 \
+               AND levenshtein_less_equal(qt.value, title_word.value, \
+                 CASE \
+                   WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
+                   WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
+                   ELSE 0 END) <= CASE \
+                 WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
+                 WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
+                 ELSE 0 END)) FROM unnest(",
+        )
+        .push_bind(fuzzy_tokens.to_vec())
+        .push(") AS qt(value)), false)");
+}
+
+fn push_issue_search_match(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    query: &CompanySearchQuery,
+    normalized_query: &str,
+    contains_pattern: &str,
+    token_patterns: &[String],
+    fuzzy_tokens: &[String],
+    fuzzy_enabled: bool,
+    fuzzy_tokens_enabled: bool,
+) {
+    let mut first = true;
+    qb.push("(");
+    if query.scope.includes_issues() {
+        for expression in [
+            "i.title",
+            "coalesce(i.identifier, '')",
+            "coalesce(i.description, '')",
+        ] {
+            if !first {
+                qb.push(" OR ");
+            }
+            push_or_ilike_expression(qb, expression, contains_pattern, token_patterns, true);
+            first = false;
+        }
+        if fuzzy_enabled {
+            qb.push(" OR similarity(lower(coalesce(i.identifier, '')), ")
+                .push_bind(normalized_query.to_string())
+                .push(") >= 0.45");
+            first = false;
+        }
+        if fuzzy_tokens_enabled {
+            qb.push(" OR ");
+            push_fuzzy_title_expression(qb, "i", fuzzy_tokens);
+            first = false;
+        }
+    }
+    if query.scope.includes_comments_or_documents() {
+        if !first {
+            qb.push(" OR ");
+        }
+        qb.push(
+            "EXISTS (SELECT 1 FROM issue_comments sc WHERE sc.company_id = i.company_id \
+                 AND sc.issue_id = i.id AND (",
+        );
+        push_or_ilike_expression(qb, "sc.body", contains_pattern, token_patterns, true);
+        qb.push("))");
+
+        qb.push(" OR ");
+        qb.push("EXISTS (SELECT 1 FROM issue_documents idoc \
+                 INNER JOIN documents d ON d.id = idoc.document_id AND d.company_id = idoc.company_id \
+                 WHERE idoc.company_id = i.company_id AND idoc.issue_id = i.id AND (");
+        push_or_ilike_expression(qb, "d.title", contains_pattern, token_patterns, true);
+        qb.push(" OR ");
+        push_or_ilike_expression(qb, "d.content", contains_pattern, token_patterns, false);
+        qb.push("))");
+    }
+    qb.push(")");
+}
+
+fn query_without_filter(query: &CompanySearchQuery, filter: SearchFacet) -> CompanySearchQuery {
+    let mut candidate = query.clone();
+    match filter {
+        SearchFacet::All => return query_without_issue_filters(query),
+        SearchFacet::Status => candidate.statuses.clear(),
+        SearchFacet::Priority => candidate.priorities.clear(),
+        SearchFacet::AssigneeAgent => candidate.assignee_agent_id = None,
+        SearchFacet::AssigneeUser => candidate.assignee_user_id = None,
+        SearchFacet::Project => candidate.project_id = None,
+        SearchFacet::Label => candidate.label_id = None,
+        SearchFacet::UpdatedWithin => candidate.updated_within = None,
+        SearchFacet::UpdatedAfter => candidate.updated_after = None,
+    }
+    candidate
+}
+
+fn query_without_issue_filters(query: &CompanySearchQuery) -> CompanySearchQuery {
+    let mut candidate = query.clone();
+    candidate.statuses.clear();
+    candidate.priorities.clear();
+    candidate.assignee_agent_id = None;
+    candidate.assignee_user_id = None;
+    candidate.project_id = None;
+    candidate.label_id = None;
+    candidate.updated_within = None;
+    candidate.updated_after = None;
+    candidate
+}
+
+fn push_issue_filters(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    alias: &str,
+    query: &CompanySearchQuery,
+    omit_filter: Option<SearchFacet>,
+) {
+    let omit_all = omit_filter == Some(SearchFacet::All);
+    let omitted = |facet| omit_all || omit_filter == Some(facet);
+
+    if !omitted(SearchFacet::Status) && !query.statuses.is_empty() {
+        qb.push(" AND ")
+            .push(alias)
+            .push(".status::text = ANY(")
+            .push_bind(query.statuses.clone())
+            .push(")");
+    }
+    if !omitted(SearchFacet::Priority) && !query.priorities.is_empty() {
+        qb.push(" AND ")
+            .push(alias)
+            .push(".priority::text = ANY(")
+            .push_bind(query.priorities.clone())
+            .push(")");
+    }
+    if !omitted(SearchFacet::AssigneeAgent) {
+        if let Some(value) = &query.assignee_agent_id {
+            match value {
+                Some(id) => {
+                    qb.push(" AND ")
+                        .push(alias)
+                        .push(".assignee_agent_id = ")
+                        .push_bind(*id);
+                }
+                None => {
+                    qb.push(" AND ")
+                        .push(alias)
+                        .push(".assignee_agent_id IS NULL");
+                }
+            };
+        }
+    }
+    if !omitted(SearchFacet::AssigneeUser) {
+        if let Some(id) = query.assignee_user_id {
+            qb.push(" AND ")
+                .push(alias)
+                .push(".assignee_user_id = ")
+                .push_bind(id);
+        }
+    }
+    if !omitted(SearchFacet::Project) {
+        if let Some(id) = query.project_id {
+            qb.push(" AND ")
+                .push(alias)
+                .push(".project_id = ")
+                .push_bind(id);
+        }
+    }
+    if !omitted(SearchFacet::Label) {
+        if let Some(id) = query.label_id {
+            qb.push(" AND EXISTS (SELECT 1 FROM issue_labels lf WHERE lf.company_id = ")
+                .push(alias)
+                .push(".company_id AND lf.issue_id = ")
+                .push(alias)
+                .push(".id AND lf.label_id = ")
+                .push_bind(id)
+                .push(")");
+        }
+    }
+    if !omitted(SearchFacet::UpdatedWithin) {
+        if let Some(value) = &query.updated_within {
+            if let Some(start) = parse_updated_within(value) {
+                qb.push(" AND ")
+                    .push(alias)
+                    .push(".updated_at >= ")
+                    .push_bind(start);
+            }
+        }
+    }
+    if !omitted(SearchFacet::UpdatedAfter) {
+        if let Some(value) = query.updated_after {
+            qb.push(" AND ")
+                .push(alias)
+                .push(".updated_at >= ")
+                .push_bind(value);
+        }
+    }
+}
+
+fn issue_search_item(
+    row: &IssueSearchRow,
+    sources: Option<&IssueSearchSources>,
+    normalized_query: &str,
+    tokens: &[String],
+    fuzzy_enabled: bool,
+    fuzzy_tokens_enabled: bool,
+    fuzzy_identifier_threshold: f64,
+) -> SearchResultItem {
+    let title_lower = row.title.to_lowercase();
+    let description_lower = row
+        .description
+        .as_deref()
+        .unwrap_or_default()
+        .to_lowercase();
+    let identifier_lower = row.identifier.as_deref().unwrap_or_default().to_lowercase();
+    let mut matched_fields = Vec::new();
+    let mut score = 0.0;
+    let mut title_literal_match = false;
+
+    if !normalized_query.is_empty() {
+        if title_lower == normalized_query {
+            score += 6.0;
+            title_literal_match = true;
+            push_unique(&mut matched_fields, "title");
+        } else if title_lower.contains(normalized_query) {
+            score += 5.0;
+            title_literal_match = true;
+            push_unique(&mut matched_fields, "title");
+        }
+        if identifier_lower.contains(normalized_query) {
+            score += 4.0;
+            push_unique(&mut matched_fields, "identifier");
+        }
+        if title_lower.contains_any(tokens) {
+            score += 3.0;
+            push_unique(&mut matched_fields, "title");
+        }
+        if description_lower.contains(normalized_query) {
+            score += 2.0;
+            push_unique(&mut matched_fields, "description");
+        }
+        if identifier_lower.contains_any(tokens) {
+            score += 1.0;
+            push_unique(&mut matched_fields, "identifier");
+        }
+        if fuzzy_enabled && row.identifier_similarity >= fuzzy_identifier_threshold {
+            score += 4.0;
+            push_unique(&mut matched_fields, "identifier");
+        }
+        if fuzzy_tokens_enabled && row.fuzzy_title {
+            score += 5.0;
+            push_unique(&mut matched_fields, "title");
+        }
+    }
+
+    let mut snippet_sources = Vec::new();
+    if title_literal_match || row.fuzzy_title {
+        snippet_sources.push(("title".to_string(), "Title".to_string(), row.title.clone()));
+    }
+    if let Some(sources) = sources {
+        if let Some(comment) = sources.comments.first() {
+            push_unique(&mut matched_fields, "comment");
+            snippet_sources.push((
+                "comment".to_string(),
+                "Comment".to_string(),
+                comment.clone(),
+            ));
+        }
+        if let Some(document) = sources.documents.first() {
+            push_unique(&mut matched_fields, "document");
+            let text = if document.title.to_lowercase().contains(normalized_query) {
+                document.title.clone()
+            } else {
+                document.content.clone()
+            };
+            snippet_sources.push((
+                "document".to_string(),
+                format!("Document ({})", document.key),
+                text,
+            ));
+        }
+    }
+    if !normalized_query.is_empty() && description_lower.contains(normalized_query) {
+        if let Some(description) = &row.description {
+            snippet_sources.push((
+                "description".to_string(),
+                "Description".to_string(),
+                description.clone(),
+            ));
+        }
+    }
+
+    let mut terms = vec![normalized_query.to_string()];
+    terms.extend(tokens.iter().cloned());
+    terms.retain(|term| !term.is_empty());
+    terms.dedup();
+    let snippets = build_issue_snippets(&snippet_sources, &terms);
+    let snippet = snippets.first().map(|value| value.text.clone());
+    let preview_image_url = row
+        .description
+        .as_deref()
+        .and_then(extract_first_image_url)
+        .or_else(|| {
+            sources.and_then(|value| {
+                value
+                    .comments
+                    .first()
+                    .and_then(|comment| extract_first_image_url(comment))
+            })
+        })
+        .or_else(|| {
+            sources.and_then(|value| {
+                value
+                    .documents
+                    .first()
+                    .and_then(|document| extract_first_image_url(&document.content))
+            })
+        });
+    let updated_at = row.updated_at.to_rfc3339();
+    let identifier = row.identifier.clone();
+    let href = identifier
+        .as_deref()
+        .map(|value| format!("/company/issues/{}", urlencoding::encode(value)))
+        .unwrap_or_else(|| format!("/company/issues/{}", row.id));
+    let issue = CompanySearchIssueSummary {
+        id: row.id.to_string(),
+        identifier: identifier.clone(),
+        title: row.title.clone(),
+        status: row.status.clone(),
+        priority: row.priority.clone(),
+        assignee_agent_id: row.assignee_agent_id.map(|id| id.to_string()),
+        assignee_user_id: row.assignee_user_id.map(|id| id.to_string()),
+        project_id: row.project_id.map(|id| id.to_string()),
+        updated_at: updated_at.clone(),
+    };
+    SearchResultItem {
+        result: CompanySearchResult {
+            id: row.id.to_string(),
+            result_type: "issue".to_string(),
+            score,
+            title: identifier
+                .as_deref()
+                .map(|value| format!("{value} {}", row.title))
+                .unwrap_or_else(|| row.title.clone()),
+            href,
+            matched_fields,
+            source_label: identifier,
+            snippet,
+            snippets,
+            issue: Some(issue),
+            artifact: None,
+            updated_at: Some(updated_at),
+            preview_image_url,
+        },
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        priority_rank: priority_rank(&row.priority),
+    }
+}
+
+fn artifact_search_item(
+    row: &ArtifactSearchRow,
+    normalized_query: &str,
+    tokens: &[String],
+) -> SearchResultItem {
+    let mut terms = vec![normalized_query.to_string()];
+    terms.extend(tokens.iter().cloned());
+    terms.retain(|term| !term.is_empty());
+    terms.dedup();
+    let snippets = build_issue_snippets(
+        &[
+            (
+                "title".to_string(),
+                "Artifact".to_string(),
+                row.title.clone(),
+            ),
+            (
+                "content".to_string(),
+                "Artifact".to_string(),
+                row.body.clone(),
+            ),
+        ],
+        &terms,
+    );
+    let snippet = snippets.first().map(|value| value.text.clone());
+    let href = match row.source.as_str() {
+        "document" => format!(
+            "/company/issues/{}#document-{}",
+            urlencoding::encode(&row.issue_identifier),
+            urlencoding::encode(row.key.as_deref().unwrap_or("document"))
+        ),
+        "work_product" => format!(
+            "/company/issues/{}#work-product-{}",
+            urlencoding::encode(&row.issue_identifier),
+            row.id
+        ),
+        _ => format!(
+            "/company/issues/{}#attachment-{}",
+            urlencoding::encode(&row.issue_identifier),
+            row.id
+        ),
+    };
+    let updated_at = row.updated_at.to_rfc3339();
+    let mut score_description = row.body.clone();
+    score_description.push(' ');
+    score_description.push_str(&row.issue_identifier);
+    score_description.push(' ');
+    score_description.push_str(&row.issue_title);
+    if let Some(project_name) = &row.project_name {
+        score_description.push(' ');
+        score_description.push_str(project_name);
+    }
+    let public_id = artifact_public_id(&row.source, row.id);
+    let artifact = CompanySearchArtifactSummary {
+        id: public_id.clone(),
+        source: row.source.clone(),
+        media_kind: media_kind(row.source.as_str(), row.media_hint.as_deref()),
+        issue_id: row.issue_id.to_string(),
+        issue_identifier: row.issue_identifier.clone(),
+        issue_title: row.issue_title.clone(),
+        project_id: row.project_id.map(|id| id.to_string()),
+        project_name: row.project_name.clone(),
+        updated_at: updated_at.clone(),
+    };
+    SearchResultItem {
+        result: CompanySearchResult {
+            id: public_id,
+            result_type: "artifact".to_string(),
+            score: score_simple_row(
+                &row.title,
+                Some(&score_description),
+                None,
+                normalized_query,
+                tokens,
+            ),
+            title: row.title.clone(),
+            href,
+            matched_fields: vec!["artifact".to_string()],
+            source_label: row.key.clone().or_else(|| Some(row.source.clone())),
+            snippet,
+            snippets,
+            issue: None,
+            artifact: Some(artifact),
+            updated_at: Some(updated_at),
+            preview_image_url: row
+                .url
+                .clone()
+                .or_else(|| extract_first_image_url(&row.body)),
+        },
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        priority_rank: 0,
+    }
+}
+
+fn media_kind(source: &str, hint: Option<&str>) -> String {
+    if source == "document" {
+        return "document".to_string();
+    }
+    let hint = hint.unwrap_or_default().to_lowercase();
+    if hint.starts_with("image/") || hint == "image" {
+        "image".to_string()
+    } else if hint.starts_with("video/") || hint == "video" {
+        "video".to_string()
+    } else if hint.starts_with("text/") || hint == "text" {
+        "text".to_string()
+    } else if hint.is_empty() {
+        "empty".to_string()
+    } else {
+        "file".to_string()
+    }
+}
+
+fn artifact_public_id(source: &str, id: Uuid) -> String {
+    format!("{source}:{id}")
+}
+
+fn priority_rank(value: &str) -> i32 {
+    match value {
+        "critical" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+fn search_type_rank(value: &str) -> i32 {
+    match value {
+        "issue" => 0,
+        "artifact" => 1,
+        "agent" => 2,
+        "project" => 3,
+        _ => 4,
+    }
+}
+
+fn compare_search_items(
+    left: &SearchResultItem,
+    right: &SearchResultItem,
+    sort: CompanySearchSort,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let primary = match sort {
+        CompanySearchSort::Relevance => right
+            .result
+            .score
+            .partial_cmp(&left.result.score)
+            .unwrap_or(Ordering::Equal),
+        CompanySearchSort::Updated => right.updated_at.cmp(&left.updated_at),
+        CompanySearchSort::Created => right.created_at.cmp(&left.created_at),
+        CompanySearchSort::Priority => right.priority_rank.cmp(&left.priority_rank),
+    };
+    primary
+        .then_with(|| right.updated_at.cmp(&left.updated_at))
+        .then_with(|| {
+            search_type_rank(&left.result.result_type)
+                .cmp(&search_type_rank(&right.result.result_type))
+        })
+        .then_with(|| left.result.id.cmp(&right.result.id))
+}
+
+fn empty_counts_by_type() -> std::collections::HashMap<String, i64> {
+    [
+        "issue", "artifact", "agent", "project", "comment", "document",
+    ]
+    .into_iter()
+    .map(|key| (key.to_string(), 0))
+    .collect()
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|entry| entry == value) {
+        values.push(value.to_string());
+    }
+}
+
+trait ContainsAny {
+    fn contains_any(&self, values: &[String]) -> bool;
+}
+
+impl ContainsAny for str {
+    fn contains_any(&self, values: &[String]) -> bool {
+        values
+            .iter()
+            .any(|value| !value.is_empty() && self.contains(value))
+    }
+}
+
 // ============ Extract 匹配/摘录辅助函数（对齐 Paperclip company-search-extract.ts） ============
 
 const EXCERPT_MAX_CHARS: usize = 180;
 
 /// URL 匹配锚点：本实现以「按空白/引号切分的 token 中包含 contains 子串」近似
 /// Paperclip 的 URL 正则；返回 contains 本身供 occurrence 计数复用（对齐语义）。
-fn url_contains_pattern(contains: &str) -> String {
-    contains.to_string()
-}
-
 /// 计算文本中 `contains` 的命中次数（literal 子串 / url token 子串），对齐
 /// Paperclip `literalOccurrences` / `urlOccurrences`。
 fn source_occurrence_count(text: &str, contains: &str, is_url: bool) -> usize {
@@ -1579,16 +2532,16 @@ fn sort_name(sort: &CompanySearchSort) -> &'static str {
     }
 }
 
-fn empty_response(query: &str, normalized_query: &str) -> CompanySearchResponse {
+fn empty_response(query: &CompanySearchQuery, normalized_query: &str) -> CompanySearchResponse {
     CompanySearchResponse {
-        query: query.to_string(),
+        query: query.q.clone(),
         normalized_query: normalized_query.to_string(),
-        scope: "all".to_string(),
-        sort: "relevance".to_string(),
-        limit: 0,
-        offset: 0,
+        scope: scope_name(&query.scope).to_string(),
+        sort: sort_name(&query.sort).to_string(),
+        limit: query.limit,
+        offset: query.offset,
         results: Vec::new(),
-        counts_by_type: std::collections::HashMap::new(),
+        counts_by_type: empty_counts_by_type(),
         filter_option_counts: CompanySearchFilterOptionCounts::default(),
         zero_results: None,
         has_more: false,
@@ -1628,7 +2581,11 @@ fn make_snippet(
         return None;
     }
     let first = find_first_match_index(&text, terms);
-    let window_start: usize = if first < 0 { 0 } else { (first as usize).saturating_sub(80) };
+    let window_start: usize = if first < 0 {
+        0
+    } else {
+        (first as usize).saturating_sub(80)
+    };
     let text_len = text.chars().count();
     let window_end: usize = (window_start + 240).min(text_len);
     let prefix = if window_start > 0 { "..." } else { "" };
@@ -1661,7 +2618,9 @@ fn make_snippet(
 /// `![alt](url)` 或带 title 引号形式）。
 fn extract_first_image_url(value: &str) -> Option<String> {
     let pattern = regex::Regex::new(r#"!\[[^\]]*\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)"#).ok()?;
-    pattern.captures(value).map(|c| c.get(1).unwrap().as_str().to_string())
+    pattern
+        .captures(value)
+        .map(|c| c.get(1).unwrap().as_str().to_string())
 }
 
 /// 对齐 Paperclip scoreSimpleRow：短语命中 90 + 每 token 20 + 标题前缀 80。
@@ -1682,7 +2641,11 @@ fn score_simple_row(
         haystack.push_str(r);
     }
     let haystack = haystack.to_lowercase();
-    let mut score = if haystack.contains(normalized_query) { 90.0 } else { 0.0 };
+    let mut score = if haystack.contains(normalized_query) {
+        90.0
+    } else {
+        0.0
+    };
     for t in tokens {
         if haystack.contains(t) {
             score += 20.0;
@@ -1705,11 +2668,18 @@ fn agent_search_result(
         .chain(tokens.iter().cloned())
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
-    let src = if row.role.is_empty() { row.name.clone() } else { row.role.clone() };
-    let snippets = build_issue_snippets(&[("capabilities".to_string(), "Agent".to_string(), src)], &terms);
+    let src = if row.role.is_empty() {
+        row.name.clone()
+    } else {
+        row.role.clone()
+    };
+    let snippets = build_issue_snippets(
+        &[("capabilities".to_string(), "Agent".to_string(), src)],
+        &terms,
+    );
     let snippet = snippets.first().map(|s| s.text.clone());
     CompanySearchResult {
-        id: row.id,
+        id: row.id.to_string(),
         result_type: "agent".to_string(),
         score: score_simple_row(&row.name, None, Some(&row.role), normalized_query, tokens),
         title: row.name.clone(),
@@ -1719,6 +2689,7 @@ fn agent_search_result(
         snippet,
         snippets,
         issue: None,
+        artifact: None,
         updated_at: Some(row.updated_at.to_rfc3339()),
         preview_image_url: None,
     }
@@ -1735,13 +2706,26 @@ fn project_search_result(
         .chain(tokens.iter().cloned())
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
-    let src = row.description.clone().filter(|d| !d.is_empty()).unwrap_or_else(|| row.name.clone());
-    let snippets = build_issue_snippets(&[("description".to_string(), "Project".to_string(), src)], &terms);
+    let src = row
+        .description
+        .clone()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| row.name.clone());
+    let snippets = build_issue_snippets(
+        &[("description".to_string(), "Project".to_string(), src)],
+        &terms,
+    );
     let snippet = snippets.first().map(|s| s.text.clone());
     CompanySearchResult {
-        id: row.id,
+        id: row.id.to_string(),
         result_type: "project".to_string(),
-        score: score_simple_row(&row.name, row.description.as_deref(), None, normalized_query, tokens),
+        score: score_simple_row(
+            &row.name,
+            row.description.as_deref(),
+            None,
+            normalized_query,
+            tokens,
+        ),
         title: row.name.clone(),
         href: format!("/company/projects/{}", row.id),
         matched_fields: vec!["project".to_string()],
@@ -1749,6 +2733,7 @@ fn project_search_result(
         snippet,
         snippets,
         issue: None,
+        artifact: None,
         updated_at: Some(row.updated_at.to_rfc3339()),
         preview_image_url: None,
     }
@@ -1804,9 +2789,7 @@ fn highlight_ranges(value: &str, terms: &[String]) -> Vec<(usize, usize)> {
             let start = from + idx;
             let end = start + normalized.chars().count();
             let next = (start, end);
-            let overlaps = ranges
-                .iter()
-                .any(|(s, e)| next.0 < *e && next.1 > *s);
+            let overlaps = ranges.iter().any(|(s, e)| next.0 < *e && next.1 > *s);
             if !overlaps {
                 ranges.push(next);
             }
