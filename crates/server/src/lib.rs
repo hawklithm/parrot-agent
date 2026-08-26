@@ -424,7 +424,10 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
         DefaultHeartbeatService::new(pool.clone())
             .with_sse_service(sse_service.clone())
             .with_cost_service(cost_service.clone())
-            .with_budget_service(budget_service.clone()),
+            .with_budget_service(budget_service.clone())
+            .with_runtime_secret_resolver(Arc::new(
+                services::DatabaseAdapterRuntimeSecretResolver::new(pool.clone()),
+            )),
     );
     let heartbeat_service: Arc<dyn services::HeartbeatService> = heartbeat_coordinator.clone();
     let recovery_action_repository = Arc::new(

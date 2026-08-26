@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -786,6 +786,7 @@ pub struct DefaultHeartbeatService {
     sse_service: Arc<dyn SseService>,
     cost_service: Option<Arc<dyn crate::CostService>>,
     budget_service: Option<Arc<dyn crate::BudgetService>>,
+    runtime_secret_resolver: Option<Arc<dyn crate::AdapterRuntimeSecretResolver>>,
 }
 
 async fn publish_live_event(
@@ -860,6 +861,7 @@ impl DefaultHeartbeatService {
             sse_service: InMemorySseService::new(),
             cost_service: None,
             budget_service: None,
+            runtime_secret_resolver: None,
         }
     }
 
@@ -878,6 +880,14 @@ impl DefaultHeartbeatService {
         self
     }
 
+    pub fn with_runtime_secret_resolver(
+        mut self,
+        resolver: Arc<dyn crate::AdapterRuntimeSecretResolver>,
+    ) -> Self {
+        self.runtime_secret_resolver = Some(resolver);
+        self
+    }
+
     /// 克隆 service 用于后台任务
     fn clone_for_background(&self) -> Self {
         Self {
@@ -886,6 +896,7 @@ impl DefaultHeartbeatService {
             sse_service: Arc::clone(&self.sse_service),
             cost_service: self.cost_service.clone(),
             budget_service: self.budget_service.clone(),
+            runtime_secret_resolver: self.runtime_secret_resolver.clone(),
         }
     }
 
@@ -1852,7 +1863,35 @@ impl DefaultHeartbeatService {
         
         // 加载默认配置并合并
         let default_config = load_default_adapter_config(adapter);
-        let cfg = merge_adapter_config(db_config, default_config);
+        let merged_config = merge_adapter_config(db_config, default_config);
+        let mut runtime_secret_paths = HashSet::new();
+        let cfg = if let Some(resolver) = &self.runtime_secret_resolver {
+            let responsible_user = sqlx::query_scalar::<_, String>(
+                "SELECT responsible_user_id::text
+                 FROM heartbeat_runs
+                 WHERE id = $1 AND company_id = $2 AND agent_id = $3",
+            )
+            .bind(run_id)
+            .bind(company_id)
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| format!("failed to load heartbeat responsible user: {error}"))?
+            .map(|value| {
+                Uuid::parse_str(&value).map_err(|error| {
+                    format!("invalid heartbeat responsible user '{value}': {error}")
+                })
+            })
+            .transpose()?;
+            let resolved = resolver
+                .resolve_adapter_config(company_id, responsible_user, merged_config)
+                .await
+                .map_err(|error| format!("runtime credential resolution failed: {error}"))?;
+            runtime_secret_paths.extend(resolved.secret_keys);
+            resolved.config
+        } else {
+            merged_config
+        };
         let prompt = cfg
             .get("promptTemplate")
             .or_else(|| cfg.get("prompt_template"))
@@ -2290,14 +2329,11 @@ impl DefaultHeartbeatService {
         full_cmd_with_env.push_str(&format!("PAPERCLIP_RUN_ID={} ", shell_quote(&run_id.to_string())));
         full_cmd_with_env.push_str(&format!("PAPERCLIP_AGENT_ID={} ", shell_quote(&agent_id.to_string())));
         full_cmd_with_env.push_str(&format!("PAPERCLIP_TOOL_GATEWAY_URL={} ", shell_quote(&gateway_url)));
-        full_cmd_with_env.push_str(&format!("PAPERCLIP_TOOL_GATEWAY_TOKEN={} ", shell_quote(&gateway_token)));
-        full_cmd_with_env.push_str(&format!("PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION={} ", shell_quote(&format!("Bearer {}", gateway_token))));
+        full_cmd_with_env.push_str("PAPERCLIP_TOOL_GATEWAY_TOKEN=[REDACTED] ");
+        full_cmd_with_env.push_str("PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION=[REDACTED] ");
         if let Some(env) = cfg.get("env").and_then(|v| v.as_object()) {
-            for (k, v) in env {
-                if let Some(s) = v.as_str() {
-                    let resolved_value = resolve_env_value(s);
-                    full_cmd_with_env.push_str(&format!("{}={} ", k, shell_quote(&resolved_value)));
-                }
+            for k in env.keys() {
+                full_cmd_with_env.push_str(&format!("{}=[REDACTED] ", k));
             }
         }
         full_cmd_with_env.push_str(&shell_command_text);
@@ -2334,7 +2370,11 @@ impl DefaultHeartbeatService {
         if let Some(env) = cfg.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env {
                 if let Some(s) = v.as_str() {
-                    let resolved_value = resolve_env_value(s);
+                    let resolved_value = if runtime_secret_paths.contains(&format!("env.{k}")) {
+                        s.to_owned()
+                    } else {
+                        resolve_env_value(s)
+                    };
                     cmd.env(k, resolved_value);
                 }
             }
@@ -3555,6 +3595,7 @@ impl DefaultHeartbeatService {
             sse_service: self.sse_service.clone(),
             cost_service: self.cost_service.clone(),
             budget_service: self.budget_service.clone(),
+            runtime_secret_resolver: self.runtime_secret_resolver.clone(),
         }
     }
 }

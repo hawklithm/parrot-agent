@@ -131,6 +131,10 @@ pub mod errors;
 pub mod saga;
 pub mod secret_provider;
 pub mod secret_service;
+pub mod adapter_runtime_secrets;
+pub use adapter_runtime_secrets::{
+    AdapterRuntimeSecretResolver, DatabaseAdapterRuntimeSecretResolver,
+};
 pub mod environment_custom_image_runtime_service;
 pub mod environment_custom_images_service;
 pub mod environment_run_orchestrator_service;

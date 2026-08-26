@@ -233,7 +233,8 @@ impl DatabaseSecretService {
                             manifest.push(RuntimeSecretManifestEntry {
                                 config_path: format!("env.{}", key),
                                 env_key: Some(key.clone()),
-                                secret_id,
+                                secret_id: Some(secret_id),
+                                user_secret_definition_id: None,
                                 secret_key: secret.key.clone(),
                                 version: version.clone(),
                                 outcome: SecretResolutionOutcome::Success,
@@ -247,7 +248,8 @@ impl DatabaseSecretService {
                             manifest.push(RuntimeSecretManifestEntry {
                                 config_path: format!("env.{}", key),
                                 env_key: Some(key.clone()),
-                                secret_id,
+                                secret_id: Some(secret_id),
+                                user_secret_definition_id: None,
                                 secret_key: format!("unknown-{}", secret_id),
                                 version: version.clone(),
                                 outcome: SecretResolutionOutcome::Failure,
@@ -375,7 +377,8 @@ impl SecretService for DatabaseSecretService {
                             manifest.push(RuntimeSecretManifestEntry {
                                 config_path: key.clone(),
                                 env_key: None,
-                                secret_id,
+                                secret_id: Some(secret_id),
+                                user_secret_definition_id: None,
                                 secret_key: secret.key.clone(),
                                 version: version.clone(),
                                 outcome: SecretResolutionOutcome::Success,
@@ -388,7 +391,8 @@ impl SecretService for DatabaseSecretService {
                             manifest.push(RuntimeSecretManifestEntry {
                                 config_path: key.clone(),
                                 env_key: None,
-                                secret_id,
+                                secret_id: Some(secret_id),
+                                user_secret_definition_id: None,
                                 secret_key: format!("unknown-{}", secret_id),
                                 version: version.clone(),
                                 outcome: SecretResolutionOutcome::Failure,

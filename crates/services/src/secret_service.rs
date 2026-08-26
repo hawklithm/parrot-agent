@@ -40,6 +40,7 @@ pub enum EnvBinding {
 
     /// 密钥引用（公司级密钥）
     SecretRef {
+        #[serde(rename = "secretId", alias = "secret_id")]
         secret_id: Uuid,
         #[serde(default = "default_version")]
         version: String,
@@ -52,7 +53,7 @@ pub enum EnvBinding {
         version: String,
         #[serde(default = "default_true")]
         required: bool,
-        #[serde(default)]
+        #[serde(default, rename = "allowMissingOverride", alias = "allow_missing_override")]
         allow_missing_override: bool,
     },
 }
@@ -112,6 +113,7 @@ impl EnvBinding {
 /// 密钥引用（用于持久化存储）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretReference {
+    #[serde(rename = "secretId", alias = "secret_id")]
     pub secret_id: Uuid,
     pub version: String,
 }
@@ -121,7 +123,10 @@ pub struct SecretReference {
 pub struct RuntimeSecretManifestEntry {
     pub config_path: String,
     pub env_key: Option<String>,
-    pub secret_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_secret_definition_id: Option<Uuid>,
     pub secret_key: String,
     pub version: String,
     pub outcome: SecretResolutionOutcome,
@@ -476,7 +481,8 @@ impl SecretService for DefaultSecretService {
                             manifest.push(RuntimeSecretManifestEntry {
                                 config_path: format!("env.{}", key),
                                 env_key: Some(key.clone()),
-                                secret_id,
+                                secret_id: Some(secret_id),
+                                user_secret_definition_id: None,
                                 secret_key: format!("secret-{}", secret_id),
                                 version,
                                 outcome: SecretResolutionOutcome::Success,
