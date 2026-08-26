@@ -333,6 +333,45 @@ fn resolve_biller(adapter_type: &str, provider: Option<&str>) -> String {
     }
 }
 
+fn config_u64(config: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| config.get(*key).and_then(Value::as_u64))
+}
+
+fn provider_http_timeout(config: &Value) -> Duration {
+    let timeout_ms = config_u64(config, &["timeoutMs", "timeout_ms"])
+        .or_else(|| config_u64(config, &["timeoutSec", "timeout_sec"]).map(|seconds| seconds.saturating_mul(1000)))
+        .filter(|timeout_ms| *timeout_ms > 0)
+        .unwrap_or(120_000)
+        .clamp(1_000, 15 * 60 * 1_000);
+    Duration::from_millis(timeout_ms)
+}
+
+fn provider_http_retries(config: &Value) -> u32 {
+    config_u64(config, &["retries", "maxRetries", "max_retries"])
+        .unwrap_or(2)
+        .min(3) as u32
+}
+
+fn provider_retry_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(3);
+    Duration::from_millis((250_u64 * 2_u64.pow(exponent)).min(2_000))
+}
+
+fn is_retryable_provider_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn redact_adapter_secret(value: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        value.to_owned()
+    } else {
+        value.replace(secret, "[REDACTED]")
+    }
+}
+
 fn valid_claude_resume_session(session_id: Option<&str>) -> Option<String> {
     let session_id = session_id?.trim();
     if uuid::Uuid::parse_str(session_id).is_ok() { Some(session_id.to_string()) } else { None }
@@ -1603,6 +1642,8 @@ impl DefaultHeartbeatService {
             "model": outcome.model,
             "provider": outcome.provider,
             "adapterType": adapter_type,
+            "biller": resolve_biller(&adapter_type, outcome.provider.as_deref()),
+            "billingType": output.billing_type.clone(),
             "sessionRecovery": session_recovery,
             "sessionRecoverySession": session_recovery_session,
             "stdout": output.stdout,
@@ -1851,26 +1892,85 @@ impl DefaultHeartbeatService {
             } else {
                 "https://api.openai.com/v1/chat/completions"
             });
-            let client = reqwest::Client::new();
-            let response = if adapter == "claude_local" {
-                client.post(url).header("x-api-key", api_key).header("anthropic-version", "2023-06-01")
-                    .json(&serde_json::json!({"model": model, "max_tokens": cfg.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(4096), "messages": [{"role":"user","content":prompt}]})).send().await
+            let request_body = if adapter == "claude_local" {
+                serde_json::json!({
+                    "model": model,
+                    "max_tokens": cfg.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(4096),
+                    "messages": [{"role":"user","content":prompt}]
+                })
             } else {
-                client.post(url).bearer_auth(api_key)
-                    .json(&serde_json::json!({"model": model, "messages": [{"role":"user","content":prompt}]})).send().await
-            }.map_err(|e| e.to_string())?;
-            let status = response.status();
-            let body = response.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(format!("LLM request failed with HTTP {status}: {body}"));
+                serde_json::json!({
+                    "model": model,
+                    "messages": [{"role":"user","content":prompt}]
+                })
+            };
+            let client = reqwest::Client::builder()
+                .timeout(provider_http_timeout(&cfg))
+                .build()
+                .map_err(|error| format!("failed to build LLM HTTP client: {error}"))?;
+            let max_retries = provider_http_retries(&cfg);
+            let mut retry_count = 0;
+            loop {
+                let request = if adapter == "claude_local" {
+                    client
+                        .post(url)
+                        .header("x-api-key", api_key)
+                        .header("anthropic-version", "2023-06-01")
+                        .json(&request_body)
+                } else {
+                    client
+                        .post(url)
+                        .bearer_auth(api_key)
+                        .json(&request_body)
+                };
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(_error) if retry_count < max_retries => {
+                        retry_count += 1;
+                        tokio::time::sleep(provider_retry_delay(retry_count)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "LLM request failed after {} attempt(s): {error}",
+                            retry_count + 1
+                        ));
+                    }
+                };
+                let status = response.status();
+                let body = match response.text().await {
+                    Ok(body) => body,
+                    Err(_error) if retry_count < max_retries => {
+                        retry_count += 1;
+                        tokio::time::sleep(provider_retry_delay(retry_count)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "LLM response read failed after {} attempt(s): {error}",
+                            retry_count + 1
+                        ));
+                    }
+                };
+                if status.is_success() {
+                    return Ok(AdapterCommandOutput {
+                        exit_code: 0,
+                        stdout: body,
+                        stderr: String::new(),
+                        resumed_session_id: None,
+                        billing_type: "api".to_string(),
+                    });
+                }
+                if is_retryable_provider_status(status) && retry_count < max_retries {
+                    retry_count += 1;
+                    tokio::time::sleep(provider_retry_delay(retry_count)).await;
+                    continue;
+                }
+                return Err(format!(
+                    "LLM request failed with HTTP {status}: {}",
+                    redact_adapter_secret(&body, api_key)
+                ));
             }
-            return Ok(AdapterCommandOutput {
-                exit_code: 0,
-                stdout: body,
-                stderr: String::new(),
-                resumed_session_id: None,
-                billing_type: "api".to_string(),
-            });
         }
         let command = cfg
             .get("command")
@@ -3461,10 +3561,13 @@ impl DefaultHeartbeatService {
 
 #[cfg(test)]
 mod adapter_outcome_tests {
+    use tokio::time::Duration;
+
     use super::{
         build_codex_exec_args, classify_adapter_error, is_codex_unknown_session_output,
-        parse_adapter_outcome, resolve_biller, valid_claude_resume_session,
-        valid_codex_resume_session, AdapterCommandOutput,
+        is_retryable_provider_status, parse_adapter_outcome, provider_http_retries,
+        provider_http_timeout, redact_adapter_secret, resolve_biller,
+        valid_claude_resume_session, valid_codex_resume_session, AdapterCommandOutput,
     };
 
     #[test]
@@ -3578,6 +3681,29 @@ mod adapter_outcome_tests {
         );
         assert_eq!(transient_code.as_deref(), Some("codex_transient_upstream"));
         assert_eq!(transient_family.as_deref(), Some("transient_upstream"));
+    }
+
+    #[test]
+    fn bounds_provider_http_timeout_retries_and_redacts_errors() {
+        assert_eq!(provider_http_timeout(&serde_json::json!({})), Duration::from_secs(120));
+        assert_eq!(
+            provider_http_timeout(&serde_json::json!({"timeoutMs": 1_500})),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            provider_http_timeout(&serde_json::json!({"timeoutSec": 2})),
+            Duration::from_secs(2)
+        );
+        assert_eq!(provider_http_retries(&serde_json::json!({})), 2);
+        assert_eq!(provider_http_retries(&serde_json::json!({"retries": 9})), 3);
+        assert_eq!(provider_http_retries(&serde_json::json!({"maxRetries": 0})), 0);
+        assert!(is_retryable_provider_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_provider_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_provider_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert_eq!(
+            redact_adapter_secret("provider echoed sk-secret in the response", "sk-secret"),
+            "provider echoed [REDACTED] in the response"
+        );
     }
 
     #[test]
