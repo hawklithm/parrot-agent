@@ -369,14 +369,19 @@ fn provider_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration
         .to_str()
         .ok()?
         .trim();
-    let seconds = raw.parse::<f64>().ok()?;
-    if !seconds.is_finite() || seconds < 0.0 {
-        return None;
+    if let Ok(seconds) = raw.parse::<f64>() {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return None;
+        }
+        let milliseconds = (seconds * 1_000.0).round();
+        return Some(Duration::from_millis(
+            milliseconds.min(PROVIDER_MAX_RETRY_AFTER_MS as f64) as u64,
+        ));
     }
-    let milliseconds = (seconds * 1_000.0).round();
-    Some(Duration::from_millis(
-        milliseconds.min(PROVIDER_MAX_RETRY_AFTER_MS as f64) as u64,
-    ))
+
+    let retry_at = httpdate::parse_http_date(raw).ok()?;
+    let wait = retry_at.duration_since(std::time::SystemTime::now()).ok()?;
+    Some(wait.min(Duration::from_millis(PROVIDER_MAX_RETRY_AFTER_MS)))
 }
 
 fn provider_retry_delay_with_hint(attempt: u32, retry_after: Option<Duration>) -> Duration {
@@ -3862,6 +3867,22 @@ mod adapter_outcome_tests {
             provider_retry_delay_with_hint(2, provider_retry_after(&headers)),
             provider_retry_delay(2)
         );
+
+        let retry_at =
+            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(2));
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(&retry_at).unwrap(),
+        );
+        let date_hint = provider_retry_after(&headers).expect("HTTP-date hint should parse");
+        assert!(date_hint >= Duration::from_millis(1_000));
+        assert!(date_hint <= Duration::from_secs(2));
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("not-a-date"),
+        );
+        assert_eq!(provider_retry_after(&headers), None);
     }
 
     #[test]

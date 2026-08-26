@@ -2456,6 +2456,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "httpdate",
  "jwt",
  "models",
  "nix",
