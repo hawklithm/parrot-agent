@@ -191,6 +191,141 @@ async fn list_gateway_runtime_slots(
     (status, value)
 }
 
+async fn list_company_runtime_slots(
+    app: &Router,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(format!("/companies/{company_id}/tools/runtime-slots"))
+        .body(Body::empty())
+        .expect("build company runtime slots request");
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("list company runtime slots");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read company runtime slots body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
+async fn post_runtime_slot_action(
+    app: &Router,
+    actor: &AuthorizationActor,
+    uri: String,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .body(Body::empty())
+        .expect("build runtime slot action request");
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("dispatch runtime slot action");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read runtime slot action body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
+async fn list_company_stdio_templates(
+    app: &Router,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(format!("/companies/{company_id}/tools/stdio-templates"))
+        .body(Body::empty())
+        .expect("build stdio template list request");
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("list stdio templates");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read stdio template list body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
+async fn create_company_stdio_template(
+    app: &Router,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("/companies/{company_id}/tools/stdio-templates"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "name": "Test template" }))
+                .expect("serialize stdio template body"),
+        ))
+        .expect("build stdio template create request");
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("create stdio template");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read stdio template create body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
+async fn request_connection_route(
+    app: &Router,
+    actor: &AuthorizationActor,
+    method: &str,
+    uri: String,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    let request = if let Some(body) = body {
+        builder = builder.header("content-type", "application/json");
+        builder
+            .body(Body::from(
+                serde_json::to_vec(&body).expect("serialize connection route body"),
+            ))
+            .expect("build connection route request")
+    } else {
+        builder
+            .body(Body::empty())
+            .expect("build connection route request")
+    };
+    let mut request = request;
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("dispatch connection route");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read connection route body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
 async fn connect_and_migrate() -> PgPool {
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile".to_string()
@@ -448,8 +583,253 @@ async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
     assert_eq!(owner_status, StatusCode::OK, "owner={owner_body:?}");
     assert!(owner_body.is_array());
 
+    let (company_owner_status, company_owner_body) =
+        list_company_runtime_slots(&app, &owner, company_id).await;
+    assert_eq!(
+        company_owner_status,
+        StatusCode::OK,
+        "company owner={company_owner_body:?}"
+    );
+    assert!(company_owner_body.is_array());
+
+    let slot_id = Uuid::new_v4();
+    for (label, uri) in [
+        (
+            "company stop",
+            format!("/companies/{company_id}/tools/runtime-slots/{slot_id}/stop"),
+        ),
+        (
+            "company restart",
+            format!("/companies/{company_id}/tools/runtime-slots/{slot_id}/restart"),
+        ),
+        (
+            "gateway stop",
+            format!("/tool-gateway/runtime-slots/{slot_id}/stop"),
+        ),
+        (
+            "gateway restart",
+            format!("/tool-gateway/runtime-slots/{slot_id}/restart"),
+        ),
+    ] {
+        let (status, body) = post_runtime_slot_action(&app, &owner, uri).await;
+        assert_eq!(status, StatusCode::OK, "{label} owner={body:?}");
+    }
+
     for (label, actor) in [("operator", operator), ("viewer", viewer)] {
         let (status, body) = list_gateway_runtime_slots(&app, &actor).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{label}={body:?}");
+
+        let (status, body) = list_company_runtime_slots(&app, &actor, company_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label} company={body:?}");
+
+        for (action, uri) in [
+            (
+                "company stop",
+                format!("/companies/{company_id}/tools/runtime-slots/{slot_id}/stop"),
+            ),
+            (
+                "company restart",
+                format!("/companies/{company_id}/tools/runtime-slots/{slot_id}/restart"),
+            ),
+            (
+                "gateway stop",
+                format!("/tool-gateway/runtime-slots/{slot_id}/stop"),
+            ),
+            (
+                "gateway restart",
+                format!("/tool-gateway/runtime-slots/{slot_id}/restart"),
+            ),
+        ] {
+            let (status, body) = post_runtime_slot_action(&app, &actor, uri).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} {action}={body:?}");
+        }
     }
+}
+
+#[tokio::test]
+async fn stdio_template_routes_require_tools_admin_permission() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let state = build_app_state(pool).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+    let operator = board_actor_with_role(company_id, MembershipRole::Operator);
+    let viewer = board_actor_with_role(company_id, MembershipRole::Viewer);
+
+    let (owner_list_status, owner_list_body) =
+        list_company_stdio_templates(&app, &owner, company_id).await;
+    assert_eq!(
+        owner_list_status,
+        StatusCode::OK,
+        "owner list={owner_list_body:?}"
+    );
+    assert!(owner_list_body.is_array());
+    let (owner_create_status, owner_create_body) =
+        create_company_stdio_template(&app, &owner, company_id).await;
+    assert_eq!(
+        owner_create_status,
+        StatusCode::OK,
+        "owner create={owner_create_body:?}"
+    );
+
+    for (label, actor) in [("operator", operator), ("viewer", viewer)] {
+        let (list_status, list_body) = list_company_stdio_templates(&app, &actor, company_id).await;
+        assert_eq!(list_status, StatusCode::FORBIDDEN, "{label} list={list_body:?}");
+        let (create_status, create_body) =
+            create_company_stdio_template(&app, &actor, company_id).await;
+        assert_eq!(
+            create_status,
+            StatusCode::FORBIDDEN,
+            "{label} create={create_body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn connection_management_routes_require_tool_permissions() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let issue_prefix = format!("TG{}", &company_id.simple().to_string()[..8]);
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Tool Gateway Permission Test")
+        .bind(issue_prefix)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+    sqlx::query(
+        "INSERT INTO agents (id, company_id, name, status) VALUES ($1, $2, $3, 'running')",
+    )
+    .bind(agent_id)
+    .bind(company_id)
+    .bind("Tool Gateway Permission Agent")
+    .execute(&pool)
+    .await
+    .expect("insert agent");
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, name, uid, transport, transport_config, enabled)
+         VALUES ($1, $2, 'Permission MCP', 'permission-mcp', 'mcp_remote', '{}', true)",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("insert tool connection");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+    let operator = board_actor_with_role(company_id, MembershipRole::Operator);
+    let viewer = board_actor_with_role(company_id, MembershipRole::Viewer);
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/tool-connections/{connection_id}/test-agents"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test agents={body:?}");
+    assert!(body.is_array());
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/tool-connections/{connection_id}/test-calls/test-call-1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test call status={body:?}");
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/tool-connections/{connection_id}/test-calls"),
+        Some(json!({ "tool": "echo" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "test call create={body:?}");
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/tool-connections/{connection_id}/grants/installations"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "grant install={body:?}");
+    let grant_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM tool_connection_grants
+          WHERE company_id = $1 AND connection_id = $2 AND agent_id = $3",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .bind(agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read installed grant");
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "DELETE",
+        format!("/tool-connections/{connection_id}/grants/{grant_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "grant delete={body:?}");
+
+    for (label, actor) in [("operator", operator), ("viewer", viewer)] {
+        for (route, method, body) in [
+            (
+                format!("/tool-connections/{connection_id}/test-agents"),
+                "GET",
+                None,
+            ),
+            (
+                format!("/tool-connections/{connection_id}/test-calls/test-call-1"),
+                "GET",
+                None,
+            ),
+            (
+                format!("/tool-connections/{connection_id}/test-calls"),
+                "POST",
+                Some(json!({ "tool": "echo" })),
+            ),
+            (
+                format!("/tool-connections/{connection_id}/grants/installations"),
+                "POST",
+                None,
+            ),
+            (
+                format!(
+                    "/tool-connections/{connection_id}/grants/{}",
+                    Uuid::new_v4()
+                ),
+                "DELETE",
+                None,
+            ),
+        ] {
+            let (status, response_body) =
+                request_connection_route(&app, &actor, method, route, body).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{label} {method} response={response_body:?}"
+            );
+        }
+    }
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
 }

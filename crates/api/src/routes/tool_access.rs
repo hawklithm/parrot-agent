@@ -250,8 +250,7 @@ async fn tools_runtime_slots(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_runtime_permission(&state, &actor, company_id).await?;
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT id, connection_id, slot_key, runtime_kind, status, health_status, process_id, last_error, last_used_at, updated_at FROM tool_runtime_slots WHERE company_id = $1 ORDER BY updated_at DESC",
@@ -324,8 +323,7 @@ async fn tools_stdio_templates(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_permission(&state, &actor, company_id, PermissionKey::TOOLS_ADMIN).await?;
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT id, template_key, name, description, status, command, args, env_keys, tools, created_at, updated_at
@@ -614,11 +612,20 @@ async fn delete_connection_grant(
     Path((connection_id, grant_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    sqlx::query("DELETE FROM tool_connection_grants WHERE id = $1 AND connection_id = $2")
+    require_gateway_permission(
+        &state,
+        &actor,
+        company_id,
+        PermissionKey::TOOLS_MANAGE_CONNECTIONS,
+    )
+    .await?;
+    sqlx::query(
+        "DELETE FROM tool_connection_grants
+          WHERE id = $1 AND connection_id = $2 AND company_id = $3",
+    )
         .bind(grant_id)
         .bind(connection_id)
+        .bind(company_id)
         .execute(&state.pool)
         .await
         .map_err(|e| {
@@ -1220,10 +1227,11 @@ async fn gateway_audit(
 }
 
 /// GET /api/tool-gateway/runtime-slots —— 网关运行时槽位。
-async fn require_gateway_runtime_permission(
+async fn require_gateway_permission(
     state: &AppState,
     actor: &AuthorizationActor,
     company_id: Uuid,
+    permission_key: &'static str,
 ) -> Result<(), StatusCode> {
     crate::routes::assert_board(actor).map_err(|_| StatusCode::FORBIDDEN)?;
     require_company_access(actor, company_id, AccessMode::Read)
@@ -1232,7 +1240,7 @@ async fn require_gateway_runtime_permission(
         &state.pool,
         actor,
         &AuthorizationAction::Permission {
-            key: PermissionKey::from_const(PermissionKey::TOOLS_MANAGE_RUNTIME),
+            key: PermissionKey::from_const(permission_key),
         },
         Some(company_id),
     )
@@ -1241,6 +1249,40 @@ async fn require_gateway_runtime_permission(
         .allowed
         .then_some(())
         .ok_or(StatusCode::FORBIDDEN)
+}
+
+async fn require_gateway_any_permission(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    permission_keys: &[&'static str],
+) -> Result<(), StatusCode> {
+    crate::routes::assert_board(actor).map_err(|_| StatusCode::FORBIDDEN)?;
+    require_company_access(actor, company_id, AccessMode::Read)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    for permission_key in permission_keys {
+        let decision = AuthorizationService::decide(
+            &state.pool,
+            actor,
+            &AuthorizationAction::Permission {
+                key: PermissionKey::from_const(*permission_key),
+            },
+            Some(company_id),
+        )
+        .await;
+        if decision.allowed {
+            return Ok(());
+        }
+    }
+    Err(StatusCode::FORBIDDEN)
+}
+
+async fn require_gateway_runtime_permission(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+) -> Result<(), StatusCode> {
+    require_gateway_permission(state, actor, company_id, PermissionKey::TOOLS_MANAGE_RUNTIME).await
 }
 
 async fn gateway_runtime_slots(
@@ -1474,7 +1516,8 @@ async fn update_tool_profile_entry(
     Json(request): Json<UpdateProfileEntryRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_gateway_runtime_permission(&state, &actor, company_id).await?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let row = sqlx::query(
         "UPDATE tool_profile_entries SET effect = CASE WHEN COALESCE($2, effect = 'include') THEN 'include' ELSE 'exclude' END,
@@ -1525,8 +1568,13 @@ async fn connection_test_agents(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_any_permission(
+        &state,
+        &actor,
+        company_id,
+        &[PermissionKey::TOOLS_USE, PermissionKey::TOOLS_MANAGE_CONNECTIONS],
+    )
+    .await?;
     use sqlx::Row;
     let exists = sqlx::query("SELECT id FROM tool_connections WHERE id = $1 AND company_id = $2")
         .bind(connection_id)
@@ -1563,13 +1611,31 @@ async fn connection_test_agents(
 
 /// GET /api/tool-connections/:id/test-calls/:call_id —— 静态空结构。
 async fn connection_test_call(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((connection_id, call_id)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_any_permission(
+        &state,
+        &actor,
+        company_id,
+        &[PermissionKey::TOOLS_USE, PermissionKey::TOOLS_MANAGE_CONNECTIONS],
+    )
+    .await?;
+    let connection_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM tool_connections WHERE id = $1 AND company_id = $2
+         )",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !connection_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
     Ok(Json(
         json!({ "connectionId": connection_id, "callId": call_id, "status": "noop" }),
     ))
@@ -1582,7 +1648,8 @@ async fn refresh_connection_catalog(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_gateway_runtime_permission(&state, &actor, company_id).await?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let connection = sqlx::query(
         "SELECT transport, transport_config FROM tool_connections WHERE id = $1 AND company_id = $2",
@@ -1676,11 +1743,29 @@ async fn install_connection_grants(
     Path(connection_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_permission(
+        &state,
+        &actor,
+        company_id,
+        PermissionKey::TOOLS_MANAGE_CONNECTIONS,
+    )
+    .await?;
+    let connection_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM tool_connections WHERE id = $1 AND company_id = $2
+         )",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !connection_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
     sqlx::query(
         "INSERT INTO tool_connection_grants (company_id, connection_id, agent_id) \
-         SELECT company_id, $1, id FROM agents WHERE company_id = $2 AND status = 'active' \
+         SELECT company_id, $1, id FROM agents WHERE company_id = $2 AND status <> 'terminated' \
          ON CONFLICT (connection_id, agent_id) DO NOTHING",
     )
     .bind(connection_id)
@@ -2004,13 +2089,12 @@ struct CreateStdioTemplateRequest {
     name: Option<String>,
 }
 async fn create_stdio_template(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(request): Json<CreateStdioTemplateRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_permission(&state, &actor, company_id, PermissionKey::TOOLS_ADMIN).await?;
     Ok(Json(json!({ "id": Uuid::new_v4(), "name": request.name })))
 }
 
@@ -2027,21 +2111,19 @@ async fn revoke_trust_rule(
 
 /// POST /companies/:cid/tools/runtime-slots/:slot_id/stop|restart —— mock。
 async fn stop_runtime_slot(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, _slot_id)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_runtime_permission(&state, &actor, company_id).await?;
     Ok(Json(json!({ "stopped": true })))
 }
 async fn restart_runtime_slot(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, _slot_id)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_runtime_permission(&state, &actor, company_id).await?;
     Ok(Json(json!({ "restarted": true })))
 }
 
@@ -2113,14 +2195,32 @@ struct CreateTestCallRequest {
     tool: Option<String>,
 }
 async fn create_connection_test_call(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
     Json(request): Json<CreateTestCallRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_any_permission(
+        &state,
+        &actor,
+        company_id,
+        &[PermissionKey::TOOLS_USE, PermissionKey::TOOLS_MANAGE_CONNECTIONS],
+    )
+    .await?;
+    let connection_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM tool_connections WHERE id = $1 AND company_id = $2
+         )",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !connection_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
     Ok((
         StatusCode::CREATED,
         Json(
@@ -2217,8 +2317,7 @@ async fn gateway_slot_stop(
     Path(slot_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_runtime_permission(&state, &actor, company_id).await?;
     let slot_id: Uuid = slot_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     sqlx::query(
         "UPDATE tool_runtime_slots \
@@ -2240,8 +2339,7 @@ async fn gateway_slot_restart(
     Path(slot_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_runtime_permission(&state, &actor, company_id).await?;
     let slot_id: Uuid = slot_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     sqlx::query(
         "UPDATE tool_runtime_slots \
