@@ -383,24 +383,59 @@ async fn update_member_permissions(
     ))
 }
 
-/// CM4: GET /companies/:company_id/search
+/// §4C.3 Company Search：对齐 Paperclip `GET /companies/:companyId/search`。
+///
+/// 返回 `CompanySearchResponse`（issue 作用域全文/分词匹配本阶段落地）；
+/// 支持 `q`/`scope`/`limit`/`offset`/`sort` 查询参数，按 company_id 租户隔离。
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
     pub q: Option<String>,
+    pub scope: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub sort: Option<String>,
 }
 
 async fn search_company(
     State(state): State<AppState>,
-    Path(_company_id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<Vec<Company>>, AppError> {
-    let q = query.q.as_deref().unwrap_or("");
-    let results = state
-        .company_service
-        .search(q)
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| AppError::Forbidden("Company search access denied".into()))?;
+
+    use services::company_search_service::{
+        CompanySearchQuery, CompanySearchScope, CompanySearchService, CompanySearchSort,
+    };
+    let scope = query
+        .scope
+        .as_deref()
+        .map(CompanySearchScope::from_str)
+        .unwrap_or_default();
+    let sort = query
+        .sort
+        .as_deref()
+        .map(CompanySearchSort::from_str)
+        .unwrap_or_default();
+    let limit = query.limit.unwrap_or(20).clamp(1, 50);
+    let offset = query.offset.unwrap_or(0).clamp(0, 200);
+
+    let svc = CompanySearchService::new(state.pool.clone());
+    let resp = svc
+        .search(
+            company_id,
+            CompanySearchQuery {
+                q: query.q.clone().unwrap_or_default(),
+                scope,
+                sort,
+                limit,
+                offset,
+            },
+        )
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(results))
+    Ok(Json(serde_json::to_value(resp).map_err(|e| AppError::InternalServerError(e.to_string()))?))
 }
 
 /// CM8: GET /companies/:company_id/sidebar-badges
