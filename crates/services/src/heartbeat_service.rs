@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use crate::text_utils::truncate_suffix_chars;
 use crate::sse_service::{InMemorySseService, SseService};
 use crate::secret_service::RuntimeSecretManifestEntry;
+use crate::adapter_executor::{AdapterExecutionContext, AdapterExecutor, ExecutionStatus, ExecutionTargetConfig, ExecutionTargetType, HttpExecutor};
 use chrono::{DateTime, Utc};
 use models::{Agent, AgentStatus, SseEvent, SseEventType};
 use serde::{Deserialize, Serialize};
@@ -807,6 +808,7 @@ pub enum HeartbeatError {
 pub struct DefaultHeartbeatService {
     pool: PgPool,
     children: Arc<Mutex<HashMap<Uuid, Arc<Mutex<Child>>>>>,
+    http_executor: Arc<HttpExecutor>,
     sse_service: Arc<dyn SseService>,
     cost_service: Option<Arc<dyn crate::CostService>>,
     budget_service: Option<Arc<dyn crate::BudgetService>>,
@@ -882,6 +884,7 @@ impl DefaultHeartbeatService {
         Self {
             pool,
             children: Arc::new(Mutex::new(HashMap::new())),
+            http_executor: Arc::new(HttpExecutor::new()),
             sse_service: InMemorySseService::new(),
             cost_service: None,
             budget_service: None,
@@ -917,6 +920,7 @@ impl DefaultHeartbeatService {
         Self {
             pool: self.pool.clone(),
             children: Arc::clone(&self.children),
+            http_executor: Arc::clone(&self.http_executor),
             sse_service: Arc::clone(&self.sse_service),
             cost_service: self.cost_service.clone(),
             budget_service: self.budget_service.clone(),
@@ -1937,6 +1941,41 @@ impl DefaultHeartbeatService {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty());
+        if adapter == "http" {
+            let result = self
+                .http_executor
+                .execute(AdapterExecutionContext {
+                    run_id: run_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    config: cfg.clone(),
+                    working_dir: cfg
+                        .get("cwd")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    execution_target: ExecutionTargetConfig {
+                        target_type: ExecutionTargetType::Local,
+                        connection_info: None,
+                        asset_sync_config: None,
+                    },
+                    log_sink: None,
+                })
+                .await;
+            let exit_code = result.exit_code.unwrap_or_else(|| {
+                if result.status == ExecutionStatus::Ok {
+                    0
+                } else {
+                    -1
+                }
+            });
+            return Ok(AdapterCommandOutput {
+                exit_code,
+                stdout: result.output,
+                stderr: result.error.unwrap_or_default(),
+                resumed_session_id: None,
+                billing_type: "custom".to_string(),
+                runtime_secret_manifest,
+            });
+        }
         if let Some(api_key) = cfg
             .get("apiKey")
             .or_else(|| cfg.get("api_key"))
@@ -3023,6 +3062,7 @@ impl HeartbeatService for DefaultHeartbeatService {
                     );
                 }
             }
+            self.http_executor.cancel(&run_id.to_string()).await;
             
             // 2. 更新 run 状态为 cancelled
             sqlx::query("UPDATE heartbeat_runs SET status='cancelled', error=$2, finished_at=NOW(), updated_at=NOW() WHERE id=$1")
@@ -3631,6 +3671,7 @@ impl DefaultHeartbeatService {
         Self {
             pool: self.pool.clone(),
             children: self.children.clone(),
+            http_executor: self.http_executor.clone(),
             sse_service: self.sse_service.clone(),
             cost_service: self.cost_service.clone(),
             budget_service: self.budget_service.clone(),
