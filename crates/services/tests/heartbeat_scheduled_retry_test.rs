@@ -166,6 +166,108 @@ async fn maybe_schedule_retry_ignores_permanent_failure() {
 }
 
 #[tokio::test]
+async fn maybe_schedule_retry_stops_after_maximum_attempts() {
+    let Some(pool) = connect().await else { return; };
+    let (company_id, agent_id) = seed(&pool).await;
+    let issue_id = Uuid::new_v4();
+    let run_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot, scheduled_retry_attempt, error_code, error_family)
+         VALUES ($1, $2, 'on_demand', 'failed', $3::jsonb, 3, 'claude_transient_upstream', 'transient_upstream') RETURNING id",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(serde_json::json!({ "issueId": issue_id.to_string() }))
+    .fetch_one(&pool)
+    .await
+    .expect("insert exhausted failed run");
+
+    let svc = services::DefaultHeartbeatService::new(pool.clone());
+    let rescheduled = svc
+        .maybe_schedule_retry(
+            run_id,
+            agent_id,
+            issue_id,
+            company_id,
+            Some("claude_transient_upstream"),
+            Some("transient_upstream"),
+            "retry budget exhausted",
+        )
+        .await
+        .expect("maybe_schedule_retry");
+    assert!(!rescheduled, "an exhausted run must remain terminal");
+
+    let row: (String, i32) = sqlx::query_as(
+        "SELECT status::text, scheduled_retry_attempt FROM heartbeat_runs WHERE id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read exhausted run");
+    assert_eq!(row.0, "failed");
+    assert_eq!(row.1, 3);
+
+    cleanup(&pool, company_id, run_id).await;
+}
+
+#[tokio::test]
+async fn maybe_schedule_retry_is_idempotent_under_concurrent_calls() {
+    let Some(pool) = connect().await else { return; };
+    let (company_id, agent_id) = seed(&pool).await;
+    let issue_id = Uuid::new_v4();
+    let run_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot, error_code, error_family)
+         VALUES ($1, $2, 'on_demand', 'failed', $3::jsonb, 'claude_transient_upstream', 'transient_upstream') RETURNING id",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(serde_json::json!({ "issueId": issue_id.to_string() }))
+    .fetch_one(&pool)
+    .await
+    .expect("insert concurrent failed run");
+
+    let svc = services::DefaultHeartbeatService::new(pool.clone());
+    let first = svc.maybe_schedule_retry(
+        run_id,
+        agent_id,
+        issue_id,
+        company_id,
+        Some("claude_transient_upstream"),
+        Some("transient_upstream"),
+        "concurrent retry",
+    );
+    let second = svc.maybe_schedule_retry(
+        run_id,
+        agent_id,
+        issue_id,
+        company_id,
+        Some("claude_transient_upstream"),
+        Some("transient_upstream"),
+        "concurrent retry",
+    );
+    let (first, second) = tokio::join!(first, second);
+    let successes = [
+        first.expect("first maybe_schedule_retry"),
+        second.expect("second maybe_schedule_retry"),
+    ]
+    .into_iter()
+    .filter(|scheduled| *scheduled)
+    .count();
+    assert_eq!(successes, 1, "exactly one concurrent caller may schedule a retry");
+
+    let row: (String, i32) = sqlx::query_as(
+        "SELECT status::text, scheduled_retry_attempt FROM heartbeat_runs WHERE id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read concurrent run");
+    assert_eq!(row.0, "scheduled_retry");
+    assert_eq!(row.1, 1, "concurrent scheduling must not skip or duplicate attempts");
+
+    cleanup(&pool, company_id, run_id).await;
+}
+
+#[tokio::test]
 async fn promote_due_scheduled_retries_rewakes_run() {
     let Some(pool) = connect().await else { return; };
     let (company_id, agent_id) = seed(&pool).await;

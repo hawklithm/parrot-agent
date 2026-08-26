@@ -1436,11 +1436,19 @@ impl DefaultHeartbeatService {
             "stdout": output.stdout,
             "stderr": output.stderr,
         });
+        // Persist the terminal result before attempting self-healing. The retry
+        // transition intentionally accepts only `failed`, so scheduling before
+        // this UPDATE would silently leave recoverable failures terminal.
+        if let Err(error) = sqlx::query(
+            "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, result_json = $6, error_code = $7, error_family = $8, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
+            .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output.stdout).bind(&result_json).bind(outcome.error_code.clone()).bind(outcome.error_family.clone()).execute(&self.pool).await
+        {
+            tracing::error!(%run_id, %error, "failed to persist heartbeat run final status");
+        }
+
         // Self-healing: a recoverable failure is rescheduled instead of left
-        // terminal. maybe_schedule_retry transitions the run to `scheduled_retry`
-        // (finished_at cleared); the finalize UPDATE below is guarded by
-        // `status IN ('queued','running')` so it is a harmless no-op for the
-        // rescheduled run, while token-usage tracking still runs below.
+        // terminal. maybe_schedule_retry clears finished_at and records the
+        // retry metadata after the failure result has been durably captured.
         if status == "failed" {
             let _ = self
                 .maybe_schedule_retry(
@@ -1453,12 +1461,6 @@ impl DefaultHeartbeatService {
                     &retry_reason(&outcome),
                 )
                 .await;
-        }
-        if let Err(error) = sqlx::query(
-            "UPDATE heartbeat_runs SET status = $2::heartbeat_run_status, exit_code = $3, error = $4, output = $5, result_json = $6, error_code = $7, error_family = $8, finished_at = NOW(), updated_at = NOW() WHERE id = $1 AND status IN ('queued','running')")
-            .bind(run_id).bind(status).bind(exit_code).bind(&error).bind(&output.stdout).bind(&result_json).bind(outcome.error_code).bind(outcome.error_family).execute(&self.pool).await
-        {
-            tracing::error!(%run_id, %error, "failed to persist heartbeat run final status");
         }
 
         if let Some(session_id) = outcome.session_id.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -3070,10 +3072,11 @@ impl DefaultHeartbeatService {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
-        let attempt = row.map(|r| (r.0 + 1).min(Self::MAX_SCHEDULED_RETRY_ATTEMPTS)).unwrap_or(1);
-        if attempt > Self::MAX_SCHEDULED_RETRY_ATTEMPTS {
+        let current_attempt = row.map(|r| r.0).unwrap_or(0);
+        if current_attempt >= Self::MAX_SCHEDULED_RETRY_ATTEMPTS {
             return Ok(false);
         }
+        let attempt = current_attempt + 1;
         let backoff = Self::scheduled_retry_backoff_secs(attempt);
         let updated = sqlx::query(
             "UPDATE heartbeat_runs
@@ -3087,7 +3090,8 @@ impl DefaultHeartbeatService {
                  result_json = COALESCE(result_json, '{}'::jsonb)
                      || jsonb_build_object('scheduledRetry', true, 'scheduledRetryAttempt', $3),
                  updated_at = NOW()
-             WHERE id = $1 AND status = 'failed'",
+             WHERE id = $1 AND status = 'failed'
+               AND COALESCE(scheduled_retry_attempt, 0) = $7",
         )
         .bind(run_id)
         .bind(backoff)
@@ -3095,6 +3099,7 @@ impl DefaultHeartbeatService {
         .bind(reason)
         .bind(error_code)
         .bind(error_family)
+        .bind(current_attempt)
         .execute(&self.pool)
         .await
         .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
