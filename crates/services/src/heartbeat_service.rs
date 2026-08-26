@@ -160,6 +160,15 @@ fn merge_adapter_config(
     serde_json::Value::Object(merged)
 }
 
+fn build_codex_exec_args(model: Option<&str>) -> Vec<String> {
+    let mut args = vec!["exec".to_string(), "--json".to_string()];
+    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    args.push("-".to_string());
+    args
+}
+
 
 /// Heartbeat service for managing agent wake/sleep lifecycle
 #[async_trait]
@@ -280,13 +289,13 @@ struct AdapterCommandOutput {
 /// Exit status remains the process-level fallback, but an adapter can emit an
 /// explicit error/result record before exiting zero; treating that as success
 /// would incorrectly complete the Issue.
-fn parse_adapter_outcome(output: &str) -> AdapterOutcome {
+fn parse_adapter_outcome(output: &str, adapter_type: &str) -> AdapterOutcome {
     let mut outcome = AdapterOutcome::default();
     for line in output.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        visit_adapter_event(&value, &mut outcome, true);
+        visit_adapter_event(&value, &mut outcome, true, adapter_type);
     }
     outcome
 }
@@ -294,6 +303,20 @@ fn parse_adapter_outcome(output: &str) -> AdapterOutcome {
 fn valid_claude_resume_session(session_id: Option<&str>) -> Option<String> {
     let session_id = session_id?.trim();
     if uuid::Uuid::parse_str(session_id).is_ok() { Some(session_id.to_string()) } else { None }
+}
+
+fn valid_codex_resume_session(session_id: Option<&str>) -> Option<String> {
+    let session_id = session_id?.trim();
+    if session_id.is_empty()
+        || session_id.len() > 256
+        || session_id.starts_with('-')
+        || !session_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':'))
+    {
+        return None;
+    }
+    Some(session_id.to_string())
 }
 
 fn classify_claude_error(message: &str) -> (Option<String>, Option<String>) {
@@ -326,6 +349,142 @@ fn classify_claude_error(message: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
+fn classify_codex_error(message: &str) -> (Option<String>, Option<String>) {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("unknown session")
+        || normalized.contains("unknown thread")
+        || normalized.contains("session not found")
+        || normalized.contains("thread not found")
+        || normalized.contains("no rollout found")
+        || normalized.contains("missing rollout path")
+        || normalized.contains("rollout path for thread")
+    {
+        return (
+            Some("codex_unknown_session".to_string()),
+            Some("session".to_string()),
+        );
+    }
+    if normalized.contains("refresh_token_reused")
+        || normalized.contains("refresh token already been used")
+        || normalized.contains("refresh token reused")
+    {
+        return (
+            Some("refresh_token_reused".to_string()),
+            Some("refresh_token_reused".to_string()),
+        );
+    }
+    if normalized.contains("refresh_token_expired")
+        || normalized.contains("expired refresh token")
+        || normalized.contains("refresh token has expired")
+    {
+        return (
+            Some("refresh_token_expired".to_string()),
+            Some("refresh_token_expired".to_string()),
+        );
+    }
+    if normalized.contains("refresh_token_invalidated")
+        || normalized.contains("invalid refresh token")
+        || normalized.contains("revoked refresh token")
+        || normalized.contains("invalid_grant")
+        || normalized.contains("missing bearer")
+    {
+        return (
+            Some("refresh_token_invalidated".to_string()),
+            Some("refresh_token_invalidated".to_string()),
+        );
+    }
+    if normalized.contains("usage limit")
+        || normalized.contains("at capacity")
+        || normalized.contains("capacity limit")
+    {
+        return (
+            Some("provider_quota".to_string()),
+            Some("provider_quota".to_string()),
+        );
+    }
+    if normalized.contains("rate limit")
+        || normalized.contains("too many requests")
+        || normalized.contains("server overloaded")
+        || normalized.contains("service unavailable")
+        || normalized.contains("high demand")
+        || normalized.contains("temporary errors")
+        || normalized.contains("try again later")
+    {
+        return (
+            Some("codex_transient_upstream".to_string()),
+            Some("transient_upstream".to_string()),
+        );
+    }
+    if normalized.contains("not logged in")
+        || normalized.contains("please log in")
+        || normalized.contains("login required")
+        || normalized.contains("authentication required")
+        || normalized.contains("unauthorized")
+        || normalized.contains("invalid api key")
+    {
+        return (
+            Some("codex_auth_required".to_string()),
+            Some("authentication".to_string()),
+        );
+    }
+    if normalized.contains("empty or malformed response") {
+        return (
+            Some("codex_malformed_response".to_string()),
+            Some("upstream_protocol".to_string()),
+        );
+    }
+    (None, None)
+}
+
+fn classify_generic_adapter_error(message: &str) -> (Option<String>, Option<String>) {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("unknown session")
+        || normalized.contains("unknown thread")
+        || normalized.contains("session not found")
+        || normalized.contains("thread not found")
+        || normalized.contains("no rollout found")
+    {
+        return (
+            Some("adapter_unknown_session".to_string()),
+            Some("session".to_string()),
+        );
+    }
+    if normalized.contains("not logged in")
+        || normalized.contains("please log in")
+        || normalized.contains("login required")
+        || normalized.contains("authentication required")
+        || normalized.contains("unauthorized")
+        || normalized.contains("invalid refresh token")
+        || normalized.contains("missing bearer")
+    {
+        return (
+            Some("adapter_auth_required".to_string()),
+            Some("authentication".to_string()),
+        );
+    }
+    if normalized.contains("rate limit")
+        || normalized.contains("too many requests")
+        || normalized.contains("server overloaded")
+        || normalized.contains("service unavailable")
+        || normalized.contains("high demand")
+        || normalized.contains("temporary errors")
+    {
+        return (
+            Some("adapter_transient_upstream".to_string()),
+            Some("transient_upstream".to_string()),
+        );
+    }
+    (None, None)
+}
+
+fn classify_adapter_error(message: &str, adapter_type: &str) -> (Option<String>, Option<String>) {
+    match adapter_type {
+        "claude_local" => classify_claude_error(message),
+        "codex_local" => classify_codex_error(message),
+        _ => classify_generic_adapter_error(message),
+    }
+}
+
 /// Human-readable reason recorded on a scheduled retry, derived from the
 /// adapter outcome. Falls back to the explicit failure reason, then to the
 /// classified error code, then a generic message.
@@ -341,7 +500,7 @@ fn retry_reason(outcome: &AdapterOutcome) -> String {
     "recoverable failure".to_string()
 }
 
-fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: bool) {
+fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: bool, adapter_type: &str) {
     let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
     if matches!(kind, "tool_use" | "tool_call") || value.get("tool_name").is_some() {
         outcome.tool_call_count += 1;
@@ -354,6 +513,7 @@ fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: b
         outcome.session_id = value
             .get("session_id")
             .or_else(|| value.get("sessionId"))
+            .or_else(|| (kind == "thread.started").then(|| value.get("thread_id")).flatten())
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
@@ -389,20 +549,32 @@ fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: b
     // top-level adapter/result records can determine the process outcome: a
     // recoverable tool_result error must not turn an otherwise successful run
     // into a failed heartbeat.
+    if kind == "item.completed" {
+        if let Some(item) = value.get("item") {
+            if item.get("type").and_then(Value::as_str) == Some("agent_message") {
+                if let Some(text) = item.get("text").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+                    outcome.result_summary = Some(text.to_owned());
+                }
+            }
+        }
+    }
+
     let is_error = top_level
         && (value.get("is_error").and_then(Value::as_bool).unwrap_or(false)
             || value.get("isError").and_then(Value::as_bool).unwrap_or(false)
-            || matches!(value.get("subtype").and_then(Value::as_str), Some("error" | "failed")));
+            || matches!(value.get("subtype").and_then(Value::as_str), Some("error" | "failed"))
+            || matches!(kind, "error" | "turn.failed"));
     if is_error {
         outcome.explicit_failure = true;
         let reason = value
             .get("error")
             .and_then(Value::as_str)
+            .or_else(|| value.get("error").and_then(|error| error.get("message")).and_then(Value::as_str))
             .or_else(|| value.get("message").and_then(Value::as_str))
             .or_else(|| value.get("result").and_then(Value::as_str))
             .map(ToOwned::to_owned);
         if let Some(reason) = reason {
-            let (error_code, error_family) = classify_claude_error(&reason);
+            let (error_code, error_family) = classify_adapter_error(&reason, adapter_type);
             outcome.failure_reason = Some(reason);
             outcome.error_code = error_code;
             outcome.error_family = error_family;
@@ -413,8 +585,12 @@ fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: b
         outcome.result_summary = Some(result.to_owned());
     }
     match value {
-        Value::Array(values) => values.iter().for_each(|item| visit_adapter_event(item, outcome, false)),
-        Value::Object(values) => values.values().for_each(|item| visit_adapter_event(item, outcome, false)),
+        Value::Array(values) => values
+            .iter()
+            .for_each(|item| visit_adapter_event(item, outcome, false, adapter_type)),
+        Value::Object(values) => values
+            .values()
+            .for_each(|item| visit_adapter_event(item, outcome, false, adapter_type)),
         _ => {}
     }
 }
@@ -1135,6 +1311,18 @@ impl DefaultHeartbeatService {
                 return;
             }
         }
+        let adapter_metadata = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT adapter_type, adapter_config->>'model'
+             FROM agents WHERE id = $1 AND company_id = $2",
+        )
+        .bind(agent_id)
+        .bind(company_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ("unknown".to_string(), None));
+        let (adapter_type, configured_model) = adapter_metadata;
         let result = self.run_command(run_id, agent_id, issue_id, company_id).await;
         // Heartbeat Start Lock contention: a second start for this agent raced in. This is not a
         // run failure and must NOT be retried — cancel this run so exactly one adapter process
@@ -1161,7 +1349,17 @@ impl DefaultHeartbeatService {
         let (status, exit_code, error, output, outcome) = match result {
             Ok(command_output) => {
                 let combined = format!("{}{}", command_output.stdout, command_output.stderr);
-                let outcome = parse_adapter_outcome(&combined);
+                let mut outcome = parse_adapter_outcome(&combined, &adapter_type);
+                if outcome.model.is_none() {
+                    outcome.model = configured_model.clone().filter(|model| !model.trim().is_empty());
+                }
+                if outcome.provider.is_none() {
+                    outcome.provider = match adapter_type.as_str() {
+                        "claude_local" => Some("anthropic".to_string()),
+                        "codex_local" => Some("openai".to_string()),
+                        _ => None,
+                    };
+                }
                 if command_output.exit_code == 0 && !outcome.explicit_failure {
                     ("succeeded", Some(command_output.exit_code), None, command_output, outcome)
                 } else if outcome.explicit_failure {
@@ -1185,7 +1383,7 @@ impl DefaultHeartbeatService {
                         .find(|line| !line.is_empty())
                         .unwrap_or("no adapter output")
                         .to_string();
-                    let (error_code, error_family) = classify_claude_error(&reason);
+                    let (error_code, error_family) = classify_adapter_error(&reason, &adapter_type);
                     let mut outcome = outcome;
                     outcome.error_code = error_code;
                     outcome.error_family = error_family;
@@ -1228,6 +1426,13 @@ impl DefaultHeartbeatService {
             "errorFamily": outcome.error_family,
             "resultEvent": outcome.result_event,
             "sessionId": outcome.session_id,
+            "inputTokens": outcome.input_tokens,
+            "cachedInputTokens": outcome.cached_input_tokens,
+            "outputTokens": outcome.output_tokens,
+            "costUsd": outcome.cost_usd,
+            "model": outcome.model,
+            "provider": outcome.provider,
+            "adapterType": adapter_type,
             "stdout": output.stdout,
             "stderr": output.stderr,
         });
@@ -1511,7 +1716,7 @@ impl DefaultHeartbeatService {
                     "-c".into(),
                     format!("printf '%s' '{}'", prompt.replace('\'', "'\\''")),
                 ],
-                "codex_local" => vec!["exec".into(), prompt.clone()],
+                "codex_local" => build_codex_exec_args(configured_model),
                 "claude_local" => vec![
                     "--print".into(),
                     "-".into(),
@@ -1521,10 +1726,6 @@ impl DefaultHeartbeatService {
                 ],
                 _ => vec!["-p".into(), prompt.clone()],
             };
-            if adapter == "codex_local" {
-                let model = configured_model.unwrap_or("deepseek-v4-flash");
-                args.splice(1..1, ["--model".to_string(), model.to_string()]);
-            }
         }
         if adapter == "claude_local" {
             let skip_permissions = cfg
@@ -1610,19 +1811,36 @@ impl DefaultHeartbeatService {
                     .iter()
                     .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
             {
-                args.push("--dangerously-bypass-approvals-and-sandbox".into());
+                let insert_at = args
+                    .iter()
+                    .rposition(|arg| arg == "-")
+                    .unwrap_or(args.len());
+                args.insert(insert_at, "--dangerously-bypass-approvals-and-sandbox".into());
             }
         }
-        if adapter == "claude_local" && !custom_args {
+        if matches!(adapter, "claude_local" | "codex_local") && !custom_args {
             let persisted_session: Option<String> = sqlx::query_scalar(
                 "SELECT session_id FROM agent_runtime_states WHERE agent_id = $1",
             )
             .bind(agent_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|error| format!("failed to load Claude session: {error}"))?;
-            if let Some(session_id) = valid_claude_resume_session(persisted_session.as_deref()) {
-                args.extend(["--resume".to_string(), session_id]);
+            .map_err(|error| format!("failed to load adapter session: {error}"))?;
+            match adapter {
+                "claude_local" => {
+                    if let Some(session_id) = valid_claude_resume_session(persisted_session.as_deref()) {
+                        args.extend(["--resume".to_string(), session_id]);
+                    }
+                }
+                "codex_local" => {
+                    if let Some(session_id) = valid_codex_resume_session(persisted_session.as_deref()) {
+                        if args.last().map(String::as_str) == Some("-") {
+                            args.pop();
+                            args.extend(["resume".to_string(), session_id, "-".to_string()]);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         let mut cmd = Command::new(command);
@@ -1699,7 +1917,7 @@ impl DefaultHeartbeatService {
             let explicit_env = cfg.get("env").and_then(|v| v.as_object());
             isolate_claude_provider_environment(&mut cmd, explicit_env);
         }
-        let stdin_prompt = adapter == "claude_local" && !custom_args;
+        let stdin_prompt = matches!(adapter, "claude_local" | "codex_local") && !custom_args;
         let timeout_sec = cfg
             .get("timeoutSec")
             .or_else(|| cfg.get("timeout_sec"))
@@ -1867,11 +2085,11 @@ impl DefaultHeartbeatService {
                 stdin
                     .write_all(prompt.as_bytes())
                     .await
-                    .map_err(|e| format!("failed to write Claude prompt: {e}"))?;
+                    .map_err(|e| format!("failed to write adapter prompt: {e}"))?;
                 stdin
                     .shutdown()
                     .await
-                    .map_err(|e| format!("failed to close Claude stdin: {e}"))?;
+                    .map_err(|e| format!("failed to close adapter stdin: {e}"))?;
             }
         }
         let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
@@ -2822,6 +3040,9 @@ impl DefaultHeartbeatService {
             Some("claude_auth_required")
                 | Some("claude_transient_upstream")
                 | Some("claude_malformed_response")
+                | Some("codex_auth_required")
+                | Some("codex_transient_upstream")
+                | Some("codex_malformed_response")
                 | Some("adapter_failed")
         )
     }
@@ -3047,12 +3268,16 @@ impl DefaultHeartbeatService {
 
 #[cfg(test)]
 mod adapter_outcome_tests {
-    use super::{parse_adapter_outcome, valid_claude_resume_session};
+    use super::{
+        build_codex_exec_args, parse_adapter_outcome, valid_claude_resume_session,
+        valid_codex_resume_session,
+    };
 
     #[test]
     fn explicit_structured_error_overrides_zero_exit() {
         let outcome = parse_adapter_outcome(
             r#"{"type":"result","subtype":"error","is_error":true,"result":"tool failed"}"#,
+            "claude_local",
         );
         assert!(outcome.explicit_failure);
         assert_eq!(outcome.failure_reason.as_deref(), Some("tool failed"));
@@ -3062,6 +3287,7 @@ mod adapter_outcome_tests {
     fn classifies_claude_malformed_response() {
         let outcome = parse_adapter_outcome(
             r#"{"type":"result","subtype":"error","is_error":true,"result":"API Error: API returned an empty or malformed response (HTTP 200)"}"#,
+            "claude_local",
         );
         assert_eq!(outcome.error_code.as_deref(), Some("claude_malformed_response"));
         assert_eq!(outcome.error_family.as_deref(), Some("upstream_protocol"));
@@ -3077,6 +3303,7 @@ mod adapter_outcome_tests {
             r#"{"type":"tool_use","name":"paperclipGetIssue"}
 {"type":"handoff","handoff":{"issueId":"ABC-1"}}
 {"type":"result","subtype":"success","result":"done"}"#,
+            "claude_local",
         );
         assert!(!outcome.explicit_failure);
         assert_eq!(outcome.tool_call_count, 1);
@@ -3090,6 +3317,7 @@ mod adapter_outcome_tests {
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"paperclipGetIssue"}]}}
 {"type":"user","message":{"content":[{"type":"tool_result","is_error":true}]}}
 {"type":"result","subtype":"success","result":"done"}"#,
+            "claude_local",
         );
         assert_eq!(outcome.tool_call_count, 1);
         assert!(!outcome.explicit_failure);
@@ -3101,6 +3329,7 @@ mod adapter_outcome_tests {
         let outcome = parse_adapter_outcome(
             r#"{"type":"system","session_id":"sess-42","model":"claude-sonnet","usage":{"input_tokens":120,"output_tokens":45,"cache_read_input_tokens":10},"total_cost_usd":0.0123}
 {"type":"result","subtype":"success","result":"done"}"#,
+            "claude_local",
         );
         assert_eq!(outcome.session_id.as_deref(), Some("sess-42"));
         assert_eq!(outcome.input_tokens, 120);
@@ -3108,6 +3337,63 @@ mod adapter_outcome_tests {
         assert_eq!(outcome.cached_input_tokens, 10);
         assert_eq!(outcome.cost_usd, Some(0.0123));
         assert_eq!(outcome.model.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[test]
+    fn parses_codex_jsonl_session_usage_summary_and_failure() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"thread.started","thread_id":"thread-42"}
+{"type":"item.completed","item":{"type":"agent_message","text":"implemented the change"}}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":30,"output_tokens":45}}"#,
+            "codex_local",
+        );
+        assert_eq!(outcome.session_id.as_deref(), Some("thread-42"));
+        assert_eq!(outcome.result_summary.as_deref(), Some("implemented the change"));
+        assert_eq!(outcome.input_tokens, 120);
+        assert_eq!(outcome.cached_input_tokens, 30);
+        assert_eq!(outcome.output_tokens, 45);
+        assert!(!outcome.explicit_failure);
+
+        let failed = parse_adapter_outcome(
+            r#"{"type":"thread.started","thread_id":"thread-43"}
+{"type":"turn.failed","error":{"message":"authentication required"}}"#,
+            "codex_local",
+        );
+        assert_eq!(failed.session_id.as_deref(), Some("thread-43"));
+        assert!(failed.explicit_failure);
+        assert_eq!(failed.failure_reason.as_deref(), Some("authentication required"));
+        assert_eq!(failed.error_code.as_deref(), Some("codex_auth_required"));
+        assert_eq!(failed.error_family.as_deref(), Some("authentication"));
+
+        let stale = parse_adapter_outcome(
+            r#"{"type":"error","message":"state db missing rollout path for thread thread-44"}"#,
+            "codex_local",
+        );
+        assert_eq!(stale.error_code.as_deref(), Some("codex_unknown_session"));
+        assert_eq!(stale.error_family.as_deref(), Some("session"));
+    }
+
+    #[test]
+    fn codex_default_invocation_uses_json_protocol_and_model() {
+        assert_eq!(
+            build_codex_exec_args(Some("gpt-5.4")),
+            vec!["exec", "--json", "--model", "gpt-5.4", "-"]
+        );
+        assert_eq!(
+            build_codex_exec_args(None),
+            vec!["exec", "--json", "-"]
+        );
+    }
+
+    #[test]
+    fn only_safe_codex_sessions_are_eligible_for_resume() {
+        assert_eq!(
+            valid_codex_resume_session(Some("thread-42")),
+            Some("thread-42".to_string())
+        );
+        assert!(valid_codex_resume_session(Some("--resume")).is_none());
+        assert!(valid_codex_resume_session(Some("thread 42")).is_none());
+        assert!(valid_codex_resume_session(None).is_none());
     }
 
     #[test]
