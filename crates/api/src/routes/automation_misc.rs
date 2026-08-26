@@ -1172,18 +1172,6 @@ async fn project_runtime_service(
     Ok(Json(json!({ "projectId": project_id, "workspaceId": workspace_id, "serviceId": service_id, "status": "accepted", "operationId": operation_id, "operationStatus": operation_status, "startedAt": started_at })))
 }
 
-/// GET /_plugins/:plugin_id/ui/*file_path —— plugin UI 静态文件（基础：404）。
-async fn plugin_ui_static(
-    State(_state): State<AppState>,
-    Extension(actor): Extension<AuthorizationActor>,
-    Path((_plugin_id, _file_path)): Path<(String, String)>,
-) -> Result<StatusCode, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    Err(StatusCode::NOT_FOUND)
-}
-
 pub fn automation_misc_routes() -> Router<AppState> {
     Router::new()
         .route("/issues/:id/watchdog", get(get_issue_watchdog).put(upsert_issue_watchdog).delete(delete_issue_watchdog))
@@ -1222,7 +1210,6 @@ pub fn automation_misc_routes() -> Router<AppState> {
             "/projects/:project_id/workspaces/:workspace_id/runtime-services/:service_id",
             post(project_runtime_service),
         )
-        .route("/_plugins/:plugin_id/ui/*file_path", get(plugin_ui_static))
 }
 
 #[cfg(test)]

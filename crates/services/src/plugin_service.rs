@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use models::Plugin;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -415,25 +416,35 @@ impl PluginService for DefaultPluginService {
 
     async fn serve_ui_asset(&self, plugin_id: Uuid, rel_path: &str) -> PluginResult<Vec<u8>> {
         let plugin = self.get(plugin_id).await?;
+        if plugin.status != "ready" {
+            return Err(PluginServiceError::InvalidState(
+                "plugin UI is only available for ready plugins".into(),
+            ));
+        }
         let install_path = plugin
             .install_path
             .ok_or_else(|| {
                 PluginServiceError::FeatureDisabled("plugin has no install path".into())
             })?;
-        if !is_safe_relative_path(rel_path) {
-            return Err(PluginServiceError::InvalidState(
-                "ui asset path is not a safe relative path".into(),
-            ));
-        }
-        let base = std::path::Path::new(&install_path).join("ui");
-        let full = base.join(rel_path);
-        // 二次校验：解析后仍需落在 base 内
-        if !full.starts_with(&base) {
-            return Err(PluginServiceError::InvalidState(
-                "ui asset path escapes plugin ui directory".into(),
-            ));
-        }
-        std::fs::read(&full).map_err(|_| PluginServiceError::NotFound(plugin_id))
+        let entrypoint = plugin_ui_entrypoint(&plugin.manifest).ok_or_else(|| {
+            PluginServiceError::FeatureDisabled("plugin does not declare a UI bundle".into())
+        })?;
+        let full = resolve_plugin_ui_asset_path(Path::new(&install_path), entrypoint, rel_path)
+            .map_err(|error| match error {
+                PluginUiAssetPathError::InvalidEntrypoint => PluginServiceError::InvalidState(
+                    "plugin UI entrypoint is not a safe relative path".into(),
+                ),
+                PluginUiAssetPathError::InvalidRelativePath => PluginServiceError::InvalidState(
+                    "ui asset path is not a safe relative path".into(),
+                ),
+                PluginUiAssetPathError::EscapesRoot => PluginServiceError::InvalidState(
+                    "ui asset path escapes plugin UI directory".into(),
+                ),
+                PluginUiAssetPathError::Missing | PluginUiAssetPathError::NotFile => {
+                    PluginServiceError::NotFound(plugin_id)
+                }
+            })?;
+        std::fs::read(full).map_err(|_| PluginServiceError::NotFound(plugin_id))
     }
 
     async fn cancel_job_run(
@@ -484,6 +495,68 @@ impl PluginService for DefaultPluginService {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginUiAssetPathError {
+    InvalidEntrypoint,
+    InvalidRelativePath,
+    Missing,
+    EscapesRoot,
+    NotFile,
+}
+
+/// Resolve the declared UI bundle and requested asset after resolving symlinks.
+/// The containment check must operate on canonical paths, not only on the
+/// lexical path, because a file inside the bundle can point outside it.
+fn resolve_plugin_ui_asset_path(
+    install_path: &Path,
+    entrypoint: &str,
+    rel_path: &str,
+) -> Result<PathBuf, PluginUiAssetPathError> {
+    if !is_safe_relative_path(entrypoint) {
+        return Err(PluginUiAssetPathError::InvalidEntrypoint);
+    }
+    if !is_safe_relative_path(rel_path) {
+        return Err(PluginUiAssetPathError::InvalidRelativePath);
+    }
+
+    let ui_root = std::fs::canonicalize(install_path.join(entrypoint))
+        .map_err(|_| PluginUiAssetPathError::Missing)?;
+    if !ui_root.is_dir() {
+        return Err(PluginUiAssetPathError::Missing);
+    }
+
+    let resolved_file = std::fs::canonicalize(ui_root.join(rel_path))
+        .map_err(|_| PluginUiAssetPathError::Missing)?;
+    let relative = resolved_file
+        .strip_prefix(&ui_root)
+        .map_err(|_| PluginUiAssetPathError::EscapesRoot)?;
+    if relative.as_os_str().is_empty() {
+        return Err(PluginUiAssetPathError::NotFile);
+    }
+    if !resolved_file.is_file() {
+        return Err(PluginUiAssetPathError::NotFile);
+    }
+    Ok(resolved_file)
+}
+
+/// Return the manifest-declared UI bundle path. `entrypoints.ui` is the
+/// Paperclip contract; a string-valued `ui` is retained for old Parrot
+/// manifests, while contribution arrays intentionally do not qualify.
+fn plugin_ui_entrypoint(manifest: &Value) -> Option<&str> {
+    manifest
+        .get("entrypoints")
+        .and_then(Value::as_object)
+        .and_then(|entrypoints| entrypoints.get("ui"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .or_else(|| {
+            manifest
+                .get("ui")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+        })
+}
+
 /// 校验相对路径安全性：禁止空串、空字节、绝对路径与 `..` 穿越。
 pub fn is_safe_relative_path(path: &str) -> bool {
     if path.is_empty() || path.contains('\0') {
@@ -506,7 +579,12 @@ pub fn is_safe_relative_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_safe_relative_path;
+    use super::{
+        is_safe_relative_path, plugin_ui_entrypoint, resolve_plugin_ui_asset_path,
+        PluginUiAssetPathError,
+    };
+    use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn safe_relative_paths_accepted() {
@@ -527,5 +605,56 @@ mod tests {
         // 空串与空字节
         assert!(!is_safe_relative_path(""));
         assert!(!is_safe_relative_path("a\0b"));
+    }
+
+    #[test]
+    fn paperclip_ui_entrypoint_wins_over_legacy_string() {
+        let manifest = json!({
+            "ui": "legacy-ui",
+            "entrypoints": { "ui": "./dist/ui" }
+        });
+        assert_eq!(plugin_ui_entrypoint(&manifest), Some("./dist/ui"));
+    }
+
+    #[test]
+    fn contribution_array_does_not_declare_a_bundle() {
+        let manifest = json!({ "ui": [{ "slot": "dashboard" }] });
+        assert_eq!(plugin_ui_entrypoint(&manifest), None);
+    }
+
+    #[test]
+    fn canonical_asset_resolution_rejects_lexical_and_symlink_escape() {
+        let root = tempdir().unwrap();
+        let ui_root = root.path().join("dist").join("ui");
+        std::fs::create_dir_all(&ui_root).unwrap();
+        std::fs::write(ui_root.join("index.js"), b"bundle").unwrap();
+
+        let resolved = resolve_plugin_ui_asset_path(root.path(), "./dist/ui", "index.js")
+            .expect("declared asset should resolve");
+        assert_eq!(std::fs::read(resolved).unwrap(), b"bundle");
+        assert_eq!(
+            resolve_plugin_ui_asset_path(root.path(), "./dist/ui", "../secret"),
+            Err(PluginUiAssetPathError::InvalidRelativePath)
+        );
+
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, b"private").unwrap();
+        let link = ui_root.join("outside.txt");
+        let link_result = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&outside, &link)
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_file(&outside, &link)
+            }
+        };
+        if link_result.is_ok() {
+            assert_eq!(
+                resolve_plugin_ui_asset_path(root.path(), "./dist/ui", "outside.txt"),
+                Err(PluginUiAssetPathError::EscapesRoot)
+            );
+        }
     }
 }

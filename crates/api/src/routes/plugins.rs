@@ -10,6 +10,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::path::Path as FilePath;
 use uuid::Uuid;
 
 pub fn plugin_routes() -> Router<AppState> {
@@ -84,6 +86,7 @@ pub fn plugin_routes() -> Router<AppState> {
             put(update_local_folder),
         )
         .route("/plugins/:plugin_id/ui/*file_path", get(serve_plugin_ui_asset))
+        .route("/_plugins/:plugin_id/ui/*file_path", get(serve_plugin_ui_asset))
         .layer(axum::middleware::from_fn(crate::routes::require_plugin_access))
 }
 
@@ -443,6 +446,7 @@ async fn update_local_folder(
 /// 安全提供 plugin UI 静态资源（防路径穿越）。
 async fn serve_plugin_ui_asset(
     State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((plugin_id, file_path)): Path<(Uuid, String)>,
 ) -> Result<Response, AppError> {
     let bytes = s
@@ -450,21 +454,125 @@ async fn serve_plugin_ui_asset(
         .serve_ui_asset(plugin_id, &file_path)
         .await
         .map_err(AppError::from)?;
-    let content_type = if file_path.ends_with(".js") {
-        "application/javascript"
-    } else if file_path.ends_with(".css") {
-        "text/css"
-    } else if file_path.ends_with(".html") {
-        "text/html"
-    } else {
-        "application/octet-stream"
-    };
-    let resp = Response::builder()
+    let content_type = plugin_ui_content_type(&file_path);
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+    if is_content_hashed_asset(&file_path) {
+        builder = builder.header(
+            header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        );
+    } else {
+        let etag = plugin_ui_etag(&bytes);
+        builder = builder
+            .header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")
+            .header(header::ETAG, &etag);
+        if request_matches_etag(&headers, &etag) {
+            return Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")
+                .header(header::ETAG, etag)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::empty())
+                .map_err(|e| AppError::InternalServerError(e.to_string()));
+        }
+    }
+    let resp = builder
         .body(Body::from(bytes))
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     Ok(resp)
+}
+
+fn plugin_ui_content_type(file_path: &str) -> &'static str {
+    match FilePath::new(file_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("js") | Some("mjs") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("json") | Some("map") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        Some("eot") => "application/vnd.ms-fontobject",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn is_content_hashed_asset(file_path: &str) -> bool {
+    let Some(file_name) = FilePath::new(file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let Some(stem) = FilePath::new(file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+    else {
+        return false;
+    };
+    let Some((_, hash)) = stem.rsplit_once(['-', '.']) else {
+        return false;
+    };
+    hash.len() >= 8 && hash.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+fn plugin_ui_etag(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("\"{}\"", hex::encode(digest))
+}
+
+fn request_matches_etag(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').any(|candidate| candidate.trim() == etag || candidate.trim() == "*"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod plugin_ui_response_tests {
+    use super::{is_content_hashed_asset, plugin_ui_content_type, plugin_ui_etag};
+
+    #[test]
+    fn detects_hashed_assets_without_treating_normal_files_as_immutable() {
+        assert!(is_content_hashed_asset("assets/index-a1b2c3d4.js"));
+        assert!(is_content_hashed_asset("assets/styles.abcdef12.css"));
+        assert!(!is_content_hashed_asset("index.js"));
+        assert!(!is_content_hashed_asset("index-short.js"));
+    }
+
+    #[test]
+    fn maps_common_bundle_mime_types_and_uses_binary_fallback() {
+        assert_eq!(
+            plugin_ui_content_type("index.mjs"),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(plugin_ui_content_type("icon.svg"), "image/svg+xml");
+        assert_eq!(
+            plugin_ui_content_type("unknown.data"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn etag_is_stable_for_the_same_bundle() {
+        assert_eq!(plugin_ui_etag(b"bundle"), plugin_ui_etag(b"bundle"));
+        assert_ne!(plugin_ui_etag(b"bundle"), plugin_ui_etag(b"changed"));
+    }
 }
 
 /// POST /plugins/:plugin_id/jobs/:job_id/runs/:run_id/cancel
