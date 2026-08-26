@@ -332,6 +332,12 @@ impl CompanySearchService {
             })
             .collect();
 
+        // 模糊匹配开关：对齐 Paperclip MIN_FUZZY_QUERY_LENGTH=4 且无 LIKE 通配符。
+        // 仅对 identifier 做 pg_trgm similarity（精确对齐 Paperclip fuzzyIdentifierMatch）；
+        // 标题模糊为 Levenshtein 分词方案，本阶段以 trigram 近似，避免过度噪声故仅 identifier。
+        let fuzzy_enabled = normalized_query.len() >= 4 && !normalized_query.contains(['\\', '%', '_']);
+        const FUZZY_IDENTIFIER_SIMILARITY_THRESHOLD: f64 = 0.45;
+
 
         let scope_includes_issues = query.scope.includes_issues();
 
@@ -392,6 +398,12 @@ impl CompanySearchService {
             "coalesce(issues.identifier,'') ILIKE ANY(string_to_array($3, ',')::text[])".to_string(),
             "coalesce(issues.description,'') ILIKE ANY(string_to_array($3, ',')::text[])".to_string(),
         ];
+        if fuzzy_enabled {
+            // 对齐 Paperclip fuzzyIdentifierMatch：identifier 与查询的 pg_trgm 相似度阈值。
+            match_conditions.push(
+                "similarity(lower(coalesce(issues.identifier,'')), $8) >= 0.45".to_string(),
+            );
+        }
         if query.scope.includes_comments_or_documents() {
             match_conditions.push(
                 "EXISTS (SELECT 1 FROM issue_comments sc WHERE sc.company_id = $4 \
@@ -411,7 +423,8 @@ impl CompanySearchService {
                 issues.id, issues.title, issues.identifier, \
                 issues.status::text, issues.priority::text, \
                 issues.assignee_agent_id, issues.assignee_user_id, issues.project_id, \
-                issues.updated_at, issues.created_at, issues.description \
+                issues.updated_at, issues.created_at, issues.description, \
+                similarity(lower(coalesce(issues.identifier,'')), $8)::double precision AS ident_sim \
              FROM issues \
              WHERE issues.company_id = $4 \
                AND ({where_sql}) \
@@ -432,6 +445,7 @@ impl CompanySearchService {
             .bind(fetch_limit)
             .bind(query.offset)
             .bind(&contains_pattern)
+            .bind(&normalized_query)
             .fetch_all(&self.pool)
             .await?;
 
@@ -503,6 +517,13 @@ impl CompanySearchService {
             }
             if let Some(ident) = &identifier {
                 if ident.to_lowercase().contains(&normalized_query) {
+                    score += 4.0;
+                    matched_fields.push("identifier".to_string());
+                }
+            }
+            if fuzzy_enabled {
+                let ident_sim: f64 = row.try_get("ident_sim").unwrap_or(0.0);
+                if ident_sim >= FUZZY_IDENTIFIER_SIMILARITY_THRESHOLD && !matched_fields.contains(&"identifier".to_string()) {
                     score += 4.0;
                     matched_fields.push("identifier".to_string());
                 }

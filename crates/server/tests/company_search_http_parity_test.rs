@@ -451,3 +451,84 @@ async fn company_search_comments_documents_matches_paperclip() {
     let _ = sqlx::query("DELETE FROM issues WHERE company_id = $1").bind(company_a).execute(&pool).await;
     let _ = sqlx::query("DELETE FROM companies WHERE id = $1").bind(company_a).execute(&pool).await;
 }
+
+/// #4C.3 Company Search acceptance — fuzzy identifier match via pg_trgm similarity
+/// (§4C.3 slice 5). A typo'd query `loginflow` surfaces an issue whose identifier
+/// `LGNFLW-1` is not a literal substring match but exceeds the 0.45 similarity
+/// threshold (aligns Paperclip `fuzzyIdentifierMatch`).
+#[tokio::test]
+async fn company_search_fuzzy_identifier_matches_paperclip() {
+    let pool = connect_and_migrate().await;
+    let user = Uuid::new_v4();
+    let company_a = Uuid::new_v4();
+    let prefix_a = format!("FZ{}", &company_a.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_a)
+        .bind("Fuzzy Co A")
+        .bind(&prefix_a)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+
+    // Identifier `LOGINFLOW-{h}`（h=company uuid 首 hex）对 typo 查询 `loginflw` 的
+    // pg_trgm 相似度 ≈0.5（≥0.45），且 `loginflw` 不是其字面子串 → 纯模糊命中路径。
+    let fuzzy_ident = format!("LOGINFLOW-{}", &company_a.simple().to_string()[..1]);
+    let _ = sqlx::query("DELETE FROM issues WHERE identifier = $1")
+        .bind(&fuzzy_ident)
+        .execute(&pool)
+        .await
+        .expect("pre-delete leftover identifier");
+    let issue_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO issues (id, company_id, title, identifier, status, priority, description) \
+         VALUES ($1, $2, $3, $4, 'todo', 'medium', $5)",
+    )
+    .bind(issue_id)
+    .bind(company_a)
+    .bind("unrelated title with no keyword at all")
+    .bind(&fuzzy_ident)
+    .bind("unrelated description body")
+    .execute(&pool)
+    .await
+    .expect("insert issue");
+
+    let state = build_app_state(pool.clone()).await.expect("build_app_state");
+    let app = company_routes().with_state(state);
+    let board = board_actor(user, company_a);
+
+    // typo 查询 "loginflw" 不字面命中 "LOGINFLOW-1"，但模糊相似度应浮出。
+    let (status, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/search?q=loginflw", company_a),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resp = parse(&body);
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "fuzzy identifier match surfaces the issue");
+    let mf: Vec<String> = results[0]["matchedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(mf.contains(&"identifier".to_string()), "matchedFields includes identifier via fuzzy: {:?}", mf);
+
+    // 短查询（<4 字符）不触发模糊匹配；"xy" 亦无字面命中。
+    let (_, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/search?q=xy", company_a),
+    )
+    .await;
+    let resp = parse(&body);
+    assert_eq!(resp["results"].as_array().unwrap().len(), 0, "short query <4 chars disables fuzzy");
+
+    // Cleanup.
+    let _ = sqlx::query("DELETE FROM issues WHERE company_id = $1").bind(company_a).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1").bind(company_a).execute(&pool).await;
+}
+
