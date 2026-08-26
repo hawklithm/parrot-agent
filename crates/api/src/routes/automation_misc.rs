@@ -464,37 +464,83 @@ async fn company_recovery_observability(
     })))
 }
 
-/// GET /companies/:company_id/search/extract —— 提取匹配 issue 标题/编号（基础实现）。
+/// GET /companies/:company_id/search/extract —— 对齐 Paperclip
+/// `GET /companies/:companyId/search/extract`（§4C.3 `/search/extract`）。
+///
+/// 在 issue 标题/描述、评论、文档中查找 `contains` 命中片段并生成截断摘录，
+/// 返回 `CompanySearchExtractResponse` 形状；按 company_id 租户隔离。
 #[derive(Debug, Deserialize)]
 struct SearchExtractQuery {
-    q: Option<String>,
+    contains: Option<String>,
+    kind: Option<String>,
+    scope: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    #[serde(rename = "matchesPerIssue")]
+    matches_per_issue: Option<i64>,
+    status: Option<Vec<String>>,
+    updated_within: Option<String>,
+    updated_after: Option<String>,
 }
+
 async fn company_search_extract(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     axum::extract::Query(query): axum::extract::Query<SearchExtractQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    let q = query.q.unwrap_or_default();
-    use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT id, title FROM issues WHERE company_id = $1 AND ($2 = '' OR title ILIKE '%' || $2 || '%') \
-         LIMIT 20",
-    )
-    .bind(company_id)
-    .bind(&q)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to search issues: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok(Json(rows.iter().map(|r| json!({
-        "id": r.get::<Uuid, _>("id"),
-        "title": r.get::<String, _>("title"),
-    })).collect()))
+
+    let contains = query.contains.clone().unwrap_or_default();
+    if contains.trim().len() < 2 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    use services::company_search_service::{
+        CompanySearchExtractKind, CompanySearchExtractQuery as ExtractQuery,
+        CompanySearchExtractScope, CompanySearchService,
+    };
+    let kind = match query.kind.as_deref() {
+        Some("url") => CompanySearchExtractKind::Url,
+        _ => CompanySearchExtractKind::Literal,
+    };
+    let scope = query
+        .scope
+        .as_deref()
+        .map(CompanySearchExtractScope::from_str)
+        .unwrap_or_default();
+    let limit = query.limit.unwrap_or(20).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0).clamp(0, 5000);
+    let matches_per_issue = query.matches_per_issue.unwrap_or(5).clamp(1, 200);
+
+    let svc = CompanySearchService::new(state.pool.clone());
+    let resp = svc
+        .extract(
+            company_id,
+            ExtractQuery {
+                contains,
+                kind,
+                scope,
+                limit,
+                offset,
+                matches_per_issue,
+                statuses: query.status.unwrap_or_default(),
+                updated_within: query.updated_within.clone(),
+                updated_after: query.updated_after.clone(),
+            },
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Company search extract failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(
+        serde_json::to_value(resp).map_err(|e| {
+            tracing::error!("Failed to serialize extract response: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?,
+    ))
 }
 
 /// GET /companies/:company_id/users/me/inbox-agent-policy（及 /users/:user_id/...）
