@@ -211,6 +211,15 @@ async fn company_search_matches_paperclip() {
         assert!(r["issue"].is_object(), "issue summary present");
         assert!(r["matchedFields"].as_array().unwrap().len() >= 1);
     }
+    // snippet/highlight：标题命中应有 field=title 的摘录且高亮覆盖 "login"。
+    let title_snip = results
+        .iter()
+        .flat_map(|r| r["snippets"].as_array().cloned().unwrap_or_default())
+        .find(|s| s["field"].as_str() == Some("title"));
+    assert!(title_snip.is_some(), "title snippet present");
+    let ts = title_snip.unwrap();
+    assert!(ts["text"].as_str().unwrap().to_lowercase().contains("login"), "title snippet contains query");
+    assert!(!ts["highlights"].as_array().unwrap().is_empty(), "title snippet highlighted");
     assert_eq!(resp["countsByType"]["issue"], json!(3));
     assert_eq!(resp["hasMore"], json!(false));
 
@@ -394,6 +403,18 @@ async fn company_search_comments_documents_matches_paperclip() {
         .collect();
     assert!(mf.contains(&"comment".to_string()), "matchedFields includes comment: {:?}", mf);
     assert!(mf.contains(&"document".to_string()), "matchedFields includes document: {:?}", mf);
+
+    // snippet/highlight：评论或文档命中的摘录非空，且高亮区间覆盖关键词。
+    let snips = results[0]["snippets"].as_array().expect("snippets array");
+    assert!(!snips.is_empty(), "snippets non-empty for comment/document match");
+    assert!(results[0]["snippet"].is_string(), "snippet scalar set");
+    let has_kw = snips.iter().any(|s| {
+        let text = s["text"].as_str().unwrap_or("");
+        let ok_field = ["comment", "document"].contains(&s["field"].as_str().unwrap_or(""));
+        let has_hl = s["highlights"].as_array().map(|h| !h.is_empty()).unwrap_or(false);
+        ok_field && text.to_lowercase().contains("parrotsearch") && has_hl
+    });
+    assert!(has_kw, "a snippet surfaces the parrotsearch hit with a highlight: {:?}", snips);
     assert_eq!(resp["countsByType"]["issue"], json!(1));
     assert_eq!(resp["countsByType"]["comment"], json!(1));
     assert_eq!(resp["countsByType"]["document"], json!(1));

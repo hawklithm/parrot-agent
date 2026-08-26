@@ -93,11 +93,29 @@ pub struct CompanySearchResult {
     pub matched_fields: Vec<String>,
     pub source_label: Option<String>,
     pub snippet: Option<String>,
-    pub snippets: Vec<serde_json::Value>,
+    pub snippets: Vec<CompanySearchSnippet>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<CompanySearchIssueSummary>,
     pub updated_at: Option<String>,
     pub preview_image_url: Option<String>,
+}
+
+/// 对齐 Paperclip `CompanySearchHighlight`：原文中的命中区间（字符偏移）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanySearchHighlight {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// 对齐 Paperclip `CompanySearchSnippet`：单字段截断摘录 + 命中高亮区间。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanySearchSnippet {
+    pub field: String,
+    pub label: String,
+    pub text: String,
+    pub highlights: Vec<CompanySearchHighlight>,
 }
 
 /// 对齐 Paperclip `CompanySearchResponse`（countsByType/filterOptionCounts/
@@ -336,6 +354,15 @@ impl CompanySearchService {
                 .join(",")
         };
 
+        // 高亮术语集（对齐 Paperclip matchTerms）：normalized_query + 各 token，去重。
+        let terms: Vec<String> = {
+            let mut t = vec![normalized_query.clone()];
+            t.extend(token_patterns.iter().cloned());
+            t.retain(|s| !s.is_empty());
+            t.dedup();
+            t
+        };
+
         // 命中字段权重（relevance 排序用）：title 短语 > identifier 短语 >
         // title 分词 > description 短语 > identifier 分词 > description 分词。
         let order_sql = match query.sort {
@@ -391,7 +418,12 @@ impl CompanySearchService {
              ORDER BY {order_sql} \
              LIMIT $5 OFFSET $6",
         );
-
+        // 评论/文档命中探测：对分页内的 issue 批量查询匹配的评论/文档原文，
+        // 用于补充 matchedFields / countsByType / snippets（对齐 Paperclip comment/document CTE）。
+        let mut comment_doc_hits: std::collections::HashMap<
+            Uuid,
+            (Option<String>, Option<(String, String)>),
+        > = std::collections::HashMap::new();
         let rows = sqlx::query(&sql)
             .bind(&normalized_query)
             .bind(&title_phrase)
@@ -406,14 +438,10 @@ impl CompanySearchService {
         let has_more = rows.len() as i64 > query.limit;
         let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
 
-        // 评论/文档命中探测：对分页内的 issue 批量查询匹配的评论/文档，
-        // 用于补充 matchedFields 与 countsByType（对齐 Paperclip comment/document CTE）。
-        let mut comment_doc_hits: std::collections::HashMap<Uuid, (bool, bool)> =
-            std::collections::HashMap::new();
         if query.scope.includes_comments_or_documents() && !page.is_empty() {
             let page_ids: Vec<Uuid> = page.iter().map(|r| r.get::<Uuid, _>("id")).collect();
             let crows = sqlx::query(
-                "SELECT DISTINCT issue_id FROM issue_comments \
+                "SELECT issue_id, body FROM issue_comments \
                  WHERE company_id = $1 AND issue_id = ANY($2) AND body ILIKE $3",
             )
             .bind(company_id)
@@ -423,10 +451,12 @@ impl CompanySearchService {
             .await?;
             for r in crows {
                 let iid: Uuid = r.get("issue_id");
-                comment_doc_hits.entry(iid).or_insert((false, false)).0 = true;
+                let body: String = r.get("body");
+                let entry = comment_doc_hits.entry(iid).or_insert((None, None));
+                entry.0 = Some(body);
             }
-            let drows = sqlx::query(
-                "SELECT DISTINCT idoc.issue_id FROM issue_documents idoc \
+        let drows = sqlx::query(
+                "SELECT DISTINCT idoc.issue_id, d.title, d.content FROM issue_documents idoc \
                  INNER JOIN documents d ON d.id = idoc.document_id AND d.company_id = idoc.company_id \
                  WHERE idoc.company_id = $1 AND idoc.issue_id = ANY($2) \
                  AND (d.title ILIKE $3 OR d.content ILIKE $3)",
@@ -438,7 +468,10 @@ impl CompanySearchService {
             .await?;
             for r in drows {
                 let iid: Uuid = r.get("issue_id");
-                comment_doc_hits.entry(iid).or_insert((false, false)).1 = true;
+                let title: String = r.get("title");
+                let content: String = r.get("content");
+                let entry = comment_doc_hits.entry(iid).or_insert((None, None));
+                entry.1 = Some((title, content));
             }
         }
 
@@ -486,15 +519,34 @@ impl CompanySearchService {
                 None => format!("/company/issues/{id}"),
             };
 
-            // 评论/文档命中补充 matchedFields（批量探测结果见 comment_doc_hits）。
-            if let Some((has_comment, has_doc)) = comment_doc_hits.get(&id) {
-                if *has_comment {
+            // 评论/文档命中补充 matchedFields + 收集 snippet 源文本。
+            let mut snippet_sources: Vec<(String, String, String)> = Vec::new();
+            if let Some((comment_body, doc)) = comment_doc_hits.get(&id) {
+                if let Some(body) = comment_body {
                     matched_fields.push("comment".to_string());
+                    snippet_sources.push(("comment".to_string(), "Comment".to_string(), body.clone()));
                 }
-                if *has_doc {
+                if let Some((doc_title, doc_content)) = doc {
                     matched_fields.push("document".to_string());
+                    snippet_sources.push((
+                        "document".to_string(),
+                        doc_title.clone(),
+                        doc_content.clone(),
+                    ));
                 }
             }
+
+            // 标题/描述命中也生成 snippet（对齐 Paperclip selectPrimarySnippets 优先级）。
+            if title.to_lowercase().contains(&normalized_query) {
+                snippet_sources.push(("title".to_string(), "Title".to_string(), title.clone()));
+            }
+            if let Some(desc) = row.try_get::<String, _>("description").ok() {
+                if desc.to_lowercase().contains(&normalized_query) {
+                    snippet_sources.push(("description".to_string(), "Description".to_string(), desc));
+                }
+            }
+            let snippets = build_issue_snippets(&snippet_sources, &terms);
+            let snippet = snippets.first().map(|s| s.text.clone());
 
             let updated_at_str = updated_at.to_rfc3339();
 
@@ -509,7 +561,6 @@ impl CompanySearchService {
                 project_id,
                 updated_at: updated_at_str.clone(),
             };
-
             results.push(CompanySearchResult {
                 id,
                 result_type: "issue".to_string(),
@@ -518,18 +569,18 @@ impl CompanySearchService {
                 href,
                 matched_fields,
                 source_label: identifier,
-                snippet: None,
-                snippets: Vec::new(),
+                snippet,
+                snippets,
                 issue: Some(issue_summary),
                 updated_at: Some(updated_at_str),
                 preview_image_url: None,
             });
             *counts.entry("issue".to_string()).or_insert(0) += 1;
-            if let Some((has_comment, has_doc)) = comment_doc_hits.get(&id) {
-                if *has_comment {
+            if let Some((comment_body, doc)) = comment_doc_hits.get(&id) {
+                if comment_body.is_some() {
                     *counts.entry("comment".to_string()).or_insert(0) += 1;
                 }
-                if *has_doc {
+                if doc.is_some() {
                     *counts.entry("document".to_string()).or_insert(0) += 1;
                 }
             }
@@ -1059,4 +1110,129 @@ fn empty_response(query: &str, normalized_query: &str) -> CompanySearchResponse 
         zero_results: None,
         has_more: false,
     }
+}
+
+/// 对齐 Paperclip `createSnippet` + `selectPrimarySnippets`：
+/// 将 `(field, label, source_text)` 候选转为截断摘录 + 命中高亮区间。
+/// 窗口 = 首个命中前 80 字符起、最长 240 字符；前缀/后缀 `...`；最多 2 条，
+/// 优先级由调用方传入顺序决定（title > comment > document > description）。
+fn build_issue_snippets(
+    sources: &[(String, String, String)],
+    terms: &[String],
+    ) -> Vec<CompanySearchSnippet> {
+    let mut out = Vec::new();
+    for (field, label, raw) in sources {
+        if let Some(snippet) = make_snippet(field, label, raw, terms) {
+            out.push(snippet);
+            if out.len() >= 2 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 单字段摘录生成（对齐 Paperclip createSnippet）。基于字符索引；
+/// 高亮区间为原文中的命中字符区间（经窗口偏移映射到摘录文本）。
+fn make_snippet(
+    field: &str,
+    label: &str,
+    raw: &str,
+    terms: &[String],
+    ) -> Option<CompanySearchSnippet> {
+    let text: String = plain_text(raw);
+    if text.is_empty() {
+        return None;
+    }
+    let first = find_first_match_index(&text, terms);
+    let window_start: usize = if first < 0 { 0 } else { (first as usize).saturating_sub(80) };
+    let text_len = text.chars().count();
+    let window_end: usize = (window_start + 240).min(text_len);
+    let prefix = if window_start > 0 { "..." } else { "" };
+    let suffix = if window_end < text_len { "..." } else { "" };
+    let slice: String = text
+        .chars()
+        .skip(window_start)
+        .take(window_end - window_start)
+        .collect();
+    let snippet_text = format!("{prefix}{slice}{suffix}");
+    let offset: isize = prefix.chars().count() as isize - window_start as isize;
+    let snippet_len = snippet_text.chars().count() as isize;
+    let highlights: Vec<CompanySearchHighlight> = highlight_ranges(&text, terms)
+        .into_iter()
+        .filter(|(s, e)| *e > window_start && *s < window_end)
+        .map(|(s, e)| CompanySearchHighlight {
+            start: ((s as isize + offset).max(0)) as usize,
+            end: ((e as isize + offset).min(snippet_len)) as usize,
+        })
+        .collect();
+    Some(CompanySearchSnippet {
+        field: field.to_string(),
+        label: label.to_string(),
+        text: snippet_text,
+        highlights,
+    })
+}
+
+/// 折叠 markdown/空白为纯文本（对齐 Paperclip plainText）。
+fn plain_text(value: &str) -> String {
+    value
+        .replace("```", " ")
+        .replace('`', " ")
+        .replace('[', " ")
+        .replace(']', " ")
+        .replace('(', " ")
+        .replace(')', " ")
+        .replace(['#', '*', '>', '_', '~', '|'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+/// 返回首个命中术语的字符索引（对齐 Paperclip findFirstMatchIndex）。
+fn find_first_match_index(value: &str, terms: &[String]) -> isize {
+    let lower = value.to_lowercase();
+    let mut best: isize = -1;
+    for term in terms {
+        let normalized = term.to_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if let Some(idx) = lower.find(&normalized) {
+            let idx = idx as isize;
+            if best < 0 || idx < best {
+                best = idx;
+            }
+        }
+    }
+    best
+}
+
+/// 返回原文中所有命中术语的字符区间（对齐 Paperclip highlightRanges）。
+fn highlight_ranges(value: &str, terms: &[String]) -> Vec<(usize, usize)> {
+    let lower = value.to_lowercase();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for term in terms {
+        let normalized = term.to_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(idx) = lower[from..].find(&normalized) {
+            let start = from + idx;
+            let end = start + normalized.chars().count();
+            let next = (start, end);
+            let overlaps = ranges
+                .iter()
+                .any(|(s, e)| next.0 < *e && next.1 > *s);
+            if !overlaps {
+                ranges.push(next);
+            }
+            from = start + normalized.chars().count();
+        }
+    }
+    ranges.sort_by_key(|(s, _)| *s);
+    ranges
 }
