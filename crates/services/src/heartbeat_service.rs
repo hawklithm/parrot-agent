@@ -284,6 +284,7 @@ struct AdapterCommandOutput {
     stdout: String,
     stderr: String,
     resumed_session_id: Option<String>,
+    billing_type: String,
 }
 
 /// Read the structured result records emitted by Claude/Codex JSONL modes.
@@ -309,6 +310,27 @@ fn is_codex_unknown_session_output(output: &AdapterCommandOutput) -> bool {
             && combined.lines().any(|line| {
                 classify_codex_error(line).0.as_deref() == Some("codex_unknown_session")
             }))
+}
+
+fn text_from_content(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => Some(text.to_owned()),
+        Value::Array(items) => items.iter().find_map(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(ToOwned::to_owned)
+        }),
+        _ => None,
+    }
+}
+
+fn resolve_biller(adapter_type: &str, provider: Option<&str>) -> String {
+    match provider.unwrap_or(adapter_type).to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" | "claude_local" => "anthropic".to_string(),
+        "openai" | "codex" | "codex_local" => "openai".to_string(),
+        provider => provider.to_string(),
+    }
 }
 
 fn valid_claude_resume_session(session_id: Option<&str>) -> Option<String> {
@@ -338,6 +360,8 @@ fn classify_claude_error(message: &str) -> (Option<String>, Option<String>) {
         || normalized.contains("authentication required")
         || normalized.contains("unauthorized")
         || normalized.contains("invalid api key")
+        || normalized.contains("http 401")
+        || normalized.contains("status 401")
     {
         return (Some("claude_auth_required".to_string()), Some("authentication".to_string()));
     }
@@ -347,7 +371,10 @@ fn classify_claude_error(message: &str) -> (Option<String>, Option<String>) {
         || normalized.contains("overloaded")
         || normalized.contains("service unavailable")
         || normalized.contains("429")
+        || normalized.contains("500")
+        || normalized.contains("502")
         || normalized.contains("503")
+        || normalized.contains("504")
         || normalized.contains("529")
         || normalized.contains("usage limit")
         || normalized.contains("out of extra usage")
@@ -414,9 +441,15 @@ fn classify_codex_error(message: &str) -> (Option<String>, Option<String>) {
         );
     }
     if normalized.contains("rate limit")
+        || normalized.contains("http 429")
+        || normalized.contains("status 429")
         || normalized.contains("too many requests")
         || normalized.contains("server overloaded")
         || normalized.contains("service unavailable")
+        || normalized.contains("http 500")
+        || normalized.contains("http 502")
+        || normalized.contains("http 503")
+        || normalized.contains("http 504")
         || normalized.contains("high demand")
         || normalized.contains("temporary errors")
         || normalized.contains("try again later")
@@ -432,6 +465,10 @@ fn classify_codex_error(message: &str) -> (Option<String>, Option<String>) {
         || normalized.contains("authentication required")
         || normalized.contains("unauthorized")
         || normalized.contains("invalid api key")
+        || normalized.contains("http 401")
+        || normalized.contains("status 401")
+        || normalized.contains("http 403")
+        || normalized.contains("status 403")
     {
         return (
             Some("codex_auth_required".to_string()),
@@ -465,6 +502,10 @@ fn classify_generic_adapter_error(message: &str) -> (Option<String>, Option<Stri
         || normalized.contains("login required")
         || normalized.contains("authentication required")
         || normalized.contains("unauthorized")
+        || normalized.contains("http 401")
+        || normalized.contains("status 401")
+        || normalized.contains("http 403")
+        || normalized.contains("status 403")
         || normalized.contains("invalid refresh token")
         || normalized.contains("missing bearer")
     {
@@ -474,9 +515,15 @@ fn classify_generic_adapter_error(message: &str) -> (Option<String>, Option<Stri
         );
     }
     if normalized.contains("rate limit")
+        || normalized.contains("http 429")
+        || normalized.contains("status 429")
         || normalized.contains("too many requests")
         || normalized.contains("server overloaded")
         || normalized.contains("service unavailable")
+        || normalized.contains("http 500")
+        || normalized.contains("http 502")
+        || normalized.contains("http 503")
+        || normalized.contains("http 504")
         || normalized.contains("high demand")
         || normalized.contains("temporary errors")
     {
@@ -532,17 +579,49 @@ fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: b
     // Parse usage and cost information (Claude emits snake_case JSONL fields;
     // retain the camelCase aliases used by older Parrot adapters).
     if let Some(usage) = value.get("usage") {
-        if let Some(input) = usage.get("input_tokens").or_else(|| usage.get("inputTokens")).and_then(Value::as_i64) {
+        if let Some(input) = usage
+            .get("input_tokens")
+            .or_else(|| usage.get("inputTokens"))
+            .or_else(|| usage.get("prompt_tokens"))
+            .or_else(|| usage.get("promptTokens"))
+            .and_then(Value::as_i64)
+        {
             outcome.input_tokens = outcome.input_tokens.max(input);
         }
-        if let Some(output) = usage.get("output_tokens").or_else(|| usage.get("outputTokens")).and_then(Value::as_i64) {
+        if let Some(output) = usage
+            .get("output_tokens")
+            .or_else(|| usage.get("outputTokens"))
+            .or_else(|| usage.get("completion_tokens"))
+            .or_else(|| usage.get("completionTokens"))
+            .and_then(Value::as_i64)
+        {
             outcome.output_tokens = outcome.output_tokens.max(output);
         }
-        if let Some(cached) = usage.get("cache_read_input_tokens").or_else(|| usage.get("cached_input_tokens")).or_else(|| usage.get("cachedInputTokens")).and_then(Value::as_i64) {
+        if let Some(cached) = usage
+            .get("cache_read_input_tokens")
+            .or_else(|| usage.get("cached_input_tokens"))
+            .or_else(|| usage.get("cachedInputTokens"))
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+            })
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+            })
+            .and_then(Value::as_i64)
+        {
             outcome.cached_input_tokens = outcome.cached_input_tokens.max(cached);
         }
     }
-    if let Some(cost) = value.get("total_cost_usd").or_else(|| value.get("costUsd")).and_then(Value::as_f64) {
+    if let Some(cost) = value
+        .get("total_cost_usd")
+        .or_else(|| value.get("costUsd"))
+        .or_else(|| value.get("cost_usd"))
+        .and_then(Value::as_f64)
+    {
         outcome.cost_usd = Some(cost);
     }
     if outcome.model.is_none() {
@@ -567,6 +646,27 @@ fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: b
                     outcome.result_summary = Some(text.to_owned());
                 }
             }
+        }
+    }
+    if outcome.result_summary.is_none()
+        && (kind == "message"
+            || kind == "chat.completion"
+            || value.get("role").and_then(Value::as_str) == Some("assistant")
+            || value.get("choices").is_some())
+    {
+        let content = value
+            .get("content")
+            .or_else(|| value.get("message").and_then(|message| message.get("content")))
+            .or_else(|| {
+                value
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .and_then(|choices| choices.first())
+                    .and_then(|choice| choice.get("message"))
+                    .and_then(|message| message.get("content"))
+            });
+        if let Some(text) = content.and_then(text_from_content) {
+            outcome.result_summary = Some(text);
         }
     }
 
@@ -1464,11 +1564,12 @@ impl DefaultHeartbeatService {
                 }
             }
             Err(error) => {
+                let (error_code, error_family) = classify_adapter_error(&error, &adapter_type);
                 let outcome = AdapterOutcome {
                     explicit_failure: true,
                     failure_reason: Some(error.clone()),
-                    error_code: Some("adapter_failed".to_string()),
-                    error_family: Some("adapter".to_string()),
+                    error_code: error_code.or_else(|| Some("adapter_failed".to_string())),
+                    error_family: error_family.or_else(|| Some("adapter".to_string())),
                     ..Default::default()
                 };
                 (
@@ -1480,6 +1581,7 @@ impl DefaultHeartbeatService {
                         stdout: String::new(),
                         stderr: String::new(),
                         resumed_session_id: None,
+                        billing_type: "unknown".to_string(),
                     },
                     outcome,
                 )
@@ -1600,8 +1702,8 @@ impl DefaultHeartbeatService {
                         billing_code: None,
                         provider: outcome.provider.clone().unwrap_or_else(|| "unknown".to_string()),
                         model: outcome.model.clone().unwrap_or_else(|| "unknown".to_string()),
-                        biller: "anthropic".to_string(), // TODO: resolve biller from adapter config
-                        billing_type: "api".to_string(), // TODO: resolve billing_type from adapter config
+                        biller: resolve_biller(&adapter_type, outcome.provider.as_deref()),
+                        billing_type: output.billing_type.clone(),
                         input_tokens: outcome.input_tokens as i32,
                         cached_input_tokens: outcome.cached_input_tokens as i32,
                         output_tokens: outcome.output_tokens as i32,
@@ -1767,6 +1869,7 @@ impl DefaultHeartbeatService {
                 stdout: body,
                 stderr: String::new(),
                 resumed_session_id: None,
+                billing_type: "api".to_string(),
             });
         }
         let command = cfg
@@ -2259,6 +2362,11 @@ impl DefaultHeartbeatService {
             stdout: String::from_utf8_lossy(&out).to_string(),
             stderr: String::from_utf8_lossy(&err).to_string(),
             resumed_session_id,
+            billing_type: if matches!(adapter, "claude_local" | "codex_local") {
+                "subscription".to_string()
+            } else {
+                "custom".to_string()
+            },
         })
     }
 }
@@ -3354,8 +3462,9 @@ impl DefaultHeartbeatService {
 #[cfg(test)]
 mod adapter_outcome_tests {
     use super::{
-        build_codex_exec_args, is_codex_unknown_session_output, parse_adapter_outcome,
-        valid_claude_resume_session, valid_codex_resume_session, AdapterCommandOutput,
+        build_codex_exec_args, classify_adapter_error, is_codex_unknown_session_output,
+        parse_adapter_outcome, resolve_biller, valid_claude_resume_session,
+        valid_codex_resume_session, AdapterCommandOutput,
     };
 
     #[test]
@@ -3425,6 +3534,53 @@ mod adapter_outcome_tests {
     }
 
     #[test]
+    fn parses_anthropic_http_message_usage_and_text() {
+        let outcome = parse_adapter_outcome(
+            r#"{"id":"msg-1","type":"message","role":"assistant","model":"claude-sonnet","content":[{"type":"text","text":"hello from Claude"}],"usage":{"input_tokens":12,"output_tokens":7,"cache_read_input_tokens":3}}"#,
+            "claude_local",
+        );
+        assert_eq!(outcome.result_summary.as_deref(), Some("hello from Claude"));
+        assert_eq!(outcome.input_tokens, 12);
+        assert_eq!(outcome.output_tokens, 7);
+        assert_eq!(outcome.cached_input_tokens, 3);
+        assert_eq!(outcome.model.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[test]
+    fn parses_openai_http_completion_usage_and_text() {
+        let outcome = parse_adapter_outcome(
+            r#"{"id":"chat-1","object":"chat.completion","model":"gpt-4o-mini","choices":[{"message":{"role":"assistant","content":"hello from OpenAI"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":4}}}"#,
+            "codex_local",
+        );
+        assert_eq!(outcome.result_summary.as_deref(), Some("hello from OpenAI"));
+        assert_eq!(outcome.input_tokens, 20);
+        assert_eq!(outcome.output_tokens, 5);
+        assert_eq!(outcome.cached_input_tokens, 4);
+        assert_eq!(outcome.model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn resolves_biller_and_http_error_classification_by_adapter() {
+        assert_eq!(resolve_biller("claude_local", Some("anthropic")), "anthropic");
+        assert_eq!(resolve_biller("codex_local", Some("openai")), "openai");
+        assert_eq!(resolve_biller("process", None), "process");
+
+        let (auth_code, auth_family) = classify_adapter_error(
+            "LLM request failed with HTTP 401: invalid api key",
+            "codex_local",
+        );
+        assert_eq!(auth_code.as_deref(), Some("codex_auth_required"));
+        assert_eq!(auth_family.as_deref(), Some("authentication"));
+
+        let (transient_code, transient_family) = classify_adapter_error(
+            "LLM request failed with HTTP 429: rate limit exceeded",
+            "codex_local",
+        );
+        assert_eq!(transient_code.as_deref(), Some("codex_transient_upstream"));
+        assert_eq!(transient_family.as_deref(), Some("transient_upstream"));
+    }
+
+    #[test]
     fn parses_codex_jsonl_session_usage_summary_and_failure() {
         let outcome = parse_adapter_outcome(
             r#"{"type":"thread.started","thread_id":"thread-42"}
@@ -3466,6 +3622,7 @@ mod adapter_outcome_tests {
                 .to_string(),
             stderr: String::new(),
             resumed_session_id: Some("thread-44".to_string()),
+            billing_type: "subscription".to_string(),
         };
         assert!(is_codex_unknown_session_output(&structured));
 
@@ -3474,6 +3631,7 @@ mod adapter_outcome_tests {
             stdout: String::new(),
             stderr: "state db missing rollout path for thread thread-45".to_string(),
             resumed_session_id: Some("thread-45".to_string()),
+            billing_type: "subscription".to_string(),
         };
         assert!(is_codex_unknown_session_output(&plain));
 
@@ -3483,6 +3641,7 @@ mod adapter_outcome_tests {
                 .to_string(),
             stderr: String::new(),
             resumed_session_id: Some("thread-46".to_string()),
+            billing_type: "subscription".to_string(),
         };
         assert!(!is_codex_unknown_session_output(&successful));
     }
