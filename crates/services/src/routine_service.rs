@@ -243,11 +243,11 @@ impl RoutineService for RoutineServiceImpl {
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 };
-                self.repository
+                let created_run = self.repository
                     .create_run(run.clone())
                     .await
                     .map_err(|e| ServiceError::Repository(e.to_string()))?;
-                return Ok(run);
+                return Ok(created_run);
             }
             Ok(None) => {}
             Err(ServiceError::InvalidInput(message)) if message == "Routine has active run, skipping" => {
@@ -270,11 +270,11 @@ impl RoutineService for RoutineServiceImpl {
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 };
-                self.repository
+                let created_run = self.repository
                     .create_run(run.clone())
                     .await
                     .map_err(|e| ServiceError::Repository(e.to_string()))?;
-                return Ok(run);
+                return Ok(created_run);
             }
             Err(e) => return Err(e),
         }
@@ -301,17 +301,9 @@ impl RoutineService for RoutineServiceImpl {
         };
         let created_run = self
             .repository
-            .create_run(run)
+            .enqueue_run(run, Utc::now())
             .await
             .map_err(|e| ServiceError::Repository(e.to_string()))?;
-
-        let mut updated_routine = routine.clone();
-        updated_routine.last_enqueued_at = Some(Utc::now());
-        self.repository
-            .update(updated_routine)
-            .await
-            .map_err(|e| ServiceError::Repository(e.to_string()))?;
-
         Ok(created_run)
     }
     async fn list_runs(&self, routine_id: Uuid, limit: i64) -> ServiceResult<Vec<RoutineRun>> {

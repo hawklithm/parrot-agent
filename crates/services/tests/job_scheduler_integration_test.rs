@@ -141,41 +141,63 @@ async fn test_routine_cron_trigger_basic() {
         dispatch_fingerprint.is_some(),
         "scheduled run should carry a dispatch_fingerprint (dispatch path aligned)"
     );
+    let last_enqueued_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT last_enqueued_at FROM routines WHERE id = $1",
+    )
+    .bind(routine_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        last_enqueued_at.is_some(),
+        "queued dispatch should update last_enqueued_at in the same transaction"
+    );
 
     let idempotency_key = format!("routine-dispatch-test:{}", routine_id);
     let mut variables = HashMap::new();
     variables.insert("channel".to_string(), "test".to_string());
-    let first_manual = routine_execution_service
-        .dispatch_routine_run(DispatchRoutineRunInput {
+    let first_dispatch = routine_execution_service.clone();
+    let second_dispatch = routine_execution_service.clone();
+    let first_key = idempotency_key.clone();
+    let second_key = idempotency_key.clone();
+    let (first_manual, second_manual) = tokio::join!(
+        first_dispatch.dispatch_routine_run(DispatchRoutineRunInput {
             routine_id,
             trigger_id: Some(trigger_id),
             source: RoutineRunSource::Api,
             payload: Some(serde_json::json!({"message": "hello"})),
             variables: Some(variables),
-            idempotency_key: Some(idempotency_key.clone()),
+            idempotency_key: Some(first_key),
             project_id: None,
             assignee_agent_id: None,
             actor_user_id: None,
             actor_agent_id: None,
-        })
-        .await
-        .expect("manual dispatch should succeed");
-    let second_manual = routine_execution_service
-        .dispatch_routine_run(DispatchRoutineRunInput {
+        }),
+        second_dispatch.dispatch_routine_run(DispatchRoutineRunInput {
             routine_id,
             trigger_id: Some(trigger_id),
             source: RoutineRunSource::Api,
             payload: Some(serde_json::json!({"message": "different"})),
             variables: None,
-            idempotency_key: Some(idempotency_key.clone()),
+            idempotency_key: Some(second_key),
             project_id: None,
             assignee_agent_id: None,
             actor_user_id: None,
             actor_agent_id: None,
-        })
-        .await
-        .expect("replayed manual dispatch should succeed");
-    assert_eq!(first_manual.id, second_manual.id, "idempotent dispatch should reuse its run");
+        }),
+    );
+    let first_manual = first_manual.expect("first concurrent dispatch should succeed");
+    let second_manual = second_manual.expect("second concurrent dispatch should converge");
+    assert_eq!(first_manual.id, second_manual.id, "concurrent idempotent dispatch should reuse its run");
+    let idempotent_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM routine_runs WHERE routine_id = $1 AND idempotency_key = $2",
+    )
+    .bind(routine_id)
+    .bind(&idempotency_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(idempotent_count, 1, "concurrent idempotent dispatch should create one run");
     let (stored_key, stored_payload): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(
         "SELECT idempotency_key, trigger_payload FROM routine_runs WHERE id = $1",
     )

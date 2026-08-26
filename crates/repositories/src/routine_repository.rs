@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -18,6 +18,11 @@ pub trait RoutineRepository: Send + Sync {
     async fn list_pending_cron_routines(&self) -> RepositoryResult<Vec<Routine>>;
 
     async fn create_run(&self, run: RoutineRun) -> RepositoryResult<RoutineRun>;
+    async fn enqueue_run(
+        &self,
+        run: RoutineRun,
+        enqueued_at: DateTime<Utc>,
+    ) -> RepositoryResult<RoutineRun>;
     async fn get_run(&self, run_id: Uuid) -> RepositoryResult<Option<RoutineRun>>;
     async fn find_run_by_idempotency_key(
         &self,
@@ -219,13 +224,19 @@ impl RoutineRepository for PostgresRoutineRepository {
     }
 
     async fn create_run(&self, run: RoutineRun) -> RepositoryResult<RoutineRun> {
-        sqlx::query(
+        let run = sqlx::query_as::<_, RoutineRun>(
             r#"INSERT INTO routine_runs
                (id, company_id, routine_id, trigger_id, source, status, triggered_at,
                 routine_revision_id, idempotency_key, trigger_payload, dispatch_fingerprint,
                 linked_issue_id, coalesced_into_run_id, failure_reason, completed_at,
                 created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"#
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+               ON CONFLICT (routine_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+               DO UPDATE SET updated_at = routine_runs.updated_at
+               RETURNING id, company_id, routine_id, trigger_id, source, status, triggered_at,
+                         routine_revision_id, idempotency_key, trigger_payload, dispatch_fingerprint,
+                         linked_issue_id, coalesced_into_run_id, failure_reason, completed_at,
+                         created_at, updated_at"#
         )
         .bind(run.id)
         .bind(run.company_id)
@@ -244,8 +255,60 @@ impl RoutineRepository for PostgresRoutineRepository {
         .bind(run.completed_at)
         .bind(run.created_at)
         .bind(run.updated_at)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
+        Ok(run)
+    }
+
+    async fn enqueue_run(
+        &self,
+        run: RoutineRun,
+        enqueued_at: DateTime<Utc>,
+    ) -> RepositoryResult<RoutineRun> {
+        let mut tx = self.pool.begin().await?;
+        let run = sqlx::query_as::<_, RoutineRun>(
+            r#"INSERT INTO routine_runs
+               (id, company_id, routine_id, trigger_id, source, status, triggered_at,
+                routine_revision_id, idempotency_key, trigger_payload, dispatch_fingerprint,
+                linked_issue_id, coalesced_into_run_id, failure_reason, completed_at,
+                created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+               ON CONFLICT (routine_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+               DO UPDATE SET updated_at = routine_runs.updated_at
+               RETURNING id, company_id, routine_id, trigger_id, source, status, triggered_at,
+                         routine_revision_id, idempotency_key, trigger_payload, dispatch_fingerprint,
+                         linked_issue_id, coalesced_into_run_id, failure_reason, completed_at,
+                         created_at, updated_at"#
+        )
+        .bind(run.id)
+        .bind(run.company_id)
+        .bind(run.routine_id)
+        .bind(run.trigger_id)
+        .bind(&run.source)
+        .bind(&run.status)
+        .bind(run.triggered_at)
+        .bind(run.routine_revision_id)
+        .bind(&run.idempotency_key)
+        .bind(&run.trigger_payload)
+        .bind(&run.dispatch_fingerprint)
+        .bind(run.linked_issue_id)
+        .bind(run.coalesced_into_run_id)
+        .bind(&run.failure_reason)
+        .bind(run.completed_at)
+        .bind(run.created_at)
+        .bind(run.updated_at)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE routines SET last_enqueued_at = $2, updated_at = $2 WHERE id = $1",
+        )
+        .bind(run.routine_id)
+        .bind(enqueued_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(run)
     }
 
