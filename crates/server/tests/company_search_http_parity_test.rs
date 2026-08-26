@@ -561,3 +561,122 @@ async fn company_search_fuzzy_identifier_matches_paperclip() {
     let _ = sqlx::query("DELETE FROM companies WHERE id = $1").bind(company_a).execute(&pool).await;
 }
 
+/// #4C.3 Company Search acceptance — agents/projects scope in the main search
+/// (§4C.3 slice 8). scope=agents returns agent results, scope=projects returns
+/// project results (archived excluded), scope=all appends both after issues.
+#[tokio::test]
+async fn company_search_agents_projects_matches_paperclip() {
+    let pool = connect_and_migrate().await;
+    let user = Uuid::new_v4();
+    let company_a = Uuid::new_v4();
+    let prefix_a = format!("AP{}", &company_a.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_a)
+        .bind("Agents Projects Co")
+        .bind(&prefix_a)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+
+    // Agent matching "researcher".
+    let agent_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, company_id, name, role, status) VALUES ($1, $2, $3, $4, 'idle')",
+    )
+    .bind(agent_id)
+    .bind(company_a)
+    .bind("Sales Researcher")
+    .bind("researcher")
+    .execute(&pool)
+    .await
+    .expect("insert agent");
+
+    // Project matching "research" (name) + one archived project that must NOT surface.
+    let project_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO projects (id, company_id, name, description, status) \
+         VALUES ($1, $2, $3, $4, 'in_progress')",
+    )
+    .bind(project_id)
+    .bind(company_a)
+    .bind("Research Portal")
+    .bind("central research hub for the team")
+    .execute(&pool)
+    .await
+    .expect("insert project");
+    let archived_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO projects (id, company_id, name, description, status, archived_at) \
+         VALUES ($1, $2, $3, $4, 'done', NOW())",
+    )
+    .bind(archived_id)
+    .bind(company_a)
+    .bind("Archived Research")
+    .bind("old research notes")
+    .execute(&pool)
+    .await
+    .expect("insert archived project");
+
+    let state = build_app_state(pool.clone()).await.expect("build_app_state");
+    let app = company_routes().with_state(state);
+    let board = board_actor(user, company_a);
+
+    // scope=agents: only agents.
+    let (status, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/search?q=researcher&scope=agents", company_a),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resp = parse(&body);
+    assert_eq!(resp["scope"], json!("agents"));
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "one agent surfaces");
+    assert_eq!(results[0]["type"], json!("agent"));
+    assert_eq!(results[0]["title"], json!("Sales Researcher"));
+    assert_eq!(results[0]["href"], json!(format!("/company/agents/{}", agent_id)));
+    assert_eq!(results[0]["matchedFields"][0], json!("agent"));
+    assert_eq!(resp["countsByType"]["agent"], json!(1));
+    assert!(results[0]["snippet"].is_string(), "agent snippet set");
+
+    // scope=projects: archived excluded.
+    let (_, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/search?q=research&scope=projects", company_a),
+    )
+    .await;
+    let resp = parse(&body);
+    assert_eq!(resp["scope"], json!("projects"));
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "one project surfaces; archived excluded");
+    assert_eq!(results[0]["type"], json!("project"));
+    assert_eq!(results[0]["title"], json!("Research Portal"));
+    assert_eq!(results[0]["href"], json!(format!("/company/projects/{}", project_id)));
+    assert_eq!(results[0]["matchedFields"][0], json!("project"));
+    assert_eq!(resp["countsByType"]["project"], json!(1));
+
+    // scope=all: agent + project appended after issues (no issue matches "research").
+    let (_, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/search?q=research", company_a),
+    )
+    .await;
+    let resp = parse(&body);
+    let results = resp["results"].as_array().expect("results array");
+    let types: Vec<String> = results.iter().map(|r| r["type"].as_str().unwrap().to_string()).collect();
+    assert_eq!(types, vec!["agent", "project"], "scope=all appends agent+project after issues");
+    assert_eq!(resp["countsByType"]["agent"], json!(1));
+    assert_eq!(resp["countsByType"]["project"], json!(1));
+
+    // Cleanup.
+    let _ = sqlx::query("DELETE FROM projects WHERE company_id = $1").bind(company_a).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM agents WHERE company_id = $1").bind(company_a).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1").bind(company_a).execute(&pool).await;
+}
+

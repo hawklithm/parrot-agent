@@ -55,6 +55,16 @@ impl CompanySearchScope {
             CompanySearchScope::All | CompanySearchScope::Comments | CompanySearchScope::Documents
         )
     }
+
+    /// 是否包含 agent 命中（Paperclip: all/agents）。
+    pub fn includes_agents(&self) -> bool {
+        matches!(self, CompanySearchScope::All | CompanySearchScope::Agents)
+    }
+
+    /// 是否包含 project 命中（Paperclip: all/projects）。
+    pub fn includes_projects(&self) -> bool {
+        matches!(self, CompanySearchScope::All | CompanySearchScope::Projects)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +154,24 @@ impl Default for CompanySearchFilterOptionCounts {
             updated_within: std::collections::HashMap::new(),
         }
     }
+}
+
+/// agent 搜索命中行（对齐 Paperclip fetchAgentRows 的 SimpleSearchRow 字段子集）。
+struct AgentSearchRow {
+    id: Uuid,
+    name: String,
+    role: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// project 搜索命中行（对齐 Paperclip fetchProjectRows）。
+struct ProjectSearchRow {
+    id: Uuid,
+    name: String,
+    description: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// 对齐 Paperclip `CompanySearchResponse`（countsByType/filterOptionCounts/
@@ -368,6 +396,22 @@ impl CompanySearchService {
 
 
         let scope_includes_issues = query.scope.includes_issues();
+        let scope_includes_agents = query.scope.includes_agents();
+        let scope_includes_projects = query.scope.includes_projects();
+
+        // 专属 agent/project 作用域（不含 issue）：走独立实体搜索路径。
+        if !scope_includes_issues && (scope_includes_agents || scope_includes_projects) {
+            return self
+                .search_agent_project_scope(
+                    company_id,
+                    &query,
+                    &normalized_query,
+                    &contains_pattern,
+                    &token_patterns,
+                    &tokens,
+                )
+                .await;
+        }
 
         // 作用域不含 issue 命中时（如纯 agents/projects/artifacts），本阶段无数据返回。
         if !scope_includes_issues {
@@ -477,7 +521,7 @@ impl CompanySearchService {
             .fetch_all(&self.pool)
             .await?;
 
-        let has_more = rows.len() as i64 > query.limit;
+        let mut has_more = rows.len() as i64 > query.limit;
         let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
 
         if query.scope.includes_comments_or_documents() && !page.is_empty() {
@@ -652,6 +696,40 @@ impl CompanySearchService {
             }
         }
 
+        // scope=all 时追加 agent/project 命中（对齐 Paperclip 的多实体结果；
+        // 跨类型按 score 合并排序为后续阶段，当前 issue 在前、agent/project 在后）。
+        let token_any: String = if token_patterns.is_empty() {
+            "%__paperclip_no_match__%".to_string()
+        } else {
+            token_patterns
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        if scope_includes_agents {
+            let (rows, more) = self
+                .fetch_agent_rows(company_id, &contains_pattern, &token_any, fetch_limit, 0)
+                .await?;
+            let n = rows.len() as i64;
+            for r in rows {
+                results.push(agent_search_result(&r, &normalized_query, &tokens));
+            }
+            *counts.entry("agent".to_string()).or_insert(0) += n;
+            has_more |= more;
+        }
+        if scope_includes_projects {
+            let (rows, more) = self
+                .fetch_project_rows(company_id, &contains_pattern, &token_any, fetch_limit, 0)
+                .await?;
+            let n = rows.len() as i64;
+            for r in rows {
+                results.push(project_search_result(&r, &normalized_query, &tokens));
+            }
+            *counts.entry("project".to_string()).or_insert(0) += n;
+            has_more |= more;
+        }
+
         // facet 计数：对全候选命中集（非仅分页）聚合，对齐 Paperclip filterOptionCounts。
         // 参数重编号：where_sql 用 $2/$3/$4/$7/$8 → $1/$2/$3/$4/$5（见 fetch_filter_option_counts）。
         let filter_option_counts = self
@@ -778,6 +856,152 @@ impl CompanySearchService {
             }
         }
         Ok(out)
+    }
+
+    /// 专属 agent/project 作用域搜索（scope=agents/projects，不含 issue）。
+    /// 分页作用于实体本身（LIMIT/OFFSET + fetch+1 探测 has_more）；
+    /// countsByType 记 agent/project 命中数。
+    async fn search_agent_project_scope(
+        &self,
+        company_id: Uuid,
+        query: &CompanySearchQuery,
+        normalized_query: &str,
+        contains_pattern: &str,
+        token_patterns: &[String],
+        tokens: &[String],
+    ) -> Result<CompanySearchResponse, sqlx::Error> {
+        let fetch_limit = query.limit + 1;
+        let token_any: String = if token_patterns.is_empty() {
+            "%__paperclip_no_match__%".to_string()
+        } else {
+            token_patterns
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut results: Vec<CompanySearchResult> = Vec::new();
+        let mut counts: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let mut has_more = false;
+
+        if query.scope.includes_agents() {
+            let (rows, more) = self
+                .fetch_agent_rows(company_id, contains_pattern, &token_any, fetch_limit, query.offset)
+                .await?;
+            for r in rows {
+                results.push(agent_search_result(&r, normalized_query, tokens));
+            }
+            counts.insert("agent".to_string(), results.len() as i64);
+            has_more |= more;
+        }
+        if query.scope.includes_projects() {
+            let (rows, more) = self
+                .fetch_project_rows(company_id, contains_pattern, &token_any, fetch_limit, query.offset)
+                .await?;
+            for r in rows {
+                results.push(project_search_result(&r, normalized_query, tokens));
+            }
+            counts.insert("project".to_string(), results.len() as i64);
+            has_more |= more;
+        }
+
+        Ok(CompanySearchResponse {
+            query: query.q.clone(),
+            normalized_query: normalized_query.to_string(),
+            scope: scope_name(&query.scope).to_string(),
+            sort: sort_name(&query.sort).to_string(),
+            limit: query.limit,
+            offset: query.offset,
+            results,
+            counts_by_type: counts,
+            filter_option_counts: CompanySearchFilterOptionCounts::default(),
+            zero_results: None,
+            has_more,
+        })
+    }
+
+    /// 拉取 agent 命中行（company 租户隔离；name/role ILIKE 短语或分词）。
+    /// fetch+1 探测 has_more；OFFSET 由调用方传入（专属作用域分页用）。
+    async fn fetch_agent_rows(
+        &self,
+        company_id: Uuid,
+        contains_pattern: &str,
+        token_any: &str,
+        fetch_limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AgentSearchRow>, bool), sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, name, role, created_at, updated_at \
+             FROM agents \
+             WHERE company_id = $1 \
+               AND (name ILIKE $2 OR role ILIKE $2 \
+                    OR name ILIKE ANY(string_to_array($3, ',')::text[]) \
+                    OR role ILIKE ANY(string_to_array($3, ',')::text[])) \
+             ORDER BY updated_at DESC, id DESC \
+             LIMIT $4 OFFSET $5",
+        )
+        .bind(company_id)
+        .bind(contains_pattern)
+        .bind(token_any)
+        .bind(fetch_limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let has_more = rows.len() as i64 > fetch_limit - 1;
+        let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
+        let out = page
+            .iter()
+            .map(|r| AgentSearchRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                role: r.get("role"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect();
+        Ok((out, has_more))
+    }
+
+    /// 拉取 project 命中行（company 租户隔离；name/description ILIKE；排除 archived）。
+    async fn fetch_project_rows(
+        &self,
+        company_id: Uuid,
+        contains_pattern: &str,
+        token_any: &str,
+        fetch_limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ProjectSearchRow>, bool), sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, name, description, created_at, updated_at \
+             FROM projects \
+             WHERE company_id = $1 AND archived_at IS NULL \
+               AND (name ILIKE $2 OR coalesce(description,'') ILIKE $2 \
+                    OR name ILIKE ANY(string_to_array($3, ',')::text[]) \
+                    OR coalesce(description,'') ILIKE ANY(string_to_array($3, ',')::text[])) \
+             ORDER BY updated_at DESC, id DESC \
+             LIMIT $4 OFFSET $5",
+        )
+        .bind(company_id)
+        .bind(contains_pattern)
+        .bind(token_any)
+        .bind(fetch_limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let has_more = rows.len() as i64 > fetch_limit - 1;
+        let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
+        let out = page
+            .iter()
+            .map(|r| ProjectSearchRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                description: r.get("description"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect();
+        Ok((out, has_more))
     }
 
     /// 对齐 Paperclip `companySearchExtractService.extract`：在 issue 标题/描述、
@@ -1358,6 +1582,96 @@ fn make_snippet(
 fn extract_first_image_url(value: &str) -> Option<String> {
     let pattern = regex::Regex::new(r#"!\[[^\]]*\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)"#).ok()?;
     pattern.captures(value).map(|c| c.get(1).unwrap().as_str().to_string())
+}
+
+/// 对齐 Paperclip scoreSimpleRow：短语命中 90 + 每 token 20 + 标题前缀 80。
+fn score_simple_row(
+    title: &str,
+    description: Option<&str>,
+    role: Option<&str>,
+    normalized_query: &str,
+    tokens: &[String],
+) -> f64 {
+    let mut haystack = title.to_string();
+    if let Some(d) = description {
+        haystack.push(' ');
+        haystack.push_str(d);
+    }
+    if let Some(r) = role {
+        haystack.push(' ');
+        haystack.push_str(r);
+    }
+    let haystack = haystack.to_lowercase();
+    let mut score = if haystack.contains(normalized_query) { 90.0 } else { 0.0 };
+    for t in tokens {
+        if haystack.contains(t) {
+            score += 20.0;
+        }
+    }
+    if title.to_lowercase().starts_with(normalized_query) {
+        score += 80.0;
+    }
+    score
+}
+
+/// agent 搜索结果（对齐 Paperclip agent 分支：type=agent、matchedFields=["agent"]、
+/// snippet 源为 role??name，href /company/agents/{id}）。
+fn agent_search_result(
+    row: &AgentSearchRow,
+    normalized_query: &str,
+    tokens: &[String],
+) -> CompanySearchResult {
+    let terms: Vec<String> = std::iter::once(normalized_query.to_string())
+        .chain(tokens.iter().cloned())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    let src = if row.role.is_empty() { row.name.clone() } else { row.role.clone() };
+    let snippets = build_issue_snippets(&[("capabilities".to_string(), "Agent".to_string(), src)], &terms);
+    let snippet = snippets.first().map(|s| s.text.clone());
+    CompanySearchResult {
+        id: row.id,
+        result_type: "agent".to_string(),
+        score: score_simple_row(&row.name, None, Some(&row.role), normalized_query, tokens),
+        title: row.name.clone(),
+        href: format!("/company/agents/{}", row.id),
+        matched_fields: vec!["agent".to_string()],
+        source_label: snippets.first().map(|s| s.label.clone()),
+        snippet,
+        snippets,
+        issue: None,
+        updated_at: Some(row.updated_at.to_rfc3339()),
+        preview_image_url: None,
+    }
+}
+
+/// project 搜索结果（对齐 Paperclip project 分支：type=project、matchedFields=["project"]、
+/// snippet 源为 description??name，href /company/projects/{id}）。
+fn project_search_result(
+    row: &ProjectSearchRow,
+    normalized_query: &str,
+    tokens: &[String],
+) -> CompanySearchResult {
+    let terms: Vec<String> = std::iter::once(normalized_query.to_string())
+        .chain(tokens.iter().cloned())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    let src = row.description.clone().filter(|d| !d.is_empty()).unwrap_or_else(|| row.name.clone());
+    let snippets = build_issue_snippets(&[("description".to_string(), "Project".to_string(), src)], &terms);
+    let snippet = snippets.first().map(|s| s.text.clone());
+    CompanySearchResult {
+        id: row.id,
+        result_type: "project".to_string(),
+        score: score_simple_row(&row.name, row.description.as_deref(), None, normalized_query, tokens),
+        title: row.name.clone(),
+        href: format!("/company/projects/{}", row.id),
+        matched_fields: vec!["project".to_string()],
+        source_label: snippets.first().map(|s| s.label.clone()),
+        snippet,
+        snippets,
+        issue: None,
+        updated_at: Some(row.updated_at.to_rfc3339()),
+        preview_image_url: None,
+    }
 }
 
 /// 折叠 markdown/空白为纯文本（对齐 Paperclip plainText）。
