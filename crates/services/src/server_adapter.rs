@@ -942,6 +942,30 @@ mod tests {
         assert_eq!(found.adapter_type(), AdapterType::Process);
     }
 
+    #[test]
+    fn default_registry_exposes_only_server_executable_adapters() {
+        let registry = create_default_server_adapter_registry();
+        let mut registered = registry
+            .list_all()
+            .into_iter()
+            .map(|adapter_type| adapter_type.to_string())
+            .collect::<Vec<_>>();
+        registered.sort();
+
+        assert_eq!(
+            registered,
+            vec![
+                "claude_local".to_string(),
+                "codex_local".to_string(),
+                "http".to_string(),
+                "process".to_string(),
+            ]
+        );
+        assert!(!registry.has_adapter(AdapterType::Cursor));
+        assert!(!registry.has_adapter(AdapterType::Opencode));
+        assert!(!registry.has_adapter(AdapterType::OpenaiCompatible));
+    }
+
     #[tokio::test]
     async fn test_process_adapter() {
         let adapter = ProcessAdapter::new();
