@@ -358,6 +358,28 @@ fn provider_retry_delay(attempt: u32) -> Duration {
     Duration::from_millis((250_u64 * 2_u64.pow(exponent)).min(2_000))
 }
 
+const PROVIDER_MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1_000;
+
+fn provider_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    let seconds = raw.parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let milliseconds = (seconds * 1_000.0).round();
+    Some(Duration::from_millis(
+        milliseconds.min(PROVIDER_MAX_RETRY_AFTER_MS as f64) as u64,
+    ))
+}
+
+fn provider_retry_delay_with_hint(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or_else(|| provider_retry_delay(attempt))
+}
+
 fn is_retryable_provider_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -1977,11 +1999,16 @@ impl DefaultHeartbeatService {
                     }
                 };
                 let status = response.status();
+                let retry_after = provider_retry_after(response.headers());
                 let body = match response.text().await {
                     Ok(body) => body,
                     Err(_error) if retry_count < max_retries => {
                         retry_count += 1;
-                        tokio::time::sleep(provider_retry_delay(retry_count)).await;
+                        tokio::time::sleep(provider_retry_delay_with_hint(
+                            retry_count,
+                            retry_after,
+                        ))
+                        .await;
                         continue;
                     }
                     Err(error) => {
@@ -2002,7 +2029,11 @@ impl DefaultHeartbeatService {
                 }
                 if is_retryable_provider_status(status) && retry_count < max_retries {
                     retry_count += 1;
-                    tokio::time::sleep(provider_retry_delay(retry_count)).await;
+                    tokio::time::sleep(provider_retry_delay_with_hint(
+                        retry_count,
+                        retry_after,
+                    ))
+                    .await;
                     continue;
                 }
                 return Err(format!(
@@ -3607,7 +3638,8 @@ mod adapter_outcome_tests {
     use super::{
         build_codex_exec_args, classify_adapter_error, is_codex_unknown_session_output,
         is_retryable_provider_status, parse_adapter_outcome, provider_http_retries,
-        provider_http_timeout, redact_adapter_secret, resolve_biller,
+        provider_http_timeout, provider_retry_after, provider_retry_delay,
+        provider_retry_delay_with_hint, redact_adapter_secret, resolve_biller,
         valid_claude_resume_session, valid_codex_resume_session, AdapterCommandOutput,
     };
 
@@ -3744,6 +3776,42 @@ mod adapter_outcome_tests {
         assert_eq!(
             redact_adapter_secret("provider echoed sk-secret in the response", "sk-secret"),
             "provider echoed [REDACTED] in the response"
+        );
+    }
+
+    #[test]
+    fn honors_bounded_provider_retry_after_hints() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("1.5"),
+        );
+        assert_eq!(
+            provider_retry_after(&headers),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(
+            provider_retry_delay_with_hint(1, provider_retry_after(&headers)),
+            Duration::from_millis(1_500)
+        );
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("999999"),
+        );
+        assert_eq!(
+            provider_retry_after(&headers),
+            Some(Duration::from_secs(15 * 60))
+        );
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("-1"),
+        );
+        assert_eq!(provider_retry_after(&headers), None);
+        assert_eq!(
+            provider_retry_delay_with_hint(2, provider_retry_after(&headers)),
+            provider_retry_delay(2)
         );
     }
 
