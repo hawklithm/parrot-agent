@@ -542,7 +542,7 @@ async fn get_global_adapter_info(
         "adapterType": adapter.adapter_type().to_string(),
         "label": adapter.label(),
         "supportsInstructionsBundle": adapter.supports_instructions_bundle().supported,
-        "configSchema": null,
+        "configSchema": adapter.get_config_schema(),
     })))
 }
 
@@ -774,10 +774,14 @@ async fn get_adapter_config_schema(
         .find_adapter(adapter_type)
         .map_err(|_| AppError::NotFound(format!("Adapter \"{}\" is not registered", adapter_type_str)))?;
     
-    Ok(Json(serde_json::json!({
-        "adapterType": adapter_type_str,
-        "schema": adapter.get_config_schema(),
-    })))
+    // The UI consumes this endpoint as an AdapterConfigSchema directly.  An
+    // envelope here makes `fields` disappear and silently disables the
+    // declarative adapter form.
+    Ok(Json(
+        adapter
+            .get_config_schema()
+            .unwrap_or_else(|| serde_json::json!({ "fields": [] })),
+    ))
 }
 
 /// E10: GET /adapters/:adapter_type/ui-parser.js - 获取 UI 解析器

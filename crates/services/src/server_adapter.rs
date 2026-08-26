@@ -76,21 +76,22 @@ pub struct ModelInfo {
     pub max_output_tokens: Option<usize>,
 }
 
-/// Model profile
+/// Model profile exposed by the adapter API.
+///
+/// Keep this shape aligned with the UI's `AdapterModelProfileDefinition`.
+/// The old provider/pricing-only shape serialized successfully but could not
+/// be consumed by the profile picker because it had no `key` or
+/// `adapterConfig`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
-    pub model_id: String,
-    pub provider: String,
-    pub capabilities: Vec<String>,
-    pub pricing: Option<ModelPricing>,
-}
-
-/// Model pricing information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelPricing {
-    pub input_per_million: f64,
-    pub output_per_million: f64,
-    pub currency: String,
+    pub key: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "adapterConfig")]
+    pub adapter_config: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Test environment check
@@ -299,6 +300,105 @@ impl Default for AdapterRegistry {
 }
 
 /// 创建并注册所有内置适配器
+fn model_options(models: &[ModelInfo]) -> Vec<serde_json::Value> {
+    models
+        .iter()
+        .map(|model| serde_json::json!({ "value": model.id, "label": model.label }))
+        .collect()
+}
+
+fn local_engine_options(supports_acp: bool) -> Vec<serde_json::Value> {
+    let mut options = vec![
+        serde_json::json!({ "value": "auto", "label": "Auto (CLI)" }),
+        serde_json::json!({ "value": "cli", "label": "Local CLI" }),
+    ];
+    if supports_acp {
+        options.push(serde_json::json!({ "value": "acp", "label": "ACP" }));
+    }
+    options
+}
+
+fn local_config_schema(
+    models: &[ModelInfo],
+    default_model: &str,
+    command: &str,
+    supports_acp: bool,
+    include_search: bool,
+) -> serde_json::Value {
+    let mut fields = vec![
+        serde_json::json!({
+            "key": "engine",
+            "label": "Execution engine",
+            "type": "select",
+            "options": local_engine_options(supports_acp),
+            "default": if supports_acp { "auto" } else { "cli" },
+            "hint": if supports_acp {
+                "Auto prefers ACP when the server runtime is available."
+            } else {
+                "This server currently executes this adapter through its local CLI."
+            }
+        }),
+        serde_json::json!({
+            "key": "model",
+            "label": "Model",
+            "type": "combobox",
+            "options": model_options(models),
+            "default": default_model,
+            "required": true
+        }),
+        serde_json::json!({
+            "key": "command",
+            "label": "CLI command",
+            "type": "text",
+            "default": command,
+            "hint": "Executable name or absolute path."
+        }),
+        serde_json::json!({
+            "key": "cwd",
+            "label": "Working directory",
+            "type": "text",
+            "hint": "Optional absolute working directory."
+        }),
+        serde_json::json!({
+            "key": "instructionsFilePath",
+            "label": "Instructions file",
+            "type": "text",
+            "hint": "Optional absolute path to an AGENTS.md-style instructions file."
+        }),
+        serde_json::json!({
+            "key": "timeoutSec",
+            "label": "Timeout (seconds)",
+            "type": "number",
+            "default": 0
+        }),
+    ];
+    if include_search {
+        fields.push(serde_json::json!({
+            "key": "search",
+            "label": "Enable search",
+            "type": "toggle",
+            "default": false
+        }));
+        fields.push(serde_json::json!({
+            "key": "fastMode",
+            "label": "Fast mode",
+            "type": "toggle",
+            "default": false
+        }));
+    }
+    serde_json::json!({ "fields": fields })
+}
+
+fn cheap_model_profile(model: &str, description: &str) -> ModelProfile {
+    ModelProfile {
+        key: "cheap".to_string(),
+        label: "Cheap".to_string(),
+        description: Some(description.to_string()),
+        adapter_config: serde_json::json!({ "model": model }),
+        source: Some("adapter_default".to_string()),
+    }
+}
+
 pub fn create_default_server_adapter_registry() -> AdapterRegistry {
     let mut registry = AdapterRegistry::new();
 
@@ -315,12 +415,51 @@ pub fn create_default_server_adapter_registry() -> AdapterRegistry {
 pub struct ClaudeLocalAdapter {
     #[allow(dead_code)]
     label: String,
+    models: Vec<ModelInfo>,
 }
 
 impl ClaudeLocalAdapter {
     pub fn new() -> Self {
         Self {
             label: "Claude Local".to_string(),
+            models: vec![
+                ModelInfo {
+                    id: "claude-opus-4-8".to_string(),
+                    label: "Claude Opus 4.8".to_string(),
+                    context_window: Some(200_000),
+                    max_output_tokens: Some(16_384),
+                },
+                ModelInfo {
+                    id: "claude-opus-4-7".to_string(),
+                    label: "Claude Opus 4.7".to_string(),
+                    context_window: Some(200_000),
+                    max_output_tokens: Some(16_384),
+                },
+                ModelInfo {
+                    id: "claude-opus-4-6".to_string(),
+                    label: "Claude Opus 4.6".to_string(),
+                    context_window: Some(200_000),
+                    max_output_tokens: Some(16_384),
+                },
+                ModelInfo {
+                    id: "claude-sonnet-4-6".to_string(),
+                    label: "Claude Sonnet 4.6".to_string(),
+                    context_window: Some(200_000),
+                    max_output_tokens: Some(16_384),
+                },
+                ModelInfo {
+                    id: "claude-sonnet-4-5".to_string(),
+                    label: "Claude Sonnet 4.5".to_string(),
+                    context_window: Some(200_000),
+                    max_output_tokens: Some(16_384),
+                },
+                ModelInfo {
+                    id: "claude-haiku-4-5".to_string(),
+                    label: "Claude Haiku 4.5".to_string(),
+                    context_window: Some(200_000),
+                    max_output_tokens: Some(8_192),
+                },
+            ],
         }
     }
 }
@@ -342,24 +481,18 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
     }
 
     async fn list_models(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelInfo>> {
-        Ok(vec![
-            ModelInfo {
-                id: "claude-sonnet-4".to_string(),
-                label: "Claude Sonnet 4".to_string(),
-                context_window: Some(200000),
-                max_output_tokens: Some(8192),
-            },
-            ModelInfo {
-                id: "claude-opus-4".to_string(),
-                label: "Claude Opus 4".to_string(),
-                context_window: Some(200000),
-                max_output_tokens: Some(8192),
-            },
-        ])
+        Ok(self.models.clone())
+    }
+
+    fn models(&self) -> &[ModelInfo] {
+        &self.models
     }
 
     async fn get_model_profiles(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelProfile>> {
-        Ok(vec![])
+        Ok(vec![cheap_model_profile(
+            "claude-haiku-4-5",
+            "Use a lower-cost Claude model for summaries and other lightweight runs.",
+        )])
     }
 
     async fn test_environment(&self, ctx: &AdapterEnvironmentTestContext) -> AdapterResult<TestEnvironmentResult> {
@@ -404,10 +537,35 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
 
     async fn detect_model(&self, _config: &serde_json::Value) -> AdapterResult<DetectModelResult> {
         Ok(DetectModelResult {
-            model_id: Some("claude-sonnet-4".to_string()),
+            model_id: Some("claude-sonnet-4-6".to_string()),
             confidence: 1.0,
             source: "claude_local".to_string(),
         })
+    }
+
+    fn agent_configuration_doc(&self) -> Option<&str> {
+        Some(
+            "# claude_local agent configuration\n\n\
+The server invokes the locally installed Claude Code CLI.\n\n\
+Fields:\n\
+- model: model passed to the CLI\n\
+- command: optional executable override; defaults to `claude`\n\
+- cwd: optional working directory\n\
+- instructionsFilePath: optional absolute instructions file path\n\
+- timeoutSec: optional run timeout in seconds\n\n\
+The current Rust server runtime exposes the CLI path. ACP configuration is \
+not advertised until a server-side ACP executor is enabled.\n",
+        )
+    }
+
+    fn get_config_schema(&self) -> Option<serde_json::Value> {
+        Some(local_config_schema(
+            &self.models,
+            "claude-sonnet-4-6",
+            "claude",
+            false,
+            false,
+        ))
     }
 
     fn supports_instructions_bundle(&self) -> InstructionsBundleSupport {
@@ -431,7 +589,7 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
     }
 
     fn supports_acp(&self) -> bool {
-        true
+        false
     }
 
     fn requires_materialized_runtime_skills(&self) -> bool {
@@ -443,12 +601,29 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
 #[allow(dead_code)]
 pub struct CodexLocalAdapter {
     label: String,
+    models: Vec<ModelInfo>,
 }
 
 impl CodexLocalAdapter {
- pub fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             label: "Codex Local".to_string(),
+            models: vec![
+                ModelInfo { id: "gpt-5.6".to_string(), label: "GPT-5.6".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "gpt-5.6-sol".to_string(), label: "GPT-5.6 Sol".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "gpt-5.6-terra".to_string(), label: "GPT-5.6 Terra".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "gpt-5.6-luna".to_string(), label: "GPT-5.6 Luna".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "gpt-5.4".to_string(), label: "GPT-5.4".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "gpt-5.4-mini".to_string(), label: "GPT-5.4 Mini".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "gpt-5.3-codex-spark".to_string(), label: "GPT-5.3 Codex Spark".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "gpt-5".to_string(), label: "GPT-5".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "o3".to_string(), label: "o3".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "o4-mini".to_string(), label: "o4-mini".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "gpt-5-mini".to_string(), label: "GPT-5 Mini".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "gpt-5-nano".to_string(), label: "GPT-5 Nano".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "o3-mini".to_string(), label: "o3-mini".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+                ModelInfo { id: "codex-mini-latest".to_string(), label: "Codex Mini".to_string(), context_window: Some(200_000), max_output_tokens: Some(16_384) },
+            ],
         }
     }
 }
@@ -470,18 +645,18 @@ impl ServerAdapterModule for CodexLocalAdapter {
     }
 
     async fn list_models(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelInfo>> {
-        Ok(vec![
-            ModelInfo {
-                id: "gpt-5.6-sol".to_string(),
-        label: "GPT-5.6 Sol".to_string(),
-                context_window: Some(200000),
-                max_output_tokens: Some(16384),
-            },
-        ])
+        Ok(self.models.clone())
+    }
+
+    fn models(&self) -> &[ModelInfo] {
+        &self.models
     }
 
     async fn get_model_profiles(&self, _config: &serde_json::Value) -> AdapterResult<Vec<ModelProfile>> {
-        Ok(vec![])
+        Ok(vec![cheap_model_profile(
+            "gpt-5.4-mini",
+            "Use a lower-cost Codex model for summaries and other lightweight runs.",
+        )])
     }
 
     async fn test_environment(&self, ctx: &AdapterEnvironmentTestContext) -> AdapterResult<TestEnvironmentResult> {
@@ -515,6 +690,33 @@ impl ServerAdapterModule for CodexLocalAdapter {
         })
     }
 
+    fn agent_configuration_doc(&self) -> Option<&str> {
+        Some(
+            "# codex_local agent configuration\n\n\
+The server invokes the locally installed Codex CLI.\n\n\
+Fields:\n\
+- model: optional model passed to Codex\n\
+- command: optional executable override; defaults to `codex`\n\
+- cwd: optional working directory\n\
+- instructionsFilePath: optional absolute instructions file path\n\
+- timeoutSec: optional run timeout in seconds\n\n\
+The default invocation is `codex exec --json [--model <model>] -`; the \
+prompt is written to stdin. A persisted session resumes with \
+`codex resume <thread-id> -`. ACP configuration is not advertised until a \
+server-side ACP executor is enabled.\n",
+        )
+    }
+
+    fn get_config_schema(&self) -> Option<serde_json::Value> {
+        Some(local_config_schema(
+            &self.models,
+            "gpt-5.6-sol",
+            "codex",
+            false,
+            true,
+        ))
+    }
+
     fn supports_instructions_bundle(&self) -> InstructionsBundleSupport {
         InstructionsBundleSupport {
             supported: true,
@@ -536,7 +738,7 @@ impl ServerAdapterModule for CodexLocalAdapter {
     }
 
     fn supports_acp(&self) -> bool {
-        true
+        false
     }
 
     fn requires_materialized_runtime_skills(&self) -> bool {
@@ -579,6 +781,22 @@ impl ServerAdapterModule for HttpAdapter {
     }
     async fn detect_model(&self, _config: &serde_json::Value) -> AdapterResult<DetectModelResult> { Ok(DetectModelResult { model_id: None, confidence: 0.0, source: "http".to_string() }) }
     fn supports_instructions_bundle(&self) -> InstructionsBundleSupport { InstructionsBundleSupport { supported: false, max_files: None, max_size_bytes: None } }
+    fn get_config_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "fields": [
+                { "key": "url", "label": "Endpoint URL", "type": "text", "required": true },
+                { "key": "method", "label": "HTTP method", "type": "select", "default": "POST", "options": [
+                    { "value": "POST", "label": "POST" },
+                    { "value": "PUT", "label": "PUT" },
+                    { "value": "PATCH", "label": "PATCH" }
+                ] },
+                { "key": "headers", "label": "Headers", "type": "textarea", "hint": "Optional JSON object of HTTP headers." },
+                { "key": "payloadTemplate", "label": "Payload template", "type": "textarea", "hint": "Optional JSON object merged with run context." },
+                { "key": "timeoutMs", "label": "Timeout (milliseconds)", "type": "number", "default": 0 },
+                { "key": "retries", "label": "Retries", "type": "number", "default": 0 }
+            ]
+        }))
+    }
 }
 
 /// Process adapter (default local process adapter)
@@ -652,6 +870,18 @@ impl ServerAdapterModule for ProcessAdapter {
             max_files: Some(100),
             max_size_bytes: Some(10 * 1024 * 1024), // 10MB
         }
+    }
+
+    fn get_config_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "fields": [
+                { "key": "command", "label": "Command", "type": "text", "required": true },
+                { "key": "args", "label": "Arguments", "type": "textarea", "hint": "Optional JSON array of command arguments." },
+                { "key": "cwd", "label": "Working directory", "type": "text" },
+                { "key": "timeoutSec", "label": "Timeout (seconds)", "type": "number", "default": 0 },
+                { "key": "graceSec", "label": "Shutdown grace (seconds)", "type": "number", "default": 15 }
+            ]
+        }))
     }
 
     fn supports_skills(&self) -> bool {
@@ -767,21 +997,21 @@ mod tests {
     }
 
     #[test]
-    fn test_adapter_capabilities_aligned_with_paperclip() {
+    fn test_adapter_capabilities_reflect_server_runtime() {
         let claude = ClaudeLocalAdapter::new();
-        // claude_local 支持 skills / local-agent JWT / model profiles / ACP，
-        // 但不要求物料化运行时 skills。
+        // The Rust server currently exposes the CLI runtime only. ACP remains
+        // a separate migration slice until a server-side ACP executor exists.
         assert!(claude.supports_skills());
         assert!(claude.supports_local_agent_jwt());
         assert!(claude.supports_model_profiles());
-        assert!(claude.supports_acp());
+        assert!(!claude.supports_acp());
         assert!(!claude.requires_materialized_runtime_skills());
 
         let codex = CodexLocalAdapter::new();
         assert!(codex.supports_skills());
         assert!(codex.supports_local_agent_jwt());
         assert!(codex.supports_model_profiles());
-        assert!(codex.supports_acp());
+        assert!(!codex.supports_acp());
         assert!(!codex.requires_materialized_runtime_skills());
 
         let process = ProcessAdapter::new();
@@ -790,5 +1020,35 @@ mod tests {
         assert!(!process.supports_model_profiles());
         assert!(!process.supports_acp());
         assert!(!process.requires_materialized_runtime_skills());
+    }
+
+    #[tokio::test]
+    async fn built_in_adapter_metadata_matches_api_contract() {
+        let claude = ClaudeLocalAdapter::new();
+        let codex = CodexLocalAdapter::new();
+
+        assert_eq!(claude.models().len(), 6);
+        assert_eq!(codex.models().len(), 14);
+        assert_eq!(claude.list_models(&serde_json::json!({})).await.unwrap().len(), 6);
+        assert_eq!(codex.list_models(&serde_json::json!({})).await.unwrap().len(), 14);
+
+        for (adapter, expected_model, expected_command) in [
+            (&claude as &dyn ServerAdapterModule, "claude-sonnet-4-6", "claude"),
+            (&codex as &dyn ServerAdapterModule, "gpt-5.6-sol", "codex"),
+        ] {
+            let schema = adapter.get_config_schema().expect("built-in schema");
+            assert!(schema.get("fields").and_then(|fields| fields.as_array()).is_some());
+            assert_eq!(schema["fields"][1]["default"], expected_model);
+            assert_eq!(schema["fields"][2]["default"], expected_command);
+
+            let profiles = adapter
+                .get_model_profiles(&serde_json::json!({}))
+                .await
+                .expect("model profiles");
+            assert_eq!(profiles.len(), 1);
+            assert_eq!(profiles[0].key, "cheap");
+            assert_eq!(profiles[0].source.as_deref(), Some("adapter_default"));
+            assert!(profiles[0].adapter_config.get("model").is_some());
+        }
     }
 }
