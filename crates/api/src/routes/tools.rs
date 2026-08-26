@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::mcp::{request_kind, McpInvocationContext, McpRequestKind, McpToolDefinition};
 use crate::paperclip_internal::PaperclipInternalClient;
-use services::auth::AuthorizationActor;
+use services::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService, PermissionKey};
 
 fn hash_gateway_token(token: &str) -> String {
     let mut hasher = Sha256::new();
@@ -5240,10 +5240,58 @@ async fn decline_gateway_action(
     )
 }
 
+async fn require_named_gateway_admin(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if crate::routes::assert_board(actor).is_err() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Board authentication required",
+                "reasonCode": "authentication_required"
+            })),
+        ));
+    }
+    if crate::routes::assert_company_access(actor, company_id, true).is_err() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Company access denied",
+                "reasonCode": "company_access_denied"
+            })),
+        ));
+    }
+    let decision = AuthorizationService::decide(
+        &state.pool,
+        actor,
+        &AuthorizationAction::Permission {
+            key: PermissionKey::from_const(PermissionKey::TOOLS_ADMIN),
+        },
+        Some(company_id),
+    )
+    .await;
+    if !decision.allowed {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Missing permission: tools:admin",
+                "reasonCode": "permission_denied"
+            })),
+        ));
+    }
+    Ok(())
+}
+
 async fn list_named_gateways(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
+    if let Err(response) = require_named_gateway_admin(&state, &actor, company_id).await {
+        return response;
+    }
     let gateways = sqlx::query_scalar::<_, Value>(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
           'id',g.id,'companyId',g.company_id,'gatewayPublicId',g.gateway_public_id,
@@ -5262,8 +5310,12 @@ async fn list_named_gateways(
 async fn create_named_gateway(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    if let Err(response) = require_named_gateway_admin(&state, &actor, company_id).await {
+        return response;
+    }
     let name = body
         .get("name")
         .and_then(Value::as_str)
@@ -5304,6 +5356,7 @@ async fn create_named_gateway(
 async fn update_named_gateway(
     Path(gateway_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let company_id = body
@@ -5316,6 +5369,9 @@ async fn update_named_gateway(
             Json(serde_json::json!({"error":"companyId is required"})),
         );
     };
+    if let Err(response) = require_named_gateway_admin(&state, &actor, company_id).await {
+        return response;
+    }
     let row = sqlx::query("UPDATE tool_mcp_gateways SET name=COALESCE($3,name), description=COALESCE($4,description), status=COALESCE($5,status), updated_at=NOW() WHERE id=$1 AND company_id=$2 RETURNING id,gateway_public_id,name,slug,description,status,agent_id,issue_id,metadata,created_at,updated_at")
         .bind(gateway_id).bind(company_id).bind(body.get("name").and_then(Value::as_str)).bind(body.get("description").and_then(Value::as_str)).bind(body.get("status").and_then(Value::as_str)).fetch_optional(&state.pool).await;
     match row {
@@ -5339,6 +5395,7 @@ async fn update_named_gateway(
 async fn create_named_gateway_token(
     Path(gateway_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let company_id = body
@@ -5351,6 +5408,9 @@ async fn create_named_gateway_token(
             Json(serde_json::json!({"error":"companyId is required"})),
         );
     };
+    if let Err(response) = require_named_gateway_admin(&state, &actor, company_id).await {
+        return response;
+    }
     let token = format!("pcgw_{}", Uuid::new_v4().simple());
     let token_id = Uuid::new_v4();
     let name = body
@@ -5380,12 +5440,22 @@ async fn create_named_gateway_token(
 async fn revoke_named_gateway_token(
     Path(token_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let company_id = body
         .get("companyId")
         .and_then(Value::as_str)
-        .and_then(|v| Uuid::parse_str(v).ok());
+            .and_then(|v| Uuid::parse_str(v).ok());
+    let Some(company_id) = company_id else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"companyId is required"})),
+        );
+    };
+    if let Err(response) = require_named_gateway_admin(&state, &actor, company_id).await {
+        return response;
+    }
     let updated = sqlx::query("UPDATE tool_mcp_gateway_tokens SET revoked_at=NOW(),updated_at=NOW() WHERE id=$1 AND company_id=$2 AND revoked_at IS NULL RETURNING id,revoked_at").bind(token_id).bind(company_id).fetch_optional(&state.pool).await.unwrap_or(None);
     match updated {
         Some(row) => (

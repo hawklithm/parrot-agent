@@ -4,13 +4,15 @@
 //! a plugin or MCP tool. Two simultaneous approvals may therefore produce one
 //! execution result and one conflict, but never two dispatch attempts.
 
-use api::routes::tools::tool_routes;
+use api::routes::{tool_access::tool_access_routes, tools::tool_routes};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use parrot_server::build_app_state;
 use serde_json::{json, Value};
-use services::auth::AuthorizationActor;
+use services::auth::{
+    ActorSource, AuthorizationActor, CompanyMembership, MembershipRole, PrincipalType,
+};
 use sqlx::PgPool;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -95,6 +97,96 @@ async fn send_idempotent_call(
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read call body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
+fn board_actor_with_role(company_id: Uuid, role: MembershipRole) -> AuthorizationActor {
+    let user_id = Uuid::new_v4();
+    AuthorizationActor::board_with_source(
+        user_id,
+        company_id,
+        ActorSource::Session,
+        vec![CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            user_id,
+            role,
+        )],
+        false,
+    )
+}
+
+async fn list_named_gateways(
+    app: &Router,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(format!("/companies/{company_id}/tools/gateways"))
+        .body(Body::empty())
+        .expect("build gateway list request");
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("list gateways");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read gateway list body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
+async fn create_named_gateway(
+    app: &Router,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("/companies/{company_id}/tools/gateways"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({})).expect("serialize gateway body"),
+        ))
+        .expect("build gateway create request");
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("create gateway");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read gateway create body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
+async fn list_gateway_runtime_slots(
+    app: &Router,
+    actor: &AuthorizationActor,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/tool-gateway/runtime-slots")
+        .body(Body::empty())
+        .expect("build runtime slots request");
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("list runtime slots");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read runtime slots body");
     let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     (status, value)
 }
@@ -306,4 +398,58 @@ async fn concurrent_tool_calls_replay_one_idempotency_key() {
         .bind(company_id)
         .execute(&pool)
         .await;
+}
+
+#[tokio::test]
+async fn named_gateway_routes_require_tools_admin_permission() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let state = build_app_state(pool).await.expect("build app state");
+    let app = tool_routes().with_state(state);
+
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+    let operator = board_actor_with_role(company_id, MembershipRole::Operator);
+    let viewer = board_actor_with_role(company_id, MembershipRole::Viewer);
+
+    let (owner_status, owner_body) = list_named_gateways(&app, &owner, company_id).await;
+    assert_eq!(owner_status, StatusCode::OK, "owner={owner_body:?}");
+    assert!(owner_body.get("gateways").is_some());
+
+    for (label, actor) in [("operator", operator), ("viewer", viewer)] {
+        let (status, body) = list_named_gateways(&app, &actor, company_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}={body:?}");
+        assert_eq!(
+            body.get("reasonCode").and_then(Value::as_str),
+            Some("permission_denied"),
+            "{label}={body:?}"
+        );
+        let (create_status, create_body) = create_named_gateway(&app, &actor, company_id).await;
+        assert_eq!(create_status, StatusCode::FORBIDDEN, "{label}={create_body:?}");
+        assert_eq!(
+            create_body.get("reasonCode").and_then(Value::as_str),
+            Some("permission_denied"),
+            "{label}={create_body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let state = build_app_state(pool).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+    let operator = board_actor_with_role(company_id, MembershipRole::Operator);
+    let viewer = board_actor_with_role(company_id, MembershipRole::Viewer);
+
+    let (owner_status, owner_body) = list_gateway_runtime_slots(&app, &owner).await;
+    assert_eq!(owner_status, StatusCode::OK, "owner={owner_body:?}");
+    assert!(owner_body.is_array());
+
+    for (label, actor) in [("operator", operator), ("viewer", viewer)] {
+        let (status, body) = list_gateway_runtime_slots(&app, &actor).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}={body:?}");
+    }
 }

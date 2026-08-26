@@ -1220,13 +1220,35 @@ async fn gateway_audit(
 }
 
 /// GET /api/tool-gateway/runtime-slots —— 网关运行时槽位。
+async fn require_gateway_runtime_permission(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+) -> Result<(), StatusCode> {
+    crate::routes::assert_board(actor).map_err(|_| StatusCode::FORBIDDEN)?;
+    require_company_access(actor, company_id, AccessMode::Read)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let decision = AuthorizationService::decide(
+        &state.pool,
+        actor,
+        &AuthorizationAction::Permission {
+            key: PermissionKey::from_const(PermissionKey::TOOLS_MANAGE_RUNTIME),
+        },
+        Some(company_id),
+    )
+    .await;
+    decision
+        .allowed
+        .then_some(())
+        .ok_or(StatusCode::FORBIDDEN)
+}
+
 async fn gateway_runtime_slots(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_runtime_permission(&state, &actor, company_id).await?;
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT id, connection_id, slot_key, runtime_kind, status, health_status, process_id, last_error, last_used_at, updated_at
@@ -1452,8 +1474,7 @@ async fn update_tool_profile_entry(
     Json(request): Json<UpdateProfileEntryRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_runtime_permission(&state, &actor, company_id).await?;
     use sqlx::Row;
     let row = sqlx::query(
         "UPDATE tool_profile_entries SET effect = CASE WHEN COALESCE($2, effect = 'include') THEN 'include' ELSE 'exclude' END,
@@ -1561,8 +1582,7 @@ async fn refresh_connection_catalog(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    require_gateway_runtime_permission(&state, &actor, company_id).await?;
     use sqlx::Row;
     let connection = sqlx::query(
         "SELECT transport, transport_config FROM tool_connections WHERE id = $1 AND company_id = $2",
