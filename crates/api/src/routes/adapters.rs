@@ -13,8 +13,8 @@ use services::auth::AuthorizationActor;
 use crate::errors::AppError;
 use crate::schemas::{
     AdapterInfoResponse, AdapterModelResponse, DetectModelRequest, DetectModelResponse,
-    ListAdaptersResponse, ModelDetectionStatus, TestAdapterEnvironmentRequest,
-    TestAdapterEnvironmentResponse,
+    DetectedAdapterModelResponse, ListAdaptersResponse, ModelDetectionStatus,
+    TestAdapterEnvironmentRequest, TestAdapterEnvironmentResponse,
 };
 
 /// AppState for adapter routes - 别名到统一的 `crate::app_state::AppState`
@@ -168,7 +168,49 @@ async fn list_models(
     Ok(Json(models))
 }
 
-/// POST /companies/:company_id/adapters/:adapter_type/detect-model - 检测可用模型
+fn detect_model_response(
+    result: services::server_adapter::AdapterResult<services::server_adapter::DetectModelResult>,
+) -> DetectModelResponse {
+    match result {
+        Ok(result) => {
+            let model = result
+                .model_id
+                .filter(|model| !model.trim().is_empty());
+            match model {
+                Some(model) => DetectModelResponse {
+                    model: Some(model),
+                    status: ModelDetectionStatus::Success,
+                    message: None,
+                },
+                None => DetectModelResponse {
+                    model: None,
+                    status: ModelDetectionStatus::NotFound,
+                    message: Some("Adapter did not detect a model".to_string()),
+                },
+            }
+        }
+        Err(error) => DetectModelResponse {
+            model: None,
+            status: ModelDetectionStatus::Error,
+            message: Some(error.to_string()),
+        },
+    }
+}
+
+fn detected_adapter_model_response(
+    result: services::server_adapter::DetectModelResult,
+) -> Option<DetectedAdapterModelResponse> {
+    let model = result
+        .model_id
+        .filter(|model| !model.trim().is_empty())?;
+    Some(DetectedAdapterModelResponse {
+        model,
+        provider: result.provider,
+        source: result.source,
+        candidates: (!result.candidates.is_empty()).then_some(result.candidates),
+    })
+}
+
 async fn detect_model(
     State(state): State<AdapterAppState>,
     Path((_company_id, adapter_type_str)): Path<(String, String)>,
@@ -178,33 +220,14 @@ async fn detect_model(
         Ok(t) => t,
         Err(_) => return Err(AppError::NotFound("Adapter not found".to_string())),
     };
-    let _adapter = state
+    let adapter = state
         .adapter_registry
         .find_adapter(adapter_type)
         .map_err(|_| AppError::NotFound("Adapter not found".to_string()))?;
 
-    // 尝试从配置中检测模型
-    // 注意：这里需要 ServerAdapterModule trait 支持 detect_model 方法
-    // 暂时返回配置中的 model 字段（如果存在）
-    let model = payload
-        .adapter_config
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let response = if model.is_some() {
-        DetectModelResponse {
-            model,
-            status: ModelDetectionStatus::Success,
-            message: None,
-        }
-    } else {
-        DetectModelResponse {
-            model: None,
-            status: ModelDetectionStatus::NotFound,
-            message: Some("No model specified in configuration".to_string()),
-        }
-    };
+    // Delegate detection to the registered adapter so POST and GET share the
+    // same adapter-specific behavior.
+    let response = detect_model_response(adapter.detect_model(&payload.adapter_config).await);
 
     Ok(Json(response))
 }
@@ -214,21 +237,22 @@ async fn detect_model(
 async fn detect_model_get(
     State(state): State<AdapterAppState>,
     Path((_company_id, adapter_type_str)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<Option<DetectedAdapterModelResponse>>, AppError> {
     let adapter_type = match adapter_type_str.parse::<services::server_adapter::AdapterType>() {
         Ok(t) => t,
         Err(_) => return Err(AppError::NotFound("Adapter not found".to_string())),
     };
-    state
+    let adapter = state
         .adapter_registry
         .find_adapter(adapter_type)
         .map_err(|_| AppError::NotFound("Adapter not found".to_string()))?;
 
-    // A local adapter can only report a detected runtime model when its
-    // executable is available. Returning null matches Paperclip's contract
-    // when detection is unavailable; configured model selection remains in
-    // the agent adapter configuration.
-    Ok(Json(serde_json::Value::Null))
+    let detected = adapter
+        .detect_model(&serde_json::json!({}))
+        .await
+        .map_err(|error| AppError::InternalServerError(error.to_string()))?;
+
+    Ok(Json(detected_adapter_model_response(detected)))
 }
 
 /// GET /companies/:company_id/adapters/:adapter_type/model-profiles
@@ -875,4 +899,83 @@ async fn reinstall_adapter(
         "reinstalled": true,
         "message": message,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(
+        model_id: Option<&str>,
+        provider: &str,
+        source: &str,
+        candidates: &[&str],
+    ) -> services::server_adapter::DetectModelResult {
+        services::server_adapter::DetectModelResult {
+            model_id: model_id.map(str::to_string),
+            confidence: 1.0,
+            source: source.to_string(),
+            provider: provider.to_string(),
+            candidates: candidates.iter().map(|value| (*value).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn detect_model_response_maps_adapter_success() {
+        let response = detect_model_response(Ok(result(
+            Some("custom-model"),
+            "provider",
+            "adapter_config",
+            &[],
+        )));
+
+        assert_eq!(response.model.as_deref(), Some("custom-model"));
+        assert_eq!(response.status, ModelDetectionStatus::Success);
+        assert!(response.message.is_none());
+    }
+
+    #[test]
+    fn detect_model_response_preserves_not_found_and_error_states() {
+        let not_found = detect_model_response(Ok(result(None, "provider", "config", &[])));
+        assert_eq!(not_found.status, ModelDetectionStatus::NotFound);
+        assert_eq!(
+            not_found.message.as_deref(),
+            Some("Adapter did not detect a model")
+        );
+
+        let error = detect_model_response(Err(
+            services::server_adapter::AdapterError::ConfigurationError(
+                "invalid adapter config".to_string(),
+            ),
+        ));
+        assert_eq!(error.status, ModelDetectionStatus::Error);
+        assert_eq!(error.message.as_deref(), Some("Configuration error: invalid adapter config"));
+    }
+
+    #[test]
+    fn detected_adapter_model_response_matches_paperclip_shape() {
+        let response = detected_adapter_model_response(result(
+            Some("custom-model"),
+            "provider",
+            "config",
+            &["fallback-a", "fallback-b"],
+        ))
+        .expect("model should be present");
+
+        assert_eq!(response.model, "custom-model");
+        assert_eq!(response.provider, "provider");
+        assert_eq!(response.source, "config");
+        assert_eq!(
+            response.candidates.as_deref(),
+            Some(["fallback-a".to_string(), "fallback-b".to_string()].as_slice())
+        );
+
+        assert!(detected_adapter_model_response(result(
+            Some(" "),
+            "provider",
+            "config",
+            &[],
+        ))
+        .is_none());
+    }
 }

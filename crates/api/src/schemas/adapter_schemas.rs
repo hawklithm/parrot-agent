@@ -139,6 +139,17 @@ pub struct DetectModelResponse {
     pub message: Option<String>,
 }
 
+/// Paperclip-compatible response for the body-less model detection endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedAdapterModelResponse {
+    pub model: String,
+    pub provider: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<String>>,
+}
+
 /// 模型检测状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

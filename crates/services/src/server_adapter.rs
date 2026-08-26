@@ -134,6 +134,9 @@ pub struct DetectModelResult {
     pub model_id: Option<String>,
     pub confidence: f64,
     pub source: String,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
 }
 
 /// Instructions bundle support
@@ -535,11 +538,27 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         })
     }
 
-    async fn detect_model(&self, _config: &serde_json::Value) -> AdapterResult<DetectModelResult> {
+    async fn detect_model(&self, config: &serde_json::Value) -> AdapterResult<DetectModelResult> {
+        let configured_model = config
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
         Ok(DetectModelResult {
-            model_id: Some("claude-sonnet-4-6".to_string()),
+            model_id: Some(
+                configured_model
+                    .unwrap_or("claude-sonnet-4-6")
+                    .to_string(),
+            ),
             confidence: 1.0,
-            source: "claude_local".to_string(),
+            source: if configured_model.is_some() {
+                "adapter_config"
+            } else {
+                "adapter_default"
+            }
+            .to_string(),
+            provider: "anthropic".to_string(),
+            candidates: Vec::new(),
         })
     }
 
@@ -682,11 +701,23 @@ impl ServerAdapterModule for CodexLocalAdapter {
         })
     }
 
-    async fn detect_model(&self, _config: &serde_json::Value) -> AdapterResult<DetectModelResult> {
+    async fn detect_model(&self, config: &serde_json::Value) -> AdapterResult<DetectModelResult> {
+        let configured_model = config
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
         Ok(DetectModelResult {
-            model_id: Some("gpt-5.6-sol".to_string()),
+            model_id: Some(configured_model.unwrap_or("gpt-5.6-sol").to_string()),
             confidence: 1.0,
-            source: "codex_local".to_string(),
+            source: if configured_model.is_some() {
+                "adapter_config"
+            } else {
+                "adapter_default"
+            }
+            .to_string(),
+            provider: "openai".to_string(),
+            candidates: Vec::new(),
         })
     }
 
@@ -779,7 +810,7 @@ impl ServerAdapterModule for HttpAdapter {
         }
         Ok(TestEnvironmentResult { adapter_type: ctx.adapter_type.clone(), status: "pass".to_string(), checks, tested_at: chrono::Utc::now().to_rfc3339() })
     }
-    async fn detect_model(&self, _config: &serde_json::Value) -> AdapterResult<DetectModelResult> { Ok(DetectModelResult { model_id: None, confidence: 0.0, source: "http".to_string() }) }
+    async fn detect_model(&self, _config: &serde_json::Value) -> AdapterResult<DetectModelResult> { Ok(DetectModelResult { model_id: None, confidence: 0.0, source: "http".to_string(), provider: "http".to_string(), candidates: Vec::new() }) }
     fn supports_instructions_bundle(&self) -> InstructionsBundleSupport { InstructionsBundleSupport { supported: false, max_files: None, max_size_bytes: None } }
     fn get_config_schema(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
@@ -861,6 +892,8 @@ impl ServerAdapterModule for ProcessAdapter {
             model_id: None,
             confidence: 0.0,
             source: "process".to_string(),
+            provider: "process".to_string(),
+            candidates: Vec::new(),
         })
     }
 
@@ -1060,6 +1093,21 @@ mod tests {
             (&claude as &dyn ServerAdapterModule, "claude-sonnet-4-6", "claude"),
             (&codex as &dyn ServerAdapterModule, "gpt-5.6-sol", "codex"),
         ] {
+            let configured = adapter
+                .detect_model(&serde_json::json!({"model": "configured-model"}))
+                .await
+                .expect("configured model detection");
+            assert_eq!(configured.model_id.as_deref(), Some("configured-model"));
+            assert_eq!(configured.source, "adapter_config");
+            assert!(!configured.provider.is_empty());
+
+            let default = adapter
+                .detect_model(&serde_json::json!({}))
+                .await
+                .expect("default model detection");
+            assert_eq!(default.model_id.as_deref(), Some(expected_model));
+            assert_eq!(default.source, "adapter_default");
+
             let schema = adapter.get_config_schema().expect("built-in schema");
             assert!(schema.get("fields").and_then(|fields| fields.as_array()).is_some());
             assert_eq!(schema["fields"][1]["default"], expected_model);
