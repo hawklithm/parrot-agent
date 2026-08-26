@@ -146,6 +146,12 @@ impl RolePermissions {
                 PermissionKey::from_const(PermissionKey::GOALS_CREATE),
                 PermissionKey::from_const(PermissionKey::GOALS_UPDATE),
                 PermissionKey::from_const(PermissionKey::GOALS_DELETE),
+                PermissionKey::from_const(PermissionKey::TOOLS_ADMIN),
+                PermissionKey::from_const(PermissionKey::TOOLS_MANAGE_CONNECTIONS),
+                PermissionKey::from_const(PermissionKey::TOOLS_MANAGE_PROFILES),
+                PermissionKey::from_const(PermissionKey::TOOLS_VIEW_AUDIT),
+                PermissionKey::from_const(PermissionKey::TOOLS_USE),
+                PermissionKey::from_const(PermissionKey::TOOLS_MANAGE_RUNTIME),
             ],
             MembershipRole::Admin => vec![
                 PermissionKey::from_const(PermissionKey::USERS_INVITE),
@@ -172,6 +178,12 @@ impl RolePermissions {
                 PermissionKey::from_const(PermissionKey::GOALS_CREATE),
                 PermissionKey::from_const(PermissionKey::GOALS_UPDATE),
                 PermissionKey::from_const(PermissionKey::GOALS_DELETE),
+                PermissionKey::from_const(PermissionKey::TOOLS_ADMIN),
+                PermissionKey::from_const(PermissionKey::TOOLS_MANAGE_CONNECTIONS),
+                PermissionKey::from_const(PermissionKey::TOOLS_MANAGE_PROFILES),
+                PermissionKey::from_const(PermissionKey::TOOLS_VIEW_AUDIT),
+                PermissionKey::from_const(PermissionKey::TOOLS_USE),
+                PermissionKey::from_const(PermissionKey::TOOLS_MANAGE_RUNTIME),
             ],
             MembershipRole::Operator => vec![
                 PermissionKey::from_const(PermissionKey::ISSUES_READ),
@@ -651,6 +663,28 @@ mod tests {
         assert!(!role_has_permission(
             MembershipRole::Viewer,
             &PermissionKey::from_const(PermissionKey::AGENTS_DELETE)
+        ));
+    }
+
+    #[test]
+    fn test_tool_gateway_role_permissions() {
+        for role in [MembershipRole::Owner, MembershipRole::Admin] {
+            assert!(role_has_permission(
+                role,
+                &PermissionKey::from_const(PermissionKey::TOOLS_VIEW_AUDIT)
+            ));
+            assert!(role_has_permission(
+                role,
+                &PermissionKey::from_const(PermissionKey::TOOLS_ADMIN)
+            ));
+            assert!(role_has_permission(
+                role,
+                &PermissionKey::from_const(PermissionKey::TOOLS_MANAGE_RUNTIME)
+            ));
+        }
+        assert!(!role_has_permission(
+            MembershipRole::Viewer,
+            &PermissionKey::from_const(PermissionKey::TOOLS_VIEW_AUDIT)
         ));
     }
 

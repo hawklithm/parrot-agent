@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::routes::{require_company_access, AccessMode};
-use services::auth::AuthorizationActor;
+use services::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService, PermissionKey};
 
 // ---------- companies/:cid/tools/* 只读聚合 ----------
 
@@ -964,6 +964,18 @@ async fn gateway_audit(
         .ok_or(StatusCode::BAD_REQUEST)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    let permission = AuthorizationService::decide(
+        &state.pool,
+        &actor,
+        &AuthorizationAction::Permission {
+            key: PermissionKey::from_const(PermissionKey::TOOLS_VIEW_AUDIT),
+        },
+        Some(company_id),
+    )
+    .await;
+    if !permission.allowed {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let application_or_connection_id = query
         .app

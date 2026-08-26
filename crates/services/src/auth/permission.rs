@@ -50,6 +50,14 @@ impl PermissionKey {
     pub const ENVIRONMENTS_MANAGE: &'static str = "environments:manage";
     pub const RUNTIME_MANAGE: &'static str = "runtime:manage";
 
+    // Tool Gateway permissions (Paperclip-compatible company grants)
+    pub const TOOLS_ADMIN: &'static str = "tools:admin";
+    pub const TOOLS_MANAGE_CONNECTIONS: &'static str = "tools:manage_connections";
+    pub const TOOLS_MANAGE_PROFILES: &'static str = "tools:manage_profiles";
+    pub const TOOLS_VIEW_AUDIT: &'static str = "tools:view_audit";
+    pub const TOOLS_USE: &'static str = "tools:use";
+    pub const TOOLS_MANAGE_RUNTIME: &'static str = "tools:manage_runtime";
+
     // Routine权限常量
     pub const ROUTINES_CREATE: &'static str = "routines:create";
     pub const ROUTINES_UPDATE: &'static str = "routines:update";
@@ -68,7 +76,11 @@ impl PermissionKey {
 
     /// 检查是否为公司级权限
     pub fn is_company_level(&self) -> bool {
-        self.0.starts_with("company:") || self.0.starts_with("members:") || self.0.starts_with("roles:")
+        self.0.starts_with("company:")
+            || self.0.starts_with("members:")
+            || self.0.starts_with("roles:")
+            || self.0.starts_with("tools:")
+            || self.0.starts_with("audit:")
     }
 
     /// 检查是否为资源级权限
