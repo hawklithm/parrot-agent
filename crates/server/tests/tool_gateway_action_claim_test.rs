@@ -273,7 +273,15 @@ async fn create_company_stdio_template(
         .uri(format!("/companies/{company_id}/tools/stdio-templates"))
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({ "name": "Test template" }))
+            serde_json::to_vec(&json!({
+                "templateId": "admin.test-template",
+                "name": "Test template",
+                "description": "A persistent test template",
+                "command": "echo",
+                "args": ["hello"],
+                "envKeys": ["TEST_VALUE"],
+                "tools": [{"name": "echo"}]
+            }))
                 .expect("serialize stdio template body"),
         ))
         .expect("build stdio template create request");
@@ -287,6 +295,37 @@ async fn create_company_stdio_template(
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read stdio template create body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
+async fn disable_company_stdio_template(
+    app: &Router,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    template_id: &str,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/companies/{company_id}/tools/stdio-templates/{template_id}/disable"
+        ))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "reason": "test cleanup" }))
+                .expect("serialize stdio template disable body"),
+        ))
+        .expect("build stdio template disable request");
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("disable stdio template");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read stdio template disable body");
     let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     (status, value)
 }
@@ -650,7 +689,17 @@ async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
 async fn stdio_template_routes_require_tools_admin_permission() {
     let pool = connect_and_migrate().await;
     let company_id = Uuid::new_v4();
-    let state = build_app_state(pool).await.expect("build app state");
+    let issue_prefix = format!("TG{}", &company_id.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Tool Gateway Stdio Template Test")
+        .bind(issue_prefix)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+    let state = build_app_state(pool.clone())
+        .await
+        .expect("build app state");
     let app = tool_access_routes().with_state(state);
 
     let owner = board_actor_with_role(company_id, MembershipRole::Owner);
@@ -669,8 +718,43 @@ async fn stdio_template_routes_require_tools_admin_permission() {
         create_company_stdio_template(&app, &owner, company_id).await;
     assert_eq!(
         owner_create_status,
-        StatusCode::OK,
+        StatusCode::CREATED,
         "owner create={owner_create_body:?}"
+    );
+    assert_eq!(
+        owner_create_body.get("templateId").and_then(Value::as_str),
+        Some("admin.test-template")
+    );
+    assert_eq!(
+        owner_create_body.get("status").and_then(Value::as_str),
+        Some("active")
+    );
+    let (owner_disable_status, owner_disable_body) = disable_company_stdio_template(
+        &app,
+        &owner,
+        company_id,
+        "admin.test-template",
+    )
+    .await;
+    assert_eq!(
+        owner_disable_status,
+        StatusCode::OK,
+        "owner disable={owner_disable_body:?}"
+    );
+    assert_eq!(
+        owner_disable_body.get("status").and_then(Value::as_str),
+        Some("disabled")
+    );
+    let (owner_after_disable_status, owner_after_disable_body) =
+        list_company_stdio_templates(&app, &owner, company_id).await;
+    assert_eq!(owner_after_disable_status, StatusCode::OK);
+    assert_eq!(
+        owner_after_disable_body
+            .as_array()
+            .and_then(|templates| templates.first())
+            .and_then(|template| template.get("status"))
+            .and_then(Value::as_str),
+        Some("disabled")
     );
 
     for (label, actor) in [("operator", operator), ("viewer", viewer)] {
@@ -683,7 +767,24 @@ async fn stdio_template_routes_require_tools_admin_permission() {
             StatusCode::FORBIDDEN,
             "{label} create={create_body:?}"
         );
+        let (disable_status, disable_body) = disable_company_stdio_template(
+            &app,
+            &actor,
+            company_id,
+            "admin.test-template",
+        )
+        .await;
+        assert_eq!(
+            disable_status,
+            StatusCode::FORBIDDEN,
+            "{label} disable={disable_body:?}"
+        );
     }
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
 }
 
 #[tokio::test]
@@ -767,6 +868,36 @@ async fn connection_management_routes_require_tool_permissions() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "grant install={body:?}");
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "PUT",
+        format!("/tool-connections/{connection_id}/installs"),
+        Some(json!({
+            "installs": [{
+                "targetType": "agent",
+                "targetId": agent_id
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "install sync={body:?}");
+    assert_eq!(
+        body.get("connectionId").and_then(Value::as_str),
+        Some(connection_id.to_string().as_str())
+    );
+    assert_eq!(body["installs"].as_array().map(Vec::len), Some(1));
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/tool-connections/{connection_id}/installs"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "install list={body:?}");
+    assert_eq!(body["installs"].as_array().map(Vec::len), Some(1));
     let grant_id: Uuid = sqlx::query_scalar(
         "SELECT id FROM tool_connection_grants
           WHERE company_id = $1 AND connection_id = $2 AND agent_id = $3",
@@ -816,6 +947,11 @@ async fn connection_management_routes_require_tool_permissions() {
                 ),
                 "DELETE",
                 None,
+            ),
+            (
+                format!("/tool-connections/{connection_id}/installs"),
+                "PUT",
+                Some(json!({ "installs": [] })),
             ),
         ] {
             let (status, response_body) =

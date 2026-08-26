@@ -12,6 +12,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
@@ -324,9 +325,9 @@ async fn tools_stdio_templates(
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     require_gateway_permission(&state, &actor, company_id, PermissionKey::TOOLS_ADMIN).await?;
-    use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT id, template_key, name, description, status, command, args, env_keys, tools, created_at, updated_at
+        "SELECT id, company_id, template_key, name, description, status, command, args, env_keys, tools,
+                created_by_agent_id, created_by_user_id, disabled_at, created_at, updated_at
          FROM tool_stdio_command_templates WHERE company_id = $1 ORDER BY name ASC",
     )
     .bind(company_id)
@@ -338,23 +339,33 @@ async fn tools_stdio_templates(
     })?;
     Ok(Json(
         rows.iter()
-            .map(|row| {
-                json!({
-                    "id": row.get::<Uuid, _>("id"),
-                    "templateKey": row.get::<String, _>("template_key"),
-                    "name": row.get::<String, _>("name"),
-                    "description": row.get::<Option<String>, _>("description"),
-                    "status": row.get::<String, _>("status"),
-                    "command": row.get::<String, _>("command"),
-                    "args": row.get::<Value, _>("args"),
-                    "envKeys": row.get::<Value, _>("env_keys"),
-                    "tools": row.get::<Value, _>("tools"),
-                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
-                })
-            })
+            .map(stdio_template_json)
             .collect(),
     ))
+}
+
+fn stdio_template_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
+    use sqlx::Row;
+    json!({
+        "id": row.get::<Uuid, _>("id"),
+        "companyId": row.get::<Uuid, _>("company_id"),
+        "templateId": row.get::<String, _>("template_key"),
+        "templateKey": row.get::<String, _>("template_key"),
+        "name": row.get::<String, _>("name"),
+        "title": Value::Null,
+        "description": row.get::<Option<String>, _>("description"),
+        "status": row.get::<String, _>("status"),
+        "source": "admin",
+        "command": row.get::<String, _>("command"),
+        "args": row.get::<Value, _>("args"),
+        "envKeys": row.get::<Value, _>("env_keys"),
+        "tools": row.get::<Value, _>("tools"),
+        "createdByAgentId": row.get::<Option<Uuid>, _>("created_by_agent_id"),
+        "createdByUserId": row.get::<Option<String>, _>("created_by_user_id"),
+        "disabledAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("disabled_at"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })
 }
 
 // ---------- tool-applications ----------
@@ -653,39 +664,245 @@ async fn connection_usage(
     Ok(Json(json!({ "totalInvocations": total })))
 }
 
+async fn load_connection_installs(
+    pool: &sqlx::PgPool,
+    company_id: Uuid,
+    connection_id: Uuid,
+) -> Result<Vec<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, target_type, target_id, created_by_agent_id, created_by_user_id, created_at
+           FROM tool_connection_installs
+          WHERE company_id = $1 AND connection_id = $2
+          ORDER BY created_at DESC",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %company_id, %connection_id, "Failed to list connection installs");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<Uuid, _>("id"),
+                "targetType": row.get::<String, _>("target_type"),
+                "targetId": row.get::<String, _>("target_id"),
+                "createdByAgentId": row.get::<Option<Uuid>, _>("created_by_agent_id"),
+                "createdByUserId": row.get::<Option<String>, _>("created_by_user_id"),
+                "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            })
+        })
+        .collect())
+}
+
 /// GET /api/tool-connections/:id/installs —— 连接安装记录。
 async fn connection_installs(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT id, target_type, target_id, created_by_user_id, created_at FROM tool_connection_installs WHERE connection_id = $1 ORDER BY created_at DESC",
+    get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let installs = load_connection_installs(&state.pool, company_id, connection_id).await?;
+    Ok(Json(json!({
+        "connectionId": connection_id,
+        "installs": installs,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectionInstallRequest {
+    #[serde(rename = "targetType", alias = "target_type")]
+    target_type: String,
+    #[serde(rename = "targetId", alias = "target_id")]
+    target_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PutConnectionInstallsRequest {
+    #[serde(default)]
+    installs: Vec<ConnectionInstallRequest>,
+}
+
+/// PUT /api/tool-connections/:id/installs —— 以声明式快照同步安装目标。
+async fn put_connection_installs(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(connection_id): Path<Uuid>,
+    Json(request): Json<PutConnectionInstallsRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = actor_company(&actor)?;
+    require_gateway_permission(
+        &state,
+        &actor,
+        company_id,
+        PermissionKey::TOOLS_MANAGE_CONNECTIONS,
     )
-    .bind(connection_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to list connection installs: {}", e);
+    .await?;
+    get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if request.installs.len() > 1000 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut requested = Vec::with_capacity(request.installs.len());
+    let mut requested_keys = HashSet::with_capacity(request.installs.len());
+    for install in request.installs {
+        let target_type = install.target_type.trim().to_ascii_lowercase();
+        let target_id = install.target_id.trim().to_string();
+        if target_id.is_empty() || !matches!(target_type.as_str(), "company" | "agent") {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let target_uuid = target_id.parse::<Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+        if target_type == "company" && target_uuid != company_id {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let key = (target_type.clone(), target_uuid.to_string());
+        if requested_keys.insert(key) {
+            requested.push((target_type, target_uuid));
+        }
+    }
+
+    let created_by_agent_id = match &actor {
+        AuthorizationActor::Agent { agent_id, .. } => Some(*agent_id),
+        _ => None,
+    };
+    let created_by_user_id = match &actor {
+        AuthorizationActor::Board { user_id, .. } => Some(user_id.to_string()),
+        _ => None,
+    };
+
+    let mut tx = state.pool.begin().await.map_err(|e| {
+        tracing::error!(%e, %company_id, %connection_id, "Failed to start connection install sync");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(
-        rows.iter()
-            .map(|row| {
-                json!({
-                    "id": row.get::<Uuid, _>("id"),
-                    "targetType": row.get::<String, _>("target_type"),
-                    "targetId": row.get::<String, _>("target_id"),
-                    "createdByUserId": row.get::<Option<String>, _>("created_by_user_id"),
-                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                })
-            })
-            .collect(),
-    ))
+
+    for (target_type, target_id) in &requested {
+        if target_type == "agent" {
+            let valid_agent = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                     SELECT 1 FROM agents
+                      WHERE id = $1 AND company_id = $2 AND status <> 'terminated'
+                 )",
+            )
+            .bind(target_id)
+            .bind(company_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, %company_id, %target_id, "Failed to validate connection install agent");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            if !valid_agent {
+                return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            }
+        }
+    }
+
+    use sqlx::Row;
+    let existing = sqlx::query(
+        "SELECT id, target_type, target_id
+           FROM tool_connection_installs
+          WHERE company_id = $1 AND connection_id = $2",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %company_id, %connection_id, "Failed to load connection installs for sync");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let existing_keys: HashSet<(String, String)> = existing
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("target_type"),
+                row.get::<String, _>("target_id"),
+            )
+        })
+        .collect();
+
+    for row in &existing {
+        let key = (
+            row.get::<String, _>("target_type"),
+            row.get::<String, _>("target_id"),
+        );
+        if !requested_keys.contains(&key) {
+            sqlx::query(
+                "DELETE FROM tool_connection_installs
+                  WHERE id = $1 AND company_id = $2 AND connection_id = $3",
+            )
+            .bind(row.get::<Uuid, _>("id"))
+            .bind(company_id)
+            .bind(connection_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, %company_id, %connection_id, "Failed to remove connection install");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
+    }
+
+    for (target_type, target_id) in &requested {
+        if !existing_keys.contains(&(target_type.clone(), target_id.to_string())) {
+            sqlx::query(
+                "INSERT INTO tool_connection_installs
+                    (company_id, connection_id, target_type, target_id, created_by_agent_id, created_by_user_id)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (company_id, connection_id, target_type, target_id) DO NOTHING",
+            )
+            .bind(company_id)
+            .bind(connection_id)
+            .bind(target_type)
+            .bind(target_id.to_string())
+            .bind(created_by_agent_id)
+            .bind(created_by_user_id.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, %company_id, %connection_id, "Failed to add connection install");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
+    }
+
+    tx.commit().await.map_err(|e| {
+        tracing::error!(%e, %company_id, %connection_id, "Failed to commit connection install sync");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let installs = load_connection_installs(&state.pool, company_id, connection_id).await?;
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "tool_connection.installs_synced",
+        &actor,
+        "tool_connection",
+        connection_id,
+        json!({
+            "installs": installs.iter().map(|install| json!({
+                "targetType": install.get("targetType").and_then(Value::as_str),
+                "targetId": install.get("targetId").and_then(Value::as_str),
+            })).collect::<Vec<_>>(),
+        }),
+    )
+    .await;
+    Ok(Json(json!({
+        "connectionId": connection_id,
+        "installs": installs,
+    })))
 }
 
 /// GET /api/tool-connections/:id/catalog —— MCP 发现得到的工具目录。
@@ -1372,7 +1589,10 @@ pub fn tool_access_routes() -> Router<AppState> {
             delete(delete_connection_grant),
         )
         .route("/tool-connections/:id/usage", get(connection_usage))
-        .route("/tool-connections/:id/installs", get(connection_installs))
+        .route(
+            "/tool-connections/:id/installs",
+            get(connection_installs).put(put_connection_installs),
+        )
         .route("/tool-connections/:id/catalog", get(connection_catalog))
         .route("/tool-connections/:id/activity", get(connection_activity))
         .route("/tool-profiles/:id/new-tools", get(profile_new_tools))
@@ -1451,6 +1671,10 @@ pub fn tool_access_routes() -> Router<AppState> {
         .route(
             "/companies/:company_id/tools/stdio-templates",
             post(create_stdio_template),
+        )
+        .route(
+            "/companies/:company_id/tools/stdio-templates/:template_id/disable",
+            post(disable_stdio_template),
         )
         .route(
             "/companies/:company_id/tools/trust-rules/:rule_id/revoke",
@@ -2083,19 +2307,176 @@ async fn test_tool_policy(
     Ok(Json(json!({ "matches": true })))
 }
 
-/// POST /companies/:cid/tools/stdio-templates —— mock。
+fn empty_json_array() -> Value {
+    json!([])
+}
+
+fn is_safe_stdio_template_key(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
+}
+
+fn is_safe_env_key(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// POST /companies/:cid/tools/stdio-templates —— 创建管理员 stdio 模板。
 #[derive(Debug, Deserialize)]
 struct CreateStdioTemplateRequest {
-    name: Option<String>,
+    #[serde(rename = "templateId", alias = "template_key")]
+    template_id: String,
+    name: String,
+    description: Option<String>,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(rename = "envKeys", alias = "env_keys", default)]
+    env_keys: Vec<String>,
+    #[serde(default = "empty_json_array")]
+    tools: Value,
 }
+
 async fn create_stdio_template(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(request): Json<CreateStdioTemplateRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    require_gateway_permission(&state, &actor, company_id, PermissionKey::TOOLS_ADMIN).await?;
+    let template_id = request.template_id.trim().to_string();
+    let name = request.name.trim().to_string();
+    let command = request.command.trim().to_string();
+    let arg_count = request.args.len();
+    let env_key_count = request.env_keys.len();
+    let tool_count = request.tools.as_array().map_or(0, Vec::len);
+    if template_id.is_empty()
+        || template_id.len() > 160
+        || !is_safe_stdio_template_key(&template_id)
+        || name.is_empty()
+        || name.len() > 160
+        || command.is_empty()
+        || command.len() > 2000
+        || request.args.len() > 100
+        || request.args.iter().any(|arg| arg.len() > 2000)
+        || request.env_keys.len() > 200
+        || request
+            .env_keys
+            .iter()
+            .any(|key| key.len() > 160 || !is_safe_env_key(key))
+        || !request.tools.is_array()
+        || request.tools.as_array().is_some_and(|tools| tools.len() > 500)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    use sqlx::Row;
+    let row = sqlx::query(
+        "INSERT INTO tool_stdio_command_templates
+            (company_id, template_key, name, description, status, command, args, env_keys, tools,
+             created_by_agent_id, created_by_user_id)
+         VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, $9, $10)
+         RETURNING *",
+    )
+    .bind(company_id)
+    .bind(template_id)
+    .bind(name)
+    .bind(request.description)
+    .bind(command)
+    .bind(json!(request.args))
+    .bind(json!(request.env_keys))
+    .bind(request.tools)
+    .bind(match &actor {
+        AuthorizationActor::Agent { agent_id, .. } => Some(*agent_id),
+        _ => None,
+    })
+    .bind(match &actor {
+        AuthorizationActor::Board { user_id, .. } => Some(user_id.to_string()),
+        _ => None,
+    })
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %company_id, "Failed to create stdio template");
+        if e.as_database_error()
+            .and_then(|database_error| database_error.code())
+            .as_deref()
+            == Some("23505")
+        {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+    let template = stdio_template_json(&row);
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "tool_stdio_command_template.created",
+        &actor,
+        "tool_stdio_command_template",
+        row.get("id"),
+        json!({
+            "templateId": template.get("templateId"),
+            "command": template.get("command"),
+            "argCount": arg_count,
+            "envKeyCount": env_key_count,
+            "toolCount": tool_count,
+        }),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(template)))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DisableStdioTemplateRequest {
+    reason: Option<String>,
+}
+
+/// POST /companies/:cid/tools/stdio-templates/:template_id/disable —— 禁用管理员模板。
+async fn disable_stdio_template(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, template_id)): Path<(Uuid, String)>,
+    Json(request): Json<DisableStdioTemplateRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_gateway_permission(&state, &actor, company_id, PermissionKey::TOOLS_ADMIN).await?;
-    Ok(Json(json!({ "id": Uuid::new_v4(), "name": request.name })))
+    if request.reason.as_deref().is_some_and(|reason| reason.len() > 1000) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    use sqlx::Row;
+    let row = sqlx::query(
+        "UPDATE tool_stdio_command_templates
+            SET status = 'disabled', disabled_at = COALESCE(disabled_at, NOW()), updated_at = NOW()
+          WHERE company_id = $1 AND template_key = $2
+         RETURNING *",
+    )
+    .bind(company_id)
+    .bind(template_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %company_id, "Failed to disable stdio template");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let template = stdio_template_json(&row);
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "tool_stdio_command_template.disabled",
+        &actor,
+        "tool_stdio_command_template",
+        row.get("id"),
+        json!({
+            "templateId": template.get("templateId"),
+            "reason": request.reason,
+        }),
+    )
+    .await;
+    Ok(Json(template))
 }
 
 /// POST /companies/:cid/tools/trust-rules/:rule_id/revoke —— mock（204）。
