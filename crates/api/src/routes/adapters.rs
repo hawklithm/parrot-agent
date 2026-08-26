@@ -9,11 +9,12 @@ use uuid::Uuid;
 
 use services::adapter_package_loader::AdapterPackageLoader;
 use services::auth::AuthorizationActor;
+use services::adapter_plugin_store::AdapterPluginRecord;
 
 use crate::errors::AppError;
 use crate::schemas::{
     AdapterInfoResponse, AdapterModelResponse, DetectModelRequest, DetectModelResponse,
-    DetectedAdapterModelResponse, ListAdaptersResponse, ModelDetectionStatus,
+    DetectedAdapterModelResponse, GlobalAdapterInfo, ListAdaptersResponse, ModelDetectionStatus,
     TestAdapterEnvironmentRequest, TestAdapterEnvironmentResponse,
 };
 
@@ -400,10 +401,37 @@ async fn test_environment(
 ///
 /// Paperclip 前端期望返回一个**裸数组**（而非包裹在对象中），
 /// 因为 AdapterStore 会直接在响应上调用 `.map()`。
+fn unloaded_external_adapter_info(
+    record: &AdapterPluginRecord,
+    disabled: bool,
+) -> GlobalAdapterInfo {
+    GlobalAdapterInfo {
+        adapter_type: record.adapter_type.clone(),
+        label: record.adapter_type.clone(),
+        source: "external".to_string(),
+        models_count: 0,
+        loaded: false,
+        disabled,
+        capabilities: crate::schemas::AdapterCapabilities {
+            supports_instructions_bundle: false,
+            supports_skills: false,
+            supports_local_agent_jwt: false,
+            requires_materialized_runtime_skills: false,
+            supports_model_profiles: false,
+            supports_acp: false,
+        },
+        overridden_builtin: None,
+        override_paused: None,
+        version: record.version.clone(),
+        package_name: Some(record.package_name.clone()),
+        is_local_path: record.local_path.as_ref().map(|_| true),
+    }
+}
+
 async fn list_global_adapters(
     State(state): State<AdapterAppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    use crate::schemas::{AdapterCapabilities, GlobalAdapterInfo};
+    use crate::schemas::AdapterCapabilities;
     use services::builtin_adapter_types::is_builtin_adapter_type;
 
     let all_adapters = state.adapter_registry.adapters();
@@ -414,6 +442,10 @@ async fn list_global_adapters(
         .list_external_plugins()
         .into_iter()
         .map(|r| (r.adapter_type.clone(), r))
+        .collect();
+    let registered_types: std::collections::HashSet<String> = all_adapters
+        .iter()
+        .map(|adapter| adapter.adapter_type().to_string())
         .collect();
     
     // 构建适配器信息列表
@@ -462,6 +494,18 @@ async fn list_global_adapters(
             }
         })
         .collect();
+
+    // Persisted plugin records can outlive a failed or not-yet-supported
+    // dynamic load. Expose those records without claiming that they are
+    // executable or that they support any runtime capability.
+    for record in external_records.values() {
+        if !registered_types.contains(&record.adapter_type) {
+            adapters.push(unloaded_external_adapter_info(
+                record,
+                registry_state.is_disabled(&record.adapter_type),
+            ));
+        }
+    }
     
     // 按适配器类型排序（对齐 Paperclip）
     adapters.sort_by(|a, b| a.adapter_type.cmp(&b.adapter_type));
@@ -977,5 +1021,31 @@ mod tests {
             &[],
         ))
         .is_none());
+    }
+
+    #[test]
+    fn unloaded_external_adapter_is_not_reported_as_executable() {
+        let info = unloaded_external_adapter_info(
+            &AdapterPluginRecord {
+                package_name: "@example/adapter".to_string(),
+                local_path: None,
+                version: Some("1.2.3".to_string()),
+                adapter_type: "example_adapter".to_string(),
+                installed_at: "2026-08-27T00:00:00Z".to_string(),
+            },
+            false,
+        );
+
+        assert_eq!(info.adapter_type, "example_adapter");
+        assert_eq!(info.source, "external");
+        assert!(!info.loaded);
+        assert_eq!(info.models_count, 0);
+        assert!(!info.capabilities.supports_acp);
+        assert!(!info.capabilities.supports_skills);
+        assert_eq!(info.version.as_deref(), Some("1.2.3"));
+
+        let serialized = serde_json::to_value(info).expect("adapter info should serialize");
+        assert_eq!(serialized["loaded"], false);
+        assert_eq!(serialized["capabilities"]["supportsAcp"], false);
     }
 }
