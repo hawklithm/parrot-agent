@@ -283,6 +283,7 @@ struct AdapterCommandOutput {
     exit_code: i32,
     stdout: String,
     stderr: String,
+    resumed_session_id: Option<String>,
 }
 
 /// Read the structured result records emitted by Claude/Codex JSONL modes.
@@ -298,6 +299,16 @@ fn parse_adapter_outcome(output: &str, adapter_type: &str) -> AdapterOutcome {
         visit_adapter_event(&value, &mut outcome, true, adapter_type);
     }
     outcome
+}
+
+fn is_codex_unknown_session_output(output: &AdapterCommandOutput) -> bool {
+    let combined = format!("{}{}", output.stdout, output.stderr);
+    let parsed = parse_adapter_outcome(&combined, "codex_local");
+    parsed.error_code.as_deref() == Some("codex_unknown_session")
+        || (output.exit_code != 0
+            && combined.lines().any(|line| {
+                classify_codex_error(line).0.as_deref() == Some("codex_unknown_session")
+            }))
 }
 
 fn valid_claude_resume_session(session_id: Option<&str>) -> Option<String> {
@@ -1323,7 +1334,63 @@ impl DefaultHeartbeatService {
         .flatten()
         .unwrap_or_else(|| ("unknown".to_string(), None));
         let (adapter_type, configured_model) = adapter_metadata;
-        let result = self.run_command(run_id, agent_id, issue_id, company_id).await;
+        let mut result = self
+            .run_command(run_id, agent_id, issue_id, company_id, false)
+            .await;
+        let mut session_recovery: Option<&'static str> = None;
+        let mut session_recovery_session: Option<String> = None;
+        if adapter_type == "codex_local" {
+            let stale_session = result.as_ref().ok().and_then(|command_output| {
+                is_codex_unknown_session_output(command_output)
+                    .then(|| command_output.resumed_session_id.clone())
+                    .flatten()
+            });
+            if let Some(session_id) = stale_session {
+                session_recovery_session = Some(session_id.clone());
+                let cleared = sqlx::query(
+                    "UPDATE agent_runtime_states
+                     SET session_id = NULL, updated_at = NOW()
+                     WHERE agent_id = $1 AND session_id = $2",
+                )
+                .bind(agent_id)
+                .bind(&session_id)
+                .execute(&self.pool)
+                .await;
+                match cleared {
+                    Ok(update_result) if update_result.rows_affected() > 0 => {
+                        session_recovery = Some("fresh_retry");
+                        tracing::warn!(
+                            %run_id,
+                            %agent_id,
+                            %session_id,
+                            "codex session is stale; retrying with a fresh session"
+                        );
+                        result = self
+                            .run_command(run_id, agent_id, issue_id, company_id, true)
+                            .await;
+                    }
+                    Ok(_) => {
+                        session_recovery = Some("cas_conflict");
+                        tracing::info!(
+                            %run_id,
+                            %agent_id,
+                            %session_id,
+                            "codex stale-session recovery skipped because runtime state changed"
+                        );
+                    }
+                    Err(error) => {
+                        session_recovery = Some("cas_failed");
+                        tracing::warn!(
+                            %run_id,
+                            %agent_id,
+                            %session_id,
+                            %error,
+                            "failed to clear stale Codex session"
+                        );
+                    }
+                }
+            }
+        }
         // Heartbeat Start Lock contention: a second start for this agent raced in. This is not a
         // run failure and must NOT be retried — cancel this run so exactly one adapter process
         // owns the agent (PAPERCLIP_MIGRATION_PLAN §4B.2 line 324).
@@ -1412,6 +1479,7 @@ impl DefaultHeartbeatService {
                         exit_code: -1,
                         stdout: String::new(),
                         stderr: String::new(),
+                        resumed_session_id: None,
                     },
                     outcome,
                 )
@@ -1433,6 +1501,8 @@ impl DefaultHeartbeatService {
             "model": outcome.model,
             "provider": outcome.provider,
             "adapterType": adapter_type,
+            "sessionRecovery": session_recovery,
+            "sessionRecoverySession": session_recovery_session,
             "stdout": output.stdout,
             "stderr": output.stderr,
         });
@@ -1600,6 +1670,7 @@ impl DefaultHeartbeatService {
         agent_id: Uuid,
         issue_id: Uuid,
         company_id: Uuid,
+        force_fresh_session: bool,
     ) -> Result<AdapterCommandOutput, String> {
         // Heartbeat Start Lock (PAPERCLIP_MIGRATION_PLAN §4B.2 line 324): guarantee at most
         // one adapter process starts per agent at a time. Acquire before building/launching the
@@ -1691,7 +1762,12 @@ impl DefaultHeartbeatService {
             if !status.is_success() {
                 return Err(format!("LLM request failed with HTTP {status}: {body}"));
             }
-            return Ok(AdapterCommandOutput { exit_code: 0, stdout: body, stderr: String::new() });
+            return Ok(AdapterCommandOutput {
+                exit_code: 0,
+                stdout: body,
+                stderr: String::new(),
+                resumed_session_id: None,
+            });
         }
         let command = cfg
             .get("command")
@@ -1820,7 +1896,8 @@ impl DefaultHeartbeatService {
                 args.insert(insert_at, "--dangerously-bypass-approvals-and-sandbox".into());
             }
         }
-        if matches!(adapter, "claude_local" | "codex_local") && !custom_args {
+        let mut resumed_session_id = None;
+        if matches!(adapter, "claude_local" | "codex_local") && !custom_args && !force_fresh_session {
             let persisted_session: Option<String> = sqlx::query_scalar(
                 "SELECT session_id FROM agent_runtime_states WHERE agent_id = $1",
             )
@@ -1831,12 +1908,14 @@ impl DefaultHeartbeatService {
             match adapter {
                 "claude_local" => {
                     if let Some(session_id) = valid_claude_resume_session(persisted_session.as_deref()) {
+                        resumed_session_id = Some(session_id.clone());
                         args.extend(["--resume".to_string(), session_id]);
                     }
                 }
                 "codex_local" => {
                     if let Some(session_id) = valid_codex_resume_session(persisted_session.as_deref()) {
                         if args.last().map(String::as_str) == Some("-") {
+                            resumed_session_id = Some(session_id.clone());
                             args.pop();
                             args.extend(["resume".to_string(), session_id, "-".to_string()]);
                         }
@@ -2179,6 +2258,7 @@ impl DefaultHeartbeatService {
             exit_code: status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out).to_string(),
             stderr: String::from_utf8_lossy(&err).to_string(),
+            resumed_session_id,
         })
     }
 }
@@ -3274,8 +3354,8 @@ impl DefaultHeartbeatService {
 #[cfg(test)]
 mod adapter_outcome_tests {
     use super::{
-        build_codex_exec_args, parse_adapter_outcome, valid_claude_resume_session,
-        valid_codex_resume_session,
+        build_codex_exec_args, is_codex_unknown_session_output, parse_adapter_outcome,
+        valid_claude_resume_session, valid_codex_resume_session, AdapterCommandOutput,
     };
 
     #[test]
@@ -3376,6 +3456,35 @@ mod adapter_outcome_tests {
         );
         assert_eq!(stale.error_code.as_deref(), Some("codex_unknown_session"));
         assert_eq!(stale.error_family.as_deref(), Some("session"));
+    }
+
+    #[test]
+    fn detects_codex_unknown_session_in_structured_or_plain_output() {
+        let structured = AdapterCommandOutput {
+            exit_code: 0,
+            stdout: r#"{"type":"error","message":"state db missing rollout path for thread thread-44"}"#
+                .to_string(),
+            stderr: String::new(),
+            resumed_session_id: Some("thread-44".to_string()),
+        };
+        assert!(is_codex_unknown_session_output(&structured));
+
+        let plain = AdapterCommandOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "state db missing rollout path for thread thread-45".to_string(),
+            resumed_session_id: Some("thread-45".to_string()),
+        };
+        assert!(is_codex_unknown_session_output(&plain));
+
+        let successful = AdapterCommandOutput {
+            exit_code: 0,
+            stdout: r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#
+                .to_string(),
+            stderr: String::new(),
+            resumed_session_id: Some("thread-46".to_string()),
+        };
+        assert!(!is_codex_unknown_session_output(&successful));
     }
 
     #[test]
