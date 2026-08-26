@@ -300,3 +300,133 @@ async fn company_search_matches_paperclip() {
 
     cleanup_fixture(&f).await;
 }
+
+/// #4C.3 Company Search acceptance — comments + documents scope in the main
+/// search (§4C.3 scope expansion). An issue surfaces when a comment or linked
+/// document matches the query, with `matchedFields` + `countsByType` reflecting it.
+#[tokio::test]
+async fn company_search_comments_documents_matches_paperclip() {
+    let pool = connect_and_migrate().await;
+    let user = Uuid::new_v4();
+    let company_a = Uuid::new_v4();
+    let prefix_a = format!("CS{}", &company_a.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_a)
+        .bind("Search Scope Co A")
+        .bind(&prefix_a)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+
+    // Issue with NO title/description/identifier match for "parrotsearch".
+    let issue_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO issues (id, company_id, title, identifier, status, priority, description) \
+         VALUES ($1, $2, $3, $4, 'todo', 'medium', $5)",
+    )
+    .bind(issue_id)
+    .bind(company_a)
+    .bind("Plain task with no keyword")
+    .bind(format!("{}-1", prefix_a))
+    .bind("unrelated body")
+    .execute(&pool)
+    .await
+    .expect("insert issue");
+    // Comment containing the keyword.
+    sqlx::query(
+        "INSERT INTO issue_comments (id, company_id, issue_id, body, actor_type) \
+         VALUES ($1, $2, $3, $4, 'user')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(company_a)
+    .bind(issue_id)
+    .bind("customer mentioned parrotsearch in passing")
+    .execute(&pool)
+    .await
+    .expect("insert comment");
+    // Linked document containing the keyword (in content).
+    let doc_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO documents (id, company_id, title, content, content_type) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(doc_id)
+    .bind(company_a)
+    .bind("Runbook")
+    .bind("restart the parrotsearch service after deploy")
+    .bind("text/markdown")
+    .execute(&pool)
+    .await
+    .expect("insert document");
+    sqlx::query(
+        "INSERT INTO issue_documents (id, company_id, issue_id, document_id, key) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(company_a)
+    .bind(issue_id)
+    .bind(doc_id)
+    .bind("runbook")
+    .execute(&pool)
+    .await
+    .expect("link document");
+
+    let state = build_app_state(pool.clone()).await.expect("build_app_state");
+    let app = company_routes().with_state(state);
+    let board = board_actor(user, company_a);
+
+    // scope=all: the issue surfaces via comment + document, matchedFields has both.
+    let (status, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/search?q=parrotsearch", company_a),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resp = parse(&body);
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "one issue surfaces via comment+document");
+    let mf: Vec<String> = results[0]["matchedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(mf.contains(&"comment".to_string()), "matchedFields includes comment: {:?}", mf);
+    assert!(mf.contains(&"document".to_string()), "matchedFields includes document: {:?}", mf);
+    assert_eq!(resp["countsByType"]["issue"], json!(1));
+    assert_eq!(resp["countsByType"]["comment"], json!(1));
+    assert_eq!(resp["countsByType"]["document"], json!(1));
+
+    // scope=comments only: still surfaces (anySearchMatch is scope-independent),
+    // but the match is comment-derived.
+    let (_, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/search?q=parrotsearch&scope=comments", company_a),
+    )
+    .await;
+    let resp = parse(&body);
+    assert_eq!(resp["scope"], json!("comments"));
+    assert_eq!(resp["results"].as_array().unwrap().len(), 1);
+
+    // scope=issues only: comment/document matches excluded → empty.
+    let (_, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/search?q=parrotsearch&scope=issues", company_a),
+    )
+    .await;
+    let resp = parse(&body);
+    assert_eq!(resp["scope"], json!("issues"));
+    assert_eq!(resp["results"].as_array().unwrap().len(), 0, "scope=issues excludes comment/doc-only matches");
+
+    // Cleanup.
+    let _ = sqlx::query("DELETE FROM issue_documents WHERE company_id = $1").bind(company_a).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM documents WHERE company_id = $1").bind(company_a).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM issue_comments WHERE company_id = $1").bind(company_a).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM issues WHERE company_id = $1").bind(company_a).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1").bind(company_a).execute(&pool).await;
+}

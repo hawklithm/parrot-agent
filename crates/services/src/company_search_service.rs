@@ -46,6 +46,15 @@ impl CompanySearchScope {
                 | CompanySearchScope::Documents
         )
     }
+
+    /// 是否把评论/文档命中纳入候选（Paperclip: all/comments/documents 触发
+    /// commentMatches/documentMatches CTE），并据此把 issue 纳入结果。
+    pub fn includes_comments_or_documents(&self) -> bool {
+        matches!(
+            self,
+            CompanySearchScope::All | CompanySearchScope::Comments | CompanySearchScope::Documents
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +354,31 @@ impl CompanySearchService {
             }
         };
 
+        // 候选 WHERE 的 OR 命中条件：issue 文本匹配 +（作用域含 comments/documents 时）
+        // 评论/文档匹配的 EXISTS。Paperclip 的 anySearchMatch 不随 scope 收窄候选，
+        // 仅影响结果呈现，故 comment/document EXISTS 在 all/issues/comments/documents 作用域加入。
+        let mut match_conditions: Vec<String> = vec![
+            "issues.title ILIKE $2".to_string(),
+            "coalesce(issues.identifier,'') ILIKE $2".to_string(),
+            "coalesce(issues.description,'') ILIKE $2".to_string(),
+            "issues.title ILIKE ANY(string_to_array($3, ',')::text[])".to_string(),
+            "coalesce(issues.identifier,'') ILIKE ANY(string_to_array($3, ',')::text[])".to_string(),
+            "coalesce(issues.description,'') ILIKE ANY(string_to_array($3, ',')::text[])".to_string(),
+        ];
+        if query.scope.includes_comments_or_documents() {
+            match_conditions.push(
+                "EXISTS (SELECT 1 FROM issue_comments sc WHERE sc.company_id = $4 \
+                 AND sc.issue_id = issues.id AND sc.body ILIKE $7)".to_string(),
+            );
+            match_conditions.push(
+                "EXISTS (SELECT 1 FROM issue_documents idoc \
+                 INNER JOIN documents d ON d.id = idoc.document_id AND d.company_id = idoc.company_id \
+                 WHERE idoc.company_id = $4 AND idoc.issue_id = issues.id \
+                 AND (d.title ILIKE $7 OR d.content ILIKE $7))".to_string(),
+            );
+        }
+        let where_sql = match_conditions.join(" OR ");
+
         let sql = format!(
             "SELECT \
                 issues.id, issues.title, issues.identifier, \
@@ -353,14 +387,7 @@ impl CompanySearchService {
                 issues.updated_at, issues.created_at, issues.description \
              FROM issues \
              WHERE issues.company_id = $4 \
-               AND (\
-                 issues.title ILIKE $2 \
-                 OR coalesce(issues.identifier,'') ILIKE $2 \
-                 OR coalesce(issues.description,'') ILIKE $2 \
-                 OR issues.title ILIKE ANY(string_to_array($3, ',')::text[]) \
-                 OR coalesce(issues.identifier,'') ILIKE ANY(string_to_array($3, ',')::text[]) \
-                 OR coalesce(issues.description,'') ILIKE ANY(string_to_array($3, ',')::text[]) \
-               ) \
+               AND ({where_sql}) \
              ORDER BY {order_sql} \
              LIMIT $5 OFFSET $6",
         );
@@ -372,11 +399,49 @@ impl CompanySearchService {
             .bind(company_id)
             .bind(fetch_limit)
             .bind(query.offset)
+            .bind(&contains_pattern)
             .fetch_all(&self.pool)
             .await?;
 
         let has_more = rows.len() as i64 > query.limit;
         let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
+
+        // 评论/文档命中探测：对分页内的 issue 批量查询匹配的评论/文档，
+        // 用于补充 matchedFields 与 countsByType（对齐 Paperclip comment/document CTE）。
+        let mut comment_doc_hits: std::collections::HashMap<Uuid, (bool, bool)> =
+            std::collections::HashMap::new();
+        if query.scope.includes_comments_or_documents() && !page.is_empty() {
+            let page_ids: Vec<Uuid> = page.iter().map(|r| r.get::<Uuid, _>("id")).collect();
+            let crows = sqlx::query(
+                "SELECT DISTINCT issue_id FROM issue_comments \
+                 WHERE company_id = $1 AND issue_id = ANY($2) AND body ILIKE $3",
+            )
+            .bind(company_id)
+            .bind(&page_ids)
+            .bind(&contains_pattern)
+            .fetch_all(&self.pool)
+            .await?;
+            for r in crows {
+                let iid: Uuid = r.get("issue_id");
+                comment_doc_hits.entry(iid).or_insert((false, false)).0 = true;
+            }
+            let drows = sqlx::query(
+                "SELECT DISTINCT idoc.issue_id FROM issue_documents idoc \
+                 INNER JOIN documents d ON d.id = idoc.document_id AND d.company_id = idoc.company_id \
+                 WHERE idoc.company_id = $1 AND idoc.issue_id = ANY($2) \
+                 AND (d.title ILIKE $3 OR d.content ILIKE $3)",
+            )
+            .bind(company_id)
+            .bind(&page_ids)
+            .bind(&contains_pattern)
+            .fetch_all(&self.pool)
+            .await?;
+            for r in drows {
+                let iid: Uuid = r.get("issue_id");
+                comment_doc_hits.entry(iid).or_insert((false, false)).1 = true;
+            }
+        }
+
 
         let mut results = Vec::with_capacity(page.len());
         let mut counts: std::collections::HashMap<String, i64> =
@@ -421,6 +486,16 @@ impl CompanySearchService {
                 None => format!("/company/issues/{id}"),
             };
 
+            // 评论/文档命中补充 matchedFields（批量探测结果见 comment_doc_hits）。
+            if let Some((has_comment, has_doc)) = comment_doc_hits.get(&id) {
+                if *has_comment {
+                    matched_fields.push("comment".to_string());
+                }
+                if *has_doc {
+                    matched_fields.push("document".to_string());
+                }
+            }
+
             let updated_at_str = updated_at.to_rfc3339();
 
             let issue_summary = CompanySearchIssueSummary {
@@ -450,6 +525,14 @@ impl CompanySearchService {
                 preview_image_url: None,
             });
             *counts.entry("issue".to_string()).or_insert(0) += 1;
+            if let Some((has_comment, has_doc)) = comment_doc_hits.get(&id) {
+                if *has_comment {
+                    *counts.entry("comment".to_string()).or_insert(0) += 1;
+                }
+                if *has_doc {
+                    *counts.entry("document".to_string()).or_insert(0) += 1;
+                }
+            }
         }
 
         Ok(CompanySearchResponse {
