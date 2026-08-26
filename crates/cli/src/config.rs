@@ -4,6 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const DEFAULT_CONFIG_DIRECTORY: &str = "parrot";
+const DEFAULT_CONFIG_FILENAME: &str = "config";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliConfig {
     pub server_url: String,
@@ -13,10 +16,11 @@ pub struct CliConfig {
 
 impl CliConfig {
     pub fn load() -> Result<Self> {
-        Self::load_from(env::var_os("PARROT_CONFIG").map(PathBuf::from))
+        Self::load_from(None)
     }
 
     pub fn load_from(config_path: Option<PathBuf>) -> Result<Self> {
+        let config_path = resolve_config_path(config_path);
         let file_values = config_path
             .as_deref()
             .map(read_config_file)
@@ -63,6 +67,59 @@ impl CliConfig {
     }
 }
 
+/// Resolve CLI configuration in the same order used by the commands:
+/// explicit option, environment override, then the platform default.
+pub fn resolve_config_path(explicit_path: Option<PathBuf>) -> Option<PathBuf> {
+    resolve_config_path_from(
+        explicit_path,
+        env::var_os("PARROT_CONFIG").map(PathBuf::from),
+        default_config_path(),
+    )
+}
+
+pub fn default_config_path() -> Option<PathBuf> {
+    let appdata = env::var_os("APPDATA").map(PathBuf::from);
+    let xdg_config_home = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+
+    default_config_path_from(
+        cfg!(windows),
+        appdata.as_deref(),
+        xdg_config_home.as_deref(),
+        home.as_deref(),
+    )
+}
+
+fn resolve_config_path_from(
+    explicit_path: Option<PathBuf>,
+    environment_path: Option<PathBuf>,
+    fallback_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    explicit_path.or(environment_path).or(fallback_path)
+}
+
+fn default_config_path_from(
+    windows: bool,
+    appdata: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let base = if windows {
+        appdata.or(home).map(Path::to_path_buf)
+    } else {
+        xdg_config_home
+            .map(Path::to_path_buf)
+            .or_else(|| home.map(|path| path.join(".config")))
+    }?;
+
+    Some(
+        base.join(DEFAULT_CONFIG_DIRECTORY)
+            .join(DEFAULT_CONFIG_FILENAME),
+    )
+}
+
 fn read_config_file(path: &Path) -> Result<std::collections::BTreeMap<String, String>> {
     if !path.exists() {
         return Ok(std::collections::BTreeMap::new());
@@ -107,8 +164,11 @@ fn validate_server_url(value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_config_file, validate_server_url};
+    use super::{
+        default_config_path_from, read_config_file, resolve_config_path_from, validate_server_url,
+    };
     use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn accepts_http_and_https_urls() {
@@ -134,5 +194,54 @@ mod tests {
         let values = read_config_file(&path).unwrap();
         assert_eq!(values.get("server_url").unwrap(), "https://example.test");
         assert_eq!(values.get("api_token").unwrap(), "abc=def");
+    }
+
+    #[test]
+    fn resolves_explicit_environment_and_default_paths_in_order() {
+        let explicit = PathBuf::from("explicit/config");
+        let environment = PathBuf::from("environment/config");
+        let fallback = PathBuf::from("default/config");
+
+        assert_eq!(
+            resolve_config_path_from(
+                Some(explicit.clone()),
+                Some(environment.clone()),
+                Some(fallback.clone()),
+            ),
+            Some(explicit),
+        );
+        assert_eq!(
+            resolve_config_path_from(None, Some(environment.clone()), Some(fallback.clone())),
+            Some(environment),
+        );
+        assert_eq!(
+            resolve_config_path_from(None, None, Some(fallback.clone())),
+            Some(fallback),
+        );
+    }
+
+    #[test]
+    fn derives_platform_default_config_paths_without_process_environment() {
+        let appdata = Path::new("appdata");
+        let xdg = Path::new("xdg");
+        let home = Path::new("home");
+
+        assert_eq!(
+            default_config_path_from(true, Some(appdata), Some(xdg), Some(home)),
+            Some(PathBuf::from("appdata").join("parrot").join("config")),
+        );
+        assert_eq!(
+            default_config_path_from(false, Some(appdata), Some(xdg), Some(home)),
+            Some(PathBuf::from("xdg").join("parrot").join("config")),
+        );
+        assert_eq!(
+            default_config_path_from(false, None, None, Some(home)),
+            Some(
+                PathBuf::from("home")
+                    .join(".config")
+                    .join("parrot")
+                    .join("config"),
+            ),
+        );
     }
 }

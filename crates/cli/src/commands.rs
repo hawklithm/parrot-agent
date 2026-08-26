@@ -1,7 +1,10 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-use crate::{backup, checks, config::CliConfig};
+use crate::{
+    backup, checks,
+    config::{resolve_config_path, CliConfig},
+};
 
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -27,7 +30,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
 
 fn print_help() -> Result<()> {
     println!(
-        "parrot {}\n\nUsage:\n  parrot --version\n  parrot doctor [--config PATH] [--json]\n  parrot configure --server-url URL [--api-token TOKEN] [--config PATH]\n  parrot db-backup [--connection-string URL] [--dir PATH] [--retention-days N] [--json]\n  parrot help\n\nEnvironment:\n  PARROT_SERVER_URL  Server base URL (default: http://localhost:3100)\n  PARROT_API_TOKEN   Optional API token; environment overrides config file\n  PARROT_CONFIG      Optional config file path",
+        "parrot {}\n\nUsage:\n  parrot --version\n  parrot doctor [--config PATH] [--json]\n  parrot configure --server-url URL [--api-token TOKEN] [--config PATH]\n  parrot db-backup [--connection-string URL] [--dir PATH] [--retention-days N] [--json]\n  parrot help\n\nEnvironment:\n  PARROT_SERVER_URL  Server base URL (default: http://localhost:3100)\n  PARROT_API_TOKEN   Optional API token; environment overrides config file\n  PARROT_CONFIG      Optional config file path; otherwise a platform default is used",
         env!("CARGO_PKG_VERSION")
     );
     Ok(())
@@ -59,7 +62,7 @@ fn parse_doctor_args(args: &[String]) -> Result<(Option<PathBuf>, bool)> {
 fn configure(args: &[String]) -> Result<()> {
     let mut server_url = None;
     let mut api_token = None;
-    let mut config_path = std::env::var_os("PARROT_CONFIG").map(PathBuf::from);
+    let mut config_path = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -74,8 +77,8 @@ fn configure(args: &[String]) -> Result<()> {
         }
         index += 2;
     }
-    let path =
-        config_path.ok_or_else(|| anyhow::anyhow!("--config or PARROT_CONFIG is required"))?;
+    let path = resolve_config_path(config_path)
+        .ok_or_else(|| anyhow::anyhow!("unable to determine a config path; pass --config"))?;
     let url = server_url.unwrap_or_else(|| "http://localhost:3100".to_owned());
     let config = CliConfig {
         server_url: url,
