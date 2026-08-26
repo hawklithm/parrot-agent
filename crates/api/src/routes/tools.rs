@@ -1920,15 +1920,135 @@ async fn create_gateway_session(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GatewaySessionRevokeScope {
+    company_id: Uuid,
+    agent_id: Option<Uuid>,
+    run_id: Option<Uuid>,
+}
+
+fn gateway_session_revoke_scope(
+    actor: &AuthorizationActor,
+    body: Option<&Value>,
+) -> Result<GatewaySessionRevokeScope, (StatusCode, Json<Value>)> {
+    match actor {
+        AuthorizationActor::Board { .. } => {
+            let company_id = body
+                .and_then(|value| value.get("companyId"))
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok());
+            let Some(company_id) = company_id else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "companyId is required",
+                        "reasonCode": "company_required"
+                    })),
+                ));
+            };
+            Ok(GatewaySessionRevokeScope {
+                company_id,
+                agent_id: None,
+                run_id: None,
+            })
+        }
+        AuthorizationActor::Agent {
+            company_id,
+            agent_id,
+            run_id,
+            ..
+        } => Ok(GatewaySessionRevokeScope {
+            company_id: *company_id,
+            agent_id: Some(*agent_id),
+            run_id: *run_id,
+        }),
+        AuthorizationActor::None => Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Board or agent authentication required",
+                "reasonCode": "authentication_required"
+            })),
+        )),
+    }
+}
+
 async fn revoke_gateway_session(
     Path(session_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    body: Option<Json<Value>>,
 ) -> impl IntoResponse {
-    let updated = sqlx::query(
-        "UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW()
-          WHERE id = $1 AND revoked_at IS NULL RETURNING id, revoked_at",
+    let body = body.map(|Json(value)| value);
+    let scope = match gateway_session_revoke_scope(&actor, body.as_ref()) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    if crate::routes::assert_company_access(&actor, scope.company_id, false).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Company access denied",
+                "reasonCode": "company_access_denied"
+            })),
+        );
+    }
+
+    // Keep the company lookup separate from the agent scope check so a caller
+    // cannot use a session UUID to revoke another run's session while still
+    // preserving Paperclip's wrong-company not-found behavior.
+    let existing = sqlx::query(
+        "SELECT agent_id, run_id
+           FROM tool_gateway_sessions
+          WHERE id = $1 AND company_id = $2",
     )
     .bind(session_id)
+    .bind(scope.company_id)
+    .fetch_optional(&state.pool)
+    .await;
+    let existing = match existing {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Tool gateway session not found",
+                    "reasonCode": "session_not_found"
+                })),
+            )
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+        }
+    };
+    if let Some(agent_id) = scope.agent_id {
+        let existing_agent_id: Uuid = existing.get("agent_id");
+        let existing_run_id: Uuid = existing.get("run_id");
+        if existing_agent_id != agent_id
+            || scope
+                .run_id
+                .is_some_and(|run_id| existing_run_id != run_id)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Tool gateway session is outside the authenticated agent scope",
+                    "reasonCode": "session_scope_mismatch"
+                })),
+            );
+        }
+    }
+
+    // Updating an already revoked row is intentionally idempotent, matching
+    // Paperclip's service behavior and avoiding a race-dependent 404.
+    let updated = sqlx::query(
+        "UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW()
+          WHERE id = $1 AND company_id = $2 RETURNING id, revoked_at",
+    )
+    .bind(session_id)
+    .bind(scope.company_id)
     .fetch_optional(&state.pool)
     .await;
     match updated {
@@ -1941,7 +2061,10 @@ async fn revoke_gateway_session(
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Tool gateway session not found"})),
+            Json(serde_json::json!({
+                "error": "Tool gateway session not found",
+                "reasonCode": "session_not_found"
+            })),
         ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5352,6 +5475,57 @@ mod tests {
                 &["issueId"]
             ),
             serde_json::json!({"title": "t"})
+        );
+    }
+
+    #[test]
+    fn gateway_session_revoke_scope_requires_board_company_and_uses_agent_context() {
+        let company_id = Uuid::new_v4();
+        let board = AuthorizationActor::board(Uuid::new_v4(), company_id);
+        let board_scope = gateway_session_revoke_scope(
+            &board,
+            Some(&serde_json::json!({"companyId": company_id})),
+        )
+        .expect("board company should resolve");
+        assert_eq!(
+            board_scope,
+            GatewaySessionRevokeScope {
+                company_id,
+                agent_id: None,
+                run_id: None,
+            }
+        );
+
+        let agent_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+        let agent_scope = gateway_session_revoke_scope(&agent, None)
+            .expect("agent scope should come from authentication context");
+        assert_eq!(
+            agent_scope,
+            GatewaySessionRevokeScope {
+                company_id,
+                agent_id: Some(agent_id),
+                run_id: Some(run_id),
+            }
+        );
+
+        let (status, Json(error)) = gateway_session_revoke_scope(&board, None).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error["reasonCode"],
+            Value::String("company_required".to_string())
+        );
+    }
+
+    #[test]
+    fn anonymous_gateway_session_revoke_is_forbidden() {
+        let (status, Json(error)) =
+            gateway_session_revoke_scope(&AuthorizationActor::none(), None).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error["reasonCode"],
+            Value::String("authentication_required".to_string())
         );
     }
 }
