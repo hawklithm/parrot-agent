@@ -19,6 +19,11 @@ pub trait RoutineRepository: Send + Sync {
 
     async fn create_run(&self, run: RoutineRun) -> RepositoryResult<RoutineRun>;
     async fn get_run(&self, run_id: Uuid) -> RepositoryResult<Option<RoutineRun>>;
+    async fn find_run_by_idempotency_key(
+        &self,
+        routine_id: Uuid,
+        idempotency_key: &str,
+    ) -> RepositoryResult<Option<RoutineRun>>;
     async fn list_runs(&self, routine_id: Uuid, limit: i64) -> RepositoryResult<Vec<RoutineRun>>;
     async fn update_run(&self, run: RoutineRun) -> RepositoryResult<RoutineRun>;
 }
@@ -253,6 +258,28 @@ impl RoutineRepository for PostgresRoutineRepository {
                FROM routine_runs WHERE id = $1"#
         )
         .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(run)
+    }
+
+    async fn find_run_by_idempotency_key(
+        &self,
+        routine_id: Uuid,
+        idempotency_key: &str,
+    ) -> RepositoryResult<Option<RoutineRun>> {
+        let run = sqlx::query_as::<_, RoutineRun>(
+            r#"SELECT id, company_id, routine_id, trigger_id, source, status, triggered_at,
+                      routine_revision_id, idempotency_key, trigger_payload, dispatch_fingerprint,
+                      linked_issue_id, coalesced_into_run_id, failure_reason, completed_at,
+                      created_at, updated_at
+               FROM routine_runs
+               WHERE routine_id = $1 AND idempotency_key = $2
+               ORDER BY created_at ASC
+               LIMIT 1"#,
+        )
+        .bind(routine_id)
+        .bind(idempotency_key)
         .fetch_optional(&self.pool)
         .await?;
         Ok(run)

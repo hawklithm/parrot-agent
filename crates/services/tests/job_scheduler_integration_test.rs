@@ -7,13 +7,15 @@
 //! 4. 乐观锁防止重复触发
 
 use services::{
-    JobScheduler, RoutineCronTrigger, RoutineExecutionService, RoutineServiceImpl, ScheduledJob,
+    DispatchRoutineRunInput, JobScheduler, RoutineCronTrigger, RoutineExecutionService,
+    RoutineRunSource, RoutineServiceImpl, ScheduledJob,
 };
 use repositories::RoutineRepository;
 use std::sync::Arc;
 use sqlx::PgPool;
 use chrono::Utc;
 use tokio::sync::Mutex as AsyncMutex;
+use std::collections::HashMap;
 
 // 三个调度器测试共享 routine_triggers/routines/routine_runs 表且各自 DELETE ALL 清理，
 // 必须串行执行以避免并行竞态（一个测试的清理误删另一个测试正在派发的触发器）。
@@ -105,7 +107,7 @@ async fn test_routine_cron_trigger_basic() {
     let routine_execution_service = Arc::new(RoutineExecutionService::new(Arc::new(
         RoutineServiceImpl::new(routine_repo),
     )));
-    let cron_trigger = RoutineCronTrigger::new(pool.clone(), routine_execution_service);
+    let cron_trigger = RoutineCronTrigger::new(pool.clone(), routine_execution_service.clone());
     
     // 执行触发
     let result = cron_trigger.execute().await;
@@ -139,6 +141,50 @@ async fn test_routine_cron_trigger_basic() {
         dispatch_fingerprint.is_some(),
         "scheduled run should carry a dispatch_fingerprint (dispatch path aligned)"
     );
+
+    let idempotency_key = format!("routine-dispatch-test:{}", routine_id);
+    let mut variables = HashMap::new();
+    variables.insert("channel".to_string(), "test".to_string());
+    let first_manual = routine_execution_service
+        .dispatch_routine_run(DispatchRoutineRunInput {
+            routine_id,
+            trigger_id: Some(trigger_id),
+            source: RoutineRunSource::Api,
+            payload: Some(serde_json::json!({"message": "hello"})),
+            variables: Some(variables),
+            idempotency_key: Some(idempotency_key.clone()),
+            project_id: None,
+            assignee_agent_id: None,
+            actor_user_id: None,
+            actor_agent_id: None,
+        })
+        .await
+        .expect("manual dispatch should succeed");
+    let second_manual = routine_execution_service
+        .dispatch_routine_run(DispatchRoutineRunInput {
+            routine_id,
+            trigger_id: Some(trigger_id),
+            source: RoutineRunSource::Api,
+            payload: Some(serde_json::json!({"message": "different"})),
+            variables: None,
+            idempotency_key: Some(idempotency_key.clone()),
+            project_id: None,
+            assignee_agent_id: None,
+            actor_user_id: None,
+            actor_agent_id: None,
+        })
+        .await
+        .expect("replayed manual dispatch should succeed");
+    assert_eq!(first_manual.id, second_manual.id, "idempotent dispatch should reuse its run");
+    let (stored_key, stored_payload): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+        "SELECT idempotency_key, trigger_payload FROM routine_runs WHERE id = $1",
+    )
+    .bind(first_manual.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored_key.as_deref(), Some(idempotency_key.as_str()));
+    assert_eq!(stored_payload, Some(serde_json::json!({"message": "hello", "channel": "test"})));
     
     // 验证 trigger 的 next_run_at 已更新
     let updated_next_run: chrono::DateTime<Utc> = sqlx::query_scalar(
@@ -252,6 +298,14 @@ async fn test_routine_catch_up_policy() {
 
     // 2 小时 / 5 分钟 ≈ 24 次，应该全部补发（上限 25）
     assert!(run_count >= 20 && run_count <= 25, "Should catch up multiple runs (got {})", run_count);
+    let coalesced_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM routine_runs WHERE routine_id = $1 AND status = 'coalesced'",
+    )
+    .bind(routine_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(coalesced_count > 0, "catch-up dispatch should coalesce against the queued run");
 
     pool.close().await;
 }

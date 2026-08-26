@@ -3,7 +3,8 @@
 //! 验证 JobScheduler 是否正常工作的示例程序
 //! 运行: cargo run --example verify_scheduler
 
-use services::{JobScheduler, RoutineCronTrigger, RoutineExecutionService};
+use services::{JobScheduler, RoutineCronTrigger, RoutineExecutionService, RoutineServiceImpl};
+use repositories::RoutineRepository;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,8 +35,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 创建 scheduler
     let scheduler = Arc::new(JobScheduler::new());
 
-    // 创建 RoutineCronTrigger
-    let routine_service = Arc::new(RoutineExecutionService::new(pool.clone()));
+    // RoutineExecutionService dispatches scheduled triggers through RoutineService
+    // (concurrency policy, idempotency, dispatch fingerprint).
+    let routine_repo: Arc<dyn RoutineRepository> =
+        Arc::new(repositories::routine_repository::PostgresRoutineRepository::new(pool.clone()));
+    let routine_service = Arc::new(RoutineExecutionService::new(Arc::new(
+        RoutineServiceImpl::new(routine_repo),
+    )));
     let routine_trigger = RoutineCronTrigger::new(pool.clone(), routine_service);
     
     scheduler.register(Arc::new(routine_trigger)).await;

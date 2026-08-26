@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::RoutineService;
+use crate::{RoutineFireOptions, RoutineService};
 use models::routine::{RunSource, RoutineRun};
 
 /// Routine run source
@@ -70,9 +70,19 @@ impl RoutineExecutionService {
             RoutineRunSource::Api => RunSource::Manual,
             RoutineRunSource::Webhook => RunSource::Webhook,
         };
-        let trigger_id = input.trigger_id.unwrap_or_else(Uuid::nil);
         self.routine_service
-            .fire_routine(input.routine_id, trigger_id, source)
+            .fire_routine_with_options(
+                input.routine_id,
+                RoutineFireOptions {
+                    trigger_id: input.trigger_id,
+                    source,
+                    payload: input.payload,
+                    variables: input.variables,
+                    idempotency_key: input.idempotency_key,
+                    project_id: input.project_id,
+                    assignee_agent_id: input.assignee_agent_id,
+                },
+            )
             .await
             .map_err(|e| AppError::Internal(format!("Failed to dispatch routine run: {}", e)))
     }

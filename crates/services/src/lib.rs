@@ -170,7 +170,7 @@ pub mod secret_provider_service;
 pub mod user_secret_service;
 pub mod workspace_operation_service;
 pub mod workspace_service;
-pub use routine_service::{RoutineService, RoutineServiceImpl};
+pub use routine_service::{RoutineFireOptions, RoutineService, RoutineServiceImpl};
 pub mod event_listeners;
 pub mod goal_service;
 pub mod plugin_tool_dispatcher_enhanced;
