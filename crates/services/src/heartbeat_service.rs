@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use crate::text_utils::truncate_suffix_chars;
 use crate::sse_service::{InMemorySseService, SseService};
+use crate::secret_service::RuntimeSecretManifestEntry;
 use chrono::{DateTime, Utc};
 use models::{Agent, AgentStatus, SseEvent, SseEventType};
 use serde::{Deserialize, Serialize};
@@ -285,6 +286,7 @@ struct AdapterCommandOutput {
     stderr: String,
     resumed_session_id: Option<String>,
     billing_type: String,
+    runtime_secret_manifest: Vec<RuntimeSecretManifestEntry>,
 }
 
 /// Read the structured result records emitted by Claude/Codex JSONL modes.
@@ -1654,6 +1656,7 @@ impl DefaultHeartbeatService {
                         stderr: String::new(),
                         resumed_session_id: None,
                         billing_type: "unknown".to_string(),
+                        runtime_secret_manifest: Vec::new(),
                     },
                     outcome,
                 )
@@ -1677,6 +1680,7 @@ impl DefaultHeartbeatService {
             "adapterType": adapter_type,
             "biller": resolve_biller(&adapter_type, outcome.provider.as_deref()),
             "billingType": output.billing_type.clone(),
+            "secretManifest": output.runtime_secret_manifest.clone(),
             "sessionRecovery": session_recovery,
             "sessionRecoverySession": session_recovery_session,
             "stdout": output.stdout,
@@ -1887,6 +1891,7 @@ impl DefaultHeartbeatService {
         let default_config = load_default_adapter_config(adapter);
         let merged_config = merge_adapter_config(db_config, default_config);
         let mut runtime_secret_paths = HashSet::new();
+        let mut runtime_secret_manifest = Vec::new();
         let cfg = if let Some(resolver) = &self.runtime_secret_resolver {
             let responsible_user = sqlx::query_scalar::<_, String>(
                 "SELECT responsible_user_id::text
@@ -1910,6 +1915,7 @@ impl DefaultHeartbeatService {
                 .await
                 .map_err(|error| format!("runtime credential resolution failed: {error}"))?;
             runtime_secret_paths.extend(resolved.secret_keys);
+            runtime_secret_manifest = resolved.manifest;
             resolved.config
         } else {
             merged_config
@@ -2025,6 +2031,7 @@ impl DefaultHeartbeatService {
                         stderr: String::new(),
                         resumed_session_id: None,
                         billing_type: "api".to_string(),
+                        runtime_secret_manifest,
                     });
                 }
                 if is_retryable_provider_status(status) && retry_count < max_retries {
@@ -2538,6 +2545,7 @@ impl DefaultHeartbeatService {
             } else {
                 "custom".to_string()
             },
+            runtime_secret_manifest,
         })
     }
 }
@@ -3858,6 +3866,7 @@ mod adapter_outcome_tests {
             stderr: String::new(),
             resumed_session_id: Some("thread-44".to_string()),
             billing_type: "subscription".to_string(),
+            runtime_secret_manifest: Vec::new(),
         };
         assert!(is_codex_unknown_session_output(&structured));
 
@@ -3867,6 +3876,7 @@ mod adapter_outcome_tests {
             stderr: "state db missing rollout path for thread thread-45".to_string(),
             resumed_session_id: Some("thread-45".to_string()),
             billing_type: "subscription".to_string(),
+            runtime_secret_manifest: Vec::new(),
         };
         assert!(is_codex_unknown_session_output(&plain));
 
@@ -3877,6 +3887,7 @@ mod adapter_outcome_tests {
             stderr: String::new(),
             resumed_session_id: Some("thread-46".to_string()),
             billing_type: "subscription".to_string(),
+            runtime_secret_manifest: Vec::new(),
         };
         assert!(!is_codex_unknown_session_output(&successful));
     }

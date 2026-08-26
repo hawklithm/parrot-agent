@@ -120,6 +120,7 @@ pub struct SecretReference {
 
 /// 运行时密钥清单条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeSecretManifestEntry {
     pub config_path: String,
     pub env_key: Option<String>,
