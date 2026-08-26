@@ -389,10 +389,23 @@ impl CompanySearchService {
             .collect();
 
         // 模糊匹配开关：对齐 Paperclip MIN_FUZZY_QUERY_LENGTH=4 且无 LIKE 通配符。
-        // 仅对 identifier 做 pg_trgm similarity（精确对齐 Paperclip fuzzyIdentifierMatch）；
-        // 标题模糊为 Levenshtein 分词方案，本阶段以 trigram 近似，避免过度噪声故仅 identifier。
+        // identifier 用 pg_trgm similarity（阈值 0.45）；标题用 Levenshtein 分词
+        // （levenshtein_less_equal，需 fuzzystrmatch 扩展，幂等创建）。
         let fuzzy_enabled = normalized_query.len() >= 4 && !normalized_query.contains(['\\', '%', '_']);
         const FUZZY_IDENTIFIER_SIMILARITY_THRESHOLD: f64 = 0.45;
+        // 标题模糊候选 token：≥4 字符（对齐 Paperclip MIN_FUZZY_TOKEN_LENGTH）。
+        let fuzzy_tokens: Vec<String> = tokens
+            .iter()
+            .filter(|t| t.len() >= 4)
+            .cloned()
+            .collect();
+        let fuzzy_tokens_enabled = fuzzy_enabled && !fuzzy_tokens.is_empty();
+        if fuzzy_tokens_enabled {
+            // CREATE EXTENSION 不能在事务块内执行；sqlx::query().execute 默认 autocommit。
+            sqlx::query("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
+                .execute(&self.pool)
+                .await?;
+        }
 
 
         let scope_includes_issues = query.scope.includes_issues();
@@ -476,6 +489,30 @@ impl CompanySearchService {
                 "similarity(lower(coalesce(issues.identifier,'')), $8) >= 0.45".to_string(),
             );
         }
+        if fuzzy_tokens_enabled {
+            // 对齐 Paperclip fuzzyTokenTitleMatch：每个模糊 token 需在标题分词中
+            // 有 levenshtein_less_equal 命中的词（≥6 字符 2 编辑、≥5 字符 1 编辑、否则 0）。
+            match_conditions.push(
+                "coalesce(( \
+                   SELECT bool_and( \
+                     EXISTS ( \
+                       SELECT 1 FROM regexp_split_to_table(lower(issues.title), '[^a-z0-9]+') AS title_word(value) \
+                       WHERE length(title_word.value) >= 4 \
+                         AND levenshtein_less_equal(qt.value, title_word.value, \
+                           CASE \
+                             WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
+                             WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
+                             ELSE 0 END \
+                         ) <= CASE \
+                           WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
+                           WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
+                           ELSE 0 END \
+                     ) \
+                   ) \
+                   FROM unnest($9) AS qt(value) \
+                 ), false)".to_string(),
+            );
+        }
         if query.scope.includes_comments_or_documents() {
             match_conditions.push(
                 "EXISTS (SELECT 1 FROM issue_comments sc WHERE sc.company_id = $4 \
@@ -496,12 +533,35 @@ impl CompanySearchService {
                 issues.status::text, issues.priority::text, \
                 issues.assignee_agent_id, issues.assignee_user_id, issues.project_id, \
                 issues.updated_at, issues.created_at, issues.description, \
-                similarity(lower(coalesce(issues.identifier,'')), $8)::double precision AS ident_sim \
+                similarity(lower(coalesce(issues.identifier,'')), $8)::double precision AS ident_sim, \
+                {fuzzy_title_expr} AS fuzzy_title \
              FROM issues \
              WHERE issues.company_id = $4 \
                AND ({where_sql}) \
              ORDER BY {order_sql} \
              LIMIT $5 OFFSET $6",
+            fuzzy_title_expr = if fuzzy_tokens_enabled {
+                "coalesce(( \
+                   SELECT bool_and( \
+                     EXISTS ( \
+                       SELECT 1 FROM regexp_split_to_table(lower(issues.title), '[^a-z0-9]+') AS title_word(value) \
+                       WHERE length(title_word.value) >= 4 \
+                         AND levenshtein_less_equal(qt.value, title_word.value, \
+                           CASE \
+                             WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
+                             WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
+                             ELSE 0 END \
+                         ) <= CASE \
+                           WHEN least(length(qt.value), length(title_word.value)) >= 6 THEN 2 \
+                           WHEN least(length(qt.value), length(title_word.value)) >= 5 THEN 1 \
+                           ELSE 0 END \
+                     ) \
+                   ) \
+                   FROM unnest($9) AS qt(value) \
+                 ), false)"
+            } else {
+                "false"
+            }
         );
         // 评论/文档命中探测：对分页内的 issue 批量查询匹配的评论/文档原文，
         // 用于补充 matchedFields / countsByType / snippets（对齐 Paperclip comment/document CTE）。
@@ -509,7 +569,7 @@ impl CompanySearchService {
             Uuid,
             (Option<String>, Option<(String, String)>),
         > = std::collections::HashMap::new();
-        let rows = sqlx::query(&sql)
+        let mut q = sqlx::query(&sql)
             .bind(&normalized_query)
             .bind(&title_phrase)
             .bind(&token_any)
@@ -517,9 +577,12 @@ impl CompanySearchService {
             .bind(fetch_limit)
             .bind(query.offset)
             .bind(&contains_pattern)
-            .bind(&normalized_query)
-            .fetch_all(&self.pool)
-            .await?;
+            .bind(&normalized_query);
+        // $9 仅在模糊 token 启用时被引用；未引用时绑定会导致参数数量不匹配。
+        if fuzzy_tokens_enabled {
+            q = q.bind(&fuzzy_tokens);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
 
         let mut has_more = rows.len() as i64 > query.limit;
         let page = if has_more { &rows[..rows.len() - 1] } else { &rows[..] };
@@ -600,6 +663,13 @@ impl CompanySearchService {
                     matched_fields.push("identifier".to_string());
                 }
             }
+            if fuzzy_tokens_enabled {
+                let fuzzy_title: bool = row.try_get("fuzzy_title").unwrap_or(false);
+                if fuzzy_title && !matched_fields.contains(&"title".to_string()) {
+                    score += 5.0;
+                    matched_fields.push("title".to_string());
+                }
+            }
             if let Some(desc) = row.try_get::<String, _>("description").ok() {
                 if desc.to_lowercase().contains(&normalized_query) {
                     score += 2.0;
@@ -632,6 +702,11 @@ impl CompanySearchService {
             // 标题/描述命中也生成 snippet（对齐 Paperclip selectPrimarySnippets 优先级）。
             if title.to_lowercase().contains(&normalized_query) {
                 snippet_sources.push(("title".to_string(), "Title".to_string(), title.clone()));
+            } else if fuzzy_tokens_enabled {
+                let fuzzy_title: bool = row.try_get("fuzzy_title").unwrap_or(false);
+                if fuzzy_title {
+                    snippet_sources.push(("title".to_string(), "Title".to_string(), title.clone()));
+                }
             }
             if let Some(desc) = row.try_get::<String, _>("description").ok() {
                 if desc.to_lowercase().contains(&normalized_query) {
@@ -740,6 +815,8 @@ impl CompanySearchService {
                 &token_any,
                 &contains_pattern,
                 &normalized_query,
+                &fuzzy_tokens,
+                fuzzy_tokens_enabled,
             )
             .await?;
 
@@ -770,15 +847,17 @@ impl CompanySearchService {
         token_any: &str,
         contains_pattern: &str,
         normalized_query: &str,
+        fuzzy_tokens: &[String],
+        fuzzy_tokens_enabled: bool,
     ) -> Result<CompanySearchFilterOptionCounts, sqlx::Error> {
         // 重编号 where_sql 参数占位符（从高到低避免二次替换）：
-        // $8->$5, $7->$4, $4->$3, $3->$2, $2->$1
+        // $9->$6, $8->$5, $7->$4, $4->$3, $3->$2, $2->$1
         // 用哨兵占位符防止级联二次替换（$4->$3 后再被 $3->$2 命中）。
         let mut ws = where_sql.to_string();
-        for (from, to) in [("$8", "$5"), ("$7", "$4"), ("$4", "$3"), ("$3", "$2"), ("$2", "$1")] {
+        for (from, to) in [("$9", "$6"), ("$8", "$5"), ("$7", "$4"), ("$4", "$3"), ("$3", "$2"), ("$2", "$1")] {
             ws = ws.replace(from, &format!("\u{0}{}", to.trim_start_matches('$')));
         }
-        for n in 1..=5 {
+        for n in 1..=6 {
             ws = ws.replace(&format!("\u{0}{}", n), &format!("${}", n));
         }
         // 候选条件引用 `issues.` 表名；facet 查询以 `i` 为别名，需整体替换。
@@ -821,22 +900,23 @@ impl CompanySearchService {
             .bind(company_id);       // $3
         // Postgres 参数编号必须连续到最高引用位：where_sql 可能引用 $5 而不引用 $4
         // （模糊开、评论/文档 EXISTS 关），此时 $4 位置仍需占位绑定。
-        let max_param = if ws.contains("$5") {
+        let max_param = if ws.contains("$6") {
+            6
+        } else if ws.contains("$5") {
             5
         } else if ws.contains("$4") {
             4
         } else {
             3
         };
-        let mut q = sqlx::query(&sql)
-            .bind(title_phrase)      // $1（原 $2）
-            .bind(token_any)         // $2（原 $3）
-            .bind(company_id);       // $3
         if max_param >= 4 {
             q = q.bind(contains_pattern); // $4（原 $7；未引用时占位）
         }
         if max_param >= 5 {
             q = q.bind(normalized_query); // $5（原 $8）
+        }
+        if max_param >= 6 {
+            q = q.bind(fuzzy_tokens);     // $6（原 $9；仅模糊 token 启用时引用）
         }
         let rows = q.fetch_all(&self.pool).await?;
         let mut out = CompanySearchFilterOptionCounts::default();

@@ -680,3 +680,71 @@ async fn company_search_agents_projects_matches_paperclip() {
     let _ = sqlx::query("DELETE FROM companies WHERE id = $1").bind(company_a).execute(&pool).await;
 }
 
+/// #4C.3 Company Search acceptance — fuzzy title match via levenshtein_less_equal
+/// (§4C.3 slice 9). Typo query `serach` (1 edit from "search", word length >= 6
+/// -> max 2 edits) surfaces an issue whose title contains "Search" even though
+/// `serach` is not a literal substring. Requires fuzzystrmatch extension.
+#[tokio::test]
+async fn company_search_fuzzy_title_matches_paperclip() {
+    let pool = connect_and_migrate().await;
+    let user = Uuid::new_v4();
+    let company_a = Uuid::new_v4();
+    let prefix_a = format!("FT{}", &company_a.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_a)
+        .bind("Fuzzy Title Co")
+        .bind(&prefix_a)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+
+    let issue_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO issues (id, company_id, title, identifier, status, priority, description) \
+         VALUES ($1, $2, $3, $4, 'todo', 'medium', $5)",
+    )
+    .bind(issue_id)
+    .bind(company_a)
+    .bind("Search results broken on mobile")
+    .bind(format!("{}-1", prefix_a))
+    .bind("unrelated description body")
+    .execute(&pool)
+    .await
+    .expect("insert issue");
+
+    let state = build_app_state(pool.clone()).await.expect("build_app_state");
+    let app = company_routes().with_state(state);
+    let board = board_actor(user, company_a);
+
+    // `serach` 不是 "Search results..." 的字面子串，但 levenshtein("serach","search")=1
+    // 且词长 6 >= FUZZY_PAIR_LONG_LENGTH → 允许 2 编辑 → 命中标题模糊。
+    let (status, body) = send(
+        &app,
+        &board,
+        "GET",
+        &format!("/companies/{}/search?q=serach", company_a),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resp = parse(&body);
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "fuzzy title match surfaces the issue");
+    let mf: Vec<String> = results[0]["matchedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(mf.contains(&"title".to_string()), "matchedFields includes title via fuzzy: {:?}", mf);
+    assert!(results[0]["snippet"].is_string(), "title snippet set for fuzzy match");
+    assert!(
+        results[0]["snippet"].as_str().unwrap().to_lowercase().contains("search"),
+        "snippet text from title: {:?}",
+        results[0]["snippet"]
+    );
+
+    // Cleanup.
+    let _ = sqlx::query("DELETE FROM issues WHERE company_id = $1").bind(company_a).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1").bind(company_a).execute(&pool).await;
+}
+
