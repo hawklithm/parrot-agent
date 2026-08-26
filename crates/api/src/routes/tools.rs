@@ -2686,7 +2686,11 @@ async fn mcp_session_protocol_json(
                     Some(session_id),
                 );
             }
-            let call_body = serde_json::json!({"tool":name,"parameters":params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}))});
+            let call_body = serde_json::json!({
+                "tool": name,
+                "parameters": params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({})),
+                "idempotencyKey": params.get("idempotencyKey").cloned().unwrap_or(Value::Null)
+            });
             let (status, Json(value)) =
                 call_gateway_tool(State(state), headers, Json(call_body)).await;
             if !status.is_success() {
@@ -4061,6 +4065,424 @@ async fn call_paperclip_builtin_tool(
     Ok(value)
 }
 
+enum GatewayInvocationReservation {
+    Created { invocation_id: Uuid },
+    Replayed((StatusCode, Json<Value>)),
+}
+
+enum GatewayApprovalReservation {
+    Created {
+        invocation_id: Uuid,
+        action_id: Uuid,
+    },
+    Replayed((StatusCode, Json<Value>)),
+}
+
+fn gateway_idempotency_key(
+    headers: &HeaderMap,
+    body: &Value,
+) -> Result<Option<String>, (StatusCode, Json<Value>)> {
+    let raw = if let Some(value) = body.get("idempotencyKey") {
+        if value.is_null() {
+            return Ok(None);
+        }
+        let Some(raw) = value.as_str() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "idempotencyKey must be a string or null",
+                    "reasonCode": "invalid_idempotency_key"
+                })),
+            ));
+        };
+        raw.to_string()
+    } else {
+        let Some(raw) = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Ok(None);
+        };
+        raw.to_string()
+    };
+    let key = raw.trim();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    if key.len() > 255 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "idempotencyKey must be at most 255 characters",
+                "reasonCode": "invalid_idempotency_key"
+            })),
+        ));
+    }
+    Ok(Some(key.to_string()))
+}
+
+async fn replay_gateway_invocation(
+    state: &AppState,
+    row: sqlx::postgres::PgRow,
+    requested_tool_name: &str,
+    requested_arguments_hash: &str,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let invocation_id: Uuid = row.get("id");
+    let stored_tool_name: String = row.get("tool_name");
+    if stored_tool_name != requested_tool_name {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Idempotency key was already used for a different tool",
+                "reasonCode": "idempotency_key_reused",
+                "invocationId": invocation_id
+            })),
+        ));
+    }
+    let stored_arguments_hash: Option<String> = row.try_get("arguments_hash").unwrap_or(None);
+    if stored_arguments_hash
+        .as_deref()
+        .is_some_and(|hash| hash != requested_arguments_hash)
+    {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Idempotency key was already used for different arguments",
+                "reasonCode": "idempotency_key_reused",
+                "invocationId": invocation_id
+            })),
+        ));
+    }
+
+    let status: String = row.get("status");
+    let error_code: Option<String> = row.try_get("error_code").unwrap_or(None);
+    let error_message: Option<String> = row.try_get("error_message").unwrap_or(None);
+    match status.as_str() {
+        "pending" | "awaiting_approval" => {
+            let action = sqlx::query(
+                "SELECT id, status
+                   FROM tool_action_requests
+                  WHERE company_id = $1 AND invocation_id = $2
+                  ORDER BY created_at DESC
+                  LIMIT 1",
+            )
+            .bind(row.get::<Uuid, _>("company_id"))
+            .bind(invocation_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                )
+            })?;
+            let Some(action) = action else {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "Idempotent tool invocation is still being initialized",
+                        "reasonCode": "idempotency_in_progress",
+                        "status": "pending",
+                        "invocationId": invocation_id
+                    })),
+                ));
+            };
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "decision": "require_approval",
+                    "status": action.get::<String, _>("status"),
+                    "replayed": true,
+                    "invocationId": invocation_id,
+                    "actionRequestId": action.get::<Uuid, _>("id")
+                })),
+            ));
+        }
+        "succeeded" => {
+            let result_summary: Option<Value> = row.try_get("result_summary").unwrap_or(None);
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "decision": "allowed",
+                    "status": "replayed",
+                    "replayed": true,
+                    "invocationId": invocation_id,
+                    "result": result_summary.unwrap_or(Value::Null)
+                })),
+            ))
+        }
+        "executing" => Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Tool invocation is still executing",
+                "reasonCode": "idempotency_in_progress",
+                "status": "executing",
+                "invocationId": invocation_id
+            })),
+        )),
+        "denied" | "rate_limited" => {
+            let status_code = if status == "rate_limited" {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            Ok((
+                status_code,
+                Json(serde_json::json!({
+                    "error": error_message.unwrap_or_else(|| {
+                        if status == "rate_limited" {
+                            "Tool call was rate limited".to_string()
+                        } else {
+                            "Tool call denied by policy".to_string()
+                        }
+                    }),
+                    "reasonCode": error_code.unwrap_or_else(|| {
+                        if status == "rate_limited" {
+                            "rate_limited".to_string()
+                        } else {
+                            "policy_denied".to_string()
+                        }
+                    }),
+                    "decision": if status == "rate_limited" { "rate_limited" } else { "deny" },
+                    "replayed": true,
+                    "invocationId": invocation_id
+                })),
+            ))
+        }
+        "failed" => Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": error_message.unwrap_or_else(|| "Tool call failed".to_string()),
+                "reasonCode": error_code.unwrap_or_else(|| "tool_execution_failed".to_string()),
+                "replayed": true,
+                "invocationId": invocation_id
+            })),
+        )),
+        _ => Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Idempotent tool invocation has an unsupported state",
+                "reasonCode": "idempotency_state_unsupported",
+                "status": status,
+                "invocationId": invocation_id
+            })),
+        )),
+    }
+}
+
+async fn load_gateway_invocation_replay(
+    state: &AppState,
+    company_id: Uuid,
+    idempotency_key: &str,
+    tool_name: &str,
+    arguments_hash: &str,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let row = sqlx::query(
+        "SELECT id, company_id, tool_name, arguments_hash, status, error_code,
+                error_message, result_summary
+           FROM tool_invocations
+          WHERE company_id = $1 AND idempotency_key = $2",
+    )
+    .bind(company_id)
+    .bind(idempotency_key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
+    let Some(row) = row else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Idempotency conflict could not be resolved",
+                "reasonCode": "idempotency_conflict_unresolved"
+            })),
+        ));
+    };
+    replay_gateway_invocation(state, row, tool_name, arguments_hash).await
+}
+
+async fn reserve_gateway_invocation(
+    state: &AppState,
+    company_id: Uuid,
+    agent_id: Uuid,
+    run_id: Uuid,
+    connection_id: Option<Uuid>,
+    tool_name: &str,
+    parameters: &Value,
+    arguments_summary: &Value,
+    policy_decision: &str,
+    status: &str,
+    idempotency_key: Option<&str>,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+) -> Result<GatewayInvocationReservation, (StatusCode, Json<Value>)> {
+    let invocation_id = Uuid::new_v4();
+    let arguments_hash = hash_gateway_token(&parameters.to_string());
+    let now = chrono::Utc::now();
+    let started_at = (status == "executing").then_some(now);
+    let completed_at = matches!(status, "denied" | "failed" | "succeeded").then_some(now);
+    let inserted = sqlx::query(
+        "INSERT INTO tool_invocations
+            (id, company_id, idempotency_key, actor_type, actor_id, agent_id, run_id,
+             connection_id, tool_name, arguments_hash, arguments_summary, policy_decision,
+             status, error_code, error_message, started_at, completed_at)
+         VALUES ($1,$2,$3,'agent',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+         ON CONFLICT (company_id, idempotency_key) DO NOTHING
+         RETURNING id",
+    )
+    .bind(invocation_id)
+    .bind(company_id)
+    .bind(idempotency_key)
+    .bind(agent_id.to_string())
+    .bind(agent_id)
+    .bind(run_id)
+    .bind(connection_id)
+    .bind(tool_name)
+    .bind(&arguments_hash)
+    .bind(arguments_summary)
+    .bind(policy_decision)
+    .bind(status)
+    .bind(error_code)
+    .bind(error_message)
+    .bind(started_at)
+    .bind(completed_at)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
+    if inserted.is_some() {
+        return Ok(GatewayInvocationReservation::Created { invocation_id });
+    }
+    let Some(idempotency_key) = idempotency_key else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":"Tool invocation was not inserted"})),
+        ));
+    };
+    load_gateway_invocation_replay(
+        state,
+        company_id,
+        idempotency_key,
+        tool_name,
+        &arguments_hash,
+    )
+    .await
+    .map(GatewayInvocationReservation::Replayed)
+}
+
+async fn reserve_gateway_approval(
+    state: &AppState,
+    company_id: Uuid,
+    agent_id: Uuid,
+    run_id: Uuid,
+    issue_id: Option<Uuid>,
+    connection_id: Option<Uuid>,
+    tool_name: &str,
+    parameters: &Value,
+    arguments_summary: &Value,
+    policy_decision: &str,
+    idempotency_key: Option<&str>,
+) -> Result<GatewayApprovalReservation, (StatusCode, Json<Value>)> {
+    let invocation_id = Uuid::new_v4();
+    let action_id = Uuid::new_v4();
+    let arguments_hash = hash_gateway_token(&parameters.to_string());
+    let mut tx = state.pool.begin().await.map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
+    let inserted = sqlx::query(
+        "INSERT INTO tool_invocations
+            (id, company_id, idempotency_key, actor_type, actor_id, agent_id, run_id,
+             connection_id, tool_name, arguments_hash, arguments_summary, policy_decision,
+             status, approval_state)
+         VALUES ($1,$2,$3,'agent',$4,$5,$6,$7,$8,$9,$10,$11,'pending','pending')
+         ON CONFLICT (company_id, idempotency_key) DO NOTHING
+         RETURNING id",
+    )
+    .bind(invocation_id)
+    .bind(company_id)
+    .bind(idempotency_key)
+    .bind(agent_id.to_string())
+    .bind(agent_id)
+    .bind(run_id)
+    .bind(connection_id)
+    .bind(tool_name)
+    .bind(&arguments_hash)
+    .bind(arguments_summary)
+    .bind(policy_decision)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
+    if inserted.is_some() {
+        if let Err(error) = sqlx::query(
+            "INSERT INTO tool_action_requests
+                (id, company_id, invocation_id, issue_id, status,
+                 canonical_arguments_hash, canonical_arguments_summary, signed_arguments,
+                 preview_markdown, requested_by_agent_id)
+             VALUES ($1,$2,$3,$4,'pending',$5,$6,$7,$8,$9)",
+        )
+        .bind(action_id)
+        .bind(company_id)
+        .bind(invocation_id)
+        .bind(issue_id)
+        .bind(&arguments_hash)
+        .bind(arguments_summary)
+        .bind(parameters.to_string())
+        .bind(format!("Tool call requires approval: {tool_name}"))
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            ));
+        }
+        if let Err(error) = tx.commit().await {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            ));
+        }
+        return Ok(GatewayApprovalReservation::Created {
+            invocation_id,
+            action_id,
+        });
+    }
+    let _ = tx.rollback().await;
+    let Some(idempotency_key) = idempotency_key else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":"Tool invocation was not inserted"})),
+        ));
+    };
+    load_gateway_invocation_replay(
+        state,
+        company_id,
+        idempotency_key,
+        tool_name,
+        &arguments_hash,
+    )
+    .await
+    .map(GatewayApprovalReservation::Replayed)
+}
+
 async fn call_gateway_tool(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4087,6 +4509,10 @@ async fn call_gateway_tool(
             Json(serde_json::json!({"error": "tool is required and must be a string"})),
         );
     };
+    let idempotency_key = match gateway_idempotency_key(&headers, &body) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
     let company_id: Uuid = session.get("company_id");
     let agent_id: Uuid = session.get("agent_id");
     let run_id: Uuid = session.get("run_id");
@@ -4098,7 +4524,6 @@ async fn call_gateway_tool(
         issue_id: session.get("issue_id"),
     };
     if tool_name.starts_with("paperclip") {
-        let invocation_id = Uuid::new_v4();
         let parameters = body
             .get("parameters")
             .cloned()
@@ -4125,21 +4550,27 @@ async fn call_gateway_tool(
         });
         let decision = gateway_decision(&state, company_id, agent_id, tool_name).await;
         if decision == "deny" {
-            let _ = sqlx::query(
-                "INSERT INTO tool_invocations
-                 (id, company_id, actor_type, actor_id, agent_id, run_id, tool_name,
-                  arguments_summary, policy_decision, status, error_code, completed_at)
-                 VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,'deny','denied','policy_denied',NOW())",
+            let invocation_id = match reserve_gateway_invocation(
+                &state,
+                company_id,
+                agent_id,
+                run_id,
+                None,
+                tool_name,
+                &parameters,
+                &arguments_summary,
+                "deny",
+                "denied",
+                idempotency_key.as_deref(),
+                Some("policy_denied"),
+                Some("Tool call denied by policy"),
             )
-            .bind(invocation_id)
-            .bind(company_id)
-            .bind(agent_id.to_string())
-            .bind(agent_id)
-            .bind(run_id)
-            .bind(tool_name)
-            .bind(&arguments_summary)
-            .execute(&state.pool)
-            .await;
+            .await
+            {
+                Ok(GatewayInvocationReservation::Created { invocation_id }) => invocation_id,
+                Ok(GatewayInvocationReservation::Replayed(response)) => return response,
+                Err(response) => return response,
+            };
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
@@ -4149,41 +4580,29 @@ async fn call_gateway_tool(
             );
         }
         if decision == "require_approval" {
-            let action_id = Uuid::new_v4();
-            let _ = sqlx::query(
-                "INSERT INTO tool_invocations
-                 (id, company_id, actor_type, actor_id, agent_id, run_id, tool_name,
-                  arguments_summary, policy_decision, status, started_at)
-                 VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,'require_approval','pending',NOW())",
+            let issue_id: Option<Uuid> = session.get("issue_id");
+            let (invocation_id, action_id) = match reserve_gateway_approval(
+                &state,
+                company_id,
+                agent_id,
+                run_id,
+                issue_id,
+                None,
+                tool_name,
+                &parameters,
+                &arguments_summary,
+                &decision,
+                idempotency_key.as_deref(),
             )
-            .bind(invocation_id)
-            .bind(company_id)
-            .bind(agent_id.to_string())
-            .bind(agent_id)
-            .bind(run_id)
-            .bind(tool_name)
-            .bind(&arguments_summary)
-            .execute(&state.pool)
-            .await;
-            let _ = sqlx::query(
-                "INSERT INTO tool_action_requests
-                 (id, company_id, invocation_id, issue_id, status,
-                  canonical_arguments_hash, canonical_arguments_summary, signed_arguments,
-                  preview_markdown, requested_by_agent_id)
-                 VALUES ($1,$2,$3,(SELECT issue_id FROM tool_gateway_sessions WHERE id=$4),
-                         'pending',$5,$6,$7,$8,$9)",
-            )
-            .bind(action_id)
-            .bind(company_id)
-            .bind(invocation_id)
-            .bind(session.get::<Uuid, _>("id"))
-            .bind(hash_gateway_token(&parameters.to_string()))
-            .bind(&arguments_summary)
-            .bind(parameters.to_string())
-            .bind(format!("Tool call requires approval: {tool_name}"))
-            .bind(agent_id)
-            .execute(&state.pool)
-            .await;
+            .await
+            {
+                Ok(GatewayApprovalReservation::Created {
+                    invocation_id,
+                    action_id,
+                }) => (invocation_id, action_id),
+                Ok(GatewayApprovalReservation::Replayed(response)) => return response,
+                Err(response) => return response,
+            };
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -4192,21 +4611,27 @@ async fn call_gateway_tool(
                 })),
             );
         }
-        let _ = sqlx::query(
-            "INSERT INTO tool_invocations
-             (id, company_id, actor_type, actor_id, agent_id, run_id, tool_name,
-              arguments_summary, policy_decision, status, started_at)
-             VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,'allow','executing',NOW())",
+        let invocation_id = match reserve_gateway_invocation(
+            &state,
+            company_id,
+            agent_id,
+            run_id,
+            None,
+            tool_name,
+            &parameters,
+            &arguments_summary,
+            "allow",
+            "executing",
+            idempotency_key.as_deref(),
+            None,
+            None,
         )
-        .bind(invocation_id)
-        .bind(company_id)
-        .bind(agent_id.to_string())
-        .bind(agent_id)
-        .bind(run_id)
-        .bind(tool_name)
-        .bind(&arguments_summary)
-        .execute(&state.pool)
-        .await;
+        .await
+        {
+            Ok(GatewayInvocationReservation::Created { invocation_id }) => invocation_id,
+            Ok(GatewayInvocationReservation::Replayed(response)) => return response,
+            Err(response) => return response,
+        };
         let result = call_paperclip_builtin_tool(
             &state,
             &token,
@@ -4287,11 +4712,29 @@ async fn call_gateway_tool(
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
                 let decision = gateway_decision(&state, company_id, agent_id, tool_name).await;
-                let invocation_id = Uuid::new_v4();
                 let args_summary = serde_json::json!({"valueType":"object","keys":parameters.as_object().map(|value| value.len()).unwrap_or(0)});
                 if decision == "deny" {
-                    let _ = sqlx::query("INSERT INTO tool_invocations (id,company_id,actor_type,actor_id,agent_id,run_id,connection_id,tool_name,arguments_summary,policy_decision,status,error_code,completed_at) VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,$8,'deny','denied','policy_denied',NOW())")
-                        .bind(invocation_id).bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(connection_id).bind(tool_name).bind(&args_summary).execute(&state.pool).await;
+                    let invocation_id = match reserve_gateway_invocation(
+                        &state,
+                        company_id,
+                        agent_id,
+                        run_id,
+                        Some(connection_id),
+                        tool_name,
+                        &parameters,
+                        &args_summary,
+                        "deny",
+                        "denied",
+                        idempotency_key.as_deref(),
+                        Some("policy_denied"),
+                        Some("Tool call denied by policy"),
+                    )
+                    .await
+                    {
+                        Ok(GatewayInvocationReservation::Created { invocation_id }) => invocation_id,
+                        Ok(GatewayInvocationReservation::Replayed(response)) => return response,
+                        Err(response) => return response,
+                    };
                     return (
                         StatusCode::FORBIDDEN,
                         Json(
@@ -4299,8 +4742,61 @@ async fn call_gateway_tool(
                         ),
                     );
                 }
-                let _ = sqlx::query("INSERT INTO tool_invocations (id,company_id,actor_type,actor_id,agent_id,run_id,connection_id,tool_name,arguments_summary,policy_decision,status,started_at) VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,$8,$9,'executing',NOW())")
-                    .bind(invocation_id).bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(connection_id).bind(tool_name).bind(&args_summary).bind(&decision).execute(&state.pool).await;
+                if decision == "require_approval" {
+                    let issue_id: Option<Uuid> = session.get("issue_id");
+                    let (invocation_id, action_id) = match reserve_gateway_approval(
+                        &state,
+                        company_id,
+                        agent_id,
+                        run_id,
+                        issue_id,
+                        Some(connection_id),
+                        tool_name,
+                        &parameters,
+                        &args_summary,
+                        &decision,
+                        idempotency_key.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(GatewayApprovalReservation::Created {
+                            invocation_id,
+                            action_id,
+                        }) => (invocation_id, action_id),
+                        Ok(GatewayApprovalReservation::Replayed(response)) => return response,
+                        Err(response) => return response,
+                    };
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "decision": "require_approval",
+                            "invocationId": invocation_id,
+                            "actionRequestId": action_id,
+                            "status": "pending"
+                        })),
+                    );
+                }
+                let invocation_id = match reserve_gateway_invocation(
+                    &state,
+                    company_id,
+                    agent_id,
+                    run_id,
+                    Some(connection_id),
+                    tool_name,
+                    &parameters,
+                    &args_summary,
+                    &decision,
+                    "executing",
+                    idempotency_key.as_deref(),
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(GatewayInvocationReservation::Created { invocation_id }) => invocation_id,
+                    Ok(GatewayInvocationReservation::Replayed(response)) => return response,
+                    Err(response) => return response,
+                };
                 let result = if transport == "mcp_remote" {
                     match connection_url(&config) {
                         Some(url) => {
@@ -4377,11 +4873,29 @@ async fn call_gateway_tool(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let decision = gateway_decision(&state, company_id, agent_id, tool_name).await;
-    let invocation_id = Uuid::new_v4();
     let args_summary = serde_json::json!({"valueType":"object","keys":parameters.as_object().map(|value| value.len()).unwrap_or(0)});
     if decision == "deny" {
-        let _ = sqlx::query("INSERT INTO tool_invocations (id, company_id, actor_type, actor_id, agent_id, run_id, tool_name, arguments_summary, policy_decision, status, error_code, completed_at) VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,'deny','denied','policy_denied',NOW())")
-            .bind(invocation_id).bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(&args_summary).execute(&state.pool).await;
+        let invocation_id = match reserve_gateway_invocation(
+            &state,
+            company_id,
+            agent_id,
+            run_id,
+            None,
+            tool_name,
+            &parameters,
+            &args_summary,
+            "deny",
+            "denied",
+            idempotency_key.as_deref(),
+            Some("policy_denied"),
+            Some("Tool call denied by policy"),
+        )
+        .await
+        {
+            Ok(GatewayInvocationReservation::Created { invocation_id }) => invocation_id,
+            Ok(GatewayInvocationReservation::Replayed(response)) => return response,
+            Err(response) => return response,
+        };
         let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,invocation_id,reason_code) VALUES ($1,'call_denied','agent',$2,$3,$4,$5,'deny','denied',$6,'policy_denied')")
             .bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).execute(&state.pool).await;
         return (
@@ -4391,21 +4905,30 @@ async fn call_gateway_tool(
             ),
         );
     }
-    let insert = sqlx::query("INSERT INTO tool_invocations (id, company_id, actor_type, actor_id, agent_id, run_id, tool_name, arguments_summary, policy_decision, status, started_at) VALUES ($1,$2,'agent',$3,$4,$5,$6,$7,$8,$9,NOW())")
-        .bind(invocation_id).bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(&args_summary)
-        .bind(&decision).bind(if decision == "require_approval" { "pending" } else { "executing" })
-        .execute(&state.pool).await;
-    if let Err(error) = insert {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": error.to_string()})),
-        );
-    }
     if decision == "require_approval" {
-        let action_id = Uuid::new_v4();
-        let _ = sqlx::query("INSERT INTO tool_action_requests (id,company_id,invocation_id,issue_id,status,canonical_arguments_hash,canonical_arguments_summary,signed_arguments,preview_markdown,requested_by_agent_id) VALUES ($1,$2,$3,(SELECT issue_id FROM tool_gateway_sessions WHERE id=$4),'pending',$5,$6,$7,$8,$9)")
-            .bind(action_id).bind(company_id).bind(invocation_id).bind(session.get::<Uuid, _>("id"))
-            .bind(hash_gateway_token(&parameters.to_string())).bind(&args_summary).bind(parameters.to_string()).bind(format!("Tool call requires approval: {tool_name}" )).bind(agent_id).execute(&state.pool).await;
+        let issue_id: Option<Uuid> = session.get("issue_id");
+        let (invocation_id, action_id) = match reserve_gateway_approval(
+            &state,
+            company_id,
+            agent_id,
+            run_id,
+            issue_id,
+            None,
+            tool_name,
+            &parameters,
+            &args_summary,
+            &decision,
+            idempotency_key.as_deref(),
+        )
+        .await
+        {
+            Ok(GatewayApprovalReservation::Created {
+                invocation_id,
+                action_id,
+            }) => (invocation_id, action_id),
+            Ok(GatewayApprovalReservation::Replayed(response)) => return response,
+            Err(response) => return response,
+        };
         let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,invocation_id,action_request_id,reason_code) VALUES ($1,'approval_requested','agent',$2,$3,$4,$5,'require_approval','pending',$6,$7,'policy_requires_approval')")
             .bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).bind(action_id).execute(&state.pool).await;
         return (
@@ -4415,6 +4938,27 @@ async fn call_gateway_tool(
             ),
         );
     }
+    let invocation_id = match reserve_gateway_invocation(
+        &state,
+        company_id,
+        agent_id,
+        run_id,
+        None,
+        tool_name,
+        &parameters,
+        &args_summary,
+        &decision,
+        "executing",
+        idempotency_key.as_deref(),
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(GatewayInvocationReservation::Created { invocation_id }) => invocation_id,
+        Ok(GatewayInvocationReservation::Replayed(response)) => return response,
+        Err(response) => return response,
+    };
     let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,arguments_summary,invocation_id) VALUES ($1,'call_started','agent',$2,$3,$4,$5,'allow','pending',$6,$7)")
         .bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(&args_summary).bind(invocation_id).execute(&state.pool).await;
     let result = state

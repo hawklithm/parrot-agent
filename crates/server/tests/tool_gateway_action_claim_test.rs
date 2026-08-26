@@ -39,6 +39,66 @@ async fn send_approval(
     (status, value)
 }
 
+async fn create_session(
+    app: &Router,
+    company_id: Uuid,
+    agent_id: Uuid,
+    run_id: Uuid,
+) -> String {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/tool-gateway/sessions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "companyId": company_id,
+                "agentId": agent_id,
+                "runId": run_id
+            }))
+            .expect("serialize session body"),
+        ))
+        .expect("build session request");
+    let response = app.clone().oneshot(request).await.expect("create session");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read session body");
+    serde_json::from_slice::<Value>(&body)
+        .expect("parse session body")
+        .get("token")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .expect("session token")
+}
+
+async fn send_idempotent_call(
+    app: &Router,
+    token: &str,
+    idempotency_key: &str,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/tool-gateway/tools/call")
+        .header("content-type", "application/json")
+        .header("x-paperclip-tool-gateway-token", token)
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "tool": "mcp.missing:call",
+                "parameters": {"value": "same-call"},
+                "idempotencyKey": idempotency_key
+            }))
+            .expect("serialize call body"),
+        ))
+        .expect("build call request");
+    let response = app.clone().oneshot(request).await.expect("dispatch call");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read call body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
 async fn connect_and_migrate() -> PgPool {
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile".to_string()
@@ -149,6 +209,98 @@ async fn concurrent_approval_has_one_database_claimant() {
     .expect("read settled action");
     assert_eq!(request_status, "failed");
     assert_eq!(invocation_status, "failed");
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
+async fn concurrent_tool_calls_replay_one_idempotency_key() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let issue_prefix = format!("TG{}", &company_id.simple().to_string()[..8]);
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Tool Gateway Idempotency Test")
+        .bind(issue_prefix)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+    sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, $3)")
+        .bind(agent_id)
+        .bind(company_id)
+        .bind("Tool Gateway Idempotency Agent")
+        .execute(&pool)
+        .await
+        .expect("insert agent");
+    sqlx::query(
+        "INSERT INTO heartbeat_runs (id, company_id, agent_id, status) VALUES ($1, $2, $3, 'running')",
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("insert heartbeat run");
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, name, uid, transport, transport_config, enabled)
+         VALUES ($1, $2, 'Missing MCP', 'missing', 'mcp_remote', '{}', true)",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("insert tool connection");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_routes().with_state(state);
+    let token = create_session(&app, company_id, agent_id, run_id).await;
+    let idempotency_key = "concurrent-mcp-call-1";
+    let (first, second) = tokio::join!(
+        send_idempotent_call(&app, &token, idempotency_key),
+        send_idempotent_call(&app, &token, idempotency_key),
+    );
+
+    assert_eq!(first.0, StatusCode::FORBIDDEN, "first={:?}", first.1);
+    assert_eq!(second.0, StatusCode::FORBIDDEN, "second={:?}", second.1);
+    assert!(
+        first.1.get("invocationId").is_some() && second.1.get("invocationId").is_some(),
+        "both responses must identify the durable invocation: first={:?}, second={:?}",
+        first.1,
+        second.1
+    );
+    assert_eq!(
+        first.1.get("invocationId"),
+        second.1.get("invocationId"),
+        "same idempotency key must replay the same invocation"
+    );
+    assert!(
+        first.1.get("replayed").is_some() || second.1.get("replayed").is_some(),
+        "one concurrent response must identify the replay path: first={:?}, second={:?}",
+        first.1,
+        second.1
+    );
+
+    let (invocation_count, stored_status, stored_key): (i64, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT COUNT(*), MIN(status), MIN(idempotency_key)
+               FROM tool_invocations
+              WHERE company_id = $1 AND tool_name = 'mcp.missing:call'",
+        )
+        .bind(company_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read idempotent invocations");
+    assert_eq!(invocation_count, 1);
+    assert_eq!(stored_status, "denied");
+    assert_eq!(stored_key.as_deref(), Some(idempotency_key));
 
     let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
         .bind(company_id)
