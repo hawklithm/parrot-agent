@@ -223,6 +223,22 @@ async fn company_search_matches_paperclip() {
     assert_eq!(resp["countsByType"]["issue"], json!(3));
     assert_eq!(resp["hasMore"], json!(false));
 
+    // filterOptionCounts：facet 计数覆盖全候选命中集（3 个 issue 的不同 status/priority）。
+    let foc = &resp["filterOptionCounts"];
+    assert_eq!(foc["status"]["todo"], json!(1), "facet status.todo");
+    assert_eq!(foc["status"]["in_progress"], json!(1), "facet status.in_progress");
+    assert_eq!(foc["status"]["backlog"], json!(1), "facet status.backlog");
+    assert_eq!(foc["priority"]["medium"], json!(1), "facet priority.medium");
+    assert_eq!(foc["priority"]["high"], json!(1), "facet priority.high");
+    assert_eq!(foc["priority"]["low"], json!(1), "facet priority.low");
+    assert!(foc["assigneeAgentId"].as_object().unwrap().is_empty(), "no assigneeAgent facets");
+    assert!(foc["assigneeUserId"].as_object().unwrap().is_empty(), "no assigneeUser facets");
+    assert!(foc["projectId"].as_object().unwrap().is_empty(), "no project facets");
+    assert!(foc["labelId"].as_object().unwrap().is_empty(), "no label facets");
+    for k in ["24h", "7d", "30d", "90d"] {
+        assert_eq!(foc["updatedWithin"][k], json!(3), "facet updatedWithin.{}", k);
+    }
+
     // Identifier match via scoped token (loginflow).
     let (_, body) = send(
         &app,
@@ -337,7 +353,7 @@ async fn company_search_comments_documents_matches_paperclip() {
     .bind(company_a)
     .bind("Plain task with no keyword")
     .bind(format!("{}-1", prefix_a))
-    .bind("unrelated body")
+    .bind("unrelated body with ![logo](https://cdn.example.com/logo.png) inside")
     .execute(&pool)
     .await
     .expect("insert issue");
@@ -415,9 +431,22 @@ async fn company_search_comments_documents_matches_paperclip() {
         ok_field && text.to_lowercase().contains("parrotsearch") && has_hl
     });
     assert!(has_kw, "a snippet surfaces the parrotsearch hit with a highlight: {:?}", snips);
+
+    // previewImageUrl：描述中的 markdown 首图（对齐 Paperclip extractFirstImageUrl）。
+    assert_eq!(
+        results[0]["previewImageUrl"],
+        json!("https://cdn.example.com/logo.png"),
+        "description image URL surfaces as previewImageUrl"
+    );
     assert_eq!(resp["countsByType"]["issue"], json!(1));
     assert_eq!(resp["countsByType"]["comment"], json!(1));
     assert_eq!(resp["countsByType"]["document"], json!(1));
+
+    // filterOptionCounts：单 issue（todo/medium）计数。
+    let foc = &resp["filterOptionCounts"];
+    assert_eq!(foc["status"]["todo"], json!(1), "facet status.todo");
+    assert_eq!(foc["priority"]["medium"], json!(1), "facet priority.medium");
+    assert_eq!(foc["updatedWithin"]["24h"], json!(1), "facet updatedWithin.24h");
 
     // scope=comments only: still surfaces (anySearchMatch is scope-independent),
     // but the match is comment-derived.

@@ -118,6 +118,34 @@ pub struct CompanySearchSnippet {
     pub highlights: Vec<CompanySearchHighlight>,
 }
 
+/// 对齐 Paperclip `CompanySearchFilterOptionCounts`：候选命中集上的 facet 计数。
+/// status/priority/updatedWithin 为离散枚举计数，assignee/project/label 为 id→计数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanySearchFilterOptionCounts {
+    pub status: std::collections::HashMap<String, i64>,
+    pub priority: std::collections::HashMap<String, i64>,
+    pub assignee_agent_id: std::collections::HashMap<String, i64>,
+    pub assignee_user_id: std::collections::HashMap<String, i64>,
+    pub project_id: std::collections::HashMap<String, i64>,
+    pub label_id: std::collections::HashMap<String, i64>,
+    pub updated_within: std::collections::HashMap<String, i64>,
+}
+
+impl Default for CompanySearchFilterOptionCounts {
+    fn default() -> Self {
+        Self {
+            status: std::collections::HashMap::new(),
+            priority: std::collections::HashMap::new(),
+            assignee_agent_id: std::collections::HashMap::new(),
+            assignee_user_id: std::collections::HashMap::new(),
+            project_id: std::collections::HashMap::new(),
+            label_id: std::collections::HashMap::new(),
+            updated_within: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// 对齐 Paperclip `CompanySearchResponse`（countsByType/filterOptionCounts/
 /// zeroResults 在本阶段为最小实现，随作用域扩展补全）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,7 +159,7 @@ pub struct CompanySearchResponse {
     pub offset: i64,
     pub results: Vec<CompanySearchResult>,
     pub counts_by_type: std::collections::HashMap<String, i64>,
-    pub filter_option_counts: serde_json::Value,
+    pub filter_option_counts: CompanySearchFilterOptionCounts,
     pub zero_results: Option<serde_json::Value>,
     pub has_more: bool,
 }
@@ -569,6 +597,23 @@ impl CompanySearchService {
             let snippets = build_issue_snippets(&snippet_sources, &terms);
             let snippet = snippets.first().map(|s| s.text.clone());
 
+            // previewImageUrl：描述 → 评论 → 文档 的 markdown 首图（对齐 Paperclip
+            // extractFirstImageUrl 优先级；文档用 content 近似 latest_body）。
+            let desc_raw = row.try_get::<String, _>("description").ok();
+            let preview_image_url = desc_raw
+                .as_deref()
+                .and_then(extract_first_image_url)
+                .or_else(|| {
+                    comment_doc_hits.get(&id).and_then(|(cb, _)| {
+                        cb.as_deref().and_then(extract_first_image_url)
+                    })
+                })
+                .or_else(|| {
+                    comment_doc_hits.get(&id).and_then(|(_, doc)| {
+                        doc.as_ref().and_then(|(_, content)| extract_first_image_url(content))
+                    })
+                });
+
             let updated_at_str = updated_at.to_rfc3339();
 
             let issue_summary = CompanySearchIssueSummary {
@@ -594,7 +639,7 @@ impl CompanySearchService {
                 snippets,
                 issue: Some(issue_summary),
                 updated_at: Some(updated_at_str),
-                preview_image_url: None,
+                preview_image_url,
             });
             *counts.entry("issue".to_string()).or_insert(0) += 1;
             if let Some((comment_body, doc)) = comment_doc_hits.get(&id) {
@@ -607,6 +652,19 @@ impl CompanySearchService {
             }
         }
 
+        // facet 计数：对全候选命中集（非仅分页）聚合，对齐 Paperclip filterOptionCounts。
+        // 参数重编号：where_sql 用 $2/$3/$4/$7/$8 → $1/$2/$3/$4/$5（见 fetch_filter_option_counts）。
+        let filter_option_counts = self
+            .fetch_filter_option_counts(
+                company_id,
+                &where_sql,
+                &title_phrase,
+                &token_any,
+                &contains_pattern,
+                &normalized_query,
+            )
+            .await?;
+
         Ok(CompanySearchResponse {
             query: query.q.clone(),
             normalized_query,
@@ -616,10 +674,110 @@ impl CompanySearchService {
             offset: query.offset,
             results,
             counts_by_type: counts,
-            filter_option_counts: serde_json::json!({}),
+            filter_option_counts,
             zero_results: None,
             has_more,
         })
+    }
+
+    /// 对齐 Paperclip `filterOptionCounts`：在候选命中集（同一 `match_conditions`）
+    /// 上聚合 status/priority/assigneeAgentId/assigneeUserId/projectId/labelId/
+    /// updatedWithin(24h/7d/30d/90d) 的计数。Parrot 尚无活动过滤器，
+    /// 故每个 facet 均不带 `optionCond`/`omit`（对齐 Paperclip 无过滤时的语义）。
+    async fn fetch_filter_option_counts(
+        &self,
+        company_id: Uuid,
+        where_sql: &str,
+        title_phrase: &str,
+        token_any: &str,
+        contains_pattern: &str,
+        normalized_query: &str,
+    ) -> Result<CompanySearchFilterOptionCounts, sqlx::Error> {
+        // 重编号 where_sql 参数占位符（从高到低避免二次替换）：
+        // $8->$5, $7->$4, $4->$3, $3->$2, $2->$1
+        // 用哨兵占位符防止级联二次替换（$4->$3 后再被 $3->$2 命中）。
+        let mut ws = where_sql.to_string();
+        for (from, to) in [("$8", "$5"), ("$7", "$4"), ("$4", "$3"), ("$3", "$2"), ("$2", "$1")] {
+            ws = ws.replace(from, &format!("\u{0}{}", to.trim_start_matches('$')));
+        }
+        for n in 1..=5 {
+            ws = ws.replace(&format!("\u{0}{}", n), &format!("${}", n));
+        }
+        // 候选条件引用 `issues.` 表名；facet 查询以 `i` 为别名，需整体替换。
+        ws = ws.replace("issues.", "i.");
+        let sql = format!(
+            "SELECT 'status' AS kind, i.status::text AS value, count(*)::int8 AS count \
+             FROM issues i WHERE i.company_id = $3 AND ({ws}) GROUP BY 2 \
+             UNION ALL \
+             SELECT 'priority' AS kind, i.priority::text AS value, count(*)::int8 AS count \
+             FROM issues i WHERE i.company_id = $3 AND ({ws}) GROUP BY 2 \
+             UNION ALL \
+             SELECT 'assigneeAgentId' AS kind, i.assignee_agent_id::text AS value, count(*)::int8 AS count \
+             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.assignee_agent_id IS NOT NULL GROUP BY 2 \
+             UNION ALL \
+             SELECT 'assigneeUserId' AS kind, i.assignee_user_id::text AS value, count(*)::int8 AS count \
+             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.assignee_user_id IS NOT NULL GROUP BY 2 \
+             UNION ALL \
+             SELECT 'projectId' AS kind, i.project_id::text AS value, count(*)::int8 AS count \
+             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.project_id IS NOT NULL GROUP BY 2 \
+             UNION ALL \
+             SELECT 'labelId' AS kind, il.label_id::text AS value, count(*)::int8 AS count \
+             FROM issues i INNER JOIN issue_labels il ON il.issue_id = i.id \
+             WHERE i.company_id = $3 AND ({ws}) GROUP BY 2 \
+             UNION ALL \
+             SELECT 'updatedWithin' AS kind, '24h' AS value, count(*)::int8 AS count \
+             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.updated_at >= now() - interval '24 hours' \
+             UNION ALL \
+             SELECT 'updatedWithin' AS kind, '7d' AS value, count(*)::int8 AS count \
+             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.updated_at >= now() - interval '7 days' \
+             UNION ALL \
+             SELECT 'updatedWithin' AS kind, '30d' AS value, count(*)::int8 AS count \
+             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.updated_at >= now() - interval '30 days' \
+             UNION ALL \
+             SELECT 'updatedWithin' AS kind, '90d' AS value, count(*)::int8 AS count \
+             FROM issues i WHERE i.company_id = $3 AND ({ws}) AND i.updated_at >= now() - interval '90 days'"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(title_phrase)      // $1（原 $2）
+            .bind(token_any)         // $2（原 $3）
+            .bind(company_id);       // $3
+        // Postgres 参数编号必须连续到最高引用位：where_sql 可能引用 $5 而不引用 $4
+        // （模糊开、评论/文档 EXISTS 关），此时 $4 位置仍需占位绑定。
+        let max_param = if ws.contains("$5") {
+            5
+        } else if ws.contains("$4") {
+            4
+        } else {
+            3
+        };
+        let mut q = sqlx::query(&sql)
+            .bind(title_phrase)      // $1（原 $2）
+            .bind(token_any)         // $2（原 $3）
+            .bind(company_id);       // $3
+        if max_param >= 4 {
+            q = q.bind(contains_pattern); // $4（原 $7；未引用时占位）
+        }
+        if max_param >= 5 {
+            q = q.bind(normalized_query); // $5（原 $8）
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        let mut out = CompanySearchFilterOptionCounts::default();
+        for row in rows {
+            let kind: String = row.get("kind");
+            let value: String = row.get("value");
+            let count: i64 = row.get("count");
+            match kind.as_str() {
+                "status" => { out.status.insert(value, count); }
+                "priority" => { out.priority.insert(value, count); }
+                "assigneeAgentId" => { out.assignee_agent_id.insert(value, count); }
+                "assigneeUserId" => { out.assignee_user_id.insert(value, count); }
+                "projectId" => { out.project_id.insert(value, count); }
+                "labelId" => { out.label_id.insert(value, count); }
+                "updatedWithin" => { out.updated_within.insert(value, count); }
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 
     /// 对齐 Paperclip `companySearchExtractService.extract`：在 issue 标题/描述、
@@ -1127,7 +1285,7 @@ fn empty_response(query: &str, normalized_query: &str) -> CompanySearchResponse 
         offset: 0,
         results: Vec::new(),
         counts_by_type: std::collections::HashMap::new(),
-        filter_option_counts: serde_json::json!({}),
+        filter_option_counts: CompanySearchFilterOptionCounts::default(),
         zero_results: None,
         has_more: false,
     }
@@ -1193,6 +1351,13 @@ fn make_snippet(
         text: snippet_text,
         highlights,
     })
+}
+
+/// 提取 markdown 首图 URL（对齐 Paperclip MARKDOWN_IMAGE_PATTERN：
+/// `![alt](url)` 或带 title 引号形式）。
+fn extract_first_image_url(value: &str) -> Option<String> {
+    let pattern = regex::Regex::new(r#"!\[[^\]]*\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)"#).ok()?;
+    pattern.captures(value).map(|c| c.get(1).unwrap().as_str().to_string())
 }
 
 /// 折叠 markdown/空白为纯文本（对齐 Paperclip plainText）。
