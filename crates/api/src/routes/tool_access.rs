@@ -3,12 +3,14 @@
 //! gallery/examples/trust-rules/stdio-templates/runtime-health 以静态/聚合语义实现。
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{delete, get, patch, post},
     Json, Router,
 };
-use serde::Deserialize;
+use base64::Engine as _;
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -867,39 +869,342 @@ async fn update_tool_profile(
 
 // ---------- tool-gateway ----------
 
-/// GET /api/tool-gateway/audit —— 从 tool_invocations 聚合。
+#[derive(Debug, Deserialize)]
+struct GatewayAuditQuery {
+    #[serde(rename = "companyId")]
+    company_id: Option<String>,
+    app: Option<String>,
+    agent: Option<String>,
+    outcome: Option<String>,
+    window: Option<String>,
+    search: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GatewayAuditCursor {
+    #[serde(rename = "createdAt")]
+    created_at: DateTime<Utc>,
+    id: Uuid,
+}
+
+fn gateway_audit_cursor_encode(cursor: &GatewayAuditCursor) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(cursor).expect("audit cursor is serializable"))
+}
+
+fn gateway_audit_cursor_decode(value: &str) -> Option<GatewayAuditCursor> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn gateway_audit_window(window: &str) -> Option<Duration> {
+    match window {
+        "1h" => Some(Duration::hours(1)),
+        "24h" => Some(Duration::hours(24)),
+        "7d" => Some(Duration::days(7)),
+        "30d" => Some(Duration::days(30)),
+        _ => None,
+    }
+}
+
+fn gateway_audit_like_pattern(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+fn gateway_audit_outcome(event_type: &str, decision: Option<&str>, outcome: &str) -> &'static str {
+    if matches!(event_type, "call_completed" | "tool_gateway.call_completed")
+        || matches!(decision, Some("allow" | "approved"))
+        || matches!(outcome, "success" | "allowed")
+    {
+        return "allowed";
+    }
+    if matches!(event_type, "approval_requested" | "tool_gateway.approval_requested")
+        || decision == Some("require_approval")
+    {
+        return "asked_first";
+    }
+    if matches!(event_type, "call_deferred" | "tool_gateway.call_deferred")
+        || decision == Some("defer_runtime")
+    {
+        return "waiting";
+    }
+    if matches!(event_type, "call_failed" | "tool_gateway.call_failed")
+        || matches!(outcome, "failure" | "failed")
+    {
+        return "failed";
+    }
+    if matches!(event_type, "call_denied" | "tool_gateway.call_denied")
+        || matches!(decision, Some("deny" | "rate_limited"))
+        || matches!(outcome, "denied" | "blocked")
+    {
+        return "blocked";
+    }
+    "unknown"
+}
+
+/// GET /api/tool-gateway/audit —— Paperclip-compatible filtered activity feed.
 async fn gateway_audit(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    Query(query): Query<GatewayAuditQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    crate::routes::assert_board(&actor).map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id = query
+        .company_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    use sqlx::Row;
+
+    let application_or_connection_id = query
+        .app
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let agent_id = query
+        .agent
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let window = query.window.as_deref().unwrap_or("24h");
+    let window_duration = gateway_audit_window(window).ok_or(StatusCode::BAD_REQUEST)?;
+    let search = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(gateway_audit_like_pattern);
+    let outcome = query
+        .outcome
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+    let cursor = match query.cursor.as_deref() {
+        Some(value) => Some(gateway_audit_cursor_decode(value).ok_or(StatusCode::BAD_REQUEST)?),
+        None => None,
+    };
+    let limit = query.limit.unwrap_or(100).clamp(1, 100);
+    let window_start = Utc::now() - window_duration;
+
     let rows = sqlx::query(
-        "SELECT id, agent_id, tool_name, status, created_at \
-         FROM tool_invocations WHERE company_id = $1 ORDER BY created_at DESC LIMIT 100",
+        r#"
+        SELECT e.id,
+               e.company_id,
+               e.event_type,
+               e.actor_type,
+               e.actor_id,
+               COALESCE(e.agent_id, i.agent_id) AS agent_id,
+               COALESCE(e.run_id, i.run_id) AS run_id,
+               COALESCE(e.application_id, i.application_id) AS application_id,
+               COALESCE(e.connection_id, i.connection_id) AS connection_id,
+               e.invocation_id,
+               e.action_request_id,
+               e.tool_name,
+               e.decision,
+               e.outcome,
+               e.reason_code,
+               e.arguments_summary,
+               e.request_summary,
+               e.result_summary,
+               e.error_code,
+               e.error_message,
+               e.metadata,
+               e.created_at,
+               a.name AS agent_name,
+               c.name AS connection_name,
+               c.application_id AS connection_application_id
+          FROM tool_call_events e
+          LEFT JOIN tool_invocations i
+            ON i.id = e.invocation_id AND i.company_id = e.company_id
+          LEFT JOIN agents a
+            ON a.id = COALESCE(e.agent_id, i.agent_id)
+           AND a.company_id = e.company_id
+          LEFT JOIN tool_connections c
+            ON c.id = COALESCE(e.connection_id, i.connection_id)
+           AND c.company_id = e.company_id
+         WHERE e.company_id = $1
+           AND e.created_at >= $2
+           AND ($3::uuid IS NULL
+                OR e.application_id = $3
+                OR i.application_id = $3
+                OR e.connection_id = $3
+                OR i.connection_id = $3
+                OR c.application_id = $3)
+           AND ($4::uuid IS NULL OR COALESCE(e.agent_id, i.agent_id) = $4)
+           AND (
+             $5::text IS NULL
+             OR e.event_type ILIKE $5 ESCAPE '\'
+             OR COALESCE(e.tool_name, '') ILIKE $5 ESCAPE '\'
+             OR COALESCE(e.reason_code, '') ILIKE $5 ESCAPE '\'
+             OR COALESCE(e.error_code, '') ILIKE $5 ESCAPE '\'
+             OR COALESCE(a.name, '') ILIKE $5 ESCAPE '\'
+             OR COALESCE(c.name, '') ILIKE $5 ESCAPE '\'
+             OR COALESCE(e.metadata::text, '') ILIKE $5 ESCAPE '\'
+           )
+           AND (
+             $6::text IS NULL
+             OR CASE $6
+                  WHEN 'allowed' THEN e.event_type IN ('call_completed', 'tool_gateway.call_completed')
+                                      OR e.decision IN ('allow', 'approved')
+                                      OR e.outcome IN ('success', 'allowed')
+                  WHEN 'blocked' THEN e.event_type IN ('call_denied', 'tool_gateway.call_denied')
+                                      OR e.decision IN ('deny', 'rate_limited')
+                                      OR e.outcome IN ('denied', 'blocked')
+                  WHEN 'asked_first' THEN e.event_type IN ('approval_requested', 'tool_gateway.approval_requested')
+                                      OR e.decision = 'require_approval'
+                  WHEN 'waiting' THEN e.event_type IN ('call_deferred', 'tool_gateway.call_deferred')
+                                      OR e.decision = 'defer_runtime'
+                  WHEN 'failed' THEN e.event_type IN ('call_failed', 'tool_gateway.call_failed')
+                                      OR e.outcome IN ('failure', 'failed')
+                  ELSE TRUE
+                END
+           )
+           AND (
+             $7::timestamptz IS NULL
+             OR e.created_at < $7
+             OR (e.created_at = $7 AND e.id < $8)
+           )
+         ORDER BY e.created_at DESC, e.id DESC
+         LIMIT $9
+        "#,
     )
     .bind(company_id)
+    .bind(window_start)
+    .bind(application_or_connection_id)
+    .bind(agent_id)
+    .bind(search)
+    .bind(outcome)
+    .bind(cursor.as_ref().map(|value| value.created_at))
+    .bind(cursor.as_ref().map(|value| value.id))
+    .bind(limit + 1)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| {
         tracing::error!("Failed to list gateway audit: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(
-        rows.iter()
-            .map(|r| {
-                json!({
-                    "id": r.get::<Uuid, _>("id"),
-                    "agentId": r.get::<Option<Uuid>, _>("agent_id"),
-                    "toolName": r.get::<String, _>("tool_name"),
-                    "status": r.get::<String, _>("status"),
-                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                })
+    use sqlx::Row;
+    let has_more = rows.len() > limit as usize;
+    let visible = rows.into_iter().take(limit as usize).collect::<Vec<_>>();
+    let events = visible
+        .iter()
+        .map(|row| {
+            let event_type: String = row.get("event_type");
+            let actor_type: String = row.get("actor_type");
+            let actor_id: Option<String> = row.get("actor_id");
+            let agent_id: Option<Uuid> = row.get("agent_id");
+            let run_id: Option<Uuid> = row.get("run_id");
+            let application_id: Option<Uuid> = row.get("application_id");
+            let connection_id: Option<Uuid> = row.get("connection_id");
+            let invocation_id: Option<Uuid> = row.get("invocation_id");
+            let action_request_id: Option<Uuid> = row.get("action_request_id");
+            let tool_name: Option<String> = row.get("tool_name");
+            let decision: Option<String> = row.get("decision");
+            let outcome: String = row.get("outcome");
+            let reason_code: Option<String> = row.get("reason_code");
+            let error_code: Option<String> = row.get("error_code");
+            let error_message: Option<String> = row.get("error_message");
+            let metadata: Option<Value> = row.get("metadata");
+            let mut details = match metadata {
+                Some(Value::Object(object)) => Value::Object(object),
+                Some(value) => json!({"metadata": value}),
+                None => json!({}),
+            };
+            if let Some(value) = decision.as_deref() {
+                details["decision"] = Value::String(value.to_string());
+            }
+            if let Some(value) = reason_code.as_deref() {
+                details["reasonCode"] = Value::String(value.to_string());
+            }
+            if let Some(value) = tool_name.as_deref() {
+                details["tool"] = Value::String(value.to_string());
+            }
+            if let Some(value) = application_id {
+                details["applicationId"] = Value::String(value.to_string());
+            }
+            if let Some(value) = connection_id {
+                details["connectionId"] = Value::String(value.to_string());
+            }
+            if let Some(value) = invocation_id {
+                details["invocationId"] = Value::String(value.to_string());
+            }
+            if let Some(value) = action_request_id {
+                details["actionRequestId"] = Value::String(value.to_string());
+            }
+            if let Some(value) = error_code.as_deref() {
+                details["errorCode"] = Value::String(value.to_string());
+            }
+            if let Some(value) = error_message.as_deref() {
+                details["error"] = Value::String(value.to_string());
+            }
+            if let Some(value) = row.get::<Option<Value>, _>("arguments_summary") {
+                details["argumentsSummary"] = value;
+            }
+            if let Some(value) = row.get::<Option<Value>, _>("request_summary") {
+                details["requestSummary"] = value;
+            }
+            if let Some(value) = row.get::<Option<Value>, _>("result_summary") {
+                details["resultSummary"] = value;
+            }
+            let agent_name: Option<String> = row.get("agent_name");
+            let connection_name: Option<String> = row.get("connection_name");
+            let effective_application_id = application_id.or_else(|| {
+                row.get::<Option<Uuid>, _>("connection_application_id")
+            });
+            let normalized_outcome = gateway_audit_outcome(
+                &event_type,
+                decision.as_deref(),
+                &outcome,
+            );
+            json!({
+                "id": row.get::<Uuid, _>("id"),
+                "companyId": row.get::<Uuid, _>("company_id"),
+                "action": event_type,
+                "actorType": actor_type,
+                "actorId": actor_id,
+                "entityType": if invocation_id.is_some() { "tool_invocation" } else if action_request_id.is_some() { "tool_action_request" } else { "tool_gateway" },
+                "entityId": invocation_id.or(action_request_id),
+                "details": details,
+                "createdAt": row.get::<DateTime<Utc>, _>("created_at"),
+                "agentId": agent_id,
+                "runId": run_id,
+                "applicationId": effective_application_id,
+                "connectionId": connection_id,
+                "agentDisplayName": agent_name,
+                "appDisplayName": connection_name,
+                "applicationDisplayName": Value::Null,
+                "connectionDisplayName": connection_name,
+                "toolDisplayName": tool_name,
+                "normalizedOutcome": normalized_outcome,
             })
-            .collect(),
-    ))
+        })
+        .collect::<Vec<_>>();
+    let next_cursor = if has_more {
+        visible.last().map(|row| {
+            gateway_audit_cursor_encode(&GatewayAuditCursor {
+                created_at: row.get("created_at"),
+                id: row.get("id"),
+            })
+        })
+    } else {
+        None
+    };
+    Ok(Json(json!({
+        "events": events,
+        "nextCursor": next_cursor,
+    })))
 }
 
 /// GET /api/tool-gateway/runtime-slots —— 网关运行时槽位。
@@ -1917,4 +2222,48 @@ async fn gateway_slot_restart(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "restarted": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_audit_cursor_round_trips_without_padding() {
+        let cursor = GatewayAuditCursor {
+            created_at: Utc::now(),
+            id: Uuid::new_v4(),
+        };
+        let encoded = gateway_audit_cursor_encode(&cursor);
+        assert!(!encoded.contains('='));
+        assert_eq!(gateway_audit_cursor_decode(&encoded), Some(cursor));
+        assert!(gateway_audit_cursor_decode("not-a-cursor").is_none());
+    }
+
+    #[test]
+    fn gateway_audit_query_helpers_match_paperclip_filters() {
+        assert_eq!(gateway_audit_window("1h"), Some(Duration::hours(1)));
+        assert_eq!(gateway_audit_window("24h"), Some(Duration::hours(24)));
+        assert!(gateway_audit_window("90d").is_none());
+        assert_eq!(
+            gateway_audit_like_pattern(r"100%_ready\now"),
+            r"%100\%\_ready\\now%"
+        );
+        assert_eq!(
+            gateway_audit_outcome("call_completed", Some("allow"), "success"),
+            "allowed"
+        );
+        assert_eq!(
+            gateway_audit_outcome("approval_requested", Some("require_approval"), "pending"),
+            "asked_first"
+        );
+        assert_eq!(
+            gateway_audit_outcome("call_failed", Some("allow"), "failure"),
+            "allowed"
+        );
+        assert_eq!(
+            gateway_audit_outcome("call_denied", Some("deny"), "denied"),
+            "blocked"
+        );
+    }
 }
