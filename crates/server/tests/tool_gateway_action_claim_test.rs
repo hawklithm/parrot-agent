@@ -1053,3 +1053,203 @@ async fn connection_subresources_are_company_scoped() {
         .execute(&pool)
         .await;
 }
+
+#[tokio::test]
+async fn profile_subresources_are_company_scoped() {
+    let pool = connect_and_migrate().await;
+    let owner_company_id = Uuid::new_v4();
+    let other_company_id = Uuid::new_v4();
+    let profile_id = Uuid::new_v4();
+    let entry_id = Uuid::new_v4();
+
+    for (company_id, name) in [
+        (owner_company_id, "Tool Profile Resource Owner"),
+        (other_company_id, "Tool Profile Resource Other"),
+    ] {
+        let issue_prefix = format!("TP{}", &company_id.simple().to_string()[..8]);
+        sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+            .bind(company_id)
+            .bind(name)
+            .bind(issue_prefix)
+            .execute(&pool)
+            .await
+            .expect("insert profile-scope company");
+    }
+    sqlx::query(
+        "INSERT INTO tool_profiles (id, company_id, profile_key, name, description)
+         VALUES ($1, $2, 'scoped-profile', 'Scoped profile', 'profile scope test')",
+    )
+    .bind(profile_id)
+    .bind(owner_company_id)
+    .execute(&pool)
+    .await
+    .expect("insert scoped tool profile");
+    sqlx::query(
+        "INSERT INTO tool_profile_entries
+            (id, company_id, profile_id, selector_type, effect, tool_name)
+         VALUES ($1, $2, $3, 'tool_name', 'include', 'scoped.tool')",
+    )
+    .bind(entry_id)
+    .bind(owner_company_id)
+    .bind(profile_id)
+    .execute(&pool)
+    .await
+    .expect("insert scoped tool profile entry");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let other_owner = board_actor_with_role(other_company_id, MembershipRole::Owner);
+
+    for (method, uri, body) in [
+        (
+            "GET",
+            format!("/tool-profiles/{profile_id}/new-tools"),
+            None,
+        ),
+        (
+            "PATCH",
+            format!("/tool-profiles/{profile_id}"),
+            Some(json!({"name": "cross-company mutation"})),
+        ),
+        (
+            "DELETE",
+            format!("/tool-profiles/{profile_id}"),
+            None,
+        ),
+        (
+            "PATCH",
+            format!("/tool-profile-entries/{entry_id}"),
+            Some(json!({"enabled": false})),
+        ),
+        (
+            "DELETE",
+            format!("/tool-profile-entries/{entry_id}"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/tool-profiles/{profile_id}/duplicate"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/tool-profiles/{profile_id}/entries"),
+            Some(json!({"tool": "cross-company.tool", "enabled": true})),
+        ),
+        (
+            "POST",
+            format!("/tool-profiles/{profile_id}/new-tools/review"),
+            None,
+        ),
+    ] {
+        let (status, body) = request_connection_route(&app, &other_owner, method, uri, body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "cross-company profile {method} response={body:?}"
+        );
+    }
+
+    let (profile_count, entry_count): (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM tool_profiles WHERE id = $1 AND company_id = $2),
+            (SELECT COUNT(*) FROM tool_profile_entries WHERE id = $3 AND company_id = $2)",
+    )
+    .bind(profile_id)
+    .bind(owner_company_id)
+    .bind(entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("verify cross-company profile isolation");
+    assert_eq!(profile_count, 1);
+    assert_eq!(entry_count, 1);
+
+    let owner = board_actor_with_role(owner_company_id, MembershipRole::Owner);
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/tool-profiles/{profile_id}/new-tools"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner new tools={body:?}");
+    assert!(body.is_array());
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "PATCH",
+        format!("/tool-profile-entries/{entry_id}"),
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner entry update={body:?}");
+    assert_eq!(body.get("enabled").and_then(Value::as_bool), Some(false));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/tool-profiles/{profile_id}/entries"),
+        Some(json!({"tool": "owner.tool", "enabled": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "owner entry create={body:?}");
+    let created_entry_id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Uuid>().ok())
+        .expect("created profile entry id");
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/tool-profiles/{profile_id}/duplicate"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner profile duplicate={body:?}");
+    assert_eq!(
+        body.get("duplicatedFrom").and_then(Value::as_str),
+        Some(profile_id.to_string().as_str())
+    );
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/tool-profiles/{profile_id}/new-tools/review"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner profile review={body:?}");
+
+    for id in [created_entry_id, entry_id] {
+        let (status, body) = request_connection_route(
+            &app,
+            &owner,
+            "DELETE",
+            format!("/tool-profile-entries/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "owner entry delete={body:?}");
+    }
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "DELETE",
+        format!("/tool-profiles/{profile_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "owner profile delete={body:?}");
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
+        .bind(owner_company_id)
+        .bind(other_company_id)
+        .execute(&pool)
+        .await;
+}

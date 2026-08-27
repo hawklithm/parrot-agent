@@ -1007,6 +1007,25 @@ async fn connection_activity(
 
 // ---------- tool-profiles ----------
 
+async fn ensure_tool_profile_scope(
+    state: &AppState,
+    profile_id: Uuid,
+    company_id: Uuid,
+) -> Result<(), StatusCode> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM tool_profiles WHERE id = $1 AND company_id = $2)",
+    )
+    .bind(profile_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to check tool profile scope: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    exists.then_some(()).ok_or(StatusCode::NOT_FOUND)
+}
+
 /// GET /api/tool-profiles/:id/new-tools —— profile 尚未审核的目录工具。
 async fn profile_new_tools(
     State(state): State<AppState>,
@@ -1016,6 +1035,7 @@ async fn profile_new_tools(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    ensure_tool_profile_scope(&state, profile_id, company_id).await?;
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT c.id, c.connection_id, c.name, c.tool_name, c.title, c.description, c.input_schema,
@@ -1064,7 +1084,7 @@ async fn delete_tool_profile(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    sqlx::query("DELETE FROM tool_profiles WHERE id = $1 AND company_id = $2")
+    let result = sqlx::query("DELETE FROM tool_profiles WHERE id = $1 AND company_id = $2")
         .bind(profile_id)
         .bind(company_id)
         .execute(&state.pool)
@@ -1073,6 +1093,9 @@ async fn delete_tool_profile(
             tracing::error!("Failed to delete tool profile: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1769,12 +1792,16 @@ async fn update_tool_profile_entry(
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let row = sqlx::query(
-        "UPDATE tool_profile_entries SET effect = CASE WHEN COALESCE($2, effect = 'include') THEN 'include' ELSE 'exclude' END,
-         updated_at = NOW() WHERE id = $1 RETURNING *",
+        "UPDATE tool_profile_entries AS e
+            SET effect = CASE WHEN COALESCE($2, e.effect = 'include') THEN 'include' ELSE 'exclude' END,
+                updated_at = NOW()
+           FROM tool_profiles AS p
+          WHERE e.id = $1 AND e.profile_id = p.id AND p.company_id = $3
+          RETURNING e.*",
     )
     .bind(entry_id)
     .bind(request.enabled)
-    .bind(request.enabled)
+    .bind(company_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| {
@@ -1799,14 +1826,22 @@ async fn delete_tool_profile_entry(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    sqlx::query("DELETE FROM tool_profile_entries WHERE id = $1")
+    let result = sqlx::query(
+        "DELETE FROM tool_profile_entries AS e
+           USING tool_profiles AS p
+          WHERE e.id = $1 AND e.profile_id = p.id AND p.company_id = $2",
+    )
         .bind(entry_id)
+        .bind(company_id)
         .execute(&state.pool)
         .await
         .map_err(|e| {
             tracing::error!("Failed to delete tool profile entry: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2643,13 +2678,14 @@ async fn create_connection_test_call(
 
 /// POST /api/tool-profiles/:id/duplicate —— mock。
 async fn duplicate_tool_profile(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(profile_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    ensure_tool_profile_scope(&state, profile_id, company_id).await?;
     Ok(Json(
         json!({ "id": Uuid::new_v4(), "duplicatedFrom": profile_id }),
     ))
@@ -2671,21 +2707,30 @@ async fn create_tool_profile_entry(
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO tool_profile_entries (id, company_id, profile_id, selector_type, effect, tool_name) \
-         VALUES ($1, $2, $3, 'tool_name', CASE WHEN COALESCE($4, true) THEN 'include' ELSE 'exclude' END, $5)",
+    let inserted_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO tool_profile_entries
+            (id, company_id, profile_id, selector_type, effect, tool_name)
+         SELECT $1, $2, p.id, 'tool_name',
+                CASE WHEN COALESCE($4, true) THEN 'include' ELSE 'exclude' END,
+                $5
+           FROM tool_profiles AS p
+          WHERE p.id = $3 AND p.company_id = $2
+         RETURNING id",
     )
     .bind(id)
     .bind(company_id)
     .bind(profile_id)
     .bind(request.enabled)
     .bind(&request.tool)
-    .execute(&state.pool)
+    .fetch_optional(&state.pool)
     .await
     .map_err(|e| {
         tracing::error!("Failed to create tool profile entry: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    let Some(id) = inserted_id else {
+        return Err(StatusCode::NOT_FOUND);
+    };
     Ok((
         StatusCode::CREATED,
         Json(json!({ "id": id, "tool": request.tool, "enabled": request.enabled })),
@@ -2694,13 +2739,14 @@ async fn create_tool_profile_entry(
 
 /// POST /api/tool-profiles/:id/new-tools/review —— mock。
 async fn review_profile_new_tools(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(profile_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    ensure_tool_profile_scope(&state, profile_id, company_id).await?;
     Ok(Json(
         json!({ "profileId": profile_id, "newTools": [], "reviewed": true }),
     ))
