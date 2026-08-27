@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use services::auth::{
     ActorSource, AuthorizationActor, CompanyMembership, MembershipRole, PrincipalType,
 };
-use services::secret_provider::decrypt_secret_material;
+use services::secret_provider::{decrypt_secret_material, encrypt_secret_material};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -417,6 +417,54 @@ async fn spawn_oauth_token_endpoint() -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{address}/oauth/token"), handle)
 }
 
+async fn spawn_connection_token_exchange_endpoint(
+    expected_parent_token: &str,
+    status_line: &str,
+    body: &str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind connection token exchange endpoint");
+    let address = listener
+        .local_addr()
+        .expect("connection token exchange endpoint address");
+    let expected_parent_token = expected_parent_token.to_string();
+    let status_line = status_line.to_string();
+    let body = body.to_string();
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .expect("accept connection token exchange request");
+        let mut buffer = vec![0_u8; 16_384];
+        let read = socket
+            .read(&mut buffer)
+            .await
+            .expect("read connection token exchange request");
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let request_lower = request.to_ascii_lowercase();
+        assert!(request.starts_with("POST /token/exchange"), "unexpected exchange request: {request}");
+        assert!(
+            request_lower.contains(&format!("authorization: bearer {expected_parent_token}")),
+            "parent credential was not sent as a bearer token: {request}"
+        );
+        assert!(
+            request.contains("\"scope\":[\"repo\"]")
+                && request.contains("\"ttlSeconds\":120"),
+            "exchange request did not carry the requested scope/ttl: {request}"
+        );
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write connection token exchange response");
+    });
+    (format!("http://{address}/token/exchange"), handle)
+}
+
 async fn insert_oauth_callback_fixture(
     pool: &PgPool,
     company_id: Uuid,
@@ -469,6 +517,97 @@ async fn insert_oauth_callback_fixture(
     .execute(pool)
     .await
     .expect("insert OAuth callback state");
+}
+
+async fn insert_token_exchange_fixture(
+    pool: &PgPool,
+    company_id: Uuid,
+    agent_id: Uuid,
+    run_id: Uuid,
+    connection_id: Uuid,
+    parent_secret_id: Uuid,
+    token_uri: &str,
+) {
+    let issue_prefix = format!("TX{}", &company_id.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Token Exchange Test")
+        .bind(issue_prefix)
+        .execute(pool)
+        .await
+        .expect("insert token exchange company");
+    sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, $3)")
+        .bind(agent_id)
+        .bind(company_id)
+        .bind("Token Exchange Agent")
+        .execute(pool)
+        .await
+        .expect("insert token exchange agent");
+    sqlx::query(
+        "INSERT INTO heartbeat_runs
+            (id, company_id, agent_id, status)
+         VALUES ($1, $2, $3, 'running')",
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .bind(agent_id)
+    .execute(pool)
+    .await
+    .expect("insert token exchange run");
+
+    let (material, digest) = encrypt_secret_material("parent-token")
+        .expect("encrypt token exchange parent credential");
+    sqlx::query(
+        "INSERT INTO company_secrets
+            (id, company_id, key, name, provider, status, scope, managed_mode)
+         VALUES ($1, $2, 'token-exchange-parent', 'Token exchange parent',
+                 'local_encrypted', 'active', 'company', 'paperclip_managed')",
+    )
+    .bind(parent_secret_id)
+    .bind(company_id)
+    .execute(pool)
+    .await
+    .expect("insert token exchange parent secret");
+    sqlx::query(
+        "INSERT INTO company_secret_versions
+            (secret_id, version, material, value_sha256, fingerprint_sha256, status)
+         VALUES ($1, 1, $2, $3, $3, 'current')",
+    )
+    .bind(parent_secret_id)
+    .bind(material)
+    .bind(digest)
+    .execute(pool)
+    .await
+    .expect("insert token exchange parent secret version");
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, name, uid, transport, auth_kind, status, enabled,
+             config, credential_secret_refs)
+         VALUES ($1, $2, 'Token exchange connection', 'token-exchange',
+                 'rest_api', 'api_key', 'active', true, $3, $4)",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .bind(json!({
+        "tokenBroker": {
+            "enabled": true,
+            "path": "exchange",
+            "protocol": "generic",
+            "tokenUrl": token_uri,
+            "parentScopes": ["repo", "read"],
+            "defaultScopes": ["repo"]
+        }
+    }))
+    .bind(json!([{
+        "secretId": parent_secret_id,
+        "versionSelector": "latest",
+        "configPath": "credentials.deploy_token",
+        "required": true,
+        "label": "Deploy token"
+    }]))
+    .execute(pool)
+    .await
+    .expect("insert token exchange connection");
 }
 
 fn oauth_callback_actor(company_id: Uuid, user_id: Uuid) -> AuthorizationActor {
@@ -2543,6 +2682,860 @@ async fn run_decision_lookup_enforces_board_company_and_run_scope() {
     let _ = sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
         .bind(company_id)
         .bind(other_company_id)
+        .execute(&pool)
+        .await;
+}
+
+// ================= Connection Token Exchange Tests =================
+
+/// POST /agents/me/connections/:connection_id/token exchange path: success (generic protocol).
+#[tokio::test]
+async fn connection_token_exchange_success_generic() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "200 OK",
+        r#"{"token":"minted-token","token_type":"Bearer","scope":["repo"],"expires_in":3600}"#,
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool,
+        company_id,
+        agent_id,
+        run_id,
+        connection_id,
+        parent_secret_id,
+        &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({
+            "requestedTtlSeconds": 120,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "exchange response={body:?}");
+    assert_eq!(body["status"], "minted");
+    assert_eq!(body["path"], "exchange");
+    assert_eq!(body["token"], "minted-token");
+    assert_eq!(body["tokenType"], "Bearer");
+    assert_eq!(body["scope"], json!(["repo"]));
+    let ttl = body["ttlSeconds"].as_i64().expect("ttlSeconds");
+    assert!(ttl <= 900, "ttlSeconds={ttl} exceeds 900 max");
+    assert!(ttl >= 1, "ttlSeconds={ttl} below minimum");
+    let expires_at = body["expiresAt"].as_str().expect("expiresAt");
+    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .expect("parse expiresAt")
+        .with_timezone(&Utc);
+    let remaining = (expires_at - Utc::now()).num_seconds();
+    assert!(remaining >= 1 && remaining <= 900, "expiresAt remaining={remaining}s outside 1..=900");
+    assert_eq!(body["connectionId"].as_str(), Some(connection_id.to_string().as_str()));
+    assert_eq!(body["grantId"].as_str().map(|s| !s.is_empty()), Some(true));
+    assert_eq!(body["attribution"]["agentId"].as_str(), Some(agent_id.to_string().as_str()));
+    assert_eq!(body["attribution"]["runId"].as_str(), Some(run_id.to_string().as_str()));
+
+    // Verify issuance record
+    let (issuance_count, issuance_outcome, issuance_token_hash): (i64, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT COUNT(*), MIN(outcome), MIN(token_hash)
+               FROM connection_token_issuances
+              WHERE company_id = $1 AND connection_id = $2 AND path = 'exchange'",
+        )
+        .bind(company_id)
+        .bind(connection_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read issuance");
+    assert_eq!(issuance_count, 1, "exactly one issuance record");
+    assert_eq!(issuance_outcome, "success");
+    let token_hash = issuance_token_hash.expect("token_hash present");
+    assert_eq!(token_hash.len(), 64, "token_hash is SHA-256 hex");
+    assert!(token_hash.chars().all(|c| c.is_ascii_hexdigit()), "token_hash is hex");
+
+    // No plaintext token in grant secret refs
+    let grant_refs: Option<Value> = sqlx::query_scalar(
+        "SELECT credential_secret_refs
+           FROM connection_grants
+          WHERE company_id = $1 AND connection_id = $2 AND kind = 'workspace'",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("read grant refs");
+    let refs_text = serde_json::to_string(&grant_refs.unwrap_or(json!([]))).expect("serialize refs");
+    assert!(!refs_text.contains("minted-token"), "grant secret refs contain plaintext token");
+
+    endpoint.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// Upstream 401 is mapped to credential_revoked (CONFLICT).
+#[tokio::test]
+async fn connection_token_exchange_upstream_401() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "401 Unauthorized",
+        r#"{"error":"invalid_token"}"#,
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({ "requestedTtlSeconds": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "expected CONFLICT for credential_revoked, got {status} body={body:?}");
+
+    let (issuance_outcome, issuance_error): (String, String) = sqlx::query_as(
+        "SELECT outcome, error_code
+           FROM connection_token_issuances
+          WHERE company_id = $1 AND connection_id = $2 AND path = 'exchange'
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read issuance");
+    assert_eq!(issuance_outcome, "upstream_error");
+    assert_eq!(issuance_error, "credential_revoked");
+
+    endpoint.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// Upstream returns invalid JSON → upstream_error (BAD_GATEWAY).
+#[tokio::test]
+async fn connection_token_exchange_invalid_upstream_json() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "200 OK",
+        "this is not valid json",
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({ "requestedTtlSeconds": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body={body:?}");
+
+    let (issuance_outcome, _issuance_error): (String, String) = sqlx::query_as(
+        "SELECT outcome, error_code
+           FROM connection_token_issuances
+          WHERE company_id = $1 AND connection_id = $2 AND path = 'exchange'
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read issuance");
+    assert_eq!(issuance_outcome, "upstream_error");
+
+    endpoint.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// Upstream 200 with no token/access_token field → upstream_token_missing.
+#[tokio::test]
+async fn connection_token_exchange_missing_token() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "200 OK",
+        r#"{"status":"ok"}"#,
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({ "requestedTtlSeconds": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body={body:?}");
+
+    let (issuance_outcome, issuance_error): (String, String) = sqlx::query_as(
+        "SELECT outcome, error_code
+           FROM connection_token_issuances
+          WHERE company_id = $1 AND connection_id = $2 AND path = 'exchange'
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read issuance");
+    assert_eq!(issuance_outcome, "upstream_error");
+    assert_eq!(issuance_error, "upstream_token_missing");
+
+    endpoint.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// Upstream returns wider scope than requested → upstream_scope_exceeds_requested.
+#[tokio::test]
+async fn connection_token_exchange_scope_expansion_rejected() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "200 OK",
+        r#"{"token":"admin-token","token_type":"Bearer","scope":["repo","admin"],"expires_in":3600}"#,
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({ "requestedTtlSeconds": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body={body:?}");
+
+    let (issuance_outcome, issuance_error): (String, String) = sqlx::query_as(
+        "SELECT outcome, error_code
+           FROM connection_token_issuances
+          WHERE company_id = $1 AND connection_id = $2 AND path = 'exchange'
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read issuance");
+    assert_eq!(issuance_outcome, "upstream_error");
+    assert_eq!(issuance_error, "upstream_scope_exceeds_requested");
+
+    endpoint.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// Requested TTL above 900s is truncated to 900s.
+#[tokio::test]
+async fn connection_token_exchange_ttl_truncation() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    // Custom endpoint that checks for ttlSeconds=900 (clamped, not 3600)
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind TTL test endpoint");
+    let address = listener.local_addr().expect("TTL test endpoint address");
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept TTL test request");
+        let mut buffer = vec![0_u8; 16_384];
+        let read = socket.read(&mut buffer).await.expect("read TTL test request");
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        assert!(
+            request.contains("\"ttlSeconds\":900"),
+            "expected ttlSeconds=900 (clamped), got: {request}"
+        );
+        let body = r#"{"token":"ttl-token","token_type":"Bearer","scope":["repo"],"expires_in":3600}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await.expect("write TTL test response");
+    });
+    let token_uri = format!("http://{address}/token/exchange");
+
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    // Request TTL=3600, but max is 900
+    let (status, body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({ "requestedTtlSeconds": 3600 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body:?}");
+    let ttl = body["ttlSeconds"].as_i64().expect("ttlSeconds");
+    // Effective TTL may be 899 due to sub-second clock drift during exchange
+    assert!(ttl >= 895 && ttl <= 900, "expected TTL near 900, got {ttl}");
+    let expires_at = body["expiresAt"].as_str().expect("expiresAt");
+    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .expect("parse expiresAt")
+        .with_timezone(&Utc);
+    let remaining = (expires_at - Utc::now()).num_seconds();
+    assert!(remaining >= 1 && remaining <= 900, "expiresAt remaining={remaining}s outside 1..=900");
+
+    let (issuance_ttl,): (Option<i32>,) = sqlx::query_as(
+        "SELECT ttl_seconds
+           FROM connection_token_issuances
+          WHERE company_id = $1 AND connection_id = $2 AND path = 'exchange'
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read issuance ttl");
+    assert!(issuance_ttl.is_some());
+    let stored_ttl = issuance_ttl.unwrap();
+    // effective TTL may be 899 due to sub-second clock drift during exchange
+    assert!(stored_ttl >= 895 && stored_ttl <= 900, "issuance ttl_seconds={stored_ttl}");
+
+    handle.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// User-grant binding: subject_user_id on request binds to user grant.
+/// User grants must be pre-created (from prior OAuth callback); the token exchange
+/// path binds to an existing user grant rather than auto-creating one.
+#[tokio::test]
+async fn connection_token_exchange_user_grant_binding() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+    let user_id = "user-123".to_string();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "200 OK",
+        r#"{"token":"user-bound-token","token_type":"Bearer","scope":["repo"],"expires_in":3600}"#,
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+    // Set responsible_user_id on the heartbeat run
+    sqlx::query("UPDATE heartbeat_runs SET responsible_user_id = $1 WHERE id = $2")
+        .bind(&user_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("update run responsible user");
+    // Pre-create user grant (normally created during OAuth callback)
+    let user_grant_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO connection_grants
+            (id, company_id, connection_id, kind, subject_user_id, status, is_default,
+             credential_secret_refs, created_by_agent_id)
+         VALUES ($1, $2, $3, 'user', $4, 'active', false, $5, $6)",
+    )
+    .bind(user_grant_id)
+    .bind(company_id)
+    .bind(connection_id)
+    .bind(&user_id)
+    .bind(json!([{
+        "secretId": parent_secret_id,
+        "versionSelector": "latest",
+        "configPath": "credentials.deploy_token",
+        "required": true,
+        "label": "Deploy token"
+    }]))
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("insert user grant");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({
+            "requestedTtlSeconds": 120,
+            "subject": { "type": "user", "userId": user_id }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body:?}");
+    assert_eq!(body["status"], "minted");
+    assert_eq!(body["grantId"].as_str(), Some(user_grant_id.to_string().as_str()));
+
+    let (grant_kind, grant_subject): (String, Option<String>) = sqlx::query_as(
+        "SELECT kind, subject_user_id
+           FROM connection_grants
+          WHERE company_id = $1 AND connection_id = $2 AND kind = 'user'",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read user grant");
+    assert_eq!(grant_kind, "user");
+    assert_eq!(grant_subject.as_deref(), Some(user_id.as_str()));
+
+    endpoint.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// No subject → workspace grant is auto-created and bound.
+#[tokio::test]
+async fn connection_token_exchange_workspace_grant_binding() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "200 OK",
+        r#"{"token":"workspace-bound-token","token_type":"Bearer","scope":["repo"],"expires_in":3600}"#,
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({ "requestedTtlSeconds": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body:?}");
+    assert_eq!(body["status"], "minted");
+
+    let (grant_kind, grant_default): (String, bool) = sqlx::query_as(
+        "SELECT kind, is_default
+           FROM connection_grants
+          WHERE company_id = $1 AND connection_id = $2 AND kind = 'workspace'",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read workspace grant");
+    assert_eq!(grant_kind, "workspace");
+    assert!(grant_default, "workspace grant must be is_default");
+
+    endpoint.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// After successful exchange, grant last_used_at is updated.
+#[tokio::test]
+async fn connection_token_exchange_last_used_at_updated() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "200 OK",
+        r#"{"token":"last-used-token","token_type":"Bearer","scope":["repo"],"expires_in":3600}"#,
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, _body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({ "requestedTtlSeconds": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "exchange must succeed to test last_used_at");
+
+    let last_used_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT last_used_at
+           FROM connection_grants
+          WHERE company_id = $1 AND connection_id = $2 AND kind = 'workspace'",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read grant last_used_at");
+    assert!(last_used_at.is_some(), "last_used_at must be set after exchange");
+    let age = (Utc::now() - last_used_at.unwrap()).num_seconds();
+    assert!(age >= 0 && age <= 30, "last_used_at {age}s ago, expected recent");
+
+    endpoint.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// Database never stores the plaintext bearer token, only a SHA-256 hash.
+#[tokio::test]
+async fn connection_token_exchange_token_hash_only_no_plaintext() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "200 OK",
+        r#"{"token":"secret-minted-token","token_type":"Bearer","scope":["repo"],"expires_in":3600}"#,
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, _body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({ "requestedTtlSeconds": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    endpoint.await.expect("token exchange endpoint task");
+
+    // Issuance has token_hash (SHA-256), no column for plaintext token
+    let token_hash: Option<String> = sqlx::query_scalar(
+        "SELECT token_hash
+           FROM connection_token_issuances
+          WHERE company_id = $1 AND connection_id = $2 AND path = 'exchange'
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read issuance token_hash");
+    let hash = token_hash.expect("token_hash present");
+    assert_eq!(hash.len(), 64, "SHA-256 hex length");
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "hex only");
+
+    // No column in connection_token_issuances for storing plain token (schema enforced)
+    // Grant secret refs should not contain the minted token value
+    let grant_refs: Value = sqlx::query_scalar(
+        "SELECT credential_secret_refs
+           FROM connection_grants
+          WHERE company_id = $1 AND connection_id = $2 AND kind = 'workspace'",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read grant");
+    let refs_text = serde_json::to_string(&grant_refs).expect("serialize");
+    assert!(!refs_text.contains("secret-minted-token"), "plaintext token leaked into grant refs");
+
+    // Connection config should not contain the minted token
+    let config: Value = sqlx::query_scalar(
+        "SELECT config FROM tool_connections WHERE id = $1 AND company_id = $2",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read connection config");
+    let config_text = serde_json::to_string(&config).expect("serialize config");
+    assert!(!config_text.contains("secret-minted-token"), "plaintext token leaked into connection config");
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// Issuance audit record has all required fields after success.
+#[tokio::test]
+async fn connection_token_exchange_issuance_audit_fields() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+    let user_id = "audit-user".to_string();
+
+    let (token_uri, endpoint) = spawn_connection_token_exchange_endpoint(
+        "parent-token",
+        "200 OK",
+        r#"{"token":"audit-token","token_type":"Bearer","scope":["repo"],"expires_in":3600}"#,
+    )
+    .await;
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+    sqlx::query("UPDATE heartbeat_runs SET responsible_user_id = $1 WHERE id = $2")
+        .bind(&user_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("update run responsible user");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/agents/me/connections/{connection_id}/token"),
+        Some(json!({
+            "requestedTtlSeconds": 120,
+            "scope": ["repo"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body:?}");
+
+    // Verify issuance record
+    let issuance: (String, String, String, String, String, String, Option<String>, String) = sqlx::query_as(
+        "SELECT connection_id::text, agent_id::text, run_id::text, path,
+                outcome, COALESCE(error_code, ''), token_hash, metadata::text
+           FROM connection_token_issuances
+          WHERE company_id = $1 AND path = 'exchange'
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read issuance");
+    assert_eq!(issuance.0, connection_id.to_string(), "connection_id");
+    assert_eq!(issuance.1, agent_id.to_string(), "agent_id");
+    assert_eq!(issuance.2, run_id.to_string(), "run_id");
+    assert_eq!(issuance.3, "exchange", "path");
+    assert_eq!(issuance.4, "success", "outcome");
+    assert!(issuance.5.is_empty() || issuance.5 == "", "error_code for success (got '{}')", issuance.5);
+    assert!(issuance.6.is_some(), "token_hash present");
+    assert!(issuance.7.contains("grantId"), "metadata has grantId");
+
+    // Also test a denied issuance has correct error fields
+    // (the failed scope-expansion test already covers this implicitly)
+
+    endpoint.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+/// Concurrent exchange requests both succeed and create separate issuance records.
+#[tokio::test]
+async fn connection_token_exchange_concurrent_requests() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let parent_secret_id = Uuid::new_v4();
+
+    // Multi-accept endpoint for concurrent tests
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind concurrent exchange endpoint");
+    let address = listener.local_addr().expect("concurrent exchange address");
+    let handle = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.expect("accept concurrent request");
+            let mut buffer = vec![0_u8; 16_384];
+            let read = socket.read(&mut buffer).await.expect("read concurrent request");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.contains("POST /token/exchange"), "expected exchange: {request}");
+            let body = r#"{"token":"concurrent-token","token_type":"Bearer","scope":["repo"],"expires_in":900}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write concurrent response");
+        }
+    });
+    let token_uri = format!("http://{address}/token/exchange");
+
+    insert_token_exchange_fixture(
+        &pool, company_id, agent_id, run_id, connection_id, parent_secret_id, &token_uri,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+    let uri = format!("/agents/me/connections/{connection_id}/token");
+    let body = Some(json!({ "requestedTtlSeconds": 120 }));
+
+    let (first, second) = tokio::join!(
+        request_connection_route(&app, &agent, "POST", uri.clone(), body.clone()),
+        request_connection_route(&app, &agent, "POST", uri.clone(), body.clone()),
+    );
+    assert_eq!(first.0, StatusCode::OK, "first={:?}", first.1);
+    assert_eq!(second.0, StatusCode::OK, "second={:?}", second.1);
+    assert_eq!(first.1["status"], "minted");
+    assert_eq!(second.1["status"], "minted");
+
+    // Both should reference the same grant (workspace default)
+    let first_grant = first.1["grantId"].as_str().map(ToOwned::to_owned);
+    let second_grant = second.1["grantId"].as_str().map(ToOwned::to_owned);
+    assert_eq!(first_grant, second_grant, "same grantId for concurrent requests");
+
+    // Two separate issuance records
+    let issuance_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM connection_token_issuances
+          WHERE company_id = $1 AND connection_id = $2 AND path = 'exchange'",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count issuances");
+    assert_eq!(issuance_count, 2, "two concurrent requests produce two issuance records");
+
+    handle.await.expect("token exchange endpoint task");
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
         .execute(&pool)
         .await;
 }

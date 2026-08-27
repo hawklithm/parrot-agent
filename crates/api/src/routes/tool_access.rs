@@ -4138,6 +4138,525 @@ fn bounded_token_ttl(row: &sqlx::postgres::PgRow, requested: Option<i64>) -> Res
         .clamp(1, 900) as i32)
 }
 
+#[derive(Debug)]
+struct ConnectionTokenExchangeError {
+    status: StatusCode,
+    outcome: &'static str,
+    code: &'static str,
+    metadata: Value,
+}
+
+impl ConnectionTokenExchangeError {
+    fn configuration(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            outcome: "failure",
+            code,
+            metadata: json!({}),
+        }
+    }
+
+    fn credential(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            outcome: "denied",
+            code,
+            metadata: json!({}),
+        }
+    }
+
+    fn internal(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            outcome: "failure",
+            code,
+            metadata: json!({}),
+        }
+    }
+
+    fn upstream(status: StatusCode, code: &'static str, metadata: Value) -> Self {
+        Self {
+            status,
+            outcome: "upstream_error",
+            code,
+            metadata,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BrokerTokenExchange {
+    token: String,
+    token_type: String,
+    expires_at: DateTime<Utc>,
+    scope: Vec<String>,
+}
+
+fn broker_reference_secret_id(reference: &Value) -> Option<Uuid> {
+    reference
+        .get("secretId")
+        .or_else(|| reference.get("secret_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn broker_reference_version(reference: &Value) -> String {
+    reference
+        .get("versionSelector")
+        .or_else(|| reference.get("version_selector"))
+        .or_else(|| reference.get("version"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("latest")
+        .to_string()
+}
+
+fn broker_reference_name(reference: &Value) -> Option<&str> {
+    reference
+        .get("name")
+        .or_else(|| reference.get("key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn is_oauth_credential_path(path: &str) -> bool {
+    matches!(
+        path.to_ascii_lowercase().as_str(),
+        "oauth.access_token"
+            | "oauth.access-token"
+            | "oauth.accesstoken"
+            | "oauth.refresh_token"
+            | "oauth.refresh-token"
+            | "oauth.refreshtoken"
+            | "oauth.client_secret"
+            | "oauth.client-secret"
+            | "oauth.clientsecret"
+    )
+}
+
+fn is_broker_secret_reference(reference: &Value) -> bool {
+    broker_reference_secret_id(reference).is_some()
+        && !credential_ref_path(reference).is_some_and(is_oauth_credential_path)
+}
+
+fn broker_parent_reference(
+    row: &sqlx::postgres::PgRow,
+    grant_secret_refs: &Value,
+    subject_user_id: Option<&str>,
+) -> Option<Value> {
+    use sqlx::Row;
+    let grant_refs = grant_secret_refs.as_array().cloned().unwrap_or_default();
+    let secret_refs = if !grant_refs.is_empty() {
+        grant_refs
+    } else if subject_user_id.is_none() {
+        row.get::<Option<Value>, _>("credential_secret_refs")
+            .unwrap_or_else(|| json!([]))
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let configured_path = connection_config_string_in_sections(
+        row,
+        &["tokenBroker", "token_broker", "broker"],
+        &["parentCredentialConfigPath", "credentialConfigPath", "secretConfigPath"],
+    );
+    if let Some(configured_path) = configured_path.as_deref() {
+        if let Some(reference) = secret_refs.iter().find(|reference| {
+            is_broker_secret_reference(reference)
+                && credential_ref_path(reference) == Some(configured_path)
+        }) {
+            return Some(reference.clone());
+        }
+    } else {
+        for preferred_path in ["credentials.deploy_token", "pages.deploy_token"] {
+            if let Some(reference) = secret_refs.iter().find(|reference| {
+                is_broker_secret_reference(reference)
+                    && credential_ref_path(reference) == Some(preferred_path)
+            }) {
+                return Some(reference.clone());
+            }
+        }
+        if let Some(reference) = secret_refs
+            .iter()
+            .find(|reference| is_broker_secret_reference(reference))
+        {
+            return Some(reference.clone());
+        }
+    }
+
+    if subject_user_id.is_some() {
+        return None;
+    }
+    let configured_name = connection_config_string_in_sections(
+        row,
+        &["tokenBroker", "token_broker", "broker"],
+        &["parentCredentialName", "credentialName"],
+    );
+    let credential_refs = row
+        .get::<Option<Value>, _>("credential_refs")
+        .unwrap_or_else(|| json!([]));
+    let credential_refs = credential_refs.as_array()?;
+    if let Some(configured_name) = configured_name.as_deref() {
+        credential_refs
+            .iter()
+            .find(|reference| {
+                broker_reference_secret_id(reference).is_some()
+                    && broker_reference_name(reference) == Some(configured_name)
+            })
+            .cloned()
+    } else {
+        credential_refs
+            .iter()
+            .find(|reference| broker_reference_secret_id(reference).is_some())
+            .cloned()
+    }
+}
+
+async fn resolve_broker_parent_credential(
+    pool: &sqlx::PgPool,
+    row: &sqlx::postgres::PgRow,
+    grant_secret_refs: &Value,
+    subject_user_id: Option<&str>,
+) -> Result<String, ConnectionTokenExchangeError> {
+    use sqlx::Row;
+    let reference = broker_parent_reference(row, grant_secret_refs, subject_user_id)
+        .ok_or_else(|| ConnectionTokenExchangeError::configuration("parent_credential_missing"))?;
+    let secret_id = broker_reference_secret_id(&reference)
+        .ok_or_else(|| ConnectionTokenExchangeError::configuration("parent_credential_invalid"))?;
+    let version = broker_reference_version(&reference);
+    let secret_row = if version.eq_ignore_ascii_case("latest") {
+        sqlx::query(
+            "SELECT v.material, s.provider
+               FROM company_secret_versions v
+               JOIN company_secrets s ON s.id = v.secret_id
+              WHERE s.id = $1 AND s.company_id = $2
+                AND s.status = 'active' AND s.deleted_at IS NULL
+                AND v.status = 'current' AND v.revoked_at IS NULL
+              ORDER BY v.version DESC
+              LIMIT 1",
+        )
+        .bind(secret_id)
+        .bind(row.get::<Uuid, _>("company_id"))
+        .fetch_optional(pool)
+        .await
+    } else {
+        let version_number = version
+            .parse::<i32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| ConnectionTokenExchangeError::configuration("parent_credential_version_invalid"))?;
+        sqlx::query(
+            "SELECT v.material, s.provider
+               FROM company_secret_versions v
+               JOIN company_secrets s ON s.id = v.secret_id
+              WHERE s.id = $1 AND s.company_id = $2
+                AND s.status = 'active' AND s.deleted_at IS NULL
+                AND v.version = $3 AND v.revoked_at IS NULL
+              LIMIT 1",
+        )
+        .bind(secret_id)
+        .bind(row.get::<Uuid, _>("company_id"))
+        .bind(version_number)
+        .fetch_optional(pool)
+        .await
+    }
+    .map_err(|error| {
+        tracing::error!(%error, %secret_id, "Failed to resolve broker parent credential");
+        ConnectionTokenExchangeError::internal("parent_credential_resolution_failed")
+    })?;
+    let Some(secret_row) = secret_row else {
+        return Err(ConnectionTokenExchangeError::credential("credential_revoked"));
+    };
+    let provider: String = secret_row.get("provider");
+    if provider != "local_encrypted" && provider != "local" {
+        return Err(ConnectionTokenExchangeError::configuration(
+            "parent_credential_provider_unsupported",
+        ));
+    }
+    let material: Value = secret_row.get("material");
+    let value = decrypt_secret_material(&material).map_err(|error| {
+        tracing::warn!(%error, %secret_id, "Failed to decrypt broker parent credential");
+        ConnectionTokenExchangeError::credential("credential_revoked")
+    })?;
+    if value.trim().is_empty() {
+        return Err(ConnectionTokenExchangeError::credential("credential_revoked"));
+    }
+    Ok(value)
+}
+
+fn broker_exchange_url(row: &sqlx::postgres::PgRow) -> Result<Url, ConnectionTokenExchangeError> {
+    let configured = connection_config_string_in_sections(
+        row,
+        &["tokenBroker", "token_broker", "broker"],
+        &["tokenUrl", "token_url", "exchangeTokenUrl", "exchange_token_url"],
+    )
+    .or_else(|| {
+        connection_config_string_in_sections(
+            row,
+            &[],
+            &["tokenExchangeUrl", "token_exchange_url", "pagesTokenExchangeUrl"],
+        )
+    })
+    .ok_or_else(|| ConnectionTokenExchangeError::configuration("exchange_url_missing"))?;
+    validate_oauth_endpoint(&configured)
+        .map_err(|_| ConnectionTokenExchangeError::configuration("exchange_url_invalid"))
+}
+
+fn broker_response_expires_at(
+    payload: &Value,
+    now: DateTime<Utc>,
+    ttl_seconds: i32,
+) -> Result<DateTime<Utc>, ConnectionTokenExchangeError> {
+    let configured = payload
+        .get("expiresAt")
+        .or_else(|| payload.get("expires_at"))
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let expires_in = payload
+        .get("expiresIn")
+        .or_else(|| payload.get("expires_in"))
+        .and_then(|value| match value {
+            Value::Number(value) => value.as_i64(),
+            Value::String(value) => value.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+        .filter(|value| *value > 0)
+        .map(|value| now + Duration::seconds(value));
+    let maximum = now + Duration::seconds(i64::from(ttl_seconds));
+    let candidate = configured.or(expires_in).unwrap_or(maximum);
+    if candidate <= now {
+        return Err(ConnectionTokenExchangeError::upstream(
+            StatusCode::BAD_GATEWAY,
+            "upstream_token_invalid",
+            json!({ "reason": "token_expired" }),
+        ));
+    }
+    let bounded = std::cmp::min(candidate, maximum);
+    Ok(std::cmp::max(bounded, now + Duration::seconds(1)))
+}
+
+async fn exchange_connection_token(
+    row: &sqlx::postgres::PgRow,
+    grant_secret_refs: &Value,
+    subject_user_id: Option<&str>,
+    context: &ActiveAgentRunContext,
+    issued_scope: &[String],
+    ttl_seconds: i32,
+    pool: &sqlx::PgPool,
+) -> Result<BrokerTokenExchange, ConnectionTokenExchangeError> {
+    use sqlx::Row;
+    let parent_token = resolve_broker_parent_credential(
+        pool,
+        row,
+        grant_secret_refs,
+        subject_user_id,
+    )
+    .await?;
+    let endpoint = broker_exchange_url(row)?;
+    let protocol = connection_config_string_in_sections(
+        row,
+        &["tokenBroker", "token_broker", "broker"],
+        &["protocol", "exchangeProtocol", "exchange_protocol"],
+    )
+    .unwrap_or_else(|| "generic".to_string())
+    .to_ascii_lowercase();
+    if !matches!(protocol.as_str(), "generic" | "json" | "pages" | "rfc8693" | "rfc_8693") {
+        return Err(ConnectionTokenExchangeError::configuration(
+            "exchange_protocol_unsupported",
+        ));
+    }
+    let audience = connection_config_string_in_sections(
+        row,
+        &["tokenBroker", "token_broker", "broker"],
+        &["audience"],
+    );
+    let actor = json!({
+        "type": "agent",
+        "id": context.agent_id,
+        "runId": context.run_id,
+        "onBehalfOf": context.responsible_user_id.as_deref().map(|id| format!("user:{id}")),
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| {
+            tracing::error!(%error, "Failed to build connection token exchange client");
+            ConnectionTokenExchangeError::internal("exchange_client_unavailable")
+        })?;
+    let response = if matches!(protocol.as_str(), "rfc8693" | "rfc_8693") {
+        let actor_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&actor).map_err(|_| {
+                ConnectionTokenExchangeError::internal("exchange_actor_serialization_failed")
+            })?,
+        );
+        let mut form = vec![
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+            ),
+            ("subject_token", parent_token.clone()),
+            (
+                "subject_token_type",
+                connection_config_string_in_sections(
+                    row,
+                    &["tokenBroker", "token_broker", "broker"],
+                    &["subjectTokenType", "subject_token_type"],
+                )
+                .unwrap_or_else(|| "urn:ietf:params:oauth:token-type:access_token".to_string()),
+            ),
+            ("scope", issued_scope.join(" ")),
+            ("requested_token_type", connection_config_string_in_sections(
+                row,
+                &["tokenBroker", "token_broker", "broker"],
+                &["requestedTokenType", "requested_token_type"],
+            )
+            .unwrap_or_else(|| "urn:ietf:params:oauth:token-type:access_token".to_string())),
+            ("actor_token", actor_token),
+            ("actor_token_type", connection_config_string_in_sections(
+                row,
+                &["tokenBroker", "token_broker", "broker"],
+                &["actorTokenType", "actor_token_type"],
+            )
+            .unwrap_or_else(|| "urn:ietf:params:oauth:token-type:jwt".to_string())),
+        ];
+        if let Some(audience) = audience.as_deref() {
+            form.push(("audience", audience.to_string()));
+        }
+        client.post(endpoint).form(&form).send().await
+    } else {
+        let mut body = if protocol == "pages" {
+            let namespace = issued_scope
+                .first()
+                .and_then(|scope| scope.strip_prefix("pages:publish:ns/"));
+            if let Some(namespace) = namespace {
+                json!({
+                    "namespace": namespace,
+                    "ttlSeconds": ttl_seconds,
+                    "actions": ["publish"],
+                    "actor": actor,
+                })
+            } else {
+                json!({
+                    "scope": issued_scope,
+                    "ttlSeconds": ttl_seconds,
+                    "actor": actor,
+                })
+            }
+        } else {
+            json!({
+                "scope": issued_scope,
+                "ttlSeconds": ttl_seconds,
+                "actor": actor,
+            })
+        };
+        if let Some(audience) = audience {
+            body["audience"] = json!(audience);
+        }
+        client
+            .post(endpoint)
+            .bearer_auth(parent_token)
+            .json(&body)
+            .send()
+            .await
+    }
+    .map_err(|error| {
+        tracing::warn!(%error, connection_id = %row.get::<Uuid, _>("id"), "Connection token exchange request failed");
+        ConnectionTokenExchangeError::upstream(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            json!({}),
+        )
+    })?;
+    let upstream_status = response.status();
+    let payload = response.json::<Value>().await.map_err(|error| {
+        tracing::warn!(%error, %upstream_status, "Connection token exchange returned invalid JSON");
+        ConnectionTokenExchangeError::upstream(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            json!({ "upstreamStatus": upstream_status.as_u16() }),
+        )
+    })?;
+    if !upstream_status.is_success() {
+        let upstream_code = payload
+            .get("code")
+            .or_else(|| payload.get("error"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(128).collect::<String>());
+        let credential_revoked = matches!(upstream_status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            || upstream_code.as_deref() == Some("parent_revoked");
+        return Err(ConnectionTokenExchangeError::upstream(
+            if credential_revoked {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
+            if credential_revoked {
+                "credential_revoked"
+            } else {
+                "upstream_error"
+            },
+            json!({
+                "upstreamStatus": upstream_status.as_u16(),
+                "upstreamCode": upstream_code,
+            }),
+        ));
+    }
+    let token = payload
+        .get("token")
+        .or_else(|| payload.get("access_token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 16_384)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            ConnectionTokenExchangeError::upstream(
+                StatusCode::BAD_GATEWAY,
+                "upstream_token_missing",
+                json!({ "upstreamStatus": upstream_status.as_u16() }),
+            )
+        })?;
+    let token_type = payload
+        .get("tokenType")
+        .or_else(|| payload.get("token_type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 128)
+        .unwrap_or("Bearer")
+        .to_string();
+    let response_scope = payload
+        .get("scope")
+        .map(config_scope_values)
+        .unwrap_or_default();
+    if !response_scope.is_empty() && !token_scopes_subset(&response_scope, issued_scope) {
+        return Err(ConnectionTokenExchangeError::upstream(
+            StatusCode::BAD_GATEWAY,
+            "upstream_scope_exceeds_requested",
+            json!({ "scopeCount": response_scope.len() }),
+        ));
+    }
+    let scope = if response_scope.is_empty() {
+        issued_scope.to_vec()
+    } else {
+        response_scope
+    };
+    let now = Utc::now();
+    let expires_at = broker_response_expires_at(&payload, now, ttl_seconds)?;
+    Ok(BrokerTokenExchange {
+        token,
+        token_type,
+        expires_at,
+        scope,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum AgentConnectionTokenScope {
@@ -4512,15 +5031,17 @@ async fn agent_connection_token(
 
     let grant = if let Some(grant_id) = request.grant_id {
         sqlx::query(
-            "SELECT id, status
+            "SELECT id, status, credential_secret_refs
                FROM connection_grants
               WHERE id = $1 AND company_id = $2 AND connection_id = $3
-                AND kind = $4",
+                AND kind = $4
+                AND ($5::text IS NULL OR subject_user_id = $5)",
         )
         .bind(grant_id)
         .bind(context.company_id)
         .bind(connection_id)
         .bind(if subject_user_id.is_some() { "user" } else { "workspace" })
+        .bind(subject_user_id.as_deref())
         .fetch_optional(&state.pool)
         .await
         .map_err(|e| {
@@ -4529,7 +5050,7 @@ async fn agent_connection_token(
         })?
     } else if let Some(subject_user_id) = subject_user_id.as_deref() {
         sqlx::query(
-            "SELECT id, status
+            "SELECT id, status, credential_secret_refs
                FROM connection_grants
               WHERE company_id = $1 AND connection_id = $2
                 AND kind = 'user' AND subject_user_id = $3
@@ -4548,13 +5069,18 @@ async fn agent_connection_token(
     } else {
         sqlx::query(
             "INSERT INTO connection_grants
-                (company_id, connection_id, kind, status, is_default, created_by_agent_id)
-             VALUES ($1, $2, 'workspace', 'active', true, $3)
+                (company_id, connection_id, kind, status, is_default,
+                 created_by_agent_id, credential_secret_refs)
+             VALUES ($1, $2, 'workspace', 'active', true, $3, $4)
              ON CONFLICT DO NOTHING",
         )
         .bind(context.company_id)
         .bind(connection_id)
         .bind(context.agent_id)
+        .bind(
+            row.get::<Option<Value>, _>("credential_secret_refs")
+                .unwrap_or_else(|| json!([])),
+        )
         .execute(&state.pool)
         .await
         .map_err(|e| {
@@ -4562,7 +5088,7 @@ async fn agent_connection_token(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
         sqlx::query(
-            "SELECT id, status
+            "SELECT id, status, credential_secret_refs
                FROM connection_grants
               WHERE company_id = $1 AND connection_id = $2
                 AND kind = 'workspace' AND is_default = true
@@ -4662,6 +5188,117 @@ async fn agent_connection_token(
                 "responsibleUserId": context.responsible_user_id
             }
         }))));
+    }
+
+    let grant_secret_refs = grant
+        .get::<Option<Value>, _>("credential_secret_refs")
+        .unwrap_or_else(|| json!([]));
+    if path == "exchange" {
+        match exchange_connection_token(
+            &row,
+            &grant_secret_refs,
+            subject_user_id.as_deref(),
+            &context,
+            &issued_scope,
+            ttl_seconds,
+            &state.pool,
+        )
+        .await
+        {
+            Ok(token) => {
+                let effective_ttl = (token.expires_at - Utc::now())
+                    .num_seconds()
+                    .clamp(1, 900) as i32;
+                let token_hash = sha256_hex(&token.token);
+                record_connection_token_issuance(
+                    &state,
+                    &context,
+                    &row,
+                    path,
+                    &requested_scope,
+                    &token.scope,
+                    Some(effective_ttl),
+                    Some(token.expires_at),
+                    Some(&token_hash),
+                    "success",
+                    None,
+                    json!({
+                        "grantId": grant_id,
+                        "tokenType": token.token_type,
+                    }),
+                )
+                .await?;
+                sqlx::query(
+                    "UPDATE connection_grants
+                        SET last_used_at = NOW(), updated_at = NOW()
+                      WHERE id = $1 AND company_id = $2",
+                )
+                .bind(grant_id)
+                .bind(context.company_id)
+                .execute(&state.pool)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, %grant_id, "Failed to update connection grant usage");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+                return Ok((
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "minted",
+                        "connectionId": connection_id,
+                        "connection": {
+                            "id": connection_id,
+                            "uid": row.get::<String, _>("uid")
+                        },
+                        "grantId": grant_id,
+                        "path": "exchange",
+                        "token": token.token,
+                        "tokenType": token.token_type,
+                        "expiresAt": token.expires_at,
+                        "ttlSeconds": effective_ttl,
+                        "scope": token.scope,
+                        "attribution": {
+                            "agentId": context.agent_id,
+                            "runId": context.run_id,
+                            "issueId": context.issue_id,
+                            "projectId": context.project_id,
+                            "responsibleUserId": context.responsible_user_id
+                        }
+                    })),
+                ));
+            }
+            Err(error) => {
+                let ConnectionTokenExchangeError {
+                    status,
+                    outcome,
+                    code,
+                    metadata,
+                } = error;
+                let metadata = match metadata {
+                    Value::Object(mut metadata) => {
+                        metadata.insert("grantId".to_string(), json!(grant_id));
+                        Value::Object(metadata)
+                    }
+                    _ => json!({ "grantId": grant_id }),
+                };
+                record_connection_token_issuance(
+                    &state,
+                    &context,
+                    &row,
+                    path,
+                    &requested_scope,
+                    &issued_scope,
+                    Some(ttl_seconds),
+                    None,
+                    None,
+                    outcome,
+                    Some(code),
+                    metadata,
+                )
+                .await?;
+                return Err(status);
+            }
+        }
     }
 
     let error_code = if path == "oauth_access" {
