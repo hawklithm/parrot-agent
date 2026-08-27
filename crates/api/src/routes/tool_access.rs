@@ -4,7 +4,8 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
 };
@@ -21,6 +22,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::routes::{assert_board, require_company_access, AccessMode};
 use services::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService, PermissionKey};
+use services::secret_provider::{decrypt_secret_material, encrypt_secret_material, sha256_hex};
 
 // ---------- companies/:cid/tools/* 只读聚合 ----------
 
@@ -2495,15 +2497,814 @@ async fn install_connection_grants(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /api/tools/oauth/callback —— OAuth callback（返回 code 回显）。
+#[derive(Debug, Deserialize)]
+struct OAuthCallbackQuery {
+    state: String,
+    code: Option<String>,
+    error: Option<String>,
+    #[serde(rename = "error_description")]
+    _error_description: Option<String>,
+}
+
+#[derive(Debug)]
+struct OAuthTokenExchange {
+    access_token: String,
+    refresh_token: Option<String>,
+    token_type: Option<String>,
+    scope: Vec<String>,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+fn validate_oauth_endpoint(value: &str) -> Result<Url, StatusCode> {
+    let url = Url::parse(value).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    let host = url.host_str().ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let local_host = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+    if url.username() != ""
+        || url.password().is_some()
+        || (url.scheme() != "https" && !(url.scheme() == "http" && local_host))
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    Ok(url)
+}
+
+fn configured_oauth_token_uri(row: &sqlx::postgres::PgRow) -> Option<String> {
+    connection_config_string_in_sections(
+        row,
+        &["oauth", "tokenBroker", "token_broker", "broker"],
+        &[
+            "tokenUrl",
+            "token_url",
+            "tokenUri",
+            "token_uri",
+            "tokenEndpoint",
+            "token_endpoint",
+        ],
+    )
+}
+
+fn oauth_callback_actor_matches(
+    actor: &AuthorizationActor,
+    state_row: &sqlx::postgres::PgRow,
+) -> Result<Uuid, StatusCode> {
+    use sqlx::Row;
+    let user_id = match actor {
+        AuthorizationActor::Board { user_id, .. } => *user_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+    let user_id_string = user_id.to_string();
+    let subject_user_id = state_row.get::<Option<String>, _>("subject_user_id");
+    if let Some(subject_user_id) = subject_user_id {
+        if subject_user_id != user_id_string {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    } else if state_row.get::<Option<String>, _>("created_by_actor_type").as_deref()
+        != Some("user")
+        || state_row.get::<Option<String>, _>("created_by_actor_id").as_deref()
+            != Some(user_id_string.as_str())
+        || state_row
+            .get::<Option<String>, _>("created_by_session_id")
+            .is_some()
+    {
+        // The current actor model does not carry a session id. Fail closed for
+        // a state that requires an unavailable session binding; Agent-started
+        // states use subject_user_id and remain fully verifiable here.
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(user_id)
+}
+
+async fn consume_oauth_state(pool: &sqlx::PgPool, state_token: &str) -> Result<(), StatusCode> {
+    let mut transaction = pool.begin().await.map_err(|e| {
+        tracing::error!(%e, "Failed to start OAuth state consumption transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let consumed = sqlx::query(
+        "DELETE FROM tool_oauth_states
+          WHERE state = $1 AND expires_at > NOW()
+       RETURNING state",
+    )
+    .bind(state_token)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, "Failed to consume OAuth state");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if consumed.is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    transaction.commit().await.map_err(|e| {
+        tracing::error!(%e, "Failed to commit OAuth state consumption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(())
+}
+
+async fn resolve_oauth_client_secret(
+    pool: &sqlx::PgPool,
+    company_id: Uuid,
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<String>, StatusCode> {
+    use sqlx::Row;
+    let refs = row
+        .get::<Option<Value>, _>("credential_secret_refs")
+        .unwrap_or_else(|| json!([]));
+    let Some(reference) = refs.as_array().and_then(|values| {
+        values.iter().find(|value| {
+            let Some(path) = value
+                .get("configPath")
+                .or_else(|| value.get("config_path"))
+                .or_else(|| value.get("path"))
+                .and_then(Value::as_str)
+            else {
+                return false;
+            };
+            matches!(
+                path.to_ascii_lowercase().as_str(),
+                "oauth.clientsecret"
+                    | "oauth.client_secret"
+                    | "clientsecret"
+                    | "client_secret"
+            )
+        })
+    }) else {
+        return Ok(None);
+    };
+    let secret_id = reference
+        .get("secretId")
+        .or_else(|| reference.get("secret_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let version_selector = reference
+        .get("versionSelector")
+        .or_else(|| reference.get("version_selector"))
+        .and_then(Value::as_str)
+        .unwrap_or("latest")
+        .trim();
+    let material: Option<Value> = if version_selector.eq_ignore_ascii_case("latest") {
+        sqlx::query_scalar(
+            "SELECT v.material
+               FROM company_secret_versions v
+               JOIN company_secrets s ON s.id = v.secret_id
+              WHERE s.id = $1 AND s.company_id = $2
+                AND s.status = 'active' AND s.deleted_at IS NULL
+                AND v.status = 'current' AND v.revoked_at IS NULL
+              ORDER BY v.version DESC
+              LIMIT 1",
+        )
+        .bind(secret_id)
+        .bind(company_id)
+        .fetch_optional(pool)
+        .await
+    } else {
+        let version = version_selector
+            .parse::<i32>()
+            .ok()
+            .filter(|version| *version > 0)
+            .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+        sqlx::query_scalar(
+            "SELECT v.material
+               FROM company_secret_versions v
+               JOIN company_secrets s ON s.id = v.secret_id
+              WHERE s.id = $1 AND s.company_id = $2
+                AND s.status = 'active' AND s.deleted_at IS NULL
+                AND v.version = $3 AND v.revoked_at IS NULL
+              LIMIT 1",
+        )
+        .bind(secret_id)
+        .bind(company_id)
+        .bind(version)
+        .fetch_optional(pool)
+        .await
+    }
+    .map_err(|e| {
+        tracing::error!(%e, %secret_id, "Failed to load OAuth client secret");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let material = material.ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    decrypt_secret_material(&material)
+        .map(Some)
+        .map_err(|e| {
+            tracing::error!(%e, %secret_id, "Failed to decrypt OAuth client secret");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn exchange_oauth_code(
+    token_uri: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    redirect_uri: &str,
+    code: &str,
+    code_verifier: &str,
+    requested_scope: &[String],
+) -> Result<OAuthTokenExchange, StatusCode> {
+    let token_uri = validate_oauth_endpoint(token_uri)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let mut form = vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("code_verifier", code_verifier.to_string()),
+        ("client_id", client_id.to_string()),
+    ];
+    if let Some(client_secret) = client_secret {
+        form.push(("client_secret", client_secret.to_string()));
+    }
+    let response = client
+        .post(token_uri)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(%e, "OAuth token endpoint request failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+    let status = response.status();
+    let payload = response.json::<Value>().await.map_err(|e| {
+        tracing::warn!(%e, "OAuth token endpoint returned invalid JSON");
+        StatusCode::BAD_GATEWAY
+    })?;
+    if !status.is_success() {
+        tracing::warn!(%status, "OAuth token endpoint rejected authorization code");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::BAD_GATEWAY)?
+        .to_string();
+    let refresh_token = payload
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let token_type = payload
+        .get("token_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let scope = payload
+        .get("scope")
+        .map(config_scope_values)
+        .filter(|scope| !scope.is_empty())
+        .unwrap_or_else(|| requested_scope.to_vec());
+    let expires_at = payload
+        .get("expires_in")
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_i64(),
+            Value::String(value) => value.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+        .filter(|seconds| (1..=31_536_000).contains(seconds))
+        .map(|seconds| Utc::now() + Duration::seconds(seconds));
+    Ok(OAuthTokenExchange {
+        access_token,
+        refresh_token,
+        token_type,
+        scope,
+        expires_at,
+    })
+}
+
+async fn upsert_oauth_secret(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    company_id: Uuid,
+    key: &str,
+    name: &str,
+    value: &str,
+    created_by_user_id: Uuid,
+) -> Result<Uuid, StatusCode> {
+    use sqlx::Row;
+    let (material, digest) = encrypt_secret_material(value).map_err(|e| {
+        tracing::error!(%e, "Failed to encrypt OAuth credential");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let existing = sqlx::query(
+        "SELECT id, latest_version
+           FROM company_secrets
+          WHERE company_id = $1 AND scope = 'company' AND key = $2
+            AND deleted_at IS NULL
+          FOR UPDATE",
+    )
+    .bind(company_id)
+    .bind(key)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %company_id, "Failed to lock OAuth secret");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if let Some(existing) = existing {
+        let secret_id: Uuid = existing.get("id");
+        let next_version = existing.get::<i32, _>("latest_version").max(1) + 1;
+        sqlx::query(
+            "UPDATE company_secret_versions
+                SET status = 'superseded', revoked_at = NOW()
+              WHERE secret_id = $1 AND status = 'current'",
+        )
+        .bind(secret_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %secret_id, "Failed to retire OAuth secret version");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        sqlx::query(
+            "INSERT INTO company_secret_versions
+                (secret_id, version, material, value_sha256, fingerprint_sha256, status)
+             VALUES ($1, $2, $3, $4, $4, 'current')",
+        )
+        .bind(secret_id)
+        .bind(next_version)
+        .bind(material)
+        .bind(&digest)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %secret_id, "Failed to store OAuth secret version");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        sqlx::query(
+            "UPDATE company_secrets
+                SET latest_version = $2, last_rotated_at = NOW(), updated_at = NOW(),
+                    status = 'active'
+              WHERE id = $1",
+        )
+        .bind(secret_id)
+        .bind(next_version)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %secret_id, "Failed to update OAuth secret metadata");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        return Ok(secret_id);
+    }
+
+    let secret_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO company_secrets
+            (id, company_id, scope, key, name, provider, status, managed_mode,
+             description, created_by_user_id)
+         VALUES ($1, $2, 'company', $3, $4, 'local_encrypted', 'active',
+                 'paperclip_managed', $5, $6)",
+    )
+    .bind(secret_id)
+    .bind(company_id)
+    .bind(key)
+    .bind(name)
+    .bind("OAuth credential managed by Tool Gateway")
+    .bind(created_by_user_id.to_string())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %company_id, "Failed to create OAuth secret");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    sqlx::query(
+        "INSERT INTO company_secret_versions
+            (secret_id, version, material, value_sha256, fingerprint_sha256, status)
+         VALUES ($1, 1, $2, $3, $3, 'current')",
+    )
+    .bind(secret_id)
+    .bind(material)
+    .bind(&digest)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %secret_id, "Failed to store initial OAuth secret version");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(secret_id)
+}
+
+fn oauth_secret_key(connection_id: Uuid, kind: &str, subject_user_id: Option<&str>) -> String {
+    let subject_suffix = subject_user_id
+        .map(|subject| format!("_{}", &sha256_hex(subject)[..16]))
+        .unwrap_or_default();
+    format!("tool_connection_{connection_id}_oauth_{kind}{subject_suffix}")
+}
+
+fn oauth_secret_ref(secret_id: Uuid, config_path: &str, label: &str) -> Value {
+    json!({
+        "secretId": secret_id,
+        "versionSelector": "latest",
+        "configPath": config_path,
+        "required": config_path.ends_with("access_token"),
+        "label": label,
+    })
+}
+
+fn credential_ref_path(value: &Value) -> Option<&str> {
+    value
+        .get("configPath")
+        .or_else(|| value.get("config_path"))
+        .or_else(|| value.get("path"))
+        .and_then(Value::as_str)
+}
+
+fn merge_oauth_secret_refs(existing: Value, access_ref: Value, refresh_ref: Option<Value>) -> Value {
+    let mut refs = existing.as_array().cloned().unwrap_or_default();
+    refs.retain(|reference| {
+        !credential_ref_path(reference).is_some_and(|path| {
+            matches!(
+                path.to_ascii_lowercase().as_str(),
+                "oauth.access_token"
+                    | "oauth.access-token"
+                    | "oauth.refreshtoken"
+                    | "oauth.refresh_token"
+                    | "oauth.refresh-token"
+            )
+        })
+    });
+    refs.push(access_ref);
+    if let Some(refresh_ref) = refresh_ref {
+        refs.push(refresh_ref);
+    }
+    Value::Array(refs)
+}
+
+fn oauth_connection_config_with_metadata(
+    existing: Value,
+    token: &OAuthTokenExchange,
+) -> Value {
+    let mut config = existing.as_object().cloned().unwrap_or_default();
+    let mut oauth = config
+        .get("oauth")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    oauth.insert("connectedAt".to_string(), json!(Utc::now()));
+    if let Some(token_type) = token.token_type.as_deref() {
+        oauth.insert("tokenType".to_string(), json!(token_type));
+    }
+    if !token.scope.is_empty() {
+        oauth.insert("scope".to_string(), json!(token.scope.join(" ")));
+    }
+    if let Some(expires_at) = token.expires_at {
+        oauth.insert("expiresAt".to_string(), json!(expires_at));
+    }
+    config.insert("oauth".to_string(), Value::Object(oauth));
+    Value::Object(config)
+}
+
+async fn persist_oauth_connection(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    connection_id: Uuid,
+    company_id: Uuid,
+    subject_user_id: Option<&str>,
+    token: &OAuthTokenExchange,
+) -> Result<Uuid, StatusCode> {
+    use sqlx::Row;
+    let user_id = match actor {
+        AuthorizationActor::Board { user_id, .. } => *user_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+    let mut transaction = state.pool.begin().await.map_err(|e| {
+        tracing::error!(%e, %connection_id, "Failed to start OAuth credential transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let connection = sqlx::query(
+        "SELECT credential_secret_refs, config
+           FROM tool_connections
+          WHERE id = $1 AND company_id = $2
+          FOR UPDATE",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %connection_id, "Failed to lock OAuth connection");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let subject_suffix = subject_user_id
+        .map(|subject| format!(" for user {}", &sha256_hex(subject)[..16]))
+        .unwrap_or_default();
+    let access_id = upsert_oauth_secret(
+        &mut transaction,
+        company_id,
+        &oauth_secret_key(connection_id, "access_token", subject_user_id),
+        &format!("OAuth access token{subject_suffix}"),
+        &token.access_token,
+        user_id,
+    )
+    .await?;
+    let refresh_id = if let Some(refresh_token) = token.refresh_token.as_deref() {
+        Some(
+            upsert_oauth_secret(
+                &mut transaction,
+                company_id,
+                &oauth_secret_key(connection_id, "refresh_token", subject_user_id),
+                &format!("OAuth refresh token{subject_suffix}"),
+                refresh_token,
+                user_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let access_ref = oauth_secret_ref(access_id, "oauth.access_token", "OAuth access token");
+    let refresh_ref = refresh_id.map(|id| oauth_secret_ref(id, "oauth.refresh_token", "OAuth refresh token"));
+    let secret_refs = merge_oauth_secret_refs(
+        connection
+            .get::<Option<Value>, _>("credential_secret_refs")
+            .unwrap_or_else(|| json!([])),
+        access_ref.clone(),
+        refresh_ref.clone(),
+    );
+    let config = oauth_connection_config_with_metadata(
+        connection
+            .get::<Option<Value>, _>("config")
+            .unwrap_or_else(|| json!({})),
+        token,
+    );
+    let grant_id = if let Some(subject_user_id) = subject_user_id {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO connection_grants
+                (id, company_id, connection_id, kind, subject_user_id,
+                 credential_secret_refs, status, is_default, created_by_user_id)
+             VALUES ($1, $2, $3, 'user', $4, $5, 'active', false, $6)
+             ON CONFLICT (connection_id, subject_user_id)
+             DO UPDATE SET company_id = EXCLUDED.company_id,
+                           credential_secret_refs = EXCLUDED.credential_secret_refs,
+                           status = 'active', revoked_at = NULL,
+                           updated_at = NOW()
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(company_id)
+        .bind(connection_id)
+        .bind(subject_user_id)
+        .bind(&secret_refs)
+        .bind(user_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to persist user OAuth grant");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    } else {
+        sqlx::query(
+            "INSERT INTO connection_grants
+                (id, company_id, connection_id, kind, credential_secret_refs,
+                 status, is_default, created_by_user_id)
+             VALUES ($1, $2, $3, 'workspace', $4, 'active', true, $5)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(company_id)
+        .bind(connection_id)
+        .bind(&secret_refs)
+        .bind(user_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to ensure workspace OAuth grant");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        sqlx::query(
+            "UPDATE connection_grants
+                SET credential_secret_refs = $3, status = 'active', revoked_at = NULL,
+                    updated_at = NOW()
+              WHERE company_id = $1 AND connection_id = $2
+                AND kind = 'workspace' AND is_default = true",
+        )
+        .bind(company_id)
+        .bind(connection_id)
+        .bind(&secret_refs)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to update workspace OAuth grant");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM connection_grants
+              WHERE company_id = $1 AND connection_id = $2
+                AND kind = 'workspace' AND is_default = true
+              LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(connection_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to load workspace OAuth grant");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
+    if subject_user_id.is_none() {
+        sqlx::query(
+            "UPDATE tool_connections
+                SET credential_secret_refs = $3, config = $4,
+                    status = 'active', enabled = true, health_status = 'unchecked',
+                    health_message = 'OAuth credentials stored; health refresh pending',
+                    last_error = NULL, updated_at = NOW()
+              WHERE id = $1 AND company_id = $2",
+        )
+        .bind(connection_id)
+        .bind(company_id)
+        .bind(&secret_refs)
+        .bind(&config)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to activate OAuth connection");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    } else {
+        sqlx::query(
+            "UPDATE tool_connections
+                SET config = $3, status = 'active', enabled = true,
+                    health_status = 'unchecked',
+                    health_message = 'OAuth credentials stored; health refresh pending',
+                    last_error = NULL, updated_at = NOW()
+              WHERE id = $1 AND company_id = $2",
+        )
+        .bind(connection_id)
+        .bind(company_id)
+        .bind(&config)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to activate user OAuth connection");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+    transaction.commit().await.map_err(|e| {
+        tracing::error!(%e, %connection_id, "Failed to commit OAuth credentials");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(grant_id)
+}
+
+/// GET /api/tools/oauth/callback —— validate, consume and complete a PKCE OAuth callback.
 async fn tools_oauth_callback(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Read)
+    Query(query): Query<OAuthCallbackQuery>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    let state_token = query.state.trim();
+    if state_token.is_empty() || state_token.chars().count() > 512 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    use sqlx::Row;
+    let state_row = sqlx::query(
+        "SELECT state, company_id, connection_id, code_verifier,
+                created_by_actor_type, created_by_actor_id, created_by_session_id,
+                subject_user_id, requested_scopes, expires_at
+           FROM tool_oauth_states
+          WHERE state = $1",
+    )
+    .bind(state_token)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, "Failed to load OAuth callback state");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::BAD_REQUEST)?;
+    let company_id: Uuid = state_row.get("company_id");
+    let connection_id: Uuid = state_row.get("connection_id");
+    let user_id = oauth_callback_actor_matches(&actor, &state_row)?;
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "received": true, "status": "ok" })))
+    if state_row.get::<DateTime<Utc>, _>("expires_at") <= Utc::now() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let connection = get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if connection.get::<String, _>("status") == "archived" {
+        return Err(StatusCode::CONFLICT);
+    }
+    if connection.get::<String, _>("auth_kind") != "oauth" {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let client_id = connection_config_string(&connection, &["clientId", "client_id"])
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let redirect_uri = configured_oauth_redirect_uri(&connection)
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let token_uri = configured_oauth_token_uri(&connection)
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    validate_oauth_endpoint(&token_uri)?;
+    let client_secret = resolve_oauth_client_secret(&state.pool, company_id, &connection).await?;
+    let provider_error = query
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if provider_error.is_some() {
+        consume_oauth_state(&state.pool, state_token).await?;
+        tracing::warn!(%connection_id, error = provider_error.unwrap_or("unknown"), "OAuth provider returned an authorization error");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let code = query
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| value.chars().count() <= 8192)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let requested_scope = state_row
+        .get::<Option<Value>, _>("requested_scopes")
+        .map(|value| config_scope_values(&value))
+        .unwrap_or_default();
+    consume_oauth_state(&state.pool, state_token).await?;
+    let token = exchange_oauth_code(
+        &token_uri,
+        &client_id,
+        client_secret.as_deref(),
+        &redirect_uri,
+        code,
+        &state_row.get::<String, _>("code_verifier"),
+        &requested_scope,
+    )
+    .await?;
+    let subject_user_id = state_row.get::<Option<String>, _>("subject_user_id");
+    let grant_id = persist_oauth_connection(
+        &state,
+        &actor,
+        connection_id,
+        company_id,
+        subject_user_id.as_deref(),
+        &token,
+    )
+    .await?;
+    let connection = get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "tool_connection.oauth_connected",
+        &actor,
+        "tool_connection",
+        connection_id,
+        json!({
+            "grantId": grant_id,
+            "subjectType": if subject_user_id.is_some() { "user" } else { "workspace" },
+            "scopeCount": token.scope.len(),
+            "hasRefreshToken": token.refresh_token.is_some(),
+            "actorUserId": user_id,
+        }),
+    )
+    .await;
+    if headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|part| part.trim() == "text/html"))
+    {
+        let issue_prefix = sqlx::query_scalar::<_, String>(
+            "SELECT issue_prefix FROM companies WHERE id = $1",
+        )
+        .bind(company_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %company_id, "Failed to load company issue prefix for OAuth redirect");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let location = format!(
+            "/{}/apps/{}/setup?oauth=connected",
+            issue_prefix, connection_id
+        );
+        let mut response = StatusCode::SEE_OTHER.into_response();
+        response.headers_mut().insert(
+            header::LOCATION,
+            HeaderValue::from_str(&location).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        );
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+        return Ok(response);
+    }
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "connectionId": connection_id,
+            "grantId": grant_id,
+            "status": "connected",
+            "connection": connection_json(&connection),
+        })),
+    )
+        .into_response())
 }
 
 /// POST /companies/:cid/tools/connections —— 创建连接。

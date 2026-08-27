@@ -8,12 +8,16 @@ use api::routes::{tool_access::tool_access_routes, tools::tool_routes};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
+use chrono::{Duration, Utc};
 use parrot_server::build_app_state;
 use serde_json::{json, Value};
 use services::auth::{
     ActorSource, AuthorizationActor, CompanyMembership, MembershipRole, PrincipalType,
 };
+use services::secret_provider::decrypt_secret_material;
 use sqlx::PgPool;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
@@ -379,6 +383,139 @@ async fn connect_and_migrate() -> PgPool {
     pool
 }
 
+async fn spawn_oauth_token_endpoint() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind OAuth token endpoint");
+    let address = listener.local_addr().expect("OAuth token endpoint address");
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept OAuth token request");
+        let mut buffer = vec![0_u8; 8192];
+        let read = socket
+            .read(&mut buffer)
+            .await
+            .expect("read OAuth token request");
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        assert!(request.contains("POST /oauth/token"), "unexpected request: {request}");
+        assert!(
+            request.contains("grant_type=authorization_code")
+                && request.contains("code_verifier=verifier")
+                && request.contains("client_id=client-id"),
+            "PKCE token exchange fields missing: {request}"
+        );
+        let body = r#"{"access_token":"access-token-from-provider","refresh_token":"refresh-token-from-provider","token_type":"Bearer","scope":"repo read","expires_in":3600}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write OAuth token response");
+    });
+    (format!("http://{address}/oauth/token"), handle)
+}
+
+async fn insert_oauth_callback_fixture(
+    pool: &PgPool,
+    company_id: Uuid,
+    connection_id: Uuid,
+    state_token: &str,
+    token_uri: &str,
+    user_id: Uuid,
+) {
+    let issue_prefix = format!("OA{}", &company_id.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("OAuth Callback Test")
+        .bind(issue_prefix)
+        .execute(pool)
+        .await
+        .expect("insert OAuth callback company");
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, name, uid, transport, auth_kind, status, enabled, config)
+         VALUES ($1, $2, 'OAuth callback connection', 'oauth-callback',
+                 'mcp_remote', 'oauth', 'draft', false, $3)",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .bind(json!({
+        "oauth": {
+            "authorizationUrl": "https://provider.example/authorize",
+            "tokenUrl": token_uri,
+            "clientId": "client-id",
+            "redirectUri": "https://parrot.example/api/tools/oauth/callback"
+        }
+    }))
+    .execute(pool)
+    .await
+    .expect("insert OAuth callback connection");
+    sqlx::query(
+        "INSERT INTO tool_oauth_states
+            (state, company_id, connection_id, code_verifier,
+             created_by_actor_type, created_by_actor_id, subject_user_id,
+             requested_scopes, expires_at)
+         VALUES ($1, $2, $3, 'verifier', 'agent', $4, $5, $6, $7)",
+    )
+    .bind(state_token)
+    .bind(company_id)
+    .bind(connection_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(user_id.to_string())
+    .bind(json!(["repo"]))
+    .bind(Utc::now() + Duration::minutes(10))
+    .execute(pool)
+    .await
+    .expect("insert OAuth callback state");
+}
+
+fn oauth_callback_actor(company_id: Uuid, user_id: Uuid) -> AuthorizationActor {
+    AuthorizationActor::board_with_source(
+        user_id,
+        company_id,
+        ActorSource::Session,
+        vec![CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            user_id,
+            MembershipRole::Owner,
+        )],
+        false,
+    )
+}
+
+async fn send_oauth_callback(
+    app: &Router,
+    actor: &AuthorizationActor,
+    state_token: &str,
+    code: &str,
+    accept: &str,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/tools/oauth/callback?state={state_token}&code={code}"
+        ))
+        .header("accept", accept)
+        .body(Body::empty())
+        .expect("build OAuth callback request");
+    request.extensions_mut().insert(actor.clone());
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("dispatch OAuth callback");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read OAuth callback body");
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, headers, value)
+}
+
 #[tokio::test]
 async fn concurrent_approval_has_one_database_claimant() {
     let pool = connect_and_migrate().await;
@@ -567,6 +704,202 @@ async fn concurrent_tool_calls_replay_one_idempotency_key() {
     assert_eq!(invocation_count, 1);
     assert_eq!(stored_status, "denied");
     assert_eq!(stored_key.as_deref(), Some(idempotency_key));
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
+async fn concurrent_oauth_callbacks_consume_state_once_and_persist_encrypted_user_grant() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let state_token = format!("oauth-state-{connection_id}");
+    let (token_uri, endpoint) = spawn_oauth_token_endpoint().await;
+    insert_oauth_callback_fixture(
+        &pool,
+        company_id,
+        connection_id,
+        &state_token,
+        &token_uri,
+        user_id,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let actor = oauth_callback_actor(company_id, user_id);
+    let (first, second) = tokio::join!(
+        send_oauth_callback(&app, &actor, &state_token, "provider-code", "application/json"),
+        send_oauth_callback(&app, &actor, &state_token, "provider-code", "application/json"),
+    );
+    let statuses = [first.0, second.0];
+    assert!(statuses.contains(&StatusCode::OK), "one callback must connect: {statuses:?}");
+    assert!(
+        statuses.contains(&StatusCode::BAD_REQUEST),
+        "the replay must lose the atomic state consume: {statuses:?}"
+    );
+    let connected = if first.0 == StatusCode::OK { first.2 } else { second.2 };
+    assert_eq!(connected["status"], "connected");
+    assert!(connected.get("accessToken").is_none());
+    assert!(connected["connection"]["credentialSecretRefs"].is_array());
+
+    endpoint.await.expect("OAuth token endpoint task");
+    let (connection_status, enabled): (String, bool) = sqlx::query_as(
+        "SELECT status, enabled
+           FROM tool_connections WHERE id = $1 AND company_id = $2",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read connected OAuth connection");
+    assert_eq!(connection_status, "active");
+    assert!(enabled);
+
+    let materials: Vec<Value> = sqlx::query_scalar(
+        "SELECT v.material
+           FROM company_secret_versions v
+           JOIN company_secrets s ON s.id = v.secret_id
+          WHERE s.company_id = $1
+            AND s.key LIKE $2
+            AND v.status = 'current'",
+    )
+    .bind(company_id)
+    .bind(format!("tool_connection_{connection_id}_oauth_%"))
+    .fetch_all(&pool)
+    .await
+    .expect("read OAuth secret versions");
+    assert_eq!(materials.len(), 2);
+    let mut plaintexts = materials
+        .iter()
+        .map(|material| {
+            assert!(material.get("ciphertext").is_some());
+            decrypt_secret_material(material).expect("decrypt OAuth secret")
+        })
+        .collect::<Vec<_>>();
+    plaintexts.sort();
+    assert_eq!(
+        plaintexts,
+        vec![
+            "access-token-from-provider".to_string(),
+            "refresh-token-from-provider".to_string()
+        ]
+    );
+
+    let (grant_status, grant_subject, grant_secret_refs): (String, Option<String>, Value) = sqlx::query_as(
+        "SELECT status, subject_user_id, credential_secret_refs
+           FROM connection_grants
+          WHERE company_id = $1 AND connection_id = $2 AND kind = 'user'",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read user OAuth grant");
+    assert_eq!(grant_status, "active");
+    assert_eq!(grant_subject.as_deref(), Some(user_id.to_string().as_str()));
+    assert_eq!(grant_secret_refs.as_array().map(Vec::len), Some(2));
+    let refs_text = serde_json::to_string(&grant_secret_refs).expect("serialize secret refs");
+    assert!(!refs_text.contains("access-token-from-provider"));
+    assert!(!refs_text.contains("refresh-token-from-provider"));
+    let state_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_oauth_states WHERE state = $1",
+    )
+    .bind(&state_token)
+    .fetch_one(&pool)
+    .await
+    .expect("count consumed OAuth state");
+    assert_eq!(state_count, 0);
+
+    let (replay_status, _, _) =
+        send_oauth_callback(&app, &actor, &state_token, "provider-code", "application/json")
+            .await;
+    assert_eq!(replay_status, StatusCode::BAD_REQUEST);
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
+async fn oauth_callback_returns_paperclip_html_redirect() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let state_token = format!("oauth-html-state-{connection_id}");
+    let (token_uri, endpoint) = spawn_oauth_token_endpoint().await;
+    insert_oauth_callback_fixture(
+        &pool,
+        company_id,
+        connection_id,
+        &state_token,
+        &token_uri,
+        user_id,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let actor = oauth_callback_actor(company_id, user_id);
+    let (status, headers, body) =
+        send_oauth_callback(&app, &actor, &state_token, "provider-code", "text/html")
+            .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "body={body:?}");
+    let expected_location = format!("/OA{}/apps/{connection_id}/setup?oauth=connected", &company_id.simple().to_string()[..8]);
+    assert_eq!(
+        headers.get("location").and_then(|value| value.to_str().ok()),
+        Some(expected_location.as_str())
+    );
+    assert_eq!(
+        headers.get("cache-control").and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    endpoint.await.expect("OAuth token endpoint task");
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
+async fn oauth_callback_rejects_wrong_subject_without_consuming_state() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let subject_user_id = Uuid::new_v4();
+    let state_token = format!("oauth-authz-state-{connection_id}");
+    insert_oauth_callback_fixture(
+        &pool,
+        company_id,
+        connection_id,
+        &state_token,
+        "http://127.0.0.1:9/oauth/token",
+        subject_user_id,
+    )
+    .await;
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let wrong_actor = oauth_callback_actor(company_id, Uuid::new_v4());
+    let (status, _, _) =
+        send_oauth_callback(&app, &wrong_actor, &state_token, "provider-code", "application/json")
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let state_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_oauth_states WHERE state = $1",
+    )
+    .bind(&state_token)
+    .fetch_one(&pool)
+    .await
+    .expect("count unconsumed OAuth state");
+    assert_eq!(state_count, 1);
 
     let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
         .bind(company_id)
