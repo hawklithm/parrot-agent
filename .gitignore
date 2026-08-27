@@ -41,3 +41,4 @@ archive_*/
 # Python helper scripts
 __pycache__/
 *.pyc
+.idea/
