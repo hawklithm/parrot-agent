@@ -16,10 +16,19 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::routes::{require_company_access, AccessMode};
+use crate::routes::{assert_board, require_company_access, AccessMode};
 use services::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService, PermissionKey};
 
 // ---------- companies/:cid/tools/* 只读聚合 ----------
+
+fn require_board_company_access(
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    mode: AccessMode,
+) -> Result<(), StatusCode> {
+    assert_board(actor)?;
+    require_company_access(actor, company_id, mode)
+}
 
 /// GET /companies/:cid/tools/gallery —— 内置工具目录（静态，与 tools.rs 内置集一致）。
 async fn tools_gallery(
@@ -27,7 +36,7 @@ async fn tools_gallery(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(vec![
         json!({ "name": "code-review", "description": "Perform automated code review", "category": "engineering" }),
@@ -43,7 +52,7 @@ async fn tools_examples(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(vec![
         json!({ "id": "review-pr", "title": "Review a pull request", "prompt": "Review the changes in this PR for correctness and security" }),
@@ -57,7 +66,7 @@ async fn tools_attention_apps(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(vec![]))
 }
@@ -68,7 +77,7 @@ async fn tools_action_requests(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let rows = sqlx::query(
@@ -104,7 +113,7 @@ async fn tools_applications(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let rows = sqlx::query(
@@ -190,7 +199,7 @@ async fn tools_profiles(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let rows =
@@ -223,7 +232,7 @@ async fn tools_runtime_health(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let rows = sqlx::query(
@@ -283,7 +292,7 @@ async fn tools_trust_rules(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let rows = sqlx::query(
@@ -424,6 +433,7 @@ async fn delete_tool_application(
     Extension(actor): Extension<AuthorizationActor>,
     Path(application_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
+    assert_board(&actor)?;
     let row = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT company_id FROM tool_applications WHERE id = $1",
     )
@@ -437,7 +447,7 @@ async fn delete_tool_application(
     let Some(company_id) = row else {
         return Err(StatusCode::NOT_FOUND);
     };
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     sqlx::query("DELETE FROM tool_applications WHERE id = $1")
         .bind(application_id)
@@ -488,13 +498,12 @@ async fn get_tool_connection(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use sqlx::Row;
-    let row = get_connection_by_id(&state, actor_company(&actor)?, connection_id)
+    let company_id = actor_company(&actor)?;
+    require_board_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let row = get_connection_by_id(&state, company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let company_id: Uuid = row.get("company_id");
-    require_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(connection_json(&row)))
 }
 
@@ -519,7 +528,7 @@ async fn update_tool_connection(
     Json(request): Json<UpdateToolConnectionRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let row = sqlx::query(
         "UPDATE tool_connections SET name = COALESCE($3, name), config = COALESCE($4, config), \
@@ -558,7 +567,7 @@ async fn delete_tool_connection(
     Path(connection_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     sqlx::query("DELETE FROM tool_connections WHERE id = $1 AND company_id = $2")
         .bind(connection_id)
@@ -589,7 +598,7 @@ async fn list_connection_grants(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
@@ -659,7 +668,7 @@ async fn connection_usage(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
@@ -719,7 +728,7 @@ async fn connection_installs(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
@@ -925,7 +934,7 @@ async fn connection_catalog(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
@@ -972,7 +981,7 @@ async fn connection_activity(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
@@ -1033,7 +1042,7 @@ async fn profile_new_tools(
     Path(profile_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     ensure_tool_profile_scope(&state, profile_id, company_id).await?;
     use sqlx::Row;
@@ -1082,7 +1091,7 @@ async fn delete_tool_profile(
     Path(profile_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let result = sqlx::query("DELETE FROM tool_profiles WHERE id = $1 AND company_id = $2")
         .bind(profile_id)
@@ -1112,7 +1121,7 @@ async fn update_tool_profile(
     Json(request): Json<UpdateToolProfileRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let row = sqlx::query(
@@ -1234,7 +1243,7 @@ async fn gateway_audit(
         .as_deref()
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let permission = AuthorizationService::decide(
         &state.pool,
@@ -1788,7 +1797,7 @@ async fn update_tool_profile_entry(
     Json(request): Json<UpdateProfileEntryRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let row = sqlx::query(
@@ -1824,7 +1833,7 @@ async fn delete_tool_profile_entry(
     Path(entry_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let result = sqlx::query(
         "DELETE FROM tool_profile_entries AS e
@@ -1932,7 +1941,7 @@ async fn refresh_connection_catalog(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     use sqlx::Row;
     let connection = sqlx::query(
@@ -2069,7 +2078,7 @@ async fn tools_oauth_callback(
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read)
+    require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(json!({ "received": true, "status": "ok" })))
 }
@@ -2088,7 +2097,7 @@ async fn create_company_tool_connection(
     Path(company_id): Path<Uuid>,
     Json(request): Json<CreateConnectionRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let id = Uuid::new_v4();
     sqlx::query(
@@ -2139,7 +2148,7 @@ async fn create_company_tool_profile(
     Path(company_id): Path<Uuid>,
     Json(request): Json<CreateToolProfileRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let id = Uuid::new_v4();
     sqlx::query(
@@ -2167,7 +2176,7 @@ async fn install_tool_example(
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, _example_id)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(json!({ "installed": true })))
 }
@@ -2176,7 +2185,7 @@ async fn smoke_tool_example(
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, _example_id)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(json!({ "smoke": "passed" })))
 }
@@ -2187,7 +2196,7 @@ async fn connect_tool_app(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(json!({ "connected": true })))
 }
@@ -2196,7 +2205,7 @@ async fn finish_tool_app(
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, _app_id)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(json!({ "finished": true })))
 }
@@ -2208,7 +2217,7 @@ async fn import_mcp_json(
     Path(company_id): Path<Uuid>,
     Json(body): Json<Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let raw = body
         .get("mcpJson")
@@ -2311,7 +2320,7 @@ async fn update_company_tool_policy(
     Path((company_id, policy_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateToolPolicyRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     sqlx::query(
         "UPDATE tool_policies SET name = COALESCE($3, name), enabled = COALESCE($4, enabled), \
@@ -2338,7 +2347,7 @@ async fn duplicate_tool_policy(
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, policy_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(
         json!({ "id": Uuid::new_v4(), "duplicatedFrom": policy_id }),
@@ -2351,7 +2360,7 @@ async fn reorder_tool_policies(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(json!({ "reordered": true })))
 }
@@ -2362,7 +2371,7 @@ async fn test_tool_policy(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(json!({ "matches": true })))
 }
@@ -2545,7 +2554,7 @@ async fn revoke_trust_rule(
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, _rule_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2611,7 +2620,7 @@ async fn connection_health_check(
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let started = std::time::Instant::now();
     let refreshed = refresh_connection_catalog(
@@ -2683,7 +2692,7 @@ async fn duplicate_tool_profile(
     Path(profile_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     ensure_tool_profile_scope(&state, profile_id, company_id).await?;
     Ok(Json(
@@ -2704,7 +2713,7 @@ async fn create_tool_profile_entry(
     Json(request): Json<CreateProfileEntryRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let id = Uuid::new_v4();
     let inserted_id = sqlx::query_scalar::<_, Uuid>(
@@ -2744,7 +2753,7 @@ async fn review_profile_new_tools(
     Path(profile_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     ensure_tool_profile_scope(&state, profile_id, company_id).await?;
     Ok(Json(
@@ -2759,7 +2768,7 @@ async fn tools_oauth_start(
     Path(provider): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(
         json!({ "provider": provider, "authorizationUrl": format!("/api/tools/oauth/{}", provider) }),

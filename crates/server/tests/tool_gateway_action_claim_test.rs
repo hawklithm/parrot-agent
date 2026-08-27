@@ -971,6 +971,105 @@ async fn connection_management_routes_require_tool_permissions() {
 }
 
 #[tokio::test]
+async fn company_tool_control_plane_routes_require_board_actor() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let resource_id = Uuid::new_v4();
+    let state = build_app_state(pool).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let agent = AuthorizationActor::agent(agent_id, company_id, Some(Uuid::new_v4()));
+
+    let mut routes = vec![
+        ("GET", format!("/companies/{company_id}/tools/gallery"), None),
+        ("GET", format!("/companies/{company_id}/tools/examples"), None),
+        (
+            "GET",
+            format!("/companies/{company_id}/tools/apps/attention"),
+            None,
+        ),
+        (
+            "GET",
+            format!("/companies/{company_id}/tools/action-requests"),
+            None,
+        ),
+        (
+            "GET",
+            format!("/companies/{company_id}/tools/applications"),
+            None,
+        ),
+        ("GET", format!("/companies/{company_id}/tools/profiles"), None),
+        (
+            "GET",
+            format!("/companies/{company_id}/tools/runtime-health"),
+            None,
+        ),
+        (
+            "GET",
+            format!("/companies/{company_id}/tools/trust-rules"),
+            None,
+        ),
+        ("GET", format!("/tool-connections/{resource_id}"), None),
+        ("GET", format!("/tool-profiles/{resource_id}/new-tools"), None),
+        (
+            "POST",
+            format!("/companies/{company_id}/tools/connections"),
+            Some(json!({ "toolType": "mcp_remote" })),
+        ),
+        (
+            "POST",
+            format!("/companies/{company_id}/tools/profiles"),
+            Some(json!({ "name": "agent profile" })),
+        ),
+        (
+            "POST",
+            format!("/companies/{company_id}/tools/examples/example/install"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/companies/{company_id}/tools/mcp/import-json"),
+            Some(json!({ "mcpJson": { "mcpServers": {} } })),
+        ),
+        (
+            "PATCH",
+            format!("/companies/{company_id}/tools/policies/{resource_id}"),
+            Some(json!({ "enabled": true })),
+        ),
+        (
+            "POST",
+            format!("/companies/{company_id}/tools/policies/reorder"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/tool-connections/{resource_id}/health-check"),
+            None,
+        ),
+        (
+            "PATCH",
+            format!("/tool-profiles/{resource_id}"),
+            Some(json!({})),
+        ),
+        (
+            "PATCH",
+            format!("/tool-profile-entries/{resource_id}"),
+            Some(json!({})),
+        ),
+    ];
+
+    for (method, uri, body) in routes.drain(..) {
+        let (status, response_body) =
+            request_connection_route(&app, &agent, method, uri, body).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "Agent must not reach company tool control plane: {method} {response_body:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn connection_subresources_are_company_scoped() {
     let pool = connect_and_migrate().await;
     let owner_company_id = Uuid::new_v4();
