@@ -188,3 +188,170 @@ async fn resolves_company_and_responsible_user_credentials_before_launch() {
         .await
         .ok();
 }
+
+#[tokio::test]
+async fn resolves_nested_credential_paths() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .expect("run migrations");
+    std::env::set_var("PARROT_SECRET_ENCRYPTION_KEY", "0".repeat(64));
+
+    let company_id = Uuid::new_v4();
+    let company_prefix = format!("AN{}", &company_id.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Nested Credential Co")
+        .bind(&company_prefix)
+        .execute(&pool)
+        .await
+        .expect("insert nested company");
+
+    // Create two secrets at different nesting depths
+    let deploy_secret = Uuid::new_v4();
+    let api_secret = Uuid::new_v4();
+    for (secret_id, key, name, value) in [
+        (deploy_secret, "DEPLOY_TOKEN", "Deploy Token", "deploy-token-value"),
+        (api_secret, "API_TOKEN", "API Token", "api-token-value"),
+    ] {
+        sqlx::query(
+            "INSERT INTO company_secrets
+             (id, company_id, scope, key, name, provider, status, managed_mode, latest_version)
+             VALUES ($1, $2, 'company', $3, $4, 'local_encrypted', 'active', 'paperclip_managed', 1)",
+        )
+        .bind(secret_id)
+        .bind(company_id)
+        .bind(key)
+        .bind(name)
+        .execute(&pool)
+        .await
+        .expect("insert nested company secret");
+        let (material, sha) = encrypt_secret_material(value).expect("encrypt nested secret");
+        sqlx::query(
+            "INSERT INTO company_secret_versions
+             (secret_id, version, material, value_sha256, fingerprint_sha256, status)
+             VALUES ($1, 1, $2, $3, $3, 'current')",
+        )
+        .bind(secret_id)
+        .bind(material)
+        .bind(sha)
+        .execute(&pool)
+        .await
+        .expect("insert nested secret version");
+    }
+
+    // Config with nested credential paths: credentials.deploy_token and credentials.api.token
+    let config = json!({
+        "credentials": {
+            "deploy_token": {
+                "type": "secret_ref",
+                "secretId": deploy_secret,
+                "version": "latest"
+            },
+            "api": {
+                "token": {
+                    "type": "secret_ref",
+                    "secretId": api_secret,
+                    "version": "latest"
+                }
+            }
+        },
+        "env": {
+            "DEPLOY_TOKEN": {
+                "type": "secret_ref",
+                "secretId": deploy_secret,
+                "version": "latest"
+            }
+        }
+    });
+
+    let resolver = DatabaseAdapterRuntimeSecretResolver::new(pool.clone());
+    let resolved = resolver
+        .resolve_adapter_config(company_id, None, config.clone())
+        .await
+        .expect("resolve nested credentials");
+
+    // Verify nested paths are resolved
+    assert_eq!(
+        resolved.config["credentials"]["deploy_token"],
+        "deploy-token-value",
+        "nested credentials.deploy_token should be resolved"
+    );
+    assert_eq!(
+        resolved.config["credentials"]["api"]["token"],
+        "api-token-value",
+        "nested credentials.api.token should be resolved"
+    );
+    // env.X should still work (existing behavior preserved)
+    assert_eq!(
+        resolved.config["env"]["DEPLOY_TOKEN"],
+        "deploy-token-value",
+        "env.DEPLOY_TOKEN should be resolved"
+    );
+
+    // Verify secret_keys contains nested paths
+    assert!(
+        resolved.secret_keys.contains(&"credentials.deploy_token".to_string()),
+        "secret_keys should include credentials.deploy_token: {:?}",
+        resolved.secret_keys
+    );
+    assert!(
+        resolved.secret_keys.contains(&"credentials.api.token".to_string()),
+        "secret_keys should include credentials.api.token: {:?}",
+        resolved.secret_keys
+    );
+    assert!(
+        resolved.secret_keys.contains(&"env.DEPLOY_TOKEN".to_string()),
+        "secret_keys should include env.DEPLOY_TOKEN: {:?}",
+        resolved.secret_keys
+    );
+
+    // Verify manifest contains entries for nested paths
+    assert!(
+        resolved.manifest.iter().any(|entry| {
+            entry.config_path == "credentials.deploy_token"
+                && entry.secret_id == Some(deploy_secret)
+                && entry.outcome == services::SecretResolutionOutcome::Success
+        }),
+        "manifest should contain credentials.deploy_token entry"
+    );
+    assert!(
+        resolved.manifest.iter().any(|entry| {
+            entry.config_path == "credentials.api.token"
+                && entry.secret_id == Some(api_secret)
+                && entry.outcome == services::SecretResolutionOutcome::Success
+        }),
+        "manifest should contain credentials.api.token entry"
+    );
+
+    // Verify no plaintext values leak into manifest
+    let manifest_json = serde_json::to_string(&resolved.manifest).expect("serialize manifest");
+    assert!(!manifest_json.contains("deploy-token-value"), "manifest leaks deploy token");
+    assert!(!manifest_json.contains("api-token-value"), "manifest leaks api token");
+
+    // Verify original config is unchanged (clone was used)
+    assert_eq!(
+        config["credentials"]["deploy_token"]["secretId"],
+        deploy_secret.to_string(),
+        "original config must not be mutated"
+    );
+
+    // Verify non-binding nested objects are preserved
+    assert!(resolved.config.get("credentials").is_some(), "credentials object preserved");
+    assert!(resolved.config["credentials"].get("deploy_token").is_some(), "deploy_token key present");
+    assert!(resolved.config["credentials"].get("api").is_some(), "api key present");
+
+    sqlx::query("DELETE FROM company_secrets WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .ok();
+}

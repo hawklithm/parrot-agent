@@ -315,15 +315,68 @@ impl AdapterRuntimeSecretResolver for DatabaseAdapterRuntimeSecretResolver {
         let config_obj = adapter_config.as_object().ok_or_else(|| {
             SecretServiceError::InvalidBinding("adapter_config must be an object".to_string())
         })?;
-        let mut resolved = config_obj.clone();
+
+        // Pass 1: collect all binding (path, value) pairs (depth-first, synchronous).
+        // A binding is any JSON object that has a "type" key.
+        fn collect_bindings(
+            prefix: &str,
+            obj: &serde_json::Map<String, Value>,
+            bindings: &mut Vec<(String, Value)>,
+        ) {
+            for (key, value) in obj {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                if let Some(nested) = value.as_object() {
+                    if nested.contains_key("type") {
+                        bindings.push((path, value.clone()));
+                    } else {
+                        collect_bindings(&path, nested, bindings);
+                    }
+                }
+            }
+        }
+
+        let mut binding_paths: Vec<(String, Value)> = Vec::new();
+        collect_bindings("", config_obj, &mut binding_paths);
+
+        // Pass 2: resolve every binding, store results keyed by path.
+        let mut resolved_values: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
         let mut secret_keys = Vec::new();
         let mut manifest = Vec::new();
 
+        for (path, value) in &binding_paths {
+            let binding = EnvBinding::from_value(value)?;
+            let (resolved_value, entry) = self
+                .resolve_binding(
+                    company_id,
+                    responsible_user_id,
+                    path,
+                    None,
+                    binding,
+                )
+                .await?;
+            if let Some(v) = resolved_value {
+                resolved_values.insert(path.clone(), Some(v));
+            } else {
+                resolved_values.insert(path.clone(), None);
+            }
+            if let Some(entry) = entry {
+                if entry.outcome == SecretResolutionOutcome::Success {
+                    secret_keys.push(path.clone());
+                }
+                manifest.push(entry);
+            }
+        }
+
+        // Handle env.* bindings (existing behavior)
         if let Some(env_value) = config_obj.get("env") {
             let env_obj = env_value.as_object().ok_or_else(|| {
                 SecretServiceError::InvalidBinding("env must be an object".to_string())
             })?;
-            let mut resolved_env = serde_json::Map::new();
             for (key, value) in env_obj {
                 let binding = EnvBinding::from_value(value)?;
                 let path = format!("env.{key}");
@@ -336,47 +389,26 @@ impl AdapterRuntimeSecretResolver for DatabaseAdapterRuntimeSecretResolver {
                         binding,
                     )
                     .await?;
-                if let Some(value) = resolved_value {
-                    resolved_env.insert(key.clone(), Value::String(value));
+                if let Some(v) = resolved_value {
+                    resolved_values.insert(path.clone(), Some(v));
                 }
                 if let Some(entry) = entry {
                     if entry.outcome == SecretResolutionOutcome::Success {
-                        secret_keys.push(path);
+                        secret_keys.push(path.clone());
                     }
                     manifest.push(entry);
                 }
             }
-            resolved.insert("env".to_string(), Value::Object(resolved_env));
         }
 
-        for (key, value) in config_obj {
-            if key == "env" {
+        // Pass 3: apply resolved values by navigating dotted-path segments.
+        let mut resolved = config_obj.clone();
+        for (path, value) in &resolved_values {
+            let segments: Vec<&str> = path.split('.').collect();
+            if segments.is_empty() {
                 continue;
             }
-            let Some(object) = value.as_object() else {
-                continue;
-            };
-            if object.get("type").is_none() {
-                continue;
-            }
-            let binding = EnvBinding::from_value(value)?;
-            let (resolved_value, entry) = self
-                .resolve_binding(company_id, responsible_user_id, key, None, binding)
-                .await?;
-            match resolved_value {
-                Some(value) => {
-                    resolved.insert(key.clone(), Value::String(value));
-                }
-                None => {
-                    resolved.remove(key);
-                }
-            }
-            if let Some(entry) = entry {
-                if entry.outcome == SecretResolutionOutcome::Success {
-                    secret_keys.push(key.clone());
-                }
-                manifest.push(entry);
-            }
+            apply_at_path(&mut resolved, &segments, value.as_deref());
         }
 
         Ok(ResolvedAdapterConfig {
@@ -384,6 +416,35 @@ impl AdapterRuntimeSecretResolver for DatabaseAdapterRuntimeSecretResolver {
             secret_keys,
             manifest,
         })
+    }
+}
+
+/// Navigate into `obj` following segments in order; set or remove at the final segment.
+fn apply_at_path(
+    obj: &mut serde_json::Map<String, Value>,
+    segments: &[&str],
+    value: Option<&str>,
+) {
+    if segments.is_empty() {
+        return;
+    }
+    let key = segments[0].to_string();
+    if segments.len() == 1 {
+        match value {
+            Some(v) => {
+                obj.insert(key, Value::String(v.to_string()));
+            }
+            None => {
+                obj.remove(&key);
+            }
+        }
+        return;
+    }
+
+    if let Some(nested) = obj.get_mut(&key) {
+        if let Some(nested_obj) = nested.as_object_mut() {
+            apply_at_path(nested_obj, &segments[1..], value);
+        }
     }
 }
 
