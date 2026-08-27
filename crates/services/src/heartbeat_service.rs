@@ -4077,6 +4077,63 @@ mod adapter_outcome_tests {
         assert!(valid_claude_resume_session(Some("not-a-session")).is_none());
         assert!(valid_claude_resume_session(None).is_none());
     }
+
+    #[test]
+    fn parses_acpx_session_and_result_events() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"acpx.session","sessionId":"acp-sess-1","agent":"claude","mode":"persistent"}
+{"type":"acpx.text_delta","text":"Working on the task","channel":"output"}
+{"type":"acpx.tool_call","name":"read_file","status":"started"}
+{"type":"acpx.tool_result","name":"read_file","isError":false}
+{"type":"acpx.result","stopReason":"end_turn","summary":"Completed the implementation"}"#,
+            "claude_local",
+        );
+        assert_eq!(outcome.session_id.as_deref(), Some("acp-sess-1"), "acpx.session sets session_id");
+        assert_eq!(outcome.result_summary.as_deref(), Some("Completed the implementation"), "acpx.result summary");
+        assert_eq!(outcome.tool_call_count, 1, "acpx.tool_call increments count");
+        assert!(!outcome.explicit_failure, "successful ACP run has no error");
+    }
+
+    #[test]
+    fn parses_acpx_error_event_as_explicit_failure() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"acpx.error","code":"auth_required","message":"Authentication required for provider","retryable":true}"#,
+            "codex_local",
+        );
+        assert!(outcome.explicit_failure, "acpx.error sets explicit_failure");
+        assert_eq!(outcome.failure_reason.as_deref(), Some("Authentication required for provider"));
+        assert_eq!(outcome.error_code.as_deref(), Some("auth_required"));
+        assert_eq!(outcome.error_family.as_deref(), Some("acp"));
+    }
+
+    #[test]
+    fn parses_acpx_status_and_text_delta_as_summary_fallback() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"acpx.status","text":"Processing request...","cost":{"total":0.0},"contextWindow":{"used":0,"max":200000}}"#,
+            "claude_local",
+        );
+        assert_eq!(outcome.result_summary.as_deref(), Some("Processing request..."), "acpx.status sets summary");
+        assert!(!outcome.explicit_failure);
+
+        // text_delta sets summary when status hasn't
+        let delta_only = parse_adapter_outcome(
+            r#"{"type":"acpx.text_delta","text":"Streaming output...","channel":"output"}"#,
+            "claude_local",
+        );
+        assert_eq!(delta_only.result_summary.as_deref(), Some("Streaming output..."), "acpx.text_delta sets summary");
+    }
+
+    #[test]
+    fn acpx_result_trumps_earlier_summary_for_final_outcome() {
+        let outcome = parse_adapter_outcome(
+            r#"{"type":"acpx.text_delta","text":"intermediate text"}
+{"type":"acpx.status","text":"still working"}
+{"type":"acpx.result","stopReason":"end_turn","summary":"Final result"}"#,
+            "claude_local",
+        );
+        // acpx.result returns early, so the summary is set by result
+        assert_eq!(outcome.result_summary.as_deref(), Some("Final result"), "acpx.result should be the final summary");
+    }
 }
 
 #[cfg(test)]
