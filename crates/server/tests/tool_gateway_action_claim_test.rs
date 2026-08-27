@@ -1070,6 +1070,107 @@ async fn company_tool_control_plane_routes_require_board_actor() {
 }
 
 #[tokio::test]
+async fn agent_connection_broker_routes_require_active_run_context() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let wrong_agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let issue_prefix = format!("TG{}", &company_id.simple().to_string()[..8]);
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Tool Gateway Agent Broker Test")
+        .bind(issue_prefix)
+        .execute(&pool)
+        .await
+        .expect("insert broker company");
+    for (agent_id, name) in [
+        (agent_id, "Tool Gateway Broker Agent"),
+        (wrong_agent_id, "Tool Gateway Wrong Agent"),
+    ] {
+        sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, $3)")
+            .bind(agent_id)
+            .bind(company_id)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("insert broker agent");
+    }
+    sqlx::query(
+        "INSERT INTO heartbeat_runs (id, company_id, agent_id, status)
+         VALUES ($1, $2, $3, 'running')",
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("insert running broker heartbeat");
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, name, uid, transport, transport_config, enabled)
+         VALUES ($1, $2, 'Agent Broker MCP', 'agent-broker-mcp', 'mcp_remote', '{}', true)",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("insert broker connection");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let routes = [
+        format!("/agents/me/connections/{connection_id}/start-authorization"),
+        format!("/agents/me/connections/{connection_id}/token"),
+    ];
+
+    let active_agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
+    for uri in &routes {
+        let (status, body) =
+            request_connection_route(&app, &active_agent, "POST", uri.clone(), None).await;
+        assert_eq!(status, StatusCode::OK, "active Agent response={body:?}");
+    }
+
+    let missing_run = AuthorizationActor::agent(agent_id, company_id, None);
+    for uri in &routes {
+        let (status, body) =
+            request_connection_route(&app, &missing_run, "POST", uri.clone(), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "missing run response={body:?}");
+    }
+
+    let wrong_agent = AuthorizationActor::agent(wrong_agent_id, company_id, Some(run_id));
+    for uri in &routes {
+        let (status, body) =
+            request_connection_route(&app, &wrong_agent, "POST", uri.clone(), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "wrong Agent response={body:?}");
+    }
+
+    let board = board_actor_with_role(company_id, MembershipRole::Owner);
+    for uri in &routes {
+        let (status, body) = request_connection_route(&app, &board, "POST", uri.clone(), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "Board response={body:?}");
+    }
+
+    sqlx::query("UPDATE heartbeat_runs SET status = 'succeeded' WHERE id = $1")
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("finish broker heartbeat");
+    for uri in &routes {
+        let (status, body) =
+            request_connection_route(&app, &active_agent, "POST", uri.clone(), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "inactive run response={body:?}");
+    }
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
 async fn connection_subresources_are_company_scoped() {
     let pool = connect_and_migrate().await;
     let owner_company_id = Uuid::new_v4();
@@ -1129,20 +1230,24 @@ async fn connection_subresources_are_company_scoped() {
             "POST",
             format!("/tool-connections/{connection_id}/health-check"),
         ),
-        (
-            "POST",
-            format!("/agents/me/connections/{connection_id}/start-authorization"),
-        ),
-        (
-            "POST",
-            format!("/agents/me/connections/{connection_id}/token"),
-        ),
     ] {
         let (status, body) = request_connection_route(&app, &other_owner, method, uri, None).await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
             "cross-company {method} response={body:?}"
+        );
+    }
+
+    for uri in [
+        format!("/agents/me/connections/{connection_id}/start-authorization"),
+        format!("/agents/me/connections/{connection_id}/token"),
+    ] {
+        let (status, body) = request_connection_route(&app, &other_owner, "POST", uri, None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "non-Agent cross-company response={body:?}"
         );
     }
 

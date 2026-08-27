@@ -1192,6 +1192,40 @@ fn gateway_audit_window(window: &str) -> Option<Duration> {
     }
 }
 
+async fn require_active_agent_run(
+    state: &AppState,
+    actor: &AuthorizationActor,
+) -> Result<(Uuid, Uuid, Uuid), StatusCode> {
+    let (agent_id, company_id, run_id) = match actor {
+        AuthorizationActor::Agent {
+            agent_id,
+            company_id,
+            run_id: Some(run_id),
+            ..
+        } => (*agent_id, *company_id, *run_id),
+        _ => return Err(StatusCode::UNAUTHORIZED),
+    };
+    let active = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM heartbeat_runs
+              WHERE id = $1 AND company_id = $2 AND agent_id = $3 AND status = 'running'
+         )",
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .bind(agent_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %agent_id, %company_id, %run_id, "Failed to validate agent run context");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    active
+        .then_some((agent_id, company_id, run_id))
+        .ok_or(StatusCode::FORBIDDEN)
+}
+
 fn gateway_audit_like_pattern(value: &str) -> String {
     let escaped = value
         .replace('\\', "\\\\")
@@ -2583,9 +2617,7 @@ async fn start_agent_connection_auth(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let (_, company_id, _) = require_active_agent_run(&state, &actor).await?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -2600,9 +2632,7 @@ async fn agent_connection_token(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let (_, company_id, _) = require_active_agent_run(&state, &actor).await?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
