@@ -969,3 +969,87 @@ async fn connection_management_routes_require_tool_permissions() {
         .execute(&pool)
         .await;
 }
+
+#[tokio::test]
+async fn connection_subresources_are_company_scoped() {
+    let pool = connect_and_migrate().await;
+    let owner_company_id = Uuid::new_v4();
+    let other_company_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+
+    for (company_id, name) in [
+        (owner_company_id, "Tool Gateway Resource Owner"),
+        (other_company_id, "Tool Gateway Resource Other"),
+    ] {
+        let issue_prefix = format!("TG{}", &company_id.simple().to_string()[..8]);
+        sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+            .bind(company_id)
+            .bind(name)
+            .bind(issue_prefix)
+            .execute(&pool)
+            .await
+            .expect("insert resource-scope company");
+    }
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, name, uid, transport, transport_config, enabled)
+         VALUES ($1, $2, 'Scoped MCP', 'scoped-mcp', 'mcp_remote', '{}', true)",
+    )
+    .bind(connection_id)
+    .bind(owner_company_id)
+    .execute(&pool)
+    .await
+    .expect("insert scoped tool connection");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let other_owner = board_actor_with_role(other_company_id, MembershipRole::Owner);
+
+    for (method, uri) in [
+        (
+            "GET",
+            format!("/tool-connections/{connection_id}/grants"),
+        ),
+        (
+            "GET",
+            format!("/tool-connections/{connection_id}/usage"),
+        ),
+        (
+            "GET",
+            format!("/tool-connections/{connection_id}/installs"),
+        ),
+        (
+            "GET",
+            format!("/tool-connections/{connection_id}/catalog"),
+        ),
+        (
+            "GET",
+            format!("/tool-connections/{connection_id}/activity"),
+        ),
+        (
+            "POST",
+            format!("/tool-connections/{connection_id}/health-check"),
+        ),
+        (
+            "POST",
+            format!("/agents/me/connections/{connection_id}/start-authorization"),
+        ),
+        (
+            "POST",
+            format!("/agents/me/connections/{connection_id}/token"),
+        ),
+    ] {
+        let (status, body) = request_connection_route(&app, &other_owner, method, uri, None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "cross-company {method} response={body:?}"
+        );
+    }
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
+        .bind(owner_company_id)
+        .bind(other_company_id)
+        .execute(&pool)
+        .await;
+}

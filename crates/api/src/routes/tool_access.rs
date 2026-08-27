@@ -591,10 +591,16 @@ async fn list_connection_grants(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT * FROM tool_connection_grants WHERE connection_id = $1 ORDER BY created_at DESC",
+        "SELECT * FROM tool_connection_grants
+          WHERE company_id = $1 AND connection_id = $2
+          ORDER BY created_at DESC",
     )
+    .bind(company_id)
     .bind(connection_id)
     .fetch_all(&state.pool)
     .await
@@ -655,8 +661,15 @@ async fn connection_usage(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
     let total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tool_invocations WHERE connection_id = $1")
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_invocations
+              WHERE company_id = $1 AND connection_id = $2",
+        )
+            .bind(company_id)
             .bind(connection_id)
             .fetch_one(&state.pool)
             .await
@@ -914,10 +927,17 @@ async fn connection_catalog(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT id, name, tool_name, title, description, input_schema, output_schema, risk_level, status, last_seen_at FROM tool_catalog_entries WHERE connection_id = $1 ORDER BY name ASC",
+        "SELECT id, name, tool_name, title, description, input_schema, output_schema, risk_level, status, last_seen_at
+           FROM tool_catalog_entries
+          WHERE company_id = $1 AND connection_id = $2
+          ORDER BY name ASC",
     )
+    .bind(company_id)
     .bind(connection_id)
     .fetch_all(&state.pool)
     .await
@@ -954,11 +974,16 @@ async fn connection_activity(
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT id, tool_name, status, occurred_at FROM tool_call_events \
-         WHERE connection_id = $1 ORDER BY occurred_at DESC LIMIT 50",
+         WHERE company_id = $1 AND connection_id = $2
+         ORDER BY occurred_at DESC LIMIT 50",
     )
+    .bind(company_id)
     .bind(connection_id)
     .fetch_all(&state.pool)
     .await
@@ -2510,13 +2535,16 @@ async fn restart_runtime_slot(
 
 /// POST /agents/me/connections/:connection_id/start-authorization —— mock。
 async fn start_agent_connection_auth(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(
         json!({ "connectionId": connection_id, "authorizationUrl": format!("/api/tools/oauth/authorize?connection={}", connection_id) }),
     ))
@@ -2524,13 +2552,16 @@ async fn start_agent_connection_auth(
 
 /// POST /agents/me/connections/:connection_id/token —— mock token。
 async fn agent_connection_token(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    get_connection_by_id(&state, company_id, connection_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(
         json!({ "connectionId": connection_id, "accessToken": format!("mock-{}", Uuid::new_v4()) }),
     ))
