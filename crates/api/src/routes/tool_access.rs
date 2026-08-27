@@ -4,7 +4,7 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{delete, get, patch, post},
     Json, Router,
 };
@@ -1552,6 +1552,7 @@ struct ActiveAgentRunContext {
     run_id: Uuid,
     responsible_user_id: Option<String>,
     issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
 }
 
 async fn load_active_agent_run_context(
@@ -1591,12 +1592,18 @@ async fn load_active_agent_run_context(
         .and_then(|snapshot| snapshot.get("issueId").or_else(|| snapshot.get("taskId")))
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok());
+    let project_id = context_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("projectId"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
     Ok(ActiveAgentRunContext {
         agent_id,
         company_id,
         run_id,
         responsible_user_id: row.get("responsible_user_id"),
         issue_id,
+        project_id,
     })
 }
 
@@ -3131,7 +3138,10 @@ async fn restart_runtime_slot(
     Ok(Json(json!({ "restarted": true })))
 }
 
-fn connection_config_string(row: &sqlx::postgres::PgRow, keys: &[&str]) -> Option<String> {
+fn connection_config_roots(
+    row: &sqlx::postgres::PgRow,
+    sections: &[&str],
+) -> Vec<Value> {
     use sqlx::Row;
     let configs = [
         row.get::<Option<Value>, _>("config")
@@ -3139,55 +3149,273 @@ fn connection_config_string(row: &sqlx::postgres::PgRow, keys: &[&str]) -> Optio
         row.get::<Option<Value>, _>("transport_config")
             .unwrap_or_else(|| json!({})),
     ];
+    let mut roots = Vec::with_capacity(configs.len() * (sections.len() + 1));
     for config in &configs {
-        let roots = [config.get("oauth"), Some(config)];
-        for root in roots.into_iter().flatten() {
-            for key in keys {
-                if let Some(value) = root
-                    .get(*key)
+        for section in sections {
+            if let Some(value) = config.get(*section) {
+                roots.push(value.clone());
+            }
+        }
+        roots.push(config.clone());
+    }
+    roots
+}
+
+fn connection_config_string_in_sections(
+    row: &sqlx::postgres::PgRow,
+    sections: &[&str],
+    keys: &[&str],
+) -> Option<String> {
+    connection_config_roots(row, sections)
+        .iter()
+        .find_map(|root| {
+            keys.iter().find_map(|key| {
+                root.get(*key)
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
-                {
-                    return Some(value.to_string());
-                }
-            }
-        }
+                    .map(ToOwned::to_owned)
+            })
+        })
+}
+
+fn connection_config_string(row: &sqlx::postgres::PgRow, keys: &[&str]) -> Option<String> {
+    connection_config_string_in_sections(row, &["oauth"], keys)
+}
+
+fn config_scope_values(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        Value::String(value) => value
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => Vec::new(),
     }
-    None
+}
+
+fn connection_config_scope_strings(
+    row: &sqlx::postgres::PgRow,
+    sections: &[&str],
+    keys: &[&str],
+) -> Vec<String> {
+    connection_config_roots(row, sections)
+        .iter()
+        .find_map(|root| {
+            keys.iter().find_map(|key| {
+                let values = root.get(*key).map(config_scope_values)?;
+                (!values.is_empty()).then_some(values)
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn connection_config_strings(row: &sqlx::postgres::PgRow, keys: &[&str]) -> Vec<String> {
-    use sqlx::Row;
-    let configs = [
-        row.get::<Option<Value>, _>("config")
-            .unwrap_or_else(|| json!({})),
-        row.get::<Option<Value>, _>("transport_config")
-            .unwrap_or_else(|| json!({})),
-    ];
-    for config in &configs {
-        let roots = [config.get("oauth"), Some(config)];
-        for root in roots.into_iter().flatten() {
-            for key in keys {
-                let Some(values) = root.get(*key).and_then(Value::as_array) else {
-                    continue;
-                };
-                let values = values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>();
-                if !values.is_empty() {
-                    return values;
-                }
-            }
-        }
-    }
-    Vec::new()
+    connection_config_scope_strings(row, &["oauth"], keys)
 }
 
+fn connection_config_bool_in_sections(
+    row: &sqlx::postgres::PgRow,
+    sections: &[&str],
+    keys: &[&str],
+) -> Option<bool> {
+    connection_config_roots(row, sections)
+        .iter()
+        .find_map(|root| keys.iter().find_map(|key| root.get(*key).and_then(Value::as_bool)))
+}
+
+fn connection_config_i64_in_sections(
+    row: &sqlx::postgres::PgRow,
+    sections: &[&str],
+    keys: &[&str],
+) -> Option<i64> {
+    connection_config_roots(row, sections)
+        .iter()
+        .find_map(|root| {
+            keys.iter().find_map(|key| {
+                root.get(*key).and_then(|value| match value {
+                    Value::Number(value) => value.as_i64(),
+                    Value::String(value) => value.trim().parse().ok(),
+                    _ => None,
+                })
+            })
+        })
+}
+
+fn normalize_token_scopes(input: Option<AgentConnectionTokenScope>) -> Result<Vec<String>, StatusCode> {
+    let values = match input {
+        None => Vec::new(),
+        Some(AgentConnectionTokenScope::String(value)) => value
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect(),
+        Some(AgentConnectionTokenScope::Array(values)) => values,
+    };
+    if values.len() > 100
+        || values
+            .iter()
+            .any(|value| value.trim().is_empty() || value.trim().chars().count() > 240)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut unique = Vec::with_capacity(values.len());
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        let value = value.trim().to_string();
+        if seen.insert(value.clone()) {
+            unique.push(value);
+        }
+    }
+    Ok(unique)
+}
+
+fn connection_token_path(row: &sqlx::postgres::PgRow) -> &'static str {
+    let sections = &["tokenBroker", "token_broker", "broker"];
+    if let Some(path) = connection_config_string_in_sections(
+        row,
+        sections,
+        &["path", "tokenPath", "token_path"],
+    ) {
+        return match path.as_str() {
+            "exchange" => "exchange",
+            "oauth_access" | "oauthAccess" => "oauth_access",
+            "static" => "static",
+            _ => "static",
+        };
+    }
+    if connection_config_string_in_sections(row, sections, &["tokenUrl", "token_url"])
+        .is_some()
+        || connection_config_string_in_sections(row, &[], &["tokenExchangeUrl", "token_exchange_url"])
+            .is_some()
+    {
+        "exchange"
+    } else {
+        "static"
+    }
+}
+
+fn connection_token_parent_scopes(row: &sqlx::postgres::PgRow) -> Vec<String> {
+    connection_config_scope_strings(
+        row,
+        &["tokenBroker", "token_broker", "broker", "oauth"],
+        &["parentScopes", "parent_scopes", "scopes", "scope"],
+    )
+}
+
+fn connection_token_default_scopes(row: &sqlx::postgres::PgRow) -> Vec<String> {
+    connection_config_scope_strings(
+        row,
+        &["tokenBroker", "token_broker", "broker"],
+        &["defaultScopes", "default_scopes"],
+    )
+}
+
+fn token_scopes_subset(requested: &[String], parent: &[String]) -> bool {
+    requested.is_empty() || (!parent.is_empty() && requested.iter().all(|scope| parent.contains(scope)))
+}
+
+fn bounded_token_ttl(row: &sqlx::postgres::PgRow, requested: Option<i64>) -> Result<i32, StatusCode> {
+    if requested.is_some_and(|value| !(1..=86_400).contains(&value)) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let configured = connection_config_i64_in_sections(
+        row,
+        &["tokenBroker", "token_broker", "broker"],
+        &["defaultTtlSeconds", "default_ttl_seconds", "ttlSeconds", "ttl_seconds"],
+    )
+    .unwrap_or(900);
+    Ok(requested
+        .unwrap_or(configured)
+        .clamp(1, 900) as i32)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AgentConnectionTokenScope {
+    String(String),
+    Array(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum AgentConnectionTokenSubject {
+    #[serde(rename = "app")]
+    App,
+    #[serde(rename = "user")]
+    User {
+        #[serde(rename = "userId")]
+        user_id: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentConnectionTokenRequest {
+    subject: Option<AgentConnectionTokenSubject>,
+    scope: Option<AgentConnectionTokenScope>,
+    #[serde(rename = "requestedTtlSeconds")]
+    requested_ttl_seconds: Option<i64>,
+    #[serde(rename = "grantId")]
+    grant_id: Option<Uuid>,
+}
+
+async fn record_connection_token_issuance(
+    state: &AppState,
+    context: &ActiveAgentRunContext,
+    row: &sqlx::postgres::PgRow,
+    path: &str,
+    requested_scope: &[String],
+    issued_scope: &[String],
+    ttl_seconds: Option<i32>,
+    expires_at: Option<DateTime<Utc>>,
+    token_hash: Option<&str>,
+    outcome: &str,
+    error_code: Option<&str>,
+    metadata: Value,
+) -> Result<(), StatusCode> {
+    use sqlx::Row;
+    sqlx::query(
+        "INSERT INTO connection_token_issuances
+            (company_id, application_id, connection_id, agent_id, run_id,
+             issue_id, project_id, responsible_user_id, path, requested_scope,
+             issued_scope, ttl_seconds, expires_at, token_hash, outcome,
+             error_code, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                 $14, $15, $16, $17)",
+    )
+    .bind(context.company_id)
+    .bind(row.get::<Option<Uuid>, _>("application_id"))
+    .bind(row.get::<Uuid, _>("id"))
+    .bind(context.agent_id)
+    .bind(context.run_id)
+    .bind(context.issue_id)
+    .bind(context.project_id)
+    .bind(context.responsible_user_id.as_deref())
+    .bind(path)
+    .bind(json!(requested_scope))
+    .bind(json!(issued_scope))
+    .bind(ttl_seconds)
+    .bind(expires_at)
+    .bind(token_hash)
+    .bind(outcome)
+    .bind(error_code)
+    .bind(metadata)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, "Failed to persist connection token issuance");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(())
+}
 fn configured_oauth_redirect_uri(row: &sqlx::postgres::PgRow) -> Option<String> {
     if let Some(value) = connection_config_string(
         row,
@@ -3226,6 +3454,7 @@ fn pkce_challenge(code_verifier: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartAgentConnectionAuthorizationRequest {
     #[serde(rename = "subjectUserId")]
     subject_user_id: String,
@@ -3346,19 +3575,315 @@ async fn start_agent_connection_auth(
     Ok(Json(json!({ "url": authorization_url.to_string() })))
 }
 
-/// POST /agents/me/connections/:connection_id/token —— mock token。
+/// POST /agents/me/connections/:connection_id/token —— Agent token broker。
 async fn agent_connection_token(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let (_, company_id, _) = require_active_agent_run(&state, &actor).await?;
-    get_connection_by_id(&state, company_id, connection_id)
+    headers: HeaderMap,
+    request: Option<Json<AgentConnectionTokenRequest>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let context = load_active_agent_run_context(&state, &actor).await?;
+    if let Some(header_run_id) = headers
+        .get("x-paperclip-run-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if header_run_id != context.run_id.to_string() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    let Json(request) = request.ok_or(StatusCode::BAD_REQUEST)?;
+    let row = get_connection_by_id(&state, context.company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(
-        json!({ "connectionId": connection_id, "accessToken": format!("mock-{}", Uuid::new_v4()) }),
-    ))
+    use sqlx::Row;
+    let requested_scope = normalize_token_scopes(request.scope)?;
+    let subject_user_id = match request.subject {
+        None | Some(AgentConnectionTokenSubject::App) => None,
+        Some(AgentConnectionTokenSubject::User { user_id }) => {
+            let user_id = user_id.trim().to_string();
+            if user_id.is_empty() || user_id.chars().count() > 500 {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            if context.responsible_user_id.as_deref() != Some(user_id.as_str()) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            Some(user_id)
+        }
+    };
+    let path = connection_token_path(&row);
+    let ttl_seconds = bounded_token_ttl(&row, request.requested_ttl_seconds)?;
+    let parent_scope = connection_token_parent_scopes(&row);
+    let issued_scope = if requested_scope.is_empty() {
+        let defaults = connection_token_default_scopes(&row);
+        if defaults.is_empty() {
+            parent_scope.clone()
+        } else {
+            defaults
+        }
+    } else {
+        requested_scope.clone()
+    };
+    if !token_scopes_subset(&issued_scope, &parent_scope) {
+        record_connection_token_issuance(
+            &state,
+            &context,
+            &row,
+            path,
+            &requested_scope,
+            &issued_scope,
+            Some(ttl_seconds),
+            None,
+            None,
+            "denied",
+            Some("scope_exceeds_parent"),
+            json!({ "parentScopeCount": parent_scope.len() }),
+        )
+        .await?;
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if row.get::<String, _>("status") != "active" || !row.get::<bool, _>("enabled") {
+        record_connection_token_issuance(
+            &state,
+            &context,
+            &row,
+            path,
+            &requested_scope,
+            &issued_scope,
+            None,
+            None,
+            None,
+            "denied",
+            Some("connection_not_active"),
+            json!({
+                "connectionStatus": row.get::<String, _>("status"),
+                "enabled": row.get::<bool, _>("enabled")
+            }),
+        )
+        .await?;
+        return Err(StatusCode::CONFLICT);
+    }
+    let health_status = row.get::<String, _>("health_status");
+    if matches!(health_status.as_str(), "failed" | "error" | "missing_secret" | "unhealthy") {
+        record_connection_token_issuance(
+            &state,
+            &context,
+            &row,
+            path,
+            &requested_scope,
+            &issued_scope,
+            None,
+            None,
+            None,
+            "denied",
+            Some("credential_revoked"),
+            json!({ "healthStatus": health_status }),
+        )
+        .await?;
+        return Err(StatusCode::CONFLICT);
+    }
+    if !connection_config_bool_in_sections(
+        &row,
+        &["tokenBroker", "token_broker", "broker"],
+        &["enabled"],
+    )
+    .unwrap_or(false)
+    {
+        record_connection_token_issuance(
+            &state,
+            &context,
+            &row,
+            path,
+            &requested_scope,
+            &issued_scope,
+            None,
+            None,
+            None,
+            "denied",
+            Some("broker_not_enabled"),
+            json!({}),
+        )
+        .await?;
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let grant = if let Some(grant_id) = request.grant_id {
+        sqlx::query(
+            "SELECT id, status
+               FROM connection_grants
+              WHERE id = $1 AND company_id = $2 AND connection_id = $3
+                AND kind = $4",
+        )
+        .bind(grant_id)
+        .bind(context.company_id)
+        .bind(connection_id)
+        .bind(if subject_user_id.is_some() { "user" } else { "workspace" })
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to load connection token grant");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    } else if let Some(subject_user_id) = subject_user_id.as_deref() {
+        sqlx::query(
+            "SELECT id, status
+               FROM connection_grants
+              WHERE company_id = $1 AND connection_id = $2
+                AND kind = 'user' AND subject_user_id = $3
+              ORDER BY created_at DESC
+              LIMIT 1",
+        )
+        .bind(context.company_id)
+        .bind(connection_id)
+        .bind(subject_user_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to load user connection token grant");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    } else {
+        sqlx::query(
+            "INSERT INTO connection_grants
+                (company_id, connection_id, kind, status, is_default, created_by_agent_id)
+             VALUES ($1, $2, 'workspace', 'active', true, $3)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(context.company_id)
+        .bind(connection_id)
+        .bind(context.agent_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to ensure workspace connection token grant");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        sqlx::query(
+            "SELECT id, status
+               FROM connection_grants
+              WHERE company_id = $1 AND connection_id = $2
+                AND kind = 'workspace' AND is_default = true
+              LIMIT 1",
+        )
+        .bind(context.company_id)
+        .bind(connection_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, %connection_id, "Failed to load default connection token grant");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
+    let Some(grant) = grant else {
+        let error_code = if subject_user_id.is_some() {
+            "user_authorization_required"
+        } else {
+            "installation_required"
+        };
+        record_connection_token_issuance(
+            &state,
+            &context,
+            &row,
+            path,
+            &requested_scope,
+            &issued_scope,
+            None,
+            None,
+            None,
+            "denied",
+            Some(error_code),
+            json!({}),
+        )
+        .await?;
+        return Err(StatusCode::CONFLICT);
+    };
+    let grant_id: Uuid = grant.get("id");
+    let grant_status: String = grant.get("status");
+    if grant_status != "active" {
+        let error_code = if grant_status == "needs_reauthorization" {
+            "needs_reauthorization"
+        } else {
+            "grant_revoked"
+        };
+        record_connection_token_issuance(
+            &state,
+            &context,
+            &row,
+            path,
+            &requested_scope,
+            &issued_scope,
+            None,
+            None,
+            None,
+            "denied",
+            Some(error_code),
+            json!({ "grantId": grant_id }),
+        )
+        .await?;
+        return Err(StatusCode::CONFLICT);
+    }
+
+    if path == "static" {
+        record_connection_token_issuance(
+            &state,
+            &context,
+            &row,
+            path,
+            &requested_scope,
+            &issued_scope,
+            Some(ttl_seconds),
+            None,
+            None,
+            "use_env_lease",
+            Some("use_env_lease"),
+            json!({ "grantId": grant_id }),
+        )
+        .await?;
+        return Ok((StatusCode::CONFLICT, Json(json!({
+            "status": "use_env_lease",
+            "code": "use_env_lease",
+            "connectionId": connection_id,
+            "connection": {
+                "id": connection_id,
+                "uid": row.get::<String, _>("uid")
+            },
+            "grantId": grant_id,
+            "path": "static",
+            "message": "This connection uses static credentials. Use an audited environment lease projection instead.",
+            "scope": issued_scope,
+            "attribution": {
+                "agentId": context.agent_id,
+                "runId": context.run_id,
+                "issueId": context.issue_id,
+                "projectId": context.project_id,
+                "responsibleUserId": context.responsible_user_id
+            }
+        }))));
+    }
+
+    let error_code = if path == "oauth_access" {
+        "oauth_access_projection_disabled"
+    } else {
+        "exchange_not_implemented"
+    };
+    record_connection_token_issuance(
+        &state,
+        &context,
+        &row,
+        path,
+        &requested_scope,
+        &issued_scope,
+        Some(ttl_seconds),
+        None,
+        None,
+        "denied",
+        Some(error_code),
+        json!({ "grantId": grant_id }),
+    )
+    .await?;
+    Err(StatusCode::UNPROCESSABLE_ENTITY)
 }
 
 // ================= Round 3 =================

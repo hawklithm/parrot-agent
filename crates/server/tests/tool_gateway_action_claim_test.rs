@@ -1432,6 +1432,11 @@ async fn agent_connection_broker_routes_require_active_run_context() {
             "clientId": "broker-client",
             "redirectUri": "https://parrot.example/api/tools/oauth/callback",
             "scopes": ["openid"]
+        },
+        "tokenBroker": {
+            "enabled": true,
+            "path": "static",
+            "parentScopes": ["openid", "repo"]
         }
     }))
     .execute(&pool)
@@ -1496,7 +1501,28 @@ async fn agent_connection_broker_routes_require_active_run_context() {
         Some(json!({})),
     )
     .await;
-    assert_eq!(token_status, StatusCode::OK, "token response={token_body:?}");
+    assert_eq!(
+        token_status,
+        StatusCode::CONFLICT,
+        "token response={token_body:?}"
+    );
+    assert_eq!(token_body["status"], "use_env_lease");
+    assert_eq!(token_body["code"], "use_env_lease");
+    assert_eq!(token_body["path"], "static");
+    let (issuance_outcome, issuance_error): (String, String) = sqlx::query_as(
+        "SELECT outcome, error_code
+           FROM connection_token_issuances
+          WHERE company_id = $1 AND connection_id = $2
+          ORDER BY created_at DESC
+          LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load persisted connection token issuance");
+    assert_eq!(issuance_outcome, "use_env_lease");
+    assert_eq!(issuance_error, "use_env_lease");
 
     let (wrong_subject_status, wrong_subject_body) = request_connection_route(
         &app,
