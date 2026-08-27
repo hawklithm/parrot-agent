@@ -112,12 +112,28 @@ async fn tools_applications(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT * FROM tool_applications WHERE company_id = $1 ORDER BY created_at DESC LIMIT 100",
+        "SELECT ta.id, ta.company_id, ta.application_key,
+                COALESCE(NULLIF(ta.name, ''), NULLIF(tc.name, ''), ta.application_key,
+                         'legacy-tool-application') AS name,
+                ta.description,
+                COALESCE(NULLIF(ta.type, ''), 'custom') AS application_type,
+                CASE WHEN ta.status IN ('draft', 'active', 'disabled', 'archived')
+                     THEN ta.status ELSE 'active' END AS status,
+                ta.plugin_id, ta.owner_agent_id, ta.owner_user_id,
+                COALESCE(ta.metadata, '{}'::jsonb) AS metadata,
+                ta.archived_at, ta.created_at, ta.updated_at,
+                ta.agent_id AS legacy_agent_id,
+                ta.connection_id AS legacy_connection_id
+           FROM tool_applications ta
+           LEFT JOIN tool_connections tc
+             ON tc.id = ta.connection_id AND tc.company_id = ta.company_id
+          WHERE ta.company_id = $1
+          ORDER BY ta.updated_at DESC
+          LIMIT 100",
     )
     .bind(company_id)
     .fetch_all(&state.pool)
@@ -126,28 +142,137 @@ async fn tools_applications(
         tracing::error!("Failed to list tool applications: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(
-        rows.iter()
-            .map(|r| {
-                json!({
-                    "id": r.get::<Uuid, _>("id"),
-                    "agentId": r.get::<Option<Uuid>, _>("agent_id"),
-                    "connectionId": r.get::<Option<Uuid>, _>("connection_id"),
-                    "status": r.get::<String, _>("status"),
-                    "justification": r.get::<Option<String>, _>("justification"),
-                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                })
-            })
-            .collect(),
-    ))
+    let applications = rows.iter().map(tool_application_json).collect::<Vec<_>>();
+    Ok(Json(json!({ "applications": applications })))
 }
 
-/// POST /companies/:cid/tools/applications —— 创建申请。
+fn tool_application_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
+    use sqlx::Row;
+    let mut application = json!({
+        "id": row.get::<Uuid, _>("id"),
+        "companyId": row.get::<Uuid, _>("company_id"),
+        "applicationKey": row.get::<Option<String>, _>("application_key"),
+        "name": row.get::<String, _>("name"),
+        "description": row.get::<Option<String>, _>("description"),
+        "type": row.get::<String, _>("application_type"),
+        "status": row.get::<String, _>("status"),
+        "pluginId": row.get::<Option<Uuid>, _>("plugin_id"),
+        "ownerAgentId": row.get::<Option<Uuid>, _>("owner_agent_id"),
+        "ownerUserId": row.get::<Option<String>, _>("owner_user_id"),
+        "metadata": row.get::<Value, _>("metadata"),
+        "archivedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("archived_at"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    });
+    if let Some(object) = application.as_object_mut() {
+        if let Some(agent_id) = row.get::<Option<Uuid>, _>("legacy_agent_id") {
+            object.insert("agentId".to_string(), json!(agent_id));
+        }
+        if let Some(connection_id) = row.get::<Option<Uuid>, _>("legacy_connection_id") {
+            object.insert("connectionId".to_string(), json!(connection_id));
+        }
+    }
+    application
+}
+
+fn is_safe_tool_application_key(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn normalize_tool_application_key(value: &str) -> String {
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+        } else if !normalized.ends_with('-') {
+            normalized.push('-');
+        }
+    }
+    let normalized = normalized.trim_matches('-');
+    if normalized.is_empty() {
+        "tool-application".to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn validate_tool_application_type(value: &str) -> bool {
+    matches!(value, "mcp_http" | "mcp_stdio" | "paperclip_plugin" | "a2a")
+}
+
+fn validate_tool_application_status(value: &str) -> bool {
+    matches!(value, "draft" | "active" | "disabled" | "archived")
+}
+
+async fn validate_tool_application_references(
+    state: &AppState,
+    company_id: Uuid,
+    plugin_id: Option<Uuid>,
+    owner_agent_id: Option<Uuid>,
+) -> Result<(), StatusCode> {
+    if let Some(plugin_id) = plugin_id {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM plugins WHERE id = $1)",
+        )
+        .bind(plugin_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to validate tool application plugin: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if !exists {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+    if let Some(owner_agent_id) = owner_agent_id {
+        let belongs_to_company = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM agents WHERE id = $1 AND company_id = $2
+             )",
+        )
+        .bind(owner_agent_id)
+        .bind(company_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to validate tool application owner agent: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if !belongs_to_company {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+    Ok(())
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .as_deref()
+        == Some("23505")
+}
+
+/// POST /companies/:cid/tools/applications —— 创建应用定义。
 #[derive(Debug, Deserialize)]
 struct CreateToolApplicationRequest {
-    #[serde(rename = "connectionId")]
-    connection_id: Uuid,
-    justification: Option<String>,
+    #[serde(rename = "applicationKey")]
+    application_key: Option<String>,
+    name: String,
+    description: Option<String>,
+    #[serde(rename = "type")]
+    application_type: String,
+    status: Option<String>,
+    #[serde(rename = "pluginId")]
+    plugin_id: Option<Uuid>,
+    #[serde(rename = "ownerAgentId")]
+    owner_agent_id: Option<Uuid>,
+    #[serde(rename = "ownerUserId")]
+    owner_user_id: Option<String>,
+    metadata: Option<Value>,
 }
 async fn create_tool_application(
     State(state): State<AppState>,
@@ -155,25 +280,67 @@ async fn create_tool_application(
     Path(company_id): Path<Uuid>,
     Json(request): Json<CreateToolApplicationRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
-    let agent_id = match &actor {
-        AuthorizationActor::Agent { agent_id, .. } => *agent_id,
-        _ => return Err(StatusCode::FORBIDDEN),
-    };
-    require_company_access(&actor, company_id, AccessMode::Write)
+    require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    let name = request.name.trim();
+    let application_type = request.application_type.trim();
+    let status = request.status.as_deref().unwrap_or("active");
+    if name.is_empty()
+        || name.chars().count() > 160
+        || !validate_tool_application_type(application_type)
+        || !validate_tool_application_status(status)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let application_key = request
+        .application_key
+        .as_deref()
+        .map(str::trim)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| normalize_tool_application_key(name));
+    if application_key.chars().count() > 160 || !is_safe_tool_application_key(&application_key) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    validate_tool_application_references(
+        &state,
+        company_id,
+        request.plugin_id,
+        request.owner_agent_id,
+    )
+    .await?;
+    let metadata = request
+        .metadata
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| json!({}));
     let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO tool_applications (id, company_id, agent_id, connection_id, justification) \
-         VALUES ($1,$2,$3,$4,$5) ON CONFLICT (agent_id, connection_id) DO NOTHING RETURNING id",
+    let row = sqlx::query(
+        "INSERT INTO tool_applications
+            (id, company_id, application_key, name, description, type, status,
+             plugin_id, owner_agent_id, owner_user_id, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         RETURNING id, company_id, application_key, name, description,
+                   type AS application_type, status, plugin_id, owner_agent_id,
+                   owner_user_id, metadata, archived_at, created_at, updated_at,
+                   NULL::uuid AS legacy_agent_id,
+                   NULL::uuid AS legacy_connection_id",
     )
     .bind(id)
     .bind(company_id)
-    .bind(agent_id)
-    .bind(request.connection_id)
-    .bind(request.justification.as_deref())
-    .fetch_optional(&state.pool)
+    .bind(application_key)
+    .bind(name)
+    .bind(request.description)
+    .bind(application_type)
+    .bind(status)
+    .bind(request.plugin_id)
+    .bind(request.owner_agent_id)
+    .bind(request.owner_user_id)
+    .bind(metadata)
+    .fetch_one(&state.pool)
     .await
     .map_err(|e| {
+        if is_unique_violation(&e) {
+            return StatusCode::CONFLICT;
+        }
         tracing::error!("Failed to create tool application: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -184,13 +351,10 @@ async fn create_tool_application(
         &actor,
         "tool_application",
         id,
-        json!({}),
+        json!({ "name": name, "type": application_type }),
     )
     .await;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({ "id": id, "status": "pending" })),
-    ))
+    Ok((StatusCode::CREATED, Json(tool_application_json(&row))))
 }
 
 /// GET /companies/:cid/tools/profiles —— tool_profiles 列表。
@@ -379,10 +543,19 @@ fn stdio_template_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
 
 // ---------- tool-applications ----------
 
-/// PATCH /api/tool-applications/:id —— 更新状态（board 审批）。
+/// PATCH /api/tool-applications/:id —— 更新应用定义。
 #[derive(Debug, Deserialize)]
 struct UpdateToolApplicationRequest {
+    name: Option<String>,
+    description: Option<String>,
     status: Option<String>,
+    #[serde(rename = "pluginId")]
+    plugin_id: Option<Uuid>,
+    #[serde(rename = "ownerAgentId")]
+    owner_agent_id: Option<Uuid>,
+    #[serde(rename = "ownerUserId")]
+    owner_user_id: Option<String>,
+    metadata: Option<Value>,
 }
 async fn update_tool_application(
     State(state): State<AppState>,
@@ -390,28 +563,80 @@ async fn update_tool_application(
     Path(application_id): Path<Uuid>,
     Json(request): Json<UpdateToolApplicationRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let user_id = match &actor {
-        AuthorizationActor::Board { user_id, .. } => *user_id,
-        _ => return Err(StatusCode::FORBIDDEN),
-    };
-    use sqlx::Row;
-    let row = sqlx::query(
-        "UPDATE tool_applications SET status = COALESCE($2, status), reviewed_by_user_id = $3, \
-         reviewed_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING company_id, *",
+    assert_board(&actor)?;
+    let company_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT company_id FROM tool_applications WHERE id = $1",
     )
     .bind(application_id)
-    .bind(request.status.as_deref())
-    .bind(user_id.to_string())
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| {
+        tracing::error!("Failed to load tool application: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    require_board_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    if request
+        .name
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty() || name.trim().chars().count() > 160)
+        || request
+            .status
+            .as_deref()
+            .is_some_and(|status| !validate_tool_application_status(status))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    validate_tool_application_references(
+        &state,
+        company_id,
+        request.plugin_id,
+        request.owner_agent_id,
+    )
+    .await?;
+    let metadata = request
+        .metadata
+        .as_ref()
+        .filter(|value| !value.is_null());
+    let row = sqlx::query(
+        "UPDATE tool_applications
+            SET name = COALESCE($2, name),
+                description = COALESCE($3, description),
+                status = COALESCE($4, status),
+                plugin_id = COALESCE($5, plugin_id),
+                owner_agent_id = COALESCE($6, owner_agent_id),
+                owner_user_id = COALESCE($7, owner_user_id),
+                metadata = COALESCE($8, metadata),
+                updated_at = NOW()
+          WHERE id = $1 AND company_id = $9
+         RETURNING id, company_id, application_key, name, description,
+                   type AS application_type, status, plugin_id, owner_agent_id,
+                   owner_user_id, metadata, archived_at, created_at, updated_at,
+                   agent_id AS legacy_agent_id,
+                   connection_id AS legacy_connection_id",
+    )
+    .bind(application_id)
+    .bind(request.name.as_deref().map(str::trim))
+    .bind(request.description.as_deref())
+    .bind(request.status.as_deref())
+    .bind(request.plugin_id)
+    .bind(request.owner_agent_id)
+    .bind(request.owner_user_id.as_deref())
+    .bind(metadata)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            return StatusCode::CONFLICT;
+        }
         tracing::error!("Failed to update tool application: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     let Some(row) = row else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let company_id: Uuid = row.get("company_id");
     crate::routes::log_activity(
         &state.pool,
         company_id,
@@ -419,12 +644,13 @@ async fn update_tool_application(
         &actor,
         "tool_application",
         application_id,
-        json!({ "status": request.status }),
+        json!({
+            "name": request.name,
+            "status": request.status,
+        }),
     )
     .await;
-    Ok(Json(
-        json!({ "id": application_id, "status": request.status }),
-    ))
+    Ok(Json(tool_application_json(&row)))
 }
 
 /// DELETE /api/tool-applications/:id
@@ -432,32 +658,82 @@ async fn delete_tool_application(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(application_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     assert_board(&actor)?;
-    let row = sqlx::query_scalar::<_, Option<Uuid>>(
+    use sqlx::Row;
+    let company_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT company_id FROM tool_applications WHERE id = $1",
     )
     .bind(application_id)
-    .fetch_one(&state.pool)
+    .fetch_optional(&state.pool)
     .await
     .map_err(|e| {
         tracing::error!("Failed to load tool application: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let Some(company_id) = row else {
-        return Err(StatusCode::NOT_FOUND);
-    };
+    let company_id = company_id.ok_or(StatusCode::NOT_FOUND)?;
     require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    sqlx::query("DELETE FROM tool_applications WHERE id = $1")
+
+    let mut transaction = state.pool.begin().await.map_err(|e| {
+        tracing::error!("Failed to start tool application delete transaction: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let has_connections = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM tool_connections
+              WHERE application_id = $1 AND company_id = $2
+         )",
+    )
+    .bind(application_id)
+    .bind(company_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to inspect tool application connections: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if has_connections {
+        return Err(StatusCode::CONFLICT);
+    }
+    let row = sqlx::query(
+        "DELETE FROM tool_applications
+          WHERE id = $1 AND company_id = $2
+         RETURNING id, company_id, application_key, name, description,
+                   type AS application_type, status, plugin_id, owner_agent_id,
+                   owner_user_id, metadata, archived_at, created_at, updated_at,
+                   agent_id AS legacy_agent_id,
+                   connection_id AS legacy_connection_id",
+    )
         .bind(application_id)
-        .execute(&state.pool)
+        .bind(company_id)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|e| {
             tracing::error!("Failed to delete tool application: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    Ok(StatusCode::NO_CONTENT)
+    let Some(row) = row else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    transaction.commit().await.map_err(|e| {
+        tracing::error!("Failed to commit tool application delete: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "tool_application.deleted",
+        &actor,
+        "tool_application",
+        application_id,
+        json!({
+            "name": row.get::<String, _>("name"),
+            "type": row.get::<String, _>("application_type"),
+        }),
+    )
+    .await;
+    Ok(Json(tool_application_json(&row)))
 }
 
 // ---------- tool-connections ----------

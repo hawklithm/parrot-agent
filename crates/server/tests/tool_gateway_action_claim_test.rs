@@ -1070,6 +1070,155 @@ async fn company_tool_control_plane_routes_require_board_actor() {
 }
 
 #[tokio::test]
+async fn tool_application_crud_matches_board_definition_contract() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let application_id;
+    let connection_id = Uuid::new_v4();
+    let issue_prefix = format!("TG{}", &company_id.simple().to_string()[..8]);
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Tool Application Contract Test")
+        .bind(issue_prefix)
+        .execute(&pool)
+        .await
+        .expect("insert application company");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+    let agent = AuthorizationActor::agent(Uuid::new_v4(), company_id, Some(Uuid::new_v4()));
+
+    let (create_status, create_body) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/companies/{company_id}/tools/applications"),
+        Some(json!({
+            "applicationKey": "github",
+            "name": "GitHub",
+            "description": "GitHub tool application",
+            "type": "mcp_http",
+            "metadata": {"provider": "github"}
+        })),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED, "create={create_body:?}");
+    assert_eq!(create_body["companyId"].as_str(), Some(company_id.to_string().as_str()));
+    assert_eq!(create_body["applicationKey"].as_str(), Some("github"));
+    assert_eq!(create_body["name"].as_str(), Some("GitHub"));
+    assert_eq!(create_body["type"].as_str(), Some("mcp_http"));
+    assert_eq!(create_body["status"].as_str(), Some("active"));
+    application_id = Uuid::parse_str(
+        create_body["id"]
+            .as_str()
+            .expect("created application id"),
+    )
+    .expect("parse created application id");
+
+    let (list_status, list_body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/companies/{company_id}/tools/applications"),
+        None,
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK, "list={list_body:?}");
+    assert_eq!(list_body["applications"].as_array().map(Vec::len), Some(1));
+    assert_eq!(list_body["applications"][0]["id"], create_body["id"]);
+
+    let (agent_list_status, agent_list_body) = request_connection_route(
+        &app,
+        &agent,
+        "GET",
+        format!("/companies/{company_id}/tools/applications"),
+        None,
+    )
+    .await;
+    assert_eq!(agent_list_status, StatusCode::FORBIDDEN, "agent list={agent_list_body:?}");
+    let (agent_create_status, agent_create_body) = request_connection_route(
+        &app,
+        &agent,
+        "POST",
+        format!("/companies/{company_id}/tools/applications"),
+        Some(json!({ "name": "Agent app", "type": "mcp_http" })),
+    )
+    .await;
+    assert_eq!(
+        agent_create_status,
+        StatusCode::FORBIDDEN,
+        "agent create={agent_create_body:?}"
+    );
+
+    let (update_status, update_body) = request_connection_route(
+        &app,
+        &owner,
+        "PATCH",
+        format!("/tool-applications/{application_id}"),
+        Some(json!({
+            "name": "GitHub Cloud",
+            "status": "disabled",
+            "metadata": {"provider": "github", "mode": "cloud"}
+        })),
+    )
+    .await;
+    assert_eq!(update_status, StatusCode::OK, "update={update_body:?}");
+    assert_eq!(update_body["name"].as_str(), Some("GitHub Cloud"));
+    assert_eq!(update_body["status"].as_str(), Some("disabled"));
+    assert_eq!(update_body["metadata"]["mode"].as_str(), Some("cloud"));
+
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, application_id, name, uid, transport, transport_config, enabled)
+         VALUES ($1, $2, $3, 'GitHub connection', 'github-connection', 'mcp_remote', '{}', true)",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .bind(application_id)
+    .execute(&pool)
+    .await
+    .expect("insert linked application connection");
+
+    let (protected_delete_status, protected_delete_body) = request_connection_route(
+        &app,
+        &owner,
+        "DELETE",
+        format!("/tool-applications/{application_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        protected_delete_status,
+        StatusCode::CONFLICT,
+        "protected delete={protected_delete_body:?}"
+    );
+
+    sqlx::query("DELETE FROM tool_connections WHERE id = $1 AND company_id = $2")
+        .bind(connection_id)
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .expect("delete linked application connection");
+    let (delete_status, delete_body) = request_connection_route(
+        &app,
+        &owner,
+        "DELETE",
+        format!("/tool-applications/{application_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK, "delete={delete_body:?}");
+    assert_eq!(delete_body["id"], create_body["id"]);
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
 async fn agent_connection_broker_routes_require_active_run_context() {
     let pool = connect_and_migrate().await;
     let company_id = Uuid::new_v4();
