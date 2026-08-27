@@ -1253,3 +1253,185 @@ async fn profile_subresources_are_company_scoped() {
         .execute(&pool)
         .await;
 }
+
+#[tokio::test]
+async fn effective_profile_projection_is_scoped_and_uses_aligned_entry_schema() {
+    let pool = connect_and_migrate().await;
+    let owner_company_id = Uuid::new_v4();
+    let other_company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let profile_id = Uuid::new_v4();
+    let binding_id = Uuid::new_v4();
+    let entry_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+
+    for (company_id, name) in [
+        (owner_company_id, "Effective Profile Owner"),
+        (other_company_id, "Effective Profile Other"),
+    ] {
+        let issue_prefix = format!("EP{}", &company_id.simple().to_string()[..8]);
+        sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+            .bind(company_id)
+            .bind(name)
+            .bind(issue_prefix)
+            .execute(&pool)
+            .await
+            .expect("insert effective-profile company");
+    }
+    sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, 'Effective Profile Agent')")
+        .bind(agent_id)
+        .bind(owner_company_id)
+        .execute(&pool)
+        .await
+        .expect("insert effective-profile agent");
+    sqlx::query(
+        "INSERT INTO tool_profiles (id, company_id, profile_key, name, description)
+         VALUES ($1, $2, 'effective-profile', 'Effective profile', 'projection test')",
+    )
+    .bind(profile_id)
+    .bind(owner_company_id)
+    .execute(&pool)
+    .await
+    .expect("insert effective-profile profile");
+    sqlx::query(
+        "INSERT INTO tool_profile_bindings
+            (id, company_id, profile_id, target_type, target_id)
+         VALUES ($1, $2, $3, 'agent', $4)",
+    )
+    .bind(binding_id)
+    .bind(owner_company_id)
+    .bind(profile_id)
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("insert effective-profile binding");
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, name, uid, transport, transport_config, enabled)
+         VALUES ($1, $2, 'Effective MCP', 'effective-mcp', 'mcp_remote', '{}', true)",
+    )
+    .bind(connection_id)
+    .bind(owner_company_id)
+    .execute(&pool)
+    .await
+    .expect("insert effective-profile connection");
+    sqlx::query(
+        "INSERT INTO tool_profile_entries
+            (id, company_id, profile_id, selector_type, effect, connection_id, tool_name)
+         VALUES ($1, $2, $3, 'tool_name', 'include', $4, 'effective.tool')",
+    )
+    .bind(entry_id)
+    .bind(owner_company_id)
+    .bind(profile_id)
+    .bind(connection_id)
+    .execute(&pool)
+    .await
+    .expect("insert effective-profile entry");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_routes().with_state(state);
+    let owner = board_actor_with_role(owner_company_id, MembershipRole::Owner);
+    let other_owner = board_actor_with_role(other_company_id, MembershipRole::Owner);
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/companies/{owner_company_id}/tools/connections"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner connections={body:?}");
+    assert_eq!(body["connections"].as_array().map(Vec::len), Some(1));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &other_owner,
+        "GET",
+        format!("/companies/{owner_company_id}/tools/connections"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-company connections={body:?}"
+    );
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!(
+            "/companies/{owner_company_id}/tools/profiles/effective/agents/{agent_id}"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner effective profiles={body:?}");
+    assert_eq!(
+        body["profiles"].as_array().map(Vec::len),
+        Some(1),
+        "effective profile body={body:?}"
+    );
+    assert_eq!(
+        body["entries"].as_array().map(Vec::len),
+        Some(1),
+        "effective profile entries body={body:?}"
+    );
+    assert_eq!(
+        body["entries"][0].get("effect").and_then(Value::as_str),
+        Some("include")
+    );
+    assert!(body["entries"][0].get("selectorValue").is_none());
+    assert_eq!(
+        body["allowedToolNames"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        body["allowedToolNames"][0].as_str(),
+        Some("effective.tool")
+    );
+    assert_eq!(
+        body["installedConnections"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let (status, body) = request_connection_route(
+        &app,
+        &other_owner,
+        "GET",
+        format!(
+            "/companies/{owner_company_id}/tools/profiles/effective/agents/{agent_id}"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-company effective profiles={body:?}"
+    );
+
+    let (status, body) = request_connection_route(
+        &app,
+        &other_owner,
+        "GET",
+        format!(
+            "/companies/{other_company_id}/tools/profiles/effective/agents/{agent_id}"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "wrong-company agent effective profiles={body:?}"
+    );
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
+        .bind(owner_company_id)
+        .bind(other_company_id)
+        .execute(&pool)
+        .await;
+}

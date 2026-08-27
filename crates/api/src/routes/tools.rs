@@ -2834,11 +2834,13 @@ async fn gateway_decision(
 ) -> String {
     let profile_effect: Option<String> = sqlx::query_scalar(
         "SELECT e.effect FROM tool_profile_entries e
-           JOIN tool_profile_bindings b ON b.profile_id = e.profile_id
-          WHERE b.company_id = $1 AND b.target_type = 'agent' AND b.target_id = $2
+           JOIN tool_profile_bindings b
+             ON b.profile_id = e.profile_id AND b.company_id = e.company_id
+          WHERE b.company_id = $1 AND e.company_id = $1
+            AND b.target_type = 'agent' AND b.target_id = $2
             AND (e.tool_name = $3 OR e.tool_name = '*')
           ORDER BY CASE WHEN e.tool_name = $3 THEN 0 ELSE 1 END,
-                   CASE WHEN e.effect = 'deny' THEN 0 ELSE 1 END
+                   CASE WHEN e.effect IN ('exclude', 'deny') THEN 0 ELSE 1 END
           LIMIT 1",
     )
     .bind(company_id)
@@ -2848,10 +2850,10 @@ async fn gateway_decision(
     .await
     .unwrap_or(None);
     if let Some(effect) = profile_effect {
-        if effect == "deny" {
+        if matches!(effect.as_str(), "exclude" | "deny") {
             return "deny".to_string();
         }
-        if effect == "allow" {
+        if matches!(effect.as_str(), "include" | "allow") {
             return "allow".to_string();
         }
     }
@@ -5472,9 +5474,16 @@ async fn revoke_named_gateway_token(
 }
 
 async fn list_connections(
-    Path(_company_id): Path<Uuid>,
+    Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
+    if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"Company access denied"})),
+        );
+    }
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(\
             'id', id, 'companyId', company_id, 'applicationId', application_id,\
@@ -5486,7 +5495,7 @@ async fn list_connections(
             'createdAt', created_at, 'updatedAt', updated_at) ORDER BY name), '[]'::jsonb)\
          FROM tool_connections WHERE company_id = $1",
     )
-    .bind(_company_id)
+    .bind(company_id)
     .fetch_one(&state.pool)
     .await
     .unwrap_or(Value::Array(vec![]));
@@ -5638,50 +5647,183 @@ async fn delete_policy(
 }
 
 async fn effective_profiles_for_agent(
-    Path((_company_id, agent_id)): Path<(Uuid, Uuid)>,
+    Path((company_id, agent_id)): Path<(Uuid, Uuid)>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
-    let profiles = sqlx::query_scalar::<_, Value>(
-        "SELECT COALESCE(jsonb_agg(to_jsonb(p) || jsonb_build_object('profileKey', p.profile_key) ORDER BY p.name), '[]'::jsonb)\
-         FROM tool_profiles p JOIN tool_profile_bindings b ON b.profile_id = p.id\
-         WHERE p.company_id = $1 AND b.target_type = 'agent' AND b.target_id = $2",
-    ).bind(_company_id).bind(agent_id).fetch_one(&state.pool).await.unwrap_or(Value::Array(vec![]));
-    let bindings = sqlx::query_scalar::<_, Value>(
-        "SELECT COALESCE(jsonb_agg(to_jsonb(b) ORDER BY b.created_at), '[]'::jsonb)\
-         FROM tool_profile_bindings b WHERE b.company_id = $1 AND b.target_type = 'agent' AND b.target_id = $2",
-    ).bind(_company_id).bind(agent_id).fetch_one(&state.pool).await.unwrap_or(Value::Array(vec![]));
-    let entries = sqlx::query_scalar::<_, Value>(
-        "SELECT COALESCE(jsonb_agg(jsonb_build_object(\
-            'id', e.id, 'profileId', e.profile_id, 'selectorType', e.selector_type,\
-            'selectorValue', e.selector_value, 'effect', e.effect, 'connectionId', e.connection_id,\
-            'toolName', e.tool_name, 'createdAt', e.created_at, 'updatedAt', e.updated_at)\
-            ORDER BY e.created_at), '[]'::jsonb)\
-         FROM tool_profile_entries e WHERE e.profile_id IN (\
-            SELECT b.profile_id FROM tool_profile_bindings b\
-            WHERE b.company_id = $1 AND b.target_type = 'agent' AND b.target_id = $2)",
+    if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"Company access denied"})),
+        );
+    }
+    let agent_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM agents WHERE id = $1 AND company_id = $2)",
     )
-    .bind(_company_id)
+    .bind(agent_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await;
+    match agent_exists {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"Agent not found"})),
+            );
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":error.to_string()})),
+            );
+        }
+    }
+    let profiles = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(
+            jsonb_agg(
+                to_jsonb(p) || jsonb_build_object('profileKey', p.profile_key)
+                ORDER BY p.name
+            ),
+            '[]'::jsonb
+        )
+          FROM tool_profiles AS p
+          JOIN tool_profile_bindings AS b
+            ON b.profile_id = p.id
+           AND b.company_id = p.company_id
+         WHERE p.company_id = $1
+           AND b.target_type = 'agent'
+           AND b.target_id = $2
+        "#,
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Value::Array(vec![]));
+    let bindings = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(jsonb_agg(to_jsonb(b) ORDER BY b.created_at), '[]'::jsonb)
+          FROM tool_profile_bindings AS b
+         WHERE b.company_id = $1
+           AND b.target_type = 'agent'
+           AND b.target_id = $2
+        "#,
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Value::Array(vec![]));
+    let entries = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(
+            jsonb_agg(
+                jsonb_build_object(
+                    'id', e.id,
+                    'profileId', e.profile_id,
+                    'selectorType', e.selector_type,
+                    'effect', e.effect,
+                    'connectionId', e.connection_id,
+                    'toolName', e.tool_name,
+                    'createdAt', e.created_at,
+                    'updatedAt', e.updated_at
+                ) ORDER BY e.created_at
+            ),
+            '[]'::jsonb
+        )
+          FROM tool_profile_entries AS e
+          JOIN tool_profiles AS p
+            ON p.id = e.profile_id
+           AND p.company_id = e.company_id
+         WHERE e.company_id = $1
+           AND e.profile_id IN (
+                SELECT b.profile_id
+                  FROM tool_profile_bindings AS b
+                 WHERE b.company_id = $1
+                   AND b.target_type = 'agent'
+                   AND b.target_id = $2
+           )
+        "#,
+    )
+    .bind(company_id)
     .bind(agent_id)
     .fetch_one(&state.pool)
     .await
     .unwrap_or(Value::Array(vec![]));
     let allowed_names = sqlx::query_scalar::<_, Value>(
-        "SELECT COALESCE(jsonb_agg(DISTINCT e.tool_name) FILTER (WHERE e.effect = 'allow' AND e.tool_name IS NOT NULL), '[]'::jsonb)\
-         FROM tool_profile_entries e WHERE e.profile_id IN (\
-            SELECT b.profile_id FROM tool_profile_bindings b\
-            WHERE b.company_id = $1 AND b.target_type = 'agent' AND b.target_id = $2)",
-    ).bind(_company_id).bind(agent_id).fetch_one(&state.pool).await.unwrap_or(Value::Array(vec![]));
+        r#"
+        SELECT COALESCE(
+            jsonb_agg(DISTINCT e.tool_name)
+                FILTER (WHERE e.effect IN ('include', 'allow') AND e.tool_name IS NOT NULL),
+            '[]'::jsonb
+        )
+          FROM tool_profile_entries AS e
+          JOIN tool_profiles AS p
+            ON p.id = e.profile_id
+           AND p.company_id = e.company_id
+         WHERE e.company_id = $1
+           AND e.profile_id IN (
+                SELECT b.profile_id
+                  FROM tool_profile_bindings AS b
+                 WHERE b.company_id = $1
+                   AND b.target_type = 'agent'
+                   AND b.target_id = $2
+           )
+        "#,
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Value::Array(vec![]));
     let installed_connections = sqlx::query_scalar::<_, Value>(
-        "SELECT COALESCE(jsonb_agg(DISTINCT jsonb_build_object(\
-            'id', c.id, 'companyId', c.company_id, 'applicationId', c.application_id, 'name', c.name,\
-            'uid', c.uid, 'connectionKind', c.connection_kind, 'ownership', c.ownership,\
-            'transport', c.transport, 'authKind', c.auth_kind, 'status', c.status,\
-            'transportConfig', c.transport_config, 'credentialSecretRefs', c.credential_secret_refs,\
-            'enabled', c.enabled, 'createdAt', c.created_at, 'updatedAt', c.updated_at)), '[]'::jsonb)\
-         FROM tool_connections c JOIN tool_profile_entries e ON e.connection_id = c.id\
-         WHERE e.profile_id IN (SELECT b.profile_id FROM tool_profile_bindings b\
-            WHERE b.company_id = $1 AND b.target_type = 'agent' AND b.target_id = $2)",
-    ).bind(_company_id).bind(agent_id).fetch_one(&state.pool).await.unwrap_or(Value::Array(vec![]));
+        r#"
+        SELECT COALESCE(
+            jsonb_agg(
+                DISTINCT jsonb_build_object(
+                    'id', c.id,
+                    'companyId', c.company_id,
+                    'applicationId', c.application_id,
+                    'name', c.name,
+                    'uid', c.uid,
+                    'connectionKind', c.connection_kind,
+                    'ownership', c.ownership,
+                    'transport', c.transport,
+                    'authKind', c.auth_kind,
+                    'status', c.status,
+                    'transportConfig', c.transport_config,
+                    'credentialSecretRefs', c.credential_secret_refs,
+                    'enabled', c.enabled,
+                    'createdAt', c.created_at,
+                    'updatedAt', c.updated_at
+                )
+            ),
+            '[]'::jsonb
+        )
+          FROM tool_connections AS c
+          JOIN tool_profile_entries AS e
+            ON e.connection_id = c.id
+           AND e.company_id = c.company_id
+          JOIN tool_profiles AS p
+            ON p.id = e.profile_id
+           AND p.company_id = e.company_id
+         WHERE c.company_id = $1
+           AND e.profile_id IN (
+                SELECT b.profile_id
+                  FROM tool_profile_bindings AS b
+                 WHERE b.company_id = $1
+                   AND b.target_type = 'agent'
+                   AND b.target_id = $2
+           )
+        "#,
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Value::Array(vec![]));
     (
         StatusCode::OK,
         Json(
