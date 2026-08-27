@@ -1383,6 +1383,7 @@ async fn agent_connection_broker_routes_require_active_run_context() {
     let wrong_agent_id = Uuid::new_v4();
     let run_id = Uuid::new_v4();
     let connection_id = Uuid::new_v4();
+    let subject_user_id = "broker-subject-user";
     let issue_prefix = format!("TG{}", &company_id.simple().to_string()[..8]);
 
     sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
@@ -1405,22 +1406,34 @@ async fn agent_connection_broker_routes_require_active_run_context() {
             .expect("insert broker agent");
     }
     sqlx::query(
-        "INSERT INTO heartbeat_runs (id, company_id, agent_id, status)
-         VALUES ($1, $2, $3, 'running')",
+        "INSERT INTO heartbeat_runs
+            (id, company_id, agent_id, status, responsible_user_id)
+         VALUES ($1, $2, $3, 'running', $4)",
     )
     .bind(run_id)
     .bind(company_id)
     .bind(agent_id)
+    .bind(subject_user_id)
     .execute(&pool)
     .await
     .expect("insert running broker heartbeat");
     sqlx::query(
         "INSERT INTO tool_connections
-            (id, company_id, name, uid, transport, transport_config, enabled)
-         VALUES ($1, $2, 'Agent Broker MCP', 'agent-broker-mcp', 'mcp_remote', '{}', true)",
+            (id, company_id, name, uid, transport, auth_kind, status,
+             config, transport_config, enabled)
+         VALUES ($1, $2, 'Agent Broker MCP', 'agent-broker-mcp', 'mcp_remote',
+                 'oauth', 'active', $3, '{}', true)",
     )
     .bind(connection_id)
     .bind(company_id)
+    .bind(json!({
+        "oauth": {
+            "authorizationUrl": "https://provider.example/oauth/authorize",
+            "clientId": "broker-client",
+            "redirectUri": "https://parrot.example/api/tools/oauth/callback",
+            "scopes": ["openid"]
+        }
+    }))
     .execute(&pool)
     .await
     .expect("insert broker connection");
@@ -1433,30 +1446,106 @@ async fn agent_connection_broker_routes_require_active_run_context() {
     ];
 
     let active_agent = AuthorizationActor::agent(agent_id, company_id, Some(run_id));
-    for uri in &routes {
-        let (status, body) =
-            request_connection_route(&app, &active_agent, "POST", uri.clone(), None).await;
-        assert_eq!(status, StatusCode::OK, "active Agent response={body:?}");
-    }
+    let (start_status, start_body) = request_connection_route(
+        &app,
+        &active_agent,
+        "POST",
+        routes[0].clone(),
+        Some(json!({
+            "subjectUserId": subject_user_id,
+            "scopes": ["openid", "repo"],
+            "returnTo": "/TG123/apps"
+        })),
+    )
+    .await;
+    assert_eq!(start_status, StatusCode::OK, "start response={start_body:?}");
+    let authorization_url = start_body["url"]
+        .as_str()
+        .expect("authorization URL in Agent response");
+    assert!(authorization_url.starts_with("https://provider.example/oauth/authorize?"));
+    assert!(authorization_url.contains("response_type=code"));
+    assert!(authorization_url.contains("client_id=broker-client"));
+    assert!(authorization_url.contains("code_challenge_method=S256"));
+    let (stored_subject, stored_actor, stored_scopes, stored_return_to): (
+        String,
+        String,
+        Value,
+        String,
+    ) = sqlx::query_as(
+        "SELECT subject_user_id, created_by_actor_id, requested_scopes, return_to
+           FROM tool_oauth_states
+          WHERE company_id = $1 AND connection_id = $2
+          ORDER BY created_at DESC
+          LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load persisted Agent OAuth state");
+    assert_eq!(stored_subject, subject_user_id);
+    assert_eq!(stored_actor, agent_id.to_string());
+    assert_eq!(stored_scopes, json!(["openid", "repo"]));
+    assert_eq!(stored_return_to, "/TG123/apps");
+
+    let (token_status, token_body) = request_connection_route(
+        &app,
+        &active_agent,
+        "POST",
+        routes[1].clone(),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(token_status, StatusCode::OK, "token response={token_body:?}");
+
+    let (wrong_subject_status, wrong_subject_body) = request_connection_route(
+        &app,
+        &active_agent,
+        "POST",
+        routes[0].clone(),
+        Some(json!({ "subjectUserId": "another-user" })),
+    )
+    .await;
+    assert_eq!(
+        wrong_subject_status,
+        StatusCode::FORBIDDEN,
+        "wrong subject response={wrong_subject_body:?}"
+    );
 
     let missing_run = AuthorizationActor::agent(agent_id, company_id, None);
     for uri in &routes {
-        let (status, body) =
-            request_connection_route(&app, &missing_run, "POST", uri.clone(), None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "missing run response={body:?}");
+        let body = if uri.contains("start-authorization") {
+            Some(json!({ "subjectUserId": subject_user_id }))
+        } else {
+            Some(json!({}))
+        };
+        let (status, response_body) =
+            request_connection_route(&app, &missing_run, "POST", uri.clone(), body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "missing run response={response_body:?}");
     }
 
     let wrong_agent = AuthorizationActor::agent(wrong_agent_id, company_id, Some(run_id));
     for uri in &routes {
-        let (status, body) =
-            request_connection_route(&app, &wrong_agent, "POST", uri.clone(), None).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "wrong Agent response={body:?}");
+        let body = if uri.contains("start-authorization") {
+            Some(json!({ "subjectUserId": subject_user_id }))
+        } else {
+            Some(json!({}))
+        };
+        let (status, response_body) =
+            request_connection_route(&app, &wrong_agent, "POST", uri.clone(), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "wrong Agent response={response_body:?}");
     }
 
     let board = board_actor_with_role(company_id, MembershipRole::Owner);
     for uri in &routes {
-        let (status, body) = request_connection_route(&app, &board, "POST", uri.clone(), None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "Board response={body:?}");
+        let body = if uri.contains("start-authorization") {
+            Some(json!({ "subjectUserId": subject_user_id }))
+        } else {
+            Some(json!({}))
+        };
+        let (status, response_body) =
+            request_connection_route(&app, &board, "POST", uri.clone(), body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "Board response={response_body:?}");
     }
 
     sqlx::query("UPDATE heartbeat_runs SET status = 'succeeded' WHERE id = $1")
@@ -1465,9 +1554,14 @@ async fn agent_connection_broker_routes_require_active_run_context() {
         .await
         .expect("finish broker heartbeat");
     for uri in &routes {
-        let (status, body) =
-            request_connection_route(&app, &active_agent, "POST", uri.clone(), None).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "inactive run response={body:?}");
+        let body = if uri.contains("start-authorization") {
+            Some(json!({ "subjectUserId": subject_user_id }))
+        } else {
+            Some(json!({}))
+        };
+        let (status, response_body) =
+            request_connection_route(&app, &active_agent, "POST", uri.clone(), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "inactive run response={response_body:?}");
     }
 
     let _ = sqlx::query("DELETE FROM companies WHERE id = $1")

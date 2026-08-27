@@ -10,9 +10,12 @@ use axum::{
 };
 use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use url::Url;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
@@ -1542,10 +1545,19 @@ fn gateway_audit_window(window: &str) -> Option<Duration> {
     }
 }
 
-async fn require_active_agent_run(
+#[derive(Debug)]
+struct ActiveAgentRunContext {
+    agent_id: Uuid,
+    company_id: Uuid,
+    run_id: Uuid,
+    responsible_user_id: Option<String>,
+    issue_id: Option<Uuid>,
+}
+
+async fn load_active_agent_run_context(
     state: &AppState,
     actor: &AuthorizationActor,
-) -> Result<(Uuid, Uuid, Uuid), StatusCode> {
+) -> Result<ActiveAgentRunContext, StatusCode> {
     let (agent_id, company_id, run_id) = match actor {
         AuthorizationActor::Agent {
             agent_id,
@@ -1555,25 +1567,45 @@ async fn require_active_agent_run(
         } => (*agent_id, *company_id, *run_id),
         _ => return Err(StatusCode::UNAUTHORIZED),
     };
-    let active = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-             SELECT 1
-               FROM heartbeat_runs
-              WHERE id = $1 AND company_id = $2 AND agent_id = $3 AND status = 'running'
-         )",
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT responsible_user_id, context_snapshot
+           FROM heartbeat_runs
+          WHERE id = $1 AND company_id = $2 AND agent_id = $3 AND status = 'running'",
     )
     .bind(run_id)
     .bind(company_id)
     .bind(agent_id)
-    .fetch_one(&state.pool)
+    .fetch_optional(&state.pool)
     .await
     .map_err(|e| {
         tracing::error!(%e, %agent_id, %company_id, %run_id, "Failed to validate agent run context");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    active
-        .then_some((agent_id, company_id, run_id))
-        .ok_or(StatusCode::FORBIDDEN)
+    let Some(row) = row else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    let context_snapshot = row.get::<Option<Value>, _>("context_snapshot");
+    let issue_id = context_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("issueId").or_else(|| snapshot.get("taskId")))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    Ok(ActiveAgentRunContext {
+        agent_id,
+        company_id,
+        run_id,
+        responsible_user_id: row.get("responsible_user_id"),
+        issue_id,
+    })
+}
+
+async fn require_active_agent_run(
+    state: &AppState,
+    actor: &AuthorizationActor,
+) -> Result<(Uuid, Uuid, Uuid), StatusCode> {
+    let context = load_active_agent_run_context(state, actor).await?;
+    Ok((context.agent_id, context.company_id, context.run_id))
 }
 
 fn gateway_audit_like_pattern(value: &str) -> String {
@@ -3099,19 +3131,219 @@ async fn restart_runtime_slot(
     Ok(Json(json!({ "restarted": true })))
 }
 
-/// POST /agents/me/connections/:connection_id/start-authorization —— mock。
+fn connection_config_string(row: &sqlx::postgres::PgRow, keys: &[&str]) -> Option<String> {
+    use sqlx::Row;
+    let configs = [
+        row.get::<Option<Value>, _>("config")
+            .unwrap_or_else(|| json!({})),
+        row.get::<Option<Value>, _>("transport_config")
+            .unwrap_or_else(|| json!({})),
+    ];
+    for config in &configs {
+        let roots = [config.get("oauth"), Some(config)];
+        for root in roots.into_iter().flatten() {
+            for key in keys {
+                if let Some(value) = root
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn connection_config_strings(row: &sqlx::postgres::PgRow, keys: &[&str]) -> Vec<String> {
+    use sqlx::Row;
+    let configs = [
+        row.get::<Option<Value>, _>("config")
+            .unwrap_or_else(|| json!({})),
+        row.get::<Option<Value>, _>("transport_config")
+            .unwrap_or_else(|| json!({})),
+    ];
+    for config in &configs {
+        let roots = [config.get("oauth"), Some(config)];
+        for root in roots.into_iter().flatten() {
+            for key in keys {
+                let Some(values) = root.get(*key).and_then(Value::as_array) else {
+                    continue;
+                };
+                let values = values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                if !values.is_empty() {
+                    return values;
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn configured_oauth_redirect_uri(row: &sqlx::postgres::PgRow) -> Option<String> {
+    if let Some(value) = connection_config_string(
+        row,
+        &["redirectUri", "redirect_uri", "clientRedirectUri", "client_redirect_uri"],
+    ) {
+        return Some(value);
+    }
+    let configured = [
+        "PAPERCLIP_PUBLIC_URL",
+        "PAPERCLIP_AUTH_PUBLIC_BASE_URL",
+        "BETTER_AUTH_URL",
+        "BETTER_AUTH_BASE_URL",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })?;
+    let mut url = Url::parse(&configured).ok()?;
+    url.set_path("/api/tools/oauth/callback");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+fn random_oauth_token(byte_count: usize) -> String {
+    let mut bytes = vec![0_u8; byte_count];
+    OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn pkce_challenge(code_verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()))
+}
+
+#[derive(Debug, Deserialize)]
+struct StartAgentConnectionAuthorizationRequest {
+    #[serde(rename = "subjectUserId")]
+    subject_user_id: String,
+    scopes: Option<Vec<String>>,
+    #[serde(rename = "returnTo")]
+    return_to: Option<String>,
+}
+
+/// POST /agents/me/connections/:connection_id/start-authorization —— 创建 OAuth/PKCE 状态。
 async fn start_agent_connection_auth(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
+    request: Option<Json<StartAgentConnectionAuthorizationRequest>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let (_, company_id, _) = require_active_agent_run(&state, &actor).await?;
-    get_connection_by_id(&state, company_id, connection_id)
+    let context = load_active_agent_run_context(&state, &actor).await?;
+    let Json(request) = request.ok_or(StatusCode::BAD_REQUEST)?;
+    let subject_user_id = request.subject_user_id.trim().to_string();
+    if subject_user_id.is_empty() || subject_user_id.chars().count() > 256 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if context.responsible_user_id.as_deref() != Some(subject_user_id.as_str()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let row = get_connection_by_id(&state, context.company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(
-        json!({ "connectionId": connection_id, "authorizationUrl": format!("/api/tools/oauth/authorize?connection={}", connection_id) }),
-    ))
+    use sqlx::Row;
+    if row.get::<String, _>("status") == "archived" {
+        return Err(StatusCode::CONFLICT);
+    }
+    if row.get::<String, _>("auth_kind") != "oauth" {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let scopes = request
+        .scopes
+        .unwrap_or_else(|| connection_config_strings(&row, &["scopes", "scope"]));
+    if scopes.len() > 100 || scopes.iter().any(|scope| scope.chars().count() > 200) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let return_to = request
+        .return_to
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if return_to
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > 2000)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let authorization_endpoint = connection_config_string(
+        &row,
+        &["authorizationUrl", "authorization_url", "authorizeUrl", "authorize_url"],
+    )
+    .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let client_id = connection_config_string(&row, &["clientId", "client_id"])
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let redirect_uri = configured_oauth_redirect_uri(&row)
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    let state_token = random_oauth_token(32);
+    let code_verifier = random_oauth_token(48);
+    let mut authorization_url =
+        Url::parse(&authorization_endpoint).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    authorization_url
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &client_id)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("state", &state_token)
+        .append_pair("code_challenge", &pkce_challenge(&code_verifier))
+        .append_pair("code_challenge_method", "S256");
+    if !scopes.is_empty() {
+        authorization_url
+            .query_pairs_mut()
+            .append_pair("scope", &scopes.join(" "));
+    }
+    let expires_at = Utc::now() + Duration::minutes(10);
+    let requested_scopes = (!scopes.is_empty()).then(|| json!(scopes));
+    let mut transaction = state.pool.begin().await.map_err(|e| {
+        tracing::error!(%e, "Failed to start OAuth authorization transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    sqlx::query("DELETE FROM tool_oauth_states WHERE expires_at <= NOW()")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!(%e, "Failed to clean expired OAuth authorization states");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    sqlx::query(
+        "INSERT INTO tool_oauth_states
+            (state, company_id, connection_id, code_verifier,
+             created_by_actor_type, created_by_actor_id, subject_user_id,
+             requested_scopes, return_to, issue_id, expires_at)
+         VALUES ($1, $2, $3, $4, 'agent', $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(&state_token)
+    .bind(context.company_id)
+    .bind(connection_id)
+    .bind(&code_verifier)
+    .bind(context.agent_id.to_string())
+    .bind(&subject_user_id)
+    .bind(requested_scopes)
+    .bind(return_to.as_deref())
+    .bind(context.issue_id)
+    .bind(expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, %connection_id, "Failed to persist OAuth authorization state");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    transaction.commit().await.map_err(|e| {
+        tracing::error!(%e, "Failed to commit OAuth authorization state");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({ "url": authorization_url.to_string() })))
 }
 
 /// POST /agents/me/connections/:connection_id/token —— mock token。
