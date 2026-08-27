@@ -5832,13 +5832,58 @@ async fn effective_profiles_for_agent(
     )
 }
 
-/// Paperclip UI run-detail contract: return tool decisions associated with a
-/// heartbeat run. Tool invocation persistence is not migrated yet, so an
-/// existing run receives an empty decision list instead of a 404.
+/// Paperclip UI run-detail contract: return persisted tool decisions associated
+/// with a heartbeat run. The route is Board-only, company-scoped, and mirrors
+/// Paperclip's not-found behavior for a run outside the requested company.
 async fn get_run_decisions(
     Path((company_id, run_id)): Path<(Uuid, Uuid)>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
+    if crate::routes::assert_board(&actor).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Board access required",
+                "reasonCode": "board_access_required"
+            })),
+        );
+    }
+    if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Company access denied",
+                "reasonCode": "company_access_denied"
+            })),
+        );
+    }
+
+    let run_exists = match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM heartbeat_runs WHERE id = $1 AND company_id = $2
+         )",
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    {
+        Ok(exists) => exists,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            );
+        }
+    };
+    if !run_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Run not found"})),
+        );
+    }
+
     let invocations = match sqlx::query(
         "SELECT id, idempotency_key, actor_type, actor_id, agent_id, issue_id, run_id,
                 application_id, connection_id, catalog_entry_id, tool_name,

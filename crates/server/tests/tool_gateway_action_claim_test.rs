@@ -1435,3 +1435,106 @@ async fn effective_profile_projection_is_scoped_and_uses_aligned_entry_schema() 
         .execute(&pool)
         .await;
 }
+
+#[tokio::test]
+async fn run_decision_lookup_enforces_board_company_and_run_scope() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let other_company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+
+    for (id, name) in [
+        (company_id, "Run Decision Owner"),
+        (other_company_id, "Run Decision Other"),
+    ] {
+        let issue_prefix = format!("RD{}", &id.simple().to_string()[..8]);
+        sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(name)
+            .bind(issue_prefix)
+            .execute(&pool)
+            .await
+            .expect("insert run-decision company");
+    }
+    sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, 'Run Decision Agent')")
+        .bind(agent_id)
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .expect("insert run-decision agent");
+    sqlx::query(
+        "INSERT INTO heartbeat_runs (id, company_id, agent_id, status)
+         VALUES ($1, $2, $3, 'succeeded')",
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("insert run-decision run");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_routes().with_state(state);
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+    let other_owner = board_actor_with_role(other_company_id, MembershipRole::Owner);
+    let agent_actor = AuthorizationActor::agent_with_source(
+        agent_id,
+        company_id,
+        Some(run_id),
+        ActorSource::Session,
+    );
+
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/companies/{company_id}/tools/runs/{run_id}/decisions"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "same-company run lookup={body:?}");
+    assert_eq!(body["runId"].as_str(), Some(run_id.to_string().as_str()));
+    assert_eq!(body["decisions"].as_array().map(Vec::len), Some(0));
+
+    let (status, body) = request_connection_route(
+        &app,
+        &other_owner,
+        "GET",
+        format!("/companies/{company_id}/tools/runs/{run_id}/decisions"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-company run lookup={body:?}"
+    );
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent_actor,
+        "GET",
+        format!("/companies/{company_id}/tools/runs/{run_id}/decisions"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "agent run lookup={body:?}");
+
+    let missing_run_id = Uuid::new_v4();
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/companies/{company_id}/tools/runs/{missing_run_id}/decisions"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "missing run lookup={body:?}");
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
+        .bind(company_id)
+        .bind(other_company_id)
+        .execute(&pool)
+        .await;
+}
