@@ -389,6 +389,46 @@ fn local_config_schema(
             "default": false
         }));
     }
+    if supports_acp {
+        fields.push(serde_json::json!({
+            "key": "agentCommand",
+            "label": "ACP server command",
+            "type": "text",
+            "default": serde_json::Value::Null,
+            "hint": "Override ACP server command (e.g. path to claude-agent-acp). Defaults to the CLI command with --acp flag.",
+            "visibleWhen": { "key": "engine", "values": ["acp"] }
+        }));
+        fields.push(serde_json::json!({
+            "key": "mode",
+            "label": "ACP session mode",
+            "type": "select",
+            "options": [
+                { "value": "persistent", "label": "Persistent" },
+                { "value": "oneshot", "label": "One-shot" }
+            ],
+            "default": "persistent",
+            "visibleWhen": { "key": "engine", "values": ["acp"] }
+        }));
+        fields.push(serde_json::json!({
+            "key": "stateDir",
+            "label": "ACP state directory",
+            "type": "text",
+            "default": serde_json::Value::Null,
+            "hint": "Override ACP session state directory.",
+            "visibleWhen": { "key": "engine", "values": ["acp"] }
+        }));
+        fields.push(serde_json::json!({
+            "key": "nonInteractivePermissions",
+            "label": "Non-interactive permission fallback",
+            "type": "select",
+            "options": [
+                { "value": "deny", "label": "Deny" },
+                { "value": "fail", "label": "Fail" }
+            ],
+            "default": "deny",
+            "visibleWhen": { "key": "engine", "values": ["acp"] }
+        }));
+    }
     serde_json::json!({ "fields": fields })
 }
 
@@ -608,7 +648,7 @@ not advertised until a server-side ACP executor is enabled.\n",
     }
 
     fn supports_acp(&self) -> bool {
-        false
+        true
     }
 
     fn requires_materialized_runtime_skills(&self) -> bool {
@@ -769,7 +809,7 @@ server-side ACP executor is enabled.\n",
     }
 
     fn supports_acp(&self) -> bool {
-        false
+        true
     }
 
     fn requires_materialized_runtime_skills(&self) -> bool {
@@ -1056,19 +1096,17 @@ mod tests {
     #[test]
     fn test_adapter_capabilities_reflect_server_runtime() {
         let claude = ClaudeLocalAdapter::new();
-        // The Rust server currently exposes the CLI runtime only. ACP remains
-        // a separate migration slice until a server-side ACP executor exists.
         assert!(claude.supports_skills());
         assert!(claude.supports_local_agent_jwt());
         assert!(claude.supports_model_profiles());
-        assert!(!claude.supports_acp());
+        assert!(claude.supports_acp());
         assert!(!claude.requires_materialized_runtime_skills());
 
         let codex = CodexLocalAdapter::new();
         assert!(codex.supports_skills());
         assert!(codex.supports_local_agent_jwt());
         assert!(codex.supports_model_profiles());
-        assert!(!codex.supports_acp());
+        assert!(codex.supports_acp());
         assert!(!codex.requires_materialized_runtime_skills());
 
         let process = ProcessAdapter::new();

@@ -162,7 +162,14 @@ fn merge_adapter_config(
     serde_json::Value::Object(merged)
 }
 
-fn build_codex_exec_args(model: Option<&str>) -> Vec<String> {
+fn build_codex_exec_args(model: Option<&str>, is_acp: bool) -> Vec<String> {
+    if is_acp {
+        let mut args = vec!["acp".to_string()];
+        if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--model".to_string(), model.to_string()]);
+        }
+        return args;
+    }
     let mut args = vec!["exec".to_string(), "--json".to_string()];
     if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
         args.extend(["--model".to_string(), model.to_string()]);
@@ -629,6 +636,59 @@ fn retry_reason(outcome: &AdapterOutcome) -> String {
 
 fn visit_adapter_event(value: &Value, outcome: &mut AdapterOutcome, top_level: bool, adapter_type: &str) {
     let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+
+    // ACP event types
+    if kind == "acpx.result" {
+        // ACP turn completed: acpx.result { stopReason, summary, usage, cost }
+        outcome.result_event = Some(value.clone());
+        if let Some(summary) = value.get("summary").or_else(|| value.get("stopReason")).and_then(Value::as_str) {
+            outcome.result_summary = Some(summary.to_owned());
+        }
+        return;
+    }
+    if kind == "acpx.error" {
+        // ACP error event: acpx.error { code, message, retryable }
+        outcome.explicit_failure = true;
+        outcome.failure_reason = value.get("message").and_then(Value::as_str).map(ToOwned::to_owned);
+        let code = value.get("code").and_then(Value::as_str).map(ToOwned::to_owned);
+        outcome.error_code = code.or_else(|| Some("acpx_error".to_string()));
+        outcome.error_family = Some("acp".to_string());
+        return;
+    }
+    if kind == "acpx.session" {
+        // ACP session started: acpx.session { sessionId, agent, mode }
+        if outcome.session_id.is_none() {
+            outcome.session_id = value
+                .get("sessionId")
+                .or_else(|| value.get("acpSessionId"))
+                .or_else(|| value.get("runtimeSessionName"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+        return;
+    }
+    if kind == "acpx.status" {
+        // ACP status update: acpx.status { text, cost, contextWindow }
+        if outcome.result_summary.is_none() {
+            outcome.result_summary = value.get("text").and_then(Value::as_str).map(ToOwned::to_owned);
+        }
+        return;
+    }
+    if kind == "acpx.text_delta" {
+        // ACP streaming text: capture first non-empty text as summary seed
+        if outcome.result_summary.is_none() {
+            outcome.result_summary = value.get("text").and_then(Value::as_str).map(ToOwned::to_owned);
+        }
+        return;
+    }
+    if kind == "acpx.tool_call" {
+        outcome.tool_call_count += 1;
+        return;
+    }
+    if kind == "acpx.tool_result" {
+        return;
+    }
+
     if matches!(kind, "tool_use" | "tool_call") || value.get("tool_name").is_some() {
         outcome.tool_call_count += 1;
     }
@@ -1957,6 +2017,15 @@ impl DefaultHeartbeatService {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty());
+        // Determine execution engine from config (auto/cli/acp).
+        // Auto defaults to CLI for now; explicit ACP launches with --acp flag.
+        let engine = cfg
+            .get("engine")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| s == "acp" || s == "cli")
+            .unwrap_or_else(|| "auto".to_string());
+        let is_acp = engine == "acp";
         if adapter == "http" {
             let result = self
                 .http_executor
@@ -2129,14 +2198,20 @@ impl DefaultHeartbeatService {
                     "-c".into(),
                     format!("printf '%s' '{}'", prompt.replace('\'', "'\\''")),
                 ],
-                "codex_local" => build_codex_exec_args(configured_model),
-                "claude_local" => vec![
-                    "--print".into(),
-                    "-".into(),
-                    "--output-format".into(),
-                    "stream-json".into(),
-                    "--verbose".into(),
-                ],
+                "codex_local" => build_codex_exec_args(configured_model, is_acp),
+                "claude_local" => {
+                    if is_acp {
+                        vec!["--acp".into(), "--print".into(), "-".into()]
+                    } else {
+                        vec![
+                            "--print".into(),
+                            "-".into(),
+                            "--output-format".into(),
+                            "stream-json".into(),
+                            "--verbose".into(),
+                        ]
+                    }
+                }
                 _ => vec!["-p".into(), prompt.clone()],
             };
         }
@@ -3968,12 +4043,20 @@ mod adapter_outcome_tests {
     #[test]
     fn codex_default_invocation_uses_json_protocol_and_model() {
         assert_eq!(
-            build_codex_exec_args(Some("gpt-5.4")),
+            build_codex_exec_args(Some("gpt-5.4"), false),
             vec!["exec", "--json", "--model", "gpt-5.4", "-"]
         );
         assert_eq!(
-            build_codex_exec_args(None),
+            build_codex_exec_args(None, false),
             vec!["exec", "--json", "-"]
+        );
+        assert_eq!(
+            build_codex_exec_args(Some("gpt-5.4"), true),
+            vec!["acp", "--model", "gpt-5.4"]
+        );
+        assert_eq!(
+            build_codex_exec_args(None, true),
+            vec!["acp"]
         );
     }
 
