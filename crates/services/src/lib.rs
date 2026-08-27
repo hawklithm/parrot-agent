@@ -184,6 +184,8 @@ pub mod session_service;
 pub use goal_service::{
     CreateGoalInput, DefaultGoalService, GoalHierarchy, GoalService, UpdateGoalInput,
 };
+pub mod price_registry;
+pub use price_registry::{estimate_cost_usd, fill_missing_cost};
 pub mod pipeline_service;
 pub use pipeline_service::{
     AdvanceCaseInput, BulkReviewResult, CaseReviewDecision, CaseReviewInput, CreateCaseInput,

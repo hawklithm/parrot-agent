@@ -1596,7 +1596,7 @@ impl DefaultHeartbeatService {
                 return;
             }
         }
-        let (status, exit_code, error, output, outcome) = match result {
+        let (status, exit_code, error, output, mut outcome) = match result {
             Ok(command_output) => {
                 let combined = format!("{}{}", command_output.stdout, command_output.stderr);
                 let mut outcome = parse_adapter_outcome(&combined, &adapter_type);
@@ -1671,6 +1671,17 @@ impl DefaultHeartbeatService {
                 )
             }
         };
+        // Fill missing cost from official price registry when provider returned
+        // token counts but no explicit cost_usd.
+        if outcome.cost_usd.is_none() && (outcome.input_tokens > 0 || outcome.output_tokens > 0) {
+            outcome.cost_usd = crate::fill_missing_cost(
+                None,
+                outcome.model.as_deref(),
+                outcome.input_tokens,
+                outcome.cached_input_tokens,
+                outcome.output_tokens,
+            );
+        }
         let result_json = serde_json::json!({
             "toolCallCount": outcome.tool_call_count,
             "resultSummary": outcome.result_summary,
