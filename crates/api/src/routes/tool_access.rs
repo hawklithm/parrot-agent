@@ -740,13 +740,39 @@ async fn delete_tool_application(
 
 fn connection_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
     use sqlx::Row;
+    let transport = row
+        .get::<Option<String>, _>("transport")
+        .or_else(|| row.get::<Option<String>, _>("tool_type"))
+        .unwrap_or_else(|| "mcp_remote".to_string());
+    let status = match row.get::<String, _>("status").as_str() {
+        "draft" | "active" | "disabled" | "archived" => row.get::<String, _>("status"),
+        _ => "draft".to_string(),
+    };
     json!({
         "id": row.get::<Uuid, _>("id"),
         "companyId": row.get::<Uuid, _>("company_id"),
-        "toolType": row.get::<String, _>("tool_type"),
+        "applicationId": row.get::<Option<Uuid>, _>("application_id"),
         "name": row.get::<String, _>("name"),
-        "status": row.get::<String, _>("status"),
-        "config": row.get::<Option<Value>, _>("config"),
+        "uid": row.get::<String, _>("uid"),
+        "connectionKind": row.get::<String, _>("connection_kind"),
+        "ownership": row.get::<String, _>("ownership"),
+        "transport": transport.clone(),
+        "toolType": transport,
+        "authKind": row.get::<String, _>("auth_kind"),
+        "status": status,
+        "enabled": row.get::<bool, _>("enabled"),
+        "config": row.get::<Option<Value>, _>("config").unwrap_or_else(|| json!({})),
+        "transportConfig": row.get::<Option<Value>, _>("transport_config").unwrap_or_else(|| json!({})),
+        "credentialRefs": row.get::<Option<Value>, _>("credential_refs").unwrap_or_else(|| json!([])),
+        "credentialSecretRefs": row.get::<Option<Value>, _>("credential_secret_refs").unwrap_or_else(|| json!([])),
+        "healthStatus": row.get::<String, _>("health_status"),
+        "healthMessage": row.get::<Option<String>, _>("health_message"),
+        "healthCheckedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("health_checked_at"),
+        "lastHealthAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_healthy_at"),
+        "lastCatalogRefreshAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_catalog_refresh_at"),
+        "lastError": row.get::<Option<String>, _>("last_error"),
+        "createdByAgentId": row.get::<Option<Uuid>, _>("created_by_agent_id"),
+        "createdByUserId": row.get::<Option<String>, _>("created_by_user_id"),
         "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
         "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
     })
@@ -795,7 +821,15 @@ fn actor_company(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
 #[derive(Debug, Deserialize)]
 struct UpdateToolConnectionRequest {
     name: Option<String>,
+    status: Option<String>,
+    enabled: Option<bool>,
     config: Option<Value>,
+    #[serde(rename = "transportConfig")]
+    transport_config: Option<Value>,
+    #[serde(rename = "credentialRefs")]
+    credential_refs: Option<Value>,
+    #[serde(rename = "credentialSecretRefs")]
+    credential_secret_refs: Option<Value>,
 }
 async fn update_tool_connection(
     State(state): State<AppState>,
@@ -806,14 +840,46 @@ async fn update_tool_connection(
     let company_id = actor_company(&actor)?;
     require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    if request
+        .name
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty() || name.trim().chars().count() > 160)
+        || request.status.as_deref().is_some_and(|status| {
+            !matches!(status, "draft" | "active" | "disabled" | "archived")
+        })
+        || request
+            .credential_refs
+            .as_ref()
+            .is_some_and(|refs| !refs.is_array())
+        || request
+            .credential_secret_refs
+            .as_ref()
+            .is_some_and(|refs| !refs.is_array())
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let row = sqlx::query(
-        "UPDATE tool_connections SET name = COALESCE($3, name), config = COALESCE($4, config), \
-         updated_at = NOW() WHERE id = $1 AND company_id = $2 RETURNING *",
+        "UPDATE tool_connections
+            SET name = COALESCE($3, name),
+                status = COALESCE($4, status),
+                enabled = COALESCE($5, enabled),
+                config = COALESCE($6, config),
+                transport_config = COALESCE($7, transport_config),
+                credential_refs = COALESCE($8, credential_refs),
+                credential_secret_refs = COALESCE($9, credential_secret_refs),
+                updated_at = NOW()
+          WHERE id = $1 AND company_id = $2
+         RETURNING *",
     )
     .bind(connection_id)
     .bind(company_id)
-    .bind(request.name.as_deref())
+    .bind(request.name.as_deref().map(str::trim))
+    .bind(request.status.as_deref())
+    .bind(request.enabled)
     .bind(request.config.as_ref())
+    .bind(request.transport_config.as_ref())
+    .bind(request.credential_refs.as_ref())
+    .bind(request.credential_secret_refs.as_ref())
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| {
@@ -841,19 +907,27 @@ async fn delete_tool_connection(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    sqlx::query("DELETE FROM tool_connections WHERE id = $1 AND company_id = $2")
+    let row = sqlx::query(
+        "UPDATE tool_connections
+            SET status = 'archived', enabled = false, updated_at = NOW()
+          WHERE id = $1 AND company_id = $2
+         RETURNING *",
+    )
         .bind(connection_id)
         .bind(company_id)
-        .execute(&state.pool)
+        .fetch_optional(&state.pool)
         .await
         .map_err(|e| {
             tracing::error!("Failed to delete tool connection: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    let Some(row) = row else {
+        return Err(StatusCode::NOT_FOUND);
+    };
     crate::routes::log_activity(
         &state.pool,
         company_id,
@@ -864,7 +938,7 @@ async fn delete_tool_connection(
         json!({}),
     )
     .await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(connection_json(&row)))
 }
 
 /// GET /api/tool-connections/:id/grants
@@ -2396,10 +2470,26 @@ async fn tools_oauth_callback(
 /// POST /companies/:cid/tools/connections —— 创建连接。
 #[derive(Debug, Deserialize)]
 struct CreateConnectionRequest {
-    #[serde(rename = "toolType")]
-    tool_type: String,
-    name: Option<String>,
+    #[serde(rename = "applicationId")]
+    application_id: Option<Uuid>,
+    #[serde(rename = "applicationName")]
+    application_name: Option<String>,
+    name: String,
+    transport: Option<String>,
+    #[serde(rename = "authKind")]
+    auth_kind: Option<String>,
+    ownership: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "connectionKind")]
+    connection_kind: Option<String>,
     config: Option<Value>,
+    #[serde(rename = "transportConfig")]
+    transport_config: Option<Value>,
+    #[serde(rename = "credentialRefs")]
+    credential_refs: Option<Value>,
+    #[serde(rename = "credentialSecretRefs")]
+    credential_secret_refs: Option<Value>,
+    enabled: Option<bool>,
 }
 async fn create_company_tool_connection(
     State(state): State<AppState>,
@@ -2409,20 +2499,150 @@ async fn create_company_tool_connection(
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    let name = request.name.trim();
+    let transport = request.transport.as_deref().unwrap_or("");
+    let auth_kind = request.auth_kind.as_deref().unwrap_or("none");
+    let ownership = request.ownership.as_deref().unwrap_or("customer");
+    let status = request.status.as_deref().unwrap_or("draft");
+    let connection_kind = request.connection_kind.as_deref().unwrap_or("managed");
+    if name.is_empty()
+        || name.chars().count() > 160
+        || !matches!(transport, "mcp_remote" | "rest_api" | "local_stdio")
+        || !matches!(auth_kind, "oauth" | "api_key" | "none")
+        || !matches!(ownership, "platform_shared" | "platform_provisioned" | "customer" | "dcr")
+        || !matches!(status, "draft" | "active" | "disabled" | "archived")
+        || !matches!(connection_kind, "managed" | "delegated" | "self_hosted")
+        || request
+            .credential_refs
+            .as_ref()
+            .is_some_and(|refs| !refs.is_array())
+        || request
+            .credential_secret_refs
+            .as_ref()
+            .is_some_and(|refs| !refs.is_array())
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let config = request
+        .config
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| json!({}));
+    let transport_config = request
+        .transport_config
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| json!({}));
+    let credential_refs = request
+        .credential_refs
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| json!([]));
+    let credential_secret_refs = request
+        .credential_secret_refs
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| json!([]));
+    let mut transaction = state.pool.begin().await.map_err(|e| {
+        tracing::error!("Failed to start tool connection transaction: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let application_id = if let Some(application_id) = request.application_id {
+        let application_type = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT type FROM tool_applications WHERE id = $1 AND company_id = $2",
+        )
+        .bind(application_id)
+        .bind(company_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to load tool connection application: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .flatten()
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+        if transport == "mcp_remote" && application_type != "mcp_http"
+            || transport == "local_stdio" && application_type != "mcp_stdio"
+        {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        application_id
+    } else {
+        let application_name = request
+            .application_name
+            .as_deref()
+            .unwrap_or(name)
+            .trim();
+        if application_name.is_empty() || application_name.chars().count() > 160 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let application_id = Uuid::new_v4();
+        let application_key = normalize_tool_application_key(application_name);
+        sqlx::query(
+            "INSERT INTO tool_applications
+                (id, company_id, application_key, name, type, status, metadata)
+             VALUES ($1, $2, $3, $4, $5, 'active', '{}')",
+        )
+        .bind(application_id)
+        .bind(company_id)
+        .bind(application_key)
+        .bind(application_name)
+        .bind(if transport == "local_stdio" {
+            "mcp_stdio"
+        } else {
+            "mcp_http"
+        })
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                return StatusCode::CONFLICT;
+            }
+            tracing::error!("Failed to create tool connection application: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        application_id
+    };
     let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO tool_connections (id, company_id, tool_type, name, config, status) \
-         VALUES ($1, $2, $3, COALESCE($4, $3), $5, 'unconfigured')",
+    let uid = format!(
+        "{}-{}",
+        normalize_tool_application_key(name),
+        id.simple()
+    );
+    let row = sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, application_id, name, uid, tool_type,
+             connection_kind, ownership, transport, auth_kind, status, enabled,
+             config, transport_config, credential_refs, credential_secret_refs,
+             created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, $14, $15, $16, $17)
+         RETURNING *",
     )
     .bind(id)
     .bind(company_id)
-    .bind(&request.tool_type)
-    .bind(request.name.as_deref())
-    .bind(request.config.as_ref())
-    .execute(&state.pool)
+    .bind(application_id)
+    .bind(name)
+    .bind(uid)
+    .bind(transport)
+    .bind(connection_kind)
+    .bind(ownership)
+    .bind(transport)
+    .bind(auth_kind)
+    .bind(status)
+    .bind(request.enabled.unwrap_or(false))
+    .bind(config)
+    .bind(transport_config)
+    .bind(credential_refs)
+    .bind(credential_secret_refs)
+    .bind(actor.principal_id().map(|id| id.to_string()))
+    .fetch_one(&mut *transaction)
     .await
     .map_err(|e| {
+        if is_unique_violation(&e) {
+            return StatusCode::CONFLICT;
+        }
         tracing::error!("Failed to create tool connection: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    transaction.commit().await.map_err(|e| {
+        tracing::error!("Failed to commit tool connection: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     crate::routes::log_activity(
@@ -2432,17 +2652,9 @@ async fn create_company_tool_connection(
         &actor,
         "tool_connection",
         id,
-        json!({ "toolType": request.tool_type }),
+        json!({ "transport": transport, "applicationId": application_id }),
     )
     .await;
-    let row = sqlx::query("SELECT * FROM tool_connections WHERE id = $1")
-        .bind(id)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to reload connection: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
     Ok((StatusCode::CREATED, Json(connection_json(&row))))
 }
 

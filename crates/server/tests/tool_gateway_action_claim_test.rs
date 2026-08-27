@@ -1014,7 +1014,10 @@ async fn company_tool_control_plane_routes_require_board_actor() {
         (
             "POST",
             format!("/companies/{company_id}/tools/connections"),
-            Some(json!({ "toolType": "mcp_remote" })),
+            Some(json!({
+                "name": "agent connection",
+                "transport": "mcp_remote"
+            })),
         ),
         (
             "POST",
@@ -1211,6 +1214,160 @@ async fn tool_application_crud_matches_board_definition_contract() {
     .await;
     assert_eq!(delete_status, StatusCode::OK, "delete={delete_body:?}");
     assert_eq!(delete_body["id"], create_body["id"]);
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
+async fn tool_connection_lifecycle_matches_definition_contract() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let issue_prefix = format!("TG{}", &company_id.simple().to_string()[..8]);
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Tool Connection Contract Test")
+        .bind(issue_prefix)
+        .execute(&pool)
+        .await
+        .expect("insert connection company");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+    let agent = AuthorizationActor::agent(Uuid::new_v4(), company_id, Some(Uuid::new_v4()));
+
+    let (create_status, create_body) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/companies/{company_id}/tools/connections"),
+        Some(json!({
+            "applicationName": "GitHub",
+            "name": "GitHub connection",
+            "transport": "mcp_remote",
+            "authKind": "oauth",
+            "config": {"provider": "github"},
+            "transportConfig": {"url": "https://example.test/mcp"},
+            "credentialRefs": [],
+            "credentialSecretRefs": []
+        })),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED, "create={create_body:?}");
+    assert_eq!(create_body["companyId"].as_str(), Some(company_id.to_string().as_str()));
+    assert_eq!(create_body["transport"].as_str(), Some("mcp_remote"));
+    assert_eq!(create_body["toolType"].as_str(), Some("mcp_remote"));
+    assert_eq!(create_body["authKind"].as_str(), Some("oauth"));
+    assert_eq!(create_body["status"].as_str(), Some("draft"));
+    assert_eq!(create_body["enabled"], false);
+    assert_eq!(create_body["transportConfig"]["url"], "https://example.test/mcp");
+    let connection_id = Uuid::parse_str(
+        create_body["id"]
+            .as_str()
+            .expect("created connection id"),
+    )
+    .expect("parse created connection id");
+    assert!(create_body["applicationId"].as_str().is_some());
+
+    let (get_status, get_body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/tool-connections/{connection_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK, "get={get_body:?}");
+    assert_eq!(get_body["id"], create_body["id"]);
+    assert_eq!(get_body["name"], "GitHub connection");
+
+    let (agent_get_status, agent_get_body) = request_connection_route(
+        &app,
+        &agent,
+        "GET",
+        format!("/tool-connections/{connection_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(agent_get_status, StatusCode::FORBIDDEN, "agent get={agent_get_body:?}");
+
+    let (update_status, update_body) = request_connection_route(
+        &app,
+        &owner,
+        "PATCH",
+        format!("/tool-connections/{connection_id}"),
+        Some(json!({
+            "name": "GitHub cloud",
+            "status": "active",
+            "enabled": true,
+            "transportConfig": {"url": "https://example.test/mcp/v2"}
+        })),
+    )
+    .await;
+    assert_eq!(update_status, StatusCode::OK, "update={update_body:?}");
+    assert_eq!(update_body["name"], "GitHub cloud");
+    assert_eq!(update_body["status"], "active");
+    assert_eq!(update_body["enabled"], true);
+    assert_eq!(
+        update_body["transportConfig"]["url"],
+        "https://example.test/mcp/v2"
+    );
+
+    let (agent_update_status, agent_update_body) = request_connection_route(
+        &app,
+        &agent,
+        "PATCH",
+        format!("/tool-connections/{connection_id}"),
+        Some(json!({"name": "agent overwrite"})),
+    )
+    .await;
+    assert_eq!(
+        agent_update_status,
+        StatusCode::FORBIDDEN,
+        "agent update={agent_update_body:?}"
+    );
+
+    let (archive_status, archive_body) = request_connection_route(
+        &app,
+        &owner,
+        "DELETE",
+        format!("/tool-connections/{connection_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(archive_status, StatusCode::OK, "archive={archive_body:?}");
+    assert_eq!(archive_body["status"], "archived");
+    assert_eq!(archive_body["enabled"], false);
+
+    let (retained_status, retained_body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/tool-connections/{connection_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(retained_status, StatusCode::OK, "retained={retained_body:?}");
+    assert_eq!(retained_body["status"], "archived");
+
+    let (repeat_archive_status, repeat_archive_body) = request_connection_route(
+        &app,
+        &owner,
+        "DELETE",
+        format!("/tool-connections/{connection_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        repeat_archive_status,
+        StatusCode::OK,
+        "repeat archive={repeat_archive_body:?}"
+    );
+    assert_eq!(repeat_archive_body["status"], "archived");
 
     let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
         .bind(company_id)
