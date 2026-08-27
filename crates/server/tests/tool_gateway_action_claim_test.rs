@@ -1332,6 +1332,7 @@ async fn effective_profile_projection_is_scoped_and_uses_aligned_entry_schema() 
     let app = tool_routes().with_state(state);
     let owner = board_actor_with_role(owner_company_id, MembershipRole::Owner);
     let other_owner = board_actor_with_role(other_company_id, MembershipRole::Owner);
+    let agent_actor = AuthorizationActor::agent(agent_id, owner_company_id, None);
 
     let (status, body) = request_connection_route(
         &app,
@@ -1411,6 +1412,50 @@ async fn effective_profile_projection_is_scoped_and_uses_aligned_entry_schema() 
         status,
         StatusCode::FORBIDDEN,
         "cross-company effective profiles={body:?}"
+    );
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent_actor,
+        "GET",
+        format!("/companies/{owner_company_id}/tools/connections"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "agent connections lookup={body:?}"
+    );
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent_actor,
+        "GET",
+        format!(
+            "/companies/{owner_company_id}/tools/profiles/effective/agents/{agent_id}"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "agent effective profiles lookup={body:?}"
+    );
+
+    let (status, body) = request_connection_route(
+        &app,
+        &agent_actor,
+        "GET",
+        format!("/companies/{owner_company_id}/tools/policies"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "agent policies lookup={body:?}"
     );
 
     let (status, body) = request_connection_route(

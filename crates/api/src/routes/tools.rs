@@ -5478,6 +5478,15 @@ async fn list_connections(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
+    if crate::routes::assert_board(&actor).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Board access required",
+                "reasonCode": "board_access_required"
+            })),
+        );
+    }
     if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
         return (
             StatusCode::FORBIDDEN,
@@ -5510,6 +5519,15 @@ async fn list_policies(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
+    if crate::routes::assert_board(&actor).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Board access required",
+                "reasonCode": "board_access_required"
+            })),
+        );
+    }
     if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
         return (
             StatusCode::FORBIDDEN,
@@ -5651,6 +5669,15 @@ async fn effective_profiles_for_agent(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> impl IntoResponse {
+    if crate::routes::assert_board(&actor).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Board access required",
+                "reasonCode": "board_access_required"
+            })),
+        );
+    }
     if crate::routes::assert_company_access(&actor, company_id, true).is_err() {
         return (
             StatusCode::FORBIDDEN,
