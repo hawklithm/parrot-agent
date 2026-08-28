@@ -16,11 +16,13 @@ struct DoctorReport {
 }
 
 pub fn run_doctor(config: &CliConfig, json_output: bool) -> Result<()> {
-    let client = ApiClient::new(config.server_url.clone(), config.api_token.clone());
+    let client = ApiClient::new(config.server_url.clone(), config.api_token.clone())?;
     let server_status = client.health_check().unwrap_or(ServiceStatus::Unavailable);
+    let server_url = client.base_url.clone();
+    let api_token_configured = client.api_token.is_some();
     let report = DoctorReport {
-        server_url: client.base_url.clone(),
-        api_token_configured: client.api_token.is_some(),
+        server_url,
+        api_token_configured,
         config_file: config
             .config_path
             .as_deref()
