@@ -202,60 +202,98 @@ pub async fn add_comment(
         req.metadata,
     ).await?;
 
-    // Parse @mentions in comment body and trigger wakeups for mentioned users
+    // Parse agent://uuid mentions per Paperclip convention: [@Name](agent://<uuid>)
+    // Uses simple string scanning rather than full markdown AST.
+    let mut mentioned_ids: Vec<Uuid> = Vec::new();
     if !req.body.trim().is_empty() {
-        // Simple regex-free mention parsing: find all @-prefixed words
-        let mentioned_actor_ids: Vec<String> = req.body
-            .split_whitespace()
-            .filter_map(|word| {
-                // Match @ followed by an identifier-like pattern (no @ in middle)
-                let trimmed = word.trim_matches(|c: char| c.is_ascii_punctuation());
-                if trimmed.starts_with('@') && trimmed.len() > 1 {
-                    let name = trimmed[1..].to_lowercase();
-                    // Skip common non-mention patterns like @everyone, @here
-                    if !matches!(name.as_str(), "everyone" | "here" | "channel" | "all" | "team") {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+        // Find all agent://UUID patterns in the body
+        let mut rest = req.body.as_str();
+        while let Some(start) = rest.find("agent://") {
+            let after_prefix = &rest[start + 8..];
+            // UUID is exactly 36 characters (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+            if after_prefix.len() >= 36 {
+                let candidate = &after_prefix[..36];
+                if let Ok(uuid) = Uuid::parse_str(candidate) {
+                    mentioned_ids.push(uuid);
                 }
-            })
-            .collect();
+            }
+            // Advance past this match
+            rest = &after_prefix[36.min(after_prefix.len())..];
+        }
+        // Deduplicate while preserving order
+        mentioned_ids.sort();
+        mentioned_ids.dedup();
+    }
 
-        if !mentioned_actor_ids.is_empty() {
-            // Look up mentioned users by name/identifier in the company
-            // and log mention activity for each found user
-            for name in &mentioned_actor_ids {
-                // Check for user mentions (by email prefix or display name)
-                let mentioned_user: Option<(String,)> = sqlx::query_as(
-                    r#"SELECT id::text FROM auth_users 
-                       WHERE company_id = $1 
-                       AND (LOWER(email) LIKE $2 OR LOWER(display_name) LIKE $2)
-                       LIMIT 1"#
-                )
-                .bind(company_id)
-                .bind(format!("%{}%", name))
-                .fetch_optional(&state.pool)
-                .await
-                .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    if !mentioned_ids.is_empty() {
+        for mentioned_id in &mentioned_ids {
+            // Skip self-mention for agent actors
+            if let AuthorizationActor::Agent { agent_id, .. } = &actor {
+                if *agent_id == *mentioned_id {
+                    continue;
+                }
+            }
+            // Verify mentioned agent belongs to same company and fetch its status
+            let mentioned_agent: Option<(String,)> = sqlx::query_as(
+                r#"SELECT status::text FROM agents WHERE id = $1 AND company_id = $2"#
+            )
+            .bind(mentioned_id)
+            .bind(company_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
 
-                if let Some((user_id,)) = mentioned_user {
+            if let Some((agent_status,)) = mentioned_agent {
+                // Only wake active agents (not paused/terminated)
+                if agent_status == "running" || agent_status == "idle" || agent_status == "paused" || agent_status == "pending_approval" {
                     log_activity(
                         &state.pool,
                         company_id,
                         "issue_comment_mentioned",
                         &actor,
-                        "issue",
-                        issue_id,
+                        "agent",
+                        *mentioned_id,
                         serde_json::json!({
-                            "mentionedUserId": user_id,
+                            "mentionedAgentId": mentioned_id,
                             "commentId": comment.id,
-                            "actorType": format!("{:?}", actor_type).to_lowercase(),
+                            "issueId": issue_id,
                         }),
                     )
                     .await;
+
+                    // Wake mentioned agent with proper context
+                    if agent_status == "idle" || agent_status == "paused" {
+                        let _ = state
+                            .heartbeat_service
+                            .wakeup_with_options(
+                                *mentioned_id,
+                                issue_id,
+                                company_id,
+                                HeartbeatWakeupOptions {
+                                    source: Some("automation".to_string()),
+                                    trigger_detail: Some("system".to_string()),
+                                    reason: Some("issue_comment_mentioned".to_string()),
+                                    requested_by_actor_type: Some(format!("{:?}", actor_type).to_lowercase()),
+                                    requested_by_actor_id: actor_id,
+                                    payload: Some(serde_json::json!({
+                                        "issueId": issue_id,
+                                        "commentId": comment.id,
+                                    })),
+                                    context_snapshot: Some(serde_json::json!({
+                                        "issueId": issue_id,
+                                        "taskId": issue_id,
+                                        "commentId": comment.id,
+                                        "wakeCommentId": comment.id,
+                                        "wakeReason": "issue_comment_mentioned",
+                                        "source": "comment.mention",
+                                        "requestedByActorType": format!("{:?}", actor_type).to_lowercase(),
+                                        "requestedByActorId": actor_id,
+                                    })),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                    }
                 }
             }
         }
