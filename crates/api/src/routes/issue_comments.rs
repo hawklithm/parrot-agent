@@ -195,12 +195,71 @@ pub async fn add_comment(
     
     let comment = service.add_comment(
         issue_id,
-        req.body,
+        req.body.clone(),
         actor_type.clone(),
         actor_id,
         req.actor_run_id,
         req.metadata,
     ).await?;
+
+    // Parse @mentions in comment body and trigger wakeups for mentioned users
+    if !req.body.trim().is_empty() {
+        // Simple regex-free mention parsing: find all @-prefixed words
+        let mentioned_actor_ids: Vec<String> = req.body
+            .split_whitespace()
+            .filter_map(|word| {
+                // Match @ followed by an identifier-like pattern (no @ in middle)
+                let trimmed = word.trim_matches(|c: char| c.is_ascii_punctuation());
+                if trimmed.starts_with('@') && trimmed.len() > 1 {
+                    let name = trimmed[1..].to_lowercase();
+                    // Skip common non-mention patterns like @everyone, @here
+                    if !matches!(name.as_str(), "everyone" | "here" | "channel" | "all" | "team") {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !mentioned_actor_ids.is_empty() {
+            // Look up mentioned users by name/identifier in the company
+            // and log mention activity for each found user
+            for name in &mentioned_actor_ids {
+                // Check for user mentions (by email prefix or display name)
+                let mentioned_user: Option<(String,)> = sqlx::query_as(
+                    r#"SELECT id::text FROM auth_users 
+                       WHERE company_id = $1 
+                       AND (LOWER(email) LIKE $2 OR LOWER(display_name) LIKE $2)
+                       LIMIT 1"#
+                )
+                .bind(company_id)
+                .bind(format!("%{}%", name))
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+
+                if let Some((user_id,)) = mentioned_user {
+                    log_activity(
+                        &state.pool,
+                        company_id,
+                        "issue_comment_mentioned",
+                        &actor,
+                        "issue",
+                        issue_id,
+                        serde_json::json!({
+                            "mentionedUserId": user_id,
+                            "commentId": comment.id,
+                            "actorType": format!("{:?}", actor_type).to_lowercase(),
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
 
     if interrupt_requested {
         let active_run: Option<(Uuid, Uuid)> = sqlx::query_as(
