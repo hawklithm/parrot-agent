@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::{
     backup, checks,
     client::ApiClient,
-    config::{resolve_config_path, CliConfig},
+    config::resolve_config_path,
 };
 
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
@@ -15,10 +15,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     };
     match command {
         "help" | "--help" | "-h" => print_help(),
-        "version" | "--version" | "-V" => {
-            println!("parrot {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        "version" | "--version" | "-V" => get_version(),
         "doctor" => cmd_doctor(rest),
         "configure" => cmd_configure(rest),
         "db-backup" => backup::run(rest),
@@ -31,8 +28,16 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         "secret" => cmd_secret(rest),
         "routine" => cmd_routine(rest),
         "activity" => cmd_activity(rest),
+        "service" => cmd_service(rest),
+        "install" => cmd_install(rest),
+        "update" => cmd_update(rest),
         _ => bail!("unknown command '{command}'. Run 'parrot help' for usage."),
     }
+}
+
+fn get_version() -> Result<()> {
+    println!("parrot {}", env!("CARGO_PKG_VERSION"));
+    Ok(())
 }
 
 fn print_help() -> Result<()> {
@@ -41,31 +46,34 @@ fn print_help() -> Result<()> {
     println!("Usage: parrot <command> [options]");
     println!();
     println!("Configuration:");
-    println!("  configure   --server-url URL [--api-token TOKEN] [--config PATH]");
-    println!("  doctor      [--config PATH] [--json]");
+    println!("  configure   --server-url URL [--api-token TOKEN]");
+    println!("  doctor      [--json]");
     println!();
     println!("Data commands:");
     println!("  auth        get-session");
     println!("  company     list | get <id>");
     println!("  agent       list <companyId> | get <companyId> <agentId>");
-    println!("  issue       list <companyId> [--q QUERY] | get <companyId> <issueId>");
+    println!("  issue       list <companyId> | get <companyId> <issueId>");
     println!("  goal        list <companyId>");
     println!("  project     list <companyId>");
     println!("  secret      list <companyId>");
     println!("  routine     list <companyId>");
     println!("  activity    get <companyId>");
     println!();
+    println!("Server management:");
+    println!("  service     status | start | stop | restart");
+    println!("  install     [--dir PATH]");
+    println!("  update      [--version VERSION]");
+    println!();
     println!("Maintenance:");
-    println!("  db-backup   [--connection-string URL] [--dir PATH] [--retention-days N]");
-    println!("  version     Show version");
-    println!("  help        Show this help");
+    println!("  db-backup   [--dir PATH] [--retention-days N]");
+    println!("  version");
+    println!("  help");
     Ok(())
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────
-
 fn load_client() -> Result<ApiClient> {
-    let config = CliConfig::load()?;
+    let config = crate::config::CliConfig::load()?;
     ApiClient::new(config.server_url, config.api_token)
 }
 
@@ -76,11 +84,8 @@ fn format_json(value: &serde_json::Value) -> String {
 // ── Doctor ──────────────────────────────────────────────────────────
 
 fn cmd_doctor(args: &[String]) -> Result<()> {
-    let (config_path, json) = parse_flag_args(args, &["--json"], &["--config"])?;
-    let config = match config_path {
-        Some(path) => CliConfig::load_from(Some(path))?,
-        None => CliConfig::load()?,
-    };
+    let json = args.contains(&"--json".to_string());
+    let config = crate::config::CliConfig::load()?;
     checks::run_doctor(&config, json)
 }
 
@@ -105,13 +110,156 @@ fn cmd_configure(args: &[String]) -> Result<()> {
     let path = resolve_config_path(config_path)
         .ok_or_else(|| anyhow::anyhow!("unable to determine a config path; pass --config"))?;
     let url = server_url.unwrap_or_else(|| "http://localhost:3100".to_owned());
-    let config = CliConfig {
+    let config = crate::config::CliConfig {
         server_url: url,
         api_token,
         config_path: Some(path.clone()),
     };
     config.save()?;
     println!("configuration saved to {}", path.display());
+    Ok(())
+}
+
+// ── Service ───────────────────────────────────────────────────────────
+
+fn cmd_service(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("status");
+    match sub {
+        "status" => {
+            let client = load_client();
+            match client {
+                Ok(c) => match c.health_check() {
+                    Ok(s) => println!("server: {:?}", s),
+                    Err(e) => println!("server: unhealthy ({e})"),
+                },
+                Err(e) => println!("config: no valid configuration ({e})"),
+            }
+            #[cfg(target_family = "unix")]
+            {
+                let svc = std::process::Command::new("systemctl")
+                    .args(["is-active", "parrot"])
+                    .output();
+                match svc {
+                    Ok(out) => println!("systemd: {}", String::from_utf8_lossy(&out.stdout).trim()),
+                    Err(_) => println!("systemd: not checked (systemctl not available)"),
+                }
+            }
+            #[cfg(target_family = "windows")]
+            {
+                let svc = std::process::Command::new("sc")
+                    .args(["query", "parrot"])
+                    .output();
+                match svc {
+                    Ok(out) => {
+                        let text = String::from_utf8_lossy(&out.stdout);
+                        if text.contains("RUNNING") {
+                            println!("windows service: running");
+                        } else if text.contains("STOPPED") {
+                            println!("windows service: stopped");
+                        } else {
+                            println!("windows service: not found");
+                        }
+                    }
+                    Err(_) => println!("windows service: not checked"),
+                }
+            }
+            Ok(())
+        }
+        "start" => {
+            #[cfg(target_family = "unix")]
+            {
+                let status = std::process::Command::new("systemctl")
+                    .args(["start", "parrot"])
+                    .status()?;
+                if status.success() {
+                    println!("started parrot service");
+                } else {
+                    bail!("failed to start parrot service");
+                }
+            }
+            #[cfg(not(target_family = "unix"))]
+            bail!("service start is only supported on Linux with systemd");
+            Ok(())
+        }
+        "stop" => {
+            #[cfg(target_family = "unix")]
+            {
+                let status = std::process::Command::new("systemctl")
+                    .args(["stop", "parrot"])
+                    .status()?;
+                if status.success() {
+                    println!("stopped parrot service");
+                } else {
+                    bail!("failed to stop parrot service");
+                }
+            }
+            #[cfg(not(target_family = "unix"))]
+            bail!("service stop is only supported on Linux with systemd");
+            Ok(())
+        }
+        "restart" => {
+            #[cfg(target_family = "unix")]
+            {
+                let status = std::process::Command::new("systemctl")
+                    .args(["restart", "parrot"])
+                    .status()?;
+                if status.success() {
+                    println!("restarted parrot service");
+                } else {
+                    bail!("failed to restart parrot service");
+                }
+            }
+            #[cfg(not(target_family = "unix"))]
+            bail!("service restart is only supported on Linux with systemd");
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot service status | start | stop | restart");
+            Ok(())
+        }
+    }
+}
+
+// ── Install ───────────────────────────────────────────────────────────
+
+fn cmd_install(args: &[String]) -> Result<()> {
+    let install_dir = get_flag_value(args, "--dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            #[cfg(target_family = "unix")]
+            { PathBuf::from("/usr/local/bin") }
+            #[cfg(target_family = "windows")]
+            { PathBuf::from(std::env::var("PROGRAMFILES").unwrap_or_else(|_| "C:\\Program Files\\parrot".into())) }
+        });
+
+    let self_path = std::env::current_exe()?;
+    let target_path = install_dir.join("parrot");
+    #[cfg(target_family = "unix")]
+    {
+        std::fs::create_dir_all(&install_dir)?;
+        std::fs::copy(&self_path, &target_path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o755))?;
+        println!("installed parrot to {}", target_path.display());
+    }
+    #[cfg(target_family = "windows")]
+    {
+        std::fs::create_dir_all(&install_dir)?;
+        std::fs::copy(&self_path, &target_path)?;
+        println!("installed parrot to {}", target_path.display());
+    }
+    #[cfg(not(any(target_family = "unix", target_family = "windows")))]
+    bail!("install is not supported on this platform");
+
+    Ok(())
+}
+
+// ── Update ─────────────────────────────────────────────────────────────
+
+fn cmd_update(args: &[String]) -> Result<()> {
+    let _version = get_flag_value(args, "--version");
+    println!("update: this command will download the latest parrot release");
+    println!("update: not yet implemented — download from https://github.com/parrot/releases");
     Ok(())
 }
 
@@ -190,7 +338,7 @@ fn cmd_issue(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot issue list <companyId> [--q QUERY]"))?;
+            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot issue list <companyId>"))?;
             let query = get_flag_value(args, "--q").or_else(|| get_flag_value(args, "--query"));
             let issues = client.list_issues(company_id, query.as_deref())?;
             println!("{}", format_json(&issues));
@@ -204,7 +352,7 @@ fn cmd_issue(args: &[String]) -> Result<()> {
             Ok(())
         }
         _ => {
-            println!("Usage: parrot issue list <companyId> [--q QUERY] | get <companyId> <issueId>");
+            println!("Usage: parrot issue list <companyId> | get <companyId> <issueId>");
             Ok(())
         }
     }
@@ -305,29 +453,7 @@ fn cmd_activity(args: &[String]) -> Result<()> {
     }
 }
 
-// ── Flag helpers ──────────────────────────────────────────────────────
-
-fn parse_flag_args(
-    args: &[String],
-    bool_flags: &[&str],
-    value_flags: &[&str],
-) -> Result<(Option<PathBuf>, bool)> {
-    let mut config_path = None;
-    let mut json = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("missing value for --config"))?;
-                config_path = Some(PathBuf::from(val));
-                i += 2;
-            }
-            "--json" => { json = true; i += 1; }
-            flag => bail!("unknown option '{flag}'"),
-        }
-    }
-    Ok((config_path, json))
-}
+// ── Helpers ──────────────────────────────────────────────────────────
 
 fn get_flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
