@@ -147,8 +147,12 @@ impl IssueThreadInteractionService {
             "request_confirmation" | "request_checkbox_confirmation" => {
                 self.accept_request_confirmation(&mut tx, issue, &interaction, &input, &resolver).await?
             }
-            "question" | "approval" | "review" => {
+            "question" | "approval" | "review" | "item_verdict" => {
                 self.accept_simple_interaction(&mut tx, issue, &interaction, &input, &resolver).await?
+            }
+            "withdraw" => {
+                // Withdraw is a cancellation, not an acceptance
+                return Err("Cannot accept a withdraw interaction; use reject instead".to_string());
             }
             _ => {
                 return Err(format!("Unsupported interaction kind: {}", interaction.kind));

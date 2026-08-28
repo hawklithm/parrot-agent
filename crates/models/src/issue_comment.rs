@@ -133,6 +133,8 @@ pub enum ThreadInteractionKind {
     AskUserQuestions,
     RequestConfirmation,
     RequestCheckboxConfirmation,
+    ItemVerdict,
+    Withdraw,
 }
 
 /// Thread interaction status
