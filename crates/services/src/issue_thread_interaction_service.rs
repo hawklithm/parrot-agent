@@ -908,8 +908,163 @@ impl IssueThreadInteractionService {
 
         Ok(expired)
     }
-}
 
+    /// Withdraw a pending interaction (sets status to cancelled with outcome=withdrawn)
+    pub async fn withdraw_interaction(
+        &self,
+        issue_id: Uuid,
+        interaction_id: Uuid,
+        input: models::WithdrawInteractionInput,
+        resolver: InteractionResolver,
+    ) -> Result<IssueThreadInteraction, String> {
+        let now = Utc::now();
+
+        let interaction = sqlx::query_as::<_, IssueThreadInteraction>(
+            r#"
+            UPDATE issue_thread_interactions
+            SET status = 'cancelled'::issue_thread_interaction_status,
+                result = $2,
+                resolved_by_type = $3,
+                resolved_by_id = $4,
+                updated_at = $5
+            WHERE id = $1 AND issue_id = $6 AND status = 'pending'
+            RETURNING 
+                id, company_id, issue_id, kind::text as kind, status::text as status,
+                source_run_id, source_comment_id, payload, idempotency_key,
+                continuation_policy, question, response, result,
+                resolved_by_type, resolved_by_id, expires_at,
+                created_at, updated_at
+            "#,
+        )
+        .bind(interaction_id)
+        .bind(serde_json::json!({
+            "outcome": "withdrawn",
+            "reason": input.reason,
+            "withdrawnAt": now,
+        }))
+        .bind(resolver.resolver_type)
+        .bind(resolver.resolver_id)
+        .bind(now)
+        .bind(issue_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("Failed to withdraw interaction: {}", e))?
+        .ok_or_else(|| "Interaction not found or already resolved".to_string())?;
+
+        Ok(interaction)
+    }
+
+    /// Submit item verdicts for a request_item_verdicts interaction
+    pub async fn submit_item_verdicts(
+        &self,
+        issue_id: Uuid,
+        interaction_id: Uuid,
+        input: models::SubmitItemVerdictsInput,
+        resolver: InteractionResolver,
+    ) -> Result<IssueThreadInteraction, String> {
+        let mut tx = self.pool.begin().await
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        // Load interaction with FOR UPDATE lock
+        let interaction = sqlx::query_as::<_, IssueThreadInteraction>(
+            r#"
+            SELECT 
+                id, company_id, issue_id, kind::text as kind, status::text as status,
+                source_run_id, source_comment_id, payload, idempotency_key,
+                continuation_policy, question, response, result,
+                resolved_by_type, resolved_by_id, expires_at,
+                created_at, updated_at
+            FROM issue_thread_interactions
+            WHERE id = $1 AND issue_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(interaction_id)
+        .bind(issue_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to load interaction: {}", e))?
+        .ok_or_else(|| "Interaction not found".to_string())?;
+
+        if interaction.kind != "request_item_verdicts" {
+            return Err("Only request_item_verdicts interactions accept verdicts".to_string());
+        }
+
+        if interaction.status != "pending" {
+            return Err(format!("Interaction is not pending (status: {})", interaction.status));
+        }
+
+        let now = Utc::now();
+
+        // Determine if all items have been judged (complete) or only some (partial)
+        let total_items = interaction.payload.get("items")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let verdict_count = input.verdicts.len();
+        let outcome = if verdict_count >= total_items && total_items > 0 {
+            "complete"
+        } else {
+            "partial"
+        };
+
+        let updated = sqlx::query_as::<_, IssueThreadInteraction>(
+            r#"
+            UPDATE issue_thread_interactions
+            SET status = 'resolved'::issue_thread_interaction_status,
+                result = $2,
+                resolved_by_type = $3,
+                resolved_by_id = $4,
+                resolved_at = $5,
+                updated_at = $5
+            WHERE id = $6 AND status = 'pending'
+            RETURNING 
+                id, company_id, issue_id, kind::text as kind, status::text as status,
+                source_run_id, source_comment_id, payload, idempotency_key,
+                continuation_policy, question, response, result,
+                resolved_by_type, resolved_by_id, expires_at,
+                created_at, updated_at
+            "#,
+        )
+        .bind(serde_json::json!({
+            "version": 1,
+            "verdicts": input.verdicts,
+            "summaryMarkdown": input.summary_markdown,
+            "outcome": outcome,
+            "totalItems": total_items,
+            "submittedVerdictCount": verdict_count,
+            "submittedAt": now,
+        }))
+        .bind(if resolver.resolver_type == "agent" {
+            Some(resolver.resolver_id.parse::<Uuid>().ok())
+        } else {
+            None
+        })
+        .bind(if resolver.resolver_type == "user" {
+            Some(resolver.resolver_id.clone())
+        } else {
+            None
+        })
+        .bind(now)
+        .bind(interaction_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to update interaction verdicts: {}", e))?
+        .ok_or_else(|| "Interaction has already been resolved".to_string())?;
+
+        // Touch the issue
+        sqlx::query("UPDATE issues SET updated_at = NOW() WHERE id = $1")
+            .bind(issue_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("Failed to touch issue: {}", e))?;
+
+        tx.commit().await
+            .map_err(|e| format!("Failed to commit transaction: {}", e))?;
+
+        Ok(updated)
+    }
+}
 /// Creator of an interaction (agent or user)
 #[derive(Debug, Clone)]
 pub struct InteractionCreator {
@@ -1038,3 +1193,4 @@ fn is_stale_document_confirmation(
 
     target_revision_id != Some(current_rev_id)
 }
+

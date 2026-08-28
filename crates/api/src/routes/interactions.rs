@@ -4,9 +4,11 @@ use axum::{
     Extension, Json, Router,
     routing::{get, post},
 };
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{app_state::AppState, errors::ApiError};
+use crate::routes::log_activity;
 use models;
 use services::auth::AuthorizationActor;
 use services::{CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
@@ -390,7 +392,139 @@ pub async fn cancel_questions(
     Ok(Json(interaction))
 }
 
-/// Create interaction routes
+/// POST /issues/:issue_id/interactions/:interaction_id/withdraw - Withdraw a thread interaction
+pub async fn withdraw_interaction(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<models::WithdrawInteractionInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get issue's company_id and assert access
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    };
+
+    crate::routes::assert_company_access(&actor, company_id, false)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
+
+    // Determine resolver
+    let resolver = match &actor {
+        AuthorizationActor::Board { user_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "user".to_string(),
+                resolver_id: user_id.to_string(),
+            }
+        },
+        AuthorizationActor::Agent { agent_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "agent".to_string(),
+                resolver_id: agent_id.to_string(),
+            }
+        },
+        AuthorizationActor::None => {
+            return Err(ApiError::Unauthorized("Authentication required".to_string()));
+        },
+    };
+
+    let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
+    let interaction = service.withdraw_interaction(issue_id, interaction_id, input, resolver).await
+        .map_err(|e| ApiError::InternalServerError(e))?;
+
+    // Log activity
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.thread_interaction_withdrawn",
+        &actor,
+        "issue_thread_interaction",
+        interaction_id,
+        serde_json::json!({
+            "issueId": issue_id,
+            "interactionId": interaction_id,
+            "kind": interaction.kind,
+            "source": "issue.interaction.withdraw",
+        }),
+    )
+    .await;
+
+    Ok(Json(interaction))
+}
+
+/// POST /issues/:issue_id/interactions/:interaction_id/verdicts - Submit item verdicts
+pub async fn submit_item_verdicts(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<models::SubmitItemVerdictsInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get issue's company_id and assert access
+    let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+    let Some(company_id) = company_id else {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    };
+
+    crate::routes::assert_company_access(&actor, company_id, false)
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
+
+    // Determine resolver
+    let resolver = match &actor {
+        AuthorizationActor::Board { user_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "user".to_string(),
+                resolver_id: user_id.to_string(),
+            }
+        },
+        AuthorizationActor::Agent { agent_id, .. } => {
+            services::InteractionResolver {
+                resolver_type: "agent".to_string(),
+                resolver_id: agent_id.to_string(),
+            }
+        },
+        AuthorizationActor::None => {
+            return Err(ApiError::Unauthorized("Authentication required".to_string()));
+        },
+    };
+
+    let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
+    let verdict_count = input.verdicts.len();
+    let interaction = service.submit_item_verdicts(issue_id, interaction_id, input, resolver).await
+        .map_err(|e| ApiError::InternalServerError(e))?;
+
+    // Log activity
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.thread_interaction_item_verdicts_submitted",
+        &actor,
+        "issue_thread_interaction",
+        interaction_id,
+        serde_json::json!({
+            "issueId": issue_id,
+            "interactionId": interaction_id,
+            "verdictCount": verdict_count,
+            "source": "issue.interaction.verdicts",
+        }),
+    )
+    .await;
+
+    Ok(Json(interaction))
+}
+
 pub fn interaction_routes() -> Router<AppState> {
     Router::new()
         .route("/issues/:id/interactions", post(create_interaction))
@@ -400,4 +534,6 @@ pub fn interaction_routes() -> Router<AppState> {
         .route("/issues/:id/interactions/:interaction_id/reject", post(reject_interaction))
         .route("/issues/:id/interactions/:interaction_id/answer", post(answer_questions))
         .route("/issues/:id/interactions/:interaction_id/cancel", post(cancel_questions))
+        .route("/issues/:id/interactions/:interaction_id/withdraw", post(withdraw_interaction))
+        .route("/issues/:id/interactions/:interaction_id/verdicts", post(submit_item_verdicts))
 }

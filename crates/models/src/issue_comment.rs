@@ -258,3 +258,30 @@ pub struct CancelQuestionsInput {
     #[serde(default)]
     pub reason: Option<String>,
 }
+
+/// Input for withdrawing a thread interaction
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawInteractionInput {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A single item verdict in a request_item_verdicts interaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemVerdict {
+    pub item_id: String,
+    pub verdict: String, // "pass" | "fail" | "skip"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Input for submitting item verdicts
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitItemVerdictsInput {
+    pub verdicts: Vec<ItemVerdict>,
+    #[serde(default)]
+    pub summary_markdown: Option<String>,
+}
