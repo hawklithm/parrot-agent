@@ -29,5 +29,9 @@ ALTER TABLE tool_profile_entries
     ALTER COLUMN effect SET DEFAULT 'include';
 
 -- Paperclip has no selector_value column; the route no longer writes it.
+-- SAFETY: selector_value column existed in earlier Parrot schema versions
+-- but was never part of Paperclip's tool_profile_entries definition.
+-- If the column does not exist (fresh install from 00_init_schema_unified),
+-- this is a safe no-op.
 ALTER TABLE tool_profile_entries
-    DROP COLUMN selector_value;
+    DROP COLUMN IF EXISTS selector_value;
