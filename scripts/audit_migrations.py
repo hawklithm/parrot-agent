@@ -1,183 +1,166 @@
 #!/usr/bin/env python3
-"""P2.4 static migration audit (no DB required).
-
-Scans migrations/*.sql for structural conventions:
-- company scope: business tables should carry `company_id`; tables that have
-  `company_id` should have an index on it and an FK to `companies` (cascade).
-- money / time / JSONB columns are listed for Paperclip compatibility review.
-- idempotency: CREATE TABLE / ADD COLUMN should use IF NOT EXISTS where the
-  migration may be re-run.
-
-Heuristic + documented limitations: SQL parsing is regex-based; derived or
-view tables may be misclassified; the output is a review starting point.
+"""Audit Parrot migrations for:
+1. Duplicate CREATE TABLE statements (same table name in multiple migrations)
+2. Duplicate CREATE INDEX / UNIQUE INDEX (same index name)
+3. Migration number conflicts or gaps
+4. Missing IF NOT EXISTS / IF EXISTS on DDL that could fail on re-run
+5. Dangerous operations (DROP TABLE, DROP COLUMN, ALTER COLUMN TYPE) without safety checks
 """
 
 import os
 import re
 import sys
+import hashlib
+from collections import defaultdict
 
-MIGRATIONS = "/Users/adazhao/workspace/parrot/parrot-agent/migrations"
-OUT = "/Users/adazhao/workspace/parrot/parrot-agent/MIGRATION_AUDIT.md"
+MIGRATIONS_DIR = os.path.join(
+    os.environ.get("CARGO_MANIFEST_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "migrations",
+)
 
-# Tables that legitimately have no company scope (system/auth/platform).
-SCOPE_FREE_TABLES = {
-    "activity_logs", "auth_users", "auth_sessions", "board_api_keys",
-    "instance_settings", "permission_grants", "cli_auth_challenges",
-    "migrations", "scheduler_heartbeats", "schema_migrations",
-}
+CREATE_TABLE_RE = re.compile(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)', re.IGNORECASE)
+CREATE_INDEX_RE = re.compile(r'CREATE\s+(UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(\w+(?:_\w+)+)\s+ON\b', re.IGNORECASE)
+DROP_TABLE_RE = re.compile(r'DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)', re.IGNORECASE)
+DROP_COLUMN_RE = re.compile(r'DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?(\w+)', re.IGNORECASE)
+ALTER_COLUMN_RE = re.compile(r'ALTER\s+COLUMN\s+(\w+)\s+TYPE\s+\w+', re.IGNORECASE)
 
+def audit():
+    if not os.path.isdir(MIGRATIONS_DIR):
+        print(f"Migrations directory not found: {MIGRATIONS_DIR}")
+        return 1
 
-def split_statements(text):
-    # naive split on ';' at end of line (multi-line CREATE TABLE)
-    return [s.strip() for s in re.split(r";\s*(?:\n|$)", text) if s.strip()]
+    files = sorted(os.listdir(MIGRATIONS_DIR))
+    sql_files = [f for f in files if f.endswith('.sql')]
+    
+    print(f"Auditing {len(sql_files)} migration files in {MIGRATIONS_DIR}")
+    print()
 
+    tables_created = {}   # table_name -> first migration
+    tables_dropped = set()
+    indexes_created = {}  # index_name -> first migration
+    # Track dangerous ops
+    dangerous_ops = []
+    
+    # Checksums for drift detection
+    checksums = {}
+    
+    errors = 0
+    warnings = 0
 
-def main():
-    create_tables = {}   # name -> info
-    indexes = []         # (table, columns)
-    for fn in sorted(os.listdir(MIGRATIONS)):
-        if not fn.endswith(".sql"):
-            continue
-        path = os.path.join(MIGRATIONS, fn)
-        sql = open(path, encoding="utf-8", errors="replace").read()
-        stmts = split_statements(sql)
-        for st in stmts:
-            m = re.search(r"CREATE TABLE (?:IF NOT EXISTS )?([a-zA-Z_][a-zA-Z0-9_]*)", st, re.I)
-            if m:
-                tname = m.group(1).lower()
-                cols = {}
-                fks = []
-                for cm in re.finditer(
-                    r"(?:^|\n)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z0-9_() ]+?)(?:,|$)", st, re.M
-                ):
-                    cols[cm.group(1).lower()] = cm.group(2).strip().lower()
-                for fm in re.finditer(r"FOREIGN KEY\s*\(([^)]+)\)\s*REFERENCES\s+([a-zA-Z_][a-zA-Z0-9_]*)", st, re.I):
-                    fks.append((fm.group(1).strip().lower(), fm.group(2).lower()))
-                has_if_not_exists = "IF NOT EXISTS" in st.upper()
-                create_tables[tname] = {
-                    "file": fn,
-                    "cols": cols,
-                    "fks": fks,
-                    "if_not_exists": has_if_not_exists,
-                }
-            for im in re.finditer(
-                r"CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)? [^ ]+ ON ([a-zA-Z_][a-zA-Z0-9_]*)"
-                r"\s*(?:USING \w+)?\s*\(([^)]+)\)",
-                st, re.I
-            ):
-                indexes.append((im.group(1).lower(), im.group(2).lower()))
+    for fn in sql_files:
+        path = os.path.join(MIGRATIONS_DIR, fn)
+        with open(path, encoding='utf-8') as f:
+            content = f.read()
+        
+        # Checksum for drift detection
+        checksums[fn] = hashlib.sha256(content.encode()).hexdigest()[:16]
+        
+        # Check for wrapping transaction
+        has_begin = 'BEGIN;' in content.upper() or 'BEGIN TRANSACTION;' in content.upper()
+        has_commit = 'COMMIT;' in content.upper()
+        if has_begin and not has_commit:
+            print(f"  WARN: {fn} has BEGIN but no COMMIT (possible orphan transaction)")
+            warnings += 1
+        
+        # --- CREATE TABLE ---
+        for m in CREATE_TABLE_RE.finditer(content):
+            tbl = m.group(1).lower()
+            ifnot = 'IF NOT EXISTS' in m.group(0).upper()
+            if tbl in tables_created:
+                first = tables_created[tbl]
+                if ifnot:
+                    print(f"  DUPLICATE TABLE: {tbl} created in {fn}, first in {first} (has IF NOT EXISTS, safe)")
+                    warnings += 1
+                else:
+                    print(f"  !! DUPLICATE TABLE: {tbl} created in {fn} WITHOUT IF NOT EXISTS, first in {first}")
+                    errors += 1
+            else:
+                tables_created[tbl] = fn
+        
+        # --- CREATE INDEX ---
+        for m in CREATE_INDEX_RE.finditer(content):
+            idx = m.group(2).lower()
+            ifnot = 'IF NOT EXISTS' in m.group(0).upper()
+            if idx in indexes_created:
+                first = indexes_created[idx]
+                if ifnot:
+                    print(f"  DUPLICATE INDEX: {idx} in {fn}, first in {first} (safe with IF NOT EXISTS)")
+                    warnings += 1
+                else:
+                    print(f"  !! DUPLICATE INDEX: {idx} in {fn} WITHOUT IF NOT EXISTS, first in {first}")
+                    errors += 1
+            else:
+                indexes_created[idx] = fn
+        
+        # --- Dangerous operations ---
+        for m in DROP_TABLE_RE.finditer(content):
+            tbl = m.group(1).lower()
+            has_if = 'IF EXISTS' in m.group(0).upper()
+            if not has_if:
+                dangerous_ops.append((fn, f"DROP TABLE {tbl} (no IF EXISTS)"))
+        
+        for m in ALTER_COLUMN_RE.finditer(content):
+            col = m.group(1).lower()
+            dangerous_ops.append((fn, f"ALTER COLUMN TYPE {col} (may fail if data incompatible)"))
+        
+        for m in DROP_COLUMN_RE.finditer(content):
+            col = m.group(1).lower()
+            has_if = 'IF EXISTS' in m.group(0).upper()
+            if not has_if:
+                dangerous_ops.append((fn, f"DROP COLUMN {col} (no IF EXISTS)"))
 
-    # Inline column-level FK detection: `company_id uuid references companies(id) on delete cascade`
-    inline_fks = set()
-    for fn in sorted(os.listdir(MIGRATIONS)):
-        sql = open(os.path.join(MIGRATIONS, fn), encoding="utf-8", errors="replace").read()
-        for fm in re.finditer(
-            r"([a-zA-Z_][a-zA-Z0-9_]*)\s+[a-zA-Z0-9_() ]*?\bREFERENCES\s+([a-zA-Z_][a-zA-Z0-9_]*)\b",
-            sql, re.I
-        ):
-            inline_fks.add((fm.group(1).lower(), fm.group(2).lower()))
+    # --- Migration numbering ---
+    print()
+    print("=== Migration Numbering ===")
+    numbered = [f for f in sql_files if re.match(r'^\d+_', f)]
+    for fn in numbered:
+        num = int(re.match(r'(\d+)', fn).group(1))
+        if num == 0:
+            continue  # 00_init_schema_unified is special
+        
+    # Check for gaps
+    nums = sorted([int(re.match(r'(\d+)', f).group(1)) for f in numbered if re.match(r'^\d+_', f) and int(re.match(r'(\d+)', f).group(1)) > 0])
+    for i, n in enumerate(nums):
+        if i > 0 and n != nums[i-1] + 1 and nums[i-1] != 0:
+            print(f"  GAP: {n} after {nums[i-1]}")
+            warnings += 1
+    
+    # Check for files with same number prefix
+    num_map = defaultdict(list)
+    for fn in sql_files:
+        m = re.match(r'^(\d+)', fn)
+        if m:
+            num_map[m.group(1)].append(fn)
+    for num, names in sorted(num_map.items()):
+        if len(names) > 1:
+            print(f"  CONFLICT: number '{num}' used by: {', '.join(names)}")
+            errors += 1
 
-    money_cols = []
-    jsonb_cols = []
-    for tname, info in create_tables.items():
-        for cname, ctype in info["cols"].items():
-            if re.search(r"\b(numeric|decimal|money)\b", ctype):
-                money_cols.append((tname, cname, ctype, info["file"]))
-            if "jsonb" in ctype:
-                jsonb_cols.append((tname, cname, info["file"]))
+    # --- Dangerous ops summary ---
+    print()
+    print("=== Dangerous Operations ===")
+    if dangerous_ops:
+        for fn, desc in dangerous_ops:
+            print(f"  !! {fn}: {desc}")
+            warnings += 1
+    else:
+        print("  None found")
 
-    # company scope / index / FK cascade
-    no_company_id = sorted(
-        t for t in create_tables
-        if t not in SCOPE_FREE_TABLES and "company_id" not in create_tables[t]["cols"]
-    )
-    company_id_no_index = []
-    company_id_no_fk = []
-    company_id_fk_no_cascade = []
-    for tname, info in create_tables.items():
-        if "company_id" not in info["cols"]:
-            continue
-        has_index = any(t == tname and "company_id" in cols.split(",") for (t, cols) in indexes)
-        if not has_index:
-            company_id_no_index.append((tname, info["file"]))
-        has_company_fk = any(c == "company_id" and ref == "companies" for (c, ref) in info["fks"]) \
-            or ("company_id", "companies") in inline_fks
-        if not has_company_fk:
-            company_id_no_fk.append((tname, info["file"]))
-        else:
-            # re-open the migration and check for ON DELETE CASCADE on the company_id FK
-            sql = open(os.path.join(MIGRATIONS, info["file"]), encoding="utf-8", errors="replace").read()
-            stmts = split_statements(sql)
-            cascade = False
-            for st in stmts:
-                if f"CREATE TABLE {tname.upper()}" in st.upper() or f"CREATE TABLE IF NOT EXISTS {tname.upper()}" in st.upper():
-                    if re.search(
-                        r"FOREIGN KEY\s*\(\s*company_id\s*\)\s*REFERENCES\s+companies[^)]*ON DELETE CASCADE",
-                        st, re.I,
-                    ) or re.search(
-                        r"\bcompany_id\s+[a-zA-Z0-9_() ]*?REFERENCES\s+companies[^,;]*ON DELETE CASCADE",
-                        st, re.I,
-                    ):
-                        cascade = True
-            if not cascade:
-                company_id_fk_no_cascade.append((tname, info["file"]))
-
-    # idempotency coverage
-    total_ct = len(create_tables)
-    ct_if = sum(1 for i in create_tables.values() if i["if_not_exists"])
-
-    lines = []
-    lines.append("# Migration Audit (P2.4, static / no DB)")
-    lines.append("")
-    lines.append("自动生成：`scripts/audit_migrations.py`。正则启发式，输出供人工复核。")
-    lines.append("")
-    lines.append(f"- migrations: **{len(os.listdir(MIGRATIONS))}**")
-    lines.append(f"- CREATE TABLE: **{total_ct}**（含 IF NOT EXISTS: **{ct_if}**）")
-    lines.append(f"- 无 company_id 的业务表（候选待核）: **{len(no_company_id)}**")
-    lines.append(f"- 有 company_id 但无索引: **{len(company_id_no_index)}**")
-    lines.append(f"- 有 company_id 但无 companies FK: **{len(company_id_no_fk)}**")
-    lines.append(f"- company_id FK 无 ON DELETE CASCADE: **{len(company_id_fk_no_cascade)}**")
-    lines.append(f"- money 列（numeric/decimal/money）: **{len(money_cols)}**")
-    lines.append(f"- JSONB 列: **{len(jsonb_cols)}**")
-    lines.append("")
-
-    def section(title, items, fmt):
-        lines.append(f"## {title}")
-        lines.append("")
-        if not items:
-            lines.append("（无）")
-        else:
-            lines.append("| 内容 |")
-            lines.append("|---|")
-            for it in items:
-                lines.append(f"| {fmt(it)} |")
-        lines.append("")
-
-    section("无 company_id 的表（业务表待核，系统表已豁免）", no_company_id,
-            lambda t: f"`{t}`")
-    section("company_id 无索引", company_id_no_index,
-            lambda p: f"`{p[0]}` ({p[1]})")
-    section("company_id 无 companies FK", company_id_no_fk,
-            lambda p: f"`{p[0]}` ({p[1]})")
-    section("company_id FK 无 ON DELETE CASCADE", company_id_fk_no_cascade,
-            lambda p: f"`{p[0]}` ({p[1]})")
-    section("money 列（核对 Paperclip 金额语义）", money_cols,
-            lambda p: f"`{p[0]}.{p[1]}` {p[2]} ({p[3]})")
-    section("JSONB 列", jsonb_cols,
-            lambda p: f"`{p[0]}.{p[1]}` ({p[2]})")
-
-    lines.append("## 结论与待办")
-    lines.append("")
-    lines.append("- 运行期 migration 测试（decision/skill_policy/watchdog decision/plugin lifecycle 等）"
-                 "需要真实 Postgres，本环境无法执行；建议在 CI 中用空库+已有库各跑一次 `sqlx::migrate!`。")
-    lines.append("- 上表为静态审计起点，请逐条复核 `no company_id` / `no index` / `no cascade` 项。")
-    with open(OUT, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    print(f"wrote {OUT}: tables={total_ct} no_company_id={len(no_company_id)} "
-          f"no_index={len(company_id_no_index)} no_fk={len(company_id_no_fk)} "
-          f"no_cascade={len(company_id_fk_no_cascade)} money={len(money_cols)} jsonb={len(jsonb_cols)}")
-    return 0
+    # --- Summary ---
+    print()
+    print(f"=== Summary ===")
+    print(f"  Tables created: {len(tables_created)} unique")
+    print(f"  Indexes created: {len(indexes_created)} unique")
+    print(f"  Errors: {errors}")
+    print(f"  Warnings: {warnings}")
+    print(f"  Checksums (first 10):")
+    for fn in list(checksums.keys())[:10]:
+        print(f"    {checksums[fn]}  {fn}")
+    if len(checksums) > 10:
+        print(f"    ... and {len(checksums)-10} more")
+    
+    return 0 if errors == 0 else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(audit())
