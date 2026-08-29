@@ -137,6 +137,8 @@ async fn create_list_get_and_idempotency_use_canonical_route_contract(pool: PgPo
     let (status, created) = send(&app, &actor, "POST", &uri, Some(request.clone())).await;
     assert_eq!(status, StatusCode::CREATED);
     let id = interaction_id(&created);
+    assert_eq!(created["resolverPolicyProvenance"], "explicit");
+    assert_eq!(created["effectiveResolverPolicySource"], "requested");
 
     let (status, replay) = send(&app, &actor, "POST", &uri, Some(request)).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -423,6 +425,8 @@ async fn governed_tool_action_is_human_only_for_agent_resolution(pool: PgPool) {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(created["requestedResolverPolicy"], "anyone");
     assert_eq!(created["effectiveResolverPolicy"], "human_only");
+    assert_eq!(created["resolverPolicyProvenance"], "explicit");
+    assert_eq!(created["effectiveResolverPolicySource"], "governed_action");
     let id = interaction_id(&created);
 
     let (status, body) = send(

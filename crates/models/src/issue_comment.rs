@@ -161,6 +161,8 @@ pub struct IssueThreadInteraction {
     pub continuation_policy: String, // "wake_assignee" | "none"
     pub requested_resolver_policy: String,
     pub effective_resolver_policy: String,
+    pub resolver_policy_provenance: String,
+    pub effective_resolver_policy_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -27,6 +27,7 @@ impl IssueThreadInteractionService {
             SELECT 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, created_by_user_id,
                 addressee_agent_id, resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -52,6 +53,7 @@ impl IssueThreadInteractionService {
             SELECT 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, created_by_user_id,
                 addressee_agent_id, resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -158,7 +160,12 @@ impl IssueThreadInteractionService {
                     .and_then(serde_json::Value::as_str)
             })
             .unwrap_or_else(|| default_resolver_policy_for_kind(&input.kind));
-        let (requested_policy, effective_policy) = resolve_resolver_policies(
+        let resolver_policy_provenance = if input.resolver_policy.is_some() {
+            "explicit"
+        } else {
+            "inherited"
+        };
+        let (requested_policy, effective_policy, effective_policy_source) = resolve_resolver_policies(
             &input.kind,
             &input.payload,
             requested_policy_input,
@@ -173,15 +180,17 @@ impl IssueThreadInteractionService {
                 continuation_policy, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, created_by_user_id,
                 addressee_agent_id, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, payload, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)
+            VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)
             ON CONFLICT (company_id, issue_id, idempotency_key)
                 WHERE idempotency_key IS NOT NULL
             DO UPDATE SET updated_at = issue_thread_interactions.updated_at
             RETURNING 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, created_by_user_id,
                 addressee_agent_id, resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -202,6 +211,8 @@ impl IssueThreadInteractionService {
         .bind(input.addressee_agent_id)
         .bind(requested_policy.clone())
         .bind(effective_policy)
+        .bind(resolver_policy_provenance)
+        .bind(effective_policy_source)
         .bind(input.idempotency_key)
         .bind(input.payload)
         .bind(now)
@@ -289,6 +300,7 @@ impl IssueThreadInteractionService {
             SELECT 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -623,6 +635,7 @@ impl IssueThreadInteractionService {
             RETURNING 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -693,6 +706,7 @@ impl IssueThreadInteractionService {
             RETURNING 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -781,6 +795,7 @@ impl IssueThreadInteractionService {
             RETURNING 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -879,6 +894,7 @@ impl IssueThreadInteractionService {
             RETURNING 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -943,6 +959,7 @@ impl IssueThreadInteractionService {
             SELECT 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -989,6 +1006,7 @@ impl IssueThreadInteractionService {
                 RETURNING 
                     id, company_id, issue_id, kind, status,
                     continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                     idempotency_key, source_comment_id, source_run_id,
                     title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                     resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -1060,6 +1078,7 @@ impl IssueThreadInteractionService {
             SELECT 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -1113,6 +1132,7 @@ impl IssueThreadInteractionService {
                 RETURNING 
                     id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -1178,6 +1198,7 @@ impl IssueThreadInteractionService {
             SELECT
                 id, company_id, issue_id, kind::text as kind, status::text as status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -1214,6 +1235,7 @@ impl IssueThreadInteractionService {
             RETURNING
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -1268,6 +1290,7 @@ impl IssueThreadInteractionService {
             SELECT 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -1398,6 +1421,7 @@ impl IssueThreadInteractionService {
             RETURNING 
                 id, company_id, issue_id, kind, status,
                 continuation_policy, requested_resolver_policy, effective_resolver_policy,
+                resolver_policy_provenance, effective_resolver_policy_source,
                 idempotency_key, source_comment_id, source_run_id,
                 title, summary, created_by_agent_id, addressee_agent_id, created_by_user_id,
                 resolved_by_agent_id, resolved_by_run_id, resolved_by_user_id,
@@ -1505,12 +1529,14 @@ fn resolve_resolver_policies(
     payload: &serde_json::Value,
     requested: &str,
     governance: &serde_json::Value,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, String), String> {
     let requested = canonical_resolver_policy(requested)?;
     let mut effective = requested.clone();
+    let mut effective_source = "requested";
 
     if kind == "request_confirmation" && payload.get("toolAction").is_some() {
         effective = "human_only".to_string();
+        effective_source = "governed_action";
     } else if let Some(cap) = governance
         .get(kind)
         .and_then(|rule| rule.get("cap"))
@@ -1519,10 +1545,11 @@ fn resolve_resolver_policies(
         let cap = canonical_resolver_policy(cap)?;
         if resolver_policy_rank(&cap) > resolver_policy_rank(&effective) {
             effective = cap;
+            effective_source = "company_cap";
         }
     }
 
-    Ok((requested, effective))
+    Ok((requested, effective, effective_source.to_string()))
 }
 
 fn resolve_checkbox_selection(

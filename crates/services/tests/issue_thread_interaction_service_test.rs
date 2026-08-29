@@ -100,6 +100,8 @@ async fn create_is_idempotent_and_uses_canonical_columns(pool: PgPool) {
     assert_eq!(first.id, second.id);
     assert_eq!(second.requested_resolver_policy, "human_only");
     assert_eq!(second.effective_resolver_policy, "human_only");
+    assert_eq!(second.resolver_policy_provenance, "explicit");
+    assert_eq!(second.effective_resolver_policy_source, "requested");
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM issue_thread_interactions WHERE company_id = $1 AND issue_id = $2",
     )
@@ -148,6 +150,8 @@ async fn resolver_policy_applies_company_caps_and_governed_action_floor(pool: Pg
         .expect("create capped interaction");
     assert_eq!(capped.requested_resolver_policy, "not_creator");
     assert_eq!(capped.effective_resolver_policy, "not_creator");
+    assert_eq!(capped.resolver_policy_provenance, "inherited");
+    assert_eq!(capped.effective_resolver_policy_source, "requested");
 
     let governed = service
         .create(
@@ -172,6 +176,8 @@ async fn resolver_policy_applies_company_caps_and_governed_action_floor(pool: Pg
         .expect("create governed interaction");
     assert_eq!(governed.requested_resolver_policy, "anyone");
     assert_eq!(governed.effective_resolver_policy, "human_only");
+    assert_eq!(governed.resolver_policy_provenance, "explicit");
+    assert_eq!(governed.effective_resolver_policy_source, "governed_action");
 
     let invalid = service
         .create(

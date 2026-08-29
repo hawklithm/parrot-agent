@@ -216,6 +216,8 @@ pub async fn create_interaction(
             "interactionStatus": interaction.status,
             "requestedResolverPolicy": interaction.requested_resolver_policy,
             "effectiveResolverPolicy": interaction.effective_resolver_policy,
+            "resolverPolicyProvenance": interaction.resolver_policy_provenance,
+            "effectiveResolverPolicySource": interaction.effective_resolver_policy_source,
         }),
     ).await;
 
