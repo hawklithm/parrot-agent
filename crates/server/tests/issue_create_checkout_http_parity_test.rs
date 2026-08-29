@@ -191,5 +191,117 @@ async fn create_then_agent_checkout_persists_run_ownership(pool: PgPool) {
     assert_eq!(persisted.1, Some(fixture.agent_id));
     assert_eq!(persisted.2, Some(fixture.run_id));
 
+    let competing_run_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO heartbeat_runs (id, company_id, agent_id, status, context_snapshot)
+         VALUES ($1, $2, $3, 'running', $4)",
+    )
+    .bind(competing_run_id)
+    .bind(fixture.company_id)
+    .bind(fixture.agent_id)
+    .bind(json!({"source": "competing-test-run"}))
+    .execute(&pool)
+    .await
+    .expect("insert competing heartbeat run");
+    let (status, _) = send(
+        &app,
+        &AuthorizationActor::agent(fixture.agent_id, fixture.company_id, Some(competing_run_id)),
+        "POST",
+        &format!("/issues/{issue_id}/release"),
+        json!({"releaseRunId": competing_run_id, "result": "success"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, released) = send(
+        &app,
+        &agent_actor(&fixture),
+        "POST",
+        &format!("/issues/{issue_id}/release"),
+        json!({"releaseRunId": fixture.run_id, "result": "success"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(released["id"], created["id"]);
+    assert_eq!(released["status"], "done");
+    assert!(released["assigneeAgentId"].is_null());
+
+    let released_persisted: (String, Option<Uuid>, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT status::text, assignee_agent_id, checkout_run_id,
+                execution_run_id
+           FROM issues WHERE id = $1 AND company_id = $2",
+    )
+    .bind(issue_id)
+    .bind(fixture.company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("persisted released issue");
+    assert_eq!(released_persisted, ("done".to_string(), None, None, None));
+
+    sqlx::query("DELETE FROM heartbeat_runs WHERE id = $1")
+        .bind(competing_run_id)
+        .execute(&pool)
+        .await
+        .expect("delete competing heartbeat run");
+
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
+async fn release_rejects_a_request_that_does_not_match_the_agent_run(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let app = issue_routes()
+        .with_state(build_app_state(pool.clone()).await.expect("build app state"));
+
+    let (status, created) = send(
+        &app,
+        &board_actor(&fixture),
+        "POST",
+        &format!("/companies/{}/issues", fixture.company_id),
+        json!({"title": "Release ownership guard", "status": "todo"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let issue_id = Uuid::parse_str(created["id"].as_str().expect("created issue id"))
+        .expect("created issue UUID");
+
+    let (status, _) = send(
+        &app,
+        &agent_actor(&fixture),
+        "POST",
+        &format!("/issues/{issue_id}/checkout"),
+        json!({
+            "agentId": fixture.agent_id,
+            "expectedStatuses": ["todo"],
+            "checkoutRunId": fixture.run_id
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        &app,
+        &agent_actor(&fixture),
+        "POST",
+        &format!("/issues/{issue_id}/release"),
+        json!({"releaseRunId": Uuid::new_v4(), "result": "success"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let persisted: (String, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT status::text, assignee_agent_id, checkout_run_id
+           FROM issues WHERE id = $1 AND company_id = $2",
+    )
+    .bind(issue_id)
+    .bind(fixture.company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("persisted issue after rejected release");
+    assert_eq!(persisted.0, "in_progress");
+    assert_eq!(persisted.1, Some(fixture.agent_id));
+    assert_eq!(persisted.2, Some(fixture.run_id));
+
     cleanup(&fixture).await;
 }

@@ -2459,29 +2459,107 @@ async fn release_issue(
 ) -> Result<Json<Issue>, StatusCode> {
     let service = state.issue_service.clone();
     let company_id = scoped_issue_company(&state, &actor, id).await?;
-    if let AuthorizationActor::Agent { run_id, .. } = &actor {
-        if run_id.is_some_and(|current| current != input.release_run_id) {
-            return Err(StatusCode::FORBIDDEN);
+    let agent_run_id = match &actor {
+        AuthorizationActor::Agent { run_id, .. } => {
+            let Some(run_id) = run_id else {
+                return Err(StatusCode::FORBIDDEN);
+            };
+            if *run_id != input.release_run_id {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            Some(*run_id)
         }
-    }
+        _ => None,
+    };
     let release_run_id = input.release_run_id;
-    let resolves_blocker = input.result.as_deref() == Some("success")
-        || input.target_status.as_deref() == Some("done");
-    service
-        .release(id, company_id, input)
+    let mut tx = state
+        .pool
+        .begin()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    sqlx::query(
-        "UPDATE issues
-            SET checkout_run_id = NULL, execution_run_id = NULL,
-                execution_locked_at = NULL, updated_at = NOW()
-          WHERE id = $1 AND company_id = $2",
+    let locked_issue = sqlx::query_as::<_, (String, Option<Uuid>, Option<Uuid>)>(
+        "SELECT status::text, assignee_agent_id, checkout_run_id
+           FROM issues
+          WHERE id = $1 AND company_id = $2
+          FOR UPDATE",
     )
     .bind(id)
     .bind(company_id)
-    .execute(&state.pool)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    if let AuthorizationActor::Agent { agent_id, .. } = &actor {
+        if locked_issue.1.is_some_and(|assignee| assignee != *agent_id) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if locked_issue.0 == "in_progress"
+            && locked_issue.2.is_some()
+            && locked_issue.2 != agent_run_id
+        {
+            let checkout_run_live = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                   SELECT 1 FROM heartbeat_runs
+                    WHERE id = $1 AND company_id = $2
+                      AND status IN ('queued', 'running')
+                )",
+            )
+            .bind(locked_issue.2)
+            .bind(company_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if checkout_run_live {
+                return Err(StatusCode::CONFLICT);
+            }
+        }
+    }
+
+    let release_status = match input.target_status.as_deref() {
+        Some("done") => IssueStatus::Done,
+        Some("todo") => IssueStatus::Todo,
+        Some("cancelled") => IssueStatus::Cancelled,
+        Some("in_progress") => IssueStatus::InProgress,
+        Some("in_review") => IssueStatus::InReview,
+        Some("blocked") => IssueStatus::Blocked,
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+        None => match input.result.as_deref() {
+            Some("success") => IssueStatus::Done,
+            Some("failed") => IssueStatus::Todo,
+            Some("cancelled") => IssueStatus::Cancelled,
+            Some("needs_review") => IssueStatus::InReview,
+            Some(_) => return Err(StatusCode::BAD_REQUEST),
+            None if locked_issue.0 == "in_progress" => IssueStatus::Todo,
+            None => match locked_issue.0.as_str() {
+                "backlog" => IssueStatus::Backlog,
+                "todo" => IssueStatus::Todo,
+                "in_review" => IssueStatus::InReview,
+                "blocked" => IssueStatus::Blocked,
+                "done" => IssueStatus::Done,
+                "cancelled" => IssueStatus::Cancelled,
+                _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            },
+        },
+    };
+    let resolves_blocker = release_status == IssueStatus::Done;
+    sqlx::query(
+        "UPDATE issues
+            SET status = $1, assignee_agent_id = NULL,
+                checkout_run_id = NULL, execution_run_id = NULL,
+                execution_agent_name_key = NULL, execution_locked_at = NULL,
+                updated_at = NOW()
+          WHERE id = $2 AND company_id = $3",
+    )
+    .bind(release_status)
+    .bind(id)
+    .bind(company_id)
+    .execute(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     log_activity(
         &state.pool,
         company_id,
