@@ -200,3 +200,66 @@ async fn concurrent_same_key_creates_one_issue_and_replays_it(pool: PgPool) {
 
     cleanup(&fixture).await;
 }
+
+#[sqlx::test]
+async fn expired_idempotency_key_is_cleaned_before_reuse(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let actor = board_actor(&fixture);
+    let app = issue_routes()
+        .with_state(build_app_state(pool.clone()).await.expect("build app state"));
+
+    let (status, first) = send(
+        &app,
+        &actor,
+        json!({"title": "Expired idempotency issue", "idempotencyKey": "expired-1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let first_id = issue_id(&first);
+
+    sqlx::query(
+        "UPDATE issue_create_idempotency_keys
+         SET created_at = NOW() - INTERVAL '8 days'
+         WHERE company_id = $1 AND idempotency_key = 'expired-1'",
+    )
+    .bind(fixture.company_id)
+    .execute(&pool)
+    .await
+    .expect("age idempotency key");
+
+    let (status, replacement) = send(
+        &app,
+        &actor,
+        json!({"title": "Replacement after expiry", "idempotencyKey": "expired-1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(replacement.get("deduplicated").is_none());
+    let replacement_id = issue_id(&replacement);
+    assert_ne!(replacement_id, first_id);
+
+    let stored_issue_id: Uuid = sqlx::query_scalar(
+        "SELECT issue_id
+         FROM issue_create_idempotency_keys
+         WHERE company_id = $1 AND idempotency_key = 'expired-1'",
+    )
+    .bind(fixture.company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("replacement idempotency row");
+    assert_eq!(stored_issue_id, replacement_id);
+
+    let issue_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM issues
+         WHERE id IN ($1, $2)",
+    )
+    .bind(first_id)
+    .bind(replacement_id)
+    .fetch_one(&pool)
+    .await
+    .expect("replacement issue count");
+    assert_eq!(issue_count, 2);
+
+    cleanup(&fixture).await;
+}
