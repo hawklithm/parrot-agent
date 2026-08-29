@@ -1,3 +1,9 @@
+//! Deprecated compatibility service for the removed generic annotation model.
+//!
+//! This module targets the historical `document_annotations` table, which is
+//! not part of the current schema. Production code must use the canonical
+//! issue/routine/case annotation thread routes instead.
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;

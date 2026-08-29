@@ -56,7 +56,22 @@ pub mod cross_issue_influence_limit_service;
 pub mod project_workspace_runtime_config_service;
 pub mod tool_runtime_metrics_service;
 pub mod database_backup_health_service;
+/// Legacy compatibility API for the pre-canonical `document_versions` model.
+///
+/// Production routes use `documents` + `document_revisions` instead. Keep the
+/// module available for old library consumers, but make accidental new use
+/// visible at compile time while the compatibility surface is retired.
+#[deprecated(
+    note = "legacy document service; use the canonical document/revision routes"
+)]
 pub mod document_service;
+/// Legacy compatibility API for the removed `document_annotations` table.
+///
+/// The canonical annotation model is `document_annotation_threads` and
+/// `document_annotation_comments`, scoped by issue/routine/case.
+#[deprecated(
+    note = "legacy document annotation service; use canonical annotation routes"
+)]
 pub mod document_annotation_service;
 pub mod issue_relation_service;
 pub mod status_card_service;

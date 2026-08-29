@@ -1,3 +1,10 @@
+//! Deprecated compatibility service for the pre-canonical document model.
+//!
+//! HTTP production routes use `documents` plus `document_revisions`, while
+//! this module still targets the historical `document_versions` table. It is
+//! retained only for source compatibility with older library consumers and
+//! must not be used to implement new API behavior.
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
