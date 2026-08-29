@@ -1993,19 +1993,11 @@ async fn create_issue(
         }
     }
     if let Some((mut connection, lock_key)) = idempotency_connection.take() {
-        let insert_result = sqlx::query(
-            "INSERT INTO issue_create_idempotency_keys (company_id, idempotency_key, issue_id) VALUES ($1, $2, $3)",
-        )
-        .bind(company_id)
-        .bind(idempotency_key.as_deref().expect("idempotency key is present"))
-        .bind(created.issue.id)
-        .execute(&mut *connection)
-        .await;
         let unlock_result = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
             .bind(&lock_key)
             .execute(&mut *connection)
             .await;
-        if insert_result.is_err() || unlock_result.is_err() {
+        if unlock_result.is_err() {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }

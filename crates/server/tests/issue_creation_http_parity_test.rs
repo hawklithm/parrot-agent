@@ -71,7 +71,11 @@ async fn send(
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read response body");
-    let value = serde_json::from_slice(&bytes).expect("response body must be JSON");
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("response body must be JSON")
+    };
     (status, value)
 }
 
@@ -260,6 +264,48 @@ async fn expired_idempotency_key_is_cleaned_before_reuse(pool: PgPool) {
     .await
     .expect("replacement issue count");
     assert_eq!(issue_count, 2);
+
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
+async fn failed_issue_association_rolls_back_issue_and_idempotency_key(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let actor = board_actor(&fixture);
+    let app = issue_routes()
+        .with_state(build_app_state(pool.clone()).await.expect("build app state"));
+
+    let (status, _body) = send(
+        &app,
+        &actor,
+        json!({
+            "title": "Should roll back",
+            "idempotencyKey": "rollback-1",
+            "labelIds": [Uuid::new_v4()],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let issue_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM issues WHERE company_id = $1 AND title = 'Should roll back'",
+    )
+    .bind(fixture.company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("issue rollback count");
+    assert_eq!(issue_count, 0);
+
+    let key_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM issue_create_idempotency_keys
+         WHERE company_id = $1 AND idempotency_key = 'rollback-1'",
+    )
+    .bind(fixture.company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("key rollback count");
+    assert_eq!(key_count, 0);
 
     cleanup(&fixture).await;
 }

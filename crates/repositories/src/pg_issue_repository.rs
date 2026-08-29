@@ -668,6 +668,23 @@ impl IssueRepository for PgIssueRepository {
             .begin()
             .await
             .map_err(RepositoryError::DatabaseError)?;
+
+        if let Some(idempotency_key) = input
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            let idempotency_guard_key = format!(
+                "issue-create:idempotency-tx:{}:{}",
+                input.company_id, idempotency_key
+            );
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&idempotency_guard_key)
+                .execute(&mut *tx)
+                .await
+                .map_err(RepositoryError::DatabaseError)?;
+        }
         
         // Generate unique origin_fingerprint to prevent duplicate issue creation
         // Strategy:
@@ -835,6 +852,24 @@ impl IssueRepository for PgIssueRepository {
                 "watchdogId": audit.watchdog_id,
                 "stopFingerprint": audit.stop_fingerprint,
             }))
+            .execute(&mut *tx)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+        }
+        if let Some(idempotency_key) = input
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            sqlx::query(
+                "INSERT INTO issue_create_idempotency_keys
+                    (company_id, idempotency_key, issue_id)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(input.company_id)
+            .bind(idempotency_key)
+            .bind(issue.id)
             .execute(&mut *tx)
             .await
             .map_err(RepositoryError::DatabaseError)?;
