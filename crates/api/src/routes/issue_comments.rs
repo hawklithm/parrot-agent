@@ -79,6 +79,42 @@ fn should_reopen_issue_after_comment(
     reopenable && (explicit_reopen || (board_comment && has_assignee))
 }
 
+fn parse_mentioned_agent_ids(body: &str) -> Vec<Uuid> {
+    const PREFIX: &str = "agent://";
+    const UUID_LEN: usize = 36;
+    let mut mentioned_ids = Vec::new();
+    let mut offset = 0;
+
+    while offset < body.len() {
+        let Some(relative_start) = body[offset..].find(PREFIX) else {
+            break;
+        };
+        let uuid_start = offset + relative_start + PREFIX.len();
+        let after_prefix = &body[uuid_start..];
+        let Some(candidate) = after_prefix.get(..UUID_LEN) else {
+            break;
+        };
+        let has_boundary = after_prefix.as_bytes().get(UUID_LEN)
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-' && *byte != b'_');
+        if has_boundary {
+            if let Ok(uuid) = Uuid::parse_str(candidate) {
+                mentioned_ids.push(uuid);
+            }
+        }
+
+        let advance = after_prefix
+            .char_indices()
+            .nth(UUID_LEN)
+            .map(|(index, _)| index)
+            .unwrap_or(after_prefix.len());
+        offset = uuid_start + advance;
+    }
+
+    mentioned_ids.sort_unstable();
+    mentioned_ids.dedup();
+    mentioned_ids
+}
+
 // Convert service errors to API errors
 impl From<CommentServiceError> for ApiError {
     fn from(err: CommentServiceError) -> Self {
@@ -202,28 +238,8 @@ pub async fn add_comment(
         req.metadata,
     ).await?;
 
-    // Parse agent://uuid mentions per Paperclip convention: [@Name](agent://<uuid>)
-    // Uses simple string scanning rather than full markdown AST.
-    let mut mentioned_ids: Vec<Uuid> = Vec::new();
-    if !req.body.trim().is_empty() {
-        // Find all agent://UUID patterns in the body
-        let mut rest = req.body.as_str();
-        while let Some(start) = rest.find("agent://") {
-            let after_prefix = &rest[start + 8..];
-            // UUID is exactly 36 characters (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
-            if after_prefix.len() >= 36 {
-                let candidate = &after_prefix[..36];
-                if let Ok(uuid) = Uuid::parse_str(candidate) {
-                    mentioned_ids.push(uuid);
-                }
-            }
-            // Advance past this match
-            rest = &after_prefix[36.min(after_prefix.len())..];
-        }
-        // Deduplicate while preserving order
-        mentioned_ids.sort();
-        mentioned_ids.dedup();
-    }
+    // Parse agent://uuid mentions per Paperclip convention: [@Name](agent://<uuid>).
+    let mentioned_ids = parse_mentioned_agent_ids(&req.body);
 
     if !mentioned_ids.is_empty() {
         for mentioned_id in &mentioned_ids {
@@ -263,7 +279,7 @@ pub async fn add_comment(
 
                     // Wake mentioned agent with proper context
                     if agent_status == "idle" || agent_status == "paused" {
-                        let _ = state
+                        if let Err(error) = state
                             .heartbeat_service
                             .wakeup_with_options(
                                 *mentioned_id,
@@ -292,7 +308,16 @@ pub async fn add_comment(
                                     ..Default::default()
                                 },
                             )
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                company_id = %company_id,
+                                agent_id = %mentioned_id,
+                                issue_id = %issue_id,
+                                error = %error,
+                                "failed to wake mentioned agent"
+                            );
+                        }
                     }
                 }
             }
@@ -462,6 +487,7 @@ pub async fn add_comment(
         let resolver = services::InteractionResolver {
             resolver_type: "system".to_string(),
             resolver_id: "comment_supersede".to_string(),
+            run_id: None,
         };
         
         let user_id = actor_id.map(|id| id.to_string());
@@ -713,4 +739,35 @@ pub fn issue_comment_routes() -> Router<AppState> {
         .route("/comments/:comment_id", get(get_comment))
         .route("/comments/:comment_id", put(update_comment))
         .route("/comments/:comment_id", delete(delete_comment))
+}
+
+#[cfg(test)]
+mod mention_parser_tests {
+    use super::parse_mentioned_agent_ids;
+    use uuid::Uuid;
+
+    #[test]
+    fn parses_exact_agent_urls_and_deduplicates() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let body = format!(
+            "[@one](agent://{first}) [@two](agent://{second}) agent://{first}"
+        );
+
+        let parsed = parse_mentioned_agent_ids(&body);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&first));
+        assert!(parsed.contains(&second));
+    }
+
+    #[test]
+    fn rejects_embedded_or_truncated_agent_urls() {
+        let id = Uuid::new_v4();
+        let parsed = parse_mentioned_agent_ids(&format!(
+            "agent://{id}extra agent://{}",
+            &id.to_string()[..35]
+        ));
+
+        assert!(parsed.is_empty());
+    }
 }

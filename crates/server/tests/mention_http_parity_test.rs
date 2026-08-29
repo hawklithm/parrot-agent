@@ -17,6 +17,10 @@ use services::auth::AuthorizationActor;
 
 /// Reusable seed helpers — tests call `connect_and_migrate` and `seed` before building a router.
 async fn connect_and_migrate(pool: &PgPool) {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
     sqlx::migrate!("../../migrations")
         .run(pool)
         .await
@@ -101,6 +105,16 @@ async fn mention_parses_agent_url_and_triggers_wakeup(pool: PgPool) {
     .await
     .unwrap_or(0);
     assert!(activity_count > 0, "mention activity should be logged for mentioned agent");
+
+    let wakeup_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_wakeup_requests WHERE agent_id = $1 AND company_id = $2"
+    )
+    .bind(mentioned)
+    .bind(cid)
+    .fetch_one(&pool)
+    .await
+    .expect("mention wakeup should be queryable");
+    assert_eq!(wakeup_count, 1, "a same-company idle mention should enqueue one wakeup");
 }
 
 #[sqlx::test]

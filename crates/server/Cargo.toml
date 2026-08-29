@@ -31,3 +31,4 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
