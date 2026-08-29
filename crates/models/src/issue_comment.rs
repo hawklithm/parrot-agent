@@ -159,6 +159,10 @@ pub struct IssueThreadInteraction {
     pub kind: String, // "question" | "approval" | "suggest_tasks" | "ask_user_questions" | "request_confirmation" | "request_checkbox_confirmation"
     pub status: String, // "pending" | "accepted" | "rejected" | "cancelled" | "resolved" | "expired"
     pub continuation_policy: String, // "wake_assignee" | "none"
+    pub requested_resolver_policy: String,
+    pub effective_resolver_policy: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_comment_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,9 +174,13 @@ pub struct IssueThreadInteraction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by_agent_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub addressee_agent_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by_user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by_agent_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by_run_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by_user_id: Option<String>,
     pub payload: serde_json::Value,
@@ -197,6 +205,12 @@ pub struct CreateThreadInteractionInput {
     #[serde(default = "default_continuation_policy")]
     pub continuation_policy: String,
     #[serde(default)]
+    pub resolver_policy: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub addressee_agent_id: Option<Uuid>,
+    #[serde(default)]
     pub source_run_id: Option<Uuid>,
     #[serde(default)]
     pub source_comment_id: Option<Uuid>,
@@ -212,12 +226,18 @@ fn default_continuation_policy() -> String {
 pub struct AcceptThreadInteractionInput {
     #[serde(default)]
     pub response: Option<serde_json::Value>,
+    #[serde(default)]
+    pub selected_client_keys: Option<Vec<String>>,
+    #[serde(default)]
+    pub selected_option_ids: Option<Vec<String>>,
 }
 
 /// Input for rejecting a thread interaction
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RejectThreadInteractionInput {
+    #[serde(default)]
+    pub reason: Option<String>,
     #[serde(default)]
     pub response: Option<serde_json::Value>,
 }
@@ -248,7 +268,8 @@ pub struct QuestionAnswer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub option_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub answer_text: Option<String>,
+    #[serde(rename = "otherText", alias = "answerText")]
+    pub other_text: Option<String>,
 }
 
 /// Input for cancelling ask_user_questions interaction
@@ -271,8 +292,9 @@ pub struct WithdrawInteractionInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemVerdict {
+    #[serde(alias = "id")]
     pub item_id: String,
-    pub verdict: String, // "pass" | "fail" | "skip"
+    pub verdict: String, // "approve" | "reject" | "defer"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

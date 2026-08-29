@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     response::IntoResponse,
     Extension, Json, Router,
     routing::{get, post},
@@ -12,7 +13,88 @@ use crate::routes::log_activity;
 use models;
 use services::auth::AuthorizationActor;
 use services::{CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
-    DefaultCrossIssueInfluenceLimitService, InfluenceLimitError, ObserveCrossIssueInfluenceInput};
+    DefaultCrossIssueInfluenceLimitService, HeartbeatWakeupOptions, InfluenceLimitError,
+    ObserveCrossIssueInfluenceInput};
+
+fn map_interaction_service_error(error: String) -> ApiError {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("already resolved")
+        || lower.contains("not pending")
+        || lower.contains("idempotency key conflicts")
+    {
+        return ApiError::Conflict(error);
+    }
+    if lower.contains("interaction not found") || lower.contains("not found") {
+        return ApiError::NotFound(error);
+    }
+    if lower.contains("resolver")
+        || lower.contains("authorized human")
+        || lower.contains("human-only")
+        || lower.contains("not resolvable")
+        || lower.contains("other than its creator")
+    {
+        return ApiError::Forbidden(error);
+    }
+    if lower.contains("only ")
+        || lower.contains("unsupported")
+        || lower.contains("unknown item")
+        || lower.contains("unknown option")
+        || lower.contains("unknown question")
+        || lower.contains("duplicate item")
+        || lower.contains("duplicate answer")
+        || lower.contains("duplicate selected")
+        || lower.contains("invalid item")
+        || lower.contains("missing an items")
+        || lower.contains("missing a questions")
+        || lower.contains("requires an answer")
+        || lower.contains("only allows one answer")
+        || lower.contains("options must be selected")
+        || lower.contains("options may be selected")
+        || lower.contains("reason is required")
+    {
+        return ApiError::Unprocessable(error);
+    }
+    ApiError::InternalServerError(error)
+}
+
+async fn assert_agent_run(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    agent_id: Uuid,
+) -> Result<Option<Uuid>, ApiError> {
+    let AuthorizationActor::Agent { run_id, company_id: actor_company_id, .. } = actor else {
+        return Ok(None);
+    };
+    if *actor_company_id != company_id {
+        return Err(ApiError::Forbidden("Issue is outside the actor's company scope".into()));
+    }
+    let Some(run_id) = run_id else {
+        return Err(ApiError::Unprocessable(
+            "A valid authenticated agent run is required for issue-thread interactions".into(),
+        ));
+    };
+    let exists: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM heartbeat_runs WHERE id = $1 AND company_id = $2 AND agent_id = $3",
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .bind(agent_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    exists.ok_or_else(|| {
+        ApiError::Unprocessable("The authenticated agent run is not valid for this company and agent".into())
+    }).map(Some)
+}
+
+fn actor_label(actor: &AuthorizationActor) -> &'static str {
+    match actor {
+        AuthorizationActor::Board { .. } => "user",
+        AuthorizationActor::Agent { .. } => "agent",
+        AuthorizationActor::None => "system",
+    }
+}
 
 async fn guard_cross_issue_resolution(
     state: &AppState,
@@ -68,9 +150,9 @@ pub async fn create_interaction(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(issue_id): Path<Uuid>,
-    Json(input): Json<models::CreateThreadInteractionInput>,
+    Json(mut input): Json<models::CreateThreadInteractionInput>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Get issue's company_id and assert access
+    // Get issue's company_id and assert write access
     let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
         .bind(issue_id)
         .fetch_optional(&state.pool)
@@ -81,8 +163,13 @@ pub async fn create_interaction(
         return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
     };
     
-    crate::routes::assert_company_access(&actor, company_id, true)
+    crate::routes::assert_company_access(&actor, company_id, false)
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    if let AuthorizationActor::Agent { agent_id, run_id, .. } = &actor {
+        let authenticated_run = assert_agent_run(&state, &actor, company_id, *agent_id).await?;
+        input.source_run_id = authenticated_run.or(*run_id);
+    }
 
     // Load issue directly from DB
     let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
@@ -114,9 +201,56 @@ pub async fn create_interaction(
     // Create interaction
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.create(&issue, input, creator).await
-        .map_err(|e| ApiError::InternalServerError(e))?;
+        .map_err(map_interaction_service_error)?;
 
-    Ok(Json(interaction))
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.thread_interaction_created",
+        &actor,
+        "issue",
+        issue_id,
+        json!({
+            "interactionId": interaction.id,
+            "interactionKind": interaction.kind,
+            "interactionStatus": interaction.status,
+            "requestedResolverPolicy": interaction.requested_resolver_policy,
+            "effectiveResolverPolicy": interaction.effective_resolver_policy,
+        }),
+    ).await;
+
+    if let Some(addressee_agent_id) = interaction.addressee_agent_id {
+        let _ = state.heartbeat_service.wakeup_with_options(
+            addressee_agent_id,
+            issue_id,
+            company_id,
+            HeartbeatWakeupOptions {
+                source: Some("automation".into()),
+                trigger_detail: Some("system".into()),
+                reason: Some("interaction_pending".into()),
+                requested_by_actor_type: Some(actor_label(&actor).into()),
+                requested_by_actor_id: actor.principal_id(),
+                idempotency_key: Some(format!("interaction-pending:{}", interaction.id)),
+                payload: Some(json!({
+                    "issueId": issue_id,
+                    "interactionId": interaction.id,
+                    "interactionKind": interaction.kind,
+                    "mutation": "interaction",
+                })),
+                context_snapshot: Some(json!({
+                    "issueId": issue_id,
+                    "taskId": issue_id,
+                    "interactionId": interaction.id,
+                    "interactionKind": interaction.kind,
+                    "wakeReason": "interaction_pending",
+                    "source": "issue.interaction.created",
+                })),
+                ..Default::default()
+            },
+        ).await;
+    }
+
+    Ok((StatusCode::CREATED, Json(interaction)))
 }
 
 /// GET /issues/:issue_id/interactions - List interactions for an issue
@@ -142,7 +276,7 @@ pub async fn list_interactions(
     // List interactions
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interactions = service.list_for_issue(issue_id).await
-        .map_err(|e| ApiError::InternalServerError(e))?;
+        .map_err(map_interaction_service_error)?;
 
     Ok(Json(interactions))
 }
@@ -165,7 +299,7 @@ pub async fn accept_interaction(
         return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
     };
     
-    crate::routes::assert_company_access(&actor, company_id, true)
+    crate::routes::assert_company_access(&actor, company_id, false)
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
 
     guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
@@ -184,12 +318,14 @@ pub async fn accept_interaction(
             services::InteractionResolver {
                 resolver_type: "user".to_string(),
                 resolver_id: user_id.to_string(),
+                run_id: None,
             }
         },
-        AuthorizationActor::Agent { agent_id, .. } => {
+        AuthorizationActor::Agent { agent_id, run_id, .. } => {
             services::InteractionResolver {
                 resolver_type: "agent".to_string(),
                 resolver_id: agent_id.to_string(),
+                run_id: *run_id,
             }
         },
         AuthorizationActor::None => {
@@ -200,7 +336,7 @@ pub async fn accept_interaction(
     // Accept interaction
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let result = service.accept_interaction(&issue, interaction_id, input, resolver).await
-        .map_err(|e| ApiError::InternalServerError(e))?;
+        .map_err(map_interaction_service_error)?;
 
     Ok(Json(result))
 }
@@ -223,7 +359,7 @@ pub async fn reject_interaction(
         return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
     };
     
-    crate::routes::assert_company_access(&actor, company_id, true)
+    crate::routes::assert_company_access(&actor, company_id, false)
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
 
     guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
@@ -241,12 +377,14 @@ pub async fn reject_interaction(
             services::InteractionResolver {
                 resolver_type: "user".to_string(),
                 resolver_id: user_id.to_string(),
+                run_id: None,
             }
         },
-        AuthorizationActor::Agent { agent_id, .. } => {
+        AuthorizationActor::Agent { agent_id, run_id, .. } => {
             services::InteractionResolver {
                 resolver_type: "agent".to_string(),
                 resolver_id: agent_id.to_string(),
+                run_id: *run_id,
             }
         },
         AuthorizationActor::None => {
@@ -257,7 +395,7 @@ pub async fn reject_interaction(
     // Reject interaction
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.reject_interaction(&issue, interaction_id, input, resolver).await
-        .map_err(|e| ApiError::InternalServerError(e))?;
+        .map_err(map_interaction_service_error)?;
 
     Ok(Json(interaction))
 }
@@ -285,7 +423,7 @@ pub async fn get_interaction(
     // Get interaction
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.get_by_id(interaction_id).await
-        .map_err(|e| ApiError::InternalServerError(e))?
+        .map_err(map_interaction_service_error)?
         .ok_or_else(|| ApiError::NotFound("Interaction not found".to_string()))?;
 
     // Verify interaction belongs to the issue
@@ -314,7 +452,7 @@ pub async fn answer_questions(
         return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
     };
     
-    crate::routes::assert_company_access(&actor, company_id, true)
+    crate::routes::assert_company_access(&actor, company_id, false)
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
 
     guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
@@ -324,12 +462,14 @@ pub async fn answer_questions(
             services::InteractionResolver {
                 resolver_type: "user".to_string(),
                 resolver_id: user_id.to_string(),
+                run_id: None,
             }
         },
-        AuthorizationActor::Agent { agent_id, .. } => {
+        AuthorizationActor::Agent { agent_id, run_id, .. } => {
             services::InteractionResolver {
                 resolver_type: "agent".to_string(),
                 resolver_id: agent_id.to_string(),
+                run_id: *run_id,
             }
         },
         AuthorizationActor::None => {
@@ -340,7 +480,7 @@ pub async fn answer_questions(
     // Answer questions
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.answer_questions(issue_id, interaction_id, input, resolver).await
-        .map_err(|e| ApiError::InternalServerError(e))?;
+        .map_err(map_interaction_service_error)?;
 
     Ok(Json(interaction))
 }
@@ -362,8 +502,11 @@ pub async fn cancel_questions(
     let Some(company_id) = company_id else {
         return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
     };
-    crate::routes::assert_company_access(&actor, company_id, true)
+    crate::routes::assert_company_access(&actor, company_id, false)
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+
+    crate::routes::assert_board(&actor)
+        .map_err(|_| ApiError::Forbidden("Only Board users can cancel question interactions".into()))?;
 
     // Determine resolver
     let resolver = match &actor {
@@ -371,12 +514,14 @@ pub async fn cancel_questions(
             services::InteractionResolver {
                 resolver_type: "user".to_string(),
                 resolver_id: user_id.to_string(),
+                run_id: None,
             }
         },
-        AuthorizationActor::Agent { agent_id, .. } => {
+        AuthorizationActor::Agent { agent_id, run_id, .. } => {
             services::InteractionResolver {
                 resolver_type: "agent".to_string(),
                 resolver_id: agent_id.to_string(),
+                run_id: *run_id,
             }
         },
         AuthorizationActor::None => {
@@ -387,7 +532,7 @@ pub async fn cancel_questions(
     // Cancel questions
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.cancel_questions(issue_id, interaction_id, input, resolver).await
-        .map_err(|e| ApiError::InternalServerError(e))?;
+        .map_err(map_interaction_service_error)?;
 
     Ok(Json(interaction))
 }
@@ -421,12 +566,14 @@ pub async fn withdraw_interaction(
             services::InteractionResolver {
                 resolver_type: "user".to_string(),
                 resolver_id: user_id.to_string(),
+                run_id: None,
             }
         },
-        AuthorizationActor::Agent { agent_id, .. } => {
+        AuthorizationActor::Agent { agent_id, run_id, .. } => {
             services::InteractionResolver {
                 resolver_type: "agent".to_string(),
                 resolver_id: agent_id.to_string(),
+                run_id: *run_id,
             }
         },
         AuthorizationActor::None => {
@@ -436,7 +583,7 @@ pub async fn withdraw_interaction(
 
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.withdraw_interaction(issue_id, interaction_id, input, resolver).await
-        .map_err(|e| ApiError::InternalServerError(e))?;
+        .map_err(map_interaction_service_error)?;
 
     // Log activity
     log_activity(
@@ -487,12 +634,14 @@ pub async fn submit_item_verdicts(
             services::InteractionResolver {
                 resolver_type: "user".to_string(),
                 resolver_id: user_id.to_string(),
+                run_id: None,
             }
         },
-        AuthorizationActor::Agent { agent_id, .. } => {
+        AuthorizationActor::Agent { agent_id, run_id, .. } => {
             services::InteractionResolver {
                 resolver_type: "agent".to_string(),
                 resolver_id: agent_id.to_string(),
+                run_id: *run_id,
             }
         },
         AuthorizationActor::None => {
@@ -503,7 +652,7 @@ pub async fn submit_item_verdicts(
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let verdict_count = input.verdicts.len();
     let interaction = service.submit_item_verdicts(issue_id, interaction_id, input, resolver).await
-        .map_err(|e| ApiError::InternalServerError(e))?;
+        .map_err(map_interaction_service_error)?;
 
     // Log activity
     log_activity(
@@ -532,6 +681,7 @@ pub fn interaction_routes() -> Router<AppState> {
         .route("/issues/:id/interactions/:interaction_id", get(get_interaction))
         .route("/issues/:id/interactions/:interaction_id/accept", post(accept_interaction))
         .route("/issues/:id/interactions/:interaction_id/reject", post(reject_interaction))
+        .route("/issues/:id/interactions/:interaction_id/respond", post(answer_questions))
         .route("/issues/:id/interactions/:interaction_id/answer", post(answer_questions))
         .route("/issues/:id/interactions/:interaction_id/cancel", post(cancel_questions))
         .route("/issues/:id/interactions/:interaction_id/withdraw", post(withdraw_interaction))
