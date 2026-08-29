@@ -5,7 +5,9 @@ use models::{
 };
 use uuid::Uuid;
 use crate::{
-    issue_tree_control_repository::{IssueTreeHoldRepository, CreateTreeHoldInput},
+    issue_tree_control_repository::{
+        CreateTreeHoldInput, IssueTreeHoldRepository, ReleaseTreeHoldInput,
+    },
     RepositoryError,
 };
 
@@ -22,13 +24,19 @@ impl PgIssueTreeHoldRepository {
 #[async_trait]
 impl IssueTreeHoldRepository for PgIssueTreeHoldRepository {
     async fn create(&self, input: CreateTreeHoldInput) -> Result<IssueTreeHold, RepositoryError> {
+        let actor_type = input
+            .created_by_actor_type
+            .clone()
+            .unwrap_or_else(|| "system".to_string());
         let hold = sqlx::query_as::<_, IssueTreeHold>(
             r#"
             INSERT INTO issue_tree_holds (
                 company_id, root_issue_id, mode, status, reason,
-                release_policy, metadata, actor_type, actor_id
+                release_policy, metadata,
+                created_by_actor_type, created_by_agent_id, created_by_user_id,
+                created_by_run_id, actor_type, actor_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING *
             "#,
         )
@@ -39,8 +47,16 @@ impl IssueTreeHoldRepository for PgIssueTreeHoldRepository {
         .bind(input.reason.as_ref())
         .bind(&input.release_policy)
         .bind(&input.metadata)
-        .bind(input.actor_type.as_ref())
-        .bind(input.actor_id)
+        .bind(&actor_type)
+        .bind(input.created_by_agent_id)
+        .bind(input.created_by_user_id.as_ref())
+        .bind(input.created_by_run_id)
+        // Legacy columns retained for readers pinned to the old shape.
+        .bind(&actor_type)
+        .bind(
+            input.created_by_agent_id
+                .or_else(|| input.created_by_user_id.as_ref().and_then(|id| Uuid::parse_str(id).ok())),
+        )
         .fetch_one(&self.pool)
         .await
         .map_err(RepositoryError::DatabaseError)?;
@@ -102,26 +118,100 @@ impl IssueTreeHoldRepository for PgIssueTreeHoldRepository {
         released_by_type: Option<String>,
         released_by_id: Option<Uuid>,
     ) -> Result<IssueTreeHold, RepositoryError> {
+        let (agent_id, user_id) = match released_by_type.as_deref() {
+            Some("agent") => (released_by_id, None),
+            Some(_) => (None, released_by_id.map(|id| id.to_string())),
+            None => (None, None),
+        };
+        self.release_with_actor(
+            hold_id,
+            ReleaseTreeHoldInput {
+                released_by_actor_type: released_by_type,
+                released_by_agent_id: agent_id,
+                released_by_user_id: user_id,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn release_with_actor(
+        &self,
+        hold_id: Uuid,
+        input: ReleaseTreeHoldInput,
+    ) -> Result<IssueTreeHold, RepositoryError> {
         let hold = sqlx::query_as::<_, IssueTreeHold>(
             r#"
             UPDATE issue_tree_holds
             SET status = 'released',
                 released_at = NOW(),
+                updated_at = NOW(),
+                released_by_actor_type = $2,
+                released_by_agent_id = $3,
+                released_by_user_id = $4,
+                released_by_run_id = $5,
+                release_reason = $6,
+                release_metadata = $7,
                 released_by_type = $2,
-                released_by_id = $3
+                released_by_id = COALESCE($3, $4::uuid)
             WHERE id = $1
             RETURNING *
             "#,
         )
         .bind(hold_id)
-        .bind(released_by_type.as_ref())
-        .bind(released_by_id)
+        .bind(input.released_by_actor_type.as_ref())
+        .bind(input.released_by_agent_id)
+        .bind(input.released_by_user_id.as_ref())
+        .bind(input.released_by_run_id)
+        .bind(input.release_reason.as_ref())
+        .bind(&input.release_metadata)
         .fetch_one(&self.pool)
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
         Ok(hold)
     }
+
+    async fn mark_member_restored(
+        &self,
+        hold_id: Uuid,
+        issue_id: Uuid,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            r#"
+            UPDATE issue_tree_hold_members
+            SET restored_at = NOW()
+            WHERE hold_id = $1 AND issue_id = $2
+            "#,
+        )
+        .bind(hold_id)
+        .bind(issue_id)
+        .execute(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+        Ok(())
+    }
+
+    async fn set_apply_error(
+        &self,
+        hold_id: Uuid,
+        error: Option<String>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            r#"
+            UPDATE issue_tree_holds
+            SET apply_error = $2, updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(hold_id)
+        .bind(error.as_ref())
+        .execute(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+        Ok(())
+    }
+
 
     async fn get_members(&self, hold_id: Uuid) -> Result<Vec<IssueTreeHoldMember>, RepositoryError> {
         let members = sqlx::query_as::<_, IssueTreeHoldMember>(
@@ -154,9 +244,9 @@ impl IssueTreeHoldRepository for PgIssueTreeHoldRepository {
                     company_id, hold_id, issue_id, parent_issue_id, depth,
                     issue_identifier, issue_title, issue_status,
                     assignee_agent_id, assignee_user_id, active_run_id,
-                    active_run_status, skipped, skip_reason
+                    active_run_status, skipped, skip_reason, previous_status
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 "#,
             )
             .bind(member.company_id)
@@ -173,6 +263,7 @@ impl IssueTreeHoldRepository for PgIssueTreeHoldRepository {
             .bind(member.active_run_status.as_ref())
             .bind(member.skipped)
             .bind(member.skip_reason.as_ref())
+            .bind(member.previous_status.as_ref())
             .execute(&mut *tx)
             .await
             .map_err(RepositoryError::DatabaseError)?;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::collections::HashSet;
 use repositories::{
     IssueTreeHoldRepository, IssueRepository, CreateTreeHoldInput,
-    RepositoryError,
+    ReleaseTreeHoldInput, RepositoryError,
 };
 
 /// Service-level errors for Tree Control operations
@@ -180,7 +180,7 @@ where
                 }
             }
             IssueTreeControlMode::Restore => {
-                // Can restore Cancelled
+                // Can restore Cancelled back to Backlog
                 match current_status {
                     IssueStatus::Cancelled => Ok(Some(IssueStatus::Backlog)),
                     _ => Err(TreeControlServiceError::InvalidOperation(
@@ -188,10 +188,110 @@ where
                     )),
                 }
             }
-            _ => Err(TreeControlServiceError::InvalidOperation(
-                format!("Unsupported control mode: {:?}", mode),
-            )),
+            IssueTreeControlMode::Pause => {
+                // A pause hold suppresses execution; the issue keeps its own
+                // status so the release path can restore it exactly.
+                match current_status {
+                    IssueStatus::Done | IssueStatus::Cancelled => Ok(None),
+                    _ => Ok(None),
+                }
+            }
+            IssueTreeControlMode::Resume => {
+                // Resume clears a pause hold; it never changes issue status.
+                Ok(None)
+            }
         }
+    }
+
+    /// Apply the tree-wide status transition for a freshly created hold.
+    ///
+    /// Returns the ids of the issues whose status actually changed. Per-issue
+    /// rejections (for example cancelling a `done` issue) are skipped rather
+    /// than aborting the rest of the subtree, matching Paperclip's preview
+    /// semantics where such members are recorded as skipped.
+    async fn apply_hold_transition(
+        &self,
+        hold: &IssueTreeHold,
+        tree_issues: &[Issue],
+    ) -> TreeControlServiceResult<Vec<Uuid>> {
+        let mut updated = Vec::new();
+        for issue in tree_issues {
+            let target = match self.validate_mode_transition(&hold.mode, &issue.status) {
+                Ok(Some(target)) => target,
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
+            self.issue_repository
+                .update(
+                    issue.id,
+                    models::UpdateIssueInput {
+                        status: Some(target),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            updated.push(issue.id);
+        }
+        Ok(updated)
+    }
+
+    /// Restore every non-skipped member to the status it held before the hold
+    /// was applied.
+    ///
+    /// Members without a recorded `previous_status` fall back to the status
+    /// captured in the member snapshot. Unparseable statuses are left alone
+    /// instead of being coerced to a guessed value.
+    async fn restore_hold_members(
+        &self,
+        hold_id: Uuid,
+        members: &[IssueTreeHoldMember],
+    ) -> TreeControlServiceResult<Vec<Uuid>> {
+        let mut restored = Vec::new();
+        for member in members {
+            if member.skipped {
+                continue;
+            }
+            let target_text = member
+                .previous_status
+                .clone()
+                .unwrap_or_else(|| member.issue_status.clone());
+            let Some(target) = parse_issue_status(&target_text) else {
+                continue;
+            };
+            self.issue_repository
+                .update(
+                    member.issue_id,
+                    models::UpdateIssueInput {
+                        status: Some(target),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let _ = self
+                .tree_hold_repository
+                .mark_member_restored(hold_id, member.issue_id)
+                .await;
+            restored.push(member.issue_id);
+        }
+        Ok(restored)
+    }
+}
+
+/// Parse an `IssueStatus` from its canonical snake_case text.
+///
+/// Hold members are persisted with `Display` text, so the release path has to
+/// map that text back to the enum. Unknown text yields `None` and the member is
+/// left untouched rather than being coerced to a guessed status.
+fn parse_issue_status(raw: &str) -> Option<IssueStatus> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "backlog" => Some(IssueStatus::Backlog),
+        "todo" => Some(IssueStatus::Todo),
+        "in_progress" | "inprogress" => Some(IssueStatus::InProgress),
+        "in_review" | "inreview" => Some(IssueStatus::InReview),
+        "blocked" => Some(IssueStatus::Blocked),
+        "done" => Some(IssueStatus::Done),
+        "cancelled" | "canceled" => Some(IssueStatus::Cancelled),
+        _ => None,
     }
 }
 
@@ -258,39 +358,43 @@ where
         if root_issue.is_none() {
             return Err(TreeControlServiceError::IssueNotFound(root_issue_id));
         }
-
-        // Default release policy
-        let release_policy = input.release_policy;
-
+        let release_policy = input.release_policy.clone();
         let release_policy_json = serde_json::to_value(&release_policy)
             .map_err(|e| TreeControlServiceError::Validation(format!("Invalid release policy: {}", e)))?;
 
         // Create tree hold
         let hold_mode = input.mode.clone();
+        let (created_by_agent_id, created_by_user_id) = match actor_type.as_deref() {
+            Some("agent") => (actor_id, None),
+            Some("user") => (None, actor_id.map(|id| id.to_string())),
+            _ => (None, None),
+        };
         let create_input = CreateTreeHoldInput {
             company_id,
             root_issue_id,
-            mode: hold_mode,
+            mode: hold_mode.clone(),
             reason: input.reason,
             release_policy: release_policy_json,
             metadata: input.metadata,
-            actor_type,
-            actor_id,
+            created_by_actor_type: actor_type,
+            created_by_agent_id,
+            created_by_user_id,
+            created_by_run_id: None,
         };
 
         let hold = self.tree_hold_repository.create(create_input).await?;
 
-        // Collect tree members
         let tree_issues = self.collect_tree_issues(root_issue_id).await?;
         let mut members = Vec::new();
-
-        for issue in tree_issues {
-            let transition_result = self.validate_mode_transition(&input.mode, &issue.status);
-            let (skipped, skip_reason) = match transition_result {
+        for issue in &tree_issues {
+            let transition = self.validate_mode_transition(&input.mode, &issue.status);
+            let (skipped, skip_reason) = match &transition {
                 Ok(None) => (true, Some("Already in target state".to_string())),
                 Ok(Some(_)) => (false, None),
                 Err(e) => (true, Some(e.to_string())),
             };
+            let previous_status = issue.status.to_string();
+            let issue_status = previous_status.clone();
 
             members.push(IssueTreeHoldMember {
                 id: Uuid::new_v4(),
@@ -298,17 +402,18 @@ where
                 hold_id: hold.id,
                 issue_id: issue.id,
                 parent_issue_id: issue.parent_id,
-                previous_status: format!("{:?}", issue.status),
+                previous_status: Some(previous_status),
                 depth: self.calculate_issue_depth(&issue).await.unwrap_or(0),
-                issue_identifier: issue.identifier,
-                issue_title: issue.title,
-                issue_status: format!("{:?}", issue.status),
+                issue_identifier: issue.identifier.clone(),
+                issue_title: issue.title.clone(),
+                issue_status,
                 assignee_agent_id: issue.assignee_agent_id,
                 assignee_user_id: issue.assignee_user_id,
-                active_run_id: None, // Note: Requires separate runs table query
-                active_run_status: None, // Note: Will be implemented with Run repository
+                active_run_id: None,
+                active_run_status: None,
                 skipped,
-                skip_reason,
+                skip_reason: skip_reason.clone(),
+                restored_at: None,
                 created_at: chrono::Utc::now(),
             });
         }
@@ -316,8 +421,28 @@ where
         // Create members
         self.tree_hold_repository.create_members(members).await?;
 
-        Ok(hold)
+        // Apply the tree-wide status transition. A failure leaves the hold
+        // active with `apply_error` set so an operator can retry instead of
+        // silently leaving the subtree half-applied.
+        if let Err(error) = self.apply_hold_transition(&hold, &tree_issues).await {
+            tracing::warn!(
+                hold_id = %hold.id,
+                mode = ?hold.mode,
+                error = %error,
+                "Failed to apply tree control transition"
+            );
+            let _ = self
+                .tree_hold_repository
+                .set_apply_error(hold.id, Some(error.to_string()))
+                .await;
+        }
+
+        self.tree_hold_repository
+            .get_by_id(hold.id)
+            .await?
+            .ok_or(TreeControlServiceError::HoldNotFound(hold.id))
     }
+
 
     async fn get_tree_hold(&self, hold_id: Uuid) -> TreeControlServiceResult<IssueTreeHold> {
         let hold = self.tree_hold_repository.get_by_id(hold_id).await?;
@@ -347,12 +472,40 @@ where
             return Err(TreeControlServiceError::HoldAlreadyReleased);
         }
 
-        // Release hold
-        let released_hold = self.tree_hold_repository.release(
-            hold_id,
-            released_by_type,
-            released_by_id,
-        ).await?;
+        // Restore each member to the status it held before the hold was
+        // applied. Only cancel/restore holds change issue status; pause holds
+        // suppress execution without mutating status, so their members are
+        // restored to the same value and the restore is a no-op.
+        let members = self.tree_hold_repository.get_members(hold_id).await?;
+        let restored = self
+            .restore_hold_members(hold_id, &members)
+            .await?;
+
+        let (released_agent_id, released_user_id) = match released_by_type.as_deref() {
+            Some("agent") => (released_by_id, None),
+            Some(_) => (None, released_by_id.map(|id| id.to_string())),
+            None => (None, None),
+        };
+
+        // Release hold with full attribution and a restore summary so the
+        // release is auditable without re-reading every member row.
+        let released_hold = self
+            .tree_hold_repository
+            .release_with_actor(
+                hold_id,
+                ReleaseTreeHoldInput {
+                    released_by_actor_type: released_by_type,
+                    released_by_agent_id: released_agent_id,
+                    released_by_user_id: released_user_id,
+                    released_by_run_id: None,
+                    release_reason: None,
+                    release_metadata: Some(serde_json::json!({
+                        "restoredIssueIds": restored,
+                        "restoredCount": restored.len(),
+                    })),
+                },
+            )
+            .await?;
 
         Ok(released_hold)
     }
@@ -361,13 +514,18 @@ where
         // Get active holds for this issue
         let active_holds = self.tree_hold_repository.list_active_for_issue(issue_id).await?;
 
-        // Find pause holds
+        // Find pause holds. Paperclip also reports whether the gated issue is
+        // the hold root, so callers can distinguish a directly-held issue from
+        // one paused by ancestor propagation.
         for hold in active_holds {
             if hold.mode == IssueTreeControlMode::Pause {
                 return Ok(Some(ActiveIssueTreePauseHoldGate {
                     hold_id: hold.id,
                     root_issue_id: hold.root_issue_id,
+                    issue_id,
+                    is_root: hold.root_issue_id == issue_id,
                     mode: hold.mode,
+                    reason: hold.reason,
                     release_policy: hold.release_policy.0,
                     created_at: hold.created_at,
                 }));

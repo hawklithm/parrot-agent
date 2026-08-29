@@ -2,14 +2,20 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Issue tree control mode
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[sqlx(type_name = "issue_tree_control_mode", rename_all = "lowercase")]
 pub enum IssueTreeControlMode {
     Pause,
     Resume,
     Cancel,
     Restore,
+}
+
+impl Default for IssueTreeControlMode {
+    fn default() -> Self {
+        IssueTreeControlMode::Pause
+    }
 }
 
 /// Issue tree hold release policy strategy
@@ -41,16 +47,29 @@ pub struct IssueTreeHold {
     pub reason: Option<String>,
     pub release_policy: sqlx::types::Json<IssueTreeHoldReleasePolicy>,
     pub metadata: Option<serde_json::Value>,
-    pub actor_agent_id: Option<Uuid>,
-    pub actor_user_id: Option<Uuid>,
+    pub created_by_actor_type: String,
+    pub created_by_agent_id: Option<Uuid>,
+    pub created_by_user_id: Option<String>,
+    pub created_by_run_id: Option<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub released_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub released_by_actor_type: Option<String>,
+    pub released_by_agent_id: Option<Uuid>,
+    pub released_by_user_id: Option<String>,
+    pub released_by_run_id: Option<Uuid>,
+    pub release_reason: Option<String>,
+    pub release_metadata: Option<serde_json::Value>,
+    /// Set when applying the tree-wide status transition failed. The hold row
+    /// stays active so an operator can retry the apply instead of silently
+    /// leaving the subtree in a half-applied state.
+    pub apply_error: Option<String>,
 }
 
 /// Issue tree hold status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[sqlx(type_name = "issue_tree_hold_status", rename_all = "lowercase")]
 pub enum IssueTreeHoldStatus {
     Active,
     Released,
@@ -64,9 +83,9 @@ pub struct IssueTreeHoldMember {
     pub id: Uuid,
     pub hold_id: Uuid,
     pub issue_id: Uuid,
-    pub previous_status: String,
     pub company_id: Uuid,
     pub parent_issue_id: Option<Uuid>,
+    pub depth: i32,
     pub issue_identifier: Option<String>,
     pub issue_title: String,
     pub issue_status: String,
@@ -74,9 +93,14 @@ pub struct IssueTreeHoldMember {
     pub assignee_user_id: Option<Uuid>,
     pub active_run_id: Option<Uuid>,
     pub active_run_status: Option<String>,
-    pub depth: i32,
     pub skipped: bool,
     pub skip_reason: Option<String>,
+    /// Issue status observed when the hold was applied. Used by the release
+    /// path to restore members to their pre-hold status instead of leaving
+    /// them in the held status.
+    pub previous_status: Option<String>,
+    /// Timestamp of the successful restore performed during hold release.
+    pub restored_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -141,7 +165,10 @@ pub type HoldReleasePolicyStrategy = IssueTreeHoldReleasePolicyStrategy;
 pub struct ActiveIssueTreePauseHoldGate {
     pub hold_id: Uuid,
     pub root_issue_id: Uuid,
+    pub issue_id: Uuid,
+    pub is_root: bool,
     pub mode: IssueTreeControlMode,
+    pub reason: Option<String>,
     pub release_policy: IssueTreeHoldReleasePolicy,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
