@@ -575,6 +575,65 @@ fn document_revision_creator(actor: &AuthorizationActor) -> (Option<&'static str
     }
 }
 
+/// Expire pending `request_confirmation` interactions whose bound issue-document
+/// target has been superseded by a newer revision.
+///
+/// Paperclip expires these as part of the document write
+/// (`expireStaleRequestConfirmationTarget`), otherwise an agent is left
+/// confirming a revision that no longer exists. Best-effort: an expiry failure
+/// must not fail the document write that triggered it, but it is logged and
+/// surfaced in the response so the drift is observable.
+async fn expire_stale_document_confirmations(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    issue_id: Uuid,
+    document_key: &str,
+    current_revision_id: Option<Uuid>,
+) -> usize {
+    let (resolver_type, resolver_id, run_id) = match actor {
+        AuthorizationActor::Board { user_id, .. } => ("user", *user_id, None),
+        AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => ("agent", *agent_id, *run_id),
+        AuthorizationActor::None => return 0,
+    };
+    let service = services::IssueThreadInteractionService::new(state.pool.clone());
+    match service
+        .expire_stale_request_confirmations_for_issue_document(
+            issue_id,
+            Some(document_key.to_string()),
+            current_revision_id,
+            services::issue_thread_interaction_service::InteractionResolver {
+                resolver_type: resolver_type.to_string(),
+                resolver_id: resolver_id.to_string(),
+                run_id,
+            },
+        )
+        .await
+    {
+        Ok(expired) => {
+            if !expired.is_empty() {
+                tracing::info!(
+                    issue_id = %issue_id,
+                    document_key = %document_key,
+                    count = expired.len(),
+                    "expired stale request-confirmation interactions after a document revision"
+                );
+            }
+            expired.len()
+        }
+        Err(error) => {
+            tracing::warn!(
+                issue_id = %issue_id,
+                document_key = %document_key,
+                error = %error,
+                "failed to expire stale request-confirmation interactions"
+            );
+            0
+        }
+    }
+}
+
 fn document_database_error(error: sqlx::Error, operation: &str, issue_id: Uuid) -> StatusCode {
     tracing::error!(error = %error, %issue_id, operation, "issue document database operation failed");
     StatusCode::INTERNAL_SERVER_ERROR
@@ -696,10 +755,11 @@ async fn upsert_issue_document(
         (document_id, 1)
     };
     let (created_by_type, created_by_id) = document_revision_creator(&actor);
-    sqlx::query(
+    let revision_id: Uuid = sqlx::query_scalar(
         "INSERT INTO document_revisions
            (document_id, company_id, revision_number, content, created_by_type, created_by_id)
-         VALUES ($1,$2,$3,$4,$5,$6)",
+         VALUES ($1,$2,$3,$4,$5,$6)
+         RETURNING id",
     )
     .bind(document_id)
     .bind(company_id)
@@ -707,17 +767,30 @@ async fn upsert_issue_document(
     .bind(content)
     .bind(created_by_type)
     .bind(created_by_id)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     tx.commit()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // A new revision supersedes any pending confirmation bound to an older one.
+    let expired_confirmations = expire_stale_document_confirmations(
+        &state,
+        &actor,
+        issue_id,
+        &key,
+        Some(revision_id),
+    )
+    .await;
+
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
             "id": document_id, "issueId": issue_id, "key": key, "content": content,
             "body": content, "contentType": content_type, "format": "markdown", "revisionNumber": revision_number,
+            "revisionId": revision_id,
+            "expiredConfirmations": expired_confirmations,
         })),
     ))
 }
@@ -807,10 +880,11 @@ async fn restore_issue_document_revision(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (created_by_type, created_by_id) = document_revision_creator(&actor);
-    sqlx::query(
+    let restored_revision_id: Uuid = sqlx::query_scalar(
         "INSERT INTO document_revisions
            (document_id, company_id, revision_number, content, created_by_type, created_by_id)
-         VALUES ($1,$2,$3,$4,$5,$6)",
+         VALUES ($1,$2,$3,$4,$5,$6)
+         RETURNING id",
     )
     .bind(document_id)
     .bind(company_id)
@@ -818,12 +892,24 @@ async fn restore_issue_document_revision(
     .bind(&content)
     .bind(created_by_type)
     .bind(created_by_id)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     tx.commit()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // A restore also produces a new revision, so it supersedes confirmations
+    // bound to whatever revision was current before.
+    let expired_confirmations = expire_stale_document_confirmations(
+        &state,
+        &actor,
+        issue_id,
+        &key,
+        Some(restored_revision_id),
+    )
+    .await;
+
     Ok(Json(
         serde_json::json!({
             "restored": true,
@@ -833,8 +919,10 @@ async fn restore_issue_document_revision(
             "revisionNumber": revision,
             "restoredFromRevisionId": revision_id,
             "restoredFromRevisionNumber": source_revision_number,
+            "restoredRevisionId": restored_revision_id,
             "content": content,
-            "body": content
+            "body": content,
+            "expiredConfirmations": expired_confirmations,
         }),
     ))
 }
