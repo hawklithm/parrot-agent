@@ -2398,21 +2398,19 @@ async fn checkout_issue(
     )
     .await;
 
-    if should_wake_assignee {
-        if let Some(agent_id) = checkout_agent_id {
-            publish_issue_event(
-                &state,
-                &actor,
+    if let Some(agent_id) = checkout_agent_id {
+        publish_issue_event(
+            &state,
+            &actor,
+            company_id,
+            IssueEvent::CheckedOut {
+                issue_id: id,
                 company_id,
-                IssueEvent::CheckedOut {
-                    issue_id: id,
-                    company_id,
-                    agent_id,
-                    checked_out_by: actor.principal_id().unwrap_or(agent_id),
-                },
-            )
-            .await;
-        }
+                agent_id,
+                checked_out_by: actor.principal_id().unwrap_or(agent_id),
+            },
+        )
+        .await;
     }
 
     // Paperclip wakes the assignee after a successful checkout so the agent
