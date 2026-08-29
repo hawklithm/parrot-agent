@@ -199,9 +199,9 @@ impl CompanySkillRepository for PgCompanySkillRepository {
 
         let row: JsonValue = sqlx::query_scalar(
             r#"
-            INSERT INTO company_skills (company_id, catalog_id, name, slug, description, category,
+            INSERT INTO company_skills (company_id, key, catalog_id, name, slug, description, category,
                                         version, tags, config, status, is_paperclip_managed)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, format('company/%s/%s', $1, $4), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING jsonb_build_object(
                 'id', id,
                 'companyId', company_id,
@@ -471,8 +471,8 @@ impl CompanySkillRepository for PgCompanySkillRepository {
         // Install all skills from a catalog into the company
         let rows: Vec<JsonValue> = sqlx::query_scalar(
             r#"
-            INSERT INTO company_skills (company_id, catalog_id, name, slug, description, category, is_paperclip_managed)
-            SELECT $1, sc.id, sc.name, LOWER(REPLACE(sc.name, ' ', '-')), sc.description, sc.category, sc.is_paperclip_managed
+            INSERT INTO company_skills (company_id, key, catalog_id, name, slug, description, category, is_paperclip_managed)
+            SELECT $1, format('company/%s/%s', $1, LOWER(REPLACE(sc.name, ' ', '-'))), sc.id, sc.name, LOWER(REPLACE(sc.name, ' ', '-')), sc.description, sc.category, sc.is_paperclip_managed
             FROM skill_catalogs sc
             WHERE sc.id = $2
             AND NOT EXISTS (

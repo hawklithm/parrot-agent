@@ -310,7 +310,12 @@ async fn skill_import_scan_and_install_catalog_match_paperclip() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "scan projects → 200");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scan projects → 200: {}",
+        String::from_utf8_lossy(&body)
+    );
     let scan = parse(&body);
     assert_eq!(scan["projectsScanned"], 1, "one project scanned");
     assert_eq!(scan["workspaceCount"], 1, "one project workspace");
@@ -348,6 +353,220 @@ async fn skill_import_scan_and_install_catalog_match_paperclip() {
     assert_eq!(status, StatusCode::FORBIDDEN, "cross-company scan → 403");
 
     cleanup_fixture(&f).await;
+}
+
+#[tokio::test]
+async fn project_skill_scan_preview_import_and_repeat_are_idempotent() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let project_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let prefix = format!("SK{}", &company_id.simple().to_string()[..8]);
+    let workspace_root = std::env::temp_dir().join(format!("parrot-skill-scan-{workspace_id}"));
+    let review_dir = workspace_root.join(".codex").join("skills").join("review");
+    let conflict_dir = workspace_root.join(".codex").join("skills").join("conflict");
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Project Scan Co")
+        .bind(prefix)
+        .execute(&pool)
+        .await
+        .expect("insert scan company");
+    sqlx::query("INSERT INTO projects (id, company_id, name) VALUES ($1, $2, $3)")
+        .bind(project_id)
+        .bind(company_id)
+        .bind("Project Scan")
+        .execute(&pool)
+        .await
+        .expect("insert scan project");
+    sqlx::query(
+        "INSERT INTO project_workspaces (id, company_id, project_id, name, config) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(workspace_id)
+    .bind(company_id)
+    .bind(project_id)
+    .bind("Local workspace")
+    .bind(json!({ "cwd": workspace_root.to_string_lossy() }))
+    .execute(&pool)
+    .await
+    .expect("insert scan workspace");
+    sqlx::query(
+        "INSERT INTO company_skills (id, company_id, name, slug, description, category) \
+         VALUES ($1, $2, 'Existing conflict', 'conflict', 'Already installed', 'ops')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("insert conflict skill");
+
+    tokio::fs::create_dir_all(review_dir.join("references"))
+        .await
+        .expect("create review skill directory");
+    tokio::fs::create_dir_all(&conflict_dir)
+        .await
+        .expect("create conflict skill directory");
+    tokio::fs::write(
+        review_dir.join("SKILL.md"),
+        "---\nname: Review Skill\nslug: review\ndescription: Review changes\n---\n\n# Review\n",
+    )
+    .await
+    .expect("write review skill");
+    tokio::fs::write(
+        review_dir.join("references").join("checklist.md"),
+        "- inspect the diff\n",
+    )
+    .await
+    .expect("write review reference");
+    tokio::fs::write(
+        conflict_dir.join("SKILL.md"),
+        "---\nname: Conflict\nslug: conflict\ndescription: Conflicts with an existing skill\n---\n",
+    )
+    .await
+    .expect("write conflict skill");
+
+    let state = build_app_state(pool.clone()).await.expect("build_app_state");
+    let app = skill_routes().with_state(state);
+    let board = board_actor(Uuid::new_v4(), company_id);
+
+    let (status, body) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{company_id}/skills/scan-projects"),
+        Some(json!({ "mode": "preview" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preview scan");
+    let preview = parse(&body);
+    assert_eq!(preview["discovered"], 2);
+    assert_eq!(preview["imported"].as_array().unwrap().len(), 0);
+    assert_eq!(preview["candidates"][0]["status"], "conflict");
+    assert_eq!(preview["candidates"][1]["status"], "new");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM company_skills WHERE company_id = $1 AND slug = 'review'",
+    )
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count preview skills");
+    assert_eq!(count, 0, "preview must not persist a skill");
+
+    let selection = json!({
+        "mode": "import",
+        "selection": [{
+            "workspaceId": workspace_id,
+            "path": ".codex/skills/review"
+        }]
+    });
+    let scan_uri = format!("/companies/{company_id}/skills/scan-projects");
+    let ((left_status, left_body), (right_status, right_body)) = tokio::join!(
+        send(
+            &app,
+            &board,
+            "POST",
+            &scan_uri,
+            Some(selection.clone()),
+        ),
+        send(
+            &app,
+            &board,
+            "POST",
+            &scan_uri,
+            Some(selection.clone()),
+        )
+    );
+    assert_eq!(left_status, StatusCode::OK, "first concurrent import scan");
+    assert_eq!(right_status, StatusCode::OK, "second concurrent import scan");
+    let left = parse(&left_body);
+    let right = parse(&right_body);
+    assert_eq!(
+        left["imported"].as_array().unwrap().len()
+            + right["imported"].as_array().unwrap().len(),
+        1,
+        "concurrent import creates one row"
+    );
+    assert_eq!(
+        left["updated"].as_array().unwrap().len()
+            + right["updated"].as_array().unwrap().len(),
+        1,
+        "concurrent import updates the converged row"
+    );
+    assert_eq!(left["conflicts"].as_array().unwrap().len(), 0);
+    assert_eq!(right["conflicts"].as_array().unwrap().len(), 0);
+    let skill_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM company_skills WHERE company_id = $1 AND slug = 'review'",
+    )
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load imported skill id");
+    let persisted: (String, String, Value) = sqlx::query_as(
+        "SELECT slug, source_locator, file_inventory FROM company_skills WHERE id = $1",
+    )
+    .bind(skill_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load imported skill");
+    assert_eq!(persisted.0, "review");
+    assert!(persisted.1.ends_with(".codex\\skills\\review") || persisted.1.ends_with(".codex/skills/review"));
+    assert_eq!(persisted.2.as_array().unwrap().len(), 2);
+    let file_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM skill_files WHERE company_id = $1 AND skill_id = $2",
+    )
+    .bind(company_id)
+    .bind(skill_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count imported files");
+    assert_eq!(file_count, 2);
+
+    tokio::fs::write(
+        review_dir.join("SKILL.md"),
+        "---\nname: Review Skill\nslug: review\ndescription: Updated review\n---\n\n# Updated Review\n",
+    )
+    .await
+    .expect("update review skill");
+    let (status, body) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{company_id}/skills/scan-projects"),
+        Some(selection),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "repeat import scan");
+    let repeated = parse(&body);
+    assert_eq!(repeated["imported"].as_array().unwrap().len(), 0);
+    assert_eq!(repeated["updated"].as_array().unwrap().len(), 1);
+    let skill_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM company_skills WHERE company_id = $1 AND slug = 'review'",
+    )
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count repeated skills");
+    assert_eq!(skill_count, 1, "repeat import must update, not duplicate");
+
+    let _ = tokio::fs::remove_dir_all(&workspace_root).await;
+    let _ = sqlx::query("DELETE FROM project_workspaces WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM projects WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM company_skills WHERE company_id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company_id)
+        .execute(&pool)
+        .await;
 }
 
 /// #124 follow-up — independent (standalone) skill creation must persist a
