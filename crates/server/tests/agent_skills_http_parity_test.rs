@@ -14,7 +14,6 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use sqlx::Row;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
@@ -74,11 +73,15 @@ struct Fixture {
     pool: PgPool,
     company_a: Uuid,
     agent_a: Uuid,
+    skill_a: Uuid,
+    release_version_a: Uuid,
 }
 
 async fn seed_fixture(pool: &PgPool) -> Fixture {
     let company_a = Uuid::new_v4();
     let agent_a = Uuid::new_v4();
+    let skill_a = Uuid::new_v4();
+    let release_version_a = Uuid::new_v4();
     sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
         .bind(company_a)
         .bind("Agent Skills Parity Co")
@@ -93,14 +96,44 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         .execute(pool)
         .await
         .expect("insert agent");
+    sqlx::query(
+        "INSERT INTO company_skills (id, company_id, name, slug, description, category, version, status) \
+         VALUES ($1, $2, 'Docs', 'docs.read', 'Read docs.', 'docs', '1.0.0', 'active')",
+    )
+    .bind(skill_a)
+    .bind(company_a)
+    .execute(pool)
+    .await
+    .expect("insert company skill");
+    sqlx::query(
+        "INSERT INTO skill_versions \
+            (id, company_id, skill_id, version, release_id, release_name, released_at) \
+         VALUES ($1, $2, $3, '1.0.0', 'docs-v1', 'Docs v1 - stable', '2026-08-01T00:00:00Z')",
+    )
+    .bind(release_version_a)
+    .bind(company_a)
+    .bind(skill_a)
+    .execute(pool)
+    .await
+    .expect("insert release version");
     Fixture {
         pool: pool.clone(),
         company_a,
         agent_a,
+        skill_a,
+        release_version_a,
     }
 }
 
 async fn cleanup_fixture(f: &Fixture) {
+    let _ = sqlx::query("DELETE FROM skill_versions WHERE id = $1")
+        .bind(f.release_version_a)
+        .execute(&f.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM company_skills WHERE id = $1")
+        .bind(f.skill_a)
+        .execute(&f.pool)
+        .await;
     let _ = sqlx::query("DELETE FROM agents WHERE id = $1")
         .bind(f.agent_a)
         .execute(&f.pool)
@@ -179,7 +212,36 @@ async fn agent_skills_sync_materialize_and_rollback_match_paperclip() {
         "sync replaces the desired set"
     );
 
-    // 3. GET returns the materialized snapshot.
+    // 3. A Paperclip release pin is persisted and returned without changing
+    // the legacy desiredSkills key projection.
+    let (status, body) = send(
+        &app,
+        &board,
+        "POST",
+        &sync_uri,
+        Some(json!({
+            "desiredSkills": [{
+                "key": "docs.read",
+                "versionId": f.release_version_a
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "skill release pin sync → 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let snapshot = parse(&body);
+    assert_eq!(snapshot["desiredSkills"], json!(["docs.read"]));
+    assert_eq!(
+        snapshot["desiredSkillEntries"],
+        json!([{"key": "docs.read", "versionId": f.release_version_a}])
+    );
+    assert_eq!(snapshot["entries"][0]["versionId"], f.release_version_a.to_string());
+
+    // 4. GET returns the materialized snapshot.
     let (status, body) = send(
         &app,
         &board,
@@ -190,9 +252,9 @@ async fn agent_skills_sync_materialize_and_rollback_match_paperclip() {
     .await;
     assert_eq!(status, StatusCode::OK, "get skills → 200");
     let snapshot = parse(&body);
-    assert_eq!(snapshot["desiredSkills"], json!(["docs.read", "web.search"]));
+    assert_eq!(snapshot["desiredSkills"], json!(["docs.read"]));
 
-    // 4. Cross-company actor cannot read or sync (agent:read / agent:update).
+    // 5. Cross-company actor cannot read or sync (agent:read / agent:update).
     let outsider = session_board_actor(Uuid::new_v4(), Uuid::new_v4());
     let (status, _) = send(
         &app,

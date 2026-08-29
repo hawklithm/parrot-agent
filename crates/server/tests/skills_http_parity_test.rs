@@ -72,11 +72,13 @@ struct Fixture {
     pool: PgPool,
     company_a: Uuid,
     skill_a: Uuid,
+    release_version_a: Uuid,
 }
 
 async fn seed_fixture(pool: &PgPool) -> Fixture {
     let company_a = Uuid::new_v4();
     let skill_a = Uuid::new_v4();
+    let release_version_a = Uuid::new_v4();
     let project_a = Uuid::new_v4();
     let prefix = format!("SK{}", &company_a.simple().to_string()[..8]);
 
@@ -100,6 +102,17 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .execute(pool)
     .await
     .expect("insert company skill");
+    sqlx::query(
+        "INSERT INTO skill_versions \
+            (id, company_id, skill_id, version, release_id, release_name, released_at) \
+         VALUES ($1, $2, $3, '2.1.0', 'release-cut-v1', 'Release cut v1 - stable', '2026-08-01T00:00:00Z')",
+    )
+    .bind(release_version_a)
+    .bind(company_a)
+    .bind(skill_a)
+    .execute(pool)
+    .await
+    .expect("insert release version");
 
     // A project + workspace for the scan surface (#128).
     sqlx::query("INSERT INTO projects (id, company_id, name) VALUES ($1, $2, $3)")
@@ -124,10 +137,15 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         pool: pool.clone(),
         company_a,
         skill_a,
+        release_version_a,
     }
 }
 
 async fn cleanup_fixture(f: &Fixture) {
+    let _ = sqlx::query("DELETE FROM skill_versions WHERE id = $1")
+        .bind(f.release_version_a)
+        .execute(&f.pool)
+        .await;
     let _ = sqlx::query("DELETE FROM project_workspaces WHERE company_id = $1")
         .bind(f.company_a)
         .execute(&f.pool)
@@ -206,8 +224,8 @@ async fn company_skills_list_detail_versions_and_authz_match_paperclip() {
     assert_eq!(detail["id"], f.skill_a.to_string());
     assert_eq!(detail["installCount"], 7);
 
-    // 3. Versions list is reachable (empty here).
-    let (status, _) = send(
+    // 3. Versions list exposes the Paperclip release projection.
+    let (status, body) = send(
         &app,
         &board,
         "GET",
@@ -216,6 +234,11 @@ async fn company_skills_list_detail_versions_and_authz_match_paperclip() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "skill versions → 200");
+    let versions = parse(&body);
+    assert_eq!(versions.as_array().expect("versions array").len(), 1);
+    assert_eq!(versions[0]["releaseId"], "release-cut-v1");
+    assert_eq!(versions[0]["releaseName"], "Release cut v1 - stable");
+    assert_eq!(versions[0]["companySkillId"], f.skill_a.to_string());
 
     // 4. Categories are company-scoped and reachable.
     let (status, _) = send(

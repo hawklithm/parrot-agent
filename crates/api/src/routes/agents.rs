@@ -647,15 +647,25 @@ async fn sync_agent_skills(
     }
 
     // 同步技能：把 desiredSkills 写入 adapter_config.desired_skills 并返回最新快照。
-    // 元素支持字符串 key 或 { key } 对象（web-ui syncSkills 契约）。
-    let desired_skills: Vec<String> = body
+    // 元素支持旧字符串 key 或带 versionId 的对象。
+    let desired_skills: Vec<models::AgentDesiredSkillEntry> = body
         .desired_skills
         .iter()
         .filter_map(|value| {
-            value
-                .as_str()
-                .map(String::from)
-                .or_else(|| value.get("key").and_then(|k| k.as_str()).map(String::from))
+            if let Some(key) = value.as_str() {
+                return Some(models::AgentDesiredSkillEntry {
+                    key: key.to_string(),
+                    version_id: None,
+                });
+            }
+            let key = value.get("key").and_then(|key| key.as_str())?;
+            Some(models::AgentDesiredSkillEntry {
+                key: key.to_string(),
+                version_id: value
+                    .get("versionId")
+                    .and_then(|version| version.as_str())
+                    .map(String::from),
+            })
         })
         .collect();
 

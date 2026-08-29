@@ -142,6 +142,13 @@ pub enum AgentSkillOrigin {
     ExternalUnknown,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDesiredSkillEntry {
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
 /// Agent skill entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,7 +177,7 @@ pub struct AgentSkillSnapshot {
     pub supported: bool,
     pub mode: AgentSkillSyncMode,
     pub desired_skills: Vec<String>,
-    pub desired_skill_entries: Option<Vec<String>>,
+    pub desired_skill_entries: Option<Vec<AgentDesiredSkillEntry>>,
     pub entries: Vec<AgentSkillEntry>,
     pub warnings: Vec<String>,
 }

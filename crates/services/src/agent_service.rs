@@ -70,6 +70,33 @@ pub struct NormalizedAgentRow {
     pub org_chain_health: f32,
 }
 
+fn parse_desired_skill_entries(value: Option<&serde_json::Value>) -> Vec<models::AgentDesiredSkillEntry> {
+    let mut entries = Vec::new();
+    for raw in value.and_then(serde_json::Value::as_array).into_iter().flatten() {
+        let (key, version_id) = if let Some(key) = raw.as_str() {
+            (key.to_string(), None)
+        } else if let Some(object) = raw.as_object() {
+            let Some(key) = object.get("key").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let version_id = object
+                .get("versionId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            (key.to_string(), version_id)
+        } else {
+            continue;
+        };
+
+        let key = key.trim().to_string();
+        if key.is_empty() || entries.iter().any(|entry: &models::AgentDesiredSkillEntry| entry.key == key) {
+            continue;
+        }
+        entries.push(models::AgentDesiredSkillEntry { key, version_id });
+    }
+    entries
+}
+
 /// AgentService trait - Agent 业务逻辑服务
 #[async_trait]
 pub trait AgentService: Send + Sync {
@@ -128,7 +155,7 @@ pub trait AgentService: Send + Sync {
     async fn sync_skills(
         &self,
         agent_id: Uuid,
-        desired_skills: Vec<String>,
+        desired_skills: Vec<models::AgentDesiredSkillEntry>,
     ) -> Result<models::AgentSkillSnapshot, ServiceError>;
 
     /// Remove a skill from the agent's desired runtime skill configuration.
@@ -1021,26 +1048,21 @@ where
         // 获取Agent信息
         let agent = self.repository.get_by_id(agent_id).await?;
 
-        // 解析adapter_config中的desired_skills（如果存在）
-        let desired_skills = agent
-            .adapter_config
-            .0
-            .get("desired_skills")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
+        let desired_skill_entries = parse_desired_skill_entries(
+            agent.adapter_config.0.get("desired_skills"),
+        );
+        let desired_skills = desired_skill_entries
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect::<Vec<_>>();
 
         // 构建技能条目（简化实现，实际应查询skill表）
-        let entries = desired_skills
+        let entries = desired_skill_entries
             .iter()
-            .map(|name| models::AgentSkillEntry {
-                key: name.clone(),
-                runtime_name: Some(name.clone()),
-                version_id: None,
+            .map(|entry| models::AgentSkillEntry {
+                key: entry.key.clone(),
+                runtime_name: Some(entry.key.clone()),
+                version_id: entry.version_id.clone(),
                 current_version_id: None,
                 desired: true,
                 managed: true,
@@ -1061,7 +1083,7 @@ where
             supported: true,
             mode: models::AgentSkillSyncMode::Persistent,
             desired_skills,
-            desired_skill_entries: None,
+            desired_skill_entries: Some(desired_skill_entries),
             entries,
             warnings: vec![],
         })
@@ -1070,16 +1092,60 @@ where
     async fn sync_skills(
         &self,
         agent_id: Uuid,
-        desired_skills: Vec<String>,
+        desired_skills: Vec<models::AgentDesiredSkillEntry>,
     ) -> Result<models::AgentSkillSnapshot, ServiceError> {
         let mut agent = self.repository.get_by_id(agent_id).await?;
+        for entry in &desired_skills {
+            let Some(version_id) = entry.version_id.as_deref() else {
+                continue;
+            };
+            let version_id = Uuid::parse_str(version_id).map_err(|_| {
+                ServiceError::InvalidInput(format!("Invalid skill version id for '{}'", entry.key))
+            })?;
+            let exists: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM skill_versions sv
+                    JOIN company_skills cs
+                      ON cs.id = sv.skill_id
+                     AND cs.company_id = $2
+                    WHERE sv.id = $1
+                      AND (cs.key = $3 OR cs.slug = $3)
+                )
+                "#,
+            )
+            .bind(version_id)
+            .bind(agent.company_id)
+            .bind(&entry.key)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| ServiceError::Internal(format!("Failed to validate skill version: {error}")))?;
+            if !exists {
+                return Err(ServiceError::InvalidInput(format!(
+                    "Skill version does not belong to '{}'",
+                    entry.key
+                )));
+            }
+        }
         let mut adapter_config = agent.adapter_config.0;
-        adapter_config["desired_skills"] = serde_json::Value::Array(
+        let has_version_pin = desired_skills.iter().any(|entry| entry.version_id.is_some());
+        adapter_config["desired_skills"] = serde_json::Value::Array(if has_version_pin {
             desired_skills
                 .iter()
-                .map(|key| serde_json::Value::String(key.clone()))
-                .collect(),
-        );
+                .map(|entry| {
+                    serde_json::json!({
+                        "key": entry.key,
+                        "versionId": entry.version_id,
+                    })
+                })
+                .collect()
+        } else {
+            desired_skills
+                .iter()
+                .map(|entry| serde_json::Value::String(entry.key.clone()))
+                .collect()
+        });
         agent.adapter_config = sqlx::types::Json(adapter_config);
         agent.updated_at = Utc::now();
         self.repository.update(agent).await?;
@@ -1098,7 +1164,10 @@ where
             .unwrap_or_default();
         let next = desired
             .iter()
-            .filter(|value| value.as_str() != Some(skill_id))
+            .filter(|value| {
+                value.as_str() != Some(skill_id)
+                    && value.get("key").and_then(|key| key.as_str()) != Some(skill_id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if next.len() == desired.len() {

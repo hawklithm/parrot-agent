@@ -516,10 +516,17 @@ impl SkillVersionRepository for PgSkillVersionRepository {
             r#"
             SELECT jsonb_build_object(
                 'id', sv.id,
-                'skillId', sv.skill_id,
-                'version', sv.version,
+                'companyId', sv.company_id,
+                'companySkillId', sv.skill_id,
+                'revisionNumber', ROW_NUMBER() OVER (PARTITION BY sv.skill_id ORDER BY sv.created_at, sv.id),
+                'label', sv.version,
+                'releaseId', sv.release_id,
+                'releaseName', sv.release_name,
+                'releasedAt', sv.released_at,
                 'files', sv.files,
-                'metadata', sv.metadata,
+                'fileInventory', '[]'::jsonb,
+                'authorAgentId', sv.created_by_agent_id,
+                'authorUserId', sv.created_by_user_id,
                 'createdAt', sv.created_at
             )
             FROM skill_versions sv
@@ -542,10 +549,22 @@ impl SkillVersionRepository for PgSkillVersionRepository {
             r#"
             SELECT jsonb_build_object(
                 'id', sv.id,
-                'skillId', sv.skill_id,
-                'version', sv.version,
+                'companyId', sv.company_id,
+                'companySkillId', sv.skill_id,
+                'revisionNumber', (
+                    SELECT COUNT(*) + 1
+                    FROM skill_versions previous
+                    WHERE previous.skill_id = sv.skill_id
+                      AND (previous.created_at, previous.id) < (sv.created_at, sv.id)
+                ),
+                'label', sv.version,
+                'releaseId', sv.release_id,
+                'releaseName', sv.release_name,
+                'releasedAt', sv.released_at,
                 'files', sv.files,
-                'metadata', sv.metadata,
+                'fileInventory', '[]'::jsonb,
+                'authorAgentId', sv.created_by_agent_id,
+                'authorUserId', sv.created_by_user_id,
                 'createdAt', sv.created_at
             )
             FROM skill_versions sv
