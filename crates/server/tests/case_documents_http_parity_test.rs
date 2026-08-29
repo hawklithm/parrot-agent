@@ -198,6 +198,7 @@ async fn case_document_crud_concurrency_lock_and_annotations_are_transactional(p
     assert_eq!(status, StatusCode::OK);
     assert_eq!(locked["lockedByType"], "user");
     assert_eq!(locked["lockedById"], fixture.board_user_id.to_string());
+    assert!(locked["lockedAt"].is_string());
 
     let (status, _) = send(
         &app,

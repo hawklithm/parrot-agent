@@ -582,11 +582,13 @@ async fn lock_case_document(
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if existing.2.is_none() {
-        sqlx::query("UPDATE documents SET locked_by_type=$2, locked_by_id=$3, locked_at=NOW(), locked_run_id=$4, updated_at=NOW() WHERE id=$1 AND company_id=$5")
+    let locked_at = if existing.2.is_none() {
+        sqlx::query_scalar("UPDATE documents SET locked_by_type=$2, locked_by_id=$3, locked_at=NOW(), locked_run_id=$4, updated_at=NOW() WHERE id=$1 AND company_id=$5 RETURNING locked_at")
             .bind(document_id).bind(actor_type).bind(actor_id).bind(run_id).bind(company_id)
-            .execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
+            .fetch_one(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        existing.2
+    };
     tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({
         "caseId": id,
@@ -594,7 +596,7 @@ async fn lock_case_document(
         "locked": true,
         "lockedByType": existing.0.or(actor_type.map(str::to_string)),
         "lockedById": existing.1.or(actor_id),
-        "lockedAt": existing.2,
+        "lockedAt": locked_at,
     })))
 }
 
