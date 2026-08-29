@@ -1668,7 +1668,7 @@ async fn create_issue(
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
     Json(mut input): Json<CreateIssueInput>,
-) -> Result<Json<Issue>, StatusCode> {
+) -> Result<impl IntoResponse, StatusCode> {
     crate::routes::assert_company_access(&actor, company_id, false)?;
     let requested_discovery = input.watchdog_discovery.take();
     if let Some(discovery) = requested_discovery.as_ref() {
@@ -1865,7 +1865,10 @@ async fn create_issue(
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                 .ok_or(StatusCode::NOT_FOUND)?;
-            return Ok(Json(duplicate_issue));
+            return Ok((
+                StatusCode::OK,
+                Json(issue_create_response(&duplicate_issue, Some("recent_open_title"))?),
+            ));
         }
         Some((connection, title_lock_key))
     } else {
@@ -1951,7 +1954,10 @@ async fn create_issue(
                 .execute(&mut *connection)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            return Ok(Json(existing_issue));
+            return Ok((
+                StatusCode::OK,
+                Json(issue_create_response(&existing_issue, Some("idempotency_key"))?),
+            ));
         }
         Some((connection, lock_key))
     } else {
@@ -2046,7 +2052,25 @@ async fn create_issue(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .unwrap_or(created.issue);
-    Ok(Json(response_issue))
+    Ok((
+        StatusCode::CREATED,
+        Json(issue_create_response(&response_issue, None)?),
+    ))
+}
+
+fn issue_create_response(issue: &Issue, deduplication_reason: Option<&str>) -> Result<Value, StatusCode> {
+    let mut response = serde_json::to_value(issue).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(reason) = deduplication_reason {
+        let object = response
+            .as_object_mut()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        object.insert("deduplicated".to_string(), Value::Bool(true));
+        object.insert(
+            "deduplicationReason".to_string(),
+            Value::String(reason.to_string()),
+        );
+    }
+    Ok(response)
 }
 
 /// GET /companies/:companyId/issues - List issues for a company
