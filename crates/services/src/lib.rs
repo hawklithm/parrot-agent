@@ -442,6 +442,7 @@ pub use job_scheduler::{
     EnvironmentHealthProber, StuckRunDetector, ConsistencyCheckJob,
     StatusCardSchedulerJob, SummarySlotFinalizerJob,
     HeartbeatRecoveryJob, SchedulerExecutionHistoryCleanupJob, SchedulerLeaseRepairJob,
+    TaskWatchdogJob,
     SecretMaterialBackfillJob, SecretProposalExpirationJob,
     RecoveryActionRetryJob,
     DecisionTrainingCommentScrubJob,

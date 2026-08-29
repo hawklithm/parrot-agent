@@ -244,6 +244,8 @@ mod tests {
             reports_to: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            pause_reason: None,
+            paused_at: None,
         };
 
         let result = repo.create(agent.clone()).await;

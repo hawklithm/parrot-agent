@@ -65,7 +65,7 @@ impl HeartbeatRunRepository for PostgresHeartbeatRunRepository {
                       started_at, finished_at, error, exit_code, context_snapshot, created_at, updated_at
                FROM heartbeat_runs
               WHERE company_id = $1
-                AND status = ANY($2)
+                AND status = ANY($2::heartbeat_run_status[])
                 AND (
                   context_snapshot->>'issueId' = ANY($3::text[])
                   OR context_snapshot->>'taskId' = ANY($3::text[])
@@ -94,7 +94,7 @@ impl HeartbeatRunRepository for PostgresHeartbeatRunRepository {
                FROM heartbeat_runs hr
                JOIN issues i ON i.execution_run_id = hr.id
               WHERE hr.company_id = $1
-                AND hr.status = ANY($2)
+                AND hr.status = ANY($2::heartbeat_run_status[])
                 AND i.id = ANY($3::uuid[])"#,
         )
         .bind(company_id)
@@ -265,7 +265,7 @@ impl IssueWatchdogRepository for PostgresIssueWatchdogRepository {
     ) -> RepositoryResult<Option<models::Issue>> {
         let issue = sqlx::query_as::<_, models::Issue>(
             r#"SELECT id, company_id, project_id, project_workspace_id, goal_id, parent_id,
-                      title, name, description, status, priority, work_mode, assignee_agent_id,
+                      title, description, status, priority, work_mode, assignee_agent_id,
                       assignee_user_id, responsible_user_id, source_trust, created_by_agent_id,
                       created_by_user_id, origin_kind, origin_id, origin_run_id, origin_fingerprint,
                       execution_workspace_id, execution_workspace_preference, execution_policy,
@@ -447,7 +447,7 @@ impl AgentWakeupRequestRepository for PostgresAgentWakeupRequestRepository {
             r#"SELECT id, company_id, agent_id, status, payload, created_at, updated_at
                FROM agent_wakeup_requests
               WHERE company_id = $1
-                AND status = ANY($2)
+                AND status = ANY($2::agent_wakeup_request_status[])
                 AND (
                   payload->>'issueId' = ANY($3::text[])
                   OR payload->>'taskId' = ANY($3::text[])

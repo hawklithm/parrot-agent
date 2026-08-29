@@ -206,6 +206,25 @@ pub struct HeartbeatRecoveryJob {
     heartbeat: Arc<DefaultHeartbeatService>,
 }
 
+/// Evaluate active issue watchdogs and reopen/create their review issues when
+/// the watched subtree has stopped.
+///
+/// Paperclip runs this inside the periodic heartbeat reconciliation loop
+/// (`reconcileTaskWatchdogs`). Parrot's `DefaultWatchdogService` implemented
+/// the full classifier and review-issue lifecycle but was never scheduled, so
+/// a stopped subtree was only noticed if some unrelated code path happened to
+/// call `evaluate_for_issue`.
+pub struct TaskWatchdogJob {
+    pool: PgPool,
+    watchdog: Arc<dyn crate::WatchdogService>,
+}
+
+impl TaskWatchdogJob {
+    pub fn new(pool: PgPool, watchdog: Arc<dyn crate::WatchdogService>) -> Self {
+        Self { pool, watchdog }
+    }
+}
+
 /// Reconcile pending recovery actions and persist retry/backoff state.
 pub struct RecoveryActionRetryJob {
     pool: PgPool,
@@ -708,6 +727,61 @@ impl ScheduledJob for HeartbeatRecoveryJob {
             .map_err(|e| e.to_string())?;
         Ok(format!(
             "reconciled {orphaned} orphaned runs, {pending} pending issues, {dependency_wakes} dependency wakes, and promoted {promoted} scheduled retries"
+        ))
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for TaskWatchdogJob {
+    fn job_name(&self) -> &str {
+        "task_watchdog"
+    }
+
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(60)
+    }
+
+    /// Evaluate every company that has an active watchdog.
+    ///
+    /// A per-company failure is logged and skipped rather than aborting the
+    /// pass: one broken company must not stop every other company's watchdogs
+    /// from being evaluated.
+    async fn execute(&self) -> Result<String, String> {
+        let company_ids =
+            sqlx::query_scalar::<_, Uuid>("SELECT DISTINCT company_id FROM issue_watchdogs WHERE status = 'active'")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("Failed to list watchdog companies: {}", e))?;
+
+        let mut evaluated = 0usize;
+        let mut failed = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        for company_id in company_ids {
+            match self.watchdog.evaluate_all(company_id).await {
+                Ok(count) => evaluated += count,
+                Err(error) => {
+                    failed += 1;
+                    let message = format!("{error}");
+                    tracing::warn!(
+                        company_id = %company_id,
+                        error = %message,
+                        "Failed to evaluate task watchdogs for company"
+                    );
+                    failures.push(message);
+                }
+            }
+        }
+
+        if failed > 0 && evaluated == 0 {
+            return Err(format!(
+                "task watchdog evaluation failed for {failed} companies: {}",
+                failures.join("; ")
+            ));
+        }
+
+        Ok(format!(
+            "evaluated {evaluated} task watchdogs across {} companies ({failed} companies failed)",
+            evaluated + failed
         ))
     }
 }

@@ -1753,6 +1753,7 @@ version = "0.1.0"
 dependencies = [
  "access",
  "api",
+ "async-trait",
  "axum",
  "chrono",
  "dotenvy",

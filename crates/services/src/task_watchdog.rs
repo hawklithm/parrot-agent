@@ -200,10 +200,10 @@ pub fn classify_subtree(input: ClassifierInput) -> ClassifierState {
         .copied()
         .filter(|id| {
             let issue = &issues_by_id[id];
-            let status = issue.status.as_str();
+            let status = issue.status;
             if matches!(
                 status,
-                "done" | "cancelled" | "in_review"
+                IssueStatus::Done | IssueStatus::Cancelled | IssueStatus::InReview
             ) {
                 return false;
             }
@@ -258,7 +258,7 @@ pub fn classify_subtree(input: ClassifierInput) -> ClassifierState {
                 issue_id: issue.id,
                 identifier: issue.identifier.clone(),
                 title: issue.title.clone(),
-                status: issue.status.clone(),
+                status: issue.status.to_string(),
                 assignee_agent_id: issue.assignee_agent_id,
                 assignee_user_id: issue.assignee_user_id,
                 blocker_issue_ids: blockers_by_issue.get(&id).cloned().unwrap_or_default(),
@@ -661,13 +661,13 @@ mod tests {
     use super::*;
     use models::task_watchdog::TaskWatchdogClassifierIssue;
 
-    fn make_issue(id: Uuid, parent_id: Option<Uuid>, status: &str, origin_kind: Option<&str>) -> TaskWatchdogClassifierIssue {
+    fn make_issue(id: Uuid, parent_id: Option<Uuid>, status: IssueStatus, origin_kind: Option<&str>) -> TaskWatchdogClassifierIssue {
         TaskWatchdogClassifierIssue {
             id,
             company_id: Uuid::nil(),
             identifier: None,
             title: format!("Issue {}", id),
-            status: status.to_string(),
+            status,
             parent_id,
             assignee_agent_id: None,
             assignee_user_id: None,
@@ -708,7 +708,7 @@ mod tests {
             watchdog_issue_id: root_id,
             company_id: Uuid::nil(),
             last_reviewed_fingerprint: None,
-            issues: vec![make_issue(root_id, None, "todo", Some("task_watchdog"))],
+            issues: vec![make_issue(root_id, None, IssueStatus::Todo, Some("task_watchdog"))],
             live_run_issue_ids: vec![],
             live_wake_issue_ids: vec![],
             blockers: vec![],
@@ -731,8 +731,8 @@ mod tests {
             company_id: Uuid::nil(),
             last_reviewed_fingerprint: None,
             issues: vec![
-                make_issue(root_id, None, "todo", None),
-                make_issue(child_id, Some(root_id), "in_progress", None),
+                make_issue(root_id, None, IssueStatus::Todo, None),
+                make_issue(child_id, Some(root_id), IssueStatus::InProgress, None),
             ],
             live_run_issue_ids: vec![child_id],
             live_wake_issue_ids: vec![],
@@ -761,8 +761,8 @@ mod tests {
             company_id: Uuid::nil(),
             last_reviewed_fingerprint: None,
             issues: vec![
-                make_issue(root_id, None, "todo", None),
-                make_issue(leaf_id, Some(root_id), "done", None),
+                make_issue(root_id, None, IssueStatus::Todo, None),
+                make_issue(leaf_id, Some(root_id), IssueStatus::Done, None),
             ],
             live_run_issue_ids: vec![],
             live_wake_issue_ids: vec![],
@@ -792,8 +792,8 @@ mod tests {
                 format!("{}:done::::{}", leaf_id, format!("Issue {}", leaf_id))
             )),
             issues: vec![
-                make_issue(root_id, None, "todo", None),
-                make_issue(leaf_id, Some(root_id), "done", None),
+                make_issue(root_id, None, IssueStatus::Todo, None),
+                make_issue(leaf_id, Some(root_id), IssueStatus::Done, None),
             ],
             live_run_issue_ids: vec![],
             live_wake_issue_ids: vec![],

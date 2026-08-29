@@ -264,6 +264,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = parrot_server::build_app_state(pool.clone()).await?;
     state.scheduler = Some(job_scheduler.clone());
 
+    // Task watchdogs evaluate stopped subtrees and reopen their review issues.
+    // Registered after `build_app_state` because the watchdog service is
+    // constructed there; Paperclip runs the equivalent step inside its periodic
+    // heartbeat reconciliation loop.
+    job_scheduler
+        .register(Arc::new(services::TaskWatchdogJob::new(
+            pool.clone(),
+            state.watchdog_service.clone(),
+        )))
+        .await;
+
     let app: Router = create_router(state);
 
     let config = services::config::Config::load(None).unwrap_or_default();

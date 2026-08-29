@@ -15,7 +15,10 @@ pub struct TaskWatchdogClassifierIssue {
     pub company_id: Uuid,
     pub identifier: Option<String>,
     pub title: String,
-    pub status: String,
+    /// The live `issues.status` column is the `issue_status` PG enum, so this
+    /// must decode as that enum — declaring it `String` made every subtree load
+    /// fail at runtime with a mismatched-type error.
+    pub status: crate::issue::IssueStatus,
     pub parent_id: Option<Uuid>,
     pub assignee_agent_id: Option<Uuid>,
     pub assignee_user_id: Option<Uuid>,
