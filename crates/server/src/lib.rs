@@ -248,8 +248,11 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
         Arc::new(DefaultEnvironmentRuntimeService::with_pool(pool.clone()));
     let workspace_runtime_authz_service: Arc<dyn services::authorization_service::WorkspaceRuntimeServiceAuthzService> =
         Arc::new(services::authorization_service::DefaultRuntimeServiceAuthzService::with_default_policy_and_pool(pool.clone()));
+    // The pool enables comment attribution resolution (on-behalf-of user and
+    // best-effort derived author attribution).
     let issue_comment_service: Arc<dyn IssueCommentService> = Arc::new(
-        IssueCommentServiceImpl::new(issue_comment_repo.clone(), issue_repo.clone()),
+        IssueCommentServiceImpl::new(issue_comment_repo.clone(), issue_repo.clone())
+            .with_pool(pool.clone()),
     );
     let issue_tree_control_service: Arc<dyn IssueTreeControlService> = Arc::new(
         IssueTreeControlServiceImpl::new(tree_hold_repo.clone(), issue_repo.clone()),

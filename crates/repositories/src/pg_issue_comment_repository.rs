@@ -11,7 +11,17 @@ pub struct PgIssueCommentRepository {
     pool: PgPool,
 }
 
-pub const ISSUE_COMMENT_COLUMNS: &str = "id, company_id, issue_id, actor_type AS author_type, actor_id, CASE WHEN actor_type = 'agent'::comment_actor_type THEN actor_id ELSE NULL END AS author_agent_id, CASE WHEN actor_type = 'user'::comment_actor_type THEN actor_id ELSE NULL END AS author_user_id, actor_run_id AS created_by_run_id, body, NULL::jsonb AS presentation, metadata, deleted_at, deleted_by_type, deleted_by_agent_id, deleted_by_user_id, deleted_by_run_id, false AS follow_up_requested, created_at, updated_at";
+pub const ISSUE_COMMENT_COLUMNS: &str = "id, company_id, issue_id, \
+    COALESCE(author_type, actor_type::text)::comment_actor_type AS author_type, \
+    actor_id, \
+    CASE WHEN actor_type = 'agent'::comment_actor_type THEN actor_id ELSE NULL END AS author_agent_id, \
+    CASE WHEN actor_type = 'user'::comment_actor_type THEN actor_id ELSE NULL END AS author_user_id, \
+    actor_run_id AS created_by_run_id, \
+    on_behalf_of_user_id, \
+    derived_author_agent_id, derived_created_by_run_id, derived_author_source, \
+    body, NULL::jsonb AS presentation, metadata, source_trust, \
+    deleted_at, deleted_by_type, deleted_by_agent_id, deleted_by_user_id, deleted_by_run_id, \
+    false AS follow_up_requested, created_at, updated_at";
 
 impl PgIssueCommentRepository {
     pub fn new(pool: PgPool) -> Self {
@@ -24,7 +34,13 @@ impl IssueCommentRepository for PgIssueCommentRepository {
     async fn create(&self, input: CreateIssueCommentInput) -> Result<IssueComment, RepositoryError> {
         let mut tx = self.pool.begin().await.map_err(RepositoryError::DatabaseError)?;
         let comment = sqlx::query_as::<_, IssueComment>(&format!(
-            "INSERT INTO issue_comments (company_id, issue_id, body, actor_type, actor_id, actor_run_id, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {ISSUE_COMMENT_COLUMNS}"
+            "INSERT INTO issue_comments
+                (company_id, issue_id, body, actor_type, actor_id, actor_run_id, metadata,
+                 author_type, on_behalf_of_user_id,
+                 derived_author_agent_id, derived_created_by_run_id, derived_author_source,
+                 source_trust)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             RETURNING {ISSUE_COMMENT_COLUMNS}"
         ))
         .bind(input.company_id)
         .bind(input.issue_id)
@@ -33,6 +49,20 @@ impl IssueCommentRepository for PgIssueCommentRepository {
         .bind(input.actor_id)
         .bind(input.actor_run_id)
         .bind(&input.metadata)
+        .bind(input.author_type.clone().unwrap_or_else(|| {
+            match input.actor_type {
+                models::CommentActorType::Agent => "agent",
+                models::CommentActorType::User => "user",
+                models::CommentActorType::System => "system",
+                models::CommentActorType::Board => "user",
+            }
+            .to_string()
+        }))
+        .bind(input.on_behalf_of_user_id)
+        .bind(input.derived_author_agent_id)
+        .bind(input.derived_created_by_run_id)
+        .bind(input.derived_author_source.as_ref())
+        .bind(input.source_trust.as_ref())
         .fetch_one(&mut *tx)
         .await
         .map_err(RepositoryError::DatabaseError)?;

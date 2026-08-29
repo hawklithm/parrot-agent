@@ -46,6 +46,19 @@ pub trait IssueCommentService: Send + Sync {
         metadata: Option<serde_json::Value>,
     ) -> CommentServiceResult<IssueComment>;
 
+    /// Add a comment with full Paperclip attribution (author type, on-behalf-of
+    /// user, and best-effort derived author attribution).
+    async fn add_comment_attributed(
+        &self,
+        issue_id: Uuid,
+        body: String,
+        actor_type: CommentActorType,
+        actor_id: Option<Uuid>,
+        actor_run_id: Option<Uuid>,
+        metadata: Option<serde_json::Value>,
+        attribution: CommentAttribution,
+    ) -> CommentServiceResult<IssueComment>;
+
     /// List comments for an issue
     async fn list_comments(
         &self,
@@ -78,6 +91,20 @@ pub trait IssueCommentService: Send + Sync {
     ) -> CommentServiceResult<()>;
 }
 
+/// Full Paperclip-style comment attribution.
+#[derive(Debug, Clone, Default)]
+pub struct CommentAttribution {
+    /// Paperclip `authorType`; `None` falls back to the actor type.
+    pub author_type: Option<String>,
+    /// User the agent comment is posted on behalf of.
+    pub on_behalf_of_user_id: Option<String>,
+    /// Best-effort attribution for sentinel-authored comments.
+    pub derived_author_agent_id: Option<Uuid>,
+    pub derived_created_by_run_id: Option<Uuid>,
+    pub derived_author_source: Option<String>,
+    pub source_trust: Option<serde_json::Value>,
+}
+
 /// Issue Comment Service implementation
 pub struct IssueCommentServiceImpl<CR, IR>
 where
@@ -86,6 +113,11 @@ where
 {
     comment_repository: Arc<CR>,
     issue_repository: Arc<IR>,
+    /// Optional pool used to resolve comment attribution: the responsible user
+    /// an agent comment was posted on behalf of, plus best-effort derived
+    /// attribution for sentinel-authored comments. Without it, comments are
+    /// still created — just without derived attribution.
+    pool: Option<sqlx::PgPool>,
 }
 
 impl<CR, IR> IssueCommentServiceImpl<CR, IR>
@@ -97,7 +129,46 @@ where
         Self {
             comment_repository,
             issue_repository,
+            pool: None,
         }
+    }
+
+    /// Attach a pool so `add_comment` can resolve on-behalf-of attribution.
+    pub fn with_pool(mut self, pool: sqlx::PgPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Resolve the user an agent comment is posted on behalf of.
+    ///
+    /// Paperclip prefers an explicit request value and falls back to the
+    /// creating heartbeat run's responsible user. A stale or unknown run id
+    /// yields `None` rather than failing the insert.
+    async fn resolve_on_behalf_of_user_id(
+        &self,
+        company_id: Uuid,
+        actor_type: CommentActorType,
+        requested: Option<String>,
+        created_by_run_id: Option<Uuid>,
+    ) -> Option<String> {
+        if requested.is_some() {
+            return requested;
+        }
+        // Only agent comments carry derived on-behalf-of attribution.
+        if !matches!(actor_type, CommentActorType::Agent) {
+            return None;
+        }
+        let (pool, run_id) = (self.pool.as_ref()?, created_by_run_id?);
+        sqlx::query_scalar::<_, String>(
+            "SELECT responsible_user_id FROM heartbeat_runs
+              WHERE id = $1 AND company_id = $2 AND responsible_user_id IS NOT NULL",
+        )
+        .bind(run_id)
+        .bind(company_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Verify that the actor can modify the comment
@@ -154,6 +225,35 @@ where
         let issue = self.issue_repository.get_by_id(issue_id).await?
             .ok_or(CommentServiceError::IssueNotFound(issue_id))?;
 
+        let comment = self
+            .add_comment_attributed(
+                issue_id,
+                body,
+                actor_type,
+                actor_id,
+                actor_run_id,
+                metadata,
+                CommentAttribution::default(),
+            )
+            .await?;
+
+        Ok(comment)
+    }
+
+    async fn add_comment_attributed(
+        &self,
+        issue_id: Uuid,
+        body: String,
+        actor_type: CommentActorType,
+        actor_id: Option<Uuid>,
+        actor_run_id: Option<Uuid>,
+        metadata: Option<serde_json::Value>,
+        attribution: CommentAttribution,
+    ) -> CommentServiceResult<IssueComment> {
+        // Verify issue exists
+        let issue = self.issue_repository.get_by_id(issue_id).await?
+            .ok_or(CommentServiceError::IssueNotFound(issue_id))?;
+
         // Create comment
         let input = CreateIssueCommentInput {
             company_id: issue.company_id,
@@ -163,6 +263,19 @@ where
             actor_id,
             actor_run_id,
             metadata,
+            author_type: attribution.author_type,
+            on_behalf_of_user_id: self
+                .resolve_on_behalf_of_user_id(
+                    issue.company_id,
+                    actor_type,
+                    attribution.on_behalf_of_user_id,
+                    actor_run_id,
+                )
+                .await,
+            derived_author_agent_id: attribution.derived_author_agent_id,
+            derived_created_by_run_id: attribution.derived_created_by_run_id,
+            derived_author_source: attribution.derived_author_source,
+            source_trust: attribution.source_trust,
         };
 
         let comment = self.comment_repository.create(input).await?;

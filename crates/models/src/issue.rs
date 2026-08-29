@@ -474,7 +474,7 @@ pub struct AddCommentInput {
 }
 
 /// Comment actor type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
 #[sqlx(type_name = "comment_actor_type", rename_all = "lowercase")]
 pub enum CommentActorType {

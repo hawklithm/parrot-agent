@@ -14,6 +14,16 @@ pub struct CreateIssueCommentInput {
     pub actor_id: Option<Uuid>,
     pub actor_run_id: Option<Uuid>,
     pub metadata: Option<JsonValue>,
+    /// Paperclip `authorType`; defaults to the legacy `actorType` text.
+    pub author_type: Option<String>,
+    /// User the agent comment is posted on behalf of.
+    pub on_behalf_of_user_id: Option<String>,
+    /// Best-effort attribution for sentinel-authored comments.
+    pub derived_author_agent_id: Option<Uuid>,
+    pub derived_created_by_run_id: Option<Uuid>,
+    /// Stored as TEXT: `run` | `log_scan` | `best_effort`.
+    pub derived_author_source: Option<String>,
+    pub source_trust: Option<JsonValue>,
 }
 
 /// Input for updating an Issue comment

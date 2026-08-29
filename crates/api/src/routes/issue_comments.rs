@@ -21,11 +21,19 @@ use repositories::ISSUE_COMMENT_COLUMNS;
 use services::auth::AuthorizationActor;
 
 /// Add comment request
+///
+/// `actor_type`/`actor_id`/`actor_run_id` are accepted in snake_case (existing
+/// clients) or camelCase (Paperclip clients). New Paperclip fields use their
+/// canonical camelCase names.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AddCommentRequest {
     pub body: String,
+    #[serde(alias = "actor_type")]
     pub actor_type: CommentActorType,
+    #[serde(alias = "actor_id")]
     pub actor_id: Option<Uuid>,
+    #[serde(alias = "actor_run_id")]
     pub actor_run_id: Option<Uuid>,
     #[serde(default)]
     pub reopen: bool,
@@ -34,6 +42,15 @@ pub struct AddCommentRequest {
     #[serde(default)]
     pub interrupt: bool,
     pub metadata: Option<serde_json::Value>,
+    /// Paperclip `authorType`. Defaults to the actor type when omitted.
+    #[serde(default)]
+    pub author_type: Option<String>,
+    /// User this agent comment is posted on behalf of. When omitted, an agent
+    /// comment derives it from the creating heartbeat run's responsible user.
+    #[serde(default)]
+    pub on_behalf_of_user_id: Option<String>,
+    #[serde(default, alias = "source_trust")]
+    pub source_trust: Option<serde_json::Value>,
 }
 
 /// Update comment request
@@ -296,14 +313,22 @@ pub async fn add_comment(
     let actor_id = Some(authenticated_actor_id);
     let actor_run_id = req.actor_run_id.or(authenticated_run_id);
     
-    let comment = service.add_comment(
-        issue_id,
-        req.body.clone(),
-        actor_type.clone(),
-        actor_id,
-        actor_run_id,
-        req.metadata,
-    ).await?;
+    let comment = service
+        .add_comment_attributed(
+            issue_id,
+            req.body.clone(),
+            actor_type.clone(),
+            actor_id,
+            actor_run_id,
+            req.metadata,
+            services::issue_comment_service::CommentAttribution {
+                author_type: req.author_type,
+                on_behalf_of_user_id: req.on_behalf_of_user_id,
+                source_trust: req.source_trust,
+                ..Default::default()
+            },
+        )
+        .await?;
 
     // Parse Markdown agent links per Paperclip convention: [@Name](agent://<uuid>).
     let mentioned_ids = parse_mentioned_agent_ids(&req.body);

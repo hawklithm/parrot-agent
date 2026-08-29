@@ -12,6 +12,18 @@ pub enum IssueCommentAuthorType {
     System,
 }
 
+/// How a best-effort derived author attribution was recovered.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueCommentDerivedAuthorSource {
+    /// Recovered directly from the creating heartbeat run.
+    Run,
+    /// Recovered by scanning run logs.
+    LogScan,
+    /// Recovered by a heuristic that is not guaranteed to be exact.
+    BestEffort,
+}
+
 /// Issue comment presentation kind
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +114,23 @@ pub struct IssueComment {
     pub author_user_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by_run_id: Option<Uuid>,
+    /// User the agent comment was posted on behalf of. Resolved from an
+    /// explicit request value, or derived from the creating heartbeat run's
+    /// responsible user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of_user_id: Option<String>,
+    /// Best-effort attribution for comments authored by a non-human sentinel
+    /// (for example `local-board`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_author_agent_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_created_by_run_id: Option<Uuid>,
+    /// Stored as TEXT (`run` | `log_scan` | `best_effort`); parsed into
+    /// `IssueCommentDerivedAuthorSource` where the value is interpreted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_author_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_trust: Option<sqlx::types::Json<serde_json::Value>>,
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<sqlx::types::Json<IssueCommentPresentation>>,
