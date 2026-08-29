@@ -47,6 +47,7 @@ fn map_interaction_service_error(error: String) -> ApiError {
         || lower.contains("missing an items")
         || lower.contains("missing a questions")
         || lower.contains("requires an answer")
+        || lower.contains("invokable agent")
         || lower.contains("only allows one answer")
         || lower.contains("options must be selected")
         || lower.contains("options may be selected")

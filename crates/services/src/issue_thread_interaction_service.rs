@@ -15,6 +15,14 @@ pub struct IssueThreadInteractionService {
     pool: PgPool,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct InteractionAgentOrgRow {
+    id: Uuid,
+    company_id: Uuid,
+    status: String,
+    reports_to: Option<Uuid>,
+}
+
 impl IssueThreadInteractionService {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -86,13 +94,8 @@ impl IssueThreadInteractionService {
                 return Err("Tool-action confirmations cannot be addressed to agents".to_string());
             }
 
-            #[derive(sqlx::FromRow)]
-            struct AddresseeAgent {
-                company_id: Uuid,
-                status: String,
-            }
-            let addressee = sqlx::query_as::<_, AddresseeAgent>(
-                "SELECT company_id, status::text AS status FROM agents WHERE id = $1",
+            let addressee = sqlx::query_as::<_, InteractionAgentOrgRow>(
+                "SELECT id, company_id, status::text AS status, reports_to FROM agents WHERE id = $1",
             )
             .bind(addressee_agent_id)
             .fetch_optional(&self.pool)
@@ -102,10 +105,16 @@ impl IssueThreadInteractionService {
             if addressee.company_id != issue.company_id {
                 return Err("addresseeAgentId must belong to the same company".to_string());
             }
-            if matches!(addressee.status.as_str(), "paused" | "terminated" | "pending_approval") {
+            let company_agents = sqlx::query_as::<_, InteractionAgentOrgRow>(
+                "SELECT id, company_id, status::text AS status, reports_to
+                 FROM agents",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("Failed to validate interaction addressee organization: {}", e))?;
+            if let Some(reason) = interaction_agent_invokability_block(&addressee, &company_agents) {
                 return Err(format!(
-                    "addresseeAgentId must reference an invokable agent (status: {})",
-                    addressee.status
+                    "addresseeAgentId must reference an invokable agent (reason: {reason})"
                 ));
             }
         }
@@ -1522,6 +1531,43 @@ fn resolver_policy_rank(policy: &str) -> u8 {
         "human_only" => 2,
         _ => u8::MAX,
     }
+}
+
+fn interaction_agent_invokability_block(
+    agent: &InteractionAgentOrgRow,
+    company_agents: &[InteractionAgentOrgRow],
+) -> Option<&'static str> {
+    if !matches!(agent.status.as_str(), "active" | "idle" | "running" | "error") {
+        return Some(match agent.status.as_str() {
+            "paused" => "paused",
+            "terminated" => "terminated",
+            "pending_approval" => "pending_approval",
+            _ => "unknown_status",
+        });
+    }
+
+    let by_id: HashMap<Uuid, &InteractionAgentOrgRow> = company_agents
+        .iter()
+        .map(|candidate| (candidate.id, candidate))
+        .collect();
+    let mut seen = HashSet::from([agent.id]);
+    let mut current = agent;
+    while let Some(manager_id) = current.reports_to {
+        if !seen.insert(manager_id) {
+            return Some("reporting_cycle");
+        }
+        let Some(manager) = by_id.get(&manager_id).copied() else {
+            return Some("manager_missing");
+        };
+        if manager.company_id != agent.company_id {
+            return Some("manager_company_mismatch");
+        }
+        if manager.status == "terminated" {
+            return Some("manager_terminated");
+        }
+        current = manager;
+    }
+    None
 }
 
 fn resolve_resolver_policies(

@@ -380,6 +380,52 @@ async fn board_can_cancel_questions_but_agent_cannot(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn create_rejects_addressee_with_invalid_org_chain_over_http(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let manager_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, company_id, name, status, adapter_type)
+         VALUES ($1, $2, 'Terminated manager', 'terminated', 'process')",
+    )
+    .bind(manager_id)
+    .bind(fixture.company_id)
+    .execute(&pool)
+    .await
+    .expect("insert terminated manager");
+    sqlx::query(
+        "INSERT INTO agents (id, company_id, name, status, adapter_type, reports_to)
+         VALUES ($1, $2, 'Child agent', 'idle', 'process', $3)",
+    )
+    .bind(child_id)
+    .bind(fixture.company_id)
+    .bind(manager_id)
+    .execute(&pool)
+    .await
+    .expect("insert child agent");
+
+    let app = app(pool.clone()).await;
+    let (status, body) = send(
+        &app,
+        &board_actor(&fixture),
+        "POST",
+        &format!("/issues/{}/interactions", fixture.issue_id),
+        Some(json!({
+            "kind": "question",
+            "payload": {},
+            "resolverPolicy": "anyone",
+            "continuationPolicy": "none",
+            "addresseeAgentId": child_id
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(body["error"].as_str().unwrap_or_default().contains("manager_terminated"));
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
 async fn governed_tool_action_is_human_only_for_agent_resolution(pool: PgPool) {
     migrate(&pool).await;
     let fixture = seed(&pool).await;

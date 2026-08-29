@@ -283,7 +283,7 @@ async fn create_rejects_invalid_addressee_and_source_references(pool: PgPool) {
         )
         .await
         .expect_err("paused addressee must not be accepted");
-    assert!(paused_addressed.contains("invokable"));
+    assert!(paused_addressed.contains("invokable"), "{paused_addressed}");
 
     let missing_source_run = service
         .create(
@@ -327,6 +327,83 @@ async fn create_rejects_invalid_addressee_and_source_references(pool: PgPool) {
         .expect_err("source comment must belong to the issue");
     assert!(missing_source_comment.contains("sourceCommentId"));
 
+    cleanup(&pool, company_id).await;
+}
+
+#[sqlx::test]
+async fn create_rejects_addressee_with_invalid_reporting_chain(pool: PgPool) {
+    migrate(&pool).await;
+    let (company_id, issue) = seed_company_and_issue(&pool).await;
+    let manager_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, company_id, name, status, adapter_type)
+         VALUES ($1, $2, 'Terminated manager', 'terminated', 'process')",
+    )
+    .bind(manager_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("insert terminated manager");
+    sqlx::query(
+        "INSERT INTO agents (id, company_id, name, status, adapter_type, reports_to)
+         VALUES ($1, $2, 'Child agent', 'idle', 'process', $3)",
+    )
+    .bind(child_id)
+    .bind(company_id)
+    .bind(manager_id)
+    .execute(&pool)
+    .await
+    .expect("insert child agent");
+
+    let service = IssueThreadInteractionService::new(pool.clone());
+    let terminated_manager = service
+        .create(
+            &issue,
+            CreateThreadInteractionInput {
+                kind: "question".to_string(),
+                payload: serde_json::json!({}),
+                title: None,
+                summary: None,
+                continuation_policy: "none".to_string(),
+                resolver_policy: None,
+                idempotency_key: None,
+                addressee_agent_id: Some(child_id),
+                source_run_id: None,
+                source_comment_id: None,
+            },
+            InteractionCreator { agent_id: None, user_id: None },
+        )
+        .await
+        .expect_err("terminated manager must block addressee");
+    assert!(terminated_manager.contains("manager_terminated"), "{terminated_manager}");
+
+    sqlx::query("UPDATE agents SET status = 'idle', reports_to = $2 WHERE id = $1")
+        .bind(manager_id)
+        .bind(child_id)
+        .execute(&pool)
+        .await
+        .expect("create reporting cycle");
+    let reporting_cycle = service
+        .create(
+            &issue,
+            CreateThreadInteractionInput {
+                kind: "question".to_string(),
+                payload: serde_json::json!({}),
+                title: None,
+                summary: None,
+                continuation_policy: "none".to_string(),
+                resolver_policy: None,
+                idempotency_key: None,
+                addressee_agent_id: Some(child_id),
+                source_run_id: None,
+                source_comment_id: None,
+            },
+            InteractionCreator { agent_id: None, user_id: None },
+        )
+        .await
+        .expect_err("reporting cycle must block addressee");
+    assert!(reporting_cycle.contains("reporting_cycle"), "{reporting_cycle}");
     cleanup(&pool, company_id).await;
 }
 
