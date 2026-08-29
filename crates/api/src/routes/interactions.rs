@@ -21,6 +21,7 @@ fn map_interaction_service_error(error: String) -> ApiError {
     if lower.contains("already resolved")
         || lower.contains("not pending")
         || lower.contains("idempotency key conflicts")
+        || lower.contains("closed issue")
     {
         return ApiError::Conflict(error);
     }

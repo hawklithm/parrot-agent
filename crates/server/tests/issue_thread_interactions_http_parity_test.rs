@@ -498,3 +498,126 @@ async fn governed_tool_action_is_human_only_for_agent_resolution(pool: PgPool) {
     assert_eq!(accepted["interaction"]["status"], "accepted");
     cleanup(&fixture).await;
 }
+
+#[sqlx::test]
+async fn concurrent_accepts_have_one_winner_and_preserve_resolution_attribution(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let creator = board_actor(&fixture);
+    let resolver_one = AuthorizationActor::board(Uuid::new_v4(), fixture.company_id);
+    let resolver_two = AuthorizationActor::board(Uuid::new_v4(), fixture.company_id);
+    let app = app(pool.clone()).await;
+    let uri = format!("/issues/{}/interactions", fixture.issue_id);
+
+    let (status, created) = send(
+        &app,
+        &creator,
+        "POST",
+        &uri,
+        Some(json!({
+            "kind": "request_confirmation",
+            "payload": {"version": 1, "title": "Resolve once"},
+            "resolverPolicy": "anyone",
+            "continuationPolicy": "none"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let interaction_id = interaction_id(&created);
+    let accept_uri = format!("{uri}/{interaction_id}/accept");
+
+    let ((first_status, first_body), (second_status, second_body)) = tokio::join!(
+        send(&app, &resolver_one, "POST", &accept_uri, Some(json!({}))),
+        send(&app, &resolver_two, "POST", &accept_uri, Some(json!({}))),
+    );
+    let statuses = [first_status, second_status];
+    assert_eq!(statuses.iter().filter(|status| **status == StatusCode::OK).count(), 1);
+    assert_eq!(statuses.iter().filter(|status| **status == StatusCode::CONFLICT).count(), 1);
+    let winner = if first_status == StatusCode::OK { first_body } else { second_body };
+    assert_eq!(winner["interaction"]["status"], "accepted");
+
+    let row: (String, String) = sqlx::query_as(
+        "SELECT status::text, resolved_by_user_id FROM issue_thread_interactions WHERE id = $1",
+    )
+    .bind(interaction_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read resolved interaction");
+    assert_eq!(row.0, "accepted");
+    let resolver_one_id = match resolver_one {
+        AuthorizationActor::Board { user_id, .. } => user_id,
+        _ => unreachable!(),
+    };
+    let resolver_two_id = match resolver_two {
+        AuthorizationActor::Board { user_id, .. } => user_id,
+        _ => unreachable!(),
+    };
+    assert!([resolver_one_id.to_string(), resolver_two_id.to_string()].contains(&row.1));
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
+async fn closed_issues_cannot_create_or_resolve_interactions(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let actor = board_actor(&fixture);
+    let app = app(pool.clone()).await;
+    let uri = format!("/issues/{}/interactions", fixture.issue_id);
+
+    sqlx::query("UPDATE issues SET status = 'done' WHERE id = $1")
+        .bind(fixture.issue_id)
+        .execute(&pool)
+        .await
+        .expect("close issue");
+    let (status, _) = send(
+        &app,
+        &actor,
+        "POST",
+        &uri,
+        Some(json!({
+            "kind": "request_confirmation",
+            "payload": {"version": 1, "title": "Closed"},
+            "resolverPolicy": "anyone",
+            "continuationPolicy": "none"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    sqlx::query("UPDATE issues SET status = 'todo' WHERE id = $1")
+        .bind(fixture.issue_id)
+        .execute(&pool)
+        .await
+        .expect("reopen issue");
+    let (status, created) = send(
+        &app,
+        &actor,
+        "POST",
+        &uri,
+        Some(json!({
+            "kind": "request_confirmation",
+            "payload": {"version": 1, "title": "Close before accept"},
+            "resolverPolicy": "anyone",
+            "continuationPolicy": "none"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let interaction_id = interaction_id(&created);
+    sqlx::query("UPDATE issues SET status = 'done' WHERE id = $1")
+        .bind(fixture.issue_id)
+        .execute(&pool)
+        .await
+        .expect("close issue before accept");
+
+    let (status, _) = send(
+        &app,
+        &actor,
+        "POST",
+        &format!("{uri}/{interaction_id}/accept"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    cleanup(&fixture).await;
+}

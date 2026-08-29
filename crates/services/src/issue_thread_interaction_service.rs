@@ -182,6 +182,22 @@ impl IssueThreadInteractionService {
         )?;
         let now = Utc::now();
         let id = Uuid::new_v4();
+        let mut tx = self.pool.begin().await
+            .map_err(|e| format!("Failed to begin interaction creation transaction: {}", e))?;
+        let issue_status: Option<String> = sqlx::query_scalar(
+            "SELECT status::text FROM issues WHERE id = $1 AND company_id = $2 FOR UPDATE",
+        )
+        .bind(issue.id)
+        .bind(issue.company_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to lock interaction issue: {}", e))?;
+        let Some(issue_status) = issue_status else {
+            return Err("Issue not found".to_string());
+        };
+        if matches!(issue_status.as_str(), "done" | "cancelled") {
+            return Err("Cannot create an interaction on a closed issue".to_string());
+        }
         let interaction = sqlx::query_as::<_, IssueThreadInteraction>(
             r#"
             INSERT INTO issue_thread_interactions (
@@ -225,7 +241,7 @@ impl IssueThreadInteractionService {
         .bind(input.idempotency_key)
         .bind(input.payload)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| format!("Failed to create interaction: {}", e))?;
 
@@ -234,6 +250,9 @@ impl IssueThreadInteractionService {
         {
             return Err("Idempotency key conflicts with a different interaction".to_string());
         }
+
+        tx.commit().await
+            .map_err(|e| format!("Failed to commit interaction creation transaction: {}", e))?;
 
         Ok(interaction)
     }
@@ -250,10 +269,21 @@ impl IssueThreadInteractionService {
         let mut tx = self.pool.begin().await
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
-        // Load the interaction
+        // Lock the issue before the interaction. Creation and terminal issue
+        // transitions use the same issue-first order, so a resolution cannot
+        // race a close or create a new actionable card after closure.
+        let locked_issue = self.get_issue_for_update(&mut tx, issue.id).await?;
+        if locked_issue.company_id != issue.company_id {
+            return Err("Issue not found".to_string());
+        }
+        if matches!(locked_issue.status, models::IssueStatus::Done | models::IssueStatus::Cancelled) {
+            return Err("Cannot resolve an interaction on a closed issue".to_string());
+        }
+
+        // Load the interaction after the issue lock.
         let interaction = self.get_interaction_for_update(&mut tx, interaction_id).await?;
 
-        if interaction.issue_id != issue.id || interaction.company_id != issue.company_id {
+        if interaction.issue_id != locked_issue.id || interaction.company_id != locked_issue.company_id {
             return Err("Interaction not found".to_string());
         }
 
@@ -266,8 +296,8 @@ impl IssueThreadInteractionService {
         // This prevents users from making decisions based on stale workspace state
         if matches!(interaction.kind.as_str(), "request_confirmation" | "request_checkbox_confirmation") {
             assert_issue_workspace_finalized_for_accept(
-                &self.pool,
-                issue.id,
+                &mut tx,
+                locked_issue.id,
                 interaction.source_run_id,
             ).await?;
         }
@@ -275,13 +305,13 @@ impl IssueThreadInteractionService {
         // Handle different interaction kinds
         let result = match interaction.kind.as_str() {
             "suggest_tasks" => {
-                self.accept_suggest_tasks(&mut tx, issue, &interaction, &input, &resolver).await?
+                self.accept_suggest_tasks(&mut tx, &locked_issue, &interaction, &input, &resolver).await?
             }
             "request_confirmation" | "request_checkbox_confirmation" => {
-                self.accept_request_confirmation(&mut tx, issue, &interaction, &input, &resolver).await?
+                self.accept_request_confirmation(&mut tx, &locked_issue, &interaction, &input, &resolver).await?
             }
             "question" | "approval" | "review" | "item_verdict" => {
-                self.accept_simple_interaction(&mut tx, issue, &interaction, &input, &resolver).await?
+                self.accept_simple_interaction(&mut tx, &locked_issue, &interaction, &input, &resolver).await?
             }
             "withdraw" => {
                 // Withdraw is a cancellation, not an acceptance
@@ -296,6 +326,21 @@ impl IssueThreadInteractionService {
             .map_err(|e| format!("Failed to commit transaction: {}", e))?;
 
         Ok(result)
+    }
+
+    async fn get_issue_for_update(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        issue_id: Uuid,
+    ) -> Result<Issue, String> {
+        sqlx::query_as::<_, Issue>(
+            "SELECT * FROM issues WHERE id = $1 FOR UPDATE",
+        )
+        .bind(issue_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("Failed to load issue for update: {}", e))?
+        .ok_or_else(|| "Issue not found".to_string())
     }
 
     /// Get interaction with FOR UPDATE lock
@@ -681,6 +726,11 @@ impl IssueThreadInteractionService {
         let mut tx = self.pool.begin().await
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
+        let locked_issue = self.get_issue_for_update(&mut tx, issue_id).await?;
+        if matches!(&locked_issue.status, models::IssueStatus::Done | models::IssueStatus::Cancelled) {
+            return Err("Cannot resolve an interaction on a closed issue".to_string());
+        }
+
         // Load and validate the interaction
         let interaction = self.get_interaction_for_update(&mut tx, interaction_id).await?;
 
@@ -772,6 +822,11 @@ impl IssueThreadInteractionService {
         let mut tx = self.pool.begin().await
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
+        let locked_issue = self.get_issue_for_update(&mut tx, issue_id).await?;
+        if matches!(&locked_issue.status, models::IssueStatus::Done | models::IssueStatus::Cancelled) {
+            return Err("Cannot resolve an interaction on a closed issue".to_string());
+        }
+
         // Load and validate the interaction
         let interaction = self.get_interaction_for_update(&mut tx, interaction_id).await?;
 
@@ -861,8 +916,16 @@ impl IssueThreadInteractionService {
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
         let now = Utc::now();
 
+        let locked_issue = self.get_issue_for_update(&mut tx, issue.id).await?;
+        if locked_issue.company_id != issue.company_id {
+            return Err("Issue not found".to_string());
+        }
+        if matches!(&locked_issue.status, models::IssueStatus::Done | models::IssueStatus::Cancelled) {
+            return Err("Cannot resolve an interaction on a closed issue".to_string());
+        }
+
         let current = self.get_interaction_for_update(&mut tx, interaction_id).await?;
-        if current.issue_id != issue.id {
+        if current.issue_id != locked_issue.id || current.company_id != locked_issue.company_id {
             return Err("Interaction not found".to_string());
         }
         if current.status != "pending" {
@@ -1202,6 +1265,11 @@ impl IssueThreadInteractionService {
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
         let now = Utc::now();
 
+        let locked_issue = self.get_issue_for_update(&mut tx, issue_id).await?;
+        if matches!(&locked_issue.status, models::IssueStatus::Done | models::IssueStatus::Cancelled) {
+            return Err("Cannot resolve an interaction on a closed issue".to_string());
+        }
+
         let current = sqlx::query_as::<_, IssueThreadInteraction>(
             r#"
             SELECT
@@ -1292,6 +1360,11 @@ impl IssueThreadInteractionService {
     ) -> Result<IssueThreadInteraction, String> {
         let mut tx = self.pool.begin().await
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        let locked_issue = self.get_issue_for_update(&mut tx, issue_id).await?;
+        if matches!(&locked_issue.status, models::IssueStatus::Done | models::IssueStatus::Cancelled) {
+            return Err("Cannot resolve an interaction on a closed issue".to_string());
+        }
 
         // Load interaction with FOR UPDATE lock
         let interaction = sqlx::query_as::<_, IssueThreadInteraction>(

@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 /// Assert that the issue workspace is finalized before accepting an interaction
@@ -9,7 +9,7 @@ use uuid::Uuid;
 ///
 /// Reference: Paperclip issues.ts:6780-6815 (assertIssueWorkspaceFinalizedForAccept)
 pub async fn assert_issue_workspace_finalized_for_accept(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     issue_id: Uuid,
     source_run_id: Option<Uuid>,
 ) -> Result<(), String> {
@@ -20,10 +20,10 @@ pub async fn assert_issue_workspace_finalized_for_accept(
 
     // Get the issue's execution_workspace_id
     let execution_workspace_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT execution_workspace_id FROM issues WHERE id = $1"
+        "SELECT execution_workspace_id FROM issues WHERE id = $1 FOR UPDATE"
     )
     .bind(issue_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|e| format!("Failed to query issue workspace: {}", e))?
     .flatten();
@@ -40,11 +40,12 @@ pub async fn assert_issue_workspace_finalized_for_accept(
         SELECT workspace_finalized 
         FROM heartbeat_runs 
         WHERE id = $1 AND execution_workspace_id = $2
+        FOR UPDATE
         "#
     )
     .bind(run_id)
     .bind(workspace_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|e| format!("Failed to query run workspace status: {}", e))?;
 
