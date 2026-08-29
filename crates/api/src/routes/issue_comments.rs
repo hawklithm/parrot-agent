@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use url::Url;
 use uuid::Uuid;
 
 use models::{CommentActorType, IssueComment, IssueCommentAuthorType};
@@ -82,34 +83,45 @@ fn should_reopen_issue_after_comment(
 }
 
 fn parse_mentioned_agent_ids(body: &str) -> Vec<Uuid> {
-    const PREFIX: &str = "agent://";
-    const UUID_LEN: usize = 36;
     let mut mentioned_ids = Vec::new();
     let mut offset = 0;
 
-    while offset < body.len() {
-        let Some(relative_start) = body[offset..].find(PREFIX) else {
+    // Paperclip extracts agent mentions from Markdown links, rather than
+    // treating arbitrary `agent://...` text as an instruction to wake an
+    // agent. Keep the URL parser responsible for query parameters and paths.
+    while let Some(open) = body[offset..].find('[') {
+        let open = offset + open;
+        let Some(label_end) = body[open + 1..].find(']') else {
             break;
         };
-        let uuid_start = offset + relative_start + PREFIX.len();
-        let after_prefix = &body[uuid_start..];
-        let Some(candidate) = after_prefix.get(..UUID_LEN) else {
+        let link_start = open + 1 + label_end + 1;
+        if body.as_bytes().get(link_start) != Some(&b'(') {
+            offset = open + 1;
+            continue;
+        }
+        let href_start = link_start + 1;
+        let Some(href_end) = body[href_start..].find(')') else {
             break;
         };
-        let has_boundary = after_prefix.as_bytes().get(UUID_LEN)
-            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-' && *byte != b'_');
-        if has_boundary {
-            if let Ok(uuid) = Uuid::parse_str(candidate) {
-                mentioned_ids.push(uuid);
+        let href_end = href_start + href_end;
+        let href = &body[href_start..href_end];
+        if !href.chars().any(char::is_whitespace) {
+            if let Ok(url) = Url::parse(href) {
+                if url.scheme() == "agent" {
+                    let id = format!(
+                        "{}{}",
+                        url.host_str().unwrap_or_default(),
+                        url.path()
+                    )
+                    .trim_start_matches('/')
+                    .to_string();
+                    if let Ok(uuid) = Uuid::parse_str(&id) {
+                        mentioned_ids.push(uuid);
+                    }
+                }
             }
         }
-
-        let advance = after_prefix
-            .char_indices()
-            .nth(UUID_LEN)
-            .map(|(index, _)| index)
-            .unwrap_or(after_prefix.len());
-        offset = uuid_start + advance;
+        offset = href_end + 1;
     }
 
     mentioned_ids.sort_unstable();
@@ -293,7 +305,7 @@ pub async fn add_comment(
         req.metadata,
     ).await?;
 
-    // Parse agent://uuid mentions per Paperclip convention: [@Name](agent://<uuid>).
+    // Parse Markdown agent links per Paperclip convention: [@Name](agent://<uuid>).
     let mentioned_ids = parse_mentioned_agent_ids(&req.body);
 
     if !mentioned_ids.is_empty() {
@@ -836,11 +848,11 @@ mod mention_parser_tests {
     use uuid::Uuid;
 
     #[test]
-    fn parses_exact_agent_urls_and_deduplicates() {
+    fn parses_markdown_agent_links_and_deduplicates() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let body = format!(
-            "[@one](agent://{first}) [@two](agent://{second}) agent://{first}"
+            "[@one](agent://{first}?i=robot) [@two](agent://{second}) agent://{first}"
         );
 
         let parsed = parse_mentioned_agent_ids(&body);
@@ -850,11 +862,11 @@ mod mention_parser_tests {
     }
 
     #[test]
-    fn rejects_embedded_or_truncated_agent_urls() {
+    fn rejects_bare_embedded_or_truncated_agent_urls() {
         let id = Uuid::new_v4();
         let parsed = parse_mentioned_agent_ids(&format!(
-            "agent://{id}extra agent://{}",
-            &id.to_string()[..35]
+            "agent://{id}extra agent://{short} [@bad](agent://{id}extra) [@short](agent://{short})",
+            short = &id.to_string()[..35]
         ));
 
         assert!(parsed.is_empty());
