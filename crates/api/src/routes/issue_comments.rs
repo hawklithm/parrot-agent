@@ -99,15 +99,50 @@ fn should_reopen_issue_after_comment(
     reopenable && (explicit_reopen || (board_comment && has_assignee))
 }
 
-fn parse_mentioned_agent_ids(body: &str) -> Vec<Uuid> {
-    let mut mentioned_ids = Vec::new();
+/// A structured `[label](scheme://id)` mention extracted from comment markdown.
+///
+/// Paperclip's `packages/shared/src/project-mentions.ts` defines mention
+/// schemes for agents, users, projects, skills, routines and pipelines. Parrot
+/// parses the same shapes so a mention written by either client resolves
+/// identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedMention {
+    /// `agent` | `user` | `project` | `skill` | `routine` | `pipeline`
+    pub scheme: &'static str,
+    /// Raw referenced id. Not forced to a UUID: user ids are text in Paperclip.
+    pub id: String,
+}
+
+/// Extract structured mentions from comment markdown.
+///
+/// Only markdown link syntax counts; a bare `agent://<id>` in prose is not a
+/// mention, matching Paperclip. The URL parser owns query parameters, so
+/// `agent://<id>?i=icon` still resolves to `<id>`.
+pub fn parse_mentions(body: &str) -> Vec<ParsedMention> {
+    let schemes: [(&str, &str); 6] = [
+        ("agent", "agent"),
+        ("user", "user"),
+        ("project", "project"),
+        ("skill", "skill"),
+        ("routine", "routine"),
+        ("pipeline", "pipeline"),
+    ];
+    let mut mentions: Vec<ParsedMention> = Vec::new();
     let mut offset = 0;
 
-    // Paperclip extracts agent mentions from Markdown links, rather than
-    // treating arbitrary `agent://...` text as an instruction to wake an
-    // agent. Keep the URL parser responsible for query parameters and paths.
     while let Some(open) = body[offset..].find('[') {
         let open = offset + open;
+        // Paperclip's `AGENT_MENTION_LINK_RE` is `\[[^\]]*]\(agent://[^)\s]+\)`:
+        // the label excludes `]`, so with nested brackets the *innermost*
+        // opening bracket is the one that pairs with the first `]`. Advance to
+        // it so `[[nested] label](agent://id)` resolves like Paperclip does.
+        let open = match body[open + 1..].find(']') {
+            Some(label_end) => match body[open + 1..open + 1 + label_end].rfind('[') {
+                Some(inner) => open + 1 + inner,
+                None => open,
+            },
+            None => break,
+        };
         let Some(label_end) = body[open + 1..].find(']') else {
             break;
         };
@@ -124,16 +159,13 @@ fn parse_mentioned_agent_ids(body: &str) -> Vec<Uuid> {
         let href = &body[href_start..href_end];
         if !href.chars().any(char::is_whitespace) {
             if let Ok(url) = Url::parse(href) {
-                if url.scheme() == "agent" {
-                    let id = format!(
-                        "{}{}",
-                        url.host_str().unwrap_or_default(),
-                        url.path()
-                    )
-                    .trim_start_matches('/')
-                    .to_string();
-                    if let Ok(uuid) = Uuid::parse_str(&id) {
-                        mentioned_ids.push(uuid);
+                if let Some((_, scheme)) = schemes.iter().find(|(name, _)| *name == url.scheme()) {
+                    let id = format!("{}{}", url.host_str().unwrap_or_default(), url.path())
+                        .trim_start_matches('/')
+                        .to_string();
+                    if !id.is_empty() && !mentions.iter().any(|m| m.scheme == *scheme && m.id == id)
+                    {
+                        mentions.push(ParsedMention { scheme, id });
                     }
                 }
             }
@@ -141,9 +173,16 @@ fn parse_mentioned_agent_ids(body: &str) -> Vec<Uuid> {
         offset = href_end + 1;
     }
 
-    mentioned_ids.sort_unstable();
-    mentioned_ids.dedup();
-    mentioned_ids
+    mentions
+}
+
+/// Agent ids mentioned via structured `agent://` links, in document order.
+pub fn parse_mentioned_agent_ids(body: &str) -> Vec<Uuid> {
+    parse_mentions(body)
+        .into_iter()
+        .filter(|mention| mention.scheme == "agent")
+        .filter_map(|mention| Uuid::parse_str(&mention.id).ok())
+        .collect()
 }
 
 fn authenticated_comment_actor(
@@ -895,5 +934,110 @@ mod mention_parser_tests {
         ));
 
         assert!(parsed.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mention_scheme_tests {
+    use super::{parse_mentioned_agent_ids, parse_mentions, ParsedMention};
+    use uuid::Uuid;
+
+    fn schemes(body: &str) -> Vec<&'static str> {
+        parse_mentions(body)
+            .into_iter()
+            .map(|mention| mention.scheme)
+            .collect()
+    }
+
+    #[test]
+    fn parses_every_paperclip_mention_scheme() {
+        let body = "[@a](agent://11111111-1111-1111-1111-111111111111)
+                    [@u](user://user-42)
+                    [p](project://22222222-2222-2222-2222-222222222222)
+                    [s](skill://deploy)
+                    [r](routine://33333333-3333-3333-3333-333333333333)
+                    [pi](pipeline://44444444-4444-4444-4444-444444444444)";
+
+        let parsed = parse_mentions(body);
+        assert_eq!(parsed.len(), 6);
+        assert_eq!(
+            schemes(body),
+            vec!["agent", "user", "project", "skill", "routine", "pipeline"]
+        );
+
+        // User ids are text in Paperclip, so they must not be forced to UUIDs.
+        let user = parsed
+            .iter()
+            .find(|mention| mention.scheme == "user")
+            .expect("user mention");
+        assert_eq!(user.id, "user-42");
+    }
+
+    #[test]
+    fn user_mentions_do_not_wake_agents() {
+        let body = "[@u](user://user-42) [@a](agent://11111111-1111-1111-1111-111111111111)";
+        assert_eq!(schemes(&body), vec!["user", "agent"]);
+        assert_eq!(parse_mentioned_agent_ids(&body).len(), 1);
+    }
+
+    #[test]
+    fn deduplicates_repeated_identical_mentions() {
+        let id = "11111111-1111-1111-1111-111111111111";
+        let body = format!("[@a](agent://{id}) [@b](agent://{id})");
+        assert_eq!(
+            parse_mentions(&body),
+            vec![ParsedMention {
+                scheme: "agent",
+                id: id.to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn honours_query_parameters_and_paths() {
+        // Paperclip encodes the agent icon as `?i=...`; the parser must still
+        // resolve the id.
+        let id = Uuid::new_v4();
+        let body = format!("[@a](agent://{id}?i=robot&x=1)");
+        assert_eq!(parse_mentioned_agent_ids(&body), vec![id]);
+    }
+
+    #[test]
+    fn ignores_unknown_schemes_and_non_link_text() {
+        let id = Uuid::new_v4();
+        let body = format!(
+            "[@a](https://example.com/{id}) [@b](agentz://{id}) plain agent://{id} text"
+        );
+        assert!(parse_mentions(&body).is_empty());
+    }
+
+    #[test]
+    fn matches_paperclip_on_nested_and_adjacent_links() {
+        // Paperclip's `AGENT_MENTION_LINK_RE` is `\[[^\]]*]\(agent://[^)\s]+\)`.
+        // The label excludes `]`, so a nested bracket makes the outer link
+        // unmatched and only the following well-formed link resolves. Verified
+        // against that regex: it yields exactly the second id. Parrot must
+        // agree, or a migrated comment would wake the wrong agent.
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let body = format!("[[nested] label](agent://{first})[@b](agent://{second})");
+        let parsed = parse_mentioned_agent_ids(&body);
+        assert_eq!(
+            parsed,
+            vec![second],
+            "nested brackets must resolve exactly like Paperclip's regex"
+        );
+
+        // Without nesting, adjacent links each resolve.
+        let body = format!("[@a](agent://{first})[@b](agent://{second})");
+        let parsed = parse_mentioned_agent_ids(&body);
+        assert_eq!(parsed, vec![first, second]);
+    }
+
+    #[test]
+    fn empty_and_link_free_bodies_produce_no_mentions() {
+        assert!(parse_mentions("").is_empty());
+        assert!(parse_mentions("no links here").is_empty());
+        assert!(parse_mentions("[unclosed](agent://x").is_empty());
     }
 }
