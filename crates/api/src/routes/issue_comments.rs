@@ -8,7 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use models::{IssueComment, CommentActorType};
+use models::{CommentActorType, IssueComment, IssueCommentAuthorType};
 use services::{
     CommentServiceError, CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
     DefaultCrossIssueInfluenceLimitService, HeartbeatWakeupOptions,
@@ -39,13 +39,15 @@ pub struct AddCommentRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateCommentRequest {
     pub body: String,
-    pub actor_id: Uuid,
+    #[serde(default)]
+    pub actor_id: Option<Uuid>,
 }
 
 /// Delete comment request
 #[derive(Debug, Deserialize)]
 pub struct DeleteCommentRequest {
-    pub actor_id: Uuid,
+    #[serde(default)]
+    pub actor_id: Option<Uuid>,
 }
 
 /// Comment pagination query
@@ -115,6 +117,30 @@ fn parse_mentioned_agent_ids(body: &str) -> Vec<Uuid> {
     mentioned_ids
 }
 
+fn authenticated_comment_actor(
+    actor: &AuthorizationActor,
+) -> Result<(CommentActorType, IssueCommentAuthorType, Uuid, Option<Uuid>), ApiError> {
+    match actor {
+        AuthorizationActor::Board { user_id, .. } => Ok((
+            CommentActorType::User,
+            IssueCommentAuthorType::User,
+            *user_id,
+            None,
+        )),
+        AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => Ok((
+            CommentActorType::Agent,
+            IssueCommentAuthorType::Agent,
+            *agent_id,
+            *run_id,
+        )),
+        AuthorizationActor::None => Err(ApiError::Unauthorized(
+            "Authentication required for issue comments".to_string(),
+        )),
+    }
+}
+
 // Convert service errors to API errors
 impl From<CommentServiceError> for ApiError {
     fn from(err: CommentServiceError) -> Self {
@@ -128,8 +154,12 @@ impl From<CommentServiceError> for ApiError {
             CommentServiceError::PermissionDenied(msg) => {
                 ApiError::Forbidden(msg)
             }
+            CommentServiceError::Conflict(msg) => ApiError::Conflict(msg),
             CommentServiceError::Validation(msg) => {
                 ApiError::BadRequest(msg)
+            }
+            CommentServiceError::Repository(repositories::RepositoryError::NotFound(id)) => {
+                ApiError::NotFound(format!("Comment not found: {}", id))
             }
             CommentServiceError::Repository(repo_err) => {
                 ApiError::InternalServerError(format!("Database error: {}", repo_err))
@@ -147,6 +177,30 @@ pub async fn add_comment(
 ) -> Result<impl IntoResponse, ApiError> {
     assert_issue_company(&state, &actor, issue_id).await?;
     let service = state.issue_comment_service.clone();
+    let (expected_actor_type, _, authenticated_actor_id, authenticated_run_id) =
+        authenticated_comment_actor(&actor)?;
+
+    if req.actor_type != expected_actor_type {
+        return Err(ApiError::Forbidden(
+            "Comment actor type must match the authenticated actor".to_string(),
+        ));
+    }
+    if req
+        .actor_id
+        .is_some_and(|actor_id| actor_id != authenticated_actor_id)
+    {
+        return Err(ApiError::Forbidden(
+            "Comment actor id must match the authenticated actor".to_string(),
+        ));
+    }
+    if req
+        .actor_run_id
+        .is_some_and(|run_id| Some(run_id) != authenticated_run_id)
+    {
+        return Err(ApiError::Forbidden(
+            "Comment run id must match the authenticated actor".to_string(),
+        ));
+    }
 
     let company_id = actor.company_id().ok_or_else(|| {
         ApiError::Forbidden("Company scope is required for issue comments".into())
@@ -227,14 +281,15 @@ pub async fn add_comment(
     let interrupt_requested = req.interrupt;
     // Save actor_type before moving req
     let actor_type = req.actor_type;
-    let actor_id = req.actor_id;
+    let actor_id = Some(authenticated_actor_id);
+    let actor_run_id = req.actor_run_id.or(authenticated_run_id);
     
     let comment = service.add_comment(
         issue_id,
         req.body.clone(),
         actor_type.clone(),
         actor_id,
-        req.actor_run_id,
+        actor_run_id,
         req.metadata,
     ).await?;
 
@@ -705,14 +760,29 @@ async fn assert_issue_company(
 /// PUT /comments/:comment_id - Update a comment
 pub async fn update_comment(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(comment_id): Path<Uuid>,
     Json(req): Json<UpdateCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let service = state.issue_comment_service.clone();
+    let current = service.get_comment(comment_id).await?;
+    crate::routes::require_company_access(
+        &actor,
+        current.company_id,
+        crate::routes::AccessMode::Write,
+    )
+    .map_err(|_| ApiError::Forbidden("Comment is outside the actor's company scope".into()))?;
+    let (_, actor_type, actor_id, _) = authenticated_comment_actor(&actor)?;
+    if req.actor_id.is_some_and(|requested| requested != actor_id) {
+        return Err(ApiError::Forbidden(
+            "Comment actor id must match the authenticated actor".to_string(),
+        ));
+    }
     let comment = service.update_comment(
         comment_id,
         req.body,
-        req.actor_id,
+        actor_type,
+        actor_id,
     ).await?;
 
     Ok(Json(CommentResponse { comment }))
@@ -721,11 +791,30 @@ pub async fn update_comment(
 /// DELETE /comments/:comment_id - Delete a comment
 pub async fn delete_comment(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(comment_id): Path<Uuid>,
-    Json(req): Json<DeleteCommentRequest>,
+    body: Option<Json<DeleteCommentRequest>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let service = state.issue_comment_service.clone();
-    service.delete_comment(comment_id, req.actor_id).await?;
+    let current = service.get_comment(comment_id).await?;
+    crate::routes::require_company_access(
+        &actor,
+        current.company_id,
+        crate::routes::AccessMode::Write,
+    )
+    .map_err(|_| ApiError::Forbidden("Comment is outside the actor's company scope".into()))?;
+    let (_, actor_type, actor_id, actor_run_id) = authenticated_comment_actor(&actor)?;
+    if body
+        .and_then(|Json(request)| request.actor_id)
+        .is_some_and(|requested| requested != actor_id)
+    {
+        return Err(ApiError::Forbidden(
+            "Comment actor id must match the authenticated actor".to_string(),
+        ));
+    }
+    service
+        .delete_comment(comment_id, actor_type, actor_id, actor_run_id)
+        .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

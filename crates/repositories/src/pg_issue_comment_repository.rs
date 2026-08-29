@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
-use models::{IssueComment, Pagination};
+use models::{IssueComment, IssueCommentAuthorType, Pagination};
 use uuid::Uuid;
 use crate::{
     issue_comment_repository::{IssueCommentRepository, CreateIssueCommentInput, UpdateIssueCommentInput},
@@ -11,7 +11,7 @@ pub struct PgIssueCommentRepository {
     pool: PgPool,
 }
 
-pub const ISSUE_COMMENT_COLUMNS: &str = "id, company_id, issue_id, actor_type AS author_type, actor_id, CASE WHEN actor_type = 'agent'::comment_actor_type THEN actor_id ELSE NULL END AS author_agent_id, CASE WHEN actor_type = 'user'::comment_actor_type THEN actor_id ELSE NULL END AS author_user_id, actor_run_id AS created_by_run_id, body, NULL::jsonb AS presentation, metadata, NULL::timestamptz AS deleted_at, NULL::text AS deleted_by_type, NULL::uuid AS deleted_by_agent_id, NULL::uuid AS deleted_by_user_id, NULL::uuid AS deleted_by_run_id, false AS follow_up_requested, created_at, updated_at";
+pub const ISSUE_COMMENT_COLUMNS: &str = "id, company_id, issue_id, actor_type AS author_type, actor_id, CASE WHEN actor_type = 'agent'::comment_actor_type THEN actor_id ELSE NULL END AS author_agent_id, CASE WHEN actor_type = 'user'::comment_actor_type THEN actor_id ELSE NULL END AS author_user_id, actor_run_id AS created_by_run_id, body, NULL::jsonb AS presentation, metadata, deleted_at, deleted_by_type, deleted_by_agent_id, deleted_by_user_id, deleted_by_run_id, false AS follow_up_requested, created_at, updated_at";
 
 impl PgIssueCommentRepository {
     pub fn new(pool: PgPool) -> Self {
@@ -95,7 +95,7 @@ impl IssueCommentRepository for PgIssueCommentRepository {
         updates.push("updated_at = NOW()".to_string());
 
         let query = format!(
-            "UPDATE issue_comments SET {} WHERE id = $1 RETURNING {}",
+            "UPDATE issue_comments SET {} WHERE id = $1 AND deleted_at IS NULL RETURNING {}",
             updates.join(", ")
             , ISSUE_COMMENT_COLUMNS
         );
@@ -109,24 +109,56 @@ impl IssueCommentRepository for PgIssueCommentRepository {
             q = q.bind(metadata);
         }
 
-        let comment = q.fetch_one(&self.pool)
+        let comment = q.fetch_optional(&self.pool)
             .await
-            .map_err(RepositoryError::DatabaseError)?;
+            .map_err(RepositoryError::DatabaseError)?
+            .ok_or(RepositoryError::NotFound(id))?;
 
         Ok(comment)
     }
 
-    async fn delete(&self, id: Uuid) -> Result<(), RepositoryError> {
-        sqlx::query(
-            r#"
-            DELETE FROM issue_comments WHERE id = $1
-            "#,
-        )
+    async fn tombstone(
+        &self,
+        id: Uuid,
+        deleted_by_type: IssueCommentAuthorType,
+        deleted_by_id: Uuid,
+        deleted_by_run_id: Option<Uuid>,
+    ) -> Result<Option<IssueComment>, RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(RepositoryError::DatabaseError)?;
+        let deleted_by_type = match deleted_by_type {
+            IssueCommentAuthorType::Agent => "agent",
+            IssueCommentAuthorType::User => "user",
+            IssueCommentAuthorType::System => "system",
+        };
+        let deleted_by_agent_id = (deleted_by_type == "agent").then_some(deleted_by_id);
+        let deleted_by_user_id = (deleted_by_type == "user").then(|| deleted_by_id.to_string());
+
+        let comment = sqlx::query_as::<_, IssueComment>(&format!(
+            "UPDATE issue_comments
+             SET body = '', metadata = NULL, deleted_at = NOW(), deleted_by_type = $2,
+                 deleted_by_agent_id = $3, deleted_by_user_id = $4, deleted_by_run_id = $5,
+                 updated_at = NOW()
+             WHERE id = $1 AND deleted_at IS NULL
+             RETURNING {ISSUE_COMMENT_COLUMNS}"
+        ))
         .bind(id)
-        .execute(&self.pool)
+        .bind(deleted_by_type)
+        .bind(deleted_by_agent_id)
+        .bind(deleted_by_user_id.as_deref())
+        .bind(deleted_by_run_id)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
-        Ok(())
+        if let Some(ref comment) = comment {
+            sqlx::query("UPDATE issues SET updated_at = NOW() WHERE id = $1")
+                .bind(comment.issue_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(RepositoryError::DatabaseError)?;
+        }
+
+        tx.commit().await.map_err(RepositoryError::DatabaseError)?;
+        Ok(comment)
     }
 }

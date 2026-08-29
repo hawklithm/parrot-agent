@@ -1274,8 +1274,8 @@ mod tests {
         async fn list_comments(&self, _issue_id: Uuid, _pagination: &models::Pagination) -> crate::issue_comment_service::CommentServiceResult<Vec<models::IssueComment>> { Ok(vec![]) }
         async fn count_comments(&self, _issue_id: Uuid) -> crate::issue_comment_service::CommentServiceResult<i64> { Ok(0) }
         async fn get_comment(&self, _comment_id: Uuid) -> crate::issue_comment_service::CommentServiceResult<models::IssueComment> { unimplemented!() }
-        async fn update_comment(&self, _comment_id: Uuid, _body: String, _actor_id: Uuid) -> crate::issue_comment_service::CommentServiceResult<models::IssueComment> { unimplemented!() }
-        async fn delete_comment(&self, _comment_id: Uuid, _actor_id: Uuid) -> crate::issue_comment_service::CommentServiceResult<()> { unimplemented!() }
+        async fn update_comment(&self, _comment_id: Uuid, _body: String, _actor_type: models::IssueCommentAuthorType, _actor_id: Uuid) -> crate::issue_comment_service::CommentServiceResult<models::IssueComment> { unimplemented!() }
+        async fn delete_comment(&self, _comment_id: Uuid, _actor_type: models::IssueCommentAuthorType, _actor_id: Uuid, _actor_run_id: Option<Uuid>) -> crate::issue_comment_service::CommentServiceResult<()> { unimplemented!() }
     }
 
     struct MockWorkProduct;

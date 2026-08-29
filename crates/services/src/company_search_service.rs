@@ -794,7 +794,7 @@ impl CompanySearchService {
             token_patterns,
             true,
         );
-        comments.push(") ORDER BY created_at ASC, id ASC");
+        comments.push(") AND deleted_at IS NULL ORDER BY created_at ASC, id ASC");
         for row in comments.build().fetch_all(&self.pool).await? {
             sources
                 .entry(row.get::<Uuid, _>("issue_id"))
@@ -1493,7 +1493,7 @@ impl CompanySearchService {
         if query.scope.includes(CompanySearchExtractScope::Comments) {
             scope_conditions.push(format!(
                 "EXISTS (SELECT 1 FROM issue_comments ec WHERE ec.company_id = $1 \
-                 AND ec.issue_id = issues.id AND ec.body ILIKE $2)"
+                 AND ec.issue_id = issues.id AND ec.deleted_at IS NULL AND ec.body ILIKE $2)"
             ));
         }
         if query.scope.includes(CompanySearchExtractScope::Documents) {
@@ -1624,7 +1624,7 @@ impl CompanySearchService {
             if query.scope.includes(CompanySearchExtractScope::Comments) {
                 let csql = format!(
                     "SELECT id, issue_id, body FROM issue_comments \
-                     WHERE company_id = $1 AND issue_id = ANY($2) AND body ILIKE $3 \
+                     WHERE company_id = $1 AND issue_id = ANY($2) AND deleted_at IS NULL AND body ILIKE $3 \
                      ORDER BY created_at ASC, id ASC"
                 );
                 let crows = sqlx::query(&csql)
@@ -1852,7 +1852,7 @@ fn push_issue_search_match(
         }
         qb.push(
             "EXISTS (SELECT 1 FROM issue_comments sc WHERE sc.company_id = i.company_id \
-                 AND sc.issue_id = i.id AND (",
+                 AND sc.issue_id = i.id AND sc.deleted_at IS NULL AND (",
         );
         push_or_ilike_expression(qb, "sc.body", contains_pattern, token_patterns, true);
         qb.push("))");

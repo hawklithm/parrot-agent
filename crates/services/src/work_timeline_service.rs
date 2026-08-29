@@ -398,7 +398,7 @@ impl WorkTimelineService for DefaultWorkTimelineService {
                 WHERE i.company_id = $1 AND i.id = ANY($2)
                   AND (i.created_by_user_id = $3 OR i.assignee_user_id = $3
                       OR EXISTS (SELECT 1 FROM issue_comments ic
-                                 WHERE ic.issue_id = i.id AND ic.author_user_id = $3
+                                 WHERE ic.issue_id = i.id AND ic.deleted_at IS NULL AND ic.author_user_id = $3
                                    AND ic.created_at BETWEEN $4 AND $5)
                       OR EXISTS (SELECT 1 FROM issue_approvals ia
                                  JOIN approvals a ON a.id = ia.approval_id

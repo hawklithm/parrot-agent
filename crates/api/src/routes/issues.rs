@@ -2318,7 +2318,8 @@ async fn checkout_issue(
                 let comment = sqlx::query_as::<_, (String, Option<uuid::Uuid>)>(
                     "SELECT actor_type::text, actor_id
                      FROM issue_comments
-                     WHERE id = $1 AND company_id = $2 AND issue_id = $3",
+                     WHERE id = $1 AND company_id = $2 AND issue_id = $3
+                       AND deleted_at IS NULL",
                 )
                 .bind(comment_id)
                 .bind(company_id)

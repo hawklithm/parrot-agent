@@ -114,7 +114,7 @@ pub struct IssueComment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_by_agent_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deleted_by_user_id: Option<Uuid>,
+    pub deleted_by_user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_by_run_id: Option<Uuid>,
     pub follow_up_requested: bool,

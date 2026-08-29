@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use models::{IssueComment, CommentActorType, Pagination};
+use models::{CommentActorType, IssueComment, IssueCommentAuthorType, Pagination};
 use uuid::Uuid;
 use std::sync::Arc;
 use repositories::{
@@ -22,6 +22,9 @@ pub enum CommentServiceError {
 
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
 
     #[error("Validation error: {0}")]
     Validation(String),
@@ -61,6 +64,7 @@ pub trait IssueCommentService: Send + Sync {
         &self,
         comment_id: Uuid,
         body: String,
+        actor_type: IssueCommentAuthorType,
         actor_id: Uuid,
     ) -> CommentServiceResult<IssueComment>;
 
@@ -68,7 +72,9 @@ pub trait IssueCommentService: Send + Sync {
     async fn delete_comment(
         &self,
         comment_id: Uuid,
+        actor_type: IssueCommentAuthorType,
         actor_id: Uuid,
+        actor_run_id: Option<Uuid>,
     ) -> CommentServiceResult<()>;
 }
 
@@ -95,12 +101,29 @@ where
     }
 
     /// Verify that the actor can modify the comment
-    async fn check_permission(&self, comment: &IssueComment, actor_id: Uuid) -> CommentServiceResult<()> {
-        // Check if actor is the comment author
-        if let Some(comment_actor_id) = comment.actor_id {
-            if comment_actor_id == actor_id {
-                return Ok(());
+    async fn check_permission(
+        &self,
+        comment: &IssueComment,
+        actor_type: &IssueCommentAuthorType,
+        actor_id: Uuid,
+    ) -> CommentServiceResult<()> {
+        if comment.deleted_at.is_some() {
+            return Err(CommentServiceError::Conflict(
+                "Deleted comments cannot be modified".to_string(),
+            ));
+        }
+
+        let is_author = match (actor_type, &comment.author_type) {
+            (IssueCommentAuthorType::Agent, IssueCommentAuthorType::Agent) => {
+                comment.author_agent_id == Some(actor_id)
             }
+            (IssueCommentAuthorType::User, IssueCommentAuthorType::User) => {
+                comment.author_user_id == Some(actor_id)
+            }
+            _ => false,
+        };
+        if is_author {
+            return Ok(());
         }
 
         // TODO: Check if actor is admin when we have access control
@@ -174,6 +197,7 @@ where
         &self,
         comment_id: Uuid,
         body: String,
+        actor_type: IssueCommentAuthorType,
         actor_id: Uuid,
     ) -> CommentServiceResult<IssueComment> {
         // Get current comment
@@ -181,7 +205,7 @@ where
             .ok_or(CommentServiceError::NotFound(comment_id))?;
 
         // Check permission
-        self.check_permission(&current, actor_id).await?;
+        self.check_permission(&current, &actor_type, actor_id).await?;
 
         // Update comment
         let input = UpdateIssueCommentInput {
@@ -196,17 +220,39 @@ where
     async fn delete_comment(
         &self,
         comment_id: Uuid,
+        actor_type: IssueCommentAuthorType,
         actor_id: Uuid,
+        actor_run_id: Option<Uuid>,
     ) -> CommentServiceResult<()> {
         // Get current comment
         let current = self.comment_repository.get_by_id(comment_id).await?
             .ok_or(CommentServiceError::NotFound(comment_id))?;
 
         // Check permission
-        self.check_permission(&current, actor_id).await?;
+        if current.deleted_at.is_some() {
+            return Ok(());
+        }
+        self.check_permission(&current, &actor_type, actor_id).await?;
 
-        // Delete comment
-        self.comment_repository.delete(comment_id).await?;
+        // Redact the body in the same transaction that updates the issue's
+        // activity timestamp. A concurrent delete is treated as idempotent.
+        if self
+            .comment_repository
+            .tombstone(comment_id, actor_type, actor_id, actor_run_id)
+            .await?
+            .is_none()
+        {
+            if self
+                .comment_repository
+                .get_by_id(comment_id)
+                .await?
+                .is_some_and(|comment| comment.deleted_at.is_none())
+            {
+                return Err(CommentServiceError::Conflict(
+                    "Comment changed while it was being deleted".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 }

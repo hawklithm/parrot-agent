@@ -375,7 +375,7 @@ impl ScheduledJob for DecisionTrainingCommentScrubJob {
             }
 
             let existing_ids: Vec<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM issue_comments WHERE id = ANY($1::uuid[])",
+               "SELECT id FROM issue_comments WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL",
             )
             .bind(&comment_ids)
             .fetch_all(&self.pool)

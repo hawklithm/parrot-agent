@@ -710,7 +710,7 @@ impl DecisionTrainingService for PgDecisionTrainingService {
         let comments = sqlx::query(
             "SELECT id, issue_id, body, actor_type::text AS actor_type, actor_id, actor_run_id,
                     metadata, created_at, updated_at
-               FROM issue_comments WHERE company_id = $3 AND issue_id = $1 AND created_at <= $2
+               FROM issue_comments WHERE company_id = $3 AND issue_id = $1 AND deleted_at IS NULL AND created_at <= $2
               ORDER BY created_at ASC, id ASC",
         )
             .bind(issue_id)
@@ -1116,7 +1116,7 @@ impl DecisionTrainingService for PgDecisionTrainingService {
             let Some(comments) = snapshot.get_mut("comments").and_then(Value::as_array_mut) else { continue };
             let ids: Vec<Uuid> = comments.iter().filter_map(|comment| comment.get("id").and_then(Value::as_str)?.parse().ok()).collect();
             if ids.is_empty() { continue; }
-            let existing: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM issue_comments WHERE id = ANY($1)")
+            let existing: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM issue_comments WHERE id = ANY($1) AND deleted_at IS NULL")
                 .bind(&ids)
                 .fetch_all(&self.pool)
                 .await

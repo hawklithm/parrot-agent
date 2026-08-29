@@ -126,7 +126,7 @@ impl IssueThreadInteractionService {
                 issue_id: Uuid,
             }
             let source_comment = sqlx::query_as::<_, SourceComment>(
-                "SELECT company_id, issue_id FROM issue_comments WHERE id = $1",
+                "SELECT company_id, issue_id FROM issue_comments WHERE id = $1 AND deleted_at IS NULL",
             )
             .bind(source_comment_id)
             .fetch_optional(&self.pool)

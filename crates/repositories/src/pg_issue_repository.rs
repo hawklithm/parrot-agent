@@ -312,14 +312,14 @@ impl IssueRepository for PgIssueRepository {
         if let Some(_participant_agent_id) = filter.participant_agent_id {
             param_count += 1;
             query.push_str(&format!(
-                " AND EXISTS (SELECT 1 FROM issue_comments participant_comments WHERE participant_comments.issue_id = issues.id AND participant_comments.actor_type = 'agent'::comment_actor_type AND participant_comments.actor_id = ${})",
+                " AND EXISTS (SELECT 1 FROM issue_comments participant_comments WHERE participant_comments.issue_id = issues.id AND participant_comments.deleted_at IS NULL AND participant_comments.actor_type = 'agent'::comment_actor_type AND participant_comments.actor_id = ${})",
                 param_count
             ));
         }
         if let Some(_touched_by_user_id) = filter.touched_by_user_id {
             param_count += 1;
             query.push_str(&format!(
-                " AND EXISTS (SELECT 1 FROM issue_comments touched_comments WHERE touched_comments.issue_id = issues.id AND touched_comments.actor_type = 'user'::comment_actor_type AND touched_comments.actor_id = ${})",
+                " AND EXISTS (SELECT 1 FROM issue_comments touched_comments WHERE touched_comments.issue_id = issues.id AND touched_comments.deleted_at IS NULL AND touched_comments.actor_type = 'user'::comment_actor_type AND touched_comments.actor_id = ${})",
                 param_count
             ));
         }
@@ -534,14 +534,14 @@ impl IssueRepository for PgIssueRepository {
         if let Some(_participant_agent_id) = filter.participant_agent_id {
             param_count += 1;
             query.push_str(&format!(
-                " AND EXISTS (SELECT 1 FROM issue_comments participant_comments WHERE participant_comments.issue_id = issues.id AND participant_comments.actor_type = 'agent'::comment_actor_type AND participant_comments.actor_id = ${})",
+                " AND EXISTS (SELECT 1 FROM issue_comments participant_comments WHERE participant_comments.issue_id = issues.id AND participant_comments.deleted_at IS NULL AND participant_comments.actor_type = 'agent'::comment_actor_type AND participant_comments.actor_id = ${})",
                 param_count
             ));
         }
         if let Some(_touched_by_user_id) = filter.touched_by_user_id {
             param_count += 1;
             query.push_str(&format!(
-                " AND EXISTS (SELECT 1 FROM issue_comments touched_comments WHERE touched_comments.issue_id = issues.id AND touched_comments.actor_type = 'user'::comment_actor_type AND touched_comments.actor_id = ${})",
+                " AND EXISTS (SELECT 1 FROM issue_comments touched_comments WHERE touched_comments.issue_id = issues.id AND touched_comments.deleted_at IS NULL AND touched_comments.actor_type = 'user'::comment_actor_type AND touched_comments.actor_id = ${})",
                 param_count
             ));
         }

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use models::{IssueComment, CommentActorType, Pagination};
+use models::{CommentActorType, IssueComment, IssueCommentAuthorType, Pagination};
 use uuid::Uuid;
 use serde_json::Value as JsonValue;
 use crate::RepositoryError;
@@ -40,6 +40,12 @@ pub trait IssueCommentRepository: Send + Sync {
     /// Update a comment
     async fn update(&self, id: Uuid, input: UpdateIssueCommentInput) -> Result<IssueComment, RepositoryError>;
 
-    /// Delete a comment
-    async fn delete(&self, id: Uuid) -> Result<(), RepositoryError>;
+    /// Redact a comment in-place and retain its identity for audit/history.
+    async fn tombstone(
+        &self,
+        id: Uuid,
+        deleted_by_type: IssueCommentAuthorType,
+        deleted_by_id: Uuid,
+        deleted_by_run_id: Option<Uuid>,
+    ) -> Result<Option<IssueComment>, RepositoryError>;
 }
