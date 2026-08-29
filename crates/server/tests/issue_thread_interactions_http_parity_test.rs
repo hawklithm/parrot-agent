@@ -384,7 +384,10 @@ async fn resolution_queues_one_assignee_continuation_wakeup_and_replay_is_quiet(
     assert_eq!(status, StatusCode::OK);
     assert_eq!(partial["status"], "pending");
 
-    let wake_key_prefix = format!("request_item_verdicts:{interaction_id}:");
+    let wake_key_prefix = format!(
+        "request_item_verdicts:{}:{interaction_id}:",
+        fixture.issue_id
+    );
     let wake_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_wakeup_requests
          WHERE company_id = $1 AND agent_id = $2 AND idempotency_key LIKE $3",

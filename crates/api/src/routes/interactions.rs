@@ -140,8 +140,8 @@ async fn queue_interaction_continuation_wakeup(
         // two-second coalescing window.
         let bucket = now.timestamp_millis().div_euclid(2_000);
         format!(
-            "request_item_verdicts:{}:{}",
-            interaction.id, bucket
+            "request_item_verdicts:{}:{}:{}",
+            wake_issue.id, interaction.id, bucket
         )
     };
 
