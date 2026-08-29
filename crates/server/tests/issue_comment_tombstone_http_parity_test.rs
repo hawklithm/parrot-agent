@@ -102,6 +102,14 @@ async fn deleting_comment_writes_redacted_tombstone_and_is_idempotent(pool: PgPo
     let actor = AuthorizationActor::agent(author_id, company_id, None);
     let app = app(pool.clone()).await;
 
+    let issue_updated_before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "UPDATE issues SET updated_at = NOW() - INTERVAL '1 hour' WHERE id = $1 RETURNING updated_at",
+    )
+    .bind(issue_id)
+    .fetch_one(&pool)
+    .await
+    .expect("age issue activity timestamp");
+
     let (status, created) = send(
         &app,
         &actor,
@@ -116,6 +124,17 @@ async fn deleting_comment_writes_redacted_tombstone_and_is_idempotent(pool: PgPo
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "create={created:?}");
+    let issue_updated_after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT updated_at FROM issues WHERE id = $1",
+    )
+    .bind(issue_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read issue activity timestamp");
+    assert!(
+        issue_updated_after > issue_updated_before,
+        "creating a comment should refresh issue updated_at"
+    );
     let comment_id = created["comment"]["id"]
         .as_str()
         .and_then(|id| Uuid::parse_str(id).ok())
@@ -216,4 +235,3 @@ async fn only_the_authenticated_comment_author_can_tombstone(pool: PgPool) {
     .expect("comment row");
     assert!(deleted_at.is_none(), "unauthorized delete must not tombstone");
 }
-

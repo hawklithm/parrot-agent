@@ -22,6 +22,7 @@ impl PgIssueCommentRepository {
 #[async_trait]
 impl IssueCommentRepository for PgIssueCommentRepository {
     async fn create(&self, input: CreateIssueCommentInput) -> Result<IssueComment, RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(RepositoryError::DatabaseError)?;
         let comment = sqlx::query_as::<_, IssueComment>(&format!(
             "INSERT INTO issue_comments (company_id, issue_id, body, actor_type, actor_id, actor_run_id, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {ISSUE_COMMENT_COLUMNS}"
         ))
@@ -32,9 +33,19 @@ impl IssueCommentRepository for PgIssueCommentRepository {
         .bind(input.actor_id)
         .bind(input.actor_run_id)
         .bind(&input.metadata)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(RepositoryError::DatabaseError)?;
+
+        // Comment activity participates in the same Issue recency ordering as
+        // Paperclip. Keep both writes atomic so a failed activity update never
+        // leaves a persisted comment with a stale Issue timestamp.
+        sqlx::query("UPDATE issues SET updated_at = NOW() WHERE id = $1")
+            .bind(input.issue_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+        tx.commit().await.map_err(RepositoryError::DatabaseError)?;
 
         Ok(comment)
     }
