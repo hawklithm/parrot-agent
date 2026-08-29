@@ -2282,6 +2282,18 @@ async fn checkout_issue(
     }
     let checkout_agent_id = input.agent_id;
     let checkout_run_id = input.checkout_run_id;
+    // Paperclip does not re-wake an agent that is checking out the Issue from
+    // the same run. A second wake here can create a new heartbeat run and
+    // overwrite the ownership established by this checkout.
+    let should_wake_assignee = match (&actor, checkout_agent_id) {
+        (
+            AuthorizationActor::Agent {
+                agent_id, run_id, ..
+            },
+            Some(checkout_agent_id),
+        ) => *agent_id != checkout_agent_id || *run_id != Some(checkout_run_id),
+        _ => true,
+    };
 
     if state
         .issue_tree_control_service
@@ -2386,46 +2398,50 @@ async fn checkout_issue(
     )
     .await;
 
-    if let Some(agent_id) = checkout_agent_id {
-        publish_issue_event(
-            &state,
-            &actor,
-            company_id,
-            IssueEvent::CheckedOut {
-                issue_id: id,
+    if should_wake_assignee {
+        if let Some(agent_id) = checkout_agent_id {
+            publish_issue_event(
+                &state,
+                &actor,
                 company_id,
-                agent_id,
-                checked_out_by: actor.principal_id().unwrap_or(agent_id),
-            },
-        )
-        .await;
+                IssueEvent::CheckedOut {
+                    issue_id: id,
+                    company_id,
+                    agent_id,
+                    checked_out_by: actor.principal_id().unwrap_or(agent_id),
+                },
+            )
+            .await;
+        }
     }
 
     // Paperclip wakes the assignee after a successful checkout so the agent
     // can continue with the newly-owned execution context.
-    if let Some(assignee_agent_id) = checkout_agent_id {
-        let wakeup_service =
-            services::IssueAssignmentWakeupService::new(state.heartbeat_service.clone());
-        let wakeup_input = services::issue_assignment_wakeup::QueueWakeupInput {
-            company_id,
-            issue_id: id,
-            assignee_agent_id: Some(assignee_agent_id),
-            status: "in_progress".to_string(),
-            reason: "issue_checked_out".to_string(),
-            mutation: "checkout".to_string(),
-            context_source: "issue.checkout".to_string(),
-            requested_by_actor_type: Some(actor.actor_type().to_string()),
-            requested_by_actor_id: actor.principal_id(),
-            idempotency_key: None,
-            rethrow_on_error: false,
-        };
-        if let Err(error) = wakeup_service.queue_wakeup(wakeup_input).await {
-            tracing::warn!(
-                error = %error,
-                issue_id = %id,
-                assignee_agent_id = %assignee_agent_id,
-                "Failed to wake assignee after issue checkout"
-            );
+    if should_wake_assignee {
+        if let Some(assignee_agent_id) = checkout_agent_id {
+            let wakeup_service =
+                services::IssueAssignmentWakeupService::new(state.heartbeat_service.clone());
+            let wakeup_input = services::issue_assignment_wakeup::QueueWakeupInput {
+                company_id,
+                issue_id: id,
+                assignee_agent_id: Some(assignee_agent_id),
+                status: "in_progress".to_string(),
+                reason: "issue_checked_out".to_string(),
+                mutation: "checkout".to_string(),
+                context_source: "issue.checkout".to_string(),
+                requested_by_actor_type: Some(actor.actor_type().to_string()),
+                requested_by_actor_id: actor.principal_id(),
+                idempotency_key: None,
+                rethrow_on_error: false,
+            };
+            if let Err(error) = wakeup_service.queue_wakeup(wakeup_input).await {
+                tracing::warn!(
+                    error = %error,
+                    issue_id = %id,
+                    assignee_agent_id = %assignee_agent_id,
+                    "Failed to wake assignee after issue checkout"
+                );
+            }
         }
     }
     service
