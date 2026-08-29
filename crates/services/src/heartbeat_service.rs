@@ -1471,13 +1471,17 @@ impl DefaultHeartbeatService {
             agent_name, adapter_type, objective, run_id, run_status, output_excerpt, error_section, next_action
         );
         let body = if body.len() > 8_000 { format!("{}\n[truncated]", &body[..7_980]) } else { body };
-        let existing = sqlx::query("SELECT d.id FROM issue_documents l JOIN documents d ON d.id=l.document_id WHERE l.issue_id=$1 AND l.key='continuation-summary' FOR UPDATE")
+        let company_id: Uuid = issue.try_get("company_id").unwrap_or_default();
+        let mut tx = match self.pool.begin().await { Ok(tx) => tx, Err(_) => return };
+        // Keep the lookup, lock, content update, and revision allocation in
+        // one transaction so concurrent heartbeat completions cannot reuse a
+        // revision number or publish a partial continuation summary.
+        let existing = sqlx::query("SELECT d.id FROM issue_documents l JOIN documents d ON d.id=l.document_id WHERE l.issue_id=$1 AND l.key='continuation-summary' FOR UPDATE OF l, d")
             .bind(issue_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .ok()
             .flatten();
-        let mut tx = match self.pool.begin().await { Ok(tx) => tx, Err(_) => return };
         let document_id = if let Some(row) = existing {
             let document_id: Uuid = row.try_get("id").unwrap_or_else(|_| Uuid::new_v4());
             let revision: Option<i32> = sqlx::query_scalar("SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1")
@@ -1485,17 +1489,16 @@ impl DefaultHeartbeatService {
             let revision = revision.unwrap_or(1);
             if sqlx::query("UPDATE documents SET content=$2, content_type='text/markdown', updated_at=NOW() WHERE id=$1")
                 .bind(document_id).bind(&body).execute(&mut *tx).await.is_err() { return; }
-            if sqlx::query("INSERT INTO document_revisions (document_id, revision_number, content) VALUES ($1,$2,$3)")
-                .bind(document_id).bind(revision).bind(&body).execute(&mut *tx).await.is_err() { return; }
+            if sqlx::query("INSERT INTO document_revisions (document_id, company_id, revision_number, content) VALUES ($1,$2,$3,$4)")
+                .bind(document_id).bind(company_id).bind(revision).bind(&body).execute(&mut *tx).await.is_err() { return; }
             document_id
         } else {
-            let company_id: Uuid = issue.try_get("company_id").unwrap_or_default();
-            let document_id: Uuid = match sqlx::query_scalar("INSERT INTO documents (company_id, content, content_type) VALUES ($1,$2,'text/markdown') RETURNING id")
+            let document_id: Uuid = match sqlx::query_scalar("INSERT INTO documents (company_id, title, content, content_type) VALUES ($1,'Continuation Summary',$2,'text/markdown') RETURNING id")
                 .bind(company_id).bind(&body).fetch_one(&mut *tx).await { Ok(id) => id, Err(_) => return };
             if sqlx::query("INSERT INTO issue_documents (company_id, issue_id, document_id, key) VALUES ($1,$2,$3,'continuation-summary')")
                 .bind(company_id).bind(issue_id).bind(document_id).execute(&mut *tx).await.is_err() { return; }
-            if sqlx::query("INSERT INTO document_revisions (document_id, revision_number, content) VALUES ($1,1,$2)")
-                .bind(document_id).bind(&body).execute(&mut *tx).await.is_err() { return; }
+            if sqlx::query("INSERT INTO document_revisions (document_id, company_id, revision_number, content) VALUES ($1,$2,1,$3)")
+                .bind(document_id).bind(company_id).bind(&body).execute(&mut *tx).await.is_err() { return; }
             document_id
         };
         if tx.commit().await.is_err() { return; }
@@ -2713,10 +2716,10 @@ impl DefaultHeartbeatService {
         }
         let run_id: Uuid = sqlx::query_scalar(
             "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot, responsible_user_id, retry_of_run_id)
-             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, i.responsible_user_id, $6
+             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, i.responsible_user_id::text, $6
              FROM issues i WHERE i.id = $5
              UNION ALL
-             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, NULL::uuid, $6
+             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, NULL::text, $6
              WHERE NOT EXISTS (SELECT 1 FROM issues WHERE id = $5)
              LIMIT 1
              RETURNING id",
@@ -2784,6 +2787,8 @@ impl DefaultHeartbeatService {
             .bind(options.source.as_deref())
             .bind(options.trigger_detail.as_deref())
             .bind(options.reason.as_deref())
+            .bind(options.requested_by_actor_type.as_deref())
+            .bind(options.requested_by_actor_id)
             .execute(&self.pool)
             .await
             .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
