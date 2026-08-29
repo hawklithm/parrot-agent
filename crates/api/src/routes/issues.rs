@@ -567,12 +567,24 @@ fn validate_issue_document_key(key: &str) -> Result<String, StatusCode> {
     Ok(key)
 }
 
+fn document_revision_creator(actor: &AuthorizationActor) -> (Option<&'static str>, Option<Uuid>) {
+    match actor {
+        AuthorizationActor::Board { user_id, .. } => (Some("user"), Some(*user_id)),
+        AuthorizationActor::Agent { agent_id, .. } => (Some("agent"), Some(*agent_id)),
+        AuthorizationActor::None => (None, None),
+    }
+}
+
+fn document_database_error(error: sqlx::Error, operation: &str, issue_id: Uuid) -> StatusCode {
+    tracing::error!(error = %error, %issue_id, operation, "issue document database operation failed");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
 /// PUT /issues/:id/documents/:key — Create or update an issue document.
 async fn upsert_issue_document(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, raw_key)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
@@ -586,6 +598,11 @@ async fn upsert_issue_document(
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&key);
     let content_type = if payload
         .get("format")
         .and_then(|value| value.as_str())
@@ -600,7 +617,18 @@ async fn upsert_issue_document(
         .pool
         .begin()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| document_database_error(error, "begin document upsert transaction", issue_id))?;
+    // A missing issue_documents row cannot itself be locked by PostgreSQL.
+    // Serialize first-create and existing-document writers on the logical
+    // issue/key so concurrent PUTs cannot create duplicate documents.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2, 0))",
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let existing = sqlx::query(
         "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2 FOR UPDATE",
     )
@@ -617,6 +645,16 @@ async fn upsert_issue_document(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let (document_id, revision_number) = if let Some(row) = existing {
         let document_id: Uuid = row.get("document_id");
+        let locked_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT locked_at FROM documents WHERE id=$1 FOR UPDATE",
+        )
+        .bind(document_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if locked_at.is_some() {
+            return Err(StatusCode::CONFLICT);
+        }
         if let Some(base_revision_id) = base_revision_id {
             let current_revision_id: Option<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM document_revisions WHERE document_id=$1 ORDER BY revision_number DESC LIMIT 1",
@@ -640,31 +678,35 @@ async fn upsert_issue_document(
         .execute(&mut *tx)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        sqlx::query("UPDATE issue_documents SET updated_at=NOW() WHERE issue_id=$1 AND key=$2")
+            .bind(issue_id)
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         (document_id, revision)
     } else {
         if base_revision_id.is_some() {
             return Err(StatusCode::CONFLICT);
         }
-        let document_id: Uuid = sqlx::query_scalar("INSERT INTO documents (company_id, content, content_type) VALUES ($1,$2,$3) RETURNING id")
-            .bind(company_id).bind(content).bind(content_type).fetch_one(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let document_id: Uuid = sqlx::query_scalar("INSERT INTO documents (company_id, title, content, content_type) VALUES ($1,$2,$3,$4) RETURNING id")
+            .bind(company_id).bind(title).bind(content).bind(content_type).fetch_one(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         sqlx::query("INSERT INTO issue_documents (company_id, issue_id, document_id, key) VALUES ($1,$2,$3,$4)")
             .bind(company_id).bind(issue_id).bind(document_id).bind(&key).execute(&mut *tx).await.map_err(|_| StatusCode::CONFLICT)?;
         (document_id, 1)
     };
-    let run_id = headers
-        .get("x-paperclip-run-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| Uuid::parse_str(value).ok());
+    let (created_by_type, created_by_id) = document_revision_creator(&actor);
     sqlx::query(
         "INSERT INTO document_revisions
-           (document_id, revision_number, content, created_by_type, created_by_id)
-         VALUES ($1,$2,$3,CASE WHEN $4::uuid IS NULL THEN NULL ELSE 'agent' END,
-                 (SELECT agent_id FROM heartbeat_runs WHERE id=$4))",
+           (document_id, company_id, revision_number, content, created_by_type, created_by_id)
+         VALUES ($1,$2,$3,$4,$5,$6)",
     )
     .bind(document_id)
+    .bind(company_id)
     .bind(revision_number)
     .bind(content)
-    .bind(run_id)
+    .bind(created_by_type)
+    .bind(created_by_id)
     .execute(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -711,59 +753,71 @@ async fn restore_issue_document_revision(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, raw_key, revision_id)): Path<(String, String, Uuid)>,
-    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
-    scoped_issue_company(&state, &actor, issue_id).await?;
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
-    let document_id: Uuid =
-        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
-            .bind(issue_id)
-            .bind(&key)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-    let content: String =
-        sqlx::query_scalar("SELECT content FROM document_revisions WHERE id=$1 AND document_id=$2")
-            .bind(revision_id)
-            .bind(document_id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-    let revision: i32 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1",
-    )
-    .bind(document_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut tx = state
         .pool
         .begin()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| document_database_error(error, "begin document restore transaction", issue_id))?;
+    // Serialize all writers for this issue/key before reading the source and
+    // allocating the next revision number. Without this lock two restores can
+    // both observe the same MAX(revision_number) and race on the unique key.
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2 FOR UPDATE",
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| document_database_error(error, "lock document for restore", issue_id))?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let locked_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT locked_at FROM documents WHERE id=$1 FOR UPDATE",
+    )
+    .bind(document_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| document_database_error(error, "check document lock for restore", issue_id))?;
+    if locked_at.is_some() {
+        return Err(StatusCode::CONFLICT);
+    }
+    let (content, source_revision_number): (String, i32) = sqlx::query_as(
+        "SELECT content, revision_number FROM document_revisions WHERE id=$1 AND document_id=$2",
+    )
+    .bind(revision_id)
+    .bind(document_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| document_database_error(error, "read restore source revision", issue_id))?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let revision: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(revision_number),0)+1 FROM document_revisions WHERE document_id=$1",
+    )
+    .bind(document_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| document_database_error(error, "create restore revision", issue_id))?;
     sqlx::query("UPDATE documents SET content=$2, updated_at=NOW() WHERE id=$1")
         .bind(document_id)
         .bind(&content)
         .execute(&mut *tx)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let run_id = headers
-        .get("x-paperclip-run-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| Uuid::parse_str(value).ok());
+    let (created_by_type, created_by_id) = document_revision_creator(&actor);
     sqlx::query(
         "INSERT INTO document_revisions
-           (document_id, revision_number, content, created_by_type, created_by_id)
-         VALUES ($1,$2,$3,CASE WHEN $4::uuid IS NULL THEN NULL ELSE 'agent' END,
-                 (SELECT agent_id FROM heartbeat_runs WHERE id=$4))",
+           (document_id, company_id, revision_number, content, created_by_type, created_by_id)
+         VALUES ($1,$2,$3,$4,$5,$6)",
     )
     .bind(document_id)
+    .bind(company_id)
     .bind(revision)
     .bind(&content)
-    .bind(run_id)
+    .bind(created_by_type)
+    .bind(created_by_id)
     .execute(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -771,7 +825,17 @@ async fn restore_issue_document_revision(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(
-        serde_json::json!({"restored": true, "issueId": issue_id, "key": key, "revisionId": revision_id, "revisionNumber": revision, "content": content, "body": content}),
+        serde_json::json!({
+            "restored": true,
+            "issueId": issue_id,
+            "key": key,
+            "revisionId": revision_id,
+            "revisionNumber": revision,
+            "restoredFromRevisionId": revision_id,
+            "restoredFromRevisionNumber": source_revision_number,
+            "content": content,
+            "body": content
+        }),
     ))
 }
 
@@ -784,6 +848,7 @@ async fn get_issue_document_annotations(
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let key = validate_issue_document_key(&key)?;
     let document_id: Uuid =
         sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
             .bind(issue_id)
@@ -805,8 +870,15 @@ async fn get_issue_document_annotations(
                      FROM document_annotation_threads \
                      WHERE issue_id=$1 AND document_id=$2".to_string();
 
+    if !matches!(status, "all" | "open" | "resolved") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if status != "all" {
-        query.push_str(&format!(" AND status='{}'", status));
+        // The value is restricted to the two enum values above before it is
+        // embedded in this query.
+        query.push_str(" AND status='");
+        query.push_str(status);
+        query.push('\'');
     }
     query.push_str(" ORDER BY updated_at DESC");
 
@@ -884,6 +956,7 @@ async fn get_issue_document_annotation_thread(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let key = validate_issue_document_key(&key)?;
     let document_id: Uuid =
         sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
             .bind(issue_id)
@@ -959,19 +1032,12 @@ async fn get_issue_document_annotation_thread(
 async fn create_issue_document_annotation(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key)): Path<(String, String)>,
+    Path((issue_id, raw_key)): Path<(String, String)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    let document_id: Uuid =
-        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
-            .bind(issue_id)
-            .bind(&key)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?;
+    let key = validate_issue_document_key(&raw_key)?;
 
     let selected_text = payload
         .get("selectedText")
@@ -987,21 +1053,83 @@ async fn create_issue_document_annotation(
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // 获取当前 revision number
-    let revision_number: i32 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(revision_number), 0) FROM document_revisions WHERE document_id=$1",
+    let base_revision_id = payload
+        .get("baseRevisionId")
+        .and_then(Value::as_str)
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let base_revision_number = payload
+        .get("baseRevisionNumber")
+        .and_then(Value::as_i64)
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if base_revision_id.is_some() != base_revision_number.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| document_database_error(error, "begin annotation transaction", issue_id))?;
+    let (document_id, document_content): (Uuid, String) = sqlx::query_as(
+        "SELECT d.id, d.content
+         FROM issue_documents l
+         JOIN documents d ON d.id=l.document_id
+         WHERE l.issue_id=$1 AND l.key=$2
+         FOR UPDATE OF l, d",
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| document_database_error(error, "lock annotation document", issue_id))?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let (current_revision_id, revision_number): (Option<Uuid>, i32) = sqlx::query_as(
+        "SELECT id, revision_number
+         FROM document_revisions
+         WHERE document_id=$1
+         ORDER BY revision_number DESC
+         LIMIT 1
+         FOR UPDATE",
     )
     .bind(document_id)
-    .fetch_one(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|error| document_database_error(error, "read annotation revision", issue_id))?
+    .map(|(id, number): (Uuid, i32)| (Some(id), number))
+    .unwrap_or((None, 0));
+    if let (Some(expected_id), Some(expected_number)) = (base_revision_id, base_revision_number) {
+        if current_revision_id != Some(expected_id) || revision_number != expected_number {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+    if !selected_text.is_empty() && !document_content.contains(selected_text) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let (author_type, author_agent_id, author_user_id, created_by_run_id) = match &actor {
+        AuthorizationActor::Board { user_id, .. } => (
+            "user",
+            None,
+            Some(user_id.to_string()),
+            None,
+        ),
+        AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => ("agent", Some(*agent_id), None, *run_id),
+        AuthorizationActor::None => return Err(StatusCode::UNAUTHORIZED),
+    };
 
     let thread_id: Uuid = sqlx::query_scalar(
         "INSERT INTO document_annotation_threads \
          (company_id, issue_id, document_id, document_key, selected_text, anchor_selector, \
-          original_revision_number, current_revision_number, normalized_start, normalized_end, \
-          markdown_start, markdown_end, prefix_text, suffix_text) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 0, 0, 0, 0, '', '') \
+          original_revision_id, original_revision_number, current_revision_id, current_revision_number, \
+          normalized_start, normalized_end, markdown_start, markdown_end, prefix_text, suffix_text, \
+          created_by_agent_id, created_by_user_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $7, $8, 0, 0, 0, 0, '', '', $9, $10) \
          RETURNING id",
     )
     .bind(company_id)
@@ -1010,20 +1138,18 @@ async fn create_issue_document_annotation(
     .bind(&key)
     .bind(selected_text)
     .bind(&selector)
+    .bind(current_revision_id)
     .bind(revision_number)
-    .fetch_one(&state.pool)
+    .bind(author_agent_id)
+    .bind(author_user_id.clone())
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let author_user_id = match &actor {
-        AuthorizationActor::Board { user_id, .. } => Some(*user_id),
-        _ => None,
-    };
+    .map_err(|error| document_database_error(error, "create annotation thread", issue_id))?;
 
     let comment_id: Uuid = sqlx::query_scalar(
         "INSERT INTO document_annotation_comments \
-         (company_id, thread_id, issue_id, document_id, body, author_type, author_user_id) \
-         VALUES ($1, $2, $3, $4, $5, 'user', $6) \
+         (company_id, thread_id, issue_id, document_id, body, author_type, author_agent_id, author_user_id, created_by_run_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          RETURNING id",
     )
     .bind(company_id)
@@ -1031,10 +1157,17 @@ async fn create_issue_document_annotation(
     .bind(issue_id)
     .bind(document_id)
     .bind(body)
-    .bind(author_user_id)
-    .fetch_one(&state.pool)
+    .bind(author_type)
+    .bind(author_agent_id)
+    .bind(author_user_id.clone())
+    .bind(created_by_run_id)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|error| document_database_error(error, "create annotation comment", issue_id))?;
+
+    tx.commit()
+        .await
+        .map_err(|error| document_database_error(error, "commit annotation transaction", issue_id))?;
 
     Ok((
         StatusCode::CREATED,
@@ -1049,8 +1182,10 @@ async fn create_issue_document_annotation(
             "comments": [{
                 "id": comment_id,
                 "body": body,
-                "authorType": "user",
+                "authorType": author_type,
+                "authorAgentId": author_agent_id,
                 "authorUserId": author_user_id,
+                "createdByRunId": created_by_run_id,
             }],
         })),
     ))
@@ -1060,35 +1195,62 @@ async fn create_issue_document_annotation(
 async fn reply_issue_document_annotation(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key, thread_id)): Path<(String, String, Uuid)>,
+    Path((issue_id, raw_key, thread_id)): Path<(String, String, Uuid)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    let document_id: Uuid =
-        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
-            .bind(issue_id)
-            .bind(&key)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?;
+    let key = validate_issue_document_key(&raw_key)?;
 
     let body = payload
         .get("body")
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    let author_user_id = match &actor {
-        AuthorizationActor::Board { user_id, .. } => Some(*user_id),
-        _ => None,
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2 FOR UPDATE",
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM document_annotation_threads
+         WHERE id=$1 AND issue_id=$2 AND document_id=$3
+         FOR UPDATE",
+    )
+    .bind(thread_id)
+    .bind(issue_id)
+    .bind(document_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let (author_type, author_agent_id, author_user_id, created_by_run_id) = match &actor {
+        AuthorizationActor::Board { user_id, .. } => (
+            "user",
+            None,
+            Some(user_id.to_string()),
+            None,
+        ),
+        AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => ("agent", Some(*agent_id), None, *run_id),
+        AuthorizationActor::None => return Err(StatusCode::UNAUTHORIZED),
     };
 
     let comment_id: Uuid = sqlx::query_scalar(
         "INSERT INTO document_annotation_comments \
-         (company_id, thread_id, issue_id, document_id, body, author_type, author_user_id) \
-         SELECT $1, $2, $3, $4, $5, 'user', $6 \
-         WHERE EXISTS (SELECT 1 FROM document_annotation_threads WHERE id=$2 AND issue_id=$3 AND document_id=$4) \
+         (company_id, thread_id, issue_id, document_id, body, author_type, author_agent_id, author_user_id, created_by_run_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          RETURNING id"
     )
     .bind(company_id)
@@ -1096,15 +1258,20 @@ async fn reply_issue_document_annotation(
     .bind(issue_id)
     .bind(document_id)
     .bind(body)
-    .bind(author_user_id)
-    .fetch_optional(&state.pool)
+    .bind(author_type)
+    .bind(author_agent_id)
+    .bind(author_user_id.clone())
+    .bind(created_by_run_id)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     sqlx::query("UPDATE document_annotation_threads SET updated_at=NOW() WHERE id=$1")
         .bind(thread_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -1116,6 +1283,10 @@ async fn reply_issue_document_annotation(
             "issueId": issue_id,
             "documentKey": key,
             "body": body,
+            "authorType": author_type,
+            "authorAgentId": author_agent_id,
+            "authorUserId": author_user_id,
+            "createdByRunId": created_by_run_id,
         })),
     ))
 }
@@ -1124,19 +1295,12 @@ async fn reply_issue_document_annotation(
 async fn update_issue_document_annotation(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, key, thread_id)): Path<(String, String, Uuid)>,
+    Path((issue_id, raw_key, thread_id)): Path<(String, String, Uuid)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     let _company_id = scoped_issue_company(&state, &actor, issue_id).await?;
-    let document_id: Uuid =
-        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
-            .bind(issue_id)
-            .bind(&key)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?;
+    let key = validate_issue_document_key(&raw_key)?;
 
     let status = payload
         .get("status")
@@ -1146,9 +1310,32 @@ async fn update_issue_document_annotation(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let document_id: Uuid = sqlx::query_scalar(
+        "SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2 FOR UPDATE",
+    )
+    .bind(issue_id)
+    .bind(&key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let (resolved_by_agent_id, resolved_by_user_id) = match &actor {
+        AuthorizationActor::Board { user_id, .. } => (None, Some(user_id.to_string())),
+        AuthorizationActor::Agent { agent_id, .. } => (Some(*agent_id), None),
+        AuthorizationActor::None => return Err(StatusCode::UNAUTHORIZED),
+    };
     let updated = sqlx::query(
         "UPDATE document_annotation_threads \
-         SET status=$1, resolved_at=CASE WHEN $1='resolved' THEN NOW() ELSE NULL END, updated_at=NOW() \
+         SET status=$1,
+             resolved_by_agent_id=CASE WHEN $1='resolved' THEN $5 ELSE NULL END,
+             resolved_by_user_id=CASE WHEN $1='resolved' THEN $6 ELSE NULL END,
+             resolved_at=CASE WHEN $1='resolved' THEN NOW() ELSE NULL END,
+             updated_at=NOW() \
          WHERE id=$2 AND issue_id=$3 AND document_id=$4 \
          RETURNING id, status, updated_at"
     )
@@ -1156,10 +1343,16 @@ async fn update_issue_document_annotation(
     .bind(thread_id)
     .bind(issue_id)
     .bind(document_id)
-    .fetch_optional(&state.pool)
+    .bind(resolved_by_agent_id)
+    .bind(resolved_by_user_id)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
+
+    tx.commit()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({
         "threadId": updated.get::<Uuid, _>("id"),
@@ -1175,38 +1368,68 @@ async fn lock_issue_document(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, key)): Path<(String, String)>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+)
+    -> Result<Json<IssueDocumentResponse>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
-    scoped_issue_company(&state, &actor, issue_id).await?;
+    if !actor.is_board() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let key = validate_issue_document_key(&key)?;
+    let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let select = "SELECT d.id, d.company_id, l.issue_id, l.key, d.content, d.content_type, \
+                         d.locked_by_type, d.locked_by_id, d.locked_at, d.locked_run_id, \
+                         d.created_at, d.updated_at \
+                  FROM issue_documents l JOIN documents d ON d.id=l.document_id \
+                  WHERE l.issue_id=$1 AND l.key=$2 FOR UPDATE OF l, d";
+    let existing = sqlx::query_as::<_, IssueDocumentResponse>(select)
+        .bind(issue_id)
+        .bind(&key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if existing.locked_at.is_some() {
+        tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(Json(existing));
+    }
 
-    let document_id: Uuid =
-        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
-            .bind(issue_id)
-            .bind(&key)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-
+    let user_id = match actor {
+        AuthorizationActor::Board { user_id, .. } => user_id,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
     sqlx::query(
-        "UPDATE documents SET locked_by_type=$2, locked_by_id=$3, locked_at=NOW(), locked_run_id=$4 \
-         WHERE id=$1 AND locked_at IS NULL"
+        "UPDATE documents SET locked_by_type='user', locked_by_id=$2, locked_at=NOW(), locked_run_id=NULL, updated_at=NOW() WHERE id=$1",
     )
-    .bind(document_id)
-    .bind(payload.get("actorType").and_then(|v| v.as_str()).unwrap_or("user"))
-    .bind(payload.get("actorId").and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok()))
-    .bind(payload.get("runId").and_then(|v| v.as_str()).and_then(|v| Uuid::parse_str(v).ok()))
-    .execute(&state.pool)
+    .bind(existing.id)
+    .bind(user_id)
+    .execute(&mut *tx)
     .await
-    .map_err(|_| StatusCode::CONFLICT)?;
-
-    Ok(Json(serde_json::json!({
-        "issueId": issue_id,
-        "key": key,
-        "locked": true,
-        "lockedBy": payload
-    })))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("UPDATE issue_documents SET updated_at=NOW() WHERE issue_id=$1 AND key=$2")
+        .bind(issue_id)
+        .bind(&key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let updated = sqlx::query_as::<_, IssueDocumentResponse>(select)
+        .bind(issue_id)
+        .bind(&key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.document_locked",
+        &actor,
+        "issue",
+        issue_id,
+        serde_json::json!({"key": key, "documentId": updated.id}),
+    )
+    .await;
+    Ok(Json(updated))
 }
 
 /// POST /issues/:id/documents/:key/unlock - Unlock issue document
@@ -1214,33 +1437,61 @@ async fn unlock_issue_document(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, key)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<IssueDocumentResponse>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
-    scoped_issue_company(&state, &actor, issue_id).await?;
-
-    let document_id: Uuid =
-        sqlx::query_scalar("SELECT document_id FROM issue_documents WHERE issue_id=$1 AND key=$2")
-            .bind(issue_id)
-            .bind(&key)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-
+    if !actor.is_board() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let company_id = scoped_issue_company(&state, &actor, issue_id).await?;
+    let key = validate_issue_document_key(&key)?;
+    let mut tx = state.pool.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let select = "SELECT d.id, d.company_id, l.issue_id, l.key, d.content, d.content_type, \
+                         d.locked_by_type, d.locked_by_id, d.locked_at, d.locked_run_id, \
+                         d.created_at, d.updated_at \
+                  FROM issue_documents l JOIN documents d ON d.id=l.document_id \
+                  WHERE l.issue_id=$1 AND l.key=$2 FOR UPDATE OF l, d";
+    let existing = sqlx::query_as::<_, IssueDocumentResponse>(select)
+        .bind(issue_id)
+        .bind(&key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if existing.locked_at.is_none() {
+        tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(Json(existing));
+    }
     sqlx::query(
-        "UPDATE documents SET locked_by_type=NULL, locked_by_id=NULL, locked_at=NULL, locked_run_id=NULL \
-         WHERE id=$1"
+        "UPDATE documents SET locked_by_type=NULL, locked_by_id=NULL, locked_at=NULL, locked_run_id=NULL, updated_at=NOW() WHERE id=$1",
     )
-    .bind(document_id)
-    .execute(&state.pool)
+    .bind(existing.id)
+    .execute(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(serde_json::json!({
-        "issueId": issue_id,
-        "key": key,
-        "unlocked": true
-    })))
+    sqlx::query("UPDATE issue_documents SET updated_at=NOW() WHERE issue_id=$1 AND key=$2")
+        .bind(issue_id)
+        .bind(&key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let updated = sqlx::query_as::<_, IssueDocumentResponse>(select)
+        .bind(issue_id)
+        .bind(&key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.document_unlocked",
+        &actor,
+        "issue",
+        issue_id,
+        serde_json::json!({"key": key, "documentId": updated.id}),
+    )
+    .await;
+    Ok(Json(updated))
 }
 
 /// DELETE /issues/:id/documents/:key - Delete issue document
