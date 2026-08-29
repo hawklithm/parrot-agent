@@ -5,6 +5,7 @@ use axum::{
     Extension, Json, Router,
     routing::{get, post},
 };
+use chrono::Utc;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -95,6 +96,111 @@ fn actor_label(actor: &AuthorizationActor) -> &'static str {
         AuthorizationActor::Board { .. } => "user",
         AuthorizationActor::Agent { .. } => "agent",
         AuthorizationActor::None => "system",
+    }
+}
+
+/// Queue the Paperclip continuation wake after an interaction resolution.
+///
+/// The interaction write itself is committed by the service before this
+/// side-effect runs.  The wake is intentionally best-effort: a transient
+/// adapter/heartbeat failure must not turn a successful user resolution into
+/// an HTTP error, while the heartbeat service still records the failed wake.
+async fn queue_interaction_continuation_wakeup(
+    state: &AppState,
+    issue: &models::Issue,
+    interaction: &models::IssueThreadInteraction,
+    actor: &AuthorizationActor,
+    continuation_issue: Option<&models::Issue>,
+    newly_resolved_item_ids: &[String],
+) {
+    let wake_issue = continuation_issue.unwrap_or(issue);
+    let Some(agent_id) = wake_issue.assignee_agent_id else {
+        return;
+    };
+    if matches!(
+        &wake_issue.status,
+        models::IssueStatus::Done | models::IssueStatus::Cancelled
+    ) {
+        return;
+    }
+
+    let accepted = interaction.status == "accepted";
+    let policy_allows_wake = interaction.continuation_policy == "wake_assignee"
+        || (interaction.continuation_policy == "wake_assignee_on_accept" && accepted);
+    if !policy_allows_wake || interaction.status == "expired" {
+        return;
+    }
+
+    let now = Utc::now();
+    let idempotency_key = if newly_resolved_item_ids.is_empty() {
+        format!("interaction-continuation:{}:{}", interaction.id, interaction.status)
+    } else {
+        // Multiple partial verdict submissions in the same short interval
+        // should produce one continuation wake, matching Paperclip's
+        // two-second coalescing window.
+        let bucket = now.timestamp_millis().div_euclid(2_000);
+        format!(
+            "request_item_verdicts:{}:{}",
+            interaction.id, bucket
+        )
+    };
+
+    let mut payload = json!({
+        "issueId": wake_issue.id,
+        "interactionId": interaction.id,
+        "interactionKind": interaction.kind,
+        "interactionStatus": interaction.status,
+        "sourceCommentId": interaction.source_comment_id,
+        "sourceRunId": interaction.source_run_id,
+        "mutation": "interaction",
+    });
+    if !newly_resolved_item_ids.is_empty() {
+        payload["itemVerdicts"] = json!({
+            "newlyResolvedItemIds": newly_resolved_item_ids,
+            "coalesceWindowMs": 2_000,
+        });
+        payload["newlyResolvedItemIds"] = json!(newly_resolved_item_ids);
+    }
+
+    let result = state
+        .heartbeat_service
+        .wakeup_with_options(
+            agent_id,
+            wake_issue.id,
+            wake_issue.company_id,
+            HeartbeatWakeupOptions {
+                source: Some("interaction".into()),
+                trigger_detail: Some("system".into()),
+                reason: Some("issue_continuation_needed".into()),
+                requested_by_actor_type: Some(actor_label(actor).into()),
+                requested_by_actor_id: actor.principal_id(),
+                idempotency_key: Some(idempotency_key),
+                payload: Some(payload.clone()),
+                context_snapshot: Some(json!({
+                    "issueId": wake_issue.id,
+                    "taskId": wake_issue.id,
+                    "interactionId": interaction.id,
+                    "interactionKind": interaction.kind,
+                    "interactionStatus": interaction.status,
+                    "sourceCommentId": interaction.source_comment_id,
+                    "sourceRunId": interaction.source_run_id,
+                    "wakeReason": "issue_continuation_needed",
+                    "source": "issue.interaction.resolution",
+                    "itemVerdicts": payload.get("itemVerdicts"),
+                    "newlyResolvedItemIds": payload.get("newlyResolvedItemIds"),
+                })),
+                ..Default::default()
+            },
+        )
+        .await;
+    if let Err(error) = result {
+        tracing::warn!(
+            issue_id = %wake_issue.id,
+            interaction_id = %interaction.id,
+            agent_id = %agent_id,
+            error = %error,
+            "failed to wake assignee after issue interaction resolution"
+        );
     }
 }
 
@@ -342,6 +448,16 @@ pub async fn accept_interaction(
     let result = service.accept_interaction(&issue, interaction_id, input, resolver).await
         .map_err(map_interaction_service_error)?;
 
+    queue_interaction_continuation_wakeup(
+        &state,
+        &issue,
+        &result.interaction,
+        &actor,
+        result.continuation_issue.as_ref(),
+        &[],
+    )
+    .await;
+
     Ok(Json(result))
 }
 
@@ -400,6 +516,16 @@ pub async fn reject_interaction(
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.reject_interaction(&issue, interaction_id, input, resolver).await
         .map_err(map_interaction_service_error)?;
+
+    queue_interaction_continuation_wakeup(
+        &state,
+        &issue,
+        &interaction,
+        &actor,
+        None,
+        &[],
+    )
+    .await;
 
     Ok(Json(interaction))
 }
@@ -460,6 +586,14 @@ pub async fn answer_questions(
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
 
     guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
+
+    let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("Issue not found".to_string()))?;
+
     // Determine resolver
     let resolver = match &actor {
         AuthorizationActor::Board { user_id, .. } => {
@@ -485,6 +619,16 @@ pub async fn answer_questions(
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.answer_questions(issue_id, interaction_id, input, resolver).await
         .map_err(map_interaction_service_error)?;
+
+    queue_interaction_continuation_wakeup(
+        &state,
+        &issue,
+        &interaction,
+        &actor,
+        None,
+        &[],
+    )
+    .await;
 
     Ok(Json(interaction))
 }
@@ -512,6 +656,13 @@ pub async fn cancel_questions(
     crate::routes::assert_board(&actor)
         .map_err(|_| ApiError::Forbidden("Only Board users can cancel question interactions".into()))?;
 
+    let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("Issue not found".to_string()))?;
+
     // Determine resolver
     let resolver = match &actor {
         AuthorizationActor::Board { user_id, .. } => {
@@ -538,6 +689,16 @@ pub async fn cancel_questions(
     let interaction = service.cancel_questions(issue_id, interaction_id, input, resolver).await
         .map_err(map_interaction_service_error)?;
 
+    queue_interaction_continuation_wakeup(
+        &state,
+        &issue,
+        &interaction,
+        &actor,
+        None,
+        &[],
+    )
+    .await;
+
     Ok(Json(interaction))
 }
 
@@ -563,6 +724,13 @@ pub async fn withdraw_interaction(
         .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
 
     guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
+
+    let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("Issue not found".to_string()))?;
 
     // Determine resolver
     let resolver = match &actor {
@@ -606,6 +774,16 @@ pub async fn withdraw_interaction(
     )
     .await;
 
+    queue_interaction_continuation_wakeup(
+        &state,
+        &issue,
+        &interaction,
+        &actor,
+        None,
+        &[],
+    )
+    .await;
+
     Ok(Json(interaction))
 }
 
@@ -632,6 +810,13 @@ pub async fn submit_item_verdicts(
 
     guard_cross_issue_resolution(&state, &actor, company_id, issue_id).await?;
 
+    let issue: models::Issue = sqlx::query_as("SELECT * FROM issues WHERE id = $1")
+        .bind(issue_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("Issue not found".to_string()))?;
+
     // Determine resolver
     let resolver = match &actor {
         AuthorizationActor::Board { user_id, .. } => {
@@ -655,8 +840,19 @@ pub async fn submit_item_verdicts(
 
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let verdict_count = input.verdicts.len();
-    let interaction = service.submit_item_verdicts(issue_id, interaction_id, input, resolver).await
+    let submission = service.submit_item_verdicts_with_details(issue_id, interaction_id, input, resolver).await
         .map_err(map_interaction_service_error)?;
+    let interaction = submission.interaction;
+
+    queue_interaction_continuation_wakeup(
+        &state,
+        &issue,
+        &interaction,
+        &actor,
+        None,
+        &submission.newly_resolved_item_ids,
+    )
+    .await;
 
     // Log activity
     log_activity(

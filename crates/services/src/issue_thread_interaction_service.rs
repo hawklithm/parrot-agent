@@ -1358,6 +1358,24 @@ impl IssueThreadInteractionService {
         input: models::SubmitItemVerdictsInput,
         resolver: InteractionResolver,
     ) -> Result<IssueThreadInteraction, String> {
+        Ok(self
+            .submit_item_verdicts_with_details(issue_id, interaction_id, input, resolver)
+            .await?
+            .interaction)
+    }
+
+    /// Submit item verdicts and expose the newly resolved ids to the caller.
+    ///
+    /// A partial verdict request is still actionable, so Paperclip wakes the
+    /// assignee when at least one new item was resolved.  Replaying a verdict
+    /// for an already resolved item must not create another wakeup.
+    pub async fn submit_item_verdicts_with_details(
+        &self,
+        issue_id: Uuid,
+        interaction_id: Uuid,
+        input: models::SubmitItemVerdictsInput,
+        resolver: InteractionResolver,
+    ) -> Result<SubmitItemVerdictsResult, String> {
         let mut tx = self.pool.begin().await
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
@@ -1419,6 +1437,7 @@ impl IssueThreadInteractionService {
         }
 
         let mut newly_resolved = 0usize;
+        let mut newly_resolved_item_ids = Vec::new();
         let mut submitted_ids = HashSet::new();
         let enabled_verdicts: HashSet<String> = interaction
             .payload
@@ -1450,6 +1469,7 @@ impl IssueThreadInteractionService {
             }
             if !resolved_by_id.contains_key(&verdict.item_id) {
                 newly_resolved += 1;
+                newly_resolved_item_ids.push(verdict.item_id.clone());
                 resolved_by_id.insert(
                     verdict.item_id.clone(),
                     serde_json::json!({
@@ -1471,7 +1491,10 @@ impl IssueThreadInteractionService {
             {
                 tx.commit().await
                     .map_err(|e| format!("Failed to commit idempotent verdict request: {}", e))?;
-                return Ok(interaction);
+                return Ok(SubmitItemVerdictsResult {
+                    interaction,
+                    newly_resolved_item_ids: Vec::new(),
+                });
             }
             return Err(format!("Interaction is not pending (status: {})", interaction.status));
         }
@@ -1479,7 +1502,10 @@ impl IssueThreadInteractionService {
         if newly_resolved == 0 {
             tx.commit().await
                 .map_err(|e| format!("Failed to commit unchanged verdict request: {}", e))?;
-            return Ok(interaction);
+            return Ok(SubmitItemVerdictsResult {
+                interaction,
+                newly_resolved_item_ids: Vec::new(),
+            });
         }
 
         let items: Vec<serde_json::Value> = payload_items.iter()
@@ -1540,7 +1566,10 @@ impl IssueThreadInteractionService {
         tx.commit().await
             .map_err(|e| format!("Failed to commit transaction: {}", e))?;
 
-        Ok(updated)
+        Ok(SubmitItemVerdictsResult {
+            interaction: updated,
+            newly_resolved_item_ids,
+        })
     }
 }
 /// Creator of an interaction (agent or user)
@@ -1860,6 +1889,15 @@ pub struct InteractionResolver {
     pub resolver_type: String, // "user" | "agent" | "system"
     pub resolver_id: String,
     pub run_id: Option<Uuid>,
+}
+
+/// The resolved interaction plus the item ids that were newly accepted by the
+/// request.  The HTTP layer uses the latter to coalesce continuation wakeups
+/// for incremental item-verdict submissions without waking on a replay.
+#[derive(Debug, Clone)]
+pub struct SubmitItemVerdictsResult {
+    pub interaction: IssueThreadInteraction,
+    pub newly_resolved_item_ids: Vec<String>,
 }
 
 fn resolver_agent_id(resolver: &InteractionResolver) -> Option<Uuid> {

@@ -314,6 +314,115 @@ async fn checkbox_accept_and_item_verdicts_follow_paperclip_values(pool: PgPool)
 }
 
 #[sqlx::test]
+async fn resolution_queues_one_assignee_continuation_wakeup_and_replay_is_quiet(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let agent_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, company_id, name, status, adapter_type)
+         VALUES ($1, $2, 'Continuation agent', 'idle', 'process')",
+    )
+    .bind(agent_id)
+    .bind(fixture.company_id)
+    .execute(&pool)
+    .await
+    .expect("insert continuation agent");
+    sqlx::query(
+        "UPDATE issues
+         SET assignee_agent_id = $2, assignee_user_id = NULL
+         WHERE id = $1",
+    )
+    .bind(fixture.issue_id)
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("assign continuation issue");
+    // Keep the wakeup in the queued state so this test observes the durable
+    // continuation request without starting a real adapter process.
+    sqlx::query(
+        "INSERT INTO heartbeat_runs
+         (id, company_id, agent_id, status, context_snapshot)
+         VALUES ($1, $2, $3, 'running', $4)",
+    )
+    .bind(run_id)
+    .bind(fixture.company_id)
+    .bind(agent_id)
+    .bind(json!({ "issueId": fixture.issue_id }))
+    .execute(&pool)
+    .await
+    .expect("insert active continuation run");
+
+    let actor = board_actor(&fixture);
+    let app = app(pool.clone()).await;
+    let uri = format!("/issues/{}/interactions", fixture.issue_id);
+    let (status, created) = send(
+        &app,
+        &actor,
+        "POST",
+        &uri,
+        Some(json!({
+            "kind": "request_item_verdicts",
+            "payload": {"version": 1, "items": [{"id": "api"}, {"id": "docs"}]},
+            "resolverPolicy": "anyone",
+            "continuationPolicy": "wake_assignee"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let interaction_id = interaction_id(&created);
+    let verdict_uri = format!("{uri}/{interaction_id}/verdicts");
+
+    let (status, partial) = send(
+        &app,
+        &actor,
+        "POST",
+        &verdict_uri,
+        Some(json!({"verdicts": [{"itemId": "api", "verdict": "approve"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(partial["status"], "pending");
+
+    let wake_key_prefix = format!("request_item_verdicts:{interaction_id}:");
+    let wake_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_wakeup_requests
+         WHERE company_id = $1 AND agent_id = $2 AND idempotency_key LIKE $3",
+    )
+    .bind(fixture.company_id)
+    .bind(agent_id)
+    .bind(format!("{wake_key_prefix}%"))
+    .fetch_one(&pool)
+    .await
+    .expect("count continuation wake");
+    assert_eq!(wake_count, 1, "a newly resolved item must wake its assignee");
+
+    let (status, replay) = send(
+        &app,
+        &actor,
+        "POST",
+        &verdict_uri,
+        Some(json!({"verdicts": [{"itemId": "api", "verdict": "approve"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay["status"], "pending");
+
+    let replay_wake_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_wakeup_requests
+         WHERE company_id = $1 AND agent_id = $2 AND idempotency_key LIKE $3",
+    )
+    .bind(fixture.company_id)
+    .bind(agent_id)
+    .bind(format!("{wake_key_prefix}%"))
+    .fetch_one(&pool)
+    .await
+    .expect("count replay continuation wake");
+    assert_eq!(replay_wake_count, 1, "a verdict replay must not wake again");
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
 async fn board_can_cancel_questions_but_agent_cannot(pool: PgPool) {
     migrate(&pool).await;
     let fixture = seed(&pool).await;

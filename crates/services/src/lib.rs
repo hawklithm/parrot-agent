@@ -274,7 +274,8 @@ pub use issue_tree_control_service::{
     TreeControlServiceResult,
 };
 pub use issue_thread_interaction_service::{
-    IssueThreadInteractionService, InteractionCreator, InteractionResolver,
+    InteractionCreator, InteractionResolver, IssueThreadInteractionService,
+    SubmitItemVerdictsResult,
 };
 pub use mock_environment_services::{
     MockEnvironmentLeaseService, MockEnvironmentService, MockExecutionWorkspaceService,
