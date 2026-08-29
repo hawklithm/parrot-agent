@@ -269,6 +269,97 @@ async fn expired_idempotency_key_is_cleaned_before_reuse(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn expired_idempotency_cleanup_respects_the_500_row_batch_boundary(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let actor = board_actor(&fixture);
+
+    sqlx::query(
+        "WITH stale AS (
+             SELECT gen_random_uuid() AS id, generate_series(1, 501) AS ordinal
+         ), inserted AS (
+             INSERT INTO issues (
+                 id, company_id, title, issue_number, identifier,
+                 origin_fingerprint, created_at, updated_at
+             )
+             SELECT id, $1, format('stale issue %s', ordinal), 10000 + ordinal,
+                    format('STALE-%s-%s', replace($1::text, '-', ''), ordinal),
+                    format('stale-fingerprint-%s', ordinal),
+                    NOW() - INTERVAL '8 days', NOW() - INTERVAL '8 days'
+             FROM stale
+             RETURNING id
+         )
+         INSERT INTO issue_create_idempotency_keys (
+             company_id, idempotency_key, issue_id, created_at
+         )
+         SELECT $1, format('stale-key-%s', row_number() OVER ()), id,
+                NOW() - INTERVAL '8 days'
+         FROM inserted",
+    )
+    .bind(fixture.company_id)
+    .execute(&pool)
+    .await
+    .expect("seed stale idempotency rows");
+
+    let app = issue_routes()
+        .with_state(build_app_state(pool.clone()).await.expect("build app state"));
+    let (status, created) = send(
+        &app,
+        &actor,
+        json!({"title": "After cleanup batch", "idempotencyKey": "batch-1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["title"], "After cleanup batch");
+
+    let stale_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM issue_create_idempotency_keys
+         WHERE company_id = $1 AND idempotency_key LIKE 'stale-key-%'",
+    )
+    .bind(fixture.company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("remaining stale keys");
+    assert_eq!(stale_count, 1, "cleanup must delete at most 500 rows per request");
+
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
+async fn idempotency_cleanup_failure_returns_500_before_issue_creation(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let actor = board_actor(&fixture);
+    let app = issue_routes()
+        .with_state(build_app_state(pool.clone()).await.expect("build app state"));
+
+    sqlx::query("DROP TABLE issue_create_idempotency_keys")
+        .execute(&pool)
+        .await
+        .expect("drop idempotency table to simulate cleanup failure");
+
+    let (status, _body) = send(
+        &app,
+        &actor,
+        json!({"title": "Cleanup must fail", "idempotencyKey": "cleanup-failure-1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let issue_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM issues WHERE company_id = $1 AND title = 'Cleanup must fail'",
+    )
+    .bind(fixture.company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("issue count after cleanup failure");
+    assert_eq!(issue_count, 0);
+
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
 async fn failed_issue_association_rolls_back_issue_and_idempotency_key(pool: PgPool) {
     migrate(&pool).await;
     let fixture = seed(&pool).await;
