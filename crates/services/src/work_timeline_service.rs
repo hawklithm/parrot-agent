@@ -223,7 +223,7 @@ impl WorkTimelineService for DefaultWorkTimelineService {
 
         let rows = sqlx::query(
             r#"
-            SELECT ic.issue_id, ic.author_type::text, ic.author_agent_id, ic.author_user_id, ic.created_at
+            SELECT ic.issue_id, ic.actor_type::text AS actor_type, ic.actor_id, ic.created_at
             FROM issue_comments ic
             WHERE ic.company_id = $1 AND ic.issue_id = ANY($2)
               AND ic.created_at BETWEEN $3 AND $4 AND ic.deleted_at IS NULL
@@ -235,13 +235,13 @@ impl WorkTimelineService for DefaultWorkTimelineService {
         .map_err(|e| ServiceError::Internal(format!("Failed to load comments: {}", e)))?;
 
         let events = rows.into_iter().map(|row| {
-            let author_type: String = row.get("author_type");
-            let actor_id = if author_type == "agent" {
-                format!("agent:{}", row.get::<Option<Uuid>, _>("author_agent_id").unwrap_or_default())
-            } else if author_type == "user" {
-                format!("user:{}", row.get::<Option<Uuid>, _>("author_user_id").unwrap_or_default())
-            } else {
-                "system:system".to_string()
+            let actor_type: String = row.get("actor_type");
+            let actor_id = row.get::<Option<Uuid>, _>("actor_id");
+            let actor_id = match (actor_type.as_str(), actor_id) {
+                ("agent", Some(id)) => format!("agent:{id}"),
+                ("user", Some(id)) => format!("user:{id}"),
+                ("system", Some(id)) => format!("system:{id}"),
+                _ => "system:system".to_string(),
             };
 
             WorkTimelineEvent {
@@ -398,7 +398,8 @@ impl WorkTimelineService for DefaultWorkTimelineService {
                 WHERE i.company_id = $1 AND i.id = ANY($2)
                   AND (i.created_by_user_id = $3 OR i.assignee_user_id = $3
                       OR EXISTS (SELECT 1 FROM issue_comments ic
-                                 WHERE ic.issue_id = i.id AND ic.deleted_at IS NULL AND ic.author_user_id = $3
+                                 WHERE ic.issue_id = i.id AND ic.deleted_at IS NULL
+                                   AND ic.actor_type = 'user'::comment_actor_type AND ic.actor_id = $3
                                    AND ic.created_at BETWEEN $4 AND $5)
                       OR EXISTS (SELECT 1 FROM issue_approvals ia
                                  JOIN approvals a ON a.id = ia.approval_id
