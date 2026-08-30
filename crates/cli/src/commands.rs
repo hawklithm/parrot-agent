@@ -28,6 +28,18 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         "secret" => cmd_secret(rest),
         "routine" => cmd_routine(rest),
         "activity" => cmd_activity(rest),
+        "approval" => cmd_approval(rest),
+        "pipeline" => cmd_pipeline(rest),
+        "skill" => cmd_skill(rest),
+        "team" => cmd_team(rest),
+        "plugin" => cmd_plugin(rest),
+        "dashboard" => cmd_dashboard(rest),
+        "cost" => cmd_cost(rest),
+        "feedback" => cmd_feedback(rest),
+        "access" => cmd_access(rest),
+        "workspace" => cmd_workspace(rest),
+        "run" => cmd_run(rest),
+        "channel" => cmd_channel(rest),
         "service" => cmd_service(rest),
         "install" => cmd_install(rest),
         "update" => cmd_update(rest),
@@ -51,7 +63,7 @@ fn print_help() -> Result<()> {
     println!();
     println!("Data commands:");
     println!("  auth        get-session");
-    println!("  company     list | get <id>");
+    println!("  company     list | get <id> | create | delete <id> | export <id> | import");
     println!("  agent       list <companyId> | get <companyId> <agentId>");
     println!("  issue       list <companyId> | get <companyId> <issueId>");
     println!("  goal        list <companyId>");
@@ -59,6 +71,18 @@ fn print_help() -> Result<()> {
     println!("  secret      list <companyId>");
     println!("  routine     list <companyId>");
     println!("  activity    get <companyId>");
+    println!("  approval    list <companyId> | get <id> | approve <id> | reject <id> | resubmit <id>");
+    println!("  pipeline    list <companyId> | get <id>");
+    println!("  skill       list | get <name>");
+    println!("  team        catalog");
+    println!("  plugin      list | install | enable <id> | disable <id>");
+    println!("  dashboard   get <companyId>");
+    println!("  cost        summary <companyId>");
+    println!("  feedback    get <traceId>");
+    println!("  access      org-chart <companyId>");
+    println!("  workspace   list <companyId> | get <id>");
+    println!("  run         list <issueId> | get <id>");
+    println!("  channel     list <companyId>");
     println!();
     println!("Server management:");
     println!("  service     status | start | stop | restart");
@@ -254,15 +278,6 @@ fn cmd_install(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-// ── Update ─────────────────────────────────────────────────────────────
-
-fn cmd_update(args: &[String]) -> Result<()> {
-    let _version = get_flag_value(args, "--version");
-    println!("update: this command will download the latest parrot release");
-    println!("update: not yet implemented — download from https://github.com/parrot/releases");
-    Ok(())
-}
-
 // ── Auth ─────────────────────────────────────────────────────────────
 
 fn cmd_auth(args: &[String]) -> Result<()> {
@@ -281,7 +296,15 @@ fn cmd_auth(args: &[String]) -> Result<()> {
     }
 }
 
-// ── Company ───────────────────────────────────────────────────────────
+
+// ── Update ─────────────────────────────────────────────────────────────
+
+fn cmd_update(args: &[String]) -> Result<()> {
+    let _version = get_flag_value(args, "--version");
+    println!("update: this command will download the latest parrot release");
+    println!("update: not yet implemented — download from https://github.com/parrot/releases");
+    Ok(())
+}
 
 fn cmd_company(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("help");
@@ -298,12 +321,318 @@ fn cmd_company(args: &[String]) -> Result<()> {
             println!("{}", format_json(&company));
             Ok(())
         }
+        "create" => {
+            let raw = get_flag_value(args, "--json")
+                .ok_or_else(|| anyhow::anyhow!("company create requires --json '{{...}}'"))?;
+            let body: serde_json::Value = serde_json::from_str(&raw)?;
+            println!("{}", format_json(&client.create_company(&body)?));
+            Ok(())
+        }
+        "delete" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot company delete <id>"))?;
+            println!("{}", format_json(&client.delete_company(id)?));
+            Ok(())
+        }
+        "export" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot company export <id>"))?;
+            println!("{}", format_json(&client.export_company(id)?));
+            Ok(())
+        }
+        "import" => {
+            let raw = get_flag_value(args, "--json")
+                .ok_or_else(|| anyhow::anyhow!("company import requires --json '{{...}}'"))?;
+            let body: serde_json::Value = serde_json::from_str(&raw)?;
+            println!("{}", format_json(&client.import_company(&body)?));
+            Ok(())
+        }
         _ => {
-            println!("Usage: parrot company list | get <id>");
+            println!("Usage: parrot company list | get <id> | create --json '{{...}}' | delete <id> | export <id> | import --json '{{...}}'");
             Ok(())
         }
     }
 }
+
+// ── Approval ───────────────────────────────────────────────────────
+
+fn cmd_approval(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let client = load_client()?;
+    match sub {
+        "list" | "ls" => {
+            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval list <companyId>"))?;
+            println!("{}", format_json(&client.list_approvals(company_id)?));
+            Ok(())
+        }
+        "get" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval get <id>"))?;
+            println!("{}", format_json(&client.get_approval(id)?));
+            Ok(())
+        }
+        "approve" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval approve <id> [--json '{{...}}']"))?;
+            let body = approval_body(args);
+            println!("{}", format_json(&client.approve_approval(id, &body)?));
+            Ok(())
+        }
+        "reject" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval reject <id> [--json '{{...}}']"))?;
+            let body = approval_body(args);
+            println!("{}", format_json(&client.reject_approval(id, &body)?));
+            Ok(())
+        }
+        "resubmit" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval resubmit <id> [--json '{{...}}']"))?;
+            let body = get_flag_value(args, "--json").map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null));
+            println!("{}", format_json(&client.resubmit_approval(id, body.as_ref())?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot approval list <companyId> | get <id> | approve <id> [--json] | reject <id> [--json] | resubmit <id> [--json]");
+            Ok(())
+        }
+    }
+}
+
+fn approval_body(args: &[String]) -> serde_json::Value {
+    match get_flag_value(args, "--json") {
+        Some(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({})),
+        None => serde_json::json!({}),
+    }
+}
+
+// ── Pipeline ───────────────────────────────────────────────────────
+
+fn cmd_pipeline(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let client = load_client()?;
+    match sub {
+        "list" | "ls" => {
+            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot pipeline list <companyId>"))?;
+            println!("{}", format_json(&client.list_pipelines(company_id)?));
+            Ok(())
+        }
+        "get" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot pipeline get <id>"))?;
+            println!("{}", format_json(&client.get_pipeline(id)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot pipeline list <companyId> | get <id>");
+            Ok(())
+        }
+    }
+}
+
+// ── Skill ──────────────────────────────────────────────────────────
+
+fn cmd_skill(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let client = load_client()?;
+    match sub {
+        "list" | "ls" => {
+            println!("{}", format_json(&client.list_skills()?));
+            Ok(())
+        }
+        "get" => {
+            let name = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot skill get <name>"))?;
+            println!("{}", format_json(&client.get_skill(name)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot skill list | get <name>");
+            Ok(())
+        }
+    }
+}
+
+// ── Team ───────────────────────────────────────────────────────────
+
+fn cmd_team(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("catalog");
+    let client = load_client()?;
+    match sub {
+        "catalog" => {
+            println!("{}", format_json(&client.list_teams_catalog()?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot team catalog");
+            Ok(())
+        }
+    }
+}
+
+// ── Plugin ─────────────────────────────────────────────────────────
+
+fn cmd_plugin(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let client = load_client()?;
+    match sub {
+        "list" | "ls" => {
+            println!("{}", format_json(&client.list_plugins()?));
+            Ok(())
+        }
+        "install" => {
+            let raw = get_flag_value(args, "--json")
+                .ok_or_else(|| anyhow::anyhow!("plugin install requires --json '{{...}}'"))?;
+            let body: serde_json::Value = serde_json::from_str(&raw)?;
+            println!("{}", format_json(&client.install_plugin(&body)?));
+            Ok(())
+        }
+        "enable" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin enable <id>"))?;
+            println!("{}", format_json(&client.enable_plugin(id)?));
+            Ok(())
+        }
+        "disable" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin disable <id>"))?;
+            println!("{}", format_json(&client.disable_plugin(id)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot plugin list | install --json '{{...}}' | enable <id> | disable <id>");
+            Ok(())
+        }
+    }
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────
+
+fn cmd_dashboard(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("get");
+    let client = load_client()?;
+    match sub {
+        "get" => {
+            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot dashboard get <companyId>"))?;
+            println!("{}", format_json(&client.get_dashboard(company_id)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot dashboard get <companyId>");
+            Ok(())
+        }
+    }
+}
+
+// ── Cost ───────────────────────────────────────────────────────────
+
+fn cmd_cost(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let client = load_client()?;
+    match sub {
+        "summary" => {
+            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot cost summary <companyId>"))?;
+            println!("{}", format_json(&client.get_cost_summary(company_id)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot cost summary <companyId>");
+            Ok(())
+        }
+    }
+}
+
+// ── Feedback ──────────────────────────────────────────────────────
+
+fn cmd_feedback(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let client = load_client()?;
+    match sub {
+        "get" => {
+            let trace_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot feedback get <traceId>"))?;
+            println!("{}", format_json(&client.get_feedback_trace(trace_id)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot feedback get <traceId>");
+            Ok(())
+        }
+    }
+}
+
+// ── Access ────────────────────────────────────────────────────────
+
+fn cmd_access(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let client = load_client()?;
+    match sub {
+        "org-chart" => {
+            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot access org-chart <companyId>"))?;
+            println!("{}", format_json(&client.get_org_chart(company_id)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot access org-chart <companyId>");
+            Ok(())
+        }
+    }
+}
+
+// ── Workspace ─────────────────────────────────────────────────────
+
+fn cmd_workspace(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let client = load_client()?;
+    match sub {
+        "list" | "ls" => {
+            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot workspace list <companyId>"))?;
+            println!("{}", format_json(&client.list_workspaces(company_id)?));
+            Ok(())
+        }
+        "get" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot workspace get <id>"))?;
+            println!("{}", format_json(&client.get_workspace(id)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot workspace list <companyId> | get <id>");
+            Ok(())
+        }
+    }
+}
+
+// ── Run ───────────────────────────────────────────────────────────
+
+fn cmd_run(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let client = load_client()?;
+    match sub {
+        "list" | "ls" => {
+            let issue_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot run list <issueId>"))?;
+            println!("{}", format_json(&client.list_issue_runs(issue_id)?));
+            Ok(())
+        }
+        "get" => {
+            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot run get <id>"))?;
+            println!("{}", format_json(&client.get_run(id)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot run list <issueId> | get <id>");
+            Ok(())
+        }
+    }
+}
+
+// ── Channel ───────────────────────────────────────────────────────
+
+fn cmd_channel(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let client = load_client()?;
+    match sub {
+        "list" | "ls" => {
+            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot channel list <companyId>"))?;
+            println!("{}", format_json(&client.list_channels(company_id)?));
+            Ok(())
+        }
+        _ => {
+            println!("Usage: parrot channel list <companyId>");
+            Ok(())
+        }
+    }
+}
+
+
 
 // ── Agent ─────────────────────────────────────────────────────────────
 
