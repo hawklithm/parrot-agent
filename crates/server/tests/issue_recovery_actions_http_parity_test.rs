@@ -155,7 +155,28 @@ async fn list_returns_paperclip_active_actions_projection_and_resolve_is_scoped(
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    let (status, _) = send(
+    let blocker_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO issues (id, company_id, title, status)
+         VALUES ($1, $2, 'Unresolved blocker', 'todo')",
+    )
+    .bind(blocker_id)
+    .bind(fixture.company_id)
+    .execute(&pool)
+    .await
+    .expect("insert blocker issue");
+    sqlx::query(
+        "INSERT INTO issue_relations (company_id, issue_id, related_issue_id, type)
+         VALUES ($1, $2, $3, 'blocks')",
+    )
+    .bind(fixture.company_id)
+    .bind(blocker_id)
+    .bind(fixture.issue_id)
+    .execute(&pool)
+    .await
+    .expect("insert blocker relation");
+
+    let (status, body) = send(
         &app,
         &actor,
         "POST",
@@ -168,7 +189,12 @@ async fn list_returns_paperclip_active_actions_projection_and_resolve_is_scoped(
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["issue"]["id"], fixture.issue_id.to_string());
+    assert_eq!(body["issue"]["status"], "blocked");
+    assert!(body["issue"]["activeRecoveryAction"].is_null());
+    assert_eq!(body["recoveryAction"]["id"], fixture.action_id.to_string());
+    assert_eq!(body["recoveryAction"]["outcome"], "blocked");
 
     let row = sqlx::query(
         "SELECT status, outcome, resolution_note, resolved_at
@@ -187,6 +213,149 @@ async fn list_returns_paperclip_active_actions_projection_and_resolve_is_scoped(
     );
     assert!(row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("resolved_at").is_some());
 
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
+async fn blocked_resolution_without_unresolved_blocker_is_atomic(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let app = app(pool.clone()).await;
+
+    let (status, _) = send(
+        &app,
+        &board_actor(&fixture),
+        "POST",
+        &format!("/issues/{}/recovery-actions/resolve", fixture.issue_id),
+        Some(json!({
+            "actionId": fixture.action_id,
+            "outcome": "blocked",
+            "sourceIssueStatus": "blocked",
+            "resolutionNote": "No blocker exists"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let row = sqlx::query(
+        "SELECT i.status::text AS issue_status, r.status, r.outcome
+           FROM issues i
+           JOIN issue_recovery_actions r ON r.source_issue_id = i.id
+          WHERE i.id = $1 AND r.id = $2",
+    )
+    .bind(fixture.issue_id)
+    .bind(fixture.action_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load unchanged recovery state");
+    assert_eq!(row.get::<String, _>("issue_status"), "blocked");
+    assert_eq!(row.get::<String, _>("status"), "active");
+    assert!(row.get::<Option<String>, _>("outcome").is_none());
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
+async fn agent_owner_resolution_hands_back_and_queues_one_wakeup(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let app = app(pool.clone()).await;
+    let agent_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, company_id, name, status)
+         VALUES ($1, $2, 'Recovery owner', 'idle')",
+    )
+    .bind(agent_id)
+    .bind(fixture.company_id)
+    .execute(&pool)
+    .await
+    .expect("insert recovery owner");
+    sqlx::query("UPDATE issues SET assignee_agent_id = $2 WHERE id = $1")
+        .bind(fixture.issue_id)
+        .bind(agent_id)
+        .execute(&pool)
+        .await
+        .expect("assign issue owner");
+    sqlx::query(
+        "UPDATE issue_recovery_actions
+            SET owner_type = 'agent', owner_agent_id = $2, return_owner_agent_id = $2
+          WHERE id = $1",
+    )
+    .bind(fixture.action_id)
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("assign recovery owner");
+
+    let (status, body) = send(
+        &app,
+        &AuthorizationActor::agent(agent_id, fixture.company_id, None),
+        "POST",
+        &format!("/issues/{}/recovery-actions/resolve", fixture.issue_id),
+        Some(json!({
+            "actionId": fixture.action_id,
+            "outcome": "restored",
+            "sourceIssueStatus": "todo",
+            "resolutionNote": "Restored to the previous owner"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["issue"]["status"], "todo");
+    assert_eq!(body["issue"]["assigneeAgentId"], agent_id.to_string());
+    assert_eq!(body["recoveryAction"]["outcome"], "handed_back");
+
+    let wake_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM agent_wakeup_requests
+          WHERE company_id = $1 AND agent_id = $2
+            AND payload->>'issueId' = $3
+            AND reason = 'issue_recovery_action_restored'",
+    )
+    .bind(fixture.company_id)
+    .bind(agent_id)
+    .bind(fixture.issue_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count recovery wakeups");
+    assert_eq!(wake_count, 1);
+    cleanup(&fixture).await;
+}
+
+#[sqlx::test]
+async fn concurrent_resolve_of_one_action_has_one_winner(pool: PgPool) {
+    migrate(&pool).await;
+    let fixture = seed(&pool).await;
+    let app = app(pool.clone()).await;
+    let actor = board_actor(&fixture);
+    let uri = format!("/issues/{}/recovery-actions/resolve", fixture.issue_id);
+    let payload = json!({
+        "actionId": fixture.action_id,
+        "outcome": "restored",
+        "sourceIssueStatus": "todo",
+        "resolutionNote": "Concurrent restore"
+    });
+
+    let first = send(&app, &actor, "POST", &uri, Some(payload.clone()));
+    let second = send(&app, &actor, "POST", &uri, Some(payload));
+    let (first, second) = tokio::join!(first, second);
+    let statuses = [first.0, second.0];
+    assert!(statuses.contains(&StatusCode::OK));
+    assert!(statuses.contains(&StatusCode::NOT_FOUND));
+
+    let row = sqlx::query(
+        "SELECT i.status::text AS issue_status, r.status, r.outcome
+           FROM issues i
+           JOIN issue_recovery_actions r ON r.source_issue_id = i.id
+          WHERE i.id = $1 AND r.id = $2",
+    )
+    .bind(fixture.issue_id)
+    .bind(fixture.action_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load concurrent recovery result");
+    assert_eq!(row.get::<String, _>("issue_status"), "todo");
+    assert_eq!(row.get::<String, _>("status"), "resolved");
+    assert_eq!(row.get::<String, _>("outcome"), "restored");
     cleanup(&fixture).await;
 }
 

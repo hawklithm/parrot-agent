@@ -15,7 +15,7 @@ use uuid::Uuid;
 use std::path::{Path as FsPath, PathBuf};
 
 use models::event_bus::{EventMetadata, IssueEvent, SystemEvent, SystemEventPayload};
-use models::{CreateIssueInput, Issue, IssuePriority, IssueStatus, UpdateIssueInput};
+use models::{CreateIssueInput, Issue, IssuePriority, IssueStatus, RecoveryAction, UpdateIssueInput};
 use services::auth::AuthorizationActor;
 use services::{
     CheckoutInput, CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
@@ -4504,26 +4504,307 @@ async fn list_recovery_actions(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveRecoveryActionRequest {
+    #[serde(default)]
+    action_id: Option<Uuid>,
+    outcome: String,
+    #[serde(default)]
+    source_issue_status: Option<IssueStatus>,
+    #[serde(default)]
+    resolution_note: Option<String>,
+}
+
+fn validate_recovery_action_resolution(
+    input: &ResolveRecoveryActionRequest,
+) -> Result<IssueStatus, StatusCode> {
+    let source_issue_status = input
+        .source_issue_status
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    match input.outcome.as_str() {
+        "restored"
+            if matches!(
+                source_issue_status,
+                IssueStatus::Todo | IssueStatus::Done | IssueStatus::InReview
+            ) => Ok(source_issue_status),
+        "blocked" if source_issue_status == IssueStatus::Blocked => Ok(source_issue_status),
+        "false_positive" | "cancelled"
+            if matches!(source_issue_status, IssueStatus::Done | IssueStatus::InReview) =>
+        {
+            Ok(source_issue_status)
+        }
+        _ => Err(StatusCode::UNPROCESSABLE_ENTITY),
+    }
+}
+
 /// I28: POST /issues/:id/recovery-actions/resolve
 async fn resolve_recovery_action(
     State(state): State<AppState>,
     Extension(actor): Extension<services::auth::AuthorizationActor>,
     IssueId(id): IssueId,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<StatusCode, StatusCode> {
+    Json(input): Json<ResolveRecoveryActionRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
     crate::routes::assert_company_access(&actor, company_id, false)?;
-    let action_id = payload
-        .get("actionId")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    state
-        .issue_service
-        .resolve_recovery_action(id, company_id, action_id, payload)
+    let target_status = validate_recovery_action_resolution(&input)?;
+    if matches!(input.outcome.as_str(), "false_positive" | "cancelled") {
+        crate::routes::assert_board(&actor)?;
+    }
+
+    // Keep the issue lock before the action lock. Every resolve path uses this
+    // order so two competing resolutions converge on one terminal action and
+    // cannot update the issue from different snapshots.
+    let mut tx = state
+        .pool
+        .begin()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::NO_CONTENT)
+    let existing_issue = sqlx::query_as::<_, Issue>(
+        "SELECT * FROM issues WHERE id = $1 AND company_id = $2 FOR UPDATE",
+    )
+    .bind(id)
+    .bind(company_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let active_recovery_action = sqlx::query_as::<_, RecoveryAction>(
+        "SELECT *
+           FROM issue_recovery_actions
+          WHERE company_id = $1
+            AND source_issue_id = $2
+            AND status IN ('active', 'escalated')
+            AND ($3::uuid IS NULL OR id = $3)
+          ORDER BY created_at DESC
+          LIMIT 1
+          FOR UPDATE",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(input.action_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    if actor.is_agent() {
+        let agent_id = actor.principal_id().ok_or(StatusCode::FORBIDDEN)?;
+        let authorized = existing_issue.assignee_agent_id == Some(agent_id)
+            || active_recovery_action.owner_agent_id == Some(agent_id);
+        if !authorized {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    if input.outcome == "blocked" {
+        let unresolved_blocker = sqlx::query_scalar::<_, i32>(
+            "SELECT 1
+               FROM issue_relations relation
+               JOIN issues blocker ON blocker.id = relation.issue_id
+              WHERE relation.company_id = $1
+                AND relation.related_issue_id = $2
+                AND relation.type = 'blocks'
+                AND blocker.status::text NOT IN ('done', 'cancelled')
+              LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if unresolved_blocker.is_none() {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    let hand_back_agent_id = if input.outcome == "restored" && target_status == IssueStatus::Todo
+    {
+        active_recovery_action.return_owner_agent_id
+    } else {
+        None
+    };
+    let recorded_outcome = if hand_back_agent_id.is_some() {
+        "handed_back"
+    } else if input.outcome == "restored" && target_status == IssueStatus::Done {
+        "owner_completed"
+    } else {
+        input.outcome.as_str()
+    };
+    let action_status = if input.outcome == "cancelled" {
+        "cancelled"
+    } else {
+        "resolved"
+    };
+
+    let updated_issue = sqlx::query_as::<_, Issue>(
+        "UPDATE issues
+            SET status = $3::issue_status,
+                assignee_agent_id = CASE
+                    WHEN $4::uuid IS NULL THEN assignee_agent_id
+                    ELSE $4::uuid
+                END,
+                assignee_user_id = CASE
+                    WHEN $4::uuid IS NULL THEN assignee_user_id
+                    ELSE NULL
+                END,
+                completed_at = CASE
+                    WHEN $3::text = 'done' THEN NOW()
+                    ELSE NULL
+                END,
+                cancelled_at = CASE
+                    WHEN $3::text = 'cancelled' THEN NOW()
+                    ELSE NULL
+                END,
+                checkout_run_id = NULL,
+                execution_run_id = NULL,
+                execution_agent_name_key = NULL,
+                execution_locked_at = NULL,
+                updated_at = NOW()
+          WHERE id = $1 AND company_id = $2
+          RETURNING *",
+    )
+    .bind(id)
+    .bind(company_id)
+    .bind(target_status.to_string())
+    .bind(hand_back_agent_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let resolved_action = sqlx::query_as::<_, RecoveryAction>(
+        "UPDATE issue_recovery_actions
+            SET status = $4,
+                outcome = $5,
+                resolution_note = $6,
+                resolved_at = NOW(),
+                updated_at = NOW()
+          WHERE id = $1
+            AND company_id = $2
+            AND source_issue_id = $3
+            AND status IN ('active', 'escalated')
+          RETURNING *",
+    )
+    .bind(active_recovery_action.id)
+    .bind(company_id)
+    .bind(id)
+    .bind(action_status)
+    .bind(recorded_outcome)
+    .bind(input.resolution_note.as_deref())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tx.commit()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let response_issue = state
+        .issue_service
+        .get(id, company_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .unwrap_or(updated_issue.clone());
+
+    if existing_issue.status != updated_issue.status
+        || existing_issue.assignee_agent_id != updated_issue.assignee_agent_id
+    {
+        log_activity(
+            &state.pool,
+            company_id,
+            "issue.updated",
+            &actor,
+            "issue",
+            id,
+            json!({
+                "status": updated_issue.status,
+                "source": "recovery_action_resolution",
+                "recoveryActionId": resolved_action.id,
+                "previousStatus": existing_issue.status,
+                "previousAssigneeAgentId": existing_issue.assignee_agent_id,
+            }),
+        )
+        .await;
+    }
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.recovery_action_resolved",
+        &actor,
+        "issue",
+        id,
+        json!({
+            "recoveryActionId": resolved_action.id,
+            "recoveryActionStatus": resolved_action.status,
+            "outcome": resolved_action.outcome,
+            "sourceIssueStatus": target_status,
+            "resolutionNote": resolved_action.resolution_note,
+        }),
+    )
+    .await;
+
+    if target_status == IssueStatus::Todo
+        && updated_issue.assignee_agent_id.is_some()
+        && (existing_issue.status != updated_issue.status
+            || existing_issue.assignee_agent_id != updated_issue.assignee_agent_id)
+    {
+        let agent_id = updated_issue.assignee_agent_id.expect("checked above");
+        if let Err(error) = state
+            .heartbeat_service
+            .wakeup_with_options(
+                agent_id,
+                id,
+                company_id,
+                HeartbeatWakeupOptions {
+                    source: Some("automation".to_string()),
+                    trigger_detail: Some("system".to_string()),
+                    reason: Some("issue_recovery_action_restored".to_string()),
+                    requested_by_actor_type: Some(actor.actor_type().to_string()),
+                    requested_by_actor_id: actor.principal_id(),
+                    idempotency_key: Some(format!(
+                        "recovery_action_resolution:{}",
+                        resolved_action.id
+                    )),
+                    payload: Some(json!({
+                        "issueId": id,
+                        "recoveryActionId": resolved_action.id,
+                        "mutation": "recovery_action_resolution",
+                    })),
+                    context_snapshot: Some(json!({
+                        "issueId": id,
+                        "taskId": id,
+                        "wakeReason": "issue_recovery_action_restored",
+                        "source": "issue.recovery_action_resolution",
+                        "recoveryActionId": resolved_action.id,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                issue_id = %id,
+                agent_id = %agent_id,
+                "failed to wake agent after recovery action restored issue"
+            );
+        }
+    }
+
+    let mut issue_json = serde_json::to_value(response_issue)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    issue_json
+        .as_object_mut()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+        .insert("activeRecoveryAction".to_string(), Value::Null);
+    let recovery_action_json = serde_json::to_value(resolved_action)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({
+        "issue": issue_json,
+        "recoveryAction": recovery_action_json,
+    })))
 }
 
 /// Create issue routes
