@@ -28,6 +28,9 @@ pub struct AdapterInfoResponse {
     /// Agent 配置文档
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_configuration_doc: Option<String>,
+
+    /// 能力集合（取自真实 adapter capability，对齐 Paperclip `AdapterInfo.capabilities`）
+    pub capabilities: AdapterCapabilities,
 }
 
 /// Adapter 模型响应
@@ -257,6 +260,14 @@ mod tests {
             supports_instructions_bundle: true,
             instructions_path_key: Some("instructionsFilePath".to_string()),
             agent_configuration_doc: None,
+            capabilities: AdapterCapabilities {
+                supports_instructions_bundle: true,
+                supports_skills: true,
+                supports_local_agent_jwt: false,
+                requires_materialized_runtime_skills: false,
+                supports_model_profiles: true,
+                supports_acp: true,
+            },
         };
 
         let json = serde_json::to_string(&response).unwrap();

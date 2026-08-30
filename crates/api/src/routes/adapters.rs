@@ -96,6 +96,14 @@ async fn list_adapters(
                 supports_instructions_bundle: adapter.supports_instructions_bundle().supported,
                 instructions_path_key: Some(adapter.instructions_path_key().to_string()),
                 agent_configuration_doc: adapter.agent_configuration_doc().map(String::from),
+                capabilities: crate::schemas::AdapterCapabilities {
+                    supports_instructions_bundle: adapter.supports_instructions_bundle().supported,
+                    supports_skills: adapter.supports_skills(),
+                    supports_local_agent_jwt: adapter.supports_local_agent_jwt(),
+                    requires_materialized_runtime_skills: adapter.requires_materialized_runtime_skills(),
+                    supports_model_profiles: adapter.supports_model_profiles(),
+                    supports_acp: adapter.supports_acp(),
+                },
             }
         })
         .collect();
@@ -134,6 +142,14 @@ async fn get_adapter_info(
         supports_instructions_bundle: adapter.supports_instructions_bundle().supported,
         instructions_path_key: Some(adapter.instructions_path_key().to_string()),
         agent_configuration_doc: adapter.agent_configuration_doc().map(String::from),
+        capabilities: crate::schemas::AdapterCapabilities {
+            supports_instructions_bundle: adapter.supports_instructions_bundle().supported,
+            supports_skills: adapter.supports_skills(),
+            supports_local_agent_jwt: adapter.supports_local_agent_jwt(),
+            requires_materialized_runtime_skills: adapter.requires_materialized_runtime_skills(),
+            supports_model_profiles: adapter.supports_model_profiles(),
+            supports_acp: adapter.supports_acp(),
+        },
     };
 
     Ok(Json(response))
@@ -1047,5 +1063,35 @@ mod tests {
         let serialized = serde_json::to_value(info).expect("adapter info should serialize");
         assert_eq!(serialized["loaded"], false);
         assert_eq!(serialized["capabilities"]["supportsAcp"], false);
+    }
+
+    #[test]
+    fn adapter_info_response_includes_capabilities() {
+        let info = AdapterInfoResponse {
+            adapter_type: "claude_local".to_string(),
+            label: "Claude Local".to_string(),
+            models: vec![],
+            config_schema: None,
+            supports_instructions_bundle: true,
+            instructions_path_key: Some("instructionsPath".to_string()),
+            agent_configuration_doc: None,
+            capabilities: crate::schemas::AdapterCapabilities {
+                supports_instructions_bundle: true,
+                supports_skills: true,
+                supports_local_agent_jwt: false,
+                requires_materialized_runtime_skills: false,
+                supports_model_profiles: true,
+                supports_acp: true,
+            },
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        // Mirrors Paperclip `AdapterInfo.capabilities` contract (camelCase).
+        let caps = json.get("capabilities").expect("capabilities present");
+        assert_eq!(caps.get("supportsSkills").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(caps.get("supportsAcp").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            caps.get("supportsLocalAgentJwt").and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
 }
