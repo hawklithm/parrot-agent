@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -259,16 +261,14 @@ impl DecisionWakeupService for DefaultDecisionWakeupService {
 /// 此函数返回一个可选的回调函数，仅在heartbeat runtime启用时才实际执行唤醒。
 /// 这确保在调度器禁用时不会接受无法处理的唤醒请求。
 pub fn create_decision_wake_origin_agent_callback(
-    wakeup_service: Option<&dyn DecisionWakeupService>,
-) -> Option<impl Fn(DecisionWakeupInput) + Send + Sync> {
-    wakeup_service.map(|_service| {
+    wakeup_service: Option<Arc<dyn DecisionWakeupService>>,
+) -> Option<impl Fn(DecisionWakeupInput) -> Pin<Box<dyn Future<Output = Result<(), WakeupError>> + Send>> + Send + Sync> {
+    wakeup_service.map(|service| {
         move |input: DecisionWakeupInput| {
-            // TODO: 实现实际的异步调用
-            tracing::debug!(
-                agent_id = %input.agent_id,
-                decision_id = %input.decision_id,
-                "Decision wakeup callback triggered"
-            );
+            let service = Arc::clone(&service);
+            let future: Pin<Box<dyn Future<Output = Result<(), WakeupError>> + Send>> =
+                Box::pin(async move { service.wake_origin_agent_for_decision(input).await });
+            future
         }
     })
 }
@@ -277,16 +277,14 @@ pub fn create_decision_wake_origin_agent_callback(
 /// 
 /// 此函数返回一个可选的回调函数，仅在heartbeat runtime启用时才实际发送通知。
 pub fn create_decision_retention_notify_origin_agent_callback(
-    wakeup_service: Option<&dyn DecisionWakeupService>,
-) -> Option<impl Fn(ArchiveNotificationBatch) + Send + Sync> {
-    wakeup_service.map(|_service| {
+    wakeup_service: Option<Arc<dyn DecisionWakeupService>>,
+) -> Option<impl Fn(ArchiveNotificationBatch) -> Pin<Box<dyn Future<Output = Result<(), WakeupError>> + Send>> + Send + Sync> {
+    wakeup_service.map(|service| {
         move |batch: ArchiveNotificationBatch| {
-            // TODO: 实现实际的异步调用
-            tracing::debug!(
-                agent_id = %batch.agent_id,
-                item_count = batch.items.len(),
-                "Archive notification callback triggered"
-            );
+            let service = Arc::clone(&service);
+            let future: Pin<Box<dyn Future<Output = Result<(), WakeupError>> + Send>> =
+                Box::pin(async move { service.notify_origin_agent_for_archives(batch).await });
+            future
         }
     })
 }
@@ -367,6 +365,65 @@ mod tests {
             })
             .await
             .unwrap();
+
+        assert_eq!(heartbeat.wakes.lock().unwrap().as_slice(), &[(agent_id, issue_id, company_id)]);
+    }
+
+    #[tokio::test]
+    async fn decision_callback_executes_async_service_and_propagates_result() {
+        let heartbeat = Arc::new(RecordingHeartbeat { wakes: Mutex::new(Vec::new()) });
+        let company_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        let service: Arc<dyn DecisionWakeupService> = Arc::new(
+            DefaultDecisionWakeupService::new(true).with_heartbeat_service(heartbeat.clone()),
+        );
+        let callback = create_decision_wake_origin_agent_callback(Some(service)).expect("callback");
+
+        callback(DecisionWakeupInput {
+            company_id,
+            agent_id,
+            issue_id,
+            decision_id: Uuid::new_v4(),
+            outcome: "approved".to_string(),
+        })
+        .await
+        .expect("decision wakeup");
+
+        assert_eq!(heartbeat.wakes.lock().unwrap().as_slice(), &[(agent_id, issue_id, company_id)]);
+    }
+
+    #[tokio::test]
+    async fn retention_callback_deduplicates_issue_notifications_via_service() {
+        let heartbeat = Arc::new(RecordingHeartbeat { wakes: Mutex::new(Vec::new()) });
+        let company_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        let service: Arc<dyn DecisionWakeupService> = Arc::new(
+            DefaultDecisionWakeupService::new(true).with_heartbeat_service(heartbeat.clone()),
+        );
+        let callback = create_decision_retention_notify_origin_agent_callback(Some(service)).expect("callback");
+
+        callback(ArchiveNotificationBatch {
+            company_id,
+            agent_id,
+            items: vec![
+                ArchiveNotificationItem {
+                    source_kind: "issue".to_string(),
+                    source_id: "issue-1".to_string(),
+                    issue_id,
+                    archive_version: 1,
+                },
+                ArchiveNotificationItem {
+                    source_kind: "approval".to_string(),
+                    source_id: "approval-1".to_string(),
+                    issue_id,
+                    archive_version: 2,
+                },
+            ],
+        })
+        .await
+        .expect("archive notification");
 
         assert_eq!(heartbeat.wakes.lock().unwrap().as_slice(), &[(agent_id, issue_id, company_id)]);
     }
