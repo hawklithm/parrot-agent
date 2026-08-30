@@ -252,3 +252,107 @@ mod event_tests {
         );
     }
 }
+
+/// Run context passed to a plugin tool handler when an agent invokes the tool.
+///
+/// Port of `@paperclipai/plugin-sdk` `ToolRunContext` (PLUGIN_SPEC §13.10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRunContext {
+    /// UUID of the agent invoking the tool.
+    pub agent_id: String,
+    /// UUID of the current agent run.
+    pub run_id: String,
+    /// UUID of the company the run belongs to.
+    pub company_id: String,
+    /// UUID of the project the run belongs to.
+    pub project_id: String,
+}
+
+/// Result returned from a plugin tool handler.
+///
+/// Port of `@paperclipai/plugin-sdk` `ToolResult` (PLUGIN_SPEC §13.10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ToolResult {
+    /// String content returned to the agent. Required for success responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Structured data returned alongside or instead of string content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// If present, indicates the tool call failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Normalize a worker `ToolResult` into the host's internal tool-output shape.
+///
+/// Mirrors Paperclip's contract: a result is a failure iff `error` is set;
+/// success carries `content` (falling back to a stringified `data`) and never
+/// an `error`. Returns `(success, payload)` where `payload` is the agent-facing
+/// content/`data` (or the error string).
+pub fn normalize_plugin_tool_result(result: &ToolResult) -> (bool, serde_json::Value) {
+    if let Some(error) = &result.error {
+        return (false, serde_json::json!(error));
+    }
+    let payload = match (&result.content, &result.data) {
+        (Some(content), _) => serde_json::json!(content),
+        (None, Some(data)) => data.clone(),
+        (None, None) => serde_json::Value::Null,
+    };
+    (true, payload)
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+
+    #[test]
+    fn tool_run_context_round_trips() {
+        let ctx = ToolRunContext {
+            agent_id: "a".to_string(),
+            run_id: "r".to_string(),
+            company_id: "c".to_string(),
+            project_id: "p".to_string(),
+        };
+        let back: ToolRunContext = serde_json::from_str(&serde_json::to_string(&ctx).unwrap()).unwrap();
+        assert_eq!(back, ctx);
+    }
+
+    #[test]
+    fn error_result_is_failure() {
+        let (ok, payload) = normalize_plugin_tool_result(&ToolResult {
+            error: Some("boom".to_string()),
+            ..Default::default()
+        });
+        assert!(!ok);
+        assert_eq!(payload, serde_json::json!("boom"));
+    }
+
+    #[test]
+    fn content_success_ignores_data() {
+        let (ok, payload) = normalize_plugin_tool_result(&ToolResult {
+            content: Some("hello".to_string()),
+            data: Some(serde_json::json!({"k": 1})),
+            ..Default::default()
+        });
+        assert!(ok);
+        assert_eq!(payload, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn data_only_success_without_content() {
+        let (ok, payload) = normalize_plugin_tool_result(&ToolResult {
+            data: Some(serde_json::json!({"k": 1})),
+            ..Default::default()
+        });
+        assert!(ok);
+        assert_eq!(payload, serde_json::json!({"k": 1}));
+    }
+
+    #[test]
+    fn empty_result_is_success_with_null_payload() {
+        let (ok, payload) = normalize_plugin_tool_result(&ToolResult::default());
+        assert!(ok);
+        assert_eq!(payload, serde_json::Value::Null);
+    }
+}
