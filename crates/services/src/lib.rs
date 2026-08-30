@@ -79,6 +79,7 @@ pub mod status_card_finalization_service;
 pub mod webhook_service;
 pub mod summary_slot_service;
 pub mod mcp_http_service;
+pub mod mcp_http;
 pub mod remote_http_endpoint_guard;
 pub mod tool_access_audit_service;
 pub mod tool_profile_binding_precedence;
