@@ -755,9 +755,8 @@ async fn upsert_issue_document(
         (document_id, 1)
     };
     let (created_by_type, created_by_id) = document_revision_creator(&actor);
-    let revision_id: Uuid = sqlx::query_scalar(
+    let revision_id: Uuid = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO document_revisions
-           (document_id, company_id, revision_number, content, created_by_type, created_by_id)
          VALUES ($1,$2,$3,$4,$5,$6)
          RETURNING id",
     )
@@ -770,6 +769,20 @@ async fn upsert_issue_document(
     .fetch_one(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if revision_number > 1 {
+        if let Err(error) = remap_open_annotation_threads(
+            &mut tx,
+            issue_id,
+            document_id,
+            Some(revision_id),
+            revision_number,
+            content,
+        )
+        .await
+        {
+            tracing::warn!(%error, issue_id = %issue_id, "anchor remap on document revision failed");
+        }
+    }
     tx.commit()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -880,9 +893,9 @@ async fn restore_issue_document_revision(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (created_by_type, created_by_id) = document_revision_creator(&actor);
-    let restored_revision_id: Uuid = sqlx::query_scalar(
+    let restored_revision_id: Uuid = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO document_revisions
-           (document_id, company_id, revision_number, content, created_by_type, created_by_id)
+         (document_id, company_id, revision_number, content, created_by_type, created_by_id)
          VALUES ($1,$2,$3,$4,$5,$6)
          RETURNING id",
     )
@@ -891,10 +904,21 @@ async fn restore_issue_document_revision(
     .bind(revision)
     .bind(&content)
     .bind(created_by_type)
-    .bind(created_by_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Err(error) = remap_open_annotation_threads(
+        &mut tx,
+        issue_id,
+        document_id,
+        Some(restored_revision_id),
+        revision,
+        &content,
+    )
+    .await
+    {
+        tracing::warn!(%error, issue_id = %issue_id, "anchor remap on document restore failed");
+    }
     tx.commit()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1377,6 +1401,79 @@ async fn reply_issue_document_annotation(
             "createdByRunId": created_by_run_id,
         })),
     ))
+}
+
+/// Mirrors Paperclip `remapOpenThreadsForDocument`: when a new document
+/// revision is created, open annotation threads are re-anchored against the
+/// new markdown body and their `current_revision_*` / `anchor_state` are
+/// updated so they track the latest revision instead of silently going stale.
+async fn remap_open_annotation_threads(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    issue_id: Uuid,
+    document_id: Uuid,
+    next_revision_id: Option<Uuid>,
+    next_revision_number: i32,
+    next_body: &str,
+) -> Result<(), sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, status, anchor_state, anchor_selector, anchor_confidence, \
+         selected_text, prefix_text, suffix_text, normalized_start, normalized_end, \
+         markdown_start, markdown_end, original_revision_id, original_revision_number, \
+         current_revision_id, current_revision_number \
+         FROM document_annotation_threads \
+         WHERE issue_id=$1 AND document_id=$2 AND status='open'",
+    )
+    .bind(issue_id)
+    .bind(document_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for row in rows {
+        let thread_id: Uuid = row.get("id");
+        let current_revision_id: Option<Uuid> = row.get("current_revision_id");
+        if current_revision_id == next_revision_id {
+            continue;
+        }
+
+        let thread = serde_json::json!({
+            "selectedText": row.get::<String, _>("selected_text"),
+            "prefixText": row.get::<String, _>("prefix_text"),
+            "suffixText": row.get::<String, _>("suffix_text"),
+            "normalizedStart": row.get::<i32, _>("normalized_start"),
+            "normalizedEnd": row.get::<i32, _>("normalized_end"),
+            "markdownStart": row.get::<i32, _>("markdown_start"),
+            "markdownEnd": row.get::<i32, _>("markdown_end"),
+        });
+
+        let result = crate::document_anchors::remap_thread(&thread, next_body);
+        let patch = crate::document_anchors::remap_result_to_patch(&result);
+        let selector = patch.get("anchorSelector").cloned().unwrap_or(serde_json::json!({}));
+
+        sqlx::query(
+            "UPDATE document_annotation_threads SET \
+             current_revision_id=$1, current_revision_number=$2, anchor_state=$3, anchor_confidence=$4, \
+             anchor_selector=$5, selected_text=$6, prefix_text=$7, suffix_text=$8, \
+             normalized_start=$9, normalized_end=$10, markdown_start=$11, markdown_end=$12, updated_at=NOW() \
+             WHERE id=$13",
+        )
+        .bind(next_revision_id)
+        .bind(next_revision_number)
+        .bind(patch.get("anchorState").and_then(Value::as_str).unwrap_or("active"))
+        .bind(patch.get("anchorConfidence").and_then(Value::as_str).unwrap_or("missing"))
+        .bind(&selector)
+        .bind(patch.get("selectedText").and_then(Value::as_str).unwrap_or(""))
+        .bind(patch.get("prefixText").and_then(Value::as_str).unwrap_or(""))
+        .bind(patch.get("suffixText").and_then(Value::as_str).unwrap_or(""))
+        .bind(patch.get("normalizedStart").and_then(Value::as_i64).unwrap_or(0) as i32)
+        .bind(patch.get("normalizedEnd").and_then(Value::as_i64).unwrap_or(0) as i32)
+        .bind(patch.get("markdownStart").and_then(Value::as_i64).unwrap_or(0) as i32)
+        .bind(patch.get("markdownEnd").and_then(Value::as_i64).unwrap_or(0) as i32)
+        .bind(thread_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
 }
 
 /// PATCH /issues/:id/documents/:key/annotations/:thread_id

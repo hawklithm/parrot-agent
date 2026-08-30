@@ -10,6 +10,7 @@ pub mod extractors;
 pub mod middleware;
 pub mod mcp;
 pub(crate) mod paperclip_internal;
+pub(crate) mod document_anchors;
 
 pub use errors::AppError;
 pub use validation::{CreateAgentHireSchema, UpdateAgentSchema, TestAdapterEnvironmentSchema};
