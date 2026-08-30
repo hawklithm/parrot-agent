@@ -151,3 +151,104 @@ mod tests {
         assert_eq!(back.composite_key(), "goal:goal-1:tab:open");
     }
 }
+
+/// Optional filter applied when subscribing to an event. The host evaluates
+/// the filter server-side so filtered-out events never cross the process boundary.
+///
+/// Port of `@paperclipai/plugin-sdk` `EventFilter` (PLUGIN_SPEC §16.1).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EventFilter {
+    /// Only receive events for this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Only receive events for this company.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company_id: Option<String>,
+    /// Only receive events for this agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Additional arbitrary filter fields.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Actor type for a plugin event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginEventActorType {
+    User,
+    Agent,
+    System,
+    Plugin,
+}
+
+/// Envelope wrapping every domain event delivered to a plugin worker.
+///
+/// Port of `@paperclipai/plugin-sdk` `PluginEvent` (PLUGIN_SPEC §16).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginEvent {
+    /// Unique event identifier (UUID).
+    pub event_id: String,
+    /// The event type (e.g. `"issue.created"`).
+    pub event_type: String,
+    /// ISO 8601 timestamp when the event occurred.
+    pub occurred_at: String,
+    /// ID of the actor that caused the event, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    /// Type of actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_type: Option<PluginEventActorType>,
+    /// Primary entity involved in the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
+    /// Type of the primary entity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
+    /// UUID of the company this event belongs to.
+    pub company_id: String,
+    /// Typed event payload.
+    pub payload: serde_json::Value,
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    #[test]
+    fn event_filter_default_is_empty() {
+        let filter = EventFilter::default();
+        assert!(filter.project_id.is_none());
+        assert!(filter.company_id.is_none());
+        assert!(filter.agent_id.is_none());
+        assert!(filter.extra.is_empty());
+    }
+
+    #[test]
+    fn event_envelope_round_trips() {
+        let event = PluginEvent {
+            event_id: "evt-1".to_string(),
+            event_type: "issue.created".to_string(),
+            occurred_at: "2026-08-30T00:00:00Z".to_string(),
+            actor_id: Some("user-1".to_string()),
+            actor_type: Some(PluginEventActorType::User),
+            entity_id: Some("iss-1".to_string()),
+            entity_type: Some("issue".to_string()),
+            company_id: "co-1".to_string(),
+            payload: serde_json::json!({"title": "x"}),
+        };
+        let serialized = serde_json::to_string(&event).unwrap();
+        let back: PluginEvent = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(back, event);
+        assert_eq!(back.event_type, "issue.created");
+        assert_eq!(back.payload.get("title").unwrap(), "x");
+    }
+
+    #[test]
+    fn event_actor_type_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&PluginEventActorType::Plugin).unwrap(),
+            "\"plugin\""
+        );
+    }
+}
