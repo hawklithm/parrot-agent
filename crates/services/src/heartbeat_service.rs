@@ -2693,16 +2693,81 @@ impl DefaultHeartbeatService {
         idempotency_row_id: Option<Uuid>,
     ) -> Result<(), HeartbeatError> {
         let _agent = self.load_agent(agent_id).await?;
+
+        // Serialize all enqueue decisions for an agent.  The Paperclip
+        // contract is that the durable wake request and its heartbeat run are
+        // created as one unit; locking the agent row also closes the race
+        // between two callers that both observe no active run.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        let locked_agent: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM agents WHERE id = $1 AND company_id = $2 FOR UPDATE",
+        )
+        .bind(agent_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        if locked_agent.is_none() {
+            return Err(HeartbeatError::AgentNotFound(agent_id));
+        }
+
+        // A second caller may have observed the idempotency row before the
+        // first caller finished linking its run.  Re-check the link while the
+        // agent lock is held so a very fast first run cannot turn the replay
+        // into a second execution.
+        if let Some(request_id) = idempotency_row_id {
+            let linked_run: Option<Uuid> = sqlx::query_scalar(
+                "SELECT run_id FROM agent_wakeup_requests
+                  WHERE id = $1 AND run_id IS NOT NULL
+                  FOR UPDATE",
+            )
+            .bind(request_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+            if linked_run.is_some() {
+                tx.commit()
+                    .await
+                    .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                return Ok(());
+            }
+        }
+
         let active_run: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM heartbeat_runs WHERE company_id = $1 AND agent_id = $2 AND status IN ('queued','running') AND (context_snapshot->>'issueId' = $3 OR context_snapshot->>'taskId' = $3) ORDER BY created_at DESC LIMIT 1",
+            "SELECT id FROM heartbeat_runs
+             WHERE company_id = $1 AND agent_id = $2
+               AND status IN ('queued','running','scheduled_retry')
+               AND (context_snapshot->>'issueId' = $3 OR context_snapshot->>'taskId' = $3)
+             ORDER BY created_at DESC
+             LIMIT 1
+             FOR UPDATE",
         )
         .bind(company_id)
         .bind(agent_id)
         .bind(issue_id.to_string())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
         if active_run.is_some() {
+            if let Some(request_id) = idempotency_row_id {
+                sqlx::query(
+                    "UPDATE agent_wakeup_requests
+                     SET status = 'dispatched', run_id = $2, updated_at = NOW()
+                     WHERE id = $1",
+                )
+                .bind(request_id)
+                .bind(active_run)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
             return Ok(());
         }
 
@@ -2730,22 +2795,9 @@ impl DefaultHeartbeatService {
         .bind(&context)
         .bind(issue_id)
         .bind(options.retry_of_run_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-        publish_live_event(
-            &self.sse_service,
-            company_id,
-            "heartbeat.run.queued",
-            serde_json::json!({
-                "runId": run_id,
-                "agentId": agent_id,
-                "issueId": issue_id,
-                "status": "queued",
-                "invocationSource": "on_demand",
-            }),
-        )
-        .await;
 
         let mut payload = options
             .payload
@@ -2761,45 +2813,64 @@ impl DefaultHeartbeatService {
                 "UPDATE agent_wakeup_requests
                  SET status = 'dispatched', payload = $2, source = $3, trigger_detail = $4,
                      reason = $5, requested_by_actor_type = $6, requested_by_actor_id = $7,
-                     updated_at = NOW()
+                     run_id = $8, updated_at = NOW()
                  WHERE id = $1",
             )
             .bind(request_id)
             .bind(&payload)
-            .bind(options.source.as_deref())
+            .bind(options.source.as_deref().unwrap_or("on_demand"))
             .bind(options.trigger_detail.as_deref())
             .bind(options.reason.as_deref())
             .bind(options.requested_by_actor_type.as_deref())
             .bind(options.requested_by_actor_id)
-            .execute(&self.pool)
+            .bind(run_id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
         } else {
             sqlx::query(
                 "INSERT INTO agent_wakeup_requests
                  (company_id, agent_id, status, payload, source, trigger_detail, reason,
-                  requested_by_actor_type, requested_by_actor_id, updated_at)
-                 VALUES ($1,$2,'dispatched',$3,$4,$5,$6,$7,$8,NOW())",
+                  requested_by_actor_type, requested_by_actor_id, run_id, requested_at, updated_at)
+                 VALUES ($1,$2,'dispatched',$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())",
             )
             .bind(company_id)
             .bind(agent_id)
             .bind(&payload)
-            .bind(options.source.as_deref())
+            .bind(options.source.as_deref().unwrap_or("on_demand"))
             .bind(options.trigger_detail.as_deref())
             .bind(options.reason.as_deref())
             .bind(options.requested_by_actor_type.as_deref())
             .bind(options.requested_by_actor_id)
-            .execute(&self.pool)
+            .bind(run_id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
         }
         sqlx::query("UPDATE issues SET assignee_agent_id = $2, assignee_user_id = NULL, status = CASE WHEN status IN ('todo','backlog') THEN 'in_progress'::issue_status ELSE status END, checkout_run_id = $3, execution_run_id = $3, started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND company_id = $4 AND (assignee_agent_id IS NULL OR assignee_agent_id = $2) AND status NOT IN ('done','cancelled')")
             .bind(issue_id).bind(agent_id).bind(run_id).bind(company_id)
-            .execute(&self.pool).await
+            .execute(&mut *tx).await
             .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
         sqlx::query("UPDATE agents SET status = 'running', updated_at = NOW() WHERE id = $1")
-            .bind(agent_id).execute(&self.pool).await
+            .bind(agent_id).execute(&mut *tx).await
             .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        publish_live_event(
+            &self.sse_service,
+            company_id,
+            "heartbeat.run.queued",
+            serde_json::json!({
+                "runId": run_id,
+                "agentId": agent_id,
+                "issueId": issue_id,
+                "status": "queued",
+                "invocationSource": "on_demand",
+            }),
+        )
+        .await;
         let service = self.clone_for_task();
         tokio::spawn(async move { service.execute_run(run_id, agent_id, issue_id, company_id).await; });
         Ok(())
@@ -2842,7 +2913,7 @@ impl DefaultHeartbeatService {
             .bind(company_id)
             .bind(agent_id)
             .bind(payload)
-            .bind(options.source.as_deref())
+            .bind(options.source.as_deref().unwrap_or("on_demand"))
             .bind(options.trigger_detail.as_deref())
             .bind(reason)
             .bind(options.requested_by_actor_type.as_deref())
@@ -2866,11 +2937,17 @@ impl HeartbeatService for DefaultHeartbeatService {
         options: HeartbeatWakeupOptions,
     ) -> Result<(), HeartbeatError> {
         let idempotency_row_id = if let Some(idempotency_key) = options.idempotency_key.as_deref() {
-            let row = sqlx::query_scalar::<_, Uuid>(
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+            let inserted = sqlx::query_scalar::<_, Uuid>(
                 "INSERT INTO agent_wakeup_requests
                  (company_id, agent_id, status, payload, source, trigger_detail, reason,
-                  requested_by_actor_type, requested_by_actor_id, idempotency_key, updated_at)
-                 VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, NOW())
+                  requested_by_actor_type, requested_by_actor_id, idempotency_key,
+                  requested_at, updated_at)
+                 VALUES ($1, $2, 'queued', $3, COALESCE($4, 'on_demand'), $5, $6, $7, $8, $9, NOW(), NOW())
                  ON CONFLICT (company_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
                  RETURNING id",
             )
@@ -2883,9 +2960,66 @@ impl HeartbeatService for DefaultHeartbeatService {
             .bind(options.requested_by_actor_type.as_deref())
             .bind(options.requested_by_actor_id)
             .bind(idempotency_key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+            let row = if inserted.is_some() {
+                inserted
+            } else {
+                let existing: Option<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
+                    "SELECT id, status::text, run_id
+                     FROM agent_wakeup_requests
+                     WHERE company_id = $1 AND idempotency_key = $2
+                     FOR UPDATE",
+                )
+                .bind(company_id)
+                .bind(idempotency_key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                let Some((existing_id, status, existing_run_id)) = existing else {
+                    return Err(HeartbeatError::WakeupFailed(
+                        "idempotency conflict did not resolve to a wake request".to_string(),
+                    ));
+                };
+
+                if matches!(status.as_str(), "dispatched" | "running" | "completed")
+                    || (status == "queued" && existing_run_id.is_some())
+                {
+                    tx.commit()
+                        .await
+                        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                    return Ok(());
+                }
+
+                if matches!(status.as_str(), "failed" | "cancelled" | "skipped") {
+                    sqlx::query(
+                        "UPDATE agent_wakeup_requests
+                         SET status = 'queued', payload = $3,
+                             source = COALESCE($4, source), trigger_detail = $5,
+                             reason = $6, requested_by_actor_type = $7,
+                             requested_by_actor_id = $8, run_id = NULL,
+                             error = NULL, finished_at = NULL,
+                             requested_at = NOW(), updated_at = NOW()
+                         WHERE id = $1 AND status = $2::agent_wakeup_request_status",
+                    )
+                    .bind(existing_id)
+                    .bind(&status)
+                    .bind(serde_json::json!({ "issueId": issue_id }))
+                    .bind(options.source.as_deref())
+                    .bind(options.trigger_detail.as_deref())
+                    .bind(options.reason.as_deref())
+                    .bind(options.requested_by_actor_type.as_deref())
+                    .bind(options.requested_by_actor_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                }
+                Some(existing_id)
+            };
+            tx.commit()
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
             row
         } else {
             None
@@ -2944,6 +3078,7 @@ impl HeartbeatService for DefaultHeartbeatService {
                         | "issue_continuation_needed"
                         | "issue_assignment_recovery"
                         | "issue_graph_liveness_backstop"
+                        | "interaction_continuation_backstop"
                 )
         );
 
@@ -3070,7 +3205,7 @@ impl HeartbeatService for DefaultHeartbeatService {
                         .bind(company_id)
                         .bind(agent_id)
                         .bind(payload)
-                        .bind(options.source.as_deref())
+                        .bind(options.source.as_deref().unwrap_or("on_demand"))
                         .bind(options.trigger_detail.as_deref())
                         .bind(options.requested_by_actor_type.as_deref())
                         .bind(options.requested_by_actor_id)
@@ -3515,6 +3650,137 @@ impl DefaultHeartbeatService {
                         "taskId": issue_id,
                         "source": "issue_graph_liveness.backstop",
                         "resolvedBlockerIssueId": blocker_issue_id,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            healed += 1;
+        }
+        Ok(healed)
+    }
+
+    /// Heal issues whose interaction continuation wake was lost.
+    ///
+    /// The interaction resolution path wakes the assignee best-effort: a wakeup
+    /// failure is logged and the resolution still succeeds, which is the right
+    /// call for the request but leaves the issue parked with no execution path
+    /// if the wake was the only thing that would have resumed it. This backstop
+    /// finds resolved interactions whose continuation policy requires a wake,
+    /// where no live run or pending wake covers the issue, and re-queues the
+    /// wake with a stable idempotency key so it runs exactly once.
+    pub async fn reconcile_interaction_continuation_wakeups(&self) -> Result<usize, HeartbeatError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT interaction.id AS interaction_id,
+                   interaction.issue_id,
+                   interaction.kind,
+                   interaction.status::text AS interaction_status,
+                   interaction.continuation_policy,
+                   issue.assignee_agent_id,
+                   issue.company_id
+              FROM issue_thread_interactions interaction
+              JOIN issues issue ON issue.id = interaction.issue_id
+             WHERE interaction.status IN ('accepted', 'rejected', 'answered', 'cancelled')
+               AND (
+                   interaction.continuation_policy = 'wake_assignee'
+                   OR (
+                       interaction.continuation_policy = 'wake_assignee_on_accept'
+                       AND interaction.status = 'accepted'
+                   )
+               )
+               AND issue.assignee_agent_id IS NOT NULL
+               AND issue.status NOT IN ('done', 'cancelled')
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM issue_tree_hold_members held_member
+                     JOIN issue_tree_holds hold ON hold.id = held_member.hold_id
+                    WHERE held_member.issue_id = issue.id
+                      AND hold.company_id = issue.company_id
+                      AND hold.status = 'active'
+                      AND hold.mode = 'pause'
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM heartbeat_runs live
+                    WHERE live.company_id = issue.company_id
+                      AND live.agent_id = issue.assignee_agent_id
+                      AND live.status IN ('queued', 'running', 'scheduled_retry')
+                      AND (live.context_snapshot->>'issueId' = issue.id::text
+                           OR live.context_snapshot->>'taskId' = issue.id::text)
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM agent_wakeup_requests wake
+                    WHERE wake.company_id = issue.company_id
+                      AND wake.agent_id = issue.assignee_agent_id
+                      AND (
+                          wake.payload->>'interactionId' = interaction.id::text
+                          OR wake.idempotency_key =
+                             'interaction_continuation_backstop:' || interaction.id::text
+                      )
+                      AND wake.status IN ('queued', 'dispatched', 'running', 'completed')
+               )
+             ORDER BY interaction.id
+             LIMIT 500
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+        let mut healed = 0;
+        for row in rows {
+            let interaction_id: Uuid = row
+                .try_get("interaction_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let issue_id: Uuid = row
+                .try_get("issue_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let agent_id: Uuid = row
+                .try_get("assignee_agent_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let company_id: Uuid = row
+                .try_get("company_id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let kind: String = row
+                .try_get("kind")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let interaction_status: String = row
+                .try_get("interaction_status")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let continuation_policy: String = row
+                .try_get("continuation_policy")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+            let idempotency_key = format!("interaction_continuation_backstop:{interaction_id}");
+            self.wakeup_with_options(
+                agent_id,
+                issue_id,
+                company_id,
+                HeartbeatWakeupOptions {
+                    source: Some("automation".to_string()),
+                    trigger_detail: Some("system".to_string()),
+                    reason: Some("interaction_continuation_backstop".to_string()),
+                    idempotency_key: Some(idempotency_key.clone()),
+                    payload: Some(serde_json::json!({
+                        "issueId": issue_id,
+                        "interactionId": interaction_id,
+                        "interactionKind": kind,
+                        "interactionStatus": interaction_status,
+                        "continuationPolicy": continuation_policy,
+                        "mutation": "interaction",
+                        "backstop": "interaction_continuation_reconciliation",
+                    })),
+                    context_snapshot: Some(serde_json::json!({
+                        "issueId": issue_id,
+                        "taskId": issue_id,
+                        "interactionId": interaction_id,
+                        "interactionKind": kind,
+                        "interactionStatus": interaction_status,
+                        "continuationPolicy": continuation_policy,
+                        "wakeReason": "interaction_continuation_backstop",
+                        "source": "issue.interaction.backstop",
                     })),
                     ..Default::default()
                 },
