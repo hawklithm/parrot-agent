@@ -130,17 +130,6 @@ impl SandboxCapabilityDeclaration {
         }
     }
 
-    fn declared_value_mut(&mut self, key: SandboxCapabilityKey) -> &mut Option<bool> {
-        match key {
-            SandboxCapabilityKey::ReusableLeases => &mut self.reusable_leases,
-            SandboxCapabilityKey::NativeSyncIn => &mut self.native_sync_in,
-            SandboxCapabilityKey::NativeSyncOut => &mut self.native_sync_out,
-            SandboxCapabilityKey::PersistentProcessSessions => &mut self.persistent_process_sessions,
-            SandboxCapabilityKey::IndependentControlCommands => &mut self.independent_control_commands,
-            SandboxCapabilityKey::IncrementalSessionOutput => &mut self.incremental_session_output,
-        }
-    }
-}
 
 /// Per-lease narrowing that can only restrict capabilities (fail-closed).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
