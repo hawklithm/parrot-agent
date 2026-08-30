@@ -80,6 +80,7 @@ pub mod webhook_service;
 pub mod summary_slot_service;
 pub mod mcp_http_service;
 pub mod mcp_http;
+pub mod mcp_jsonrpc;
 pub mod remote_http_endpoint_guard;
 pub mod tool_access_audit_service;
 pub mod tool_profile_binding_precedence;
