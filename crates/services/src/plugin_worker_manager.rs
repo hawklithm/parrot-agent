@@ -3,11 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -230,6 +231,8 @@ struct WorkerState {
     started_at: Option<DateTime<Utc>>,
     /// Stderr excerpt from the last crash
     stderr_excerpt: String,
+    /// Earliest time at which an automatic restart may begin
+    next_restart_at: Option<DateTime<Utc>>,
     /// Authorized company scopes for proactive calls
     proactive_company_scopes: Vec<String>,
     /// Supported methods reported by the worker
@@ -242,13 +245,13 @@ pub struct PluginWorkerHandle {
     options: WorkerStartOptions,
     state: Arc<Mutex<WorkerState>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    restart_tx: OnceLock<UnboundedSender<()>>,
 }
 
 impl PluginWorkerHandle {
     /// Create a new worker handle (does not start the process yet)
     pub fn new(plugin_id: String, options: WorkerStartOptions) -> Self {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
         
         Self {
             plugin_id: plugin_id.clone(),
@@ -263,12 +266,19 @@ impl PluginWorkerHandle {
                 last_crash_at: None,
                 started_at: None,
                 stderr_excerpt: String::new(),
+                next_restart_at: None,
                 proactive_company_scopes: vec![],
                 supported_methods: vec![],
             })),
             shutdown_tx,
-            shutdown_rx,
+            restart_tx: OnceLock::new(),
         }
+    }
+
+    /// Attach the manager-owned restart channel. The manager owns the receiver
+    /// and the worker monitor only requests a restart after its backoff.
+    fn attach_restart_sender(&self, restart_tx: UnboundedSender<()>) {
+        let _ = self.restart_tx.set(restart_tx);
     }
     
     /// Get the plugin ID
@@ -285,7 +295,10 @@ impl PluginWorkerHandle {
     pub async fn start(&self) -> WorkerResult<()> {
         let mut state = self.state.lock().await;
         
-        if state.status != WorkerStatus::Idle && state.status != WorkerStatus::Stopped {
+        if !matches!(
+            state.status,
+            WorkerStatus::Idle | WorkerStatus::Stopped | WorkerStatus::Crashed
+        ) {
             return Err(PluginWorkerError::StartFailed(
                 format!("worker already started: {:?}", state.status)
             ));
@@ -296,6 +309,8 @@ impl PluginWorkerHandle {
         state.status = WorkerStatus::Starting;
         state.started_at = Some(Utc::now());
         state.stderr_excerpt.clear();
+        state.next_restart_at = None;
+        let _ = self.shutdown_tx.send(false);
         
         // Spawn the worker process
         let mut cmd = Command::new("node");
@@ -335,6 +350,16 @@ impl PluginWorkerHandle {
         
         state.child = Some(child);
         drop(state);
+
+        // Monitor the process independently from stdout/stderr so an exit
+        // also rejects pending RPC calls and can trigger bounded recovery.
+        let state_clone = Arc::clone(&self.state);
+        let plugin_id_clone = self.plugin_id.clone();
+        let restart_tx = self.restart_tx.get().cloned();
+        let auto_restart = self.options.auto_restart;
+        tokio::spawn(async move {
+            Self::monitor_process(state_clone, plugin_id_clone, restart_tx, auto_restart).await;
+        });
         
         // Spawn stdout reader task
         let state_clone = Arc::clone(&self.state);
@@ -372,6 +397,11 @@ impl PluginWorkerHandle {
         
         // Mark as running
         let mut state = self.state.lock().await;
+        if state.status != WorkerStatus::Starting {
+            return Err(PluginWorkerError::Crashed(
+                "worker exited while initializing".to_string(),
+            ));
+        }
         state.status = WorkerStatus::Running;
         state.consecutive_crashes = 0;
         
@@ -492,19 +522,32 @@ impl PluginWorkerHandle {
         
         drop(state);
         let mut state = self.state.lock().await;
-        state.pending_requests.insert(request_id.clone(), pending);
-        
-        // Get stdin handle
+
+        // Take stdin out of the state while awaiting I/O. Holding the state
+        // mutex across write/flush would make the auto-restart monitor
+        // non-Send and would serialize process health checks behind slow I/O.
         let child = state.child.as_mut()
             .ok_or_else(|| PluginWorkerError::Internal("child process not found".into()))?;
-        let stdin = child.stdin.as_mut()
+        let mut stdin = child.stdin.take()
             .ok_or_else(|| PluginWorkerError::Internal("stdin not available".into()))?;
-        
-        // Write request to stdin
-        stdin.write_all(request_json.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-        
+        state.pending_requests.insert(request_id.clone(), pending);
+        drop(state);
+
+        let write_result = async {
+            stdin.write_all(request_json.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await
+        }
+        .await;
+
+        let mut state = self.state.lock().await;
+        if let Some(child) = state.child.as_mut() {
+            child.stdin = Some(stdin);
+        }
+        if let Err(error) = write_result {
+            state.pending_requests.remove(&request_id);
+            return Err(PluginWorkerError::Io(error));
+        }
         drop(state);
         
         debug!(plugin_id = %self.plugin_id, method, request_id, "RPC request sent");
@@ -562,7 +605,7 @@ impl PluginWorkerHandle {
             total_crashes: state.total_crashes,
             pending_requests: state.pending_requests.len(),
             last_crash_at: state.last_crash_at,
-            next_restart_at: None, // TODO: implement restart scheduling
+            next_restart_at: state.next_restart_at,
         }
     }
     
@@ -616,6 +659,97 @@ impl PluginWorkerHandle {
         }
         
         debug!(plugin_id = %plugin_id, "stderr reader terminated");
+    }
+
+    /// Watch the child process without holding the worker lock across an await.
+    /// A clean stop sets `Stopping` first, so it is never mistaken for a crash.
+    async fn monitor_process(
+        state: Arc<Mutex<WorkerState>>,
+        plugin_id: String,
+        restart_tx: Option<UnboundedSender<()>>,
+        auto_restart: bool,
+    ) {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let crash = {
+                let mut state = state.lock().await;
+                if matches!(state.status, WorkerStatus::Stopping | WorkerStatus::Stopped | WorkerStatus::Idle) {
+                    return;
+                }
+
+                let Some(child) = state.child.as_mut() else {
+                    return;
+                };
+                match child.try_wait() {
+                    Ok(Some(exit_status)) => {
+                        state.child = None;
+                        state.pid = None;
+                        state.status = WorkerStatus::Crashed;
+                        state.consecutive_crashes = state.consecutive_crashes.saturating_add(1);
+                        state.total_crashes = state.total_crashes.saturating_add(1);
+                        state.last_crash_at = Some(Utc::now());
+                        state.next_restart_at = None;
+                        for (_, pending) in state.pending_requests.drain() {
+                            let _ = pending.sender.send(Err(PluginWorkerError::Crashed(
+                                format!("worker exited with status {exit_status}"),
+                            )));
+                        }
+
+                        let restart = auto_restart
+                            && state.consecutive_crashes <= MAX_CONSECUTIVE_CRASHES
+                            && restart_tx.is_some();
+                        let delay = restart.then(|| Self::restart_backoff(state.consecutive_crashes));
+                        if let Some(delay) = delay {
+                            state.next_restart_at = Some(
+                                Utc::now()
+                                    + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::minutes(5)),
+                            );
+                        } else {
+                            state.status = WorkerStatus::Failed;
+                        }
+                        Some((restart, delay))
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        warn!(plugin_id = %plugin_id, error = %error, "failed to poll plugin worker");
+                        state.child = None;
+                        state.pid = None;
+                        state.status = WorkerStatus::Failed;
+                        for (_, pending) in state.pending_requests.drain() {
+                            let _ = pending.sender.send(Err(PluginWorkerError::Crashed(
+                                error.to_string(),
+                            )));
+                        }
+                        return;
+                    }
+                }
+            };
+
+            let Some((restart, Some(delay))) = crash else {
+                continue;
+            };
+            if !restart {
+                return;
+            }
+
+            info!(plugin_id = %plugin_id, ?delay, "scheduling plugin worker restart");
+            tokio::time::sleep(delay).await;
+            if let Some(restart_tx) = restart_tx {
+                let _ = restart_tx.send(());
+            }
+            return;
+        }
+    }
+
+    fn restart_backoff(consecutive_crashes: u32) -> Duration {
+        let shift = consecutive_crashes.saturating_sub(1).min(63);
+        let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+        Duration::from_millis(
+            INITIAL_RESTART_BACKOFF_MS
+                .saturating_mul(multiplier)
+                .min(MAX_RESTART_BACKOFF_MS),
+        )
     }
     
     /// Handle a JSON-RPC response from the worker
@@ -696,6 +830,25 @@ impl PluginWorkerManager {
         }
         
         let handle = Arc::new(PluginWorkerHandle::new(plugin_id.clone(), options));
+        let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.attach_restart_sender(restart_tx);
+        let handle_ref = Arc::downgrade(&handle);
+        tokio::spawn(async move {
+            while restart_rx.recv().await.is_some() {
+                let Some(handle) = handle_ref.upgrade() else {
+                    return;
+                };
+                if handle.status().await != WorkerStatus::Crashed {
+                    continue;
+                }
+                if let Err(error) = handle.start().await {
+                    error!(plugin_id = %handle.plugin_id(), error = %error, "plugin worker restart failed");
+                    let mut state = handle.state.lock().await;
+                    state.status = WorkerStatus::Failed;
+                    state.next_restart_at = None;
+                }
+            }
+        });
         handle.start().await?;
         
         workers.insert(plugin_id, Arc::clone(&handle));
@@ -800,6 +953,8 @@ impl Default for PluginWorkerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
     
     #[tokio::test]
     async fn test_worker_manager_creation() {
@@ -834,6 +989,115 @@ mod tests {
         
         let handle = PluginWorkerHandle::new("test-plugin".into(), options);
         assert_eq!(handle.status().await, WorkerStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn worker_process_crash_is_restarted_and_pending_state_is_recovered() {
+        let dir = tempdir().expect("temporary plugin directory");
+        let marker_path = dir.path().join("starts");
+        let entrypoint_path = dir.path().join("worker.js");
+        fs::write(
+            &entrypoint_path,
+            r#"
+const fs = require("fs");
+const marker = process.env.PARROT_PLUGIN_MARKER;
+let starts = 0;
+try { starts = Number(fs.readFileSync(marker, "utf8")); } catch (_) {}
+starts += 1;
+fs.writeFileSync(marker, String(starts));
+const crashAfterInitialize = starts === 1;
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  const lines = buffer.split("\n");
+  buffer = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const request = JSON.parse(line);
+    if (request.method === "initialize") {
+      process.stdout.write(JSON.stringify({jsonrpc: "2.0", id: request.id, result: {methods: []}}) + "\n");
+      if (crashAfterInitialize) setTimeout(() => process.exit(17), 25);
+    } else if (request.method === "shutdown") {
+      process.stdout.write(JSON.stringify({jsonrpc: "2.0", id: request.id, result: {}}) + "\n");
+      setTimeout(() => process.exit(0), 5);
+    }
+  }
+});
+"#,
+        )
+        .expect("write plugin fixture");
+
+        let plugin_id = Uuid::new_v4();
+        let mut env = HashMap::new();
+        env.insert(
+            "PARROT_PLUGIN_MARKER".to_string(),
+            marker_path.to_string_lossy().into_owned(),
+        );
+        let options = WorkerStartOptions {
+            entrypoint_path: entrypoint_path.to_string_lossy().into_owned(),
+            manifest: PluginManifest {
+                name: "crash-recovery-plugin".into(),
+                version: "1.0.0".into(),
+                description: None,
+                methods: vec![],
+                proactive: false,
+            },
+            config: serde_json::json!({}),
+            instance_info: InstanceInfo {
+                instance_id: "test-instance".into(),
+                host_version: "1.0.0".into(),
+            },
+            api_version: 1,
+            database_namespace: None,
+            rpc_timeout_ms: None,
+            auto_restart: true,
+            exec_argv: vec![],
+            env,
+            proactive_company_scopes: vec![],
+        };
+
+        let manager = PluginWorkerManager::new();
+        let handle = manager
+            .start_worker(plugin_id.to_string(), options)
+            .await
+            .expect("initial plugin worker start");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let diagnostics = handle.diagnostics().await;
+            if diagnostics.total_crashes == 1
+                && diagnostics.status == WorkerStatus::Running
+                && fs::read_to_string(&marker_path)
+                    .map(|starts| starts == "2")
+                    .unwrap_or(false)
+            {
+                assert_eq!(diagnostics.consecutive_crashes, 0);
+                assert!(diagnostics.next_restart_at.is_none());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not recover: {diagnostics:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        manager
+            .stop_worker(&plugin_id)
+            .await
+            .expect("stop recovered worker");
+        assert_eq!(handle.status().await, WorkerStatus::Stopped);
+    }
+
+    #[test]
+    fn restart_backoff_is_bounded_and_exponential() {
+        assert_eq!(PluginWorkerHandle::restart_backoff(0), Duration::from_millis(1000));
+        assert_eq!(PluginWorkerHandle::restart_backoff(1), Duration::from_millis(1000));
+        assert_eq!(PluginWorkerHandle::restart_backoff(2), Duration::from_millis(2000));
+        assert_eq!(PluginWorkerHandle::restart_backoff(8), Duration::from_millis(128_000));
+        assert_eq!(PluginWorkerHandle::restart_backoff(10), Duration::from_millis(MAX_RESTART_BACKOFF_MS));
+        assert_eq!(PluginWorkerHandle::restart_backoff(32), Duration::from_millis(MAX_RESTART_BACKOFF_MS));
     }
 }
 
