@@ -327,8 +327,8 @@ async fn can_read_decision_source(
         .await
         .map_err(db_err)?,
         "recovery_action" => sqlx::query(
-            "SELECT issue_id, NULL::uuid AS agent_id, NULL::jsonb AS context_snapshot
-               FROM recovery_actions
+            "SELECT source_issue_id AS issue_id, NULL::uuid AS agent_id, NULL::jsonb AS context_snapshot
+               FROM issue_recovery_actions
               WHERE company_id = $1 AND id = $2",
         )
         .bind(company_id)
@@ -813,10 +813,11 @@ async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<
 
     // -- recovery actions ---------------------------------------------------
     let recovery_rows = sqlx::query(
-        "SELECT r.id, r.issue_id, r.action_type, r.status, r.description, r.metadata, \
-                r.triggered_by_issue_id, r.created_at, r.updated_at \
-           FROM recovery_actions r \
-          WHERE r.company_id = $1 AND r.status IN ('pending', 'in_progress') \
+        "SELECT r.id, r.source_issue_id AS issue_id, r.kind AS action_type, r.status, \
+                r.next_action AS description, r.evidence AS metadata, \
+                r.source_issue_id AS triggered_by_issue_id, r.created_at, r.updated_at \
+           FROM issue_recovery_actions r \
+          WHERE r.company_id = $1 AND r.status IN ('active', 'escalated') \
           ORDER BY r.updated_at DESC LIMIT $2",
     )
     .bind(company_id)
@@ -1223,7 +1224,7 @@ async fn collect_attention_items(pool: &PgPool, company_id: Uuid) -> Result<Vec<
                 verb("cancel", "Cancel", "Cancel the recovery action."),
             ],
             false,
-            "recovery_actions.status in ('pending','in_progress')",
+            "issue_recovery_actions.status in ('active','escalated')",
             "Recovery action resolves, is cancelled, or moves back to an agent/system owner.",
             format!("recovery_action:{id}"),
             severity,

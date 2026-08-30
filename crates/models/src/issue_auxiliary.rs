@@ -233,19 +233,19 @@ pub struct FeedbackTraceBundle {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryActionStatus {
-    Pending,
-    InProgress,
+    Active,
+    Escalated,
     Resolved,
-    Failed,
+    Cancelled,
 }
 
 impl std::fmt::Display for RecoveryActionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RecoveryActionStatus::Pending => write!(f, "pending"),
-            RecoveryActionStatus::InProgress => write!(f, "in_progress"),
+            RecoveryActionStatus::Active => write!(f, "active"),
+            RecoveryActionStatus::Escalated => write!(f, "escalated"),
             RecoveryActionStatus::Resolved => write!(f, "resolved"),
-            RecoveryActionStatus::Failed => write!(f, "failed"),
+            RecoveryActionStatus::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -256,17 +256,27 @@ impl std::fmt::Display for RecoveryActionStatus {
 pub struct RecoveryAction {
     pub id: Uuid,
     pub company_id: Uuid,
-    pub issue_id: Uuid,
-    pub action_type: String,
+    pub source_issue_id: Uuid,
+    pub recovery_issue_id: Option<Uuid>,
+    pub kind: String,
     pub status: String,
-    pub description: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-    pub triggered_by_issue_id: Option<Uuid>,
-    pub triggered_at: chrono::DateTime<chrono::Utc>,
-    pub retry_count: i32,
-    pub next_retry_at: chrono::DateTime<chrono::Utc>,
+    pub owner_type: String,
+    pub owner_agent_id: Option<Uuid>,
+    pub owner_user_id: Option<String>,
+    pub previous_owner_agent_id: Option<Uuid>,
+    pub return_owner_agent_id: Option<Uuid>,
+    pub cause: String,
+    pub fingerprint: String,
+    pub evidence: serde_json::Value,
+    pub next_action: String,
+    pub wake_policy: Option<serde_json::Value>,
+    pub monitor_policy: Option<serde_json::Value>,
+    pub attempt_count: i32,
+    pub max_attempts: Option<i32>,
+    pub timeout_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub last_error: Option<String>,
+    pub outcome: Option<String>,
+    pub resolution_note: Option<String>,
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -276,16 +286,31 @@ pub struct RecoveryAction {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateRecoveryActionInput {
-    pub action_type: String,
-    pub description: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-    pub triggered_by_issue_id: Option<Uuid>,
+    pub recovery_issue_id: Option<Uuid>,
+    pub kind: String,
+    pub owner_type: Option<String>,
+    pub owner_agent_id: Option<Uuid>,
+    pub owner_user_id: Option<String>,
+    pub previous_owner_agent_id: Option<Uuid>,
+    pub return_owner_agent_id: Option<Uuid>,
+    pub cause: String,
+    pub fingerprint: String,
+    pub evidence: Option<serde_json::Value>,
+    pub next_action: String,
+    pub wake_policy: Option<serde_json::Value>,
+    pub monitor_policy: Option<serde_json::Value>,
+    pub max_attempts: Option<i32>,
+    pub timeout_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Resolve recovery action input
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolveRecoveryActionInput {
+    pub status: String,
+    pub outcome: String,
+    pub resolution_note: Option<String>,
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 

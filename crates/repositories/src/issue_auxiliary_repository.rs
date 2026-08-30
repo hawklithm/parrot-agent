@@ -106,7 +106,13 @@ pub trait RecoveryActionRepository: Send + Sync {
     async fn list_pending(&self, company_id: Uuid, limit: i64) -> Result<Vec<RecoveryAction>, RepositoryError>;
 
     /// Resolve a recovery action
-    async fn resolve(&self, action_id: Uuid, input: &ResolveRecoveryActionInput) -> Result<RecoveryAction, RepositoryError>;
+    async fn resolve(
+        &self,
+        company_id: Uuid,
+        source_issue_id: Uuid,
+        action_id: Uuid,
+        input: &ResolveRecoveryActionInput,
+    ) -> Result<RecoveryAction, RepositoryError>;
 
     /// Reconcile recovery actions for an issue and its ancestors
     async fn reconcile_for_issue_and_ancestors(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, RepositoryError>;

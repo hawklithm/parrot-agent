@@ -1183,32 +1183,54 @@ impl issue_service::IssueService for LegacyIssueService {
         Ok(())
     }
 
-    async fn get_recovery_actions(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
+    async fn get_recovery_actions(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String> {
         let actions = self
             .recovery_action_service
             .list_by_issue(company_id, id)
             .await?;
-        actions
+        let active = actions
             .into_iter()
+            .find(|action| matches!(action.status.as_str(), "active" | "escalated"));
+        let active_json = active
             .map(|action| serde_json::to_value(action).map_err(|error| error.to_string()))
-            .collect()
+            .transpose()?;
+        let actions = active_json.clone().into_iter().collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "active": active_json,
+            "actions": actions,
+        }))
     }
 
-    async fn resolve_recovery_action(&self, id: Uuid, company_id: Uuid, action_id: Uuid) -> Result<(), String> {
-        let actions = self
-            .recovery_action_service
-            .list_by_issue(company_id, id)
-            .await?;
-        if !actions.iter().any(|action| action.id == action_id) {
-            return Err("Recovery action not found for issue".to_string());
-        }
+    async fn resolve_recovery_action(
+        &self,
+        id: Uuid,
+        company_id: Uuid,
+        action_id: Uuid,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let outcome = input
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Recovery action outcome is required".to_string())?;
+        let status = if outcome == "cancelled" { "cancelled" } else { "resolved" };
+        let resolution_note = input
+            .get("resolutionNote")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         self.recovery_action_service
             .resolve(
+                company_id,
+                id,
                 action_id,
-                &models::ResolveRecoveryActionInput { resolved_at: None },
+                &models::ResolveRecoveryActionInput {
+                    status: status.to_string(),
+                    outcome: outcome.to_string(),
+                    resolution_note,
+                    resolved_at: None,
+                },
             )
             .await
-            .map(|_| ())
+            .and_then(|action| serde_json::to_value(action).map_err(|error| error.to_string()))
     }
 
     async fn create_work_product(&self, id: Uuid, _company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> {

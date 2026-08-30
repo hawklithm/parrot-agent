@@ -462,14 +462,12 @@ impl ScheduledJob for RecoveryActionRetryJob {
     async fn execute(&self) -> Result<String, String> {
         const BATCH_SIZE: i64 = 100;
         const MAX_RETRIES: i32 = 5;
-        const BASE_BACKOFF_SECONDS: i64 = 300;
-        const MAX_BACKOFF_SECONDS: i64 = 7_200;
 
         let rows = sqlx::query(
-            "SELECT id FROM recovery_actions
-              WHERE status IN ('pending', 'in_progress')
-                AND next_retry_at <= NOW()
-              ORDER BY next_retry_at ASC
+            "SELECT id FROM issue_recovery_actions
+              WHERE status IN ('active', 'escalated')
+                AND (last_attempt_at IS NULL OR last_attempt_at <= NOW() - INTERVAL '5 minutes')
+              ORDER BY COALESCE(last_attempt_at, created_at) ASC, id ASC
               LIMIT $1",
         )
         .bind(BATCH_SIZE)
@@ -479,22 +477,19 @@ impl ScheduledJob for RecoveryActionRetryJob {
 
         let mut resolved = 0usize;
         let mut deferred = 0usize;
-        let mut failed = 0usize;
+        let mut escalated = 0usize;
 
         for row in rows {
             let id: Uuid = row.try_get("id").map_err(|error| error.to_string())?;
             let Some(claimed) = sqlx::query(
-                "UPDATE recovery_actions
-                    SET status = 'in_progress',
-                        retry_count = retry_count + 1,
+                "UPDATE issue_recovery_actions
+                    SET attempt_count = attempt_count + 1,
                         last_attempt_at = NOW(),
-                        next_retry_at = NOW() + INTERVAL '1 year',
-                        last_error = NULL,
                         updated_at = NOW()
                   WHERE id = $1
-                    AND status IN ('pending', 'in_progress')
-                    AND next_retry_at <= NOW()
-               RETURNING company_id, issue_id, retry_count, action_type",
+                    AND status IN ('active', 'escalated')
+                    AND (last_attempt_at IS NULL OR last_attempt_at <= NOW() - INTERVAL '5 minutes')
+               RETURNING company_id, source_issue_id, attempt_count, max_attempts, kind",
             )
             .bind(id)
             .fetch_optional(&self.pool)
@@ -505,12 +500,13 @@ impl ScheduledJob for RecoveryActionRetryJob {
             };
 
             let company_id: Uuid = claimed.try_get("company_id").map_err(|error| error.to_string())?;
-            let issue_id: Uuid = claimed.try_get("issue_id").map_err(|error| error.to_string())?;
-            let retry_count: i32 = claimed.try_get("retry_count").map_err(|error| error.to_string())?;
-            let action_type: String = claimed.try_get("action_type").map_err(|error| error.to_string())?;
+            let issue_id: Uuid = claimed.try_get("source_issue_id").map_err(|error| error.to_string())?;
+            let attempt_count: i32 = claimed.try_get("attempt_count").map_err(|error| error.to_string())?;
+            let max_attempts: Option<i32> = claimed.try_get("max_attempts").map_err(|error| error.to_string())?;
+            let kind: String = claimed.try_get("kind").map_err(|error| error.to_string())?;
 
             let issue = sqlx::query(
-                "SELECT status, execution_locked_at, assignee_agent_id, assignee_user_id
+                "SELECT status::text AS status, execution_locked_at, assignee_agent_id, assignee_user_id
                    FROM issues WHERE id = $1 AND company_id = $2",
             )
             .bind(issue_id)
@@ -524,8 +520,8 @@ impl ScheduledJob for RecoveryActionRetryJob {
                 let locked: Option<chrono::DateTime<Utc>> = issue.try_get("execution_locked_at").ok();
                 let agent: Option<Uuid> = issue.try_get("assignee_agent_id").ok();
                 let user: Option<Uuid> = issue.try_get("assignee_user_id").ok();
-                match action_type.as_str() {
-                    "unblock" => status != "blocked",
+                match kind.as_str() {
+                    "unblock" | "issue_graph_liveness" => status != "blocked",
                     "stale_execution" => status != "in_progress" || locked.is_none(),
                     "missing_assignee" => agent.is_some() || user.is_some(),
                     "general" => status == "done" || status == "cancelled",
@@ -535,9 +531,12 @@ impl ScheduledJob for RecoveryActionRetryJob {
 
             if should_resolve {
                 sqlx::query(
-                    "UPDATE recovery_actions
-                        SET status = 'resolved', resolved_at = NOW(), next_retry_at = NOW(), updated_at = NOW()
-                      WHERE id = $1",
+                    "UPDATE issue_recovery_actions
+                        SET status = 'resolved',
+                            outcome = 'restored',
+                            resolved_at = NOW(),
+                            updated_at = NOW()
+                      WHERE id = $1 AND status IN ('active', 'escalated')",
                 )
                 .bind(id)
                 .execute(&self.pool)
@@ -553,8 +552,8 @@ impl ScheduledJob for RecoveryActionRetryJob {
                     id,
                     serde_json::json!({
                         "issueId": issue_id,
-                        "actionType": action_type,
-                        "attempt": retry_count,
+                        "kind": kind,
+                        "attempt": attempt_count,
                     }),
                 )
                 .await;
@@ -562,13 +561,15 @@ impl ScheduledJob for RecoveryActionRetryJob {
                 continue;
             }
 
-            if retry_count >= MAX_RETRIES {
+            let retry_limit = max_attempts.unwrap_or(MAX_RETRIES).max(1);
+            if attempt_count >= retry_limit {
                 sqlx::query(
-                    "UPDATE recovery_actions
-                        SET status = 'failed',
-                            last_error = 'recovery retry limit exceeded',
+                    "UPDATE issue_recovery_actions
+                        SET status = 'escalated',
+                            outcome = 'escalated',
+                            resolution_note = 'recovery retry limit exceeded',
                             updated_at = NOW()
-                      WHERE id = $1",
+                      WHERE id = $1 AND status IN ('active', 'escalated')",
                 )
                 .bind(id)
                 .execute(&self.pool)
@@ -577,35 +578,21 @@ impl ScheduledJob for RecoveryActionRetryJob {
                 record_activity(
                     &self.pool,
                     company_id,
-                    "recovery_action.failed",
+                    "recovery_action.escalated",
                     "system",
                     Uuid::nil(),
                     "recovery_action",
                     id,
                     serde_json::json!({
                         "issueId": issue_id,
-                        "actionType": action_type,
-                        "attempt": retry_count,
+                        "kind": kind,
+                        "attempt": attempt_count,
                         "reason": "retry_limit_exceeded",
                     }),
                 )
                 .await;
-                failed += 1;
+                escalated += 1;
             } else {
-                let backoff = (BASE_BACKOFF_SECONDS * (1_i64 << (retry_count - 1).min(5) as u32))
-                    .min(MAX_BACKOFF_SECONDS);
-                sqlx::query(
-                    "UPDATE recovery_actions
-                        SET status = 'pending',
-                            next_retry_at = NOW() + ($2 * INTERVAL '1 second'),
-                            updated_at = NOW()
-                      WHERE id = $1",
-                )
-                .bind(id)
-                .bind(backoff)
-                .execute(&self.pool)
-                .await
-                .map_err(|error| format!("failed to defer recovery action {id}: {error}"))?;
                 record_activity(
                     &self.pool,
                     company_id,
@@ -616,9 +603,9 @@ impl ScheduledJob for RecoveryActionRetryJob {
                     id,
                     serde_json::json!({
                         "issueId": issue_id,
-                        "actionType": action_type,
-                        "attempt": retry_count,
-                        "backoffSeconds": backoff,
+                        "kind": kind,
+                        "attempt": attempt_count,
+                        "backoffSeconds": 300,
                     }),
                 )
                 .await;
@@ -626,7 +613,7 @@ impl ScheduledJob for RecoveryActionRetryJob {
             }
         }
 
-        Ok(format!("resolved {resolved}, deferred {deferred}, failed {failed} recovery actions"))
+        Ok(format!("resolved {resolved}, deferred {deferred}, escalated {escalated} recovery actions"))
     }
 }
 

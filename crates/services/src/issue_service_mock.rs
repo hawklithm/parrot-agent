@@ -288,14 +288,18 @@ impl IssueService for MockIssueService {
         Ok(())
     }
 
-    async fn get_recovery_actions(&self, _id: Uuid, _company_id: Uuid) -> Result<Vec<serde_json::Value>, String> {
-        Ok(vec![
-            serde_json::json!({"id": Uuid::new_v4(), "action": "retry", "status": "pending"}),
-        ])
+    async fn get_recovery_actions(&self, _id: Uuid, _company_id: Uuid) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"active": null, "actions": []}))
     }
 
-    async fn resolve_recovery_action(&self, _id: Uuid, _company_id: Uuid, _action_id: Uuid) -> Result<(), String> {
-        Ok(())
+    async fn resolve_recovery_action(
+        &self,
+        _id: Uuid,
+        _company_id: Uuid,
+        _action_id: Uuid,
+        _input: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"ok": true}))
     }
 
     async fn create_work_product(&self, _id: Uuid, _company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String> {

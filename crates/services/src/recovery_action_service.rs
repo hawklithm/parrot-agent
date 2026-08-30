@@ -33,6 +33,8 @@ pub trait RecoveryActionService: Send + Sync {
     /// Resolve a specific recovery action
     async fn resolve(
         &self,
+        company_id: Uuid,
+        source_issue_id: Uuid,
         action_id: Uuid,
         input: &ResolveRecoveryActionInput,
     ) -> Result<RecoveryAction, String>;
@@ -78,9 +80,9 @@ impl DefaultRecoveryActionService {
     /// 2. Check if the action type matches a resolvable condition
     /// 3. If issue is in a terminal/healthy state, resolve matching actions
     fn should_resolve_action(&self, action: &RecoveryAction, issue: &Issue) -> bool {
-        match action.action_type.as_str() {
+        match action.kind.as_str() {
             // Blocked recovery: if issue is no longer blocked, resolve
-            "unblock" => issue.status != models::IssueStatus::Blocked,
+            "unblock" | "issue_graph_liveness" => issue.status != models::IssueStatus::Blocked,
 
             // Stale execution recovery: if issue is no longer in_progress with stale lock, resolve
             "stale_execution" => {
@@ -127,6 +129,33 @@ impl RecoveryActionService for DefaultRecoveryActionService {
             return Err(format!("Issue {} does not belong to company {}", issue_id, company_id));
         }
 
+        if let Some(recovery_issue_id) = input.recovery_issue_id {
+            let recovery_issue = self
+                .issue_repo
+                .get_by_id(recovery_issue_id)
+                .await
+                .map_err(|e| format!("Failed to verify recovery issue: {}", e))?
+                .ok_or_else(|| format!("Recovery issue {} not found", recovery_issue_id))?;
+            if recovery_issue.company_id != company_id {
+                return Err(format!(
+                    "Recovery issue {} does not belong to company {}",
+                    recovery_issue_id, company_id
+                ));
+            }
+        }
+
+        if input.cause.trim().is_empty()
+            || input.fingerprint.trim().is_empty()
+            || input.next_action.trim().is_empty()
+        {
+            return Err("Recovery action cause, fingerprint, and nextAction are required".to_string());
+        }
+        if let Some(owner_type) = input.owner_type.as_deref() {
+            if !matches!(owner_type, "agent" | "user" | "board" | "system") {
+                return Err(format!("Unsupported recovery action owner type: {owner_type}"));
+            }
+        }
+
         self.recovery_repo
             .create(company_id, issue_id, input)
             .await
@@ -157,11 +186,29 @@ impl RecoveryActionService for DefaultRecoveryActionService {
 
     async fn resolve(
         &self,
+        company_id: Uuid,
+        source_issue_id: Uuid,
         action_id: Uuid,
         input: &ResolveRecoveryActionInput,
     ) -> Result<RecoveryAction, String> {
+        if !matches!(input.status.as_str(), "resolved" | "cancelled") {
+            return Err("Recovery action status must be resolved or cancelled".to_string());
+        }
+        if !matches!(
+            input.outcome.as_str(),
+            "restored"
+                | "handed_back"
+                | "owner_completed"
+                | "delegated"
+                | "false_positive"
+                | "blocked"
+                | "escalated"
+                | "cancelled"
+        ) {
+            return Err(format!("Unsupported recovery action outcome: {}", input.outcome));
+        }
         self.recovery_repo
-            .resolve(action_id, input)
+            .resolve(company_id, source_issue_id, action_id, input)
             .await
             .map_err(|e| format!("Failed to resolve recovery action: {}", e))
     }
@@ -192,7 +239,17 @@ impl RecoveryActionService for DefaultRecoveryActionService {
             if self.should_resolve_action(action, &issue) {
                 let resolved_action = self
                     .recovery_repo
-                    .resolve(action.id, &ResolveRecoveryActionInput { resolved_at: None })
+                    .resolve(
+                        action.company_id,
+                        action.source_issue_id,
+                        action.id,
+                        &ResolveRecoveryActionInput {
+                            status: "resolved".to_string(),
+                            outcome: "restored".to_string(),
+                            resolution_note: Some("Recovery condition is no longer present".to_string()),
+                            resolved_at: None,
+                        },
+                    )
                     .await
                     .map_err(|e| format!("Failed to resolve action {}: {}", action.id, e))?;
                 resolved.push(resolved_action);
@@ -208,7 +265,7 @@ impl RecoveryActionService for DefaultRecoveryActionService {
         issue_id: Uuid,
     ) -> Result<Vec<RecoveryAction>, String> {
         self.recovery_repo
-            .resolve_active_for_issue(company_id, issue_id)
+        .resolve_active_for_issue(company_id, issue_id)
             .await
             .map_err(|e| format!("Failed to resolve active recovery actions: {}", e))
     }
@@ -247,13 +304,27 @@ mod tests {
             id: Uuid::new_v4(),
             company_id: Uuid::nil(),
             issue_id: Uuid::nil(),
-            action_type: "unblock".to_string(),
-            status: "pending".to_string(),
-            description: None,
-            metadata: None,
-            triggered_by_issue_id: None,
-            triggered_at: chrono::Utc::now(),
-            resolved_at: None,
+            source_issue_id: Uuid::nil(),
+            recovery_issue_id: None,
+            kind: "unblock".to_string(),
+            status: "active".to_string(),
+            owner_type: "agent".to_string(),
+            owner_agent_id: None,
+            owner_user_id: None,
+            previous_owner_agent_id: None,
+            return_owner_agent_id: None,
+            cause: "blocked".to_string(),
+            fingerprint: "test".to_string(),
+            evidence: serde_json::json!({}),
+            next_action: "unblock".to_string(),
+            wake_policy: None,
+            monitor_policy: None,
+            attempt_count: 0,
+            max_attempts: None,
+            timeout_at: None,
+            last_attempt_at: None,
+            outcome: None,
+            resolution_note: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -308,6 +379,8 @@ impl RecoveryActionRepository for MockRecoveryRepo {
     }
     async fn resolve(
         &self,
+        _company_id: Uuid,
+        _source_issue_id: Uuid,
         _action_id: Uuid,
         _input: &ResolveRecoveryActionInput,
     ) -> Result<RecoveryAction, RepositoryError> {

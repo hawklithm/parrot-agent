@@ -800,7 +800,7 @@ async fn list_issue_document_revisions(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, raw_key)): Path<(String, String)>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let issue_id = resolve_issue_id(&state.pool, &issue_id).await?;
     scoped_issue_company(&state, &actor, issue_id).await?;
     let key = validate_issue_document_key(&raw_key)?;
@@ -4492,9 +4492,10 @@ fn feedback_trace_json(row: sqlx::postgres::PgRow) -> serde_json::Value {
 /// I27: GET /issues/:id/recovery-actions
 async fn list_recovery_actions(
     State(state): State<AppState>,
+    Extension(actor): Extension<services::auth::AuthorizationActor>,
     IssueId(id): IssueId,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
     state
         .issue_service
         .get_recovery_actions(id, company_id)
@@ -4506,10 +4507,12 @@ async fn list_recovery_actions(
 /// I28: POST /issues/:id/recovery-actions/resolve
 async fn resolve_recovery_action(
     State(state): State<AppState>,
+    Extension(actor): Extension<services::auth::AuthorizationActor>,
     IssueId(id): IssueId,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = issue_company_id(&state, id).await?;
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
+    crate::routes::assert_company_access(&actor, company_id, false)?;
     let action_id = payload
         .get("actionId")
         .and_then(|v| v.as_str())
@@ -4517,7 +4520,7 @@ async fn resolve_recovery_action(
         .ok_or(StatusCode::BAD_REQUEST)?;
     state
         .issue_service
-        .resolve_recovery_action(id, company_id, action_id)
+        .resolve_recovery_action(id, company_id, action_id, payload)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)

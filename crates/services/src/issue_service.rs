@@ -144,10 +144,16 @@ pub trait IssueService: Send + Sync {
     async fn unarchive_inbox(&self, id: Uuid, company_id: Uuid) -> Result<(), String>;
 
     /// I27: Get recovery actions
-    async fn get_recovery_actions(&self, id: Uuid, company_id: Uuid) -> Result<Vec<serde_json::Value>, String>;
+    async fn get_recovery_actions(&self, id: Uuid, company_id: Uuid) -> Result<serde_json::Value, String>;
 
     /// I28: Resolve recovery action
-    async fn resolve_recovery_action(&self, id: Uuid, company_id: Uuid, action_id: Uuid) -> Result<(), String>;
+    async fn resolve_recovery_action(
+        &self,
+        id: Uuid,
+        company_id: Uuid,
+        action_id: Uuid,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
 
     /// I39: Create work product
     async fn create_work_product(&self, id: Uuid, company_id: Uuid, input: serde_json::Value) -> Result<serde_json::Value, String>;

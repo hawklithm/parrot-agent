@@ -415,17 +415,37 @@ impl RecoveryActionRepository for PgRecoveryActionRepository {
     async fn create(&self, company_id: Uuid, issue_id: Uuid, input: &CreateRecoveryActionInput) -> Result<RecoveryAction, RepositoryError> {
         sqlx::query_as::<_, RecoveryAction>(
             r#"
-            INSERT INTO recovery_actions (company_id, issue_id, action_type, description, metadata, triggered_by_issue_id)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO issue_recovery_actions (
+                company_id, source_issue_id, recovery_issue_id, kind, owner_type,
+                owner_agent_id, owner_user_id, previous_owner_agent_id,
+                return_owner_agent_id, cause, fingerprint, evidence, next_action,
+                wake_policy, monitor_policy, max_attempts, timeout_at, last_attempt_at
+            )
+            VALUES (
+                $1, $2, $3, $4, COALESCE($5, 'agent'), $6, $7, $8, $9,
+                $10, $11, COALESCE($12, '{}'::jsonb), $13, $14, $15, $16, $17, $18
+            )
             RETURNING *
             "#,
         )
         .bind(company_id)
         .bind(issue_id)
-        .bind(&input.action_type)
-        .bind(&input.description)
-        .bind(&input.metadata)
-        .bind(input.triggered_by_issue_id)
+        .bind(input.recovery_issue_id)
+        .bind(&input.kind)
+        .bind(&input.owner_type)
+        .bind(input.owner_agent_id)
+        .bind(&input.owner_user_id)
+        .bind(input.previous_owner_agent_id)
+        .bind(input.return_owner_agent_id)
+        .bind(&input.cause)
+        .bind(&input.fingerprint)
+        .bind(&input.evidence)
+        .bind(&input.next_action)
+        .bind(&input.wake_policy)
+        .bind(&input.monitor_policy)
+        .bind(input.max_attempts)
+        .bind(input.timeout_at)
+        .bind(input.last_attempt_at)
         .fetch_one(&self.pool)
         .await
         .map_err(RepositoryError::DatabaseError)
@@ -434,9 +454,9 @@ impl RecoveryActionRepository for PgRecoveryActionRepository {
     async fn list_by_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, RepositoryError> {
         sqlx::query_as::<_, RecoveryAction>(
             r#"
-            SELECT * FROM recovery_actions
-            WHERE company_id = $1 AND issue_id = $2
-            ORDER BY triggered_at DESC
+            SELECT * FROM issue_recovery_actions
+            WHERE company_id = $1 AND source_issue_id = $2
+            ORDER BY updated_at DESC, id DESC
             "#,
         )
         .bind(company_id)
@@ -449,9 +469,9 @@ impl RecoveryActionRepository for PgRecoveryActionRepository {
     async fn list_pending(&self, company_id: Uuid, limit: i64) -> Result<Vec<RecoveryAction>, RepositoryError> {
         sqlx::query_as::<_, RecoveryAction>(
             r#"
-            SELECT * FROM recovery_actions
-            WHERE company_id = $1 AND status IN ('pending', 'in_progress')
-            ORDER BY triggered_at ASC
+            SELECT * FROM issue_recovery_actions
+            WHERE company_id = $1 AND status IN ('active', 'escalated')
+            ORDER BY updated_at ASC, id ASC
             LIMIT $2
             "#,
         )
@@ -462,17 +482,35 @@ impl RecoveryActionRepository for PgRecoveryActionRepository {
         .map_err(RepositoryError::DatabaseError)
     }
 
-    async fn resolve(&self, action_id: Uuid, input: &ResolveRecoveryActionInput) -> Result<RecoveryAction, RepositoryError> {
+    async fn resolve(
+        &self,
+        company_id: Uuid,
+        source_issue_id: Uuid,
+        action_id: Uuid,
+        input: &ResolveRecoveryActionInput,
+    ) -> Result<RecoveryAction, RepositoryError> {
         let resolved_at = input.resolved_at.unwrap_or_else(chrono::Utc::now);
         sqlx::query_as::<_, RecoveryAction>(
             r#"
-            UPDATE recovery_actions
-            SET status = 'resolved', resolved_at = $1, updated_at = NOW()
-            WHERE id = $2
+            UPDATE issue_recovery_actions
+            SET status = $1,
+                outcome = $2,
+                resolution_note = $3,
+                resolved_at = $4,
+                updated_at = NOW()
+            WHERE company_id = $5
+              AND source_issue_id = $6
+              AND id = $7
+              AND status IN ('active', 'escalated')
             RETURNING *
             "#,
         )
+        .bind(&input.status)
+        .bind(&input.outcome)
+        .bind(&input.resolution_note)
         .bind(resolved_at)
+        .bind(company_id)
+        .bind(source_issue_id)
         .bind(action_id)
         .fetch_one(&self.pool)
         .await
@@ -490,11 +528,11 @@ impl RecoveryActionRepository for PgRecoveryActionRepository {
                 INNER JOIN issue_tree t ON i.id = t.parent_id
             )
             SELECT ra.*
-            FROM recovery_actions ra
-            INNER JOIN issue_tree it ON ra.issue_id = it.id
+            FROM issue_recovery_actions ra
+            INNER JOIN issue_tree it ON ra.source_issue_id = it.id
             WHERE ra.company_id = $1
-              AND ra.status IN ('pending', 'in_progress')
-            ORDER BY ra.triggered_at ASC
+              AND ra.status IN ('active', 'escalated')
+            ORDER BY ra.updated_at ASC
             "#,
         )
         .bind(company_id)
@@ -507,10 +545,13 @@ impl RecoveryActionRepository for PgRecoveryActionRepository {
     async fn resolve_active_for_issue(&self, company_id: Uuid, issue_id: Uuid) -> Result<Vec<RecoveryAction>, RepositoryError> {
         sqlx::query_as::<_, RecoveryAction>(
             r#"
-            UPDATE recovery_actions
-            SET status = 'resolved', resolved_at = NOW(), updated_at = NOW()
-            WHERE company_id = $1 AND issue_id = $2
-              AND status IN ('pending', 'in_progress')
+            UPDATE issue_recovery_actions
+            SET status = 'resolved',
+                outcome = 'owner_completed',
+                resolved_at = NOW(),
+                updated_at = NOW()
+            WHERE company_id = $1 AND source_issue_id = $2
+              AND status IN ('active', 'escalated')
             RETURNING *
             "#,
         )
