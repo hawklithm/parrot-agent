@@ -3727,3 +3727,90 @@ async fn review_new_tools_persists_decisions_and_entries() {
     assert_eq!(status, StatusCode::OK, "new tools after review={body:?}");
     assert_eq!(body.as_array().map(Vec::len), Some(0), "pending list must be empty");
 }
+
+/// Deterministic fake MCP upstream serving a fixed tools/list response; each
+/// call consumes one request.
+async fn spawn_tools_list_endpoint(response_body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tools/list endpoint");
+    let address = listener.local_addr().expect("tools/list endpoint address");
+    let handle = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.expect("accept tools/list request");
+            let mut buffer = vec![0_u8; 16_384];
+            let _ = socket.read(&mut buffer).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write tools/list response");
+        }
+    });
+    (format!("http://{address}/mcp"), handle)
+}
+
+/// Catalog refresh must derive version_hash/schema_hash from descriptor
+/// content (Paperclip stableHash), so two refreshes of an unchanged upstream
+/// produce identical hashes — the change-detection invariant the previous
+/// random-UUID implementation broke.
+#[tokio::test]
+async fn catalog_refresh_version_hash_is_content_stable() {
+    let (base_url, server) = spawn_tools_list_endpoint(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"kv_get","title":"Get value","description":"Reads a key","inputSchema":{"type":"object","properties":{"key":{"type":"string"}}},"annotations":{"readOnlyHint":true}}]}}"#,
+    ).await;
+
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let application_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id).bind("Snapshot Company").bind(format!("SC{}", &company_id.simple().to_string()[..8]))
+        .execute(&pool).await.expect("insert company");
+    sqlx::query(
+        "INSERT INTO tool_applications (id, company_id, name) VALUES ($1, $2, 'Snapshot App')",
+    ).bind(application_id).bind(company_id).execute(&pool).await.expect("insert application");
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, application_id, name, uid, transport, auth_kind, status, enabled, config, transport_config)
+         VALUES ($1, $2, $3, 'Snapshot connection', 'snapshot-conn', 'mcp_remote', 'none', 'active', true, '{}'::jsonb, $4)",
+    )
+    .bind(connection_id).bind(company_id).bind(application_id)
+    .bind(json!({"endpoint": base_url}))
+    .execute(&pool).await.expect("insert connection");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+
+    let mut first: Option<(String, String)> = None;
+    for round in 1..=2 {
+        let (status, body) = request_connection_route(
+            &app,
+            &owner,
+            "POST",
+            format!("/tool-connections/{connection_id}/catalog/refresh"),
+            None,
+        ).await;
+        assert_eq!(status, StatusCode::OK, "refresh round {round}={body:?}");
+        let row: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT version_hash, schema_hash FROM tool_catalog_entries WHERE connection_id = $1",
+        )
+        .bind(connection_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load catalog entry");
+        let hash = row.0.expect("version_hash must be persisted");
+        let schema = row.1.expect("schema_hash must be persisted");
+        assert_eq!(hash.len(), 64, "sha256 hex");
+        if round == 1 {
+            first = Some((hash, schema));
+        } else {
+            // Same upstream content -> identical hashes across refreshes
+            // (the invariant broken by the previous random-UUID hash).
+            assert_eq!(first, Some((hash, schema)));
+        }
+    }
+
+    server.abort();
+}

@@ -281,6 +281,135 @@ pub fn activity_log_action_to_lifecycle_type(
     }
 }
 
+/// Canonical JSON key order: collect every recursively nested key name.
+///
+/// Port of Paperclip `flattenKeys`.
+fn flatten_keys(value: &serde_json::Value, keys: &mut std::collections::BTreeSet<String>) {
+    if let serde_json::Value::Object(map) = value {
+        for (key, nested) in map {
+            keys.insert(key.clone());
+            flatten_keys(nested, keys);
+        }
+    }
+}
+
+/// Deterministic content hash: `sha256(canonical JSON)`, where canonical JSON
+/// serializes the value with every object key at every nesting level sorted.
+///
+/// Port of Paperclip `stableHash` (`createHash("sha256")
+/// .update(JSON.stringify(value, Object.keys(flattenKeys(value)).sort()))`).
+pub fn stable_hash(value: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut keys = std::collections::BTreeSet::new();
+    flatten_keys(value, &mut keys);
+    let key_names: Vec<&str> = keys.iter().map(String::as_str).collect();
+    // serde_json with preserve_order off sorts map keys only when using
+    // BTreeMap-backed maps; serialize through a deterministic re-writer that
+    // sorts object keys at every depth (matching JS sorted-key stringify).
+    let canonical = canonicalize(value, &key_names);
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+/// Re-serialize `value` with every object's keys sorted lexicographically.
+fn canonicalize(value: &serde_json::Value, key_names: &[&str]) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            // JS `JSON.stringify(value, keysArray)` re-includes ONLY the listed
+            // top-level keys... but for nested objects the replacer receives
+            // every object, so all depths are filtered to the same key list.
+            // Paperclip passes the flattened key names, so nested objects that
+            // contain keys outside the list are serialized as `{}` by JS.
+            let mut parts: Vec<String> = Vec::with_capacity(map.len());
+            for (key, val) in map {
+                // JS replacer semantics: keys not in the whitelist are skipped.
+                if !key_names.contains(&key.as_str()) && !key_names.is_empty() {
+                    continue;
+                }
+                parts.push(format!("{}:{}", serde_json::to_string(key).unwrap(), canonicalize(val, key_names)));
+            }
+            parts.sort(); // JS object key order from the replacer list is sorted upstream
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(|item| canonicalize(item, key_names)).collect();
+            format!("[{}]", parts.join(","))
+        }
+        other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Risk classification for a tool descriptor.
+///
+/// Port of Paperclip `classifyRisk` (descriptor annotations + name heuristics).
+pub fn classify_risk(name: &str, annotations: &serde_json::Value) -> &'static str {
+    let annotation = |key: &str| {
+        annotations
+            .get(key)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    let destructive = annotation("destructiveHint");
+    let read_only = annotation("readOnlyHint");
+    let idempotent = annotation("idempotentHint");
+    let open_world = annotation("openWorldHint");
+    if destructive {
+        return "destructive";
+    }
+    if read_only && (idempotent || !open_world) {
+        return "read";
+    }
+    if read_only {
+        return "low";
+    }
+    let name = name.to_ascii_lowercase();
+    if name.contains("delete")
+        || name.contains("remove")
+        || name.contains("destroy")
+        || name.contains("drop")
+    {
+        return "destructive";
+    }
+    if name.contains("create")
+        || name.contains("update")
+        || name.contains("write")
+        || name.contains("send")
+        || name.contains("publish")
+    {
+        return "write";
+    }
+    "medium"
+}
+
+/// Content hash of a tool descriptor: Paperclip `descriptorHash`.
+pub fn descriptor_hash(
+    name: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    input_schema: &serde_json::Value,
+    annotations: &serde_json::Value,
+    risk_level: &str,
+) -> String {
+    stable_hash(&serde_json::json!({
+        "name": name,
+        "title": title,
+        "description": description,
+        "inputSchema": input_schema,
+        "annotations": annotations,
+        "riskLevel": risk_level,
+    }))
+}
+
+/// Schema-only content hash: Paperclip `stableHash(descriptor.inputSchema ?? {})`.
+pub fn schema_hash(input_schema: &serde_json::Value) -> String {
+    stable_hash(input_schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +627,50 @@ mod tests {
         for path in ["exchange", "oauth_access", "static"] {
             assert!(CONNECTION_TOKEN_ISSUANCE_PATHS.contains(&path));
         }
+    }
+
+/// Canonical JSON key order: collect every recursively nested key name.
+///
+/// Port of Paperclip `flattenKeys`.
+
+    #[test]
+    fn stable_hash_is_key_order_independent() {
+        let a = serde_json::json!({"b": 1, "a": {"y": 2, "x": 3}});
+        let b = serde_json::json!({"a": {"x": 3, "y": 2}, "b": 1});
+        assert_eq!(stable_hash(&a), stable_hash(&b));
+        let c = serde_json::json!({"b": 1, "a": {"y": 2, "x": 4}});
+        assert_ne!(stable_hash(&a), stable_hash(&c));
+    }
+
+    #[test]
+    fn descriptor_hash_changes_when_schema_changes() {
+        let schema1 = serde_json::json!({"type": "object", "properties": {"key": {"type": "string"}}});
+        let schema2 = serde_json::json!({"type": "object", "properties": {"key": {"type": "number"}}});
+        let h1 = descriptor_hash("kv_get", Some("Get"), None, &schema1, &serde_json::json!({}), "low");
+        let h2 = descriptor_hash("kv_get", Some("Get"), None, &schema2, &serde_json::json!({}), "low");
+        assert_ne!(h1, h2, "schema change must change version hash");
+        // Identical descriptor (key order shuffled inside schema) keeps the hash.
+        let schema3 = serde_json::json!({"properties": {"key": {"type": "string"}}, "type": "object"});
+        let h3 = descriptor_hash("kv_get", Some("Get"), None, &schema3, &serde_json::json!({}), "low");
+        assert_eq!(h1, h3, "key-order-only change must NOT change the hash");
+        assert_eq!(h1, descriptor_hash("kv_get", Some("Get"), None, &schema1, &serde_json::json!({}), "low"));
+    }
+
+    #[test]
+    fn schema_hash_tracks_schema_only() {
+        let schema = serde_json::json!({"type": "object"});
+        assert_eq!(schema_hash(&schema), schema_hash(&serde_json::json!({"type": "object"})));
+        assert_ne!(schema_hash(&schema), schema_hash(&serde_json::json!({"type": "string"})));
+        assert_eq!(schema_hash(&serde_json::json!({})).len(), 64);
+    }
+
+    #[test]
+    fn risk_classification_matches_annotations_then_names() {
+        let ann = |s: &str, d: bool| serde_json::json!({s: d});
+        assert_eq!(classify_risk("delete_thing", &ann("destructiveHint", true)), "destructive");
+        assert_eq!(classify_risk("get_thing", &ann("readOnlyHint", true)), "read");
+        assert_eq!(classify_risk("create_thing", &serde_json::json!({})), "write");
+        assert_eq!(classify_risk("remove_thing", &serde_json::json!({})), "destructive");
+        assert_eq!(classify_risk("do_thing", &serde_json::json!({})), "medium");
     }
 }

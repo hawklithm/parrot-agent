@@ -2474,24 +2474,45 @@ async fn refresh_connection_catalog(
             .get("name")
             .and_then(Value::as_str)
             .ok_or(StatusCode::BAD_GATEWAY)?;
+        let title = tool.get("title").and_then(Value::as_str);
+        let description = tool.get("description").and_then(Value::as_str);
+        let input_schema = tool.get("inputSchema").cloned().unwrap_or_else(|| json!({}));
+        let annotations = tool.get("annotations").cloned().unwrap_or_else(|| json!({}));
+        // Paperclip refreshCatalog: content-derived snapshot hashes + risk
+        // classification (the previous implementation stored a random UUID as
+        // version_hash, so change detection never matched).
+        let risk_level = services::tool_access_contract::classify_risk(name, &annotations);
+        let version_hash = services::tool_access_contract::descriptor_hash(
+            name,
+            title,
+            description,
+            &input_schema,
+            &annotations,
+            risk_level,
+        );
+        let schema_hash = services::tool_access_contract::schema_hash(&input_schema);
         let entry_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO tool_catalog_entries
-                (id, company_id, connection_id, name, tool_name, title, description, input_schema, output_schema, version_hash, last_seen_at, updated_at)
-             VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,NOW(),NOW())
+                (id, company_id, connection_id, name, tool_name, title, description, input_schema, output_schema, version_hash, schema_hash, risk_level, last_seen_at, updated_at)
+             VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())
              ON CONFLICT (connection_id, name) DO UPDATE SET
                 title = EXCLUDED.title, description = EXCLUDED.description, input_schema = EXCLUDED.input_schema,
-                output_schema = EXCLUDED.output_schema, status = 'active', last_seen_at = NOW(), updated_at = NOW()",
+                output_schema = EXCLUDED.output_schema, version_hash = EXCLUDED.version_hash,
+                schema_hash = EXCLUDED.schema_hash, risk_level = EXCLUDED.risk_level,
+                last_seen_at = NOW(), updated_at = NOW()",
         )
         .bind(entry_id)
         .bind(company_id)
         .bind(connection_id)
         .bind(name)
-        .bind(tool.get("title").and_then(Value::as_str))
-        .bind(tool.get("description").and_then(Value::as_str))
-        .bind(tool.get("inputSchema").cloned().unwrap_or_else(|| json!({})))
+        .bind(title)
+        .bind(description)
+        .bind(input_schema)
         .bind(tool.get("outputSchema").cloned())
-        .bind(Uuid::new_v4().to_string())
+        .bind(version_hash)
+        .bind(schema_hash)
+        .bind(risk_level)
         .execute(&state.pool)
         .await
         .map_err(|e| {
