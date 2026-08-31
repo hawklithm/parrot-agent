@@ -208,6 +208,21 @@ pub struct PluginManifestV1 {
     /// Environment drivers this plugin contributes (§: runtime drivers).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environment_drivers: Vec<PluginEnvironmentDriverDeclaration>,
+    /// Suggested company-scoped agents this plugin can provision/resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<PluginManagedAgentDeclaration>,
+    /// Suggested company-scoped projects this plugin can provision/resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<PluginManagedProjectDeclaration>,
+    /// Suggested company-scoped routines this plugin can provision/resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routines: Vec<PluginManagedRoutineDeclaration>,
+    /// Suggested company skills this plugin can install/resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<PluginManagedSkillDeclaration>,
+    /// Trusted local folders this plugin can configure and access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_folders: Vec<PluginLocalFolderDeclaration>,
     /// JSON Schema for operator-editable instance configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_config_schema: Option<serde_json::Value>,
@@ -618,6 +633,169 @@ pub fn validate_environment_driver(
     Ok(())
 }
 
+/// Maximum length for a managed-resource stable key (Paperclip validators).
+pub const MANAGED_KEY_MAX_LEN: usize = 100;
+
+/// Validate a Paperclip managed-resource stable key.
+///
+/// Paperclip rule (`validators/plugin.ts`): `^[a-z0-9][a-z0-9._:-]*$`, max 100
+/// chars — must start with a lowercase alphanumeric and contain only lowercase
+/// letters, digits, dots, colons, underscores, or hyphens. Note this set
+/// includes `:` unlike the plugin id pattern.
+pub fn validate_managed_key(kind: &str, key: &str) -> Result<(), CapabilityError> {
+    if key.is_empty() || key.len() > MANAGED_KEY_MAX_LEN {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "{kind} must be 1-{MANAGED_KEY_MAX_LEN} chars"
+        )));
+    }
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "{kind} '{key}' must start with a lowercase alphanumeric"
+            )))
+        }
+    }
+    if !chars.all(|c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | ':' | '-')
+    }) {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "{kind} '{key}' may only contain lowercase letters, digits, dots, colons, underscores, or hyphens"
+        )));
+    }
+    Ok(())
+}
+
+/// Declares a company-scoped agent a plugin can provision and resolve by key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManagedAgentDeclaration {
+    /// Stable identifier for this managed agent, unique within the plugin.
+    pub agent_key: String,
+    /// Suggested visible agent name.
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adapter_preference: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_monthly_cents: Option<i64>,
+}
+
+/// Declares a company-scoped project a plugin can provision and resolve by key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManagedProjectDeclaration {
+    pub project_key: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// Declares a company skill a plugin can install and resolve by key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManagedSkillDeclaration {
+    pub skill_key: String,
+    pub display_name: String,
+    /// Suggested skill slug. Defaults to `skillKey`. Must match the key pattern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Declares a company routine a plugin can provision and resolve by key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManagedRoutineDeclaration {
+    pub routine_key: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Folder access level requested by a trusted plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginLocalFolderAccess {
+    Read,
+    ReadWrite,
+}
+
+/// Declares a company-scoped local folder a trusted plugin wants configured.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginLocalFolderDeclaration {
+    /// Stable identifier for this folder, unique within the plugin.
+    pub folder_key: String,
+    /// Human-readable name shown in plugin settings.
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Access level requested by the plugin. Defaults to `readWrite`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<PluginLocalFolderAccess>,
+    /// Relative directories expected to exist under the configured root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_directories: Vec<String>,
+    /// Relative files expected to exist under the configured root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_files: Vec<String>,
+}
+
+/// Validate a relative path expected under a local folder root.
+///
+/// Paperclip rejects absolute paths, `..` traversal, and paths over 500 chars.
+pub fn validate_local_folder_relative_path(path: &str) -> Result<(), CapabilityError> {
+    if path.is_empty() || path.len() > 500 {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "local folder path must be 1-500 chars: '{path}'"
+        )));
+    }
+    if path.starts_with('/') {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "local folder path must be relative: '{path}'"
+        )));
+    }
+    if path.split('/').any(|seg| seg == "..") {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "local folder path must not contain '..': '{path}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a local folder declaration.
+pub fn validate_local_folder(
+    folder: &PluginLocalFolderDeclaration,
+) -> Result<(), CapabilityError> {
+    validate_managed_key("folderKey", &folder.folder_key)?;
+    if folder.display_name.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "localFolders.displayName is required".into(),
+        ));
+    }
+    for dir in &folder.required_directories {
+        validate_local_folder_relative_path(dir)?;
+    }
+    for file in &folder.required_files {
+        validate_local_folder_relative_path(file)?;
+    }
+    Ok(())
+}
+
 /// Validate a manifest against Paperclip's declaration rules.
 ///
 /// Enforced (PLUGIN_SPEC §6/§11/§13.6/§18):
@@ -637,16 +815,22 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
             manifest.api_version
         )));
     }
-    if manifest.id.is_empty()
-        || !manifest
-            .id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
+    // Paperclip: /^[a-z0-9][a-z0-9._-]*$/ — must start with a lowercase
+    // alphanumeric. No trailing colon (unlike managed-resource keys).
     {
-        return Err(CapabilityError::InvalidManifest(format!(
-            "invalid plugin id: {}",
-            manifest.id
-        )));
+        let id = &manifest.id;
+        let first_ok = id
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+        let rest_ok = id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'));
+        if id.is_empty() || !first_ok || !rest_ok {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "invalid plugin id: {id}"
+            )));
+        }
     }
     if manifest.display_name.is_empty() || manifest.display_name.len() > 100 {
         return Err(CapabilityError::InvalidManifest(
@@ -833,6 +1017,112 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
             return Err(CapabilityError::MissingCapability(
                 "environmentDrivers".into(),
                 "environment.drivers.register".into(),
+            ));
+        }
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for agent in &manifest.agents {
+            validate_managed_key("agentKey", &agent.agent_key)?;
+            if !seen.insert(agent.agent_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate agentKey: {}",
+                    agent.agent_key
+                )));
+            }
+        }
+        if !manifest.agents.is_empty() && !has_capability(&manifest.capabilities, "agents.managed")
+        {
+            return Err(CapabilityError::MissingCapability(
+                "agents".into(),
+                "agents.managed".into(),
+            ));
+        }
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for project in &manifest.projects {
+            validate_managed_key("projectKey", &project.project_key)?;
+            if !seen.insert(project.project_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate projectKey: {}",
+                    project.project_key
+                )));
+            }
+        }
+        if !manifest.projects.is_empty()
+            && !has_capability(&manifest.capabilities, "projects.managed")
+        {
+            return Err(CapabilityError::MissingCapability(
+                "projects".into(),
+                "projects.managed".into(),
+            ));
+        }
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for routine in &manifest.routines {
+            validate_managed_key("routineKey", &routine.routine_key)?;
+            if !seen.insert(routine.routine_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate routineKey: {}",
+                    routine.routine_key
+                )));
+            }
+        }
+        if !manifest.routines.is_empty()
+            && !has_capability(&manifest.capabilities, "routines.managed")
+        {
+            return Err(CapabilityError::MissingCapability(
+                "routines".into(),
+                "routines.managed".into(),
+            ));
+        }
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for skill in &manifest.skills {
+            validate_managed_key("skillKey", &skill.skill_key)?;
+            if let Some(slug) = &skill.slug {
+                validate_managed_key("slug", slug)?;
+            }
+            if !seen.insert(skill.skill_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate skillKey: {}",
+                    skill.skill_key
+                )));
+            }
+        }
+        if !manifest.skills.is_empty() && !has_capability(&manifest.capabilities, "skills.managed")
+        {
+            return Err(CapabilityError::MissingCapability(
+                "skills".into(),
+                "skills.managed".into(),
+            ));
+        }
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for folder in &manifest.local_folders {
+            validate_local_folder(folder)?;
+            if !seen.insert(folder.folder_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate folderKey: {}",
+                    folder.folder_key
+                )));
+            }
+        }
+        if !manifest.local_folders.is_empty()
+            && !has_capability(&manifest.capabilities, "local.folders")
+        {
+            return Err(CapabilityError::MissingCapability(
+                "localFolders".into(),
+                "local.folders".into(),
             ));
         }
     }
@@ -1088,6 +1378,11 @@ mod manifest_tests {
             api_routes: vec![],
             object_references: vec![],
             environment_drivers: vec![],
+            agents: vec![],
+            projects: vec![],
+            routines: vec![],
+            skills: vec![],
+            local_folders: vec![],
             instance_config_schema: None,
             declares_ui: false,
         }
@@ -1510,6 +1805,148 @@ mod manifest_tests {
         assert_eq!(
             serde_json::to_string(&PluginEnvironmentDriverKind::SandboxProvider).unwrap(),
             "\"sandbox_provider\""
+        );
+    }
+
+    fn agent(key: &str) -> PluginManagedAgentDeclaration {
+        PluginManagedAgentDeclaration {
+            agent_key: key.into(),
+            display_name: "Agent".into(),
+            role: None,
+            title: None,
+            icon: None,
+            adapter_type: None,
+            adapter_preference: vec![],
+            budget_monthly_cents: None,
+        }
+    }
+
+    fn folder(key: &str) -> PluginLocalFolderDeclaration {
+        PluginLocalFolderDeclaration {
+            folder_key: key.into(),
+            display_name: "Folder".into(),
+            description: None,
+            access: None,
+            required_directories: vec![],
+            required_files: vec![],
+        }
+    }
+
+    #[test]
+    fn managed_key_must_start_alphanumeric_and_allow_colon() {
+        // Colons are allowed in managed keys (unlike plugin ids).
+        assert!(validate_managed_key("agentKey", "ns:agent").is_ok());
+        assert!(validate_managed_key("agentKey", "agent.1-a_b").is_ok());
+        // Leading dot/hyphen/underscore is rejected.
+        assert!(validate_managed_key("agentKey", ".agent").is_err());
+        assert!(validate_managed_key("agentKey", "-agent").is_err());
+        // Uppercase and empty rejected.
+        assert!(validate_managed_key("agentKey", "Agent").is_err());
+        assert!(validate_managed_key("agentKey", "").is_err());
+        // Over 100 chars rejected.
+        let long = "a".repeat(101);
+        assert!(validate_managed_key("agentKey", &long).is_err());
+    }
+
+    #[test]
+    fn plugin_id_rejects_leading_punctuation() {
+        // Paperclip: /^[a-z0-9][a-z0-9._-]*$/ — no leading punctuation, no colon.
+        for bad in [".acme", "-acme", "_acme", "acme:thing"] {
+            let mut m = manifest(&[]);
+            m.id = bad.into();
+            assert!(validate_manifest(&m).is_err(), "id {bad:?} must be rejected");
+        }
+        for good in ["acme.thing", "a1-b_c.d"] {
+            let mut m = manifest(&[]);
+            m.id = good.into();
+            assert!(validate_manifest(&m).is_ok(), "id {good:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn managed_agents_require_agents_managed_capability() {
+        let mut m = manifest(&[]);
+        m.agents = vec![agent("bot")];
+        assert!(validate_manifest(&m).is_err());
+        m.capabilities.push("agents.managed".into());
+        assert!(validate_manifest(&m).is_ok());
+        m.agents = vec![agent("bot"), agent("bot")];
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn managed_projects_routines_skills_require_their_capabilities() {
+        let mut m = manifest(&[]);
+        m.projects = vec![PluginManagedProjectDeclaration {
+            project_key: "p".into(),
+            display_name: "P".into(),
+            description: None,
+            status: None,
+            color: None,
+        }];
+        assert!(validate_manifest(&m).is_err());
+        m.capabilities.push("projects.managed".into());
+        assert!(validate_manifest(&m).is_ok());
+
+        let mut m2 = manifest(&[]);
+        m2.routines = vec![PluginManagedRoutineDeclaration {
+            routine_key: "r".into(),
+            title: "R".into(),
+            description: None,
+        }];
+        assert!(validate_manifest(&m2).is_err());
+        m2.capabilities.push("routines.managed".into());
+        assert!(validate_manifest(&m2).is_ok());
+
+        let mut m3 = manifest(&[]);
+        m3.skills = vec![PluginManagedSkillDeclaration {
+            skill_key: "s".into(),
+            display_name: "S".into(),
+            slug: Some("custom-slug".into()),
+            description: None,
+        }];
+        assert!(validate_manifest(&m3).is_err());
+        m3.capabilities.push("skills.managed".into());
+        assert!(validate_manifest(&m3).is_ok());
+    }
+
+    #[test]
+    fn skill_slug_must_match_key_pattern() {
+        let mut m = manifest(&["skills.managed"]);
+        m.skills = vec![PluginManagedSkillDeclaration {
+            skill_key: "s".into(),
+            display_name: "S".into(),
+            slug: Some("Bad Slug".into()),
+            description: None,
+        }];
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn local_folders_require_capability_and_safe_paths() {
+        let mut m = manifest(&[]);
+        m.local_folders = vec![folder("docs")];
+        assert!(validate_manifest(&m).is_err());
+        m.capabilities.push("local.folders".into());
+        assert!(validate_manifest(&m).is_ok());
+
+        // Traversal and absolute paths are rejected.
+        let mut bad = folder("docs");
+        bad.required_directories = vec!["../etc".into()];
+        m.local_folders = vec![bad];
+        assert!(validate_manifest(&m).is_err());
+
+        let mut bad2 = folder("docs");
+        bad2.required_files = vec!["/etc/passwd".into()];
+        m.local_folders = vec![bad2];
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn local_folder_access_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&PluginLocalFolderAccess::ReadWrite).unwrap(),
+            "\"readWrite\""
         );
     }
 }
