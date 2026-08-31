@@ -1334,7 +1334,7 @@ async fn connection_activity(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = actor_company(&actor)?;
     require_board_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
@@ -1355,18 +1355,72 @@ async fn connection_activity(
         tracing::error!("Failed to list connection activity: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(
-        rows.iter()
-            .map(|r| {
-                json!({
-                    "id": r.get::<Uuid, _>("id"),
-                    "toolName": r.get::<String, _>("tool_name"),
-                    "status": r.get::<String, _>("status"),
-                    "occurredAt": r.get::<chrono::DateTime<chrono::Utc>, _>("occurred_at"),
-                })
+    let events: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<Uuid, _>("id"),
+                "toolName": r.get::<String, _>("tool_name"),
+                "status": r.get::<String, _>("status"),
+                "occurredAt": r.get::<chrono::DateTime<chrono::Utc>, _>("occurred_at"),
             })
-            .collect(),
-    ))
+        })
+        .collect();
+
+    // Derive lifecycle events from the connection-scoped activity log, the
+    // same way Paperclip's listConnectionLifecycleEvents does (no separate
+    // table): map each log row through the canonical lifecycle mapper.
+    let log_rows = sqlx::query(
+        "SELECT id, action, entity_type, entity_id, resource_type, resource_id, details, actor_type, agent_id, user_id, created_at \
+           FROM activity_log
+          WHERE company_id = $1
+            AND ((entity_type = 'tool_connection' AND entity_id = $2)
+              OR (resource_type = 'tool_connection' AND resource_id = $2))
+          ORDER BY created_at DESC LIMIT 50",
+    )
+    .bind(company_id)
+    .bind(connection_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list connection lifecycle log: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let lifecycle_events: Vec<serde_json::Value> = log_rows
+        .iter()
+        .filter_map(|r| {
+            let action: String = r.get("action");
+            let details: serde_json::Value = r.get("details");
+            let lifecycle_type =
+                services::tool_access_contract::activity_log_action_to_lifecycle_type(
+                    &action,
+                    Some(&details),
+                )?;
+            let actor_type: Option<String> = r.try_get("actor_type").unwrap_or(None);
+            let agent_id: Option<Uuid> = r.try_get("agent_id").unwrap_or(None);
+            let user_id: Option<Uuid> = r.try_get("user_id").unwrap_or(None);
+            let actor_display = user_id
+                .map(|id| id.to_string())
+                .or_else(|| agent_id.map(|id| id.to_string()));
+            Some(json!({
+                "id": r.get::<Uuid, _>("id"),
+                "connectionId": connection_id,
+                "type": lifecycle_type,
+                "actorType": actor_type,
+                "actorId": user_id,
+                "agentId": agent_id,
+                "actorDisplayName": actor_display,
+                "details": details,
+                "occurredAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            }))
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "connectionId": connection_id,
+        "events": events,
+        "lifecycleEvents": lifecycle_events,
+    })))
 }
 
 // ---------- tool-profiles ----------

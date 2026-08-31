@@ -244,6 +244,43 @@ pub fn validate_policy_decision(decision: &str) -> Result<(), ToolAccessContract
     require_member("policy decision", TOOL_POLICY_DECISIONS, decision)
 }
 
+/// Map a connection-scoped activity-log action + details to a canonical
+/// lifecycle event type, or `None` when the row is not an operator-visible
+/// lifecycle change.
+///
+/// Port of Paperclip `activityLogActionToLifecycleType`
+/// (`server/src/services/tool-access.ts`), extended to also recognize the
+/// action spellings Parrot already writes (`tool_connection.created`,
+/// `tool_connection.oauth_connected`) so the two systems' feeds line up. A
+/// `tool_connection.updated` row only surfaces when its details carry a
+/// `lifecycle` discriminator (`paused`/`resumed`/`allowlist_changed`);
+/// plain settings edits stay out of the feed.
+pub fn activity_log_action_to_lifecycle_type(
+    action: &str,
+    details: Option<&serde_json::Value>,
+) -> Option<&'static str> {
+    let lifecycle = details
+        .and_then(|d| d.get("lifecycle"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match action {
+        "tool_app.connected" | "tool_app.oauth_connected" | "tool_example.installed" => {
+            Some("app_connected")
+        }
+        // Parrot spellings for the same operator-visible moments.
+        "tool_connection.created" | "tool_connection.oauth_connected" => Some("app_connected"),
+        "tool_app.reconnected" => Some("reconnected"),
+        "tool_connection.archived" | "tool_connection.deleted" => Some("disconnected"),
+        "tool_connection.updated" => match lifecycle {
+            "paused" => Some("app_paused"),
+            "resumed" => Some("app_resumed"),
+            "allowlist_changed" => Some("allowlist_changed"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,42 +419,6 @@ mod tests {
         }
     }
 
-/// Map a connection-scoped activity-log action + details to a canonical
-/// lifecycle event type, or `None` when the row is not an operator-visible
-/// lifecycle change.
-///
-/// Port of Paperclip `activityLogActionToLifecycleType`
-/// (`server/src/services/tool-access.ts`), extended to also recognize the
-/// action spellings Parrot already writes (`tool_connection.created`,
-/// `tool_connection.oauth_connected`) so the two systems' feeds line up. A
-/// `tool_connection.updated` row only surfaces when its details carry a
-/// `lifecycle` discriminator (`paused`/`resumed`/`allowlist_changed`);
-/// plain settings edits stay out of the feed.
-pub fn activity_log_action_to_lifecycle_type(
-    action: &str,
-    details: Option<&serde_json::Value>,
-) -> Option<&'static str> {
-    let lifecycle = details
-        .and_then(|d| d.get("lifecycle"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    match action {
-        "tool_app.connected" | "tool_app.oauth_connected" | "tool_example.installed" => {
-            Some("app_connected")
-        }
-        // Parrot spellings for the same operator-visible moments.
-        "tool_connection.created" | "tool_connection.oauth_connected" => Some("app_connected"),
-        "tool_app.reconnected" => Some("reconnected"),
-        "tool_connection.archived" | "tool_connection.deleted" => Some("disconnected"),
-        "tool_connection.updated" => match lifecycle {
-            "paused" => Some("app_paused"),
-            "resumed" => Some("app_resumed"),
-            "allowlist_changed" => Some("allowlist_changed"),
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
     #[test]
     fn activity_actions_map_to_lifecycle_types() {
