@@ -202,6 +202,12 @@ pub struct PluginManifestV1 {
     /// Scoped JSON API routes mounted under `/api/plugins/:pluginId/api/*` (§20).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub api_routes: Vec<PluginApiRouteDeclaration>,
+    /// External object reference providers this plugin contributes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub object_references: Vec<PluginObjectReferenceProviderDeclaration>,
+    /// Environment drivers this plugin contributes (§: runtime drivers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_drivers: Vec<PluginEnvironmentDriverDeclaration>,
     /// JSON Schema for operator-editable instance configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_config_schema: Option<serde_json::Value>,
@@ -462,6 +468,156 @@ pub fn validate_api_route(route: &PluginApiRouteDeclaration) -> Result<(), Capab
     Ok(())
 }
 
+/// Optional default refresh behavior for an external object provider.
+///
+/// Port of `@paperclipai/shared` `PluginObjectReferenceRefreshPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginObjectReferenceRefreshPolicy {
+    /// Default freshness window for resolved objects from this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ttl_seconds: Option<i64>,
+    /// UI-visible staleness window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_after_seconds: Option<i64>,
+}
+
+/// Declares an external object reference provider contributed by the plugin.
+///
+/// Port of `@paperclipai/shared` `PluginObjectReferenceProviderDeclaration`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginObjectReferenceProviderDeclaration {
+    /// Stable provider key such as "github", "linear", or "mocktracker".
+    pub provider_key: String,
+    /// Human-readable provider name shown in operator-facing surfaces.
+    pub display_name: String,
+    /// Provider object types this plugin can detect and resolve.
+    pub object_types: Vec<String>,
+    /// Human-readable URL patterns this provider recognizes (metadata only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_patterns: Vec<String>,
+    /// Optional default refresh behavior for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_policy: Option<PluginObjectReferenceRefreshPolicy>,
+    /// Webhook endpoint keys declared under `webhooks` that can refresh objects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webhook_endpoint_keys: Vec<String>,
+}
+
+/// Driver classification for a plugin environment driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginEnvironmentDriverKind {
+    /// Used by core `driver: "plugin"` environments.
+    EnvironmentDriver,
+    /// Used by core `driver: "sandbox"` environments whose provider is a plugin.
+    SandboxProvider,
+}
+
+/// Declares an environment runtime driver contributed by the plugin.
+///
+/// Port of `@paperclipai/shared` `PluginEnvironmentDriverDeclaration`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginEnvironmentDriverDeclaration {
+    /// Stable driver key, unique within the plugin.
+    pub driver_key: String,
+    /// Driver classification; defaults to `environment_driver`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<PluginEnvironmentDriverKind>,
+    /// Human-readable name shown in environment configuration UI.
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Sandbox providers must opt in before the host retains/resumes leases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reusable_leases: Option<bool>,
+    /// Provider can keep a temporary setup sandbox alive for customization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_interactive_setup: Option<bool>,
+    /// Connection types the setup sandbox can expose (initially `ssh`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interactive_setup_connection_types: Vec<String>,
+    /// Provider can capture a reusable template from a live setup sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_template_capture: Option<bool>,
+    /// Kind of template reference returned by the provider's capture hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_ref_kind: Option<String>,
+}
+
+/// Validate an external object reference provider declaration.
+///
+/// - `providerKey` and `displayName` are required
+/// - `objectTypes` must be non-empty (a provider that detects nothing is invalid)
+/// - `webhookEndpointKeys` must reference endpoints declared under `webhooks`
+pub fn validate_object_reference_provider(
+    provider: &PluginObjectReferenceProviderDeclaration,
+    declared_webhook_keys: &[String],
+) -> Result<(), CapabilityError> {
+    if provider.provider_key.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "objectReferences.providerKey is required".into(),
+        ));
+    }
+    if provider.display_name.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "objectReferences.displayName is required".into(),
+        ));
+    }
+    if provider.object_types.is_empty() {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "objectReferences provider '{}' must declare objectTypes",
+            provider.provider_key
+        )));
+    }
+    for key in &provider.webhook_endpoint_keys {
+        if !declared_webhook_keys.contains(key) {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "objectReferences provider '{}' references undeclared webhook endpointKey '{}'",
+                provider.provider_key, key
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate an environment driver declaration.
+///
+/// - `driverKey` and `displayName` are required
+/// - `templateRefKind` requires `supportsTemplateCapture`
+/// - `interactiveSetupConnectionTypes` requires `supportsInteractiveSetup`
+pub fn validate_environment_driver(
+    driver: &PluginEnvironmentDriverDeclaration,
+) -> Result<(), CapabilityError> {
+    if driver.driver_key.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "environmentDrivers.driverKey is required".into(),
+        ));
+    }
+    if driver.display_name.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "environmentDrivers.displayName is required".into(),
+        ));
+    }
+    if driver.template_ref_kind.is_some() && driver.supports_template_capture != Some(true) {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "environmentDrivers driver '{}' declares templateRefKind without supportsTemplateCapture",
+            driver.driver_key
+        )));
+    }
+    if !driver.interactive_setup_connection_types.is_empty()
+        && driver.supports_interactive_setup != Some(true)
+    {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "environmentDrivers driver '{}' declares interactiveSetupConnectionTypes without supportsInteractiveSetup",
+            driver.driver_key
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a manifest against Paperclip's declaration rules.
 ///
 /// Enforced (PLUGIN_SPEC §6/§11/§13.6/§18):
@@ -630,6 +786,53 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
             return Err(CapabilityError::MissingCapability(
                 "apiRoutes".into(),
                 API_ROUTE_CAPABILITY.into(),
+            ));
+        }
+    }
+
+    let declared_webhook_keys: Vec<String> = manifest
+        .webhooks
+        .as_ref()
+        .map(|hooks| hooks.iter().map(|h| h.endpoint_key.clone()).collect())
+        .unwrap_or_default();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for provider in &manifest.object_references {
+            validate_object_reference_provider(provider, &declared_webhook_keys)?;
+            if !seen.insert(provider.provider_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate objectReferences providerKey: {}",
+                    provider.provider_key
+                )));
+            }
+        }
+        if !manifest.object_references.is_empty()
+            && !has_capability(&manifest.capabilities, "external.objects.read")
+        {
+            return Err(CapabilityError::MissingCapability(
+                "objectReferences".into(),
+                "external.objects.read".into(),
+            ));
+        }
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for driver in &manifest.environment_drivers {
+            validate_environment_driver(driver)?;
+            if !seen.insert(driver.driver_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate environmentDrivers driverKey: {}",
+                    driver.driver_key
+                )));
+            }
+        }
+        if !manifest.environment_drivers.is_empty()
+            && !has_capability(&manifest.capabilities, "environment.drivers.register")
+        {
+            return Err(CapabilityError::MissingCapability(
+                "environmentDrivers".into(),
+                "environment.drivers.register".into(),
             ));
         }
     }
@@ -883,6 +1086,8 @@ mod manifest_tests {
             database: None,
             ui_slots: vec![],
             api_routes: vec![],
+            object_references: vec![],
+            environment_drivers: vec![],
             instance_config_schema: None,
             declares_ui: false,
         }
@@ -1197,5 +1402,114 @@ mod manifest_tests {
         assert_eq!(PLUGIN_API_ROUTE_METHODS.len(), 4);
         assert_eq!(PLUGIN_API_ROUTE_AUTH_MODES.len(), 4);
         assert_eq!(PLUGIN_API_ROUTE_CHECKOUT_POLICIES.len(), 3);
+    }
+
+    fn provider(key: &str) -> PluginObjectReferenceProviderDeclaration {
+        PluginObjectReferenceProviderDeclaration {
+            provider_key: key.into(),
+            display_name: "Provider".into(),
+            object_types: vec!["pull_request".into()],
+            url_patterns: vec![],
+            refresh_policy: None,
+            webhook_endpoint_keys: vec![],
+        }
+    }
+
+    fn driver(key: &str) -> PluginEnvironmentDriverDeclaration {
+        PluginEnvironmentDriverDeclaration {
+            driver_key: key.into(),
+            kind: None,
+            display_name: "Driver".into(),
+            description: None,
+            supports_reusable_leases: None,
+            supports_interactive_setup: None,
+            interactive_setup_connection_types: vec![],
+            supports_template_capture: None,
+            template_ref_kind: None,
+        }
+    }
+
+    #[test]
+    fn object_reference_provider_requires_key_name_and_types() {
+        let mut p = provider("github");
+        assert!(validate_object_reference_provider(&p, &[]).is_ok());
+
+        let mut no_types = p.clone();
+        no_types.object_types = vec![];
+        assert!(validate_object_reference_provider(&no_types, &[]).is_err());
+
+        p.display_name = " ".into();
+        assert!(validate_object_reference_provider(&p, &[]).is_err());
+    }
+
+    #[test]
+    fn object_reference_webhook_keys_must_be_declared() {
+        let mut m = manifest(&["external.objects.read"]);
+        let mut p = provider("github");
+        p.webhook_endpoint_keys = vec!["missing".into()];
+        m.object_references = vec![p.clone()];
+        assert!(validate_manifest(&m).is_err());
+
+        m.webhooks = Some(vec![PluginWebhookDeclaration {
+            endpoint_key: "missing".into(),
+            display_name: "M".into(),
+            description: None,
+        }]);
+        m.capabilities.push("webhooks.receive".into());
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn object_references_require_external_objects_read() {
+        let mut m = manifest(&[]);
+        m.object_references = vec![provider("github")];
+        assert!(validate_manifest(&m).is_err());
+        m.capabilities.push("external.objects.read".into());
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn environment_driver_requires_key_and_name() {
+        assert!(validate_environment_driver(&driver("k8s")).is_ok());
+        let mut d = driver("k8s");
+        d.driver_key = " ".into();
+        assert!(validate_environment_driver(&d).is_err());
+    }
+
+    #[test]
+    fn template_ref_kind_requires_template_capture() {
+        let mut d = driver("k8s");
+        d.template_ref_kind = Some("image".into());
+        assert!(validate_environment_driver(&d).is_err());
+        d.supports_template_capture = Some(true);
+        assert!(validate_environment_driver(&d).is_ok());
+    }
+
+    #[test]
+    fn interactive_connection_types_require_interactive_setup() {
+        let mut d = driver("k8s");
+        d.interactive_setup_connection_types = vec!["ssh".into()];
+        assert!(validate_environment_driver(&d).is_err());
+        d.supports_interactive_setup = Some(true);
+        assert!(validate_environment_driver(&d).is_ok());
+    }
+
+    #[test]
+    fn environment_drivers_require_register_capability_and_unique_keys() {
+        let mut m = manifest(&[]);
+        m.environment_drivers = vec![driver("e2b")];
+        assert!(validate_manifest(&m).is_err());
+        m.capabilities.push("environment.drivers.register".into());
+        assert!(validate_manifest(&m).is_ok());
+        m.environment_drivers = vec![driver("e2b"), driver("e2b")];
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn driver_kind_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PluginEnvironmentDriverKind::SandboxProvider).unwrap(),
+            "\"sandbox_provider\""
+        );
     }
 }
