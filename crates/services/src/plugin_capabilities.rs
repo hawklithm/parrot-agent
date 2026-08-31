@@ -136,6 +136,7 @@ pub fn has_capability(granted: &[String], required: &str) -> bool {
 ///
 /// Port of `@paperclipai/shared` `PluginJobDeclaration` (PLUGIN_SPEC §13.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginJobDeclaration {
     /// Stable identifier for this job, unique within the plugin.
     pub job_key: String,
@@ -153,6 +154,7 @@ pub struct PluginJobDeclaration {
 ///
 /// Port of `@paperclipai/shared` `PluginWebhookDeclaration` (PLUGIN_SPEC §18).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginWebhookDeclaration {
     /// Stable identifier for this endpoint, unique within the plugin.
     pub endpoint_key: String,
@@ -338,6 +340,7 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
 ///
 /// Port of `@paperclipai/shared` `PluginToolDeclaration` (PLUGIN_SPEC §11).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginToolDeclaration {
     /// Tool name, unique within the plugin. Namespaced by plugin ID at runtime.
     pub name: String,

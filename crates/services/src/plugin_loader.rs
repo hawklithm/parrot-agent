@@ -34,6 +34,16 @@ pub fn parse_manifest(manifest: &Value) -> Result<PluginCapabilities, String> {
                 .into(),
         );
     }
+    // Run the full Paperclip manifest contract (PLUGIN_SPEC §6) when the
+    // manifest carries the V1 fields; loose/legacy manifests without them are
+    // still accepted so existing plugins keep loading.
+    if manifest.get("apiVersion").is_some() && manifest.get("id").is_some() {
+        let v1: crate::plugin_capabilities::PluginManifestV1 =
+            serde_json::from_value(manifest.clone())
+                .map_err(|e| format!("invalid plugin manifest: {e}"))?;
+        crate::plugin_capabilities::validate_manifest(&v1)
+            .map_err(|e| format!("invalid plugin manifest: {e}"))?;
+    }
 
     Ok(PluginCapabilities { tools, actions: array("actions"), jobs: array("jobs"), ui_contributions: manifest.get("uiContributions").or_else(||manifest.get("ui_contributions")).and_then(Value::as_array).cloned().unwrap_or_default(), capabilities })
 }
@@ -81,6 +91,32 @@ mod tests {
         let parsed = parse_manifest(&json!({})).unwrap();
         assert!(parsed.capabilities.is_empty());
         assert!(parsed.tools.is_empty());
+    }
+
+    #[test]
+    fn v1_manifest_is_fully_validated() {
+        let ok = json!({
+            "id": "acme.linear-sync",
+            "apiVersion": 1,
+            "version": "1.2.0",
+            "displayName": "Linear Sync",
+            "description": "Syncs",
+            "author": "Jane",
+            "capabilities": ["jobs.schedule"],
+            "entrypoints": {"worker": "dist/worker.js"},
+            "jobs": [{"jobKey": "sync", "displayName": "Sync"}]
+        });
+        assert!(parse_manifest(&ok).is_ok());
+
+        // V1 manifest with an unsupported apiVersion must be rejected.
+        let mut bad = ok.clone();
+        bad["apiVersion"] = json!(2);
+        assert!(parse_manifest(&bad).is_err());
+
+        // V1 job without jobs.schedule must be rejected.
+        let mut bad2 = ok.clone();
+        bad2["capabilities"] = json!(["issues.read"]);
+        assert!(parse_manifest(&bad2).is_err());
     }
 
     #[test]
