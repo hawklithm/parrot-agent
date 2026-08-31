@@ -81,6 +81,7 @@ pub mod summary_slot_service;
 pub mod mcp_http_service;
 pub mod mcp_http;
 pub mod mcp_jsonrpc;
+pub mod mcp_stdio;
 pub mod plugin_sdk;
 pub mod plugin_capabilities;
 pub mod tool_access_contract;

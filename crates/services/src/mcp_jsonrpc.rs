@@ -36,6 +36,7 @@ impl JsonRpcErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
+    #[serde(default)]
     pub id: Value,
     pub method: String,
     #[serde(default, skip_serializing_if = "Value::is_null")]
