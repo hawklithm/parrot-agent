@@ -1053,7 +1053,19 @@ async fn named_gateway_routes_require_tools_admin_permission() {
     let state = build_app_state(pool).await.expect("build app state");
     let app = tool_routes().with_state(state);
 
-    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+    let owner_user_id = Uuid::new_v4();
+    let owner = AuthorizationActor::board_with_source(
+        owner_user_id,
+        company_id,
+        ActorSource::Session,
+        vec![CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            owner_user_id,
+            MembershipRole::Owner,
+        )],
+        false,
+    );
     let operator = board_actor_with_role(company_id, MembershipRole::Operator);
     let viewer = board_actor_with_role(company_id, MembershipRole::Viewer);
 
@@ -2241,7 +2253,7 @@ async fn profile_subresources_are_company_scoped() {
         (
             "POST",
             format!("/tool-profiles/{profile_id}/new-tools/review"),
-            None,
+            Some(json!({"decisions": [{"catalogEntryId": Uuid::new_v4(), "decision": "allow"}]})),
         ),
     ] {
         let (status, body) = request_connection_route(&app, &other_owner, method, uri, body).await;
@@ -2318,15 +2330,17 @@ async fn profile_subresources_are_company_scoped() {
         Some(profile_id.to_string().as_str())
     );
 
+    // Paperclip reviewProfileNewTools: reviewing with no pending tools is a
+    // bad request (the review must cover every pending tool exactly once).
     let (status, body) = request_connection_route(
         &app,
         &owner,
         "POST",
         format!("/tool-profiles/{profile_id}/new-tools/review"),
-        None,
+        Some(json!({"decisions": [{"catalogEntryId": Uuid::new_v4(), "decision": "allow"}]})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "owner profile review={body:?}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "owner profile review={body:?}");
 
     for id in [created_entry_id, entry_id] {
         let (status, body) = request_connection_route(
@@ -3538,4 +3552,168 @@ async fn connection_token_exchange_concurrent_requests() {
         .bind(company_id)
         .execute(&pool)
         .await;
+}
+
+#[tokio::test]
+async fn review_new_tools_persists_decisions_and_entries() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let profile_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+    let application_id = Uuid::new_v4();
+    let allow_entry_id = Uuid::new_v4();
+    let block_entry_id = Uuid::new_v4();
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Review Tools Company")
+        .bind(format!("RT{}", &company_id.simple().to_string()[..8]))
+        .execute(&pool)
+        .await
+        .expect("insert company");
+    sqlx::query(
+        "INSERT INTO tool_applications (id, company_id, application_key, name)
+         VALUES ($1, $2, 'review-app', 'Review App')",
+    )
+    .bind(application_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("insert application");
+    sqlx::query(
+        "INSERT INTO tool_profiles (id, company_id, profile_key, name, description)
+         VALUES ($1, $2, 'review-profile', 'Review profile', 'review test')",
+    )
+    .bind(profile_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("insert profile");
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, application_id, name, uid, transport, auth_kind, status, enabled, config)
+         VALUES ($1, $2, $3, 'Review connection', 'review-conn', 'mcp_remote', 'none', 'active', true, '{}'::jsonb)",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .bind(application_id)
+    .execute(&pool)
+    .await
+    .expect("insert connection");
+    for (entry_id, tool_name) in [(allow_entry_id, "review.allow_me"), (block_entry_id, "review.block_me")] {
+        sqlx::query(
+            "INSERT INTO tool_catalog_entries
+                (id, company_id, connection_id, name, tool_name, status, risk_level, version_hash, first_seen_at, last_seen_at)
+             VALUES ($1, $2, $3, $4, $5, 'active', 'low', 'review-test-hash', NOW(), NOW())",
+        )
+        .bind(entry_id)
+        .bind(company_id)
+        .bind(connection_id)
+        .bind(tool_name)
+        .bind(tool_name)
+        .execute(&pool)
+        .await
+        .expect("insert catalog entry");
+    }
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let owner_user_id = Uuid::new_v4();
+    let owner = AuthorizationActor::board_with_source(
+        owner_user_id,
+        company_id,
+        ActorSource::Session,
+        vec![CompanyMembership::new(
+            company_id,
+            PrincipalType::User,
+            owner_user_id,
+            MembershipRole::Owner,
+        )],
+        false,
+    );
+
+    // Partial coverage must be rejected (Paperclip: decisions must cover every
+    // pending tool exactly once).
+    let (status, _) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/tool-profiles/{profile_id}/new-tools/review"),
+        Some(json!({"decisions": [
+            {"catalogEntryId": allow_entry_id, "decision": "allow"}
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "partial coverage must 400");
+
+    // Duplicates must be rejected.
+    let (status, _) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/tool-profiles/{profile_id}/new-tools/review"),
+        Some(json!({"decisions": [
+            {"catalogEntryId": allow_entry_id, "decision": "allow"},
+            {"catalogEntryId": allow_entry_id, "decision": "allow"}
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "duplicate decisions must 400");
+
+    // Full coverage succeeds: allow one, keep the other blocked.
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "POST",
+        format!("/tool-profiles/{profile_id}/new-tools/review"),
+        Some(json!({"decisions": [
+            {"catalogEntryId": allow_entry_id, "decision": "allow"},
+            {"catalogEntryId": block_entry_id, "decision": "keep_blocked"}
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "review={body:?}");
+    assert_eq!(body.get("allowedCount").and_then(Value::as_i64), Some(1));
+    assert_eq!(body.get("keptBlockedCount").and_then(Value::as_i64), Some(1));
+    assert_eq!(body.get("entriesCreated").and_then(Value::as_i64), Some(1));
+
+    // Allowed entry created a catalog_entry/include profile entry.
+    let entry_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_profile_entries
+          WHERE profile_id = $1 AND catalog_entry_id = $2 AND selector_type = 'catalog_entry' AND effect = 'include'",
+    )
+    .bind(profile_id)
+    .bind(allow_entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count created profile entries");
+    assert_eq!(entry_count, 1);
+
+    // Both entries carry reviewed_at; attribution went to the board user.
+    let (reviewed, by_agent, by_user): (Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT reviewed_at, reviewed_by_agent_id, reviewed_by_user_id FROM tool_catalog_entries WHERE id = $1",
+    )
+    .bind(allow_entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load reviewed entry");
+    assert!(reviewed.is_some(), "reviewed_at must be set");
+    assert!(by_agent.is_none(), "board review must not set agent attribution");
+    assert_eq!(
+        by_user.as_deref(),
+        Some(owner_user_id.to_string().as_str()),
+        "board review must set user attribution"
+    );
+
+    // GET /new-tools no longer lists the reviewed entries.
+    let (status, body) = request_connection_route(
+        &app,
+        &owner,
+        "GET",
+        format!("/tool-profiles/{profile_id}/new-tools"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "new tools after review={body:?}");
+    assert_eq!(body.as_array().map(Vec::len), Some(0), "pending list must be empty");
 }

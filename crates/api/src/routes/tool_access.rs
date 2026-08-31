@@ -5516,19 +5516,147 @@ async fn create_tool_profile_entry(
     ))
 }
 
-/// POST /api/tool-profiles/:id/new-tools/review —— mock。
+#[derive(serde::Deserialize)]
+struct ReviewNewToolsDecision {
+    #[serde(rename = "catalogEntryId")]
+    catalog_entry_id: Uuid,
+    decision: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ReviewNewToolsInput {
+    decisions: Vec<ReviewNewToolsDecision>,
+}
+
+/// POST /api/tool-profiles/:id/new-tools/review
+///
+/// Paperclip `reviewProfileNewTools`: decisions must cover every currently
+/// pending tool exactly once (no duplicates, no omissions); `allow` inserts a
+/// `catalog_entry`/`include` profile entry per tool; every decided catalog
+/// entry gets `reviewed_at` + reviewer attribution; responds with counts.
 async fn review_profile_new_tools(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(profile_id): Path<Uuid>,
+    Json(input): Json<ReviewNewToolsInput>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
     let company_id = actor_company(&actor)?;
     require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     ensure_tool_profile_scope(&state, profile_id, company_id).await?;
-    Ok(Json(
-        json!({ "profileId": profile_id, "newTools": [], "reviewed": true }),
-    ))
+
+    let decisions = input.decisions;
+    if decisions.is_empty() || decisions.len() > 250 {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    for decision in &decisions {
+        if decision.decision != "allow" && decision.decision != "keep_blocked" {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+    let decision_ids: Vec<Uuid> = decisions.iter().map(|d| d.catalog_entry_id).collect();
+    let mut seen = std::collections::HashSet::new();
+    if !decision_ids.iter().all(|id| seen.insert(*id)) {
+        // Paperclip: duplicate catalogEntryId values are a bad request.
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Pending = active catalog entries not yet reviewed (same predicate as the
+    // GET /new-tools listing).
+    let pending = sqlx::query(
+        "SELECT c.id, c.connection_id, c.application_id
+           FROM tool_catalog_entries c
+           JOIN tool_profiles p ON p.id = $1 AND p.company_id = c.company_id
+          WHERE c.company_id = $2 AND c.reviewed_at IS NULL AND c.status = 'active'",
+    )
+    .bind(profile_id)
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to list profile new tools: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if pending.is_empty() {
+        // Paperclip: no pending tools -> bad request.
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let pending_ids: std::collections::HashSet<Uuid> =
+        pending.iter().map(|row| row.get::<Uuid, _>("id")).collect();
+    let covers_every_pending = decision_ids.len() == pending_ids.len()
+        && decision_ids.iter().all(|id| pending_ids.contains(id));
+    if !covers_every_pending {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let allow_ids: Vec<Uuid> = decisions
+        .iter()
+        .filter(|d| d.decision == "allow")
+        .map(|d| d.catalog_entry_id)
+        .collect();
+    let now_at = chrono::Utc::now();
+
+    // allow -> one catalog_entry/include profile entry per allowed tool.
+    let mut entries_created = 0usize;
+    for entry_id in &allow_ids {
+        let row = pending
+            .iter()
+            .find(|row| row.get::<Uuid, _>("id") == *entry_id)
+            .expect("decision ids verified against pending set");
+        let result = sqlx::query(
+            "INSERT INTO tool_profile_entries
+             (company_id, profile_id, selector_type, effect, application_id, connection_id, catalog_entry_id)
+             VALUES ($1, $2, 'catalog_entry', 'include', $3, $4, $5)",
+        )
+        .bind(company_id)
+        .bind(profile_id)
+        .bind(row.try_get::<Option<Uuid>, _>("application_id").unwrap_or(None))
+        .bind(row.get::<Option<Uuid>, _>("connection_id"))
+        .bind(entry_id)
+        .execute(&state.pool)
+        .await;
+        match result {
+            Ok(_) => entries_created += 1,
+            Err(e) => {
+                tracing::error!("Failed to create profile entry: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    // Every decided entry is marked reviewed with reviewer attribution.
+    sqlx::query(
+        "UPDATE tool_catalog_entries SET reviewed_at = $3, \
+         reviewed_by_agent_id = $4, reviewed_by_user_id = $5, updated_at = $3 \
+         WHERE company_id = $1 AND id = ANY($2)",
+    )
+    .bind(company_id)
+    .bind(&decision_ids)
+    .bind(now_at)
+    .bind(match &actor {
+        AuthorizationActor::Agent { agent_id, .. } => Some(*agent_id),
+        _ => None,
+    })
+    .bind(match &actor {
+        AuthorizationActor::Board { user_id, .. } => Some(*user_id),
+        _ => None,
+    })
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to mark catalog entries reviewed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(json!({
+        "profileId": profile_id,
+        "reviewedAt": now_at,
+        "allowedCount": allow_ids.len(),
+        "keptBlockedCount": decisions.len() - allow_ids.len(),
+        "entriesCreated": entries_created,
+        "reviewedCatalogEntryIds": decision_ids,
+    })))
 }
 
 /// POST /api/tools/oauth/:provider/start —— mock。
