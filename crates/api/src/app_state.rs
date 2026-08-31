@@ -396,6 +396,11 @@ pub fn create_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             crate::middleware::request_id::request_id_middleware,
         ))
+        // Paperclip pino-http equivalent: one structured line per request,
+        // 4xx/5xx carry redacted payloads (see middleware::http_log).
+        .layer(axum::middleware::from_fn(
+            crate::middleware::http_log::http_log_middleware,
+        ))
 }
 
 #[cfg(test)]

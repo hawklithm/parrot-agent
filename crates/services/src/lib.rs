@@ -84,6 +84,7 @@ pub mod mcp_jsonrpc;
 pub mod plugin_sdk;
 pub mod plugin_capabilities;
 pub mod tool_access_contract;
+pub mod log_redaction;
 pub mod remote_http_endpoint_guard;
 pub mod tool_access_audit_service;
 pub mod tool_profile_binding_precedence;
