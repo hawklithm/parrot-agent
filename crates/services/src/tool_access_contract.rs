@@ -189,7 +189,9 @@ pub const CONNECTION_RECOVERABLE_ERROR_CODES: &[&str] = &[
     "user_authorization_required",
     "grant_revoked",
     "needs_reauthorization",
-    "missing_secret",
+    "installation_required",
+    "connection_not_installed",
+    "subject_not_permitted",
 ];
 
 /// Validate that a status string belongs to a canonical list.
