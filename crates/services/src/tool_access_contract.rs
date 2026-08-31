@@ -11,6 +11,7 @@
 //! `crates/services/src/tool_access*.rs` and
 //! `crates/api/src/routes/tool_access.rs`); this module supplies the canonical
 //! vocabulary and shared semantics those paths must agree on.
+use uuid::Uuid;
 
 /// Health states for a tool connection.
 pub const TOOL_CONNECTION_HEALTH_STATUSES: &[&str] = &[
@@ -840,6 +841,152 @@ pub fn trust_rule_needs_review(
         || rule_schema.is_some_and(|rs| catalog_schema_hash.is_some_and(|cs| rs != cs))
 }
 
+/// Rate-limit rule parsed from a policy's `config.rateLimit` (or the config
+/// itself). Port of Paperclip `rateLimitRule`: positive integer limit and
+/// windowSeconds are required; keyBy strings are passed through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitRule {
+    pub limit: i64,
+    pub window_seconds: i64,
+    pub key_by: Option<Vec<String>>,
+}
+
+/// Parse a rate-limit rule from a policy config JSON. Returns `None` for
+/// invalid rules (Paperclip treats those as deny_policy_block at runtime).
+pub fn rate_limit_rule(config: &serde_json::Value) -> Option<RateLimitRule> {
+    let raw = config
+        .get("rateLimit")
+        .filter(|value| value.is_object())
+        .unwrap_or(config);
+    let limit = raw.get("limit").and_then(serde_json::Value::as_i64)?;
+    let window_seconds = raw.get("windowSeconds").and_then(serde_json::Value::as_i64)?;
+    if limit <= 0 || window_seconds <= 0 {
+        return None;
+    }
+    let key_by = raw
+        .get("keyBy")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
+    Some(RateLimitRule {
+        limit,
+        window_seconds,
+        key_by,
+    })
+}
+
+/// Window bucket classification: minute/hour/day/month.
+///
+/// Port of Paperclip `windowKind`.
+pub fn window_kind(window_seconds: i64) -> &'static str {
+    if window_seconds <= 60 {
+        "minute"
+    } else if window_seconds <= 3600 {
+        "hour"
+    } else if window_seconds <= 86400 {
+        "day"
+    } else {
+        "month"
+    }
+}
+
+/// Fixed-window start instant.
+///
+/// Port of Paperclip `windowStart`.
+pub fn window_start(now_ms: i64, window_seconds: i64) -> chrono::DateTime<chrono::Utc> {
+    let window_ms = window_seconds * 1000;
+    let start_ms = (now_ms / window_ms) * window_ms;
+    chrono::DateTime::from_timestamp_millis(start_ms).unwrap_or_else(|| chrono::Utc::now())
+}
+
+/// Bucket identity components for a rate-limit counter.
+#[derive(Debug, Clone, Default)]
+pub struct RateLimitContext {
+    pub company_id: String,
+    pub agent_id: Option<String>,
+    pub application_id: Option<String>,
+    pub connection_id: Option<String>,
+    pub tool_name: String,
+}
+
+/// Bucket key: the keyBy dimensions joined with `|`, defaulting to
+/// company/agent/connection/tool. Port of Paperclip `rateBucket`.
+pub fn rate_bucket(rule: &RateLimitRule, ctx: &RateLimitContext) -> String {
+    let default_parts = ["company", "agent", "connection", "tool"];
+    let parts: &[String] = rule.key_by.as_deref().unwrap_or(&[]);
+    let owned_default: Vec<String> = default_parts.iter().map(|s| s.to_string()).collect();
+    let parts: Vec<String> = if parts.is_empty() {
+        owned_default
+    } else {
+        parts.to_vec()
+    };
+    parts
+        .iter()
+        .map(|part| match part.as_str() {
+            "company" => format!("company:{}", ctx.company_id),
+            "agent" => format!("agent:{}", ctx.agent_id.as_deref().unwrap_or("none")),
+            "application" => {
+                format!("application:{}", ctx.application_id.as_deref().unwrap_or("none"))
+            }
+            "connection" => {
+                format!("connection:{}", ctx.connection_id.as_deref().unwrap_or("none"))
+            }
+            _ => format!("tool:{}", ctx.tool_name),
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+/// Atomic fixed-window rate-limit consumption over tool_rate_limit_counters.
+///
+/// Port of Paperclip `enforceRateLimit` (consume=true branch): INSERT ... ON
+/// CONFLICT decrements remaining, guarded by remaining > 0; no row returned
+/// means the bucket is exhausted.
+pub async fn enforce_rate_limit(
+    pool: &sqlx::PgPool,
+    company_id: Uuid,
+    policy_id: &Uuid,
+    bucket_key: &str,
+    rule: &RateLimitRule,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, sqlx::Error> {
+    let kind = window_kind(rule.window_seconds);
+    let start = window_start(
+        now.timestamp_millis(),
+        rule.window_seconds,
+    );
+    let reset_at = start + chrono::Duration::seconds(rule.window_seconds);
+    let counter_key = format!("{policy_id}:{bucket_key}");
+    let updated: Option<i32> = sqlx::query_scalar(
+        "INSERT INTO tool_rate_limit_counters
+            (id, company_id, policy_id, counter_key, scope_type, scope_id, window_kind, window_start_at, \"limit\", remaining, reset_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, 'policy', $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (company_id, policy_id, counter_key, window_kind, window_start_at)
+         DO UPDATE SET
+            remaining = GREATEST(0, LEAST(tool_rate_limit_counters.remaining, $7) - 1),
+            reset_at = $9,
+            updated_at = NOW()
+         WHERE tool_rate_limit_counters.remaining > 0
+         RETURNING remaining",
+    )
+    .bind(company_id)
+    .bind(policy_id)
+    .bind(&counter_key)
+    .bind(policy_id.to_string())
+    .bind(kind)
+    .bind(start)
+    .bind(rule.limit as i32)
+    .bind((rule.limit - 1) as i32)
+    .bind(reset_at)
+    .fetch_optional(pool)
+    .await?;
+    Ok(updated.is_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,5 +1441,65 @@ mod tests {
         assert!(trust_rule_needs_review(Some(&with_schema), Some("active"), Some("v1"), Some("s2")));
         assert!(!trust_rule_needs_review(Some(&with_schema), Some("active"), Some("v1"), Some("s1")));
         assert!(!trust_rule_needs_review(None, Some("quarantined"), None, None));
+    }
+
+    #[test]
+    fn rate_limit_rule_parses_and_rejects_invalid() {
+        let config = serde_json::json!({"rateLimit": {"limit": 100, "windowSeconds": 3600, "keyBy": ["company", "tool"]}});
+        let rule = rate_limit_rule(&config).expect("valid rule");
+        assert_eq!(rule.limit, 100);
+        assert_eq!(rule.window_seconds, 3600);
+        assert_eq!(rule.key_by.as_deref().map(<[String]>::len), Some(2));
+
+        // Top-level config also accepted (no rateLimit wrapper).
+        let flat = serde_json::json!({"limit": 5, "windowSeconds": 60});
+        assert!(rate_limit_rule(&flat).is_some());
+        // Missing/zero/negative fields -> None (fail closed at runtime).
+        assert!(rate_limit_rule(&serde_json::json!({"windowSeconds": 60})).is_none());
+        assert!(rate_limit_rule(&serde_json::json!({"limit": 0, "windowSeconds": 60})).is_none());
+        assert!(rate_limit_rule(&serde_json::json!({"limit": 5, "windowSeconds": -1})).is_none());
+        assert!(rate_limit_rule(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn window_kind_classification_matches_paperclip() {
+        assert_eq!(window_kind(60), "minute");
+        assert_eq!(window_kind(61), "hour");
+        assert_eq!(window_kind(3600), "hour");
+        assert_eq!(window_kind(3601), "day");
+        assert_eq!(window_kind(86400), "day");
+        assert_eq!(window_kind(86401), "month");
+    }
+
+    #[test]
+    fn window_start_aligns_to_epoch_buckets() {
+        // 90s window: t=125s -> bucket starts at 90s.
+        let start = window_start(125_000, 90);
+        assert_eq!(start.timestamp_millis(), 90_000);
+        // Fixed windows are deterministic.
+        assert_eq!(window_start(179_999, 90), window_start(90_000, 90));
+        assert_ne!(window_start(180_000, 90), window_start(179_999, 90));
+    }
+
+    #[test]
+    fn rate_bucket_uses_keyby_or_default_dimensions() {
+        let ctx = RateLimitContext {
+            company_id: "co".into(),
+            agent_id: Some("ag".into()),
+            application_id: Some("app".into()),
+            connection_id: Some("conn".into()),
+            tool_name: "kv_get".into(),
+        };
+        let rule = RateLimitRule { limit: 1, window_seconds: 60, key_by: Some(vec!["company".into(), "tool".into()]) };
+        assert_eq!(rate_bucket(&rule, &ctx), "company:co|tool:kv_get");
+        // Default: company|agent|connection|tool.
+        let rule = RateLimitRule { limit: 1, window_seconds: 60, key_by: None };
+        assert_eq!(
+            rate_bucket(&rule, &ctx),
+            "company:co|agent:ag|connection:conn|tool:kv_get"
+        );
+        // Unknown dimension falls to tool.
+        let rule = RateLimitRule { limit: 1, window_seconds: 60, key_by: Some(vec!["weird".into()]) };
+        assert_eq!(rate_bucket(&rule, &ctx), "tool:kv_get");
     }
 }

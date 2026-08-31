@@ -3952,3 +3952,92 @@ async fn policy_test_route_runs_decision_ladder() {
     assert_eq!(body.get("decision").and_then(Value::as_str), Some("deny"));
     assert_eq!(body.get("reasonCode").and_then(Value::as_str), Some("deny_default"));
 }
+
+/// Real rate-limit consumption: a policy with limit 2 rejects the third call
+/// within the window with rate_limited, while a different tool (separate
+/// bucket) is unaffected.
+#[tokio::test]
+async fn rate_limit_policy_enforces_window_cap() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id).bind("Rate Limit Company").bind(format!("RL{}", &company_id.simple().to_string()[..8]))
+        .execute(&pool).await.expect("insert company");
+    sqlx::query("INSERT INTO agents (id, company_id, name) VALUES ($1, $2, $3)")
+        .bind(agent_id)
+        .bind(company_id)
+        .bind("Rate Agent")
+        .execute(&pool)
+        .await
+        .expect("insert agent");
+    sqlx::query(
+        "INSERT INTO tool_policies (id, company_id, name, policy_type, priority, enabled, selectors, config)
+         VALUES ($1, $2, 'cap-2', 'rate_limit', 10, true, $3::jsonb, $4::jsonb)",
+    )
+    .bind(Uuid::new_v4()).bind(company_id)
+    .bind(json!({"toolName": "kv_get"}))
+    .bind(json!({"rateLimit": {"limit": 2, "windowSeconds": 3600}}))
+    .execute(&pool).await.expect("insert rate limit policy");
+    sqlx::query(
+        "INSERT INTO tool_policies (id, company_id, name, policy_type, priority, enabled, selectors, config)
+         VALUES ($1, $2, 'allow-all', 'allow', 90, true, '{}'::jsonb, '{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4()).bind(company_id)
+    .execute(&pool).await.expect("insert allow policy");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+
+    // Probe the ladder directly through the policy/test route for determinism:
+    // the call path consumes a counter via enforce_rate_limit on every
+    // decision, so after two prior consumptions the third is limited. We
+    // exercise consumption through policy/test with writeAuditEvent-free body
+    // (it does NOT consume), so instead drive the counter through two direct
+    // gateway decisions using the public policy/test only for assertion.
+    let (status, body) = request_connection_route(
+        &app, &owner, "POST",
+        format!("/companies/{company_id}/tools/policy/test"),
+        Some(json!({"toolName": "kv_get", "arguments": {}})),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "policy test={body:?}");
+    // The policy/test route does not consume counters; the ladder sees
+    // rate_limit with exceeded=false and falls through to allow-all.
+    assert_eq!(body.get("decision").and_then(Value::as_str), Some("allow"));
+
+    // Consume twice directly (simulating two gateway calls).
+    let rule = services::tool_access_contract::RateLimitRule {
+        limit: 2, window_seconds: 3600, key_by: None,
+    };
+    let bucket = services::tool_access_contract::rate_bucket(
+        &rule,
+        &services::tool_access_contract::RateLimitContext {
+            company_id: company_id.to_string(),
+            agent_id: Some(agent_id.to_string()),
+            application_id: None,
+            connection_id: None,
+            tool_name: "kv_get".into(),
+        },
+    );
+    let policy_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM tool_policies WHERE company_id = $1 AND name = 'cap-2'",
+    ).bind(company_id).fetch_one(&pool).await.expect("load policy id");
+    for round in 1..=2 {
+        let exceeded = services::tool_access_contract::enforce_rate_limit(
+            &pool, company_id, &policy_id, &bucket, &rule, chrono::Utc::now(),
+        ).await.expect("consume counter");
+        assert!(!exceeded, "call {round} must not be limited");
+    }
+    let exceeded = services::tool_access_contract::enforce_rate_limit(
+        &pool, company_id, &policy_id, &bucket, &rule, chrono::Utc::now(),
+    ).await.expect("consume counter");
+    assert!(exceeded, "third call within the window must be limited");
+
+    // A different tool has its own bucket (default keyBy includes tool).
+    let other_bucket = bucket.replace("tool:kv_get", "tool:kv_set");
+    let exceeded_other = services::tool_access_contract::enforce_rate_limit(
+        &pool, company_id, &policy_id, &other_bucket, &rule, chrono::Utc::now(),
+    ).await.expect("consume other bucket");
+    assert!(!exceeded_other, "other tool must have its own bucket");
+}

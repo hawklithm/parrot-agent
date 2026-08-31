@@ -2863,6 +2863,8 @@ async fn load_profile_decision(
     (false, has_include)
 }
 
+
+
 async fn gateway_decision(
     state: &AppState,
     company_id: Uuid,
@@ -2916,10 +2918,26 @@ async fn gateway_decision(
             }
         })
         .collect();
+    // Parse rate-limit rules while the DB rows are in scope.
+    let mut rate_rules: std::collections::HashMap<String, services::tool_access_contract::RateLimitRule> =
+        Default::default();
+    for row in rows.iter() {
+        let id: Uuid = row.get("id");
+        let policy_type: String = row.get("policy_type");
+        if policy_type != "rate_limit" {
+            continue;
+        }
+        let config: serde_json::Value = row.try_get("config").unwrap_or(serde_json::json!({}));
+        if let Some(rule) = services::tool_access_contract::rate_limit_rule(&config) {
+            rate_rules.insert(id.to_string(), rule);
+        }
+    }
+
     let (explicit_grant, profile_allows) =
         load_profile_decision(state, company_id, agent_id, tool_name).await;
-    let ctx = services::tool_access_contract::EvaluationContext {
-        tool_name: tool_name.to_string(),
+    let tool_name_string = tool_name.to_string();
+    let mut ctx = services::tool_access_contract::EvaluationContext {
+        tool_name: tool_name_string.clone(),
         explicit_grant,
         profile_allows,
         arguments: None,
@@ -2928,6 +2946,61 @@ async fn gateway_decision(
         catalog_version_hash: None,
         catalog_schema_hash: None,
     };
+
+    // Paperclip enforces each matching rate_limit policy inside the ladder
+    // (consume=true on a real call). Pre-compute exceeded flags per policy so
+    // the pure ladder sees the live counter state.
+    let mut exceeded_policies: std::collections::HashSet<String> = Default::default();
+    for policy in &policies {
+        if policy.policy_type != "rate_limit" || policy.rate_limit_exceeded {
+            continue;
+        }
+        let Some(rule) = rate_rules.get(&policy.id) else {
+            continue;
+        };
+        {
+            let bucket = services::tool_access_contract::rate_bucket(
+                &rule,
+                &services::tool_access_contract::RateLimitContext {
+                    company_id: company_id.to_string(),
+                    agent_id: Some(agent_id.to_string()),
+                    application_id: None,
+                    connection_id: None,
+                    tool_name: tool_name_string.clone(),
+                },
+            );
+            let policy_uuid = policy.id.parse::<Uuid>();
+            let Ok(policy_uuid) = policy_uuid else {
+                return "deny".to_string();
+            };
+            match services::tool_access_contract::enforce_rate_limit(
+                &state.pool,
+                company_id,
+                &policy_uuid,
+                &bucket,
+                rule,
+                chrono::Utc::now(),
+            )
+            .await
+            {
+                Ok(exceeded) => {
+                    if exceeded {
+                        exceeded_policies.insert(policy.id.clone());
+                    }
+                }
+                Err(_) => return "deny".to_string(),
+            }
+        }
+    }
+    let policies: Vec<services::tool_access_contract::PolicySpec> = policies
+        .into_iter()
+        .map(|mut policy| {
+            if exceeded_policies.contains(&policy.id) {
+                policy.rate_limit_exceeded = true;
+            }
+            policy
+        })
+        .collect();
     let outcome = services::tool_access_contract::decide_tool_access(&policies, &ctx);
 
     // Paperclip recordTrustRuleHit: a live trust-rule allow bumps hitCount /
