@@ -170,8 +170,21 @@ impl From<services::plugin_service::PluginServiceError> for AppError {
     }
 }
 
+/// Error context attached to 5xx responses — Parrot equivalent of
+/// Paperclip's `attachErrorContext` (`server/src/middleware/error-handler.ts`):
+/// the http-log middleware reads this extension and includes the redacted
+/// error details on 5xx log lines. `details` carries the error message; the
+/// variant name identifies the source (Paperclip `error.name`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ErrorContext {
+    pub message: String,
+    pub name: &'static str,
+    pub details: Option<serde_json::Value>,
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let variant_name = self.variant_name();
         let (status, error_message) = match self {
             AppError::Service(services::ServiceError::NotFound(msg)) => {
                 (StatusCode::NOT_FOUND, msg)
@@ -242,7 +255,48 @@ impl IntoResponse for AppError {
             "error": error_message,
         }));
 
+        // Paperclip attaches __errorContext only for 5xx; the http-log
+        // middleware promotes it onto the error log line.
+        if status.is_server_error() {
+            let context = ErrorContext {
+                message: error_message.clone(),
+                name: variant_name,
+                details: Some(serde_json::json!({ "message": error_message })),
+            };
+            let mut response = (status, body).into_response();
+            response.extensions_mut().insert(context);
+            return response;
+        }
+
         (status, body).into_response()
+    }
+}
+
+impl AppError {
+    fn variant_name(&self) -> &'static str {
+        match self {
+            AppError::Service(services::ServiceError::NotFound(_)) => "NotFound",
+            AppError::Service(services::ServiceError::InvalidInput(_)) => "InvalidInput",
+            AppError::Service(services::ServiceError::Unauthorized(_)) => "Unauthorized",
+            AppError::Service(services::ServiceError::Forbidden(_)) => "Forbidden",
+            AppError::Service(services::ServiceError::Conflict(_)) => "Conflict",
+            AppError::Service(services::ServiceError::ReportingCycle) => "ReportingCycle",
+            AppError::Service(services::ServiceError::TerminalState) => "TerminalState",
+            AppError::Service(services::ServiceError::ConfigurationFrozen) => "ConfigurationFrozen",
+            AppError::Service(_) => "ServiceError",
+            AppError::AccessDenied(_) => "AccessDenied",
+            AppError::Validation(_) => "Validation",
+            AppError::Unprocessable(_) => "Unprocessable",
+            AppError::NotFound(_) => "NotFound",
+            AppError::Forbidden(_) => "Forbidden",
+            AppError::Unauthorized(_) => "Unauthorized",
+            AppError::Conflict(_) => "Conflict",
+            AppError::BadRequest(_) => "BadRequest",
+            AppError::TooManyRequests(_) => "TooManyRequests",
+            AppError::Internal => "Internal",
+            AppError::InternalServerError(_) => "InternalServerError",
+            AppError::NotImplemented(_) => "NotImplemented",
+        }
     }
 }
 
@@ -348,5 +402,22 @@ mod plugin_error_tests {
         let err: AppError =
             services::plugin_service::PluginServiceError::InvalidState("bad".into()).into();
         assert_eq!(status_of(err), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn server_errors_carry_error_context_extension() {
+        let response = AppError::InternalServerError("boom".into()).into_response();
+        assert!(response.status().is_server_error());
+        let context = response.extensions().get::<ErrorContext>().expect("5xx must carry ErrorContext");
+        assert_eq!(context.message, "boom");
+        assert_eq!(context.name, "InternalServerError");
+        assert!(context.details.is_some());
+    }
+
+    #[test]
+    fn client_errors_do_not_carry_error_context() {
+        let response = AppError::NotFound("nope".into()).into_response();
+        assert!(!response.status().is_server_error());
+        assert!(response.extensions().get::<ErrorContext>().is_none());
     }
 }

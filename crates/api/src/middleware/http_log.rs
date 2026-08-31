@@ -23,6 +23,8 @@ use serde_json::Value;
 
 use services::log_redaction::redact_sensitive;
 
+use crate::errors::ErrorContext;
+
 /// Health/status endpoints whose success lines would flood the log.
 ///
 /// Port of Paperclip `shouldSilenceHttpSuccessLog`
@@ -89,6 +91,11 @@ pub async fn http_log_middleware(mut request: Request<Body>, next: Next) -> Resp
     let elapsed_ms = started.elapsed().as_millis();
 
     let status = response.status();
+    let error_context = if status.is_server_error() {
+        response.extensions().get::<ErrorContext>().cloned()
+    } else {
+        None
+    };
     if should_silence_http_success_log(&method, &url, status.as_u16()) {
         return response;
     }
@@ -108,23 +115,31 @@ pub async fn http_log_middleware(mut request: Request<Body>, next: Next) -> Resp
 
     match level {
         "error" => {
-            if let Some(redacted) = body.as_ref().map(redact_sensitive) {
-                tracing::error!(
+            let error_message = error_context
+                .as_ref()
+                .map(|ctx| ctx.message.clone())
+                .unwrap_or_else(|| "unknown error".to_string());
+            let error_name = error_context.as_ref().map(|ctx| ctx.name);
+            match body.as_ref().map(redact_sensitive) {
+                Some(redacted) => tracing::error!(
                     method = %method, url = %url, status = status.as_u16(),
                     request_id = request_id.as_deref().unwrap_or(""),
                     elapsed_ms = elapsed_ms as u64,
+                    errorContext = %error_message,
+                    errorName = error_name.unwrap_or(""),
                     reqBody = %redacted,
-                    "{} {} {}",
-                    method, url, status.as_u16()
-                );
-            } else {
-                tracing::error!(
+                    "{} {} {} — {}",
+                    method, url, status.as_u16(), error_message
+                ),
+                None => tracing::error!(
                     method = %method, url = %url, status = status.as_u16(),
                     request_id = request_id.as_deref().unwrap_or(""),
                     elapsed_ms = elapsed_ms as u64,
-                    "{} {} {}",
-                    method, url, status.as_u16()
-                );
+                    errorContext = %error_message,
+                    errorName = error_name.unwrap_or(""),
+                    "{} {} {} — {}",
+                    method, url, status.as_u16(), error_message
+                ),
             }
         }
         "warn" => {
