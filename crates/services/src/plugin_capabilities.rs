@@ -223,6 +223,15 @@ pub struct PluginManifestV1 {
     /// Trusted local folders this plugin can configure and access.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_folders: Vec<PluginLocalFolderDeclaration>,
+    /// Declarative launcher metadata for host-mounted plugin entry points.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchers: Vec<PluginLauncherDeclaration>,
+    /// Minimum host version required (semver lower bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_host_version: Option<String>,
+    /// Legacy alias for `minimumHostVersion`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_paperclip_version: Option<String>,
     /// JSON Schema for operator-editable instance configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_config_schema: Option<serde_json::Value>,
@@ -796,6 +805,195 @@ pub fn validate_local_folder(
     Ok(())
 }
 
+/// Where in the host UI a launcher should be placed.
+pub const PLUGIN_LAUNCHER_PLACEMENT_ZONES: &[&str] = &[
+    "page",
+    "detailTab",
+    "taskDetailView",
+    "dashboardWidget",
+    "sidebar",
+    "sidebarPanel",
+    "projectSidebarItem",
+    "globalToolbarButton",
+    "toolbarButton",
+    "contextMenuItem",
+    "commentAnnotation",
+    "commentContextMenuItem",
+    "settingsPage",
+];
+
+/// What a launcher does when activated.
+pub const PLUGIN_LAUNCHER_ACTIONS: &[&str] = &[
+    "navigate",
+    "openModal",
+    "openDrawer",
+    "openPopover",
+    "performAction",
+    "deepLink",
+];
+
+/// Size hints for plugin-owned launcher destinations.
+pub const PLUGIN_LAUNCHER_BOUNDS: &[&str] = &["inline", "compact", "default", "wide", "full"];
+
+/// Containers a launcher destination may render in.
+pub const PLUGIN_LAUNCHER_RENDER_ENVIRONMENTS: &[&str] = &[
+    "hostInline",
+    "hostOverlay",
+    "hostRoute",
+    "external",
+    "iframe",
+];
+
+/// What should happen when a launcher is activated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginLauncherActionDeclaration {
+    /// What kind of launch behavior the host should perform.
+    #[serde(rename = "type")]
+    pub action_type: String,
+    /// Stable target identifier or URL; meaning depends on `type`.
+    pub target: String,
+    /// Optional arbitrary parameters passed along to the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+/// Optional render metadata for the destination opened by a launcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLauncherRenderDeclaration {
+    /// High-level container the launcher expects the host to use.
+    pub environment: String,
+    /// Optional size hint for the destination surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<String>,
+}
+
+/// Declares a plugin launcher surface independent of the slot that mounts it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginLauncherDeclaration {
+    /// Stable identifier for this launcher, unique within the plugin.
+    pub id: String,
+    /// Human-readable label shown for the launcher.
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Where in the host UI this launcher should be placed.
+    pub placement_zone: String,
+    /// Optional export name in the UI bundle when the launcher has custom UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_name: Option<String>,
+    /// Optional entity targeting for context-sensitive launcher zones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entity_types: Vec<String>,
+    /// Optional ordering hint within the placement zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
+    /// What should happen when the launcher is activated.
+    pub action: PluginLauncherActionDeclaration,
+    /// Optional render/container hints for the launched destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render: Option<PluginLauncherRenderDeclaration>,
+}
+
+/// Validate a launcher declaration.
+///
+/// - `id` and `displayName` are required, `id` unique (checked by caller)
+/// - `placementZone` must be canonical
+/// - `action.type` must be canonical and `action.target` non-empty
+/// - `render.environment` must be canonical; `render.bounds` must be canonical
+pub fn validate_launcher(launcher: &PluginLauncherDeclaration) -> Result<(), CapabilityError> {
+    if launcher.id.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "launchers.id is required".into(),
+        ));
+    }
+    if launcher.display_name.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "launchers.displayName is required".into(),
+        ));
+    }
+    if !PLUGIN_LAUNCHER_PLACEMENT_ZONES.contains(&launcher.placement_zone.as_str()) {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "unsupported launcher placementZone: {}",
+            launcher.placement_zone
+        )));
+    }
+    if !PLUGIN_LAUNCHER_ACTIONS.contains(&launcher.action.action_type.as_str()) {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "unsupported launcher action type: {}",
+            launcher.action.action_type
+        )));
+    }
+    if launcher.action.target.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "launchers.action.target is required".into(),
+        ));
+    }
+    if let Some(render) = &launcher.render {
+        if !PLUGIN_LAUNCHER_RENDER_ENVIRONMENTS.contains(&render.environment.as_str()) {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "unsupported launcher render environment: {}",
+                render.environment
+            )));
+        }
+        if let Some(bounds) = &render.bounds {
+            if !PLUGIN_LAUNCHER_BOUNDS.contains(&bounds.as_str()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "unsupported launcher render bounds: {bounds}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a `minimumHostVersion` / `minimumPaperclipVersion` value.
+///
+/// Paperclip requires a semver lower bound:
+/// `^\d+\.\d+\.\d+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`
+pub fn validate_minimum_host_version(version: &str) -> Result<(), CapabilityError> {
+    fn is_ident(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    }
+    let (core, rest) = match version.split_once('-') {
+        Some((core, rest)) => (core, Some(rest)),
+        None => (version, None),
+    };
+    // Split build metadata off the pre-release (or the core).
+    let (core, pre, build) = match rest {
+        Some(rest) => match rest.split_once('+') {
+            Some((pre, build)) => (core, Some(pre), Some(build)),
+            None => (core, Some(rest), None),
+        },
+        None => match core.split_once('+') {
+            Some((c, build)) => (c, None, Some(build)),
+            None => (core, None, None),
+        },
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 || !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "minimumHostVersion must be semver (major.minor.patch): {version}"
+        )));
+    }
+    if let Some(pre) = pre {
+        if !pre.split('.').all(is_ident) {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "minimumHostVersion has invalid pre-release: {version}"
+            )));
+        }
+    }
+    if let Some(build) = build {
+        if !build.split('.').all(is_ident) {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "minimumHostVersion has invalid build metadata: {version}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a manifest against Paperclip's declaration rules.
 ///
 /// Enforced (PLUGIN_SPEC §6/§11/§13.6/§18):
@@ -1127,6 +1325,26 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
         }
     }
 
+    if let Some(v) = &manifest.minimum_host_version {
+        validate_minimum_host_version(v)?;
+    }
+    if let Some(v) = &manifest.minimum_paperclip_version {
+        validate_minimum_host_version(v)?;
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for launcher in &manifest.launchers {
+            validate_launcher(launcher)?;
+            if !seen.insert(launcher.id.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate launcher id: {}",
+                    launcher.id
+                )));
+            }
+        }
+    }
+
     if let Some(schema) = &manifest.instance_config_schema {
         // A config schema must be an object-shaped JSON Schema.
         if !schema.is_object() {
@@ -1383,6 +1601,9 @@ mod manifest_tests {
             routines: vec![],
             skills: vec![],
             local_folders: vec![],
+            launchers: vec![],
+            minimum_host_version: None,
+            minimum_paperclip_version: None,
             instance_config_schema: None,
             declares_ui: false,
         }
@@ -1948,5 +2169,114 @@ mod manifest_tests {
             serde_json::to_string(&PluginLocalFolderAccess::ReadWrite).unwrap(),
             "\"readWrite\""
         );
+    }
+
+    fn launcher(zone: &str, action: &str) -> PluginLauncherDeclaration {
+        PluginLauncherDeclaration {
+            id: "l1".into(),
+            display_name: "Launcher".into(),
+            description: None,
+            placement_zone: zone.into(),
+            export_name: None,
+            entity_types: vec![],
+            order: None,
+            action: PluginLauncherActionDeclaration {
+                action_type: action.into(),
+                target: "/somewhere".into(),
+                params: None,
+            },
+            render: None,
+        }
+    }
+
+    #[test]
+    fn launcher_placement_zone_must_be_canonical() {
+        assert!(validate_launcher(&launcher("sidebar", "navigate")).is_ok());
+        assert!(validate_launcher(&launcher("nowhere", "navigate")).is_err());
+    }
+
+    #[test]
+    fn launcher_action_type_must_be_canonical_with_target() {
+        assert!(validate_launcher(&launcher("page", "deepLink")).is_ok());
+        assert!(validate_launcher(&launcher("page", "nuke")).is_err());
+        let mut l = launcher("page", "navigate");
+        l.action.target = " ".into();
+        assert!(validate_launcher(&l).is_err());
+    }
+
+    #[test]
+    fn launcher_render_must_be_canonical() {
+        let mut l = launcher("page", "navigate");
+        l.render = Some(PluginLauncherRenderDeclaration {
+            environment: "iframe".into(),
+            bounds: Some("wide".into()),
+        });
+        assert!(validate_launcher(&l).is_ok());
+
+        let mut bad_env = l.clone();
+        bad_env.render = Some(PluginLauncherRenderDeclaration {
+            environment: "shadowRealm".into(),
+            bounds: None,
+        });
+        assert!(validate_launcher(&bad_env).is_err());
+
+        let mut bad_bounds = l.clone();
+        bad_bounds.render = Some(PluginLauncherRenderDeclaration {
+            environment: "iframe".into(),
+            bounds: Some("enormous".into()),
+        });
+        assert!(validate_launcher(&bad_bounds).is_err());
+    }
+
+    #[test]
+    fn launchers_require_unique_ids() {
+        let mut m = manifest(&[]);
+        m.launchers = vec![launcher("page", "navigate")];
+        assert!(validate_manifest(&m).is_ok());
+        m.launchers = vec![launcher("page", "navigate"), launcher("page", "navigate")];
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn minimum_host_version_must_be_semver() {
+        for good in [
+            "1.2.3",
+            "0.10.0",
+            "1.0.0-beta.1",
+            "1.0.0-rc.1+build.5",
+            "1.0.0+build.5",
+        ] {
+            assert!(
+                validate_minimum_host_version(good).is_ok(),
+                "{good} must be accepted"
+            );
+        }
+        for bad in ["1.2", "1.2.x", "v1.2.3", "1..3", "", "1.2.3-"] {
+            assert!(
+                validate_minimum_host_version(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_validates_both_minimum_version_aliases() {
+        let mut m = manifest(&[]);
+        m.minimum_host_version = Some("1.2.3".into());
+        assert!(validate_manifest(&m).is_ok());
+        m.minimum_host_version = Some("1.2".into());
+        assert!(validate_manifest(&m).is_err());
+
+        let mut m2 = manifest(&[]);
+        m2.minimum_paperclip_version = Some("not-semver".into());
+        assert!(validate_manifest(&m2).is_err());
+    }
+
+    #[test]
+    fn canonical_launcher_lists_match_paperclip() {
+        assert_eq!(PLUGIN_LAUNCHER_PLACEMENT_ZONES.len(), 13);
+        assert_eq!(PLUGIN_LAUNCHER_ACTIONS.len(), 6);
+        assert_eq!(PLUGIN_LAUNCHER_BOUNDS.len(), 5);
+        assert_eq!(PLUGIN_LAUNCHER_RENDER_ENVIRONMENTS.len(), 5);
     }
 }
