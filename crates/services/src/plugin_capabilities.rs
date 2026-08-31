@@ -193,7 +193,16 @@ pub struct PluginManifestV1 {
     pub webhooks: Option<Vec<PluginWebhookDeclaration>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<PluginToolDeclaration>>,
-    /// Whether the manifest declares UI slots (requires `entrypoints.ui`).
+    /// Restricted plugin-owned database namespace declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<PluginDatabaseDeclaration>,
+    /// UI slot contributions (requires `entrypoints.ui`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui_slots: Vec<PluginUiSlotDeclaration>,
+    /// JSON Schema for operator-editable instance configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_config_schema: Option<serde_json::Value>,
+    /// Whether the manifest declares UI (legacy flag; `ui_slots` is preferred).
     #[serde(default)]
     pub declares_ui: bool,
 }
@@ -206,6 +215,147 @@ pub struct PluginManifestEntrypoints {
     /// Path to the UI bundle directory (required when UI is declared).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<String>,
+}
+
+/// Core tables a plugin may read or join at runtime.
+///
+/// Port of `@paperclipai/shared` `PLUGIN_DATABASE_CORE_READ_TABLES`.
+pub const PLUGIN_DATABASE_CORE_READ_TABLES: &[&str] = &[
+    "companies",
+    "projects",
+    "goals",
+    "agents",
+    "issues",
+    "issue_documents",
+    "issue_relations",
+    "issue_comments",
+    "heartbeat_runs",
+    "cost_events",
+    "approvals",
+    "issue_approvals",
+    "budget_incidents",
+];
+
+/// UI extension slot types (PLUGIN_SPEC §19).
+pub const PLUGIN_UI_SLOT_TYPES: &[&str] = &[
+    "page",
+    "detailTab",
+    "taskDetailView",
+    "dashboardWidget",
+    "sidebar",
+    "routeSidebar",
+    "sidebarPanel",
+    "projectSidebarItem",
+    "globalToolbarButton",
+    "toolbarButton",
+    "contextMenuItem",
+    "commentAnnotation",
+    "commentContextMenuItem",
+    "settingsPage",
+    "companySettingsPage",
+];
+
+/// Slot types that require `entityTypes` to be declared.
+pub const ENTITY_SCOPED_UI_SLOT_TYPES: &[&str] = &["detailTab", "taskDetailView", "contextMenuItem"];
+
+/// Restricted plugin-owned database namespace declaration.
+///
+/// Port of `@paperclipai/shared` `PluginDatabaseDeclaration` (PLUGIN_SPEC §21.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginDatabaseDeclaration {
+    /// Optional stable human-readable slug included in the host-derived namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_slug: Option<String>,
+    /// SQL migration directory relative to the plugin package root.
+    pub migrations_dir: String,
+    /// Public core tables this plugin may read or join at runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub core_read_tables: Vec<String>,
+}
+
+/// A UI mount point contributed by the plugin.
+///
+/// Port of `@paperclipai/shared` `PluginUiSlotDeclaration` (PLUGIN_SPEC §19).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginUiSlotDeclaration {
+    /// The type of UI mount point.
+    #[serde(rename = "type")]
+    pub slot_type: String,
+    /// Unique slot identifier within the plugin.
+    pub id: String,
+    /// Human-readable name shown in navigation or tab labels.
+    pub display_name: String,
+    /// Which export name in the UI bundle provides this component.
+    pub export_name: String,
+    /// Entity targets for context-sensitive slots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entity_types: Vec<String>,
+    /// Optional company-scoped route segment for page/routeSidebar/companySettingsPage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_path: Option<String>,
+    /// Optional ordering hint; lower numbers appear first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
+}
+
+/// Validate a database namespace declaration (PLUGIN_SPEC §21.3).
+///
+/// - `migrationsDir` is required
+/// - every `coreReadTables` entry must be a canonical core table
+pub fn validate_database_declaration(
+    db: &PluginDatabaseDeclaration,
+) -> Result<(), CapabilityError> {
+    if db.migrations_dir.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "database.migrationsDir is required".into(),
+        ));
+    }
+    for table in &db.core_read_tables {
+        if !PLUGIN_DATABASE_CORE_READ_TABLES.contains(&table.as_str()) {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "unsupported core read table: {table}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a UI slot declaration (PLUGIN_SPEC §19).
+///
+/// - `type` must be a canonical slot type
+/// - `id`, `displayName`, and `exportName` are required
+/// - context-sensitive slots require `entityTypes`
+pub fn validate_ui_slot(slot: &PluginUiSlotDeclaration) -> Result<(), CapabilityError> {
+    if !PLUGIN_UI_SLOT_TYPES.contains(&slot.slot_type.as_str()) {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "unsupported UI slot type: {}",
+            slot.slot_type
+        )));
+    }
+    if slot.id.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest("ui slot id is required".into()));
+    }
+    if slot.display_name.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "ui slot displayName is required".into(),
+        ));
+    }
+    if slot.export_name.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "ui slot exportName is required".into(),
+        ));
+    }
+    if ENTITY_SCOPED_UI_SLOT_TYPES.contains(&slot.slot_type.as_str())
+        && slot.entity_types.is_empty()
+    {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "ui slot type '{}' requires entityTypes",
+            slot.slot_type
+        )));
+    }
+    Ok(())
 }
 
 /// Validate a manifest against Paperclip's declaration rules.
@@ -326,10 +476,46 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
         }
     }
 
-    if manifest.declares_ui && manifest.entrypoints.ui.is_none() {
+    let declares_ui = manifest.declares_ui || !manifest.ui_slots.is_empty();
+    if declares_ui && manifest.entrypoints.ui.is_none() {
         return Err(CapabilityError::InvalidManifest(
             "ui declared without entrypoints.ui".into(),
         ));
+    }
+
+    if let Some(db) = &manifest.database {
+        validate_database_declaration(db)?;
+        // A plugin that reaches into core tables must be able to read them.
+        if !db.core_read_tables.is_empty()
+            && !has_capability(&manifest.capabilities, "database.namespace.read")
+        {
+            return Err(CapabilityError::MissingCapability(
+                "database.coreReadTables".into(),
+                "database.namespace.read".into(),
+            ));
+        }
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for slot in &manifest.ui_slots {
+            validate_ui_slot(slot)?;
+            if !seen.insert(slot.id.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate ui slot id: {}",
+                    slot.id
+                )));
+            }
+        }
+    }
+
+    if let Some(schema) = &manifest.instance_config_schema {
+        // A config schema must be an object-shaped JSON Schema.
+        if !schema.is_object() {
+            return Err(CapabilityError::InvalidManifest(
+                "instanceConfigSchema must be a JSON object".into(),
+            ));
+        }
     }
 
     Ok(())
@@ -569,6 +755,9 @@ mod manifest_tests {
             jobs: None,
             webhooks: None,
             tools: None,
+            database: None,
+            ui_slots: vec![],
+            instance_config_schema: None,
             declares_ui: false,
         }
     }
@@ -698,5 +887,105 @@ mod manifest_tests {
         assert!(json.contains("\"displayName\""));
         let back: PluginManifestV1 = serde_json::from_str(&json).unwrap();
         assert_eq!(back, m);
+    }
+
+    fn slot(slot_type: &str) -> PluginUiSlotDeclaration {
+        PluginUiSlotDeclaration {
+            slot_type: slot_type.into(),
+            id: "s1".into(),
+            display_name: "Slot".into(),
+            export_name: "Slot".into(),
+            entity_types: vec![],
+            route_path: None,
+            order: None,
+        }
+    }
+
+    #[test]
+    fn database_declaration_requires_migrations_dir() {
+        let mut db = PluginDatabaseDeclaration::default();
+        assert!(validate_database_declaration(&db).is_err());
+        db.migrations_dir = "drizzle".into();
+        assert!(validate_database_declaration(&db).is_ok());
+    }
+
+    #[test]
+    fn core_read_tables_must_be_canonical() {
+        let mut db = PluginDatabaseDeclaration {
+            migrations_dir: "drizzle".into(),
+            ..Default::default()
+        };
+        db.core_read_tables = vec!["issues".into(), "secrets".into()];
+        assert!(validate_database_declaration(&db).is_err());
+        db.core_read_tables = vec!["issues".into(), "issue_comments".into()];
+        assert!(validate_database_declaration(&db).is_ok());
+    }
+
+    #[test]
+    fn core_read_tables_require_namespace_read_capability() {
+        let mut m = manifest(&[]);
+        m.database = Some(PluginDatabaseDeclaration {
+            migrations_dir: "drizzle".into(),
+            core_read_tables: vec!["issues".into()],
+            namespace_slug: None,
+        });
+        assert!(validate_manifest(&m).is_err());
+        m.capabilities.push("database.namespace.read".into());
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn ui_slot_type_must_be_canonical() {
+        assert!(validate_ui_slot(&slot("page")).is_ok());
+        let bad = slot("madeUpSlot");
+        assert!(matches!(
+            validate_ui_slot(&bad),
+            Err(CapabilityError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn context_sensitive_ui_slots_require_entity_types() {
+        // detailTab is context-sensitive.
+        let s = slot("detailTab");
+        assert!(validate_ui_slot(&s).is_err());
+        let mut ok = s;
+        ok.entity_types = vec!["issue".into()];
+        assert!(validate_ui_slot(&ok).is_ok());
+    }
+
+    #[test]
+    fn ui_slots_require_entrypoints_ui_and_unique_ids() {
+        let mut m = manifest(&[]);
+        m.ui_slots = vec![slot("page")];
+        assert!(validate_manifest(&m).is_err());
+        m.entrypoints.ui = Some("dist/ui".into());
+        assert!(validate_manifest(&m).is_ok());
+
+        m.ui_slots = vec![slot("page"), slot("page")];
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn instance_config_schema_must_be_object() {
+        let mut m = manifest(&[]);
+        m.instance_config_schema = Some(serde_json::json!("not-an-object"));
+        assert!(validate_manifest(&m).is_err());
+        m.instance_config_schema =
+            Some(serde_json::json!({"type": "object", "properties": {}}));
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn canonical_table_and_slot_lists_match_paperclip() {
+        assert_eq!(PLUGIN_DATABASE_CORE_READ_TABLES.len(), 13);
+        assert_eq!(PLUGIN_DATABASE_CORE_READ_TABLES.first().copied(), Some("companies"));
+        assert_eq!(
+            PLUGIN_DATABASE_CORE_READ_TABLES.last().copied(),
+            Some("budget_incidents")
+        );
+        assert_eq!(PLUGIN_UI_SLOT_TYPES.len(), 15);
+        assert_eq!(PLUGIN_UI_SLOT_TYPES.first().copied(), Some("page"));
+        assert_eq!(PLUGIN_UI_SLOT_TYPES.last().copied(), Some("companySettingsPage"));
     }
 }
