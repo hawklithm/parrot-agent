@@ -4260,6 +4260,29 @@ async fn replay_gateway_invocation(
                 "invocationId": invocation_id
             })),
         )),
+        // Paperclip counts cancelled/timed_out as terminal invocation states,
+        // so an idempotent replay must return the recorded outcome instead of
+        // reporting an unsupported state.
+        "cancelled" => Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": error_message.unwrap_or_else(|| "Tool call was cancelled".to_string()),
+                "reasonCode": error_code.unwrap_or_else(|| "tool_call_cancelled".to_string()),
+                "status": "cancelled",
+                "replayed": true,
+                "invocationId": invocation_id
+            })),
+        )),
+        "timed_out" => Ok((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": error_message.unwrap_or_else(|| "Tool call timed out".to_string()),
+                "reasonCode": error_code.unwrap_or_else(|| "tool_call_timed_out".to_string()),
+                "status": "timed_out",
+                "replayed": true,
+                "invocationId": invocation_id
+            })),
+        )),
         _ => Ok((
             StatusCode::CONFLICT,
             Json(serde_json::json!({

@@ -345,4 +345,40 @@ mod tests {
         assert_eq!(TOOL_AUDIT_EVENT_TYPES.len(), 16);
         assert_eq!(TOOL_CONNECTION_LIFECYCLE_EVENT_TYPES.len(), 7);
     }
+
+    #[test]
+    fn attention_set_covers_every_recoverable_health_failure() {
+        // Every health status that blocks token issuance in the gateway route
+        // must be an attention status, and vice versa.
+        for status in TOOL_CONNECTION_ATTENTION_HEALTH_STATUSES {
+            assert!(
+                is_tool_connection_attention_health(status),
+                "{status} must be an attention status"
+            );
+        }
+        // The non-canonical 'unhealthy' value previously used by Parrot is not
+        // a health status at all and must not be treated as one.
+        assert!(!TOOL_CONNECTION_HEALTH_STATUSES.contains(&"unhealthy"));
+        assert!(!is_tool_connection_attention_health("unhealthy"));
+    }
+
+    #[test]
+    fn terminal_sets_exclude_in_flight_states() {
+        for status in TOOL_INVOCATION_STATUSES {
+            let terminal = is_terminal_invocation_status(status);
+            let in_flight = matches!(*status, "pending" | "authorized" | "awaiting_approval" | "executing");
+            assert!(
+                terminal != in_flight,
+                "{status} must be exactly one of terminal/in-flight"
+            );
+        }
+        for status in TOOL_ACTION_REQUEST_STATUSES {
+            let terminal = is_terminal_action_request_status(status);
+            let in_flight = matches!(*status, "pending" | "approved" | "executing");
+            assert!(
+                terminal != in_flight,
+                "{status} must be exactly one of terminal/in-flight"
+            );
+        }
+    }
 }

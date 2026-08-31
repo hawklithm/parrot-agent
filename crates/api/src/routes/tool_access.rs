@@ -4986,7 +4986,10 @@ async fn agent_connection_token(
         return Err(StatusCode::CONFLICT);
     }
     let health_status = row.get::<String, _>("health_status");
-    if matches!(health_status.as_str(), "failed" | "error" | "missing_secret" | "unhealthy") {
+    // Paperclip: TOOL_CONNECTION_ATTENTION_HEALTH_STATUSES is the single source
+    // of truth for "this app needs the user's attention". The previous ad-hoc
+    // list omitted `degraded` and included the non-canonical `unhealthy`.
+    if services::tool_access_contract::is_tool_connection_attention_health(&health_status) {
         record_connection_token_issuance(
             &state,
             &context,
@@ -5350,7 +5353,7 @@ async fn connection_health_check(
             "catalog": result,
         }))),
         Err(status) => {
-            let _ = sqlx::query("UPDATE tool_connections SET health_status = 'unhealthy', health_message = $3, health_checked_at = NOW(), last_error = $3, updated_at = NOW() WHERE id = $1 AND company_id = $2")
+            let _ = sqlx::query("UPDATE tool_connections SET health_status = 'failed', health_message = $3, health_checked_at = NOW(), last_error = $3, updated_at = NOW() WHERE id = $1 AND company_id = $2")
                 .bind(connection_id).bind(company_id).bind(format!("MCP health check failed ({status})"))
                 .execute(&state.pool).await;
             Err(status)
