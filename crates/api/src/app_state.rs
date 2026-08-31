@@ -385,6 +385,13 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         // The Paperclip HTTP contract exposes all service routes below `/api`.
         .nest("/api", api_routes)
+        // §8.1 HTTP middleware (Paperclip parity):
+        // - private_json_etag: ETag + 304 for JSON GET responses
+        // - api_compression: gzip/br response compression (tower-http)
+        .layer(axum::middleware::from_fn(
+            crate::middleware::private_json_etag::private_json_etag_middleware,
+        ))
+        .layer(tower_http::compression::CompressionLayer::new())
         // Middleware layers
         .layer(axum::middleware::from_fn(
             crate::middleware::security_headers::security_headers_middleware,

@@ -11,8 +11,8 @@ repositories = { path = "../repositories" }
 adapters = { path = "../adapters" }
 
 axum = { workspace = true, features = ["multipart", "ws"] }
-tower = { workspace = true }
-tower-http = { workspace = true, features = ["cors", "trace"] }
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true, features = ["cors", "trace", "compression-gzip", "compression-br"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
