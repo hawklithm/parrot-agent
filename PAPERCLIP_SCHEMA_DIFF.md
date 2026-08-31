@@ -9,9 +9,9 @@ Parrot migrations dir: `/mnt/d/workspace/parrot/parrot-agent/migrations`
 | 来源 | 表数量 |
 |---|---|
 | Paperclip 声明 | 173 |
-| Parrot 创建 | 176 |
-| 共有 | 130 |
-| Paperclip 独有（缺失） | 43 |
+| Parrot 创建 | 178 |
+| 共有 | 132 |
+| Paperclip 独有（缺失） | 41 |
 | Parrot 独有（扩展） | 46 |
 
 ## Paperclip 独有表（Parrot 缺失）
@@ -40,7 +40,6 @@ Parrot migrations dir: `/mnt/d/workspace/parrot/parrot-agent/migrations`
 | `issue_attachments` | `issue_attachments.ts` |  |
 | `issue_execution_decisions` | `issue_execution_decisions.ts` |  |
 | `issue_read_states` | `issue_read_states.ts` |  |
-| `issue_recovery_actions` | `issue_recovery_actions.ts` |  |
 | `issue_reference_mentions` | `issue_reference_mentions.ts` |  |
 | `pipeline_automation_executions` | `pipeline_cases.ts` |  |
 | `pipeline_case_blockers` | `pipeline_cases.ts` |  |
@@ -57,7 +56,6 @@ Parrot migrations dir: `/mnt/d/workspace/parrot/parrot-agent/migrations`
 | `session` | `auth.ts` |  |
 | `tool_access_audit_events` | `tool_access.ts` |  |
 | `tool_gateway_rate_limit_counters` | `tool_access.ts` |  |
-| `tool_rate_limit_counters` | `tool_access.ts` |  |
 | `tool_runtime_metric_counters` | `tool_access.ts` |  |
 | `user` | `auth.ts` |  |
 | `verification` | `auth.ts` |  |
@@ -115,7 +113,7 @@ Parrot migrations dir: `/mnt/d/workspace/parrot/parrot-agent/migrations`
 
 ## 共有表
 
-共 130 张表在两者中都有定义。
+共 132 张表在两者中都有定义。
 
 ## 说明
 
