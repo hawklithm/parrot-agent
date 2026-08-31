@@ -28,15 +28,15 @@ pub enum PluginStateScopeKind {
     Company,
     Project,
     ProjectWorkspace,
-    Issue,
     Agent,
+    Issue,
     Goal,
-    Routine,
-    Skill,
+    Run,
     /// Forward-compatible catch-all for scopes added after this port.
     #[serde(untagged)]
     Other(String),
 }
+
 
 /// A scope key identifying exactly where plugin state is stored.
 ///
@@ -354,5 +354,28 @@ mod tool_tests {
         let (ok, payload) = normalize_plugin_tool_result(&ToolResult::default());
         assert!(ok);
         assert_eq!(payload, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn scope_kind_covers_paperclip_state_scope_kinds() {
+        // Paperclip PLUGIN_STATE_SCOPE_KINDS (constants.ts).
+        for raw in [
+            "instance",
+            "company",
+            "project",
+            "project_workspace",
+            "agent",
+            "issue",
+            "goal",
+            "run",
+        ] {
+            let kind: PluginStateScopeKind = serde_json::from_value(serde_json::json!(raw))
+                .unwrap_or_else(|_| panic!("scope kind {raw} must deserialize"));
+            assert_eq!(
+                serde_json::to_value(&kind).unwrap(),
+                serde_json::json!(raw),
+                "scope kind {raw} must round-trip"
+            );
+        }
     }
 }

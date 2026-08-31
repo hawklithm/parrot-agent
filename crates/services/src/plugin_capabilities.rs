@@ -395,6 +395,13 @@ pub fn validate_ui_slot(slot: &PluginUiSlotDeclaration) -> Result<(), Capability
             slot.slot_type
         )));
     }
+    for entity in &slot.entity_types {
+        if !PLUGIN_UI_SLOT_ENTITY_TYPES.contains(&entity.as_str()) {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "unsupported ui slot entityType: {entity}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1064,6 +1071,18 @@ pub fn validate_categories(categories: &[String]) -> Result<(), CapabilityError>
     }
     Ok(())
 }
+
+/// Entity types a context-sensitive UI slot can attach to (PLUGIN_SPEC §19.3).
+pub const PLUGIN_UI_SLOT_ENTITY_TYPES: &[&str] = &[
+    "project",
+    "issue",
+    "agent",
+    "goal",
+    "run",
+    "comment",
+    "execution_workspace",
+    "project_workspace",
+];
 
 /// Validate a manifest against Paperclip's declaration rules.
 ///
@@ -2450,5 +2469,28 @@ mod manifest_tests {
         assert_eq!(PLUGIN_CATEGORIES.len(), 4);
         assert_eq!(PLUGIN_CATEGORIES.first().copied(), Some("connector"));
         assert_eq!(PLUGIN_CATEGORIES.last().copied(), Some("ui"));
+    }
+
+    #[test]
+    fn ui_slot_entity_types_must_be_canonical() {
+        let mut s = slot("detailTab");
+        s.entity_types = vec!["issue".into()];
+        assert!(validate_ui_slot(&s).is_ok());
+
+        s.entity_types = vec!["issue".into(), "widget".into()];
+        assert!(matches!(
+            validate_ui_slot(&s),
+            Err(CapabilityError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn canonical_entity_type_list_matches_paperclip() {
+        assert_eq!(PLUGIN_UI_SLOT_ENTITY_TYPES.len(), 8);
+        assert_eq!(PLUGIN_UI_SLOT_ENTITY_TYPES.first().copied(), Some("project"));
+        assert_eq!(
+            PLUGIN_UI_SLOT_ENTITY_TYPES.last().copied(),
+            Some("project_workspace")
+        );
     }
 }
