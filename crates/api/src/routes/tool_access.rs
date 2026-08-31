@@ -2468,7 +2468,31 @@ async fn refresh_connection_catalog(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // Paperclip refreshCatalog gates: config.quarantineNewEntries === true,
+    // connection active, safeDefault/sourceTemplateKey config reads.
+    let connection_row = sqlx::query(
+        "SELECT status, config, transport_config FROM tool_connections WHERE id = $1 AND company_id = $2",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let connection_status: String = connection_row.get("status");
+    let conn_config: Value = connection_row
+        .try_get::<Value, _>("config")
+        .unwrap_or_else(|_| json!({}));
+    let quarantine_on_refresh = conn_config.get("quarantineNewEntries").and_then(Value::as_bool)
+        == Some(true)
+        && connection_status == "active";
+    let safe_default = conn_config.get("safeDefault").and_then(Value::as_bool) == Some(true);
+    let _source_template_key = conn_config
+        .get("sourceTemplateKey")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
     let mut refreshed = 0usize;
+    let mut quarantined_count = 0usize;
     for tool in tools {
         let name = tool
             .get("name")
@@ -2491,35 +2515,137 @@ async fn refresh_connection_catalog(
             risk_level,
         );
         let schema_hash = services::tool_access_contract::schema_hash(&input_schema);
-        let entry_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO tool_catalog_entries
-                (id, company_id, connection_id, name, tool_name, title, description, input_schema, output_schema, version_hash, schema_hash, risk_level, last_seen_at, updated_at)
-             VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())
-             ON CONFLICT (connection_id, name) DO UPDATE SET
-                title = EXCLUDED.title, description = EXCLUDED.description, input_schema = EXCLUDED.input_schema,
-                output_schema = EXCLUDED.output_schema, version_hash = EXCLUDED.version_hash,
-                schema_hash = EXCLUDED.schema_hash, risk_level = EXCLUDED.risk_level,
-                last_seen_at = NOW(), updated_at = NOW()",
-        )
-        .bind(entry_id)
-        .bind(company_id)
-        .bind(connection_id)
-        .bind(name)
-        .bind(title)
-        .bind(description)
-        .bind(input_schema)
-        .bind(tool.get("outputSchema").cloned())
-        .bind(version_hash)
-        .bind(schema_hash)
-        .bind(risk_level)
-        .execute(&state.pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to upsert catalog entry: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+
+        // Existing row drives Paperclip's quarantine decision.
+        let existing: Option<(Uuid, Option<String>, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+            sqlx::query_as(
+                "SELECT id, version_hash, schema_hash, status, quarantined_at \
+                 FROM tool_catalog_entries WHERE connection_id = $1 AND name = $2",
+            )
+            .bind(connection_id)
+            .bind(name)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("x: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let (entry_id, prev_status, prev_quarantined_at) = match &existing {
+            Some((id, _, _, status, quarantined_at)) => {
+                (*id, status.as_deref(), *quarantined_at)
+            }
+            None => (Uuid::new_v4(), None, None),
+        };
+        let changed = matches!(
+            &existing,
+            Some((_, prev_version, prev_schema, _, _))
+                if prev_version.as_deref() != Some(version_hash.as_str())
+                    || prev_schema.as_deref() != Some(schema_hash.as_str())
+        );
+        let should_quarantine = quarantine_on_refresh
+            && (existing.is_none() || changed)
+            && prev_status != Some("disabled")
+            && (!safe_default || risk_level != "read");
+        if should_quarantine {
+            quarantined_count += 1;
+        }
+        let next_status = if should_quarantine {
+            "quarantined"
+        } else if prev_status == Some("disabled") {
+            "disabled"
+        } else if prev_status == Some("quarantined") {
+            "quarantined"
+        } else {
+            "active"
+        };
+        let quarantine_reason = if should_quarantine {
+            Some("pending_review")
+        } else {
+            None
+        };
+        let quarantined_at = if should_quarantine {
+            Some(chrono::Utc::now())
+        } else {
+            prev_quarantined_at
+        };
+
+        match existing {
+            Some(_) => {
+                sqlx::query(
+                    "UPDATE tool_catalog_entries SET
+                        title = $2, description = $3, input_schema = $4, output_schema = $5,
+                        annotations = $6, risk_level = $7, is_read_only = $8, is_write = $9,
+                        is_destructive = $10, status = $11, version_hash = $12, schema_hash = $13,
+                        last_seen_at = NOW(),
+                        quarantined_at = $14, quarantine_reason = $15, updated_at = NOW()
+                     WHERE id = $1",
+                )
+                .bind(entry_id)
+                .bind(title)
+                .bind(description)
+                .bind(input_schema)
+                .bind(tool.get("outputSchema").cloned())
+                .bind(annotations)
+                .bind(risk_level)
+                .bind(risk_level == "read")
+                .bind(risk_level == "write")
+                .bind(risk_level == "destructive")
+                .bind(next_status)
+                .bind(version_hash)
+                .bind(schema_hash)
+                .bind(quarantined_at)
+                .bind(quarantine_reason)
+                .execute(&state.pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("x: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO tool_catalog_entries
+                        (id, company_id, connection_id, name, tool_name, title, description,
+                         input_schema, output_schema, annotations, risk_level, is_read_only,
+                         is_write, is_destructive, status, version_hash, schema_hash,
+                         first_seen_at, last_seen_at, quarantined_at, quarantine_reason, updated_at)
+                     VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW(),NOW(),$17,$18,NOW())",
+                )
+                .bind(entry_id)
+                .bind(company_id)
+                .bind(connection_id)
+                .bind(name)
+                .bind(title)
+                .bind(description)
+                .bind(input_schema)
+                .bind(tool.get("outputSchema").cloned())
+                .bind(annotations)
+                .bind(risk_level)
+                .bind(risk_level == "read")
+                .bind(risk_level == "write")
+                .bind(risk_level == "destructive")
+                .bind(next_status)
+                .bind(version_hash)
+                .bind(schema_hash)
+                .bind(quarantined_at)
+                .bind(quarantine_reason)
+                .execute(&state.pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("x: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            }
+        }
         refreshed += 1;
+    }
+    if quarantined_count > 0 {
+        tracing::info!(
+            connection_id = %connection_id,
+            quarantined = quarantined_count,
+            "catalog refresh quarantined new/changed entries"
+        );
     }
     sqlx::query("UPDATE tool_connections SET health_status = 'healthy', health_message = NULL, health_checked_at = NOW(), last_catalog_refresh_at = NOW(), last_healthy_at = NOW(), last_error = NULL, status = 'active', updated_at = NOW() WHERE id = $1 AND company_id = $2")
         .bind(connection_id).bind(company_id).execute(&state.pool).await

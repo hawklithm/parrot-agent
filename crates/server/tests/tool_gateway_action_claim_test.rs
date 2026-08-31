@@ -3814,3 +3814,76 @@ async fn catalog_refresh_version_hash_is_content_stable() {
 
     server.abort();
 }
+
+/// Paperclip refreshCatalog: with config.quarantineNewEntries, new entries land
+/// as quarantined/pending_review; re-refresh of unchanged content keeps them
+/// quarantined; safeDefault exempts read-only tools.
+#[tokio::test]
+async fn catalog_refresh_quarantines_new_entries_per_paperclip() {
+    let (base_url, server) = spawn_tools_list_endpoint(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"kv_get","title":"Get value","description":"Reads a key","inputSchema":{"type":"object","properties":{"key":{"type":"string"}}},"annotations":{"readOnlyHint":true}},{"name":"kv_delete","title":"Delete value","description":"Removes a key","inputSchema":{"type":"object","properties":{"key":{"type":"string"}}},"annotations":{}}]}}"#,
+    ).await;
+
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    let application_id = Uuid::new_v4();
+    let connection_id = Uuid::new_v4();
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id).bind("Quarantine Company").bind(format!("QC{}", &company_id.simple().to_string()[..8]))
+        .execute(&pool).await.expect("insert company");
+    sqlx::query(
+        "INSERT INTO tool_applications (id, company_id, name) VALUES ($1, $2, 'Quarantine App')",
+    ).bind(application_id).bind(company_id).execute(&pool).await.expect("insert application");
+    sqlx::query(
+        "INSERT INTO tool_connections
+            (id, company_id, application_id, name, uid, transport, auth_kind, status, enabled, config, transport_config)
+         VALUES ($1, $2, $3, 'Quarantine connection', 'quarantine-conn', 'mcp_remote', 'none', 'active', true, $4, $5)",
+    )
+    .bind(connection_id).bind(company_id).bind(application_id)
+    .bind(json!({"quarantineNewEntries": true}))
+    .bind(json!({"endpoint": base_url}))
+    .execute(&pool).await.expect("insert connection");
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+
+    let (status, body) = request_connection_route(
+        &app, &owner, "POST",
+        format!("/tool-connections/{connection_id}/catalog/refresh"),
+        None,
+    ).await;
+    assert_eq!(status, StatusCode::OK, "refresh={body:?}");
+
+    // Both new entries are quarantined pending review (read-only does NOT get
+    // exempted without safeDefault).
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT tool_name, status FROM tool_catalog_entries WHERE connection_id = $1 ORDER BY tool_name",
+    ).bind(connection_id).fetch_all(&pool).await.expect("load entries");
+    assert_eq!(rows.len(), 2, "both tools persisted");
+    for (tool_name, status) in &rows {
+        assert_eq!(status, "quarantined", "{tool_name} must be quarantined");
+    }
+    let reason: Vec<String> = sqlx::query_scalar(
+        "SELECT quarantine_reason FROM tool_catalog_entries WHERE connection_id = $1 AND quarantine_reason IS NOT NULL",
+    ).bind(connection_id).fetch_all(&pool).await.expect("load reasons");
+    assert_eq!(reason.len(), 2);
+    for r in reason {
+        assert_eq!(r, "pending_review");
+    }
+
+    // Second refresh of identical content: still quarantined (no state churn).
+    let (status, _) = request_connection_route(
+        &app, &owner, "POST",
+        format!("/tool-connections/{connection_id}/catalog/refresh"),
+        None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let still: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_catalog_entries WHERE connection_id = $1 AND status = 'quarantined'",
+    ).bind(connection_id).fetch_one(&pool).await.expect("count quarantined");
+    assert_eq!(still, 2, "unchanged entries keep quarantine state");
+
+    server.abort();
+}
