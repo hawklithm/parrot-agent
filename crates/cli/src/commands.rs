@@ -75,7 +75,7 @@ fn print_help() -> Result<()> {
     println!("  pipeline    list <companyId> | get <id>");
     println!("  skill       list | get <name>");
     println!("  team        catalog");
-    println!("  plugin      list | install | enable <id> | disable <id>");
+    println!("  plugin      list | create <name> --output <dir> | install | enable | disable");
     println!("  dashboard   get <companyId>");
     println!("  cost        summary <companyId>");
     println!("  feedback    get <traceId>");
@@ -484,13 +484,39 @@ fn cmd_plugin(args: &[String]) -> Result<()> {
             println!("{}", format_json(&client.enable_plugin(id)?));
             Ok(())
         }
+        "create" => {
+            // Offline scaffolding: `parrot plugin create <name> --output <dir>
+            // [--template default|connector|workspace|environment]`
+            // (Paperclip create-paperclip-plugin equivalent).
+            let name = args.get(1).ok_or_else(|| {
+                anyhow::anyhow!("Usage: parrot plugin create <name> --output <dir> [--template T]")
+            })?;
+            let output = get_flag_value(args, "--output")
+                .ok_or_else(|| anyhow::anyhow!("plugin create requires --output <dir>"))?;
+            let options = crate::plugin_scaffold::ScaffoldPluginOptions {
+                plugin_name: name.clone(),
+                output_dir: output.clone(),
+                template: get_flag_value(args, "--template"),
+                display_name: get_flag_value(args, "--display-name"),
+                description: get_flag_value(args, "--description"),
+                author: get_flag_value(args, "--author"),
+                category: get_flag_value(args, "--category"),
+            };
+            let written = crate::plugin_scaffold::scaffold_plugin_project(&options)
+                .map_err(|message| anyhow::anyhow!("{message}"))?;
+            println!("Created plugin scaffold at {output}");
+            for path in &written {
+                println!("  {path}");
+            }
+            Ok(())
+        }
         "disable" => {
             let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin disable <id>"))?;
             println!("{}", format_json(&client.disable_plugin(id)?));
             Ok(())
         }
         _ => {
-            println!("Usage: parrot plugin list | install --json '{{...}}' | enable <id> | disable <id>");
+            println!("Usage: parrot plugin list | create <name> --output <dir> | install --json '{{...}}' | enable <id> | disable <id>");
             Ok(())
         }
     }

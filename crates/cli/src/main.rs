@@ -2,6 +2,7 @@ mod backup;
 mod checks;
 mod client;
 mod commands;
+mod plugin_scaffold;
 mod config;
 mod services;
 
