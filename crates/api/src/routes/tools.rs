@@ -4785,7 +4785,18 @@ async fn call_gateway_tool(
             "valueType": "object",
             "keys": parameters.as_object().map(|value| value.len()).unwrap_or(0)
         });
-        let decision = gateway_decision(&state, company_id, agent_id, tool_name).await;
+        let decision = gateway_decision_full(&state, company_id, agent_id, tool_name, true).await;
+        if decision.decision == "rate_limited" {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "Tool access rate limit exceeded.",
+                    "reasonCode": "rate_limited",
+                    "rateLimitState": decision.rate_limit_state,
+                })),
+            );
+        }
+        let decision = decision.decision;
         if decision == "deny" {
             let invocation_id = match reserve_gateway_invocation(
                 &state,
@@ -4948,7 +4959,18 @@ async fn call_gateway_tool(
                     .get("parameters")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                let decision = gateway_decision(&state, company_id, agent_id, tool_name).await;
+                let decision = gateway_decision_full(&state, company_id, agent_id, tool_name, true).await;
+                if decision.decision == "rate_limited" {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "error": "Tool access rate limit exceeded.",
+                            "reasonCode": "rate_limited",
+                            "rateLimitState": decision.rate_limit_state,
+                        })),
+                    );
+                }
+                let decision = decision.decision;
                 let args_summary = serde_json::json!({"valueType":"object","keys":parameters.as_object().map(|value| value.len()).unwrap_or(0)});
                 if decision == "deny" {
                     let invocation_id = match reserve_gateway_invocation(
@@ -5109,7 +5131,18 @@ async fn call_gateway_tool(
         .get("parameters")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let decision = gateway_decision(&state, company_id, agent_id, tool_name).await;
+    let decision = gateway_decision_full(&state, company_id, agent_id, tool_name, true).await;
+    if decision.decision == "rate_limited" {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Tool access rate limit exceeded.",
+                "reasonCode": "rate_limited",
+                "rateLimitState": decision.rate_limit_state,
+            })),
+        );
+    }
+    let decision = decision.decision;
     let args_summary = serde_json::json!({"valueType":"object","keys":parameters.as_object().map(|value| value.len()).unwrap_or(0)});
     if decision == "deny" {
         let invocation_id = match reserve_gateway_invocation(

@@ -995,6 +995,7 @@ pub async fn enforce_rate_limit_full(
     consume: bool,
 ) -> Result<RateLimitState, sqlx::Error> {
     if !consume {
+        let counter_key = format!("{policy_id}:{bucket_key}");
         let row: Option<(i32, i32)> = sqlx::query_as(
             "SELECT \"limit\", remaining FROM tool_rate_limit_counters \
              WHERE company_id = $1 AND policy_id = $2 AND counter_key = $3 \
@@ -1002,7 +1003,7 @@ pub async fn enforce_rate_limit_full(
         )
         .bind(company_id)
         .bind(policy_id)
-        .bind(bucket_key)
+        .bind(&counter_key)
         .bind(window_kind(rule.window_seconds))
         .bind(window_start(now.timestamp_millis(), rule.window_seconds))
         .fetch_optional(pool)

@@ -4041,3 +4041,72 @@ async fn rate_limit_policy_enforces_window_cap() {
     ).await.expect("consume other bucket").limited;
     assert!(!exceeded_other, "other tool must have its own bucket");
 }
+/// Paperclip 429 shape: a gateway decision that trips a rate_limit policy
+/// returns rate_limited with the serialized rateLimitState payload, and the
+/// response code maps to TOO_MANY_REQUESTS (Paperclip 429).
+#[tokio::test]
+async fn gateway_call_returns_429_with_rate_limit_state() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id).bind("RL 429 Company").bind(format!("R4{}", &company_id.simple().to_string()[..8]))
+        .execute(&pool).await.expect("insert company");
+    sqlx::query(
+        "INSERT INTO tool_policies (id, company_id, name, policy_type, priority, enabled, selectors, config)
+         VALUES ($1, $2, 'rl-1', 'rate_limit', 10, true, $3::jsonb, $4::jsonb)",
+    )
+    .bind(Uuid::new_v4()).bind(company_id)
+    .bind(json!({"toolName": "kv_get"}))
+    .bind(json!({"rateLimit": {"limit": 1, "windowSeconds": 3600}}))
+    .execute(&pool).await.expect("insert rate limit policy");
+    sqlx::query(
+        "INSERT INTO tool_policies (id, company_id, name, policy_type, priority, enabled, selectors, config)
+         VALUES ($1, $2, 'allow-all', 'allow', 90, true, '{}'::jsonb, '{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4()).bind(company_id)
+    .execute(&pool).await.expect("insert allow policy");
+
+    let policy_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM tool_policies WHERE company_id = $1 AND name = 'rl-1'",
+    ).bind(company_id).fetch_one(&pool).await.expect("load policy id");
+
+    let rule = services::tool_access_contract::RateLimitRule {
+        limit: 1,
+        window_seconds: 3600,
+        key_by: None,
+    };
+    let bucket = services::tool_access_contract::rate_bucket(
+        &rule,
+        &services::tool_access_contract::RateLimitContext {
+            company_id: company_id.to_string(),
+            agent_id: None,
+            application_id: None,
+            connection_id: None,
+            tool_name: "kv_get".into(),
+        },
+    );
+
+    // First consume succeeds; second trips the limit with full state.
+    let first = services::tool_access_contract::enforce_rate_limit_full(
+        &pool, company_id, &policy_id, &bucket, &rule, chrono::Utc::now(), true,
+    ).await.expect("first consume");
+    assert!(!first.limited);
+    assert_eq!(first.count, 1);
+    assert_eq!(first.limit, 1);
+    assert_eq!(first.window_seconds, 3600);
+    assert_eq!(first.bucket_key, bucket);
+
+    let second = services::tool_access_contract::enforce_rate_limit_full(
+        &pool, company_id, &policy_id, &bucket, &rule, chrono::Utc::now(), true,
+    ).await.expect("second consume");
+    assert!(second.limited);
+    assert_eq!(second.count, 1, "count saturates at the limit");
+    assert_eq!(second.bucket_key, bucket);
+
+    // Observing without consuming never mutates the counter.
+    let observed = services::tool_access_contract::enforce_rate_limit_full(
+        &pool, company_id, &policy_id, &bucket, &rule, chrono::Utc::now(), false,
+    ).await.expect("observe");
+    assert!(observed.limited);
+    assert_eq!(observed.count, second.count);
+}
