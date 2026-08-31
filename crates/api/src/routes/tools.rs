@@ -2865,12 +2865,36 @@ async fn load_profile_decision(
 
 
 
+/// Structured decision from the ladder, carrying rate-limit state so callers
+/// can shape Paperclip's 429 response.
+#[derive(Debug, Clone)]
+pub(crate) struct GatewayDecision {
+    /// deny | allow | require_approval | rate_limited
+    pub decision: String,
+    pub rate_limit_state: Option<serde_json::Value>,
+}
+
 async fn gateway_decision(
     state: &AppState,
     company_id: Uuid,
     agent_id: Uuid,
     tool_name: &str,
 ) -> String {
+    gateway_decision_full(state, company_id, agent_id, tool_name, true)
+        .await
+        .decision
+}
+
+/// Paperclip `decide()`: `consumeRateLimit === true` for real calls (each
+/// consumes one token per matching rate_limit policy); discovery/list
+/// evaluation passes consume=false and observes without consuming.
+async fn gateway_decision_full(
+    state: &AppState,
+    company_id: Uuid,
+    agent_id: Uuid,
+    tool_name: &str,
+    consume: bool,
+) -> GatewayDecision {
     let rows = match sqlx::query(
         "SELECT id, policy_type, selectors, config, description \\
            FROM tool_policies \\
@@ -2882,7 +2906,12 @@ async fn gateway_decision(
     .await
     {
         Ok(rows) => rows,
-        Err(_) => return "deny".to_string(),
+        Err(_) => {
+            return GatewayDecision {
+                decision: "deny".into(),
+                rate_limit_state: None,
+            };
+        }
     };
     use sqlx::Row;
     let policies: Vec<services::tool_access_contract::PolicySpec> = rows
@@ -2945,6 +2974,7 @@ async fn gateway_decision(
         catalog_status: None,
         catalog_version_hash: None,
         catalog_schema_hash: None,
+        last_rate_limit_state: None,
     };
 
     // Paperclip enforces each matching rate_limit policy inside the ladder
@@ -2969,26 +2999,34 @@ async fn gateway_decision(
                     tool_name: tool_name_string.clone(),
                 },
             );
-            let policy_uuid = policy.id.parse::<Uuid>();
-            let Ok(policy_uuid) = policy_uuid else {
-                return "deny".to_string();
+            let Ok(policy_uuid) = policy.id.parse::<Uuid>() else {
+                return GatewayDecision {
+                    decision: "deny".into(),
+                    rate_limit_state: None,
+                };
             };
-            match services::tool_access_contract::enforce_rate_limit(
+            match services::tool_access_contract::enforce_rate_limit_full(
                 &state.pool,
                 company_id,
                 &policy_uuid,
                 &bucket,
                 rule,
                 chrono::Utc::now(),
+                consume,
             )
             .await
             {
-                Ok(exceeded) => {
-                    if exceeded {
+                Ok(state) => {
+                    if state.limited {
                         exceeded_policies.insert(policy.id.clone());
                     }
                 }
-                Err(_) => return "deny".to_string(),
+                Err(_) => {
+                    return GatewayDecision {
+                        decision: "deny".into(),
+                        rate_limit_state: None,
+                    };
+                }
             }
         }
     }
@@ -3033,16 +3071,20 @@ async fn gateway_decision(
         }
     }
 
-    match outcome.decision {
+    let decision = match outcome.decision {
+        "allow" | "require_approval" | "rate_limited" => outcome.decision.to_string(),
         "deny" => "deny".to_string(),
-        "allow" => "allow".to_string(),
-        "require_approval" => "require_approval".to_string(),
-        "rate_limited" => "deny".to_string(),
         _ => if tool_name.starts_with("paperclip") {
             "allow".to_string()
         } else {
             "deny".to_string()
         },
+    };
+    GatewayDecision {
+        decision,
+        rate_limit_state: outcome
+            .rate_limit_state
+            .map(|s| serde_json::to_value(&s).unwrap_or(serde_json::Value::Null)),
     }
 }
 

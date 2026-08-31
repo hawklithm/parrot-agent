@@ -4009,6 +4009,7 @@ async fn test_tool_policy(
         catalog_status: None,
         catalog_version_hash: None,
         catalog_schema_hash: None,
+        last_rate_limit_state: None,
     };
     let outcome = services::tool_access_contract::decide_tool_access(&policies, &ctx);
     Ok(Json(json!({

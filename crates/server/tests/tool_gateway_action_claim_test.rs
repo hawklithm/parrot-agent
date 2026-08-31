@@ -4024,20 +4024,20 @@ async fn rate_limit_policy_enforces_window_cap() {
         "SELECT id FROM tool_policies WHERE company_id = $1 AND name = 'cap-2'",
     ).bind(company_id).fetch_one(&pool).await.expect("load policy id");
     for round in 1..=2 {
-        let exceeded = services::tool_access_contract::enforce_rate_limit(
-            &pool, company_id, &policy_id, &bucket, &rule, chrono::Utc::now(),
-        ).await.expect("consume counter");
+        let exceeded = services::tool_access_contract::enforce_rate_limit_full(
+            &pool, company_id, &policy_id, &bucket, &rule, chrono::Utc::now(), true,
+        ).await.expect("consume counter").limited;
         assert!(!exceeded, "call {round} must not be limited");
     }
-    let exceeded = services::tool_access_contract::enforce_rate_limit(
-        &pool, company_id, &policy_id, &bucket, &rule, chrono::Utc::now(),
-    ).await.expect("consume counter");
+    let exceeded = services::tool_access_contract::enforce_rate_limit_full(
+        &pool, company_id, &policy_id, &bucket, &rule, chrono::Utc::now(), true,
+    ).await.expect("consume counter").limited;
     assert!(exceeded, "third call within the window must be limited");
 
     // A different tool has its own bucket (default keyBy includes tool).
     let other_bucket = bucket.replace("tool:kv_get", "tool:kv_set");
-    let exceeded_other = services::tool_access_contract::enforce_rate_limit(
-        &pool, company_id, &policy_id, &other_bucket, &rule, chrono::Utc::now(),
-    ).await.expect("consume other bucket");
+    let exceeded_other = services::tool_access_contract::enforce_rate_limit_full(
+        &pool, company_id, &policy_id, &other_bucket, &rule, chrono::Utc::now(), true,
+    ).await.expect("consume other bucket").limited;
     assert!(!exceeded_other, "other tool must have its own bucket");
 }

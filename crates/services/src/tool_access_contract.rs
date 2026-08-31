@@ -456,7 +456,7 @@ impl PolicySpec {
 }
 
 /// Static inputs the ladder reads outside the policy table.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct EvaluationContext {
     pub tool_name: String,
     /// Paperclip `explicitGrant(ctx)`.
@@ -472,6 +472,13 @@ pub struct EvaluationContext {
     pub catalog_status: Option<String>,
     pub catalog_version_hash: Option<String>,
     pub catalog_schema_hash: Option<String>,
+    /// Observed rate-limit state from the enforcing caller; attached to the
+    /// outcome when the ladder decides rate_limited.
+    pub last_rate_limit_state: Option<RateLimitState>,
+}
+
+fn rate_bucket_key_for(policy: &PolicySpec, _ctx: &EvaluationContext) -> String {
+    policy.id.clone()
 }
 
 impl EvaluationContext {
@@ -489,7 +496,7 @@ impl EvaluationContext {
 
 /// The outcome of the decision ladder: decision + reason code pair exactly as
 /// Paperclip emits them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DecisionOutcome {
     /// One of `TOOL_POLICY_DECISIONS`.
     pub decision: &'static str,
@@ -497,6 +504,10 @@ pub struct DecisionOutcome {
     pub message: String,
     /// The policy that decided, when one did.
     pub policy_id: Option<String>,
+    /// Populated when the decision is `rate_limited`: Paperclip's
+    /// rateLimitState for the 429 body. Serialize via
+    /// [`RateLimitState`]; carried as JSON for struct-field simplicity.
+    pub rate_limit_state: Option<RateLimitState>,
 }
 
 fn self_filters(policy: &PolicySpec) -> Option<TrustRuleArgumentFilters> {
@@ -541,14 +552,23 @@ pub fn decide_tool_access_at(
                     reason_code: "deny_policy_block",
                     message: policy.description.clone().unwrap_or_else(|| "Tool access is blocked by policy.".into()),
                     policy_id: Some(policy.id.clone()),
+                    rate_limit_state: None,
                 };
             }
             "rate_limit" if policy.rate_limit_exceeded => {
+                // The enforcing caller attaches the observed RateLimitState
+                // (count/limit/window) to the context before the ladder runs.
+                let state = ctx
+                    .last_rate_limit_state
+                    .as_ref()
+                    .filter(|s| s.bucket_key == rate_bucket_key_for(policy, ctx))
+                    .cloned();
                 return DecisionOutcome {
                     decision: "rate_limited",
                     reason_code: "rate_limited",
                     message: "Tool access rate limit exceeded.".into(),
                     policy_id: Some(policy.id.clone()),
+                    rate_limit_state: state,
                 };
             }
             "trust_rule" => {
@@ -570,6 +590,7 @@ pub fn decide_tool_access_at(
                         reason_code: "requires_review_changed_tool",
                         message: "Tool definition changed or was quarantined after this trust rule was created; review is required.".into(),
                         policy_id: Some(policy.id.clone()),
+                        rate_limit_state: None,
                     };
                 }
                 return DecisionOutcome {
@@ -577,6 +598,7 @@ pub fn decide_tool_access_at(
                     reason_code: "allow_trust_rule",
                     message: policy.description.clone().unwrap_or_else(|| "Tool access allowed by trust rule.".into()),
                     policy_id: Some(policy.id.clone()),
+                    rate_limit_state: None,
                 };
             }
             "require_approval" => {
@@ -585,6 +607,7 @@ pub fn decide_tool_access_at(
                     reason_code: "requires_approval_policy",
                     message: policy.description.clone().unwrap_or_else(|| "Tool access requires approval.".into()),
                     policy_id: Some(policy.id.clone()),
+                    rate_limit_state: None,
                 };
             }
             "allow" => {
@@ -593,6 +616,7 @@ pub fn decide_tool_access_at(
                     reason_code: "allow_policy",
                     message: "Tool access allowed by policy.".into(),
                     policy_id: Some(policy.id.clone()),
+                    rate_limit_state: None,
                 };
             }
             // rate_limit not exceeded and inactive trust rules fall through,
@@ -606,6 +630,7 @@ pub fn decide_tool_access_at(
             reason_code: "allow_explicit_grant",
             message: "Tool access allowed by explicit grant.".into(),
             policy_id: None,
+            rate_limit_state: None,
         };
     }
     if ctx.profile_allows {
@@ -614,6 +639,7 @@ pub fn decide_tool_access_at(
             reason_code: "allow_profile",
             message: "Tool access allowed by effective profile.".into(),
             policy_id: None,
+            rate_limit_state: None,
         };
     }
     DecisionOutcome {
@@ -621,6 +647,7 @@ pub fn decide_tool_access_at(
         reason_code: "deny_default",
         message: "No effective tool profile, grant, or allow policy permits this call.".into(),
         policy_id: None,
+        rate_limit_state: None,
     }
 }
 
@@ -946,14 +973,50 @@ pub fn rate_bucket(rule: &RateLimitRule, ctx: &RateLimitContext) -> String {
 /// Port of Paperclip `enforceRateLimit` (consume=true branch): INSERT ... ON
 /// CONFLICT decrements remaining, guarded by remaining > 0; no row returned
 /// means the bucket is exhausted.
-pub async fn enforce_rate_limit(
+/// Paperclip `enforceRateLimit` state, serialized for the 429 response body.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RateLimitState {
+    pub limited: bool,
+    pub count: i64,
+    pub limit: i64,
+    pub window_seconds: i64,
+    pub bucket_key: String,
+}
+
+/// Paperclip `enforceRateLimit`: `consume=false` observes without taking a
+/// token; `consume=true` takes a token atomically. Returns the full state.
+pub async fn enforce_rate_limit_full(
     pool: &sqlx::PgPool,
     company_id: Uuid,
     policy_id: &Uuid,
     bucket_key: &str,
     rule: &RateLimitRule,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, sqlx::Error> {
+    consume: bool,
+) -> Result<RateLimitState, sqlx::Error> {
+    if !consume {
+        let row: Option<(i32, i32)> = sqlx::query_as(
+            "SELECT \"limit\", remaining FROM tool_rate_limit_counters \
+             WHERE company_id = $1 AND policy_id = $2 AND counter_key = $3 \
+               AND window_kind = $4 AND window_start_at = $5",
+        )
+        .bind(company_id)
+        .bind(policy_id)
+        .bind(bucket_key)
+        .bind(window_kind(rule.window_seconds))
+        .bind(window_start(now.timestamp_millis(), rule.window_seconds))
+        .fetch_optional(pool)
+        .await?;
+        let (limit, remaining) = row.unwrap_or((rule.limit as i32, rule.limit as i32));
+        let count = (limit as i64 - remaining as i64).max(0);
+        return Ok(RateLimitState {
+            limited: count >= rule.limit,
+            count,
+            limit: rule.limit,
+            window_seconds: rule.window_seconds,
+            bucket_key: bucket_key.to_string(),
+        });
+    }
     let kind = window_kind(rule.window_seconds);
     let start = window_start(
         now.timestamp_millis(),
@@ -984,7 +1047,22 @@ pub async fn enforce_rate_limit(
     .bind(reset_at)
     .fetch_optional(pool)
     .await?;
-    Ok(updated.is_none())
+    match updated {
+        None => Ok(RateLimitState {
+            limited: true,
+            count: rule.limit,
+            limit: rule.limit,
+            window_seconds: rule.window_seconds,
+            bucket_key: bucket_key.to_string(),
+        }),
+        Some(remaining) => Ok(RateLimitState {
+            limited: false,
+            count: (rule.limit - remaining as i64).max(0),
+            limit: rule.limit,
+            window_seconds: rule.window_seconds,
+            bucket_key: bucket_key.to_string(),
+        }),
+    }
 }
 
 #[cfg(test)]
