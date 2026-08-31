@@ -2826,13 +2826,17 @@ async fn list_gateway_tools(
     (StatusCode::OK, Json(Value::Array(visible)))
 }
 
-async fn gateway_decision(
+/// Load the profile decision inputs for the ladder's profile fallback stage.
+async fn load_profile_decision(
     state: &AppState,
     company_id: Uuid,
     agent_id: Uuid,
     tool_name: &str,
-) -> String {
-    let profile_effect: Option<String> = sqlx::query_scalar(
+) -> (bool, bool) {
+    // Paperclip: an exclude entry on any effective profile blocks the tool;
+    // otherwise defaultAction=allow or an include match allows it. The query
+    // mirrors the previous precedence: exact tool match wins, excludes win.
+    let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT e.effect FROM tool_profile_entries e
            JOIN tool_profile_bindings b
              ON b.profile_id = e.profile_id AND b.company_id = e.company_id
@@ -2840,39 +2844,132 @@ async fn gateway_decision(
             AND b.target_type = 'agent' AND b.target_id = $2
             AND (e.tool_name = $3 OR e.tool_name = '*')
           ORDER BY CASE WHEN e.tool_name = $3 THEN 0 ELSE 1 END,
-                   CASE WHEN e.effect IN ('exclude', 'deny') THEN 0 ELSE 1 END
-          LIMIT 1",
+                   CASE WHEN e.effect IN ('exclude', 'deny') THEN 0 ELSE 1 END",
     )
     .bind(company_id)
     .bind(agent_id)
     .bind(tool_name)
-    .fetch_optional(&state.pool)
+    .fetch_all(&state.pool)
     .await
-    .unwrap_or(None);
-    if let Some(effect) = profile_effect {
-        if matches!(effect.as_str(), "exclude" | "deny") {
-            return "deny".to_string();
-        }
-        if matches!(effect.as_str(), "include" | "allow") {
-            return "allow".to_string();
+    .unwrap_or_default();
+    let mut has_include = false;
+    for (effect,) in rows {
+        match effect.as_str() {
+            "exclude" | "deny" => return (false, false),
+            "include" | "allow" => has_include = true,
+            _ => {}
         }
     }
-    let policy_type: Option<String> = sqlx::query_scalar(
-        "SELECT policy_type FROM tool_policies
-          WHERE company_id = $1 AND enabled = true
-            AND (selectors->>'toolName' = $2 OR selectors->>'tool_name' = $2 OR selectors->>'tool' = $2)
-          ORDER BY priority DESC LIMIT 1",
+    (false, has_include)
+}
+
+async fn gateway_decision(
+    state: &AppState,
+    company_id: Uuid,
+    agent_id: Uuid,
+    tool_name: &str,
+) -> String {
+    let rows = match sqlx::query(
+        "SELECT id, policy_type, selectors, config, description \\
+           FROM tool_policies \\
+          WHERE company_id = $1 AND enabled = true \\
+          ORDER BY priority ASC, created_at ASC",
     )
-    .bind(company_id).bind(tool_name)
-    .fetch_optional(&state.pool).await.unwrap_or(None);
-    match policy_type.as_deref() {
-        Some("deny") | Some("block") => "deny".to_string(),
-        Some("require_approval") | Some("approval") | Some("ask_first") => {
-            "require_approval".to_string()
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return "deny".to_string(),
+    };
+    use sqlx::Row;
+    let policies: Vec<services::tool_access_contract::PolicySpec> = rows
+        .iter()
+        .map(|row| {
+            let id: Uuid = row.get("id");
+            let selectors: serde_json::Value =
+                row.try_get("selectors").unwrap_or(serde_json::json!({}));
+            let selector_tool_name = selectors
+                .get("toolName")
+                .or_else(|| selectors.get("tool_name"))
+                .or_else(|| selectors.get("tool"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let config: serde_json::Value = row.try_get("config").unwrap_or(serde_json::json!({}));
+            let trust_rule_config = config
+                .get("trustRule")
+                .or_else(|| config.get("trust_rule"))
+                .cloned()
+                .filter(|value| value.is_object());
+            let rate_limit_exceeded = config
+                .get("exceeded")
+                .or_else(|| config.get("limited"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            services::tool_access_contract::PolicySpec {
+                id: id.to_string(),
+                policy_type: row.get("policy_type"),
+                selector_tool_name,
+                description: row.try_get("description").unwrap_or(None),
+                trust_rule_config,
+                rate_limit_exceeded,
+            }
+        })
+        .collect();
+    let (explicit_grant, profile_allows) =
+        load_profile_decision(state, company_id, agent_id, tool_name).await;
+    let ctx = services::tool_access_contract::EvaluationContext {
+        tool_name: tool_name.to_string(),
+        explicit_grant,
+        profile_allows,
+        arguments: None,
+        arguments_hash: None,
+        catalog_status: None,
+        catalog_version_hash: None,
+        catalog_schema_hash: None,
+    };
+    let outcome = services::tool_access_contract::decide_tool_access(&policies, &ctx);
+
+    // Paperclip recordTrustRuleHit: a live trust-rule allow bumps hitCount /
+    // lastHitAt on the policy config.
+    if outcome.reason_code == "allow_trust_rule" {
+        if let Some(policy_id) = &outcome.policy_id {
+            let policy_id = policy_id.parse::<Uuid>().ok();
+            if let Some(policy_id) = policy_id {
+                let _ = sqlx::query(
+                    "UPDATE tool_policies SET config = jsonb_set( \\
+                         jsonb_set(config, '{trustRule,hitCount}', \\
+                             (((COALESCE(config->'trustRule'->>'hitCount','0'))::int + 1))::text::jsonb), \\
+                         '{trustRule,lastHitAt}', to_jsonb(NOW())) \\
+                     WHERE id = $1",
+                )
+                .bind(policy_id)
+                .execute(&state.pool)
+                .await;
+                let _ = sqlx::query(
+                    "INSERT INTO tool_call_events
+                        (company_id, event_type, actor_type, agent_id, connection_id, tool_name, decision, outcome, reason_code)
+                     VALUES ($1, 'trust_rule_used', 'agent', $2, NULL, $3, 'allow', 'success', 'allow_trust_rule')",
+                )
+                .bind(company_id)
+                .bind(agent_id)
+                .bind(tool_name)
+                .execute(&state.pool)
+                .await;
+            }
         }
-        Some("allow") => "allow".to_string(),
-        _ if tool_name.starts_with("paperclip") => "allow".to_string(),
-        _ => "deny".to_string(),
+    }
+
+    match outcome.decision {
+        "deny" => "deny".to_string(),
+        "allow" => "allow".to_string(),
+        "require_approval" => "require_approval".to_string(),
+        "rate_limited" => "deny".to_string(),
+        _ => if tool_name.starts_with("paperclip") {
+            "allow".to_string()
+        } else {
+            "deny".to_string()
+        },
     }
 }
 
