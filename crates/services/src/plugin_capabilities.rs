@@ -199,6 +199,9 @@ pub struct PluginManifestV1 {
     /// UI slot contributions (requires `entrypoints.ui`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui_slots: Vec<PluginUiSlotDeclaration>,
+    /// Scoped JSON API routes mounted under `/api/plugins/:pluginId/api/*` (§20).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_routes: Vec<PluginApiRouteDeclaration>,
     /// JSON Schema for operator-editable instance configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_config_schema: Option<serde_json::Value>,
@@ -358,6 +361,107 @@ pub fn validate_ui_slot(slot: &PluginUiSlotDeclaration) -> Result<(), Capability
     Ok(())
 }
 
+/// HTTP methods a plugin API route may accept (PLUGIN_SPEC §20).
+pub const PLUGIN_API_ROUTE_METHODS: &[&str] = &["GET", "POST", "PATCH", "DELETE"];
+
+/// Actor classes allowed to call a plugin API route (PLUGIN_SPEC §20).
+pub const PLUGIN_API_ROUTE_AUTH_MODES: &[&str] = &["board", "agent", "board-or-agent", "webhook"];
+
+/// Checkout policies the host enforces before worker dispatch (PLUGIN_SPEC §20).
+pub const PLUGIN_API_ROUTE_CHECKOUT_POLICIES: &[&str] = &[
+    "none",
+    "required-for-agent-in-progress",
+    "always-for-agent",
+];
+
+/// The capability required to expose a plugin API route (PLUGIN_SPEC §20).
+pub const API_ROUTE_CAPABILITY: &str = "api.routes.register";
+
+/// How the host resolves company access for a route (PLUGIN_SPEC §20).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "camelCase")]
+pub enum PluginApiRouteCompanyResolution {
+    /// Read the company id from a body field.
+    Body { key: String },
+    /// Read the company id from a query parameter.
+    Query { key: String },
+    /// Resolve the company from an issue path parameter.
+    Issue { param: String },
+}
+
+/// Declares a scoped JSON API route mounted under
+/// `/api/plugins/:pluginId/api/*`.
+///
+/// Port of `@paperclipai/shared` `PluginApiRouteDeclaration` (PLUGIN_SPEC §20).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginApiRouteDeclaration {
+    /// Stable plugin-defined route key passed to the worker.
+    pub route_key: String,
+    /// HTTP method accepted by this route.
+    pub method: String,
+    /// Plugin-local path under `/api/plugins/:pluginId/api`.
+    pub path: String,
+    /// Actor class allowed to call the route.
+    pub auth: String,
+    /// Capability required to expose the route.
+    pub capability: String,
+    /// Optional checkout policy enforced by the host before worker dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_policy: Option<String>,
+    /// How the host resolves company access for this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company_resolution: Option<PluginApiRouteCompanyResolution>,
+}
+
+/// Validate a plugin API route declaration (PLUGIN_SPEC §20).
+///
+/// - `routeKey` non-empty and unique (uniqueness checked by the caller)
+/// - `method` must be a canonical HTTP method
+/// - `path` must be absolute (`/...`)
+/// - `auth` must be a canonical auth mode
+/// - `capability` must be `api.routes.register`
+/// - `checkoutPolicy`, when present, must be canonical
+pub fn validate_api_route(route: &PluginApiRouteDeclaration) -> Result<(), CapabilityError> {
+    if route.route_key.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "api route routeKey is required".into(),
+        ));
+    }
+    if !PLUGIN_API_ROUTE_METHODS.contains(&route.method.as_str()) {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "unsupported api route method: {}",
+            route.method
+        )));
+    }
+    if !route.path.starts_with('/') {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "api route path must start with '/': {}",
+            route.path
+        )));
+    }
+    if !PLUGIN_API_ROUTE_AUTH_MODES.contains(&route.auth.as_str()) {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "unsupported api route auth mode: {}",
+            route.auth
+        )));
+    }
+    if route.capability != API_ROUTE_CAPABILITY {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "api route capability must be '{}'",
+            API_ROUTE_CAPABILITY
+        )));
+    }
+    if let Some(policy) = &route.checkout_policy {
+        if !PLUGIN_API_ROUTE_CHECKOUT_POLICIES.contains(&policy.as_str()) {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "unsupported api route checkoutPolicy: {policy}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a manifest against Paperclip's declaration rules.
 ///
 /// Enforced (PLUGIN_SPEC §6/§11/§13.6/§18):
@@ -506,6 +610,27 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
                     slot.id
                 )));
             }
+        }
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for route in &manifest.api_routes {
+            validate_api_route(route)?;
+            if !seen.insert(route.route_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate api route routeKey: {}",
+                    route.route_key
+                )));
+            }
+        }
+        if !manifest.api_routes.is_empty()
+            && !has_capability(&manifest.capabilities, API_ROUTE_CAPABILITY)
+        {
+            return Err(CapabilityError::MissingCapability(
+                "apiRoutes".into(),
+                API_ROUTE_CAPABILITY.into(),
+            ));
         }
     }
 
@@ -757,6 +882,7 @@ mod manifest_tests {
             tools: None,
             database: None,
             ui_slots: vec![],
+            api_routes: vec![],
             instance_config_schema: None,
             declares_ui: false,
         }
@@ -987,5 +1113,89 @@ mod manifest_tests {
         assert_eq!(PLUGIN_UI_SLOT_TYPES.len(), 15);
         assert_eq!(PLUGIN_UI_SLOT_TYPES.first().copied(), Some("page"));
         assert_eq!(PLUGIN_UI_SLOT_TYPES.last().copied(), Some("companySettingsPage"));
+    }
+
+    fn route(method: &str, auth: &str) -> PluginApiRouteDeclaration {
+        PluginApiRouteDeclaration {
+            route_key: "r1".into(),
+            method: method.into(),
+            path: "/issues/:issueId/smoke".into(),
+            auth: auth.into(),
+            capability: API_ROUTE_CAPABILITY.into(),
+            checkout_policy: None,
+            company_resolution: None,
+        }
+    }
+
+    #[test]
+    fn api_route_method_must_be_canonical() {
+        assert!(validate_api_route(&route("POST", "board")).is_ok());
+        assert!(validate_api_route(&route("PUT", "board")).is_err());
+    }
+
+    #[test]
+    fn api_route_path_must_be_absolute() {
+        let mut r = route("GET", "board");
+        r.path = "issues".into();
+        assert!(validate_api_route(&r).is_err());
+        r.path = "/issues".into();
+        assert!(validate_api_route(&r).is_ok());
+    }
+
+    #[test]
+    fn api_route_auth_must_be_canonical() {
+        assert!(validate_api_route(&route("GET", "board-or-agent")).is_ok());
+        assert!(validate_api_route(&route("GET", "anyone")).is_err());
+    }
+
+    #[test]
+    fn api_route_capability_must_be_api_routes_register() {
+        let mut r = route("GET", "board");
+        r.capability = "issues.read".into();
+        assert!(validate_api_route(&r).is_err());
+    }
+
+    #[test]
+    fn api_route_checkout_policy_must_be_canonical() {
+        let mut r = route("POST", "agent");
+        r.checkout_policy = Some("sometimes".into());
+        assert!(validate_api_route(&r).is_err());
+        r.checkout_policy = Some("required-for-agent-in-progress".into());
+        assert!(validate_api_route(&r).is_ok());
+    }
+
+    #[test]
+    fn api_routes_require_capability_and_unique_keys() {
+        let mut m = manifest(&[]);
+        m.api_routes = vec![route("GET", "board")];
+        assert!(validate_manifest(&m).is_err());
+        m.capabilities.push(API_ROUTE_CAPABILITY.into());
+        assert!(validate_manifest(&m).is_ok());
+
+        m.api_routes = vec![route("GET", "board"), route("POST", "agent")];
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn company_resolution_deserializes_tagged_union() {
+        let body: PluginApiRouteCompanyResolution =
+            serde_json::from_value(serde_json::json!({"from": "body", "key": "companyId"})).unwrap();
+        assert_eq!(
+            body,
+            PluginApiRouteCompanyResolution::Body { key: "companyId".into() }
+        );
+        let issue: PluginApiRouteCompanyResolution =
+            serde_json::from_value(serde_json::json!({"from": "issue", "param": "issueId"})).unwrap();
+        assert_eq!(
+            issue,
+            PluginApiRouteCompanyResolution::Issue { param: "issueId".into() }
+        );
+    }
+
+    #[test]
+    fn canonical_route_lists_match_paperclip() {
+        assert_eq!(PLUGIN_API_ROUTE_METHODS.len(), 4);
+        assert_eq!(PLUGIN_API_ROUTE_AUTH_MODES.len(), 4);
+        assert_eq!(PLUGIN_API_ROUTE_CHECKOUT_POLICIES.len(), 3);
     }
 }
