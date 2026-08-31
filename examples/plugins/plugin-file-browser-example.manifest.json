@@ -1,0 +1,91 @@
+{
+  "id": "paperclip-file-browser-example",
+  "apiVersion": 1,
+  "version": "0.2.0",
+  "displayName": "File Browser (Example)",
+  "description": "Example plugin that adds a Files link under each project in the sidebar, a file browser + editor tab on the project detail page, and per-comment file link annotations with a context menu action to open referenced files.",
+  "author": "Paperclip",
+  "categories": [
+    "workspace",
+    "ui"
+  ],
+  "capabilities": [
+    "ui.sidebar.register",
+    "ui.detailTab.register",
+    "ui.commentAnnotation.register",
+    "ui.action.register",
+    "projects.read",
+    "project.workspaces.read",
+    "issue.comments.read",
+    "plugin.state.read"
+  ],
+  "instanceConfigSchema": {
+    "type": "object",
+    "properties": {
+      "showFilesInSidebar": {
+        "type": "boolean",
+        "title": "Show Files in Sidebar",
+        "default": false,
+        "description": "Adds the Files link under each project in the sidebar."
+      },
+      "commentAnnotationMode": {
+        "type": "string",
+        "title": "Comment File Links",
+        "enum": [
+          "annotation",
+          "contextMenu",
+          "both",
+          "none"
+        ],
+        "default": "both",
+        "description": "Controls which comment extensions are active: 'annotation' shows file links below each comment, 'contextMenu' adds an \"Open in Files\" action to the comment menu, 'both' enables both, 'none' disables comment features."
+      }
+    }
+  },
+  "entrypoints": {
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui"
+  },
+  "ui": {
+    "slots": [
+      {
+        "type": "projectSidebarItem",
+        "id": "files-link",
+        "displayName": "Files",
+        "exportName": "FilesLink",
+        "entityTypes": [
+          "project"
+        ],
+        "order": 10
+      },
+      {
+        "type": "detailTab",
+        "id": "files-tab",
+        "displayName": "Files",
+        "exportName": "FilesTab",
+        "entityTypes": [
+          "project"
+        ],
+        "order": 10
+      },
+      {
+        "type": "commentAnnotation",
+        "id": "comment-file-links",
+        "displayName": "File Links",
+        "exportName": "CommentFileLinks",
+        "entityTypes": [
+          "comment"
+        ]
+      },
+      {
+        "type": "commentContextMenuItem",
+        "id": "comment-open-files",
+        "displayName": "Open in Files",
+        "exportName": "CommentOpenFiles",
+        "entityTypes": [
+          "comment"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "paperclip.hello-world-example",
+  "apiVersion": 1,
+  "version": "0.1.0",
+  "displayName": "Hello World Widget (Example)",
+  "description": "Reference UI plugin that adds a simple Hello World widget to the Paperclip dashboard.",
+  "author": "Paperclip",
+  "categories": [
+    "ui"
+  ],
+  "capabilities": [
+    "ui.dashboardWidget.register"
+  ],
+  "entrypoints": {
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui"
+  },
+  "ui": {
+    "slots": [
+      {
+        "type": "dashboardWidget",
+        "id": "hello-world-dashboard-widget",
+        "displayName": "Hello World",
+        "exportName": "HelloWorldDashboardWidget"
+      }
+    ]
+  }
+}

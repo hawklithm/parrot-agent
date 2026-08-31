@@ -1,0 +1,319 @@
+{
+  "id": "paperclip-kitchen-sink-example",
+  "apiVersion": 1,
+  "version": "0.1.0",
+  "displayName": "Kitchen Sink (Example)",
+  "description": "Reference plugin that demonstrates the current Paperclip plugin API surface, UI surfaces, bridge actions, events, jobs, webhooks, tools, local workspace access, and runtime diagnostics in one place.",
+  "author": "Paperclip",
+  "categories": [
+    "ui",
+    "automation",
+    "workspace",
+    "connector"
+  ],
+  "capabilities": [
+    "companies.read",
+    "projects.read",
+    "project.workspaces.read",
+    "issues.read",
+    "issues.create",
+    "issues.update",
+    "issue.comments.read",
+    "issue.comments.create",
+    "agents.read",
+    "agents.pause",
+    "agents.resume",
+    "agents.invoke",
+    "agent.sessions.create",
+    "agent.sessions.list",
+    "agent.sessions.send",
+    "agent.sessions.close",
+    "goals.read",
+    "goals.create",
+    "goals.update",
+    "activity.log.write",
+    "metrics.write",
+    "telemetry.track",
+    "plugin.state.read",
+    "plugin.state.write",
+    "events.subscribe",
+    "events.emit",
+    "jobs.schedule",
+    "webhooks.receive",
+    "http.outbound",
+    "secrets.read-ref",
+    "agent.tools.register",
+    "instance.settings.register",
+    "ui.sidebar.register",
+    "ui.page.register",
+    "ui.detailTab.register",
+    "ui.dashboardWidget.register",
+    "ui.commentAnnotation.register",
+    "ui.action.register"
+  ],
+  "entrypoints": {
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui"
+  },
+  "instanceConfigSchema": {
+    "type": "object",
+    "properties": {
+      "showSidebarEntry": {
+        "type": "boolean",
+        "title": "Show Sidebar Entry",
+        "default": true
+      },
+      "showSidebarPanel": {
+        "type": "boolean",
+        "title": "Show Sidebar Panel",
+        "default": true
+      },
+      "showProjectSidebarItem": {
+        "type": "boolean",
+        "title": "Show Project Sidebar Item",
+        "default": true
+      },
+      "showCommentAnnotation": {
+        "type": "boolean",
+        "title": "Show Comment Annotation",
+        "default": true
+      },
+      "showCommentContextMenuItem": {
+        "type": "boolean",
+        "title": "Show Comment Action",
+        "default": true
+      },
+      "enableWorkspaceDemos": {
+        "type": "boolean",
+        "title": "Enable Workspace Demos",
+        "default": true
+      },
+      "enableProcessDemos": {
+        "type": "boolean",
+        "title": "Enable Process Demos",
+        "default": false,
+        "description": "Allows curated local child-process demos in project workspaces."
+      },
+      "secretRefExample": {
+        "type": "string",
+        "title": "Secret Reference Example",
+        "default": true
+      },
+      "httpDemoUrl": {
+        "type": "string",
+        "title": "HTTP Demo URL",
+        "default": true
+      },
+      "allowedCommands": {
+        "type": "array",
+        "title": "Allowed Process Commands",
+        "items": {
+          "type": "string",
+          "enum": true
+        },
+        "default": true
+      },
+      "workspaceScratchFile": {
+        "type": "string",
+        "title": "Workspace Scratch File",
+        "default": true
+      }
+    }
+  },
+  "jobs": [
+    {
+      "jobKey": "demo-heartbeat",
+      "displayName": "Demo Heartbeat",
+      "description": "Periodic demo job that records plugin runtime activity.",
+      "schedule": "*/15 * * * *"
+    }
+  ],
+  "webhooks": [
+    {
+      "endpointKey": "demo-ingest",
+      "displayName": "Demo Ingest",
+      "description": "Accepts arbitrary webhook payloads and records the latest delivery in plugin state."
+    }
+  ],
+  "tools": [
+    {
+      "name": "echo",
+      "displayName": "Kitchen Sink Echo",
+      "description": "Returns the provided message and the current run context.",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ]
+      }
+    },
+    {
+      "name": "company-summary",
+      "displayName": "Kitchen Sink Company Summary",
+      "description": "Summarizes the current company using the Paperclip domain APIs.",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "create-issue",
+      "displayName": "Kitchen Sink Create Issue",
+      "description": "Creates an issue in the current project from an agent tool call.",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ]
+      }
+    }
+  ],
+  "ui": {
+    "slots": [
+      {
+        "type": "page",
+        "id": "kitchen-sink-page",
+        "displayName": "Kitchen Sink",
+        "exportName": "KitchenSinkPage",
+        "routePath": "kitchensink"
+      },
+      {
+        "type": "settingsPage",
+        "id": "kitchen-sink-settings-page",
+        "displayName": "Kitchen Sink Settings",
+        "exportName": "KitchenSinkSettingsPage"
+      },
+      {
+        "type": "companySettingsPage",
+        "id": "kitchen-sink-company-settings-page",
+        "displayName": "Kitchen Sink",
+        "exportName": "KitchenSinkCompanySettingsPage",
+        "routePath": "kitchen-sink"
+      },
+      {
+        "type": "dashboardWidget",
+        "id": "kitchen-sink-dashboard-widget",
+        "displayName": "Kitchen Sink",
+        "exportName": "KitchenSinkDashboardWidget"
+      },
+      {
+        "type": "sidebar",
+        "id": "kitchen-sink-sidebar-link",
+        "displayName": "Kitchen Sink",
+        "exportName": "KitchenSinkSidebarLink"
+      },
+      {
+        "type": "sidebarPanel",
+        "id": "kitchen-sink-sidebar-panel",
+        "displayName": "Kitchen Sink Panel",
+        "exportName": "KitchenSinkSidebarPanel"
+      },
+      {
+        "type": "projectSidebarItem",
+        "id": "kitchen-sink-project-link",
+        "displayName": "Kitchen Sink",
+        "exportName": "KitchenSinkProjectSidebarItem",
+        "entityTypes": [
+          "project"
+        ]
+      },
+      {
+        "type": "detailTab",
+        "id": "kitchen-sink-project-tab",
+        "displayName": "Kitchen Sink",
+        "exportName": "KitchenSinkProjectTab",
+        "entityTypes": [
+          "project"
+        ]
+      },
+      {
+        "type": "detailTab",
+        "id": "kitchen-sink-issue-tab",
+        "displayName": "Kitchen Sink",
+        "exportName": "KitchenSinkIssueTab",
+        "entityTypes": [
+          "issue"
+        ]
+      },
+      {
+        "type": "taskDetailView",
+        "id": "kitchen-sink-task-detail",
+        "displayName": "Kitchen Sink Task View",
+        "exportName": "KitchenSinkTaskDetailView",
+        "entityTypes": [
+          "issue"
+        ]
+      },
+      {
+        "type": "toolbarButton",
+        "id": "kitchen-sink-toolbar-action",
+        "displayName": "Kitchen Sink Action",
+        "exportName": "KitchenSinkToolbarButton",
+        "entityTypes": [
+          "project",
+          "issue"
+        ]
+      },
+      {
+        "type": "contextMenuItem",
+        "id": "kitchen-sink-context-action",
+        "displayName": "Kitchen Sink Context",
+        "exportName": "KitchenSinkContextMenuItem",
+        "entityTypes": [
+          "project",
+          "issue"
+        ]
+      },
+      {
+        "type": "commentAnnotation",
+        "id": "kitchen-sink-comment-annotation",
+        "displayName": "Kitchen Sink Comment Annotation",
+        "exportName": "KitchenSinkCommentAnnotation",
+        "entityTypes": [
+          "comment"
+        ]
+      },
+      {
+        "type": "commentContextMenuItem",
+        "id": "kitchen-sink-comment-action",
+        "displayName": "Kitchen Sink Comment Action",
+        "exportName": "KitchenSinkCommentContextMenuItem",
+        "entityTypes": [
+          "comment"
+        ]
+      }
+    ],
+    "launchers": [
+      {
+        "id": "kitchen-sink-launcher",
+        "displayName": "Kitchen Sink Modal",
+        "placementZone": "toolbarButton",
+        "entityTypes": [
+          "project",
+          "issue"
+        ],
+        "action": {
+          "type": "openModal",
+          "target": "KitchenSinkLauncherModal"
+        },
+        "render": {
+          "environment": "hostOverlay",
+          "bounds": "wide"
+        }
+      }
+    ]
+  }
+}
