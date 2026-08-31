@@ -410,6 +410,145 @@ pub fn schema_hash(input_schema: &serde_json::Value) -> String {
     stable_hash(input_schema)
 }
 
+/// A policy row simplified to the fields Paperclip's decision ladder reads.
+///
+/// Faithful to `server/src/services/tool-access-policy.ts` `decide()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicySpec {
+    pub id: String,
+    /// One of `TOOL_POLICY_TYPES`.
+    pub policy_type: String,
+    /// Selector: only apply this policy to this tool name (None = all tools).
+    pub selector_tool_name: Option<String>,
+    pub description: Option<String>,
+    /// trust_rule only: whether the rule is active.
+    pub trust_rule_active: bool,
+    /// trust_rule only: whether the covered tool changed after rule creation.
+    pub trust_rule_needs_review: bool,
+    /// rate_limit only: whether the caller pre-evaluated the limit as exceeded.
+    pub rate_limit_exceeded: bool,
+}
+
+/// Static inputs the ladder reads outside the policy table.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EvaluationContext {
+    pub tool_name: String,
+    /// Paperclip `explicitGrant(ctx)`.
+    pub explicit_grant: bool,
+    /// Paperclip profile fallback: an effective profile allows the tool
+    /// (defaultAction=allow or an include entry matched, with no excludes).
+    pub profile_allows: bool,
+}
+
+/// The outcome of the decision ladder: decision + reason code pair exactly as
+/// Paperclip emits them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionOutcome {
+    /// One of `TOOL_POLICY_DECISIONS`.
+    pub decision: &'static str,
+    pub reason_code: &'static str,
+    pub message: String,
+    /// The policy that decided, when one did.
+    pub policy_id: Option<String>,
+}
+
+fn matched(policy: &PolicySpec, ctx: &EvaluationContext) -> bool {
+    match &policy.selector_tool_name {
+        Some(name) => name == &ctx.tool_name,
+        None => true,
+    }
+}
+
+/// Paperclip's `decide()` precedence ladder over an ordered policy list.
+///
+/// Order (fail-closed): block → rate_limit (if exceeded) → trust_rule
+/// (needs_review → require_approval, else allow) → require_approval → allow →
+/// explicit grant → effective profile → **deny by default**.
+pub fn decide_tool_access(
+    policies: &[PolicySpec],
+    ctx: &EvaluationContext,
+) -> DecisionOutcome {
+    for policy in policies {
+        if !matched(policy, ctx) {
+            continue;
+        }
+        match policy.policy_type.as_str() {
+            "block" => {
+                return DecisionOutcome {
+                    decision: "deny",
+                    reason_code: "deny_policy_block",
+                    message: policy.description.clone().unwrap_or_else(|| "Tool access is blocked by policy.".into()),
+                    policy_id: Some(policy.id.clone()),
+                };
+            }
+            "rate_limit" if policy.rate_limit_exceeded => {
+                return DecisionOutcome {
+                    decision: "rate_limited",
+                    reason_code: "rate_limited",
+                    message: "Tool access rate limit exceeded.".into(),
+                    policy_id: Some(policy.id.clone()),
+                };
+            }
+            "trust_rule" if policy.trust_rule_active => {
+                if policy.trust_rule_needs_review {
+                    return DecisionOutcome {
+                        decision: "require_approval",
+                        reason_code: "requires_review_changed_tool",
+                        message: "Tool definition changed or was quarantined after this trust rule was created; review is required.".into(),
+                        policy_id: Some(policy.id.clone()),
+                    };
+                }
+                return DecisionOutcome {
+                    decision: "allow",
+                    reason_code: "allow_trust_rule",
+                    message: policy.description.clone().unwrap_or_else(|| "Tool access allowed by trust rule.".into()),
+                    policy_id: Some(policy.id.clone()),
+                };
+            }
+            "require_approval" => {
+                return DecisionOutcome {
+                    decision: "require_approval",
+                    reason_code: "requires_approval_policy",
+                    message: policy.description.clone().unwrap_or_else(|| "Tool access requires approval.".into()),
+                    policy_id: Some(policy.id.clone()),
+                };
+            }
+            "allow" => {
+                return DecisionOutcome {
+                    decision: "allow",
+                    reason_code: "allow_policy",
+                    message: "Tool access allowed by policy.".into(),
+                    policy_id: Some(policy.id.clone()),
+                };
+            }
+            // rate_limit not exceeded and inactive trust rules fall through,
+            // exactly like Paperclip's `continue`.
+            _ => {}
+        }
+    }
+    if ctx.explicit_grant {
+        return DecisionOutcome {
+            decision: "allow",
+            reason_code: "allow_explicit_grant",
+            message: "Tool access allowed by explicit grant.".into(),
+            policy_id: None,
+        };
+    }
+    if ctx.profile_allows {
+        return DecisionOutcome {
+            decision: "allow",
+            reason_code: "allow_profile",
+            message: "Tool access allowed by effective profile.".into(),
+            policy_id: None,
+        };
+    }
+    DecisionOutcome {
+        decision: "deny",
+        reason_code: "deny_default",
+        message: "No effective tool profile, grant, or allow policy permits this call.".into(),
+        policy_id: None,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +811,82 @@ mod tests {
         assert_eq!(classify_risk("create_thing", &serde_json::json!({})), "write");
         assert_eq!(classify_risk("remove_thing", &serde_json::json!({})), "destructive");
         assert_eq!(classify_risk("do_thing", &serde_json::json!({})), "medium");
+    }
+
+    #[test]
+    fn decision_ladder_follows_paperclip_precedence() {
+        let policy = |id: &str, kind: &str| PolicySpec {
+            id: id.into(),
+            policy_type: kind.into(),
+            selector_tool_name: None,
+            description: None,
+            trust_rule_active: true,
+            trust_rule_needs_review: false,
+            rate_limit_exceeded: false,
+        };
+        let ctx = EvaluationContext::default();
+        // block beats a later allow.
+        let out = decide_tool_access(&[policy("p1", "block"), policy("p2", "allow")], &ctx);
+        assert_eq!(out.decision, "deny");
+        assert_eq!(out.reason_code, "deny_policy_block");
+        // allow beats a later require_approval.
+        let out = decide_tool_access(&[policy("p1", "allow"), policy("p2", "require_approval")], &ctx);
+        assert_eq!(out.decision, "allow");
+        assert_eq!(out.reason_code, "allow_policy");
+        // require_approval beats a later allow.
+        let out = decide_tool_access(&[policy("p1", "require_approval"), policy("p2", "allow")], &ctx);
+        assert_eq!(out.decision, "require_approval");
+        assert_eq!(out.reason_code, "requires_approval_policy");
+        // rate_limit only limits when exceeded; otherwise falls through.
+        let mut limited = policy("p1", "rate_limit");
+        limited.rate_limit_exceeded = true;
+        let out = decide_tool_access(&[limited, policy("p2", "allow")], &ctx);
+        assert_eq!(out.decision, "rate_limited");
+        assert_eq!(out.reason_code, "rate_limited");
+        // trust rule needs review -> require_approval.
+        let mut review = policy("p1", "trust_rule");
+        review.trust_rule_needs_review = true;
+        let out = decide_tool_access(&[review], &ctx);
+        assert_eq!(out.decision, "require_approval");
+        assert_eq!(out.reason_code, "requires_review_changed_tool");
+        // active trust rule -> allow.
+        let out = decide_tool_access(&[policy("p1", "trust_rule")], &ctx);
+        assert_eq!(out.decision, "allow");
+        assert_eq!(out.reason_code, "allow_trust_rule");
+        // inactive trust rule falls through to default deny.
+        let mut inactive = policy("p1", "trust_rule");
+        inactive.trust_rule_active = false;
+        let out = decide_tool_access(&[inactive], &ctx);
+        assert_eq!(out.decision, "deny");
+        assert_eq!(out.reason_code, "deny_default");
+    }
+
+    #[test]
+    fn grant_profile_and_default_deny_fallbacks() {
+        let ctx = EvaluationContext { explicit_grant: true, profile_allows: true, ..Default::default() };
+        // Grant outranks profile.
+        let out = decide_tool_access(&[], &ctx);
+        assert_eq!(out.reason_code, "allow_explicit_grant");
+        let out = decide_tool_access(&[], &EvaluationContext { profile_allows: true, ..Default::default() });
+        assert_eq!(out.reason_code, "allow_profile");
+        let out = decide_tool_access(&[], &EvaluationContext::default());
+        assert_eq!((out.decision, out.reason_code), ("deny", "deny_default"));
+    }
+
+    #[test]
+    fn selectors_narrow_policy_scope() {
+        let scoped = PolicySpec {
+            id: "scoped".into(),
+            policy_type: "block".into(),
+            selector_tool_name: Some("other_tool".into()),
+            description: None,
+            trust_rule_active: true,
+            trust_rule_needs_review: false,
+            rate_limit_exceeded: false,
+        };
+        let ctx = EvaluationContext { tool_name: "my_tool".into(), ..Default::default() };
+        // Selector does not match -> policy skipped -> default deny.
+        let out = decide_tool_access(&[scoped], &ctx);
+        assert_eq!(out.reason_code, "deny_default");
     }
 }

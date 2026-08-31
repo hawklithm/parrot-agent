@@ -3928,15 +3928,93 @@ async fn reorder_tool_policies(
     Ok(Json(json!({ "reordered": true })))
 }
 
-/// POST /companies/:cid/tools/policy/test —— mock。
+/// POST /companies/:cid/tools/policy/test
+///
+/// Runs Paperclip's decision ladder (block → rate_limit → trust_rule →
+/// require_approval → allow → explicit grant → effective profile → default
+/// deny) over the company's enabled policies for the requested tool.
 async fn test_tool_policy(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
     require_board_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok(Json(json!({ "matches": true })))
+    let tool_name = body
+        .get("toolName")
+        .or_else(|| body.get("tool_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    let rows = sqlx::query(
+        "SELECT id, policy_type, selectors, conditions, config, description \
+           FROM tool_policies \
+          WHERE company_id = $1 AND enabled = true \
+          ORDER BY priority ASC, created_at ASC",
+    )
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to load tool policies: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let policies: Vec<services::tool_access_contract::PolicySpec> = rows
+        .iter()
+        .map(|row| {
+            let id: Uuid = row.get("id");
+            let selectors: Value = row.try_get("selectors").unwrap_or(json!({}));
+            // Paperclip selectorMatches narrows by toolName when present.
+            let selector_tool_name = selectors
+                .get("toolName")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let policy_type: String = row.get("policy_type");
+            let config: Value = row.try_get("config").unwrap_or(json!({}));
+            let conditions: Value = row.try_get("conditions").unwrap_or(json!({}));
+            // trust_rule liveness: config.active !== false and conditions do
+            // not mark the covered tool changed.
+            let trust_rule_active = config.get("active").and_then(Value::as_bool) != Some(false);
+            let trust_rule_needs_review = conditions
+                .get("needsReview")
+                .or_else(|| conditions.get("needs_review"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let rate_limit_exceeded = config
+                .get("exceeded")
+                .or_else(|| config.get("limited"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            services::tool_access_contract::PolicySpec {
+                id: id.to_string(),
+                policy_type,
+                selector_tool_name,
+                description: row.try_get("description").unwrap_or(None),
+                trust_rule_active,
+                trust_rule_needs_review,
+                rate_limit_exceeded,
+            }
+        })
+        .collect();
+
+    let ctx = services::tool_access_contract::EvaluationContext {
+        tool_name,
+        // Live grant/profile projection is not wired in the test route yet;
+        // Paperclip falls through to default deny without them.
+        explicit_grant: false,
+        profile_allows: false,
+    };
+    let outcome = services::tool_access_contract::decide_tool_access(&policies, &ctx);
+    Ok(Json(json!({
+        "decision": outcome.decision,
+        "reasonCode": outcome.reason_code,
+        "message": outcome.message,
+        "policyId": outcome.policy_id,
+    })))
 }
 
 fn empty_json_array() -> Value {

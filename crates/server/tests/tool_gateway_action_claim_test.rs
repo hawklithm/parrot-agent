@@ -3887,3 +3887,68 @@ async fn catalog_refresh_quarantines_new_entries_per_paperclip() {
 
     server.abort();
 }
+
+/// Policy test route runs Paperclip's decision ladder over real rows: block
+/// wins over allow by priority order, and a tool outside every selector
+/// falls to default deny.
+#[tokio::test]
+async fn policy_test_route_runs_decision_ladder() {
+    let pool = connect_and_migrate().await;
+    let company_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id).bind("Policy Test Company").bind(format!("PT{}", &company_id.simple().to_string()[..8]))
+        .execute(&pool).await.expect("insert company");
+
+    // A block policy on delete_repo and an allow policy on everything else;
+    // block comes first by priority, matching Paperclip's fail-closed ladder.
+    for (name, kind, selector, priority) in [
+        ("block-delete", "block", json!({"toolName": "delete_repo"}), 10),
+        ("allow-rest", "allow", json!({}), 20),
+    ] {
+        sqlx::query(
+            "INSERT INTO tool_policies (id, company_id, name, policy_type, priority, enabled, selectors, config)
+             VALUES ($1, $2, $3, $4, $5, true, $6, '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4()).bind(company_id).bind(name).bind(kind).bind(priority).bind(selector)
+        .execute(&pool).await.expect("insert policy");
+    }
+
+    let state = build_app_state(pool.clone()).await.expect("build app state");
+    let app = tool_access_routes().with_state(state);
+    let owner = board_actor_with_role(company_id, MembershipRole::Owner);
+
+    // delete_repo matches the block selector first -> deny.
+    let (status, body) = request_connection_route(
+        &app, &owner, "POST",
+        format!("/companies/{company_id}/tools/policy/test"),
+        Some(json!({"toolName": "delete_repo"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "policy test={body:?}");
+    assert_eq!(body.get("decision").and_then(Value::as_str), Some("deny"));
+    assert_eq!(body.get("reasonCode").and_then(Value::as_str), Some("deny_policy_block"));
+
+    // create_repo misses the block selector, hits allow -> allowed by policy.
+    let (status, body) = request_connection_route(
+        &app, &owner, "POST",
+        format!("/companies/{company_id}/tools/policy/test"),
+        Some(json!({"toolName": "create_repo"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "policy test={body:?}");
+    assert_eq!(body.get("decision").and_then(Value::as_str), Some("allow"));
+    assert_eq!(body.get("reasonCode").and_then(Value::as_str), Some("allow_policy"));
+
+    // No policies at all -> default deny.
+    let empty_company = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(empty_company).bind("Policy Test Empty").bind(format!("PE{}", &empty_company.simple().to_string()[..8]))
+        .execute(&pool).await.expect("insert empty company");
+    let owner2 = board_actor_with_role(empty_company, MembershipRole::Owner);
+    let (status, body) = request_connection_route(
+        &app, &owner2, "POST",
+        format!("/companies/{empty_company}/tools/policy/test"),
+        Some(json!({"toolName": "anything"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "policy test={body:?}");
+    assert_eq!(body.get("decision").and_then(Value::as_str), Some("deny"));
+    assert_eq!(body.get("reasonCode").and_then(Value::as_str), Some("deny_default"));
+}
