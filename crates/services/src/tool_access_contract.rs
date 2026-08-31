@@ -476,4 +476,27 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn gateway_issuance_outcomes_are_canonical() {
+        // Outcomes produced by ConnectionTokenExchangeError constructors and
+        // direct call sites in api/src/routes/tool_access.rs.
+        for outcome in [
+            "success",
+            "denied",
+            "use_env_lease",
+            "upstream_error",
+            "failure",
+            "rate_limited", // canonical, reserved for the limited path
+        ] {
+            assert!(
+                CONNECTION_TOKEN_ISSUANCE_OUTCOMES.contains(&outcome),
+                "{outcome} must be canonical"
+            );
+        }
+        // Paths emitted by connection_token_path are exactly the canonical set.
+        for path in ["exchange", "oauth_access", "static"] {
+            assert!(CONNECTION_TOKEN_ISSUANCE_PATHS.contains(&path));
+        }
+    }
 }
