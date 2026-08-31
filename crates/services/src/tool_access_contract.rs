@@ -381,4 +381,98 @@ mod tests {
             );
         }
     }
+
+/// Map a connection-scoped activity-log action + details to a canonical
+/// lifecycle event type, or `None` when the row is not an operator-visible
+/// lifecycle change.
+///
+/// Port of Paperclip `activityLogActionToLifecycleType`
+/// (`server/src/services/tool-access.ts`), extended to also recognize the
+/// action spellings Parrot already writes (`tool_connection.created`,
+/// `tool_connection.oauth_connected`) so the two systems' feeds line up. A
+/// `tool_connection.updated` row only surfaces when its details carry a
+/// `lifecycle` discriminator (`paused`/`resumed`/`allowlist_changed`);
+/// plain settings edits stay out of the feed.
+pub fn activity_log_action_to_lifecycle_type(
+    action: &str,
+    details: Option<&serde_json::Value>,
+) -> Option<&'static str> {
+    let lifecycle = details
+        .and_then(|d| d.get("lifecycle"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match action {
+        "tool_app.connected" | "tool_app.oauth_connected" | "tool_example.installed" => {
+            Some("app_connected")
+        }
+        // Parrot spellings for the same operator-visible moments.
+        "tool_connection.created" | "tool_connection.oauth_connected" => Some("app_connected"),
+        "tool_app.reconnected" => Some("reconnected"),
+        "tool_connection.archived" | "tool_connection.deleted" => Some("disconnected"),
+        "tool_connection.updated" => match lifecycle {
+            "paused" => Some("app_paused"),
+            "resumed" => Some("app_resumed"),
+            "allowlist_changed" => Some("allowlist_changed"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+    #[test]
+    fn activity_actions_map_to_lifecycle_types() {
+        let d = serde_json::json!({"lifecycle": "paused"});
+        assert_eq!(
+            activity_log_action_to_lifecycle_type("tool_connection.updated", Some(&d)),
+            Some("app_paused")
+        );
+        let d = serde_json::json!({"lifecycle": "allowlist_changed", "added": 2});
+        assert_eq!(
+            activity_log_action_to_lifecycle_type("tool_connection.updated", Some(&d)),
+            Some("allowlist_changed")
+        );
+        // Plain settings edits produce no lifecycle event.
+        let d = serde_json::json!({"name": "renamed"});
+        assert_eq!(
+            activity_log_action_to_lifecycle_type("tool_connection.updated", Some(&d)),
+            None
+        );
+        // Paperclip spellings.
+        assert_eq!(
+            activity_log_action_to_lifecycle_type("tool_app.connected", None),
+            Some("app_connected")
+        );
+        assert_eq!(
+            activity_log_action_to_lifecycle_type("tool_connection.archived", None),
+            Some("disconnected")
+        );
+        // Parrot spellings.
+        assert_eq!(
+            activity_log_action_to_lifecycle_type("tool_connection.oauth_connected", None),
+            Some("app_connected")
+        );
+        assert_eq!(
+            activity_log_action_to_lifecycle_type("tool_connection.created", None),
+            Some("app_connected")
+        );
+        // Unknown actions are not lifecycle events.
+        assert_eq!(activity_log_action_to_lifecycle_type("company.updated", None), None);
+    }
+
+    #[test]
+    fn every_lifecycle_type_is_canonical() {
+        for action in [
+            "tool_app.connected",
+            "tool_app.oauth_connected",
+            "tool_example.installed",
+            "tool_connection.created",
+            "tool_connection.oauth_connected",
+        ] {
+            let t = activity_log_action_to_lifecycle_type(action, None).unwrap();
+            assert!(
+                TOOL_CONNECTION_LIFECYCLE_EVENT_TYPES.contains(&t),
+                "{t} must be canonical"
+            );
+        }
+    }
 }
