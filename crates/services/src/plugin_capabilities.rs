@@ -114,6 +114,8 @@ pub enum CapabilityError {
     MissingCapability(String, String),
     #[error("invalid tool declaration: {0}")]
     InvalidTool(String),
+    #[error("invalid manifest: {0}")]
+    InvalidManifest(String),
 }
 
 /// Parse a capability string into its canonical form, rejecting unknown values.
@@ -128,6 +130,207 @@ pub fn parse_capability(raw: &str) -> Result<String, CapabilityError> {
 /// Whether `granted` contains the capability required by `op`.
 pub fn has_capability(granted: &[String], required: &str) -> bool {
     granted.iter().any(|c| c == required)
+}
+
+/// Declares a scheduled job contributed by the plugin.
+///
+/// Port of `@paperclipai/shared` `PluginJobDeclaration` (PLUGIN_SPEC §13.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginJobDeclaration {
+    /// Stable identifier for this job, unique within the plugin.
+    pub job_key: String,
+    /// Human-readable name shown in the operator UI.
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Cron expression for the schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+}
+
+/// Declares a webhook endpoint the plugin can receive.
+/// Route: `POST /api/plugins/:pluginId/webhooks/:endpointKey`
+///
+/// Port of `@paperclipai/shared` `PluginWebhookDeclaration` (PLUGIN_SPEC §18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWebhookDeclaration {
+    /// Stable identifier for this endpoint, unique within the plugin.
+    pub endpoint_key: String,
+    /// Human-readable name shown in the operator UI.
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The subset of `PaperclipPluginManifestV1` (PLUGIN_SPEC §6) this host
+/// validates. Unknown/extra manifest keys are ignored so newer Paperclip
+/// manifests still load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManifestV1 {
+    /// Globally unique plugin identifier (e.g. `"acme.linear-sync"`).
+    /// Lowercase alphanumeric with dots, hyphens, or underscores.
+    pub id: String,
+    /// Plugin API version. Must be `1` for the current spec.
+    pub api_version: i64,
+    /// Semver version of the plugin package (e.g. `"1.2.0"`).
+    pub version: String,
+    /// Human-readable name (max 100 chars).
+    pub display_name: String,
+    /// Short description (max 500 chars).
+    pub description: String,
+    /// Author name (max 200 chars).
+    pub author: String,
+    /// Capabilities this plugin requires from the host. Enforced at runtime.
+    pub capabilities: Vec<String>,
+    /// Entrypoint paths relative to the package root.
+    pub entrypoints: PluginManifestEntrypoints,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jobs: Option<Vec<PluginJobDeclaration>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhooks: Option<Vec<PluginWebhookDeclaration>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<PluginToolDeclaration>>,
+    /// Whether the manifest declares UI slots (requires `entrypoints.ui`).
+    #[serde(default)]
+    pub declares_ui: bool,
+}
+
+/// Entrypoint paths relative to the package root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginManifestEntrypoints {
+    /// Path to the worker entrypoint (required).
+    pub worker: String,
+    /// Path to the UI bundle directory (required when UI is declared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<String>,
+}
+
+/// Validate a manifest against Paperclip's declaration rules.
+///
+/// Enforced (PLUGIN_SPEC §6/§11/§13.6/§18):
+/// - `apiVersion` must be `1`
+/// - `id` must be lowercase alphanumeric with `.`/`-`/`_`
+/// - required text fields must be non-empty and within length caps
+/// - every capability must be canonical
+/// - `tools` requires `agent.tools.register`
+/// - `jobs` requires `jobs.schedule`
+/// - `webhooks` requires `webhooks.receive`
+/// - declared UI requires `entrypoints.ui`
+/// - duplicate job keys / webhook keys / tool names are rejected
+pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityError> {
+    if manifest.api_version != 1 {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "unsupported apiVersion: {}",
+            manifest.api_version
+        )));
+    }
+    if manifest.id.is_empty()
+        || !manifest
+            .id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(CapabilityError::InvalidManifest(format!(
+            "invalid plugin id: {}",
+            manifest.id
+        )));
+    }
+    if manifest.display_name.is_empty() || manifest.display_name.len() > 100 {
+        return Err(CapabilityError::InvalidManifest(
+            "displayName must be 1-100 chars".into(),
+        ));
+    }
+    if manifest.description.is_empty() || manifest.description.len() > 500 {
+        return Err(CapabilityError::InvalidManifest(
+            "description must be 1-500 chars".into(),
+        ));
+    }
+    if manifest.author.is_empty() || manifest.author.len() > 200 {
+        return Err(CapabilityError::InvalidManifest(
+            "author must be 1-200 chars".into(),
+        ));
+    }
+    if manifest.entrypoints.worker.trim().is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "entrypoints.worker is required".into(),
+        ));
+    }
+
+    for cap in &manifest.capabilities {
+        parse_capability(cap)?;
+    }
+
+    if let Some(jobs) = &manifest.jobs {
+        if !jobs.is_empty() && !has_capability(&manifest.capabilities, "jobs.schedule") {
+            return Err(CapabilityError::MissingCapability(
+                "jobs".into(),
+                "jobs.schedule".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for job in jobs {
+            if job.job_key.trim().is_empty() {
+                return Err(CapabilityError::InvalidManifest("jobKey is required".into()));
+            }
+            if !seen.insert(job.job_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate jobKey: {}",
+                    job.job_key
+                )));
+            }
+        }
+    }
+
+    if let Some(webhooks) = &manifest.webhooks {
+        if !webhooks.is_empty() && !has_capability(&manifest.capabilities, "webhooks.receive") {
+            return Err(CapabilityError::MissingCapability(
+                "webhooks".into(),
+                "webhooks.receive".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for hook in webhooks {
+            if hook.endpoint_key.trim().is_empty() {
+                return Err(CapabilityError::InvalidManifest(
+                    "endpointKey is required".into(),
+                ));
+            }
+            if !seen.insert(hook.endpoint_key.clone()) {
+                return Err(CapabilityError::InvalidManifest(format!(
+                    "duplicate endpointKey: {}",
+                    hook.endpoint_key
+                )));
+            }
+        }
+    }
+
+    if let Some(tools) = &manifest.tools {
+        if !tools.is_empty() && !has_capability(&manifest.capabilities, "agent.tools.register") {
+            return Err(CapabilityError::MissingCapability(
+                "tools".into(),
+                "agent.tools.register".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for tool in tools {
+            validate_tool_declaration(tool, &manifest.capabilities)?;
+            if !seen.insert(tool.name.clone()) {
+                return Err(CapabilityError::InvalidTool(format!(
+                    "duplicate tool name: {}",
+                    tool.name
+                )));
+            }
+        }
+    }
+
+    if manifest.declares_ui && manifest.entrypoints.ui.is_none() {
+        return Err(CapabilityError::InvalidManifest(
+            "ui declared without entrypoints.ui".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Declares an agent tool contributed by the plugin. Tools are namespaced by
@@ -340,5 +543,157 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
         assert_eq!(back, t);
         assert_eq!(back.name, "linear:search");
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    fn manifest(caps: &[&str]) -> PluginManifestV1 {
+        PluginManifestV1 {
+            id: "acme.linear-sync".into(),
+            api_version: 1,
+            version: "1.2.0".into(),
+            display_name: "Linear Sync".into(),
+            description: "Syncs issues".into(),
+            author: "Jane Doe".into(),
+            capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            entrypoints: PluginManifestEntrypoints {
+                worker: "dist/worker.js".into(),
+                ui: None,
+            },
+            jobs: None,
+            webhooks: None,
+            tools: None,
+            declares_ui: false,
+        }
+    }
+
+    #[test]
+    fn minimal_manifest_is_valid() {
+        assert!(validate_manifest(&manifest(&["issues.read"])).is_ok());
+    }
+
+    #[test]
+    fn api_version_must_be_one() {
+        let mut m = manifest(&[]);
+        m.api_version = 2;
+        assert!(matches!(
+            validate_manifest(&m),
+            Err(CapabilityError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn plugin_id_must_be_lowercase_alphanumeric() {
+        for bad in ["Acme.Thing", "acme thing", "acme/thing", ""] {
+            let mut m = manifest(&[]);
+            m.id = bad.into();
+            assert!(validate_manifest(&m).is_err(), "id {bad:?} must be rejected");
+        }
+        for good in ["acme.linear-sync", "acme_thing", "acme.thing2"] {
+            let mut m = manifest(&[]);
+            m.id = good.into();
+            assert!(validate_manifest(&m).is_ok(), "id {good:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn jobs_require_jobs_schedule_capability() {
+        let mut m = manifest(&["issues.read"]);
+        m.jobs = Some(vec![PluginJobDeclaration {
+            job_key: "sync".into(),
+            display_name: "Sync".into(),
+            description: None,
+            schedule: Some("0 * * * *".into()),
+        }]);
+        assert_eq!(
+            validate_manifest(&m),
+            Err(CapabilityError::MissingCapability(
+                "jobs".into(),
+                "jobs.schedule".into()
+            ))
+        );
+        m.capabilities.push("jobs.schedule".into());
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn webhooks_require_webhooks_receive_capability() {
+        let mut m = manifest(&[]);
+        m.webhooks = Some(vec![PluginWebhookDeclaration {
+            endpoint_key: "linear".into(),
+            display_name: "Linear".into(),
+            description: None,
+        }]);
+        assert!(validate_manifest(&m).is_err());
+        m.capabilities.push("webhooks.receive".into());
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn tools_require_agent_tools_register_in_manifest() {
+        let mut m = manifest(&["issues.read"]);
+        m.tools = Some(vec![PluginToolDeclaration {
+            name: "search".into(),
+            display_name: "Search".into(),
+            description: "d".into(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+        }]);
+        assert!(validate_manifest(&m).is_err());
+        m.capabilities.push("agent.tools.register".into());
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn duplicate_job_and_webhook_keys_are_rejected() {
+        let job = PluginJobDeclaration {
+            job_key: "sync".into(),
+            display_name: "S".into(),
+            description: None,
+            schedule: None,
+        };
+        let mut m = manifest(&["jobs.schedule"]);
+        m.jobs = Some(vec![job.clone(), job]);
+        assert!(validate_manifest(&m).is_err());
+
+        let hook = PluginWebhookDeclaration {
+            endpoint_key: "h".into(),
+            display_name: "H".into(),
+            description: None,
+        };
+        let mut m2 = manifest(&["webhooks.receive"]);
+        m2.webhooks = Some(vec![hook.clone(), hook]);
+        assert!(validate_manifest(&m2).is_err());
+    }
+
+    #[test]
+    fn declared_ui_requires_entrypoints_ui() {
+        let mut m = manifest(&[]);
+        m.declares_ui = true;
+        assert!(validate_manifest(&m).is_err());
+        m.entrypoints.ui = Some("dist/ui".into());
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn unknown_manifest_capability_is_rejected() {
+        let mut m = manifest(&[]);
+        m.capabilities.push("made.up".into());
+        assert!(matches!(
+            validate_manifest(&m),
+            Err(CapabilityError::UnknownCapability(_))
+        ));
+    }
+
+    #[test]
+    fn manifest_round_trips_camel_case() {
+        let m = manifest(&["issues.read"]);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"apiVersion\""), "got: {json}");
+        assert!(json.contains("\"displayName\""));
+        let back: PluginManifestV1 = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
     }
 }
