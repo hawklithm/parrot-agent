@@ -102,6 +102,7 @@ mod tests {
             "displayName": "Linear Sync",
             "description": "Syncs",
             "author": "Jane",
+            "categories": ["connector"],
             "capabilities": ["jobs.schedule"],
             "entrypoints": {"worker": "dist/worker.js"},
             "jobs": [{"jobKey": "sync", "displayName": "Sync"}]

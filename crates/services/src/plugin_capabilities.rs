@@ -229,6 +229,13 @@ pub struct PluginManifestV1 {
     /// Minimum host version required (semver lower bound).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_host_version: Option<String>,
+    /// One or more categories classifying this plugin (§6.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    /// UI bundle declarations (§19); `ui.slots`/`ui.launchers` are preferred
+    /// over the flat legacy fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<PluginUiDeclaration>,
     /// Legacy alias for `minimumHostVersion`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_paperclip_version: Option<String>,
@@ -566,6 +573,9 @@ pub struct PluginEnvironmentDriverDeclaration {
     /// Provider can capture a reusable template from a live setup sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_template_capture: Option<bool>,
+    /// Fine-grained sandbox capability declaration (declaration ∩ verified ∩ narrowing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_capabilities: Option<SandboxProviderCapabilities>,
     /// Kind of template reference returned by the provider's capture hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_ref_kind: Option<String>,
@@ -994,6 +1004,67 @@ pub fn validate_minimum_host_version(version: &str) -> Result<(), CapabilityErro
     Ok(())
 }
 
+/// Plugin classification categories (PLUGIN_SPEC §6.2).
+pub const PLUGIN_CATEGORIES: &[&str] = &["connector", "workspace", "automation", "ui"];
+
+/// Fine-grained sandbox capability declaration for a plugin environment driver.
+///
+/// Every flag is optional and partial: the host resolves the effective
+/// capability as `declaration ∩ verified ∩ narrowing`. A declared flag never
+/// grants a capability the live worker did not verify.
+///
+/// Port of `@paperclipai/shared` `SandboxProviderCapabilities`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxProviderCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reusable_leases: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_sync_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_sync_out: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_process_sessions: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independent_control_commands: Option<bool>,
+    /// Selects the session-output streaming path; every other provider keeps
+    /// the output-file poll path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_session_output: Option<bool>,
+}
+
+/// Groups plugin UI declarations served from the shared UI bundle root.
+///
+/// Port of `@paperclipai/shared` `PluginUiDeclaration` (PLUGIN_SPEC §19).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PluginUiDeclaration {
+    /// UI extension slots this plugin fills.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<PluginUiSlotDeclaration>,
+    /// Declarative launcher metadata for host-mounted plugin entry points.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchers: Vec<PluginLauncherDeclaration>,
+}
+
+/// Validate a category list (PLUGIN_SPEC §6.2).
+///
+/// Paperclip requires at least one category and every value must be canonical.
+pub fn validate_categories(categories: &[String]) -> Result<(), CapabilityError> {
+    if categories.is_empty() {
+        return Err(CapabilityError::InvalidManifest(
+            "at least one category is required".into(),
+        ));
+    }
+    for category in categories {
+        if !PLUGIN_CATEGORIES.contains(&category.as_str()) {
+            return Err(CapabilityError::InvalidManifest(format!(
+                "unsupported plugin category: {category}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a manifest against Paperclip's declaration rules.
 ///
 /// Enforced (PLUGIN_SPEC §6/§11/§13.6/§18):
@@ -1118,7 +1189,15 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
         }
     }
 
-    let declares_ui = manifest.declares_ui || !manifest.ui_slots.is_empty();
+    // still accepted and merged so existing manifests keep validating.
+    let mut ui_slots = manifest.ui_slots.clone();
+    let mut launchers = manifest.launchers.clone();
+    if let Some(ui) = &manifest.ui {
+        ui_slots.extend(ui.slots.iter().cloned());
+        launchers.extend(ui.launchers.iter().cloned());
+    }
+    let declares_ui = manifest.declares_ui || !ui_slots.is_empty() || manifest.ui.is_some();
+
     if declares_ui && manifest.entrypoints.ui.is_none() {
         return Err(CapabilityError::InvalidManifest(
             "ui declared without entrypoints.ui".into(),
@@ -1140,7 +1219,7 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
 
     {
         let mut seen = std::collections::HashSet::new();
-        for slot in &manifest.ui_slots {
+        for slot in &ui_slots {
             validate_ui_slot(slot)?;
             if !seen.insert(slot.id.clone()) {
                 return Err(CapabilityError::InvalidManifest(format!(
@@ -1325,6 +1404,9 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
         }
     }
 
+    validate_categories(&manifest.categories)?;
+
+    // Paperclip nests UI declarations under `ui`; the flat legacy fields are
     if let Some(v) = &manifest.minimum_host_version {
         validate_minimum_host_version(v)?;
     }
@@ -1334,7 +1416,7 @@ pub fn validate_manifest(manifest: &PluginManifestV1) -> Result<(), CapabilityEr
 
     {
         let mut seen = std::collections::HashSet::new();
-        for launcher in &manifest.launchers {
+        for launcher in &launchers {
             validate_launcher(launcher)?;
             if !seen.insert(launcher.id.clone()) {
                 return Err(CapabilityError::InvalidManifest(format!(
@@ -1602,6 +1684,8 @@ mod manifest_tests {
             skills: vec![],
             local_folders: vec![],
             launchers: vec![],
+            categories: vec!["connector".into()],
+            ui: None,
             minimum_host_version: None,
             minimum_paperclip_version: None,
             instance_config_schema: None,
@@ -1942,6 +2026,7 @@ mod manifest_tests {
             interactive_setup_connection_types: vec![],
             supports_template_capture: None,
             template_ref_kind: None,
+            sandbox_capabilities: None,
         }
     }
 
@@ -2278,5 +2363,92 @@ mod manifest_tests {
         assert_eq!(PLUGIN_LAUNCHER_ACTIONS.len(), 6);
         assert_eq!(PLUGIN_LAUNCHER_BOUNDS.len(), 5);
         assert_eq!(PLUGIN_LAUNCHER_RENDER_ENVIRONMENTS.len(), 5);
+    }
+
+    #[test]
+    fn categories_must_be_non_empty_and_canonical() {
+        assert!(validate_categories(&["connector".into()]).is_ok());
+        assert!(validate_categories(&["connector".into(), "ui".into()]).is_ok());
+        assert!(validate_categories(&[]).is_err());
+        assert!(validate_categories(&["nope".into()]).is_err());
+    }
+
+    #[test]
+    fn manifest_requires_at_least_one_category() {
+        let mut m = manifest(&[]);
+        assert!(validate_manifest(&m).is_ok());
+        m.categories = vec![];
+        assert!(validate_manifest(&m).is_err());
+        m.categories = vec!["bogus".into()];
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn nested_ui_slots_and_launchers_are_validated_and_merged() {
+        let mut m = manifest(&[]);
+        m.ui = Some(PluginUiDeclaration {
+            slots: vec![slot("page")],
+            launchers: vec![launcher("sidebar", "navigate")],
+        });
+        // Nested UI still requires entrypoints.ui.
+        assert!(validate_manifest(&m).is_err());
+        m.entrypoints.ui = Some("dist/ui".into());
+        assert!(validate_manifest(&m).is_ok());
+
+        // A nested launcher with a bogus placement zone must be rejected.
+        let mut bad = m.clone();
+        bad.ui = Some(PluginUiDeclaration {
+            slots: vec![],
+            launchers: vec![launcher("nowhere", "navigate")],
+        });
+        assert!(validate_manifest(&bad).is_err());
+    }
+
+    #[test]
+    fn nested_and_flat_ui_slots_merge_for_duplicate_detection() {
+        let mut m = manifest(&[]);
+        m.entrypoints.ui = Some("dist/ui".into());
+        m.ui_slots = vec![slot("page")];
+        m.ui = Some(PluginUiDeclaration {
+            slots: vec![slot("page")],
+            launchers: vec![],
+        });
+        // Same slot id declared both flat and nested -> duplicate.
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn sandbox_capabilities_deserialize_as_partial_flags() {
+        let caps: SandboxProviderCapabilities = serde_json::from_value(serde_json::json!({
+            "reusableLeases": true,
+            "incrementalSessionOutput": true
+        }))
+        .unwrap();
+        assert_eq!(caps.reusable_leases, Some(true));
+        assert_eq!(caps.incremental_session_output, Some(true));
+        // Absent flags stay None (defer to the verified baseline).
+        assert_eq!(caps.native_sync_in, None);
+        assert_eq!(caps.persistent_process_sessions, None);
+    }
+
+    #[test]
+    fn driver_sandbox_capabilities_round_trip() {
+        let mut d = driver("e2b");
+        d.sandbox_capabilities = Some(SandboxProviderCapabilities {
+            reusable_leases: Some(true),
+            native_sync_in: Some(false),
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"sandboxCapabilities\""), "got: {json}");
+        let back: PluginEnvironmentDriverDeclaration = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn canonical_category_list_matches_paperclip() {
+        assert_eq!(PLUGIN_CATEGORIES.len(), 4);
+        assert_eq!(PLUGIN_CATEGORIES.first().copied(), Some("connector"));
+        assert_eq!(PLUGIN_CATEGORIES.last().copied(), Some("ui"));
     }
 }
