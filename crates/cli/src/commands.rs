@@ -466,28 +466,11 @@ fn cmd_team(args: &[String]) -> Result<()> {
 
 fn cmd_plugin(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("help");
-    let client = load_client()?;
     match sub {
-        "list" | "ls" => {
-            println!("{}", format_json(&client.list_plugins()?));
-            Ok(())
-        }
-        "install" => {
-            let raw = get_flag_value(args, "--json")
-                .ok_or_else(|| anyhow::anyhow!("plugin install requires --json '{{...}}'"))?;
-            let body: serde_json::Value = serde_json::from_str(&raw)?;
-            println!("{}", format_json(&client.install_plugin(&body)?));
-            Ok(())
-        }
-        "enable" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin enable <id>"))?;
-            println!("{}", format_json(&client.enable_plugin(id)?));
-            Ok(())
-        }
         "create" => {
             // Offline scaffolding: `parrot plugin create <name> --output <dir>
             // [--template default|connector|workspace|environment]`
-            // (Paperclip create-paperclip-plugin equivalent).
+            // (Paperclip create-paperclip-plugin equivalent). No API client needed.
             let name = args.get(1).ok_or_else(|| {
                 anyhow::anyhow!("Usage: parrot plugin create <name> --output <dir> [--template T]")
             })?;
@@ -510,14 +493,36 @@ fn cmd_plugin(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        "disable" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin disable <id>"))?;
-            println!("{}", format_json(&client.disable_plugin(id)?));
-            Ok(())
-        }
         _ => {
-            println!("Usage: parrot plugin list | create <name> --output <dir> | install --json '{{...}}' | enable <id> | disable <id>");
-            Ok(())
+            // Networked subcommands require the API client.
+            let client = load_client()?;
+            match sub {
+                "list" | "ls" => {
+                    println!("{}", format_json(&client.list_plugins()?));
+                    Ok(())
+                }
+                "install" => {
+                    let raw = get_flag_value(args, "--json")
+                        .ok_or_else(|| anyhow::anyhow!("plugin install requires --json '{{...}}'"))?;
+                    let body: serde_json::Value = serde_json::from_str(&raw)?;
+                    println!("{}", format_json(&client.install_plugin(&body)?));
+                    Ok(())
+                }
+                "enable" => {
+                    let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin enable <id>"))?;
+                    println!("{}", format_json(&client.enable_plugin(id)?));
+                    Ok(())
+                }
+                "disable" => {
+                    let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin disable <id>"))?;
+                    println!("{}", format_json(&client.disable_plugin(id)?));
+                    Ok(())
+                }
+                _ => {
+                    println!("Usage: parrot plugin list | create <name> --output <dir> | install --json '{{...}}' | enable <id> | disable <id>");
+                    Ok(())
+                }
+            }
         }
     }
 }

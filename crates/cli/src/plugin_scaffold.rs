@@ -99,7 +99,7 @@ pub fn build_manifest(options: &ScaffoldPluginOptions) -> Result<serde_json::Val
     let description = options
         .description
         .clone()
-        .unwrap_or_else(|| "A Paperclip plugin".into());
+            .unwrap_or_else(|| "A Parrot plugin".into());
     let author = options.author.clone().unwrap_or_else(|| "Plugin Author".into());
     let category = options
         .category
@@ -187,7 +187,7 @@ fn manifest_package_json(
             "test": "vitest run --config ./vitest.config.ts",
             "typecheck": "tsc --noEmit"
         },
-        "paperclipPlugin": {
+        "parrotPlugin": {
             "manifest": "./dist/manifest.js",
             "worker": "./dist/worker.js",
             "ui": "./dist/ui/"
@@ -232,7 +232,7 @@ pub fn scaffold_plugin_project(options: &ScaffoldPluginOptions) -> Result<Vec<St
         "tests/plugin.spec.ts",
         &render_spec_ts(template, &manifest["id"].as_str().unwrap_or_default().to_string()),
     )?;
-    write(".gitignore", "dist\nnode_modules\n.paperclip-sdk\n");
+    write(".gitignore", "dist\nnode_modules\nparrot-sdk\n");
     Ok(written)
 }
 

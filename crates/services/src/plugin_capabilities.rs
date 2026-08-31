@@ -1012,7 +1012,7 @@ pub fn validate_minimum_host_version(version: &str) -> Result<(), CapabilityErro
 }
 
 /// Plugin classification categories (PLUGIN_SPEC §6.2).
-pub const PLUGIN_CATEGORIES: &[&str] = &["connector", "workspace", "automation", "ui"];
+pub const PLUGIN_CATEGORIES: &[&str] = &["connector", "workspace", "automation", "ui", "environment"];
 
 /// Fine-grained sandbox capability declaration for a plugin environment driver.
 ///
@@ -2466,9 +2466,9 @@ mod manifest_tests {
 
     #[test]
     fn canonical_category_list_matches_paperclip() {
-        assert_eq!(PLUGIN_CATEGORIES.len(), 4);
+        assert_eq!(PLUGIN_CATEGORIES.len(), 5);
         assert_eq!(PLUGIN_CATEGORIES.first().copied(), Some("connector"));
-        assert_eq!(PLUGIN_CATEGORIES.last().copied(), Some("ui"));
+        assert_eq!(PLUGIN_CATEGORIES.last().copied(), Some("environment"));
     }
 
     #[test]
