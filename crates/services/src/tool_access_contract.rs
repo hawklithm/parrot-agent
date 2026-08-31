@@ -421,12 +421,37 @@ pub struct PolicySpec {
     /// Selector: only apply this policy to this tool name (None = all tools).
     pub selector_tool_name: Option<String>,
     pub description: Option<String>,
-    /// trust_rule only: whether the rule is active.
-    pub trust_rule_active: bool,
-    /// trust_rule only: whether the covered tool changed after rule creation.
-    pub trust_rule_needs_review: bool,
+    /// trust_rule only: the raw `config.trustRule` object (liveness, review
+    /// hashes, argument filters). None means the rule is not configured.
+    pub trust_rule_config: Option<serde_json::Value>,
     /// rate_limit only: whether the caller pre-evaluated the limit as exceeded.
     pub rate_limit_exceeded: bool,
+}
+
+impl PolicySpec {
+    /// Convenience constructor for tests/simple callers.
+    pub fn simple(id: &str, policy_type: &str) -> Self {
+        Self {
+            id: id.into(),
+            policy_type: policy_type.into(),
+            selector_tool_name: None,
+            description: None,
+            trust_rule_config: None,
+            rate_limit_exceeded: false,
+        }
+    }
+
+    /// Derive the trust-rule flags Paperclip computes before deciding.
+    fn trust_rule_state(&self, ctx: &EvaluationContext, now: chrono::DateTime<chrono::Utc>) -> (bool, bool) {
+        let active = trust_rule_is_active(self.trust_rule_config.as_ref(), now);
+        let needs_review = trust_rule_needs_review(
+            self.trust_rule_config.as_ref(),
+            ctx.catalog_status.as_deref(),
+            ctx.catalog_version_hash.as_deref(),
+            ctx.catalog_schema_hash.as_deref(),
+        );
+        (active, needs_review)
+    }
 }
 
 /// Static inputs the ladder reads outside the policy table.
@@ -438,6 +463,27 @@ pub struct EvaluationContext {
     /// Paperclip profile fallback: an effective profile allows the tool
     /// (defaultAction=allow or an include entry matched, with no excludes).
     pub profile_allows: bool,
+    /// Raw invocation arguments (evaluated against trust-rule filters).
+    pub arguments: Option<serde_json::Value>,
+    /// Pre-computed `arguments_hash`; derived from `arguments` when None.
+    pub arguments_hash: Option<String>,
+    /// Catalog entry status of the invoked tool, when known.
+    pub catalog_status: Option<String>,
+    pub catalog_version_hash: Option<String>,
+    pub catalog_schema_hash: Option<String>,
+}
+
+impl EvaluationContext {
+    /// Effective arguments hash, computed on demand.
+    pub fn effective_arguments_hash(&self) -> String {
+        if let Some(hash) = &self.arguments_hash {
+            return hash.clone();
+        }
+        match &self.arguments {
+            Some(args) => arguments_hash(args),
+            None => arguments_hash(&serde_json::Value::Null),
+        }
+    }
 }
 
 /// The outcome of the decision ladder: decision + reason code pair exactly as
@@ -450,6 +496,12 @@ pub struct DecisionOutcome {
     pub message: String,
     /// The policy that decided, when one did.
     pub policy_id: Option<String>,
+}
+
+fn self_filters(policy: &PolicySpec) -> Option<TrustRuleArgumentFilters> {
+    let config = policy.trust_rule_config.as_ref()?;
+    let filters = config.get("argumentFilters")?;
+    serde_json::from_value(filters.clone()).ok()
 }
 
 fn matched(policy: &PolicySpec, ctx: &EvaluationContext) -> bool {
@@ -467,6 +519,15 @@ fn matched(policy: &PolicySpec, ctx: &EvaluationContext) -> bool {
 pub fn decide_tool_access(
     policies: &[PolicySpec],
     ctx: &EvaluationContext,
+) -> DecisionOutcome {
+    decide_tool_access_at(policies, ctx, chrono::Utc::now())
+}
+
+/// As [`decide_tool_access`], with an explicit clock for deterministic tests.
+pub fn decide_tool_access_at(
+    policies: &[PolicySpec],
+    ctx: &EvaluationContext,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> DecisionOutcome {
     for policy in policies {
         if !matched(policy, ctx) {
@@ -489,8 +550,20 @@ pub fn decide_tool_access(
                     policy_id: Some(policy.id.clone()),
                 };
             }
-            "trust_rule" if policy.trust_rule_active => {
-                if policy.trust_rule_needs_review {
+            "trust_rule" => {
+                let (active, needs_review) = policy.trust_rule_state(ctx, now);
+                if !active {
+                    // Paperclip: inactive trust rules fall through.
+                    continue;
+                }
+                // Argument filters must match for the rule to fire.
+                let filters = self_filters(policy);
+                let hash = ctx.effective_arguments_hash();
+                let arguments = ctx.arguments.clone().unwrap_or(serde_json::Value::Null);
+                if !argument_filters_match(filters.as_ref(), &arguments, &hash) {
+                    continue;
+                }
+                if needs_review {
                     return DecisionOutcome {
                         decision: "require_approval",
                         reason_code: "requires_review_changed_tool",
@@ -549,6 +622,224 @@ pub fn decide_tool_access(
         policy_id: None,
     }
 }
+
+/// Trust-rule argument filters - port of Paperclip
+/// `ToolTrustRuleArgumentFilters`.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustRuleArgumentFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_any: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hashes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_equals: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_not_equals: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_in: Option<std::collections::BTreeMap<String, Vec<serde_json::Value>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_matches: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_exists: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_absent: Option<Vec<String>>,
+}
+
+/// Stable stringify: objects sorted by key at every depth, arrays in order.
+///
+/// Port of Paperclip `stableStringify`.
+pub fn stable_stringify(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_default(),
+                        stable_stringify(&map[key])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(stable_stringify).collect();
+            format!("[{}]", parts.join(","))
+        }
+        other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
+/// sha256 over the stable stringify of a value - Paperclip trust-rule
+/// argument hashing.
+pub fn arguments_hash(arguments: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(stable_stringify(arguments).as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+/// Read a dot-separated path from JSON, supporting numeric array indices.
+///
+/// Port of Paperclip `readPath`.
+pub fn read_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut current = value;
+    for segment in path.split('.') {
+        match current {
+            serde_json::Value::Object(map) => {
+                current = map.get(segment)?;
+            }
+            serde_json::Value::Array(items) => {
+                let index: usize = segment.parse().ok()?;
+                current = items.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+/// Port of Paperclip `argumentFiltersMatch`.
+///
+/// Returns false unless at least one constraint is configured; `allowAny`
+/// short-circuits to true. Mirrors the filter matrix exactly.
+pub fn argument_filters_match(
+    filters: Option<&TrustRuleArgumentFilters>,
+    arguments: &serde_json::Value,
+    arguments_hash: &str,
+) -> bool {
+    let Some(filters) = filters else {
+        return false;
+    };
+    if filters.allow_any == Some(true) {
+        return true;
+    }
+    if let Some(exact) = &filters.exact_hash {
+        if exact != arguments_hash {
+            return false;
+        }
+    }
+    if let Some(allowed) = &filters.allowed_hashes {
+        if !allowed.is_empty() && !allowed.iter().any(|h| h == arguments_hash) {
+            return false;
+        }
+    }
+    if let Some(equals) = &filters.field_equals {
+        for (path, expected) in equals {
+            let actual = read_path(arguments, path);
+            let actual_str = actual.map(stable_stringify).unwrap_or_else(|| "undefined".into());
+            if actual_str != stable_stringify(expected) {
+                return false;
+            }
+        }
+    }
+    if let Some(not_equals) = &filters.field_not_equals {
+        for (path, expected) in not_equals {
+            let actual = read_path(arguments, path);
+            let actual_str = actual.map(stable_stringify).unwrap_or_else(|| "undefined".into());
+            if actual_str == stable_stringify(expected) {
+                return false;
+            }
+        }
+    }
+    if let Some(field_in) = &filters.field_in {
+        for (path, allowed_values) in field_in {
+            let actual = read_path(arguments, path);
+            let actual_str = actual.map(stable_stringify).unwrap_or_else(|| "undefined".into());
+            if !allowed_values.iter().any(|expected| stable_stringify(expected) == actual_str) {
+                return false;
+            }
+        }
+    }
+    if let Some(matches) = &filters.field_matches {
+        for (path, pattern) in matches {
+            let Some(actual) = read_path(arguments, path).and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Ok(re) = regex::Regex::new(pattern) else {
+                return false;
+            };
+            if !re.is_match(actual) {
+                return false;
+            }
+        }
+    }
+    if let Some(exists) = &filters.field_exists {
+        if exists.iter().any(|path| read_path(arguments, path).is_none()) {
+            return false;
+        }
+    }
+    if let Some(absent) = &filters.field_absent {
+        if absent.iter().any(|path| read_path(arguments, path).is_some()) {
+            return false;
+        }
+    }
+    filters.exact_hash.is_some()
+        || filters.allowed_hashes.as_ref().is_some_and(|h| !h.is_empty())
+        || filters.field_equals.is_some()
+        || filters.field_not_equals.is_some()
+        || filters.field_in.is_some()
+        || filters.field_matches.is_some()
+        || filters.field_exists.as_ref().is_some_and(|f| !f.is_empty())
+        || filters.field_absent.as_ref().is_some_and(|f| !f.is_empty())
+}
+
+/// Trust-rule liveness: config present, not revoked, not expired.
+///
+/// Port of Paperclip `trustRuleIsActive` (evaluated against `now`).
+pub fn trust_rule_is_active(
+    config: Option<&serde_json::Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(config) = config else {
+        return false;
+    };
+    if let Some(revoked_at) = config.get("revokedAt").and_then(serde_json::Value::as_str) {
+        if let Ok(at) = chrono::DateTime::parse_from_rfc3339(revoked_at) {
+            if at.with_timezone(&chrono::Utc) <= now {
+                return false;
+            }
+        }
+    }
+    if let Some(expires_at) = config.get("expiresAt").and_then(serde_json::Value::as_str) {
+        if let Ok(at) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+            if at.with_timezone(&chrono::Utc) <= now {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether the trust rule needs re-review: catalog quarantined/removed, or the
+/// configured version/schema hash no longer matches the live catalog entry.
+///
+/// Port of Paperclip `trustRuleNeedsReview`.
+pub fn trust_rule_needs_review(
+    config: Option<&serde_json::Value>,
+    catalog_status: Option<&str>,
+    catalog_version_hash: Option<&str>,
+    catalog_schema_hash: Option<&str>,
+) -> bool {
+    let Some(config) = config else {
+        return false;
+    };
+    let rule_version = config.get("catalogVersionHash").and_then(serde_json::Value::as_str);
+    let rule_schema = config.get("schemaHash").and_then(serde_json::Value::as_str);
+    matches!(catalog_status, Some("quarantined") | Some("removed"))
+        || rule_version.is_some_and(|rv| catalog_version_hash.is_some_and(|cv| rv != cv))
+        || rule_schema.is_some_and(|rs| catalog_schema_hash.is_some_and(|cs| rs != cs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,8 +1111,14 @@ mod tests {
             policy_type: kind.into(),
             selector_tool_name: None,
             description: None,
-            trust_rule_active: true,
-            trust_rule_needs_review: false,
+            trust_rule_config: if kind == "trust_rule" {
+                // A live rule always carries argumentFilters (Paperclip rules
+                // use allowAny when unrestricted); without them the ladder
+                // falls through, matching argumentFiltersMatch(undefined)=false.
+                Some(serde_json::json!({"argumentFilters": {"allowAny": true}}))
+            } else {
+                None
+            },
             rate_limit_exceeded: false,
         };
         let ctx = EvaluationContext::default();
@@ -845,8 +1142,16 @@ mod tests {
         assert_eq!(out.reason_code, "rate_limited");
         // trust rule needs review -> require_approval.
         let mut review = policy("p1", "trust_rule");
-        review.trust_rule_needs_review = true;
-        let out = decide_tool_access(&[review], &ctx);
+        review.trust_rule_config = Some(serde_json::json!({
+            "argumentFilters": {"allowAny": true},
+            "catalogVersionHash": "v1"
+        }));
+        let ctx_review = EvaluationContext {
+            catalog_status: Some("active".into()),
+            catalog_version_hash: Some("v2".into()),
+            ..EvaluationContext::default()
+        };
+        let out = decide_tool_access(&[review], &ctx_review);
         assert_eq!(out.decision, "require_approval");
         assert_eq!(out.reason_code, "requires_review_changed_tool");
         // active trust rule -> allow.
@@ -855,7 +1160,7 @@ mod tests {
         assert_eq!(out.reason_code, "allow_trust_rule");
         // inactive trust rule falls through to default deny.
         let mut inactive = policy("p1", "trust_rule");
-        inactive.trust_rule_active = false;
+        inactive.trust_rule_config = None;
         let out = decide_tool_access(&[inactive], &ctx);
         assert_eq!(out.decision, "deny");
         assert_eq!(out.reason_code, "deny_default");
@@ -875,18 +1180,119 @@ mod tests {
 
     #[test]
     fn selectors_narrow_policy_scope() {
-        let scoped = PolicySpec {
-            id: "scoped".into(),
-            policy_type: "block".into(),
-            selector_tool_name: Some("other_tool".into()),
-            description: None,
-            trust_rule_active: true,
-            trust_rule_needs_review: false,
-            rate_limit_exceeded: false,
-        };
+        let mut scoped = PolicySpec::simple("scoped", "block");
+        scoped.selector_tool_name = Some("other_tool".into());
         let ctx = EvaluationContext { tool_name: "my_tool".into(), ..Default::default() };
         // Selector does not match -> policy skipped -> default deny.
         let out = decide_tool_access(&[scoped], &ctx);
         assert_eq!(out.reason_code, "deny_default");
+    }
+
+    #[test]
+    fn stable_stringify_sorts_keys_recursively() {
+        let a = serde_json::json!({"b": 1, "a": {"x": 3, "y": [1, {"z": 2}]}});
+        let b = serde_json::json!({"a": {"y": [1, {"z": 2}], "x": 3}, "b": 1});
+        assert_eq!(stable_stringify(&a), stable_stringify(&b));
+        assert_eq!(stable_stringify(&serde_json::json!(null)), "null");
+        assert_eq!(stable_stringify(&serde_json::json!(true)), "true");
+    }
+
+    #[test]
+    fn arguments_hash_is_stable_and_hex() {
+        let args = serde_json::json!({"key": "demo/launch", "limit": 5});
+        let h1 = arguments_hash(&args);
+        let h2 = arguments_hash(&serde_json::json!({"limit": 5, "key": "demo/launch"}));
+        assert_eq!(h1, h2, "key order must not change the hash");
+        assert_eq!(h1.len(), 64);
+        assert_ne!(h1, arguments_hash(&serde_json::json!({"key": "other"})));
+    }
+
+    #[test]
+    fn read_path_supports_nested_and_array_segments() {
+        let v = serde_json::json!({"a": {"b": [{"c": 1}, {"c": 2}]}});
+        assert_eq!(read_path(&v, "a.b.1.c"), Some(&serde_json::json!(2)));
+        assert_eq!(read_path(&v, "a.b.5.c"), None);
+        assert_eq!(read_path(&v, ""), None);
+    }
+
+    #[test]
+    fn argument_filters_full_matrix() {
+        let args = serde_json::json!({"env": "prod", "limit": 10, "note": "deploy on friday"});
+        let h = arguments_hash(&args);
+
+        let f = TrustRuleArgumentFilters { allow_any: Some(true), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        assert!(!argument_filters_match(None, &args, &h));
+        assert!(!argument_filters_match(Some(&TrustRuleArgumentFilters::default()), &args, &h));
+
+        let f = TrustRuleArgumentFilters { exact_hash: Some(h.clone()), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { exact_hash: Some("deadbeef".into()), ..Default::default() };
+        assert!(!argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { allowed_hashes: Some(vec!["x".into(), h.clone()]), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { allowed_hashes: Some(vec!["x".into()]), ..Default::default() };
+        assert!(!argument_filters_match(Some(&f), &args, &h));
+
+        let f = TrustRuleArgumentFilters { field_equals: Some([("env".into(), serde_json::json!("prod"))].into_iter().collect()), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_equals: Some([("env".into(), serde_json::json!("dev"))].into_iter().collect()), ..Default::default() };
+        assert!(!argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_not_equals: Some([("env".into(), serde_json::json!("dev"))].into_iter().collect()), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_in: Some([("limit".into(), vec![serde_json::json!(5), serde_json::json!(10)])].into_iter().collect()), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_in: Some([("limit".into(), vec![serde_json::json!(5)])].into_iter().collect()), ..Default::default() };
+        assert!(!argument_filters_match(Some(&f), &args, &h));
+
+        let f = TrustRuleArgumentFilters { field_matches: Some([("note".into(), "deploy".into())].into_iter().collect()), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_matches: Some([("note".into(), "^deploy on (monday|friday)$".into())].into_iter().collect()), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_matches: Some([("note".into(), "^deploy on monday$".into())].into_iter().collect()), ..Default::default() };
+        assert!(!argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_matches: Some([("note".into(), "((".into())].into_iter().collect()), ..Default::default() };
+        assert!(!argument_filters_match(Some(&f), &args, &h), "invalid regex must fail closed");
+        let f = TrustRuleArgumentFilters { field_matches: Some([("limit".into(), "10".into())].into_iter().collect()), ..Default::default() };
+        assert!(!argument_filters_match(Some(&f), &args, &h), "non-string target must fail");
+
+        let f = TrustRuleArgumentFilters { field_exists: Some(vec!["env".into()]), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_exists: Some(vec!["env.deep".into()]), ..Default::default() };
+        assert!(!argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_absent: Some(vec!["missing".into()]), ..Default::default() };
+        assert!(argument_filters_match(Some(&f), &args, &h));
+        let f = TrustRuleArgumentFilters { field_absent: Some(vec!["env".into()]), ..Default::default() };
+        assert!(!argument_filters_match(Some(&f), &args, &h));
+
+        let f = TrustRuleArgumentFilters {
+            allow_any: Some(true),
+            exact_hash: Some("mismatch".into()),
+            ..Default::default()
+        };
+        assert!(argument_filters_match(Some(&f), &args, &h), "allowAny overrides");
+    }
+
+    #[test]
+    fn trust_rule_liveness_and_review() {
+        let active = serde_json::json!({"catalogVersionHash": "v1"});
+        let now = chrono::Utc::now();
+        assert!(trust_rule_is_active(Some(&active), now));
+        let revoked = serde_json::json!({"revokedAt": "2020-01-01T00:00:00Z"});
+        assert!(!trust_rule_is_active(Some(&revoked), now));
+        let expired = serde_json::json!({"expiresAt": "2020-01-01T00:00:00Z"});
+        assert!(!trust_rule_is_active(Some(&expired), now));
+        let future = serde_json::json!({"expiresAt": "2999-01-01T00:00:00Z"});
+        assert!(trust_rule_is_active(Some(&future), now));
+        assert!(!trust_rule_is_active(None, now));
+
+        assert!(trust_rule_needs_review(Some(&active), Some("quarantined"), Some("v1"), None));
+        assert!(trust_rule_needs_review(Some(&active), Some("removed"), Some("v1"), None));
+        assert!(trust_rule_needs_review(Some(&active), Some("active"), Some("v2"), None));
+        assert!(!trust_rule_needs_review(Some(&active), Some("active"), Some("v1"), None));
+        let with_schema = serde_json::json!({"schemaHash": "s1"});
+        assert!(trust_rule_needs_review(Some(&with_schema), Some("active"), Some("v1"), Some("s2")));
+        assert!(!trust_rule_needs_review(Some(&with_schema), Some("active"), Some("v1"), Some("s1")));
+        assert!(!trust_rule_needs_review(None, Some("quarantined"), None, None));
     }
 }

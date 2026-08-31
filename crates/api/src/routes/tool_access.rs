@@ -3975,15 +3975,12 @@ async fn test_tool_policy(
                 .map(str::to_string);
             let policy_type: String = row.get("policy_type");
             let config: Value = row.try_get("config").unwrap_or(json!({}));
-            let conditions: Value = row.try_get("conditions").unwrap_or(json!({}));
-            // trust_rule liveness: config.active !== false and conditions do
-            // not mark the covered tool changed.
-            let trust_rule_active = config.get("active").and_then(Value::as_bool) != Some(false);
-            let trust_rule_needs_review = conditions
-                .get("needsReview")
-                .or_else(|| conditions.get("needs_review"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            // Paperclip wraps trust-rule settings under config.trustRule.
+            let trust_rule_config = config
+                .get("trustRule")
+                .or_else(|| config.get("trust_rule"))
+                .cloned()
+                .filter(|value| value.is_object());
             let rate_limit_exceeded = config
                 .get("exceeded")
                 .or_else(|| config.get("limited"))
@@ -3994,19 +3991,24 @@ async fn test_tool_policy(
                 policy_type,
                 selector_tool_name,
                 description: row.try_get("description").unwrap_or(None),
-                trust_rule_active,
-                trust_rule_needs_review,
+                trust_rule_config,
                 rate_limit_exceeded,
             }
         })
         .collect();
 
+    let arguments = body.get("arguments").cloned();
     let ctx = services::tool_access_contract::EvaluationContext {
         tool_name,
         // Live grant/profile projection is not wired in the test route yet;
         // Paperclip falls through to default deny without them.
         explicit_grant: false,
         profile_allows: false,
+        arguments,
+        arguments_hash: None,
+        catalog_status: None,
+        catalog_version_hash: None,
+        catalog_schema_hash: None,
     };
     let outcome = services::tool_access_contract::decide_tool_access(&policies, &ctx);
     Ok(Json(json!({
