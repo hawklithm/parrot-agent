@@ -3705,6 +3705,16 @@ async fn review_new_tools_persists_decisions_and_entries() {
         "board review must set user attribution"
     );
 
+    // Paperclip also stamps the profile-level review timestamp.
+    let profile_reviewed: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT new_tools_reviewed_at FROM tool_profiles WHERE id = $1",
+    )
+    .bind(profile_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load profile review timestamp");
+    assert!(profile_reviewed.is_some(), "new_tools_reviewed_at must be set");
+
     // GET /new-tools no longer lists the reviewed entries.
     let (status, body) = request_connection_route(
         &app,

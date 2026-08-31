@@ -5649,6 +5649,20 @@ async fn review_profile_new_tools(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Paperclip also stamps the profile-level review timestamp.
+    sqlx::query(
+        "UPDATE tool_profiles SET new_tools_reviewed_at = $2, updated_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(profile_id)
+    .bind(now_at)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to stamp profile new_tools_reviewed_at: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     Ok(Json(json!({
         "profileId": profile_id,
         "reviewedAt": now_at,
