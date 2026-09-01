@@ -140,6 +140,30 @@ pub fn create_default_adapter_registry() -> AdapterRegistry {
 
     // 注册 Gemini Local 适配器（Paperclip 内置 adapter）
     registry.register(Arc::new(crate::adapters::GeminiLocalAdapter::new()));
+
+    // 注册 Cursor Local 适配器
+    registry.register(Arc::new(crate::adapters::CursorLocalAdapter::new()));
+
+    // 注册 OpenCode Local 适配器
+    registry.register(Arc::new(crate::adapters::OpencodeLocalAdapter::new()));
+
+    // 注册 Grok Local 适配器
+    registry.register(Arc::new(crate::adapters::GrokLocalAdapter::new()));
+
+    // 注册 Hermes Local 适配器
+    registry.register(Arc::new(crate::adapters::HermesLocalAdapter::new()));
+
+    // 注册 Pi Local 适配器
+    registry.register(Arc::new(crate::adapters::PiLocalAdapter::new()));
+
+    // 注册 Hermes Gateway 适配器
+    registry.register(Arc::new(crate::adapters::HermesGatewayAdapter::new()));
+
+    // 注册 Cursor Cloud 适配器
+    registry.register(Arc::new(crate::adapters::CursorCloudAdapter::new()));
+
+    // 注册 OpenClaw Gateway 适配器
+    registry.register(Arc::new(crate::adapters::OpenclawGatewayAdapter::new()));
     
     registry
 }
