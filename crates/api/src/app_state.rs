@@ -419,6 +419,10 @@ pub fn create_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             crate::middleware::http_log::http_log_middleware,
         ))
+        // §8.1 Trust Proxy: resolves X-Forwarded-* when TRUST_PROXY env is set
+        .layer(axum::middleware::from_fn(
+            crate::middleware::trust_proxy::trust_proxy_middleware,
+        ))
 }
 
 #[cfg(test)]
