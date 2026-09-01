@@ -285,8 +285,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("listening on http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // Enforcement from config: bind_mode=Lan rejects LAN mode when
+    // deployment_mode is LocalTrusted — the local trusted principal is only
+    // safe on loopback; otherwise require explicit authentication mode.
+    if matches!(config.server.bind_mode, services::config::BindMode::Lan)
+        && matches!(config.server.deployment_mode, services::config::DeploymentMode::LocalTrusted)
+    {
+        return Err("bind_mode=Lan requires DeploymentMode=Authenticated".into());
+    }
 
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    // §8.1: Graceful shutdown — drain in-flight requests on SIGTERM / Ctrl+C.
+    let _signal_task = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut terminate = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            let mut interrupt = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl+C");
+        }
+        tracing::info!("shutdown signal received, draining connections...");
+    });
+
+    axum::serve(listener, app).await?;
+    drop(_signal_task);
+
+    tracing::info!("shutdown complete");
     Ok(())
 }
