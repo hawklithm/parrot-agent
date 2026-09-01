@@ -334,7 +334,7 @@ impl ExportService for DefaultCompanyPortabilityService {
     }
 
     async fn preview(&self, id: Uuid, input: Value) -> Result<Value, sqlx::Error> {
-        let (include_company, include_agents, include_projects, include_issues, include_skills, include_work_products) =
+        let (include_company, include_agents, include_projects, include_issues, include_skills, _include_work_products) =
             include_flags(&input);
         let c = counts(&self.pool, id).await?;
         let routines: i64 = sqlx::query_scalar(
