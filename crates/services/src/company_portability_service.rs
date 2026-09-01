@@ -252,7 +252,7 @@ impl ExportService for DefaultCompanyPortabilityService {
 
         let work_products: Vec<Value> = if include_work_products {
             let rows = sqlx::query(
-                "SELECT id, issue_id, type, provider, title, status, review_state,                  is_primary, health_status, metadata, source_trust, created_at                  FROM issue_work_products WHERE company_id = $1 ORDER BY id",
+                "SELECT id, issue_id, type, provider, title, status, review_state, is_primary, health_status, metadata, source_trust, created_at FROM issue_work_products WHERE company_id = $1 ORDER BY id",
             )
             .bind(id)
             .fetch_all(&self.pool)
@@ -620,7 +620,7 @@ impl ImportService for DefaultCompanyPortabilityService {
             let source_trust = entry.get("sourceTrust").or_else(|| entry.get("source_trust")).cloned();
 
             sqlx::query(
-                "INSERT INTO issue_work_products                  (id, company_id, issue_id, type, provider, title, status, review_state,                   is_primary, health_status, metadata, source_trust, created_at)                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())",
+                "INSERT INTO issue_work_products (id, company_id, issue_id, type, provider, title, status, review_state, is_primary, health_status, metadata, source_trust, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())",
             )
             .bind(wp_id)
             .bind(id)
