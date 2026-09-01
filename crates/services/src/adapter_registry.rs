@@ -215,4 +215,30 @@ mod tests {
         let all = registry.list_all();
         assert_eq!(all.len(), 1);
     }
+    #[tokio::test]
+    async fn test_default_registry_has_all_adapters() {
+        let registry = create_default_adapter_registry();
+        let all = registry.list_all();
+        assert_eq!(all.len(), 12, "default registry must contain all 12 adapters");
+        let types: Vec<&str> = all
+            .iter()
+            .map(|a| a.adapter_type().as_str())
+            .collect();
+        for expected in [
+            "process",
+            "claude_local",
+            "codex_local",
+            "gemini_local",
+            "cursor",
+            "opencode_local",
+            "grok_local",
+            "hermes_local",
+            "hermes_gateway",
+            "pi_local",
+            "cursor_cloud",
+            "openclaw_gateway",
+        ] {
+            assert!(types.contains(&expected), "missing adapter: {expected}");
+        }
+    }
 }
