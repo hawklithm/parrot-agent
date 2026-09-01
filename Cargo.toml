@@ -9,7 +9,7 @@ default-members = ["crates/server"]
 # Web framework
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "compression-br", "fs"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

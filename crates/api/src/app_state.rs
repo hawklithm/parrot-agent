@@ -1,22 +1,24 @@
+use crate::routes::health::health_check;
 use axum::Router;
 use sqlx::PgPool;
 use std::sync::Arc;
-use crate::routes::health::health_check;
+use tower_http::services::ServeDir;
+use tower_http::services::ServeDirFallback;
 
 // Re-export services
 pub use services::{
-    AdapterRegistry, AdapterRegistryState, AgentService, ApprovalService, AttachmentService, BudgetService,
-    BuiltInAgentService, CaseService, CloudUpstreamService, CompanyService, ConfigRevisionService,
-    CostService, CustomImageSetupService, DecisionTrainingService, EnvironmentDiagnosticsService,
-    EnvironmentRuntimeService, EnvironmentService, ExportService, ImportService, InboxService,
-    FinanceService, GoalService, InstanceSettingsService, InviteResourceService, InviteService,
-    IssueCommentService, IssueService, IssueTreeControlService, LabelService, LowTrustService,
-    OpenClawService, OrgChartService, PipelineService, PluginService, ProjectService,
-    RoutineAnnotationService, RoutineService, SecretProviderConfigService,
-    SecretRemoteImportService, SkillPolicyService, SkillRegistryService, SseService,
-    TeamsCatalogService, TermService,
-    UserDirectoryService, UserSecretDefinitionService, UserSecretService, WatchdogService,
-    WorkProductService, WorkTimelineService,
+    AdapterRegistry, AdapterRegistryState, AgentService, ApprovalService, AttachmentService,
+    BudgetService, BuiltInAgentService, CaseService, CloudUpstreamService, CompanyService,
+    ConfigRevisionService, CostService, CustomImageSetupService, DecisionTrainingService,
+    EnvironmentDiagnosticsService, EnvironmentRuntimeService, EnvironmentService, ExportService,
+    FinanceService, GoalService, ImportService, InboxService, InstanceSettingsService,
+    InviteResourceService, InviteService, IssueCommentService, IssueService,
+    IssueTreeControlService, LabelService, LowTrustService, OpenClawService, OrgChartService,
+    PipelineService, PluginService, ProjectService, RoutineAnnotationService, RoutineService,
+    SecretProviderConfigService, SecretRemoteImportService, SkillPolicyService,
+    SkillRegistryService, SseService, TeamsCatalogService, TermService, UserDirectoryService,
+    UserSecretDefinitionService, UserSecretService, WatchdogService, WorkProductService,
+    WorkTimelineService,
 };
 
 pub use access::AccessService;
@@ -151,8 +153,9 @@ impl AppState {
         adapter_registry: Arc<AdapterRegistry>,
         adapter_registry_state: Arc<AdapterRegistryState>,
         environment_runtime_service: Arc<dyn EnvironmentRuntimeService>,
-        workspace_runtime_authz_service:
-            Arc<dyn services::authorization_service::WorkspaceRuntimeServiceAuthzService>,
+        workspace_runtime_authz_service: Arc<
+            dyn services::authorization_service::WorkspaceRuntimeServiceAuthzService,
+        >,
         issue_service: Arc<dyn IssueService>,
         case_service: Arc<dyn CaseService>,
         issue_comment_service: Arc<dyn IssueCommentService>,
@@ -281,8 +284,7 @@ pub fn create_router(state: AppState) -> Router {
         std::sync::Arc::new(state.pool.clone()),
     ));
     // Routes that don't require authentication
-    let public_routes = Router::new()
-        .route("/health", axum::routing::get(health_check));
+    let public_routes = Router::new().route("/health", axum::routing::get(health_check));
 
     // Routes that require authentication
     let protected_routes = Router::new()
@@ -372,19 +374,28 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::tool_access::tool_access_routes())
         .merge(crate::routes::dashboard::dashboard_routes())
         .merge(crate::routes::decisions::decision_routes())
+        .merge(crate::routes::version::version_routes())
         .layer(axum::middleware::from_fn_with_state(
             auth_middleware,
             services::auth::auth_middleware_fn,
         ));
 
     // Combine public and protected routes
-    let api_routes = public_routes
-        .merge(protected_routes)
-        .with_state(state);
+    let api_routes = public_routes.merge(protected_routes).with_state(state);
 
     Router::new()
         // The Paperclip HTTP contract exposes all service routes below `/api`.
         .nest("/api", api_routes)
+        // §8A.2 SPA fallback: serve parrot-web-ui/dist/ when PARROT_UI_DIR is set
+        .merge({
+            let ui_dir = std::env::var("PARROT_UI_DIR").ok();
+            if let Some(dir) = &ui_dir {
+                tracing::info!(%dir, "mounting SPA static file server");
+                Router::new().fallback_service(ServeDirFallback::new(ServeDir::new(dir)))
+            } else {
+                Router::new()
+            }
+        })
         // §8.1 HTTP middleware (Paperclip parity):
         // - private_json_etag: ETag + 304 for JSON GET responses
         // - api_compression: gzip/br response compression (tower-http)

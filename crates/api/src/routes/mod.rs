@@ -66,6 +66,7 @@ pub mod instance_settings;
 pub mod labels;
 pub mod llms;
 pub mod plugins;
+pub mod version;
 
 /// Reject requests which did not receive an actor from the global auth middleware.
 /// Route-specific company/role checks remain in the handlers as the actor also
@@ -357,6 +358,7 @@ pub use watchdogs::watchdog_routes;
 pub use approvals::approval_routes;
 pub use costs::cost_routes;
 pub use decisions::decision_routes;
+pub use version::version_routes;
 pub use resource_memberships::resource_membership_routes;
 
 /// 权限测试用的 actor 构造器（board owner/admin/operator/viewer、agent、匿名）。
