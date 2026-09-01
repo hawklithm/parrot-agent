@@ -36,7 +36,7 @@ async fn counts(pool: &PgPool, company_id: Uuid) -> Result<Value, sqlx::Error> {
 
 /// Parse the Paperclip `include` object (company/agents/projects/issues/
 /// skills booleans), defaulting to everything included.
-fn include_flags(input: &Value) -> (bool, bool, bool, bool, bool) {
+fn include_flags(input: &Value) -> (bool, bool, bool, bool, bool, bool) {
     let include = input.get("include").and_then(Value::as_object);
     let flag = |key: &str, default: bool| -> bool {
         include
@@ -50,6 +50,7 @@ fn include_flags(input: &Value) -> (bool, bool, bool, bool, bool) {
         flag("projects", true),
         flag("issues", true),
         flag("skills", true),
+        flag("work_products", true),
     )
 }
 
@@ -78,7 +79,7 @@ fn validated_root_path(input: &Value) -> Result<Option<String>, String> {
 
 /// Read the entity arrays from either the Paperclip-style `source.files`
 /// (a `manifest.json` entry) or the direct `entities` shape.
-fn entity_arrays(input: &Value) -> (Vec<&Value>, Vec<&Value>, Vec<&Value>) {
+fn entity_arrays(input: &Value) -> (Vec<&Value>, Vec<&Value>, Vec<&Value>, Vec<&Value>) {
     let manifest = input
         .get("source")
         .and_then(Value::as_object)
@@ -92,7 +93,7 @@ fn entity_arrays(input: &Value) -> (Vec<&Value>, Vec<&Value>, Vec<&Value>) {
         .or_else(|| manifest);
     let container = match container {
         Some(Value::Object(map)) => map,
-        _ => return (Vec::new(), Vec::new(), Vec::new()),
+        _ => return (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let agents = container
         .get("agents")
@@ -109,7 +110,13 @@ fn entity_arrays(input: &Value) -> (Vec<&Value>, Vec<&Value>, Vec<&Value>) {
         .and_then(Value::as_array)
         .map(|a| a.iter().collect())
         .unwrap_or_default();
-    (agents, projects, issues)
+    let work_products = container
+        .get("workProducts")
+        .or_else(|| container.get("work_products"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    (agents, projects, issues, work_products)
 }
 
 fn entity_name(entry: &Value) -> Option<String> {
@@ -127,7 +134,7 @@ fn entity_name(entry: &Value) -> Option<String> {
 #[async_trait]
 impl ExportService for DefaultCompanyPortabilityService {
     async fn export(&self, id: Uuid, input: Value) -> Result<Value, sqlx::Error> {
-        let (include_company, include_agents, include_projects, include_issues, include_skills) =
+        let (include_company, include_agents, include_projects, include_issues, include_skills, include_work_products) =
             include_flags(&input);
         let company: Option<Value> = if include_company {
             sqlx::query(
@@ -243,6 +250,35 @@ impl ExportService for DefaultCompanyPortabilityService {
             })
             .collect();
 
+        let work_products: Vec<Value> = if include_work_products {
+            let rows = sqlx::query(
+                "SELECT id, issue_id, type, provider, title, status, review_state,                  is_primary, health_status, metadata, source_trust, created_at                  FROM issue_work_products WHERE company_id = $1 ORDER BY id",
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.iter()
+                .map(|r| {
+                    json!({
+                        "id": r.get::<Uuid, _>("id"),
+                        "issueId": r.get::<Uuid, _>("issue_id"),
+                        "type": r.get::<String, _>("type"),
+                        "provider": r.get::<String, _>("provider"),
+                        "title": r.get::<String, _>("title"),
+                        "status": r.get::<String, _>("status"),
+                        "reviewState": r.get::<String, _>("review_state"),
+                        "isPrimary": r.get::<bool, _>("is_primary"),
+                        "healthStatus": r.get::<String, _>("health_status"),
+                        "metadata": r.get::<Value, _>("metadata"),
+                        "sourceTrust": r.get::<Option<Value>, _>("source_trust"),
+                        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let skills: Vec<Value> = if include_skills {
             let rows = sqlx::query(
                 "SELECT id, name, slug, version, status, category, install_count, created_at \
@@ -292,11 +328,13 @@ impl ExportService for DefaultCompanyPortabilityService {
             "issues": issues,
             "skills": skills,
             "routines": routines,
+            "workProducts": work_products,
             "generatedAt": chrono::Utc::now(),
         }))
     }
+
     async fn preview(&self, id: Uuid, input: Value) -> Result<Value, sqlx::Error> {
-        let (include_company, include_agents, include_projects, include_issues, include_skills) =
+        let (include_company, include_agents, include_projects, include_issues, include_skills, include_work_products) =
             include_flags(&input);
         let c = counts(&self.pool, id).await?;
         let routines: i64 = sqlx::query_scalar(
@@ -321,6 +359,13 @@ impl ExportService for DefaultCompanyPortabilityService {
                 "issues": if include_issues { c["issues"].clone() } else { json!(0) },
                 "skills": if include_skills { json!(skills) } else { json!(0) },
                 "routines": json!(routines),
+                "workProducts": sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM issue_work_products WHERE company_id = $1",
+                )
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0i64),
             },
         }))
     }
@@ -387,7 +432,7 @@ impl ImportService for DefaultCompanyPortabilityService {
         let root_path = validated_root_path(&input).map_err(|e| {
             sqlx::Error::Protocol(format!("invalid import root: {e}"))
         })?;
-        let (agent_entries, project_entries, issue_entries) = entity_arrays(&input);
+        let (agent_entries, project_entries, issue_entries, work_product_entries) = entity_arrays(&input);
         let (existing_agents, existing_projects, existing_issues) = load_existing(&self.pool, id).await?;
         let collision_strategy = input
             .get("collisionStrategy")
@@ -423,7 +468,7 @@ impl ImportService for DefaultCompanyPortabilityService {
             "valid": errors.is_empty(),
             "rootPath": root_path,
             "collisionStrategy": collision_strategy,
-            "entityCount": agent_entries.len() + project_entries.len() + issue_entries.len(),
+            "entityCount": agent_entries.len() + project_entries.len() + issue_entries.len() + work_product_entries.len(),
             "conflicts": conflicts,
             "errors": errors,
             "plan": {
@@ -431,6 +476,7 @@ impl ImportService for DefaultCompanyPortabilityService {
                 "agentPlans": agent_plans,
                 "projectPlans": project_plans,
                 "issuePlans": issue_plans,
+                "workProductPlans": vec![json!({"action": "create"})],
             },
         }))
     }
@@ -439,7 +485,7 @@ impl ImportService for DefaultCompanyPortabilityService {
         let root_path = validated_root_path(&input).map_err(|e| {
             sqlx::Error::Protocol(format!("invalid import root: {e}"))
         })?;
-        let (agent_entries, project_entries, issue_entries) = entity_arrays(&input);
+        let (agent_entries, project_entries, issue_entries, work_product_entries) = entity_arrays(&input);
         let (existing_agents, existing_projects, existing_issues) = load_existing(&self.pool, id).await?;
         let collision_strategy = input
             .get("collisionStrategy")
@@ -547,16 +593,64 @@ impl ImportService for DefaultCompanyPortabilityService {
             issue_results.push(json!({ "title": title, "id": issue_id, "action": action }));
         }
 
+        // Import work products (linked to issues via issue_id)
+        let mut work_product_results = Vec::new();
+        for entry in work_product_entries {
+            let Some(_id) = entry.get("id").and_then(Value::as_str).map(|s| s.to_string()) else { continue };
+            let issue_id = entry
+                .get("issueId")
+                .or_else(|| entry.get("issue_id"))
+                .and_then(Value::as_str)
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(Uuid::nil());
+            if issue_id.is_nil() { continue; }
+
+            let wp_id = Uuid::new_v4();
+            let type_val = entry.get("type").and_then(Value::as_str).unwrap_or("artifact");
+            let provider = entry.get("provider").and_then(Value::as_str).unwrap_or("parrot");
+            let title = entry.get("title").and_then(Value::as_str).unwrap_or("work product");
+            let status = entry.get("status").and_then(Value::as_str).unwrap_or("active");
+            let review_state = entry.get("reviewState").or_else(|| entry.get("review_state"))
+                .and_then(Value::as_str).unwrap_or("none");
+            let is_primary = entry.get("isPrimary").or_else(|| entry.get("is_primary"))
+                .and_then(Value::as_bool).unwrap_or(false);
+            let health_status = entry.get("healthStatus").or_else(|| entry.get("health_status"))
+                .and_then(Value::as_str).unwrap_or("unknown");
+            let metadata = entry.get("metadata").cloned();
+            let source_trust = entry.get("sourceTrust").or_else(|| entry.get("source_trust")).cloned();
+
+            sqlx::query(
+                "INSERT INTO issue_work_products                  (id, company_id, issue_id, type, provider, title, status, review_state,                   is_primary, health_status, metadata, source_trust, created_at)                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())",
+            )
+            .bind(wp_id)
+            .bind(id)
+            .bind(issue_id)
+            .bind(type_val)
+            .bind(provider)
+            .bind(title)
+            .bind(status)
+            .bind(review_state)
+            .bind(is_primary)
+            .bind(health_status)
+            .bind(metadata)
+            .bind(source_trust)
+            .execute(&mut *tx)
+            .await?;
+
+            work_product_results.push(json!({ "id": wp_id, "issueId": issue_id, "action": "created" }));
+        }
+
         tx.commit().await?;
 
         Ok(json!({
             "companyId": id,
             "applied": true,
             "rootPath": root_path,
-            "entityCount": agent_results.len() + project_results.len() + issue_results.len(),
+            "entityCount": agent_results.len() + project_results.len() + issue_results.len() + work_product_results.len(),
             "agents": agent_results,
             "projects": project_results,
             "issues": issue_results,
+            "workProducts": work_product_results,
         }))
     }
 }
