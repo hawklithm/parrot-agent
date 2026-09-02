@@ -371,8 +371,13 @@ mod tests {
 
     #[test]
     fn test_ci_detection() {
-        // Should not detect CI in normal environment
-        assert!(!is_ci());
+        // Verify detection matches current environment state (CI may be set in some envs)
+        let detected = is_ci();
+        let in_ci = std::env::var("CI").is_ok()
+            || std::env::var("GITHUB_ACTIONS").is_ok()
+            || std::env::var("GITLAB_CI").is_ok()
+            || std::env::var("BUILD_NUMBER").is_ok();
+        assert_eq!(detected, in_ci);
     }
 
     #[test]

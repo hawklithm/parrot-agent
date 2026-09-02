@@ -362,7 +362,7 @@ mod tests {
         // 上升趋势
         for i in 0..10 {
             let mut metric = Metric::new("growth".to_string(), (i * 10) as f64);
-            metric.timestamp = now + chrono::Duration::hours(i);
+            metric.timestamp = now - chrono::Duration::hours(i as i64);
             service.record_metric(metric);
         }
         
