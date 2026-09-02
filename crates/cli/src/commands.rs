@@ -1,11 +1,7 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-use crate::{
-    backup, checks,
-    client::ApiClient,
-    config::resolve_config_path,
-};
+use crate::{backup, checks, client::ApiClient, config::resolve_config_path};
 
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     let raw: Vec<String> = args.into_iter().collect();
@@ -71,7 +67,9 @@ fn print_help() -> Result<()> {
     println!("  secret      list <companyId>");
     println!("  routine     list <companyId>");
     println!("  activity    get <companyId>");
-    println!("  approval    list <companyId> | get <id> | approve <id> | reject <id> | resubmit <id>");
+    println!(
+        "  approval    list <companyId> | get <id> | approve <id> | reject <id> | resubmit <id>"
+    );
     println!("  pipeline    list <companyId> | get <id>");
     println!("  skill       list | get <name>");
     println!("  team        catalog");
@@ -86,7 +84,7 @@ fn print_help() -> Result<()> {
     println!();
     println!("Server management:");
     println!("  service     status | start | stop | restart");
-    println!("  install     [--dir PATH]");
+    println!("  install     [--dir PATH] [--install-service] [--service-dir PATH]");
     println!("  update      [--version VERSION]");
     println!();
     println!("Maintenance:");
@@ -122,7 +120,9 @@ fn cmd_configure(args: &[String]) -> Result<()> {
     let mut i = 0;
     while i < args.len() {
         let flag = &args[i];
-        let val = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))?;
+        let val = args
+            .get(i + 1)
+            .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))?;
         match flag.as_str() {
             "--server-url" => server_url = Some(val.clone()),
             "--api-token" => api_token = Some(val.clone()),
@@ -166,6 +166,19 @@ fn cmd_service(args: &[String]) -> Result<()> {
                 match svc {
                     Ok(out) => println!("systemd: {}", String::from_utf8_lossy(&out.stdout).trim()),
                     Err(_) => println!("systemd: not checked (systemctl not available)"),
+                }
+                // Check for unit file and show install hint if missing
+                let unit_path = std::path::PathBuf::from("/etc/systemd/system/parrot.service");
+                if !unit_path.exists() {
+                    let user_unit = std::path::PathBuf::from(
+                        std::env::var("HOME").unwrap_or_default()
+                            + "/.config/systemd/user/parrot.service",
+                    );
+                    if !user_unit.exists() {
+                        println!(
+                            "hint: no systemd unit file found; run `parrot install --install-service` to create one"
+                        );
+                    }
                 }
             }
             #[cfg(target_family = "windows")]
@@ -251,9 +264,35 @@ fn cmd_install(args: &[String]) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             #[cfg(target_family = "unix")]
-            { PathBuf::from("/usr/local/bin") }
+            {
+                PathBuf::from("/usr/local/bin")
+            }
             #[cfg(target_family = "windows")]
-            { PathBuf::from(std::env::var("PROGRAMFILES").unwrap_or_else(|_| "C:\\Program Files\\parrot".into())) }
+            {
+                PathBuf::from(
+                    std::env::var("PROGRAMFILES")
+                        .unwrap_or_else(|_| "C:\\Program Files\\parrot".into()),
+                )
+            }
+        });
+
+    let install_service = args.contains(&"--install-service".to_string());
+    let service_dir = get_flag_value(args, "--service-dir")
+        .map(PathBuf::from)
+        .or_else(|| {
+            #[cfg(target_family = "unix")]
+            {
+                if std::os::unix::process::geteuid() == 0 {
+                    Some(PathBuf::from("/etc/systemd/system"))
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    Some(PathBuf::from(home).join(".config/systemd/user"))
+                }
+            }
+            #[cfg(not(target_family = "unix"))]
+            {
+                None
+            }
         });
 
     let self_path = std::env::current_exe()?;
@@ -265,11 +304,45 @@ fn cmd_install(args: &[String]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o755))?;
         println!("installed parrot to {}", target_path.display());
+
+        if install_service {
+            let service_dir = service_dir.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--service-dir required on non-Linux platforms; use --service-dir to specify"
+                )
+            })?;
+            std::fs::create_dir_all(&service_dir)?;
+            let unit_path = service_dir.join("parrot.service");
+            let executable = target_path.canonicalize().unwrap_or(target_path.clone());
+            let unit_content = format!(
+                "[Unit]\n\
+                 Description=Parrot Agent Server\n\
+                 After=network.target\n\n\
+                 [Service]\n\
+                 Type=notify\n\
+                 ExecStart={}\n\
+                 NotifyAccess=main\n\
+                 Restart=on-failure\n\
+                 RestartSec=5s\n\n\
+                 [Install]\n\
+                 WantedBy=default.target\n",
+                executable.display()
+            );
+            std::fs::write(&unit_path, unit_content)?;
+            println!("installed systemd unit to {}", unit_path.display());
+            println!("run: systemctl daemon-reload");
+            println!("run: systemctl enable --now parrot (or --user for user service)");
+        }
     }
     #[cfg(target_family = "windows")]
     {
         std::fs::create_dir_all(&install_dir)?;
         std::fs::copy(&self_path, &target_path)?;
+        if install_service {
+            println!(
+                "warning: --install-service is not supported on Windows; skip systemd unit generation"
+            );
+        }
         println!("installed parrot to {}", target_path.display());
     }
     #[cfg(not(any(target_family = "unix", target_family = "windows")))]
@@ -296,7 +369,6 @@ fn cmd_auth(args: &[String]) -> Result<()> {
     }
 }
 
-
 // ── Update ─────────────────────────────────────────────────────────────
 
 fn cmd_update(args: &[String]) -> Result<()> {
@@ -316,7 +388,9 @@ fn cmd_company(args: &[String]) -> Result<()> {
             Ok(())
         }
         "get" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot company get <id>"))?;
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot company get <id>"))?;
             let company = client.get_company(id)?;
             println!("{}", format_json(&company));
             Ok(())
@@ -329,12 +403,16 @@ fn cmd_company(args: &[String]) -> Result<()> {
             Ok(())
         }
         "delete" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot company delete <id>"))?;
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot company delete <id>"))?;
             println!("{}", format_json(&client.delete_company(id)?));
             Ok(())
         }
         "export" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot company export <id>"))?;
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot company export <id>"))?;
             println!("{}", format_json(&client.export_company(id)?));
             Ok(())
         }
@@ -359,31 +437,45 @@ fn cmd_approval(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot approval list <companyId>"))?;
             println!("{}", format_json(&client.list_approvals(company_id)?));
             Ok(())
         }
         "get" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval get <id>"))?;
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot approval get <id>"))?;
             println!("{}", format_json(&client.get_approval(id)?));
             Ok(())
         }
         "approve" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval approve <id> [--json '{{...}}']"))?;
+            let id = args.get(1).ok_or_else(|| {
+                anyhow::anyhow!("Usage: parrot approval approve <id> [--json '{{...}}']")
+            })?;
             let body = approval_body(args);
             println!("{}", format_json(&client.approve_approval(id, &body)?));
             Ok(())
         }
         "reject" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval reject <id> [--json '{{...}}']"))?;
+            let id = args.get(1).ok_or_else(|| {
+                anyhow::anyhow!("Usage: parrot approval reject <id> [--json '{{...}}']")
+            })?;
             let body = approval_body(args);
             println!("{}", format_json(&client.reject_approval(id, &body)?));
             Ok(())
         }
         "resubmit" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot approval resubmit <id> [--json '{{...}}']"))?;
-            let body = get_flag_value(args, "--json").map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null));
-            println!("{}", format_json(&client.resubmit_approval(id, body.as_ref())?));
+            let id = args.get(1).ok_or_else(|| {
+                anyhow::anyhow!("Usage: parrot approval resubmit <id> [--json '{{...}}']")
+            })?;
+            let body = get_flag_value(args, "--json")
+                .map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null));
+            println!(
+                "{}",
+                format_json(&client.resubmit_approval(id, body.as_ref())?)
+            );
             Ok(())
         }
         _ => {
@@ -407,12 +499,16 @@ fn cmd_pipeline(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot pipeline list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot pipeline list <companyId>"))?;
             println!("{}", format_json(&client.list_pipelines(company_id)?));
             Ok(())
         }
         "get" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot pipeline get <id>"))?;
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot pipeline get <id>"))?;
             println!("{}", format_json(&client.get_pipeline(id)?));
             Ok(())
         }
@@ -434,7 +530,9 @@ fn cmd_skill(args: &[String]) -> Result<()> {
             Ok(())
         }
         "get" => {
-            let name = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot skill get <name>"))?;
+            let name = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot skill get <name>"))?;
             println!("{}", format_json(&client.get_skill(name)?));
             Ok(())
         }
@@ -502,19 +600,24 @@ fn cmd_plugin(args: &[String]) -> Result<()> {
                     Ok(())
                 }
                 "install" => {
-                    let raw = get_flag_value(args, "--json")
-                        .ok_or_else(|| anyhow::anyhow!("plugin install requires --json '{{...}}'"))?;
+                    let raw = get_flag_value(args, "--json").ok_or_else(|| {
+                        anyhow::anyhow!("plugin install requires --json '{{...}}'")
+                    })?;
                     let body: serde_json::Value = serde_json::from_str(&raw)?;
                     println!("{}", format_json(&client.install_plugin(&body)?));
                     Ok(())
                 }
                 "enable" => {
-                    let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin enable <id>"))?;
+                    let id = args
+                        .get(1)
+                        .ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin enable <id>"))?;
                     println!("{}", format_json(&client.enable_plugin(id)?));
                     Ok(())
                 }
                 "disable" => {
-                    let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin disable <id>"))?;
+                    let id = args
+                        .get(1)
+                        .ok_or_else(|| anyhow::anyhow!("Usage: parrot plugin disable <id>"))?;
                     println!("{}", format_json(&client.disable_plugin(id)?));
                     Ok(())
                 }
@@ -534,7 +637,9 @@ fn cmd_dashboard(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "get" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot dashboard get <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot dashboard get <companyId>"))?;
             println!("{}", format_json(&client.get_dashboard(company_id)?));
             Ok(())
         }
@@ -552,7 +657,9 @@ fn cmd_cost(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "summary" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot cost summary <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot cost summary <companyId>"))?;
             println!("{}", format_json(&client.get_cost_summary(company_id)?));
             Ok(())
         }
@@ -570,7 +677,9 @@ fn cmd_feedback(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "get" => {
-            let trace_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot feedback get <traceId>"))?;
+            let trace_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot feedback get <traceId>"))?;
             println!("{}", format_json(&client.get_feedback_trace(trace_id)?));
             Ok(())
         }
@@ -588,7 +697,9 @@ fn cmd_access(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "org-chart" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot access org-chart <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot access org-chart <companyId>"))?;
             println!("{}", format_json(&client.get_org_chart(company_id)?));
             Ok(())
         }
@@ -606,12 +717,16 @@ fn cmd_workspace(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot workspace list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot workspace list <companyId>"))?;
             println!("{}", format_json(&client.list_workspaces(company_id)?));
             Ok(())
         }
         "get" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot workspace get <id>"))?;
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot workspace get <id>"))?;
             println!("{}", format_json(&client.get_workspace(id)?));
             Ok(())
         }
@@ -629,12 +744,16 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let issue_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot run list <issueId>"))?;
+            let issue_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot run list <issueId>"))?;
             println!("{}", format_json(&client.list_issue_runs(issue_id)?));
             Ok(())
         }
         "get" => {
-            let id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot run get <id>"))?;
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot run get <id>"))?;
             println!("{}", format_json(&client.get_run(id)?));
             Ok(())
         }
@@ -652,7 +771,9 @@ fn cmd_channel(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot channel list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot channel list <companyId>"))?;
             println!("{}", format_json(&client.list_channels(company_id)?));
             Ok(())
         }
@@ -663,8 +784,6 @@ fn cmd_channel(args: &[String]) -> Result<()> {
     }
 }
 
-
-
 // ── Agent ─────────────────────────────────────────────────────────────
 
 fn cmd_agent(args: &[String]) -> Result<()> {
@@ -672,14 +791,20 @@ fn cmd_agent(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot agent list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot agent list <companyId>"))?;
             let agents = client.list_agents(company_id)?;
             println!("{}", format_json(&agents));
             Ok(())
         }
         "get" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot agent get <companyId> <agentId>"))?;
-            let agent_id = args.get(2).ok_or_else(|| anyhow::anyhow!("Usage: parrot agent get <companyId> <agentId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot agent get <companyId> <agentId>"))?;
+            let agent_id = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot agent get <companyId> <agentId>"))?;
             let agent = client.get_agent(company_id, agent_id)?;
             println!("{}", format_json(&agent));
             Ok(())
@@ -698,15 +823,21 @@ fn cmd_issue(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot issue list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot issue list <companyId>"))?;
             let query = get_flag_value(args, "--q").or_else(|| get_flag_value(args, "--query"));
             let issues = client.list_issues(company_id, query.as_deref())?;
             println!("{}", format_json(&issues));
             Ok(())
         }
         "get" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot issue get <companyId> <issueId>"))?;
-            let issue_id = args.get(2).ok_or_else(|| anyhow::anyhow!("Usage: parrot issue get <companyId> <issueId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot issue get <companyId> <issueId>"))?;
+            let issue_id = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot issue get <companyId> <issueId>"))?;
             let issue = client.get_issue(company_id, issue_id)?;
             println!("{}", format_json(&issue));
             Ok(())
@@ -725,7 +856,9 @@ fn cmd_goal(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot goal list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot goal list <companyId>"))?;
             let goals = client.list_goals(company_id)?;
             println!("{}", format_json(&goals));
             Ok(())
@@ -744,7 +877,9 @@ fn cmd_project(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot project list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot project list <companyId>"))?;
             let projects = client.list_projects(company_id)?;
             println!("{}", format_json(&projects));
             Ok(())
@@ -763,7 +898,9 @@ fn cmd_secret(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot secret list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot secret list <companyId>"))?;
             let secrets = client.list_secrets(company_id)?;
             println!("{}", format_json(&secrets));
             Ok(())
@@ -782,7 +919,9 @@ fn cmd_routine(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot routine list <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot routine list <companyId>"))?;
             let routines = client.list_routines(company_id)?;
             println!("{}", format_json(&routines));
             Ok(())
@@ -801,7 +940,9 @@ fn cmd_activity(args: &[String]) -> Result<()> {
     let client = load_client()?;
     match sub {
         "get" => {
-            let company_id = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: parrot activity get <companyId>"))?;
+            let company_id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot activity get <companyId>"))?;
             let activity = client.get_activity(company_id)?;
             println!("{}", format_json(&activity));
             Ok(())

@@ -1,0 +1,43 @@
+[Unit]
+Description=Parrot Agent Server
+Documentation=https://github.com/parrot-agent/parrot-agent
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+
+ExecStart=/usr/local/bin/parrot-server --config /etc/parrot/parrot.conf
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=300
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/parrot /var/log/parrot
+
+# Runtime
+RuntimeDirectory=parrot
+StateDirectory=parrot
+LogsDirectory=parrot
+
+# Environment
+EnvironmentFile=/etc/parrot/parrot.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=parrot-server
+
+# User/group
+User=parrot
+Group=parrot
+
+[Install]
+WantedBy=multi-user.target
