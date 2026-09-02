@@ -39,7 +39,8 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         "service" => cmd_service(rest),
         "install" => cmd_install(rest),
         "update" => cmd_update(rest),
-        _ => bail!("unknown command '{command}'. Run 'parrot help' for usage."),
+        "config" => cmd_config(rest),
+        _ => bail!("unknown command '{{command}}'. Run 'parrot help' for usage."),
     }
 }
 
@@ -90,6 +91,7 @@ fn print_help() -> Result<()> {
     println!("Maintenance:");
     println!("  db-backup   [--dir PATH] [--retention-days N]");
     println!("  version");
+    println!("  config      path [--json] | dir");
     println!("  help");
     Ok(())
 }
@@ -144,6 +146,48 @@ fn cmd_configure(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+
+// ── Config ──────────────────────────────────────────────────────────
+
+fn cmd_config(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("path");
+    match sub {
+        "path" => {
+            let json = args.contains(&"--json".to_string());
+            let path = resolve_config_path(None);
+            match path {
+                Some(p) => {
+                    if json {
+                        println!("{}", serde_json::json!({"path": p.display().to_string()}));
+                    } else {
+                        println!("{}", p.display());
+                    }
+                }
+                None => bail!("no config path available; set PARROT_CONFIG or use --config"),
+            }
+        }
+        "dir" => {
+            let dir = crate::config::default_config_path()
+                .map(|p| p.parent().unwrap_or(p.as_path()).to_path_buf());
+            match dir {
+                Some(d) => println!("{}", d.display()),
+                None => bail!("no default config directory available"),
+            }
+        }
+        _ => {
+            println!("Usage: parrot config path [--json] | dir");
+            println!();
+            println!("  path    Show resolved config file path");
+            println!("  dir     Show config directory path");
+            println!();
+            println!("Options:");
+            println!("  --json  Output JSON instead of plain text");
+        }
+    }
+    Ok(())
+}
+
+// ── Service ───────────────────────────────────────────────────────────
 // ── Service ───────────────────────────────────────────────────────────
 
 fn cmd_service(args: &[String]) -> Result<()> {
