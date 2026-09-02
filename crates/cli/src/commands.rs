@@ -83,7 +83,7 @@ fn print_help() -> Result<()> {
     println!("  channel     list <companyId>");
     println!();
     println!("Server management:");
-    println!("  service     status | start | stop | restart");
+    println!("  service     status | start | stop | restart | log [LINES]");
     println!("  install     [--dir PATH] [--install-service] [--service-dir PATH]");
     println!("  update      [--version VERSION]");
     println!();
@@ -249,9 +249,67 @@ fn cmd_service(args: &[String]) -> Result<()> {
             #[cfg(not(target_family = "unix"))]
             bail!("service restart is only supported on Linux with systemd");
             Ok(())
+        "log" => {
+            let tail_lines: usize = args.get(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50);
+
+            #[cfg(target_family = "unix")]
+            {
+                // Try systemd journal first
+                let journal = std::process::Command::new("journalctl")
+                    .args(["-u", "parrot", "--no-pager", "-n", &tail_lines.to_string(), "-f"])
+                    .output();
+
+                match journal {
+                    Ok(out) if out.status.success() => {
+                        print!("{}", String::from_utf8_lossy(&out.stdout));
+                    }
+                    Ok(_) | Err(_) => {
+                        // Fallback to log file
+                        let log_path = std::path::PathBuf::from(
+                            std::env::var("PARROT_LOG_DIR").unwrap_or_else(|_| "/var/log/parrot".to_string())
+                        ).join("server.log");
+
+                        if log_path.exists() {
+                            let content = std::fs::read_to_string(&log_path)?;
+                            let lines: Vec<&str> = content.lines().collect();
+                            let start = lines.len().saturating_sub(tail_lines);
+                            for line in &lines[start..] {
+                                println!("{line}");
+                            }
+                        } else {
+                            println!("no log file found at {}", log_path.display());
+                            println!("hint: ensure PARROT_LOG_DIR is set or service is running under systemd");
+                        }
+                    }
+                }
+            }
+
+            #[cfg(not(target_family = "unix"))]
+            {
+                let log_path = std::path::PathBuf::from(
+                    std::env::var("PARROT_LOG_DIR").unwrap_or_else(|_| {
+                        std::env::var("APPDATA").unwrap_or_default() + "\\parrot\\logs"
+                    })
+                ).join("server.log");
+
+                if log_path.exists() {
+                    let content = std::fs::read_to_string(&log_path)?;
+                    let lines: Vec<&str> = content.lines().collect();
+                    let start = lines.len().saturating_sub(tail_lines);
+                    for line in &lines[start..] {
+                        println!("{line}");
+                    }
+                } else {
+                    println!("no log file found at {}", log_path.display());
+                }
+            }
+
+            Ok(())
         }
         _ => {
-            println!("Usage: parrot service status | start | stop | restart");
+            println!("Usage: parrot service status | start | stop | restart | log [LINES]");
             Ok(())
         }
     }
