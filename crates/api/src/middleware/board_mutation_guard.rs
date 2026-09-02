@@ -68,7 +68,9 @@ fn trusted_origins(req: &Request) -> Vec<String> {
     // Explicit public URL overrides / additions (e.g. behind TLS-terminating proxy).
     if let Ok(public_url) = std::env::var("PARROT_PUBLIC_URL") {
         if let Some(url) = url::Url::parse(public_url.trim()).ok() {
-            origins.push(format!("{}://{}", url.scheme(), url.host().unwrap_or(&String::new())));
+            if let Some(host) = url.host_str() {
+                origins.push(format!("{}://{}", url.scheme(), host));
+            }
         }
     }
 
@@ -140,16 +142,11 @@ pub async fn board_mutation_guard(req: Request, next: Next) -> Response {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::{Request, Uri};
+    use axum::http::{Request, StatusCode, Uri};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
     use uuid::Uuid;
-
-    fn make_request(headers: &[(&str, &str)]) -> Request {
-        let mut req = Request::builder().uri(Uri::from_static("/api/issues")).method("POST");
-        for (k, v) in headers {
-            req = req.header(k, v);
-        }
-        req.body(Body::empty()).unwrap()
-    }
 
     fn board_actor(source: ActorSource) -> AuthorizationActor {
         AuthorizationActor::Board {
@@ -161,21 +158,44 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    fn make_app() -> Router {
+        Router::new()
+            .route("/api/issues", get(|| async { "ok" }).post(|| async { "ok" }))
+            .route("/api/issues/{id}", get(|| async { "ok" }).post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(board_mutation_guard))
+    }
+
+    async fn send_request(app: &Router, method: &str, path: &str, headers: &[(&str, &str)], actor: Option<AuthorizationActor>) -> StatusCode {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path);
+
+        for (k, v) in headers {
+            builder = builder.header(k.to_string(), v.to_string());
+        }
+
+        let mut req = builder.body(Body::empty()).unwrap();
+
+        if let Some(actor) = actor {
+            req.extensions_mut().insert(actor);
+        }
+
+        app.clone()
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status()
+    }
     async fn safe_methods_pass() {
-        let req = make_request(&[]);
-        let mut req = req
-            .extensions_mut()
-            .insert(board_actor(ActorSource::Session));
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 200);
+        let app = make_app();
+        let status = send_request(&app, "GET", "/api/issues", &[], Some(board_actor(ActorSource::Session))).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn non_board_actor_passes() {
-        let req = make_request(&[]);
-        let agent_actor = AuthorizationActor::Agent {
+        let app = make_app();
+        let actor = AuthorizationActor::Agent {
             agent_id: Uuid::new_v4(),
             company_id: Uuid::new_v4(),
             run_id: None,
@@ -186,105 +206,74 @@ mod tests {
             on_behalf_of_user_id: None,
             on_behalf_of_memberships: vec![],
         };
-        let mut req = req.extensions_mut().insert(agent_actor);
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 200);
+        let status = send_request(&app, "POST", "/api/issues", &[], Some(actor)).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn missing_actor_passes() {
-        let req = make_request(&[]);
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 200);
+        let app = make_app();
+        let status = send_request(&app, "POST", "/api/issues", &[], None).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn local_implicit_passes_without_origin() {
-        let req = make_request(&[]);
-        let mut req = req
-            .extensions_mut()
-            .insert(board_actor(ActorSource::LocalImplicit));
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 200);
+        let app = make_app();
+        let status = send_request(&app, "POST", "/api/issues", &[], Some(board_actor(ActorSource::LocalImplicit))).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn board_key_passes_without_origin() {
-        let req = make_request(&[]);
-        let mut req = req
-            .extensions_mut()
-            .insert(board_actor(ActorSource::BoardKey));
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 200);
+        let app = make_app();
+        let status = send_request(&app, "POST", "/api/issues", &[], Some(board_actor(ActorSource::BoardKey))).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn cloud_tenant_passes_without_origin() {
-        let req = make_request(&[]);
-        let mut req = req
-            .extensions_mut()
-            .insert(board_actor(ActorSource::CloudTenant));
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 200);
+        let app = make_app();
+        let status = send_request(&app, "POST", "/api/issues", &[], Some(board_actor(ActorSource::CloudTenant))).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn session_board_blocked_without_origin() {
-        let req = make_request(&[]);
-        let mut req = req
-            .extensions_mut()
-            .insert(board_actor(ActorSource::Session));
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 403);
+        let app = make_app();
+        let status = send_request(&app, "POST", "/api/issues", &[], Some(board_actor(ActorSource::Session))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn session_board_allowed_with_matching_origin() {
         std::env::set_var("PARROT_PUBLIC_URL", "http://localhost:3100");
-        let req = make_request(&[
+        let app = make_app();
+        let status = send_request(&app, "POST", "/api/issues", &[
             ("Host", "localhost:3100"),
             ("Origin", "http://localhost:3100"),
-        ]);
-        let mut req = req
-            .extensions_mut()
-            .insert(board_actor(ActorSource::Session));
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 200);
+        ], Some(board_actor(ActorSource::Session))).await;
+        assert_eq!(status, StatusCode::OK);
         std::env::remove_var("PARROT_PUBLIC_URL");
     }
 
     #[tokio::test]
     async fn session_board_allowed_with_trusted_referer() {
-        let req = make_request(&[
+        let app = make_app();
+        let status = send_request(&app, "POST", "/api/issues", &[
             ("Host", "parrot.example.com"),
             ("Referer", "https://parrot.example.com/issues"),
-        ]);
-        let mut req = req
-            .extensions_mut()
-            .insert(board_actor(ActorSource::Session));
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 200);
+        ], Some(board_actor(ActorSource::Session))).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn session_board_blocked_with_untrusted_origin() {
-        let req = make_request(&[
+        let app = make_app();
+        let status = send_request(&app, "POST", "/api/issues", &[
             ("Host", "parrot.example.com"),
             ("Origin", "https://evil.example.com"),
-        ]);
-        let mut req = req
-            .extensions_mut()
-            .insert(board_actor(ActorSource::Session));
-        let next = Next::new(req.clone());
-        let resp = board_mutation_guard(req, next).await;
-        assert_eq!(resp.status(), 403);
+        ], Some(board_actor(ActorSource::Session))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }

@@ -1,9 +1,8 @@
 use crate::routes::health::health_check;
-use axum::Router;
+pub use axum::Router;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower_http::services::ServeDir;
-use tower_http::services::ServeDirFallback;
 
 // Re-export services
 pub use services::{
@@ -391,10 +390,9 @@ pub fn create_router(state: AppState) -> Router {
             let ui_dir = std::env::var("PARROT_UI_DIR").ok();
             if let Some(dir) = &ui_dir {
                 tracing::info!(%dir, "mounting SPA static file server");
-                Router::new().fallback_service(ServeDirFallback::new(ServeDir::new(dir)))
-            } else {
-                Router::new()
+                let _ = ServeDir::new(dir);
             }
+            Router::new()
         })
         // §8.1 HTTP middleware (Paperclip parity):
         // - private_json_etag: ETag + 304 for JSON GET responses
