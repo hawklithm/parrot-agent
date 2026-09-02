@@ -18,5 +18,37 @@ services:
       timeout: 5s
       retries: 10
 
+  parrot-agent:
+    build:
+      context: ..
+      dockerfile: parrot-agent/Dockerfile
+      args:
+        PARROT_VERSION: "0.1.0-dev"
+        PARROT_BUILD_COMMIT: "${GIT_COMMIT:-local}"
+        PARROT_BUILD_TIME: "${BUILD_TIME:-unknown}"
+    image: parrot-agent:latest
+    container_name: parrot-agent
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/parrot_agent_dev
+      DEPLOYMENT_MODE: authenticated
+      PARROT_UI_DIR: /app/ui
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - parrot-data:/var/lib/parrot
+      - parrot-logs:/var/log/parrot
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3100/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   parrot-agent-postgres-data:
+  parrot-data:
+  parrot-logs:
