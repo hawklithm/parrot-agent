@@ -3,20 +3,21 @@
 //! Builds the dependency graph (repositories -> services -> AppState),
 //! runs migrations, and serves the Axum router produced by `api::create_router`.
 
+mod systemd_notify;
+
 use std::sync::Arc;
 
+use api::create_router;
 use axum::Router;
+use repositories::{
+    budget_repository::{PgBudgetIncidentRepository, PgBudgetPolicyRepository},
+    company_repository::CompanyRepository,
+    cost_event_repository::PgCostEventRepository,
+};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-use api::create_router;
-use repositories::{
-    budget_repository::{PgBudgetIncidentRepository, PgBudgetPolicyRepository},
-    cost_event_repository::PgCostEventRepository,
-    company_repository::CompanyRepository,
-};
-
 
 async fn ensure_local_trusted_principal(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let configured_user_id = std::env::var("LOCAL_TRUSTED_USER_ID")
@@ -145,14 +146,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dispatch fingerprint) — see services::routine_execution_service.
     let routine_repo: Arc<dyn repositories::RoutineRepository> =
         Arc::new(repositories::routine_repository::PostgresRoutineRepository::new(pool.clone()));
-    let scheduler_budget_service: Arc<dyn services::BudgetService> = Arc::new(
-        services::DefaultBudgetService::new(
+    let scheduler_budget_service: Arc<dyn services::BudgetService> =
+        Arc::new(services::DefaultBudgetService::new(
             Arc::new(PgCostEventRepository::new(pool.clone())),
             Arc::new(PgBudgetPolicyRepository::new(pool.clone())),
             Arc::new(PgBudgetIncidentRepository::new(pool.clone())),
             Arc::new(CompanyRepository::new(pool.clone())),
-        ),
-    );
+        ));
     let scheduler_heartbeat = Arc::new(
         services::DefaultHeartbeatService::new(pool.clone())
             .with_budget_service(scheduler_budget_service),
@@ -175,7 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register(Arc::new(services::MonitorCheckJob::new(pool.clone())))
         .await;
     job_scheduler
-        .register(Arc::new(services::RecoveryActionRetryJob::new(pool.clone())))
+        .register(Arc::new(services::RecoveryActionRetryJob::new(
+            pool.clone(),
+        )))
         .await;
     job_scheduler
         .register(Arc::new(services::DecisionTrainingCommentScrubJob::new(
@@ -224,9 +226,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )))
         .await;
     job_scheduler
-        .register(Arc::new(services::SchedulerExecutionHistoryCleanupJob::new(
-            job_scheduler.clone(),
-        )))
+        .register(Arc::new(
+            services::SchedulerExecutionHistoryCleanupJob::new(job_scheduler.clone()),
+        ))
         .await;
     job_scheduler
         .register(Arc::new(services::SchedulerLeaseRepairJob::new(
@@ -289,20 +291,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deployment_mode is LocalTrusted — the local trusted principal is only
     // safe on loopback; otherwise require explicit authentication mode.
     if matches!(config.server.bind_mode, services::config::BindMode::Lan)
-        && matches!(config.server.deployment_mode, services::config::DeploymentMode::LocalTrusted)
+        && matches!(
+            config.server.deployment_mode,
+            services::config::DeploymentMode::LocalTrusted
+        )
     {
         return Err("bind_mode=Lan requires DeploymentMode=Authenticated".into());
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-
+    systemd_notify::notify_ready();
     // §8.1: Graceful shutdown — drain in-flight requests on SIGTERM / Ctrl+C.
     let _signal_task = tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut terminate = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-            let mut interrupt = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut terminate =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            let mut interrupt =
+                signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
             tokio::select! {
                 _ = terminate.recv() => {},
                 _ = interrupt.recv() => {},
@@ -310,9 +317,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(unix))]
         {
-            tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl+C");
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to listen for Ctrl+C");
         }
-        tracing::info!("shutdown signal received, draining connections...");
+        systemd_notify::notify_stopping("draining connections");
     });
 
     axum::serve(listener, app).await?;
