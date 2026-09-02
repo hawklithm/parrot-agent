@@ -152,7 +152,7 @@ impl TelemetryQueue {
         }
 
         let events = std::mem::take(&mut self.events);
-        if let Err(e) = send_events(self.config.clone(), events).await {
+        if let Err(e) = send_events(self.config.clone(), events.clone()).await {
             tracing::warn!(error = %e, "Failed to flush telemetry events");
             // Put events back for retry
             self.events.extend(events);
@@ -189,7 +189,7 @@ async fn send_events(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            tracing::debug!(events = r.events.len(), "Telemetry sent successfully");
+            tracing::debug!(status = ?r.status(), "Telemetry sent successfully");
             Ok(())
         }
         Ok(r) => {
@@ -286,8 +286,7 @@ impl TelemetryClient {
                     let mut q = queue_clone.write().await;
                     q.flush().await;
                     // Update state with current install_id for future sends
-                    let s = state_clone.read().await;
-                    q.config.endpoint.clone_from(&client.config.endpoint);
+                    q.config.endpoint = config.clone().endpoint;
                 }
             });
         }
@@ -301,10 +300,7 @@ impl TelemetryClient {
             return;
         }
 
-        let install_id = {
-            let state = self.state.read().await;
-            state.install_id.clone()
-        };
+        { let _ = &self.state; }
 
         let mut queue = self.queue.write().await;
         queue.config.endpoint = self.config.endpoint.clone();
