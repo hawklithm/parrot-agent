@@ -277,7 +277,6 @@ impl TelemetryClient {
 
         // Start periodic flush if enabled
         if client.config.enabled {
-            let state_clone = client.state.clone();
             let queue_clone = client.queue.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
