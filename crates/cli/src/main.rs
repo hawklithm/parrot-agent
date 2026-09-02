@@ -2,8 +2,9 @@ mod backup;
 mod checks;
 mod client;
 mod commands;
-mod plugin_scaffold;
 mod config;
+mod install_store;
+mod plugin_scaffold;
 mod services;
 
 use anyhow::Result;
