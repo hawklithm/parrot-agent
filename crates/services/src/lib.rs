@@ -497,6 +497,7 @@ pub use server_adapter::{AdapterRegistry, ServerAdapterModule, create_default_se
 pub use adapter_registry_state::AdapterRegistryState;
 pub use adapter_executor::*;
 pub mod issue_execution_lock_service;
+pub mod telemetry_service;
 pub use adapters::*;
 pub use issue_execution_lock_service::*;
 pub use label_service::*;

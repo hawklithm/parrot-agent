@@ -423,6 +423,15 @@ pub fn create_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             crate::middleware::trust_proxy::trust_proxy_middleware,
         ))
+        .layer(axum::middleware::from_fn(
+            crate::middleware::trust_proxy::trust_proxy_middleware,
+        ))
+        // Board Mutation Guard: blocks board-sourced mutations from untrusted
+        // origins (CSRF protection). Session-based board actors are subject to
+        // Origin/Referer checks; API-key / local-implicit / cloud sources pass.
+        .layer(axum::middleware::from_fn(
+            crate::middleware::board_mutation_guard::board_mutation_guard,
+        ))
 }
 
 #[cfg(test)]
