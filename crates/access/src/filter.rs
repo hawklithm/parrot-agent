@@ -111,12 +111,13 @@ mod tests {
             permissions: Json(AgentPermissions::default()),
             metadata: Json(AgentMetadata { is_built_in: None, built_in_key: None, instructions_path: None, instructions_bundle: None }),
             budget_monthly_cents: 0,
+            pause_reason: None,
+            paused_at: None,
             reports_to: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
     }
-
     #[tokio::test]
     async fn test_filter_agents() {
         let service = DefaultAccessService::new();

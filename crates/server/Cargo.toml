@@ -34,3 +34,6 @@ async-trait = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+chrono = { workspace = true }
