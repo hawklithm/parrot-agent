@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-use crate::{backup, checks, client::ApiClient, config::resolve_config_path};
+use crate::{backup, checks, client::ApiClient, config::resolve_config_path, update_notice};
 
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     let raw: Vec<String> = args.into_iter().collect();
@@ -45,10 +45,20 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         "config" => cmd_config(rest),
         _ => bail!("unknown command '{{command}}'. Run 'parrot help' for usage."),
     }
-}
 
 fn get_version() -> Result<()> {
     println!("parrot {}", env!("CARGO_PKG_VERSION"));
+    // Check for updates if enabled
+    let _ = update_notice::print_update_notice();
+    Ok(())
+}
+}
+
+
+fn get_version() -> Result<()> {
+    println!("parrot {}", env!("CARGO_PKG_VERSION"));
+    // Check for updates if enabled
+    let _ = update_notice::print_update_notice();
     Ok(())
 }
 
@@ -1110,6 +1120,22 @@ fn cmd_update(args: &[String]) -> Result<()> {
     let paths = crate::install_store::InstallStorePaths::new();
     let current_manifest = crate::install_store::read_install_manifest(&paths)?;
     let current_version = current_manifest.as_ref().map(|m| m.current.version.clone()).unwrap_or_else(|| "unknown".to_string());
+
+    // Check version compatibility with server
+    if let Ok(config) = crate::config::CliConfig::load() {
+        if let Ok(response) = reqwest::blocking::get(format!("{}/api/version", config.server_url)) {
+            if let Ok(version_info) = response.json::<serde_json::Value>() {
+                let server_version = version_info.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                let api_version = version_info.get("api_version").and_then(|v| v.as_str()).unwrap_or("");
+                println!("server version: {}", server_version);
+                println!("api version: {}", api_version);
+                // Warn if API versions don't match (major version mismatch)
+                if !api_version.is_empty() && !api_version.starts_with(&env!("CARGO_PKG_VERSION").split('.').take(1).collect::<String>()) {
+                    println!("warning: API version mismatch may cause issues");
+                }
+            }
+        }
+    }
 
     let latest_version = if let Some(v) = version_flag {
         v

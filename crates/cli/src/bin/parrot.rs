@@ -7,6 +7,7 @@ mod install_store;
 mod plugin_scaffold;
 mod services;
 
+mod update_notice;
 use anyhow::Result;
 
 fn main() -> Result<()> {

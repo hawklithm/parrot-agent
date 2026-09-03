@@ -5,9 +5,13 @@ edition = "2021"
 description = "Parrot command-line client"
 license = "MIT"
 
+[lib]
+name = "parrot_cli_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "parrot"
-path = "src/main.rs"
+path = "src/bin/parrot.rs"
 
 [dependencies]
 anyhow = { workspace = true }
