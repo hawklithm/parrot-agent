@@ -40,10 +40,23 @@ impl ApiClient {
     // ── Health ──────────────────────────────────────────────────────
 
     pub fn health_check(&self) -> Result<ServiceStatus> {
-        let resp = self.get("/health").send();
-        Ok(match resp {
-            Ok(r) if r.status().is_success() => ServiceStatus::Healthy,
-            _ => ServiceStatus::Unavailable,
+        let resp = match self.get("/health").send() {
+            Ok(r) => r,
+            Err(_) => return Ok(ServiceStatus::Unavailable),
+        };
+        if !resp.status().is_success() {
+            return Ok(ServiceStatus::Unavailable);
+        }
+        // `/health` returns `{status, message, deployment_mode, bootstrap_status}`.
+        // Anything other than "ok" (e.g. "degraded") is surfaced as Degraded.
+        let status = resp
+            .json::<serde_json::Value>()
+            .ok()
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+            .unwrap_or_else(|| "ok".to_string());
+        Ok(match status.as_str() {
+            "ok" => ServiceStatus::Healthy,
+            _ => ServiceStatus::Degraded,
         })
     }
 

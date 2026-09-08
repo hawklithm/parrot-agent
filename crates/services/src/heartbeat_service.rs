@@ -2779,6 +2779,59 @@ impl DefaultHeartbeatService {
         } else {
             context = serde_json::json!({ "issueId": issue_id });
         }
+        // Enrich the wake context with plan-review state, mirroring Paperclip's
+        // `heartbeat.ts` call to `buildPlanReviewContext`. Best-effort: a context
+        // build failure must never block the wake.
+        if let Some(object) = context.as_object_mut() {
+            let include_for_issue_comment = object.get("commentId").is_some();
+            let include_for_annotation_delta = object.get("annotationDeltas").is_some();
+            let interaction_id = object
+                .get("interactionId")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            // Paperclip gates on `issueWorkMode === "planning"` in addition to the
+            // comment/annotation/interaction markers, so read it from the issue.
+            let issue_work_mode: Option<String> = sqlx::query_scalar(
+                "SELECT work_mode::text FROM issues WHERE id = $1 AND company_id = $2",
+            )
+            .bind(issue_id)
+            .bind(company_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+            let planning = issue_work_mode.as_deref() == Some("planning");
+            if planning
+                || include_for_issue_comment
+                || include_for_annotation_delta
+                || interaction_id.is_some()
+            {
+                let input = crate::plan_review_context_service::BuildPlanReviewContextInput {
+                    company_id,
+                    issue_id,
+                    interaction_id,
+                    include_for_issue_comment,
+                    include_for_annotation_delta,
+                    issue_work_mode,
+                };
+                match crate::plan_review_context_service::build_plan_review_context(
+                    &self.pool,
+                    &input,
+                )
+                .await
+                {
+                    Ok(Some(plan_review)) => {
+                        if let Ok(value) = serde_json::to_value(&plan_review) {
+                            object.insert("planReviewContext".to_string(), value);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("plan review context unavailable for issue {issue_id}: {e}");
+                    }
+                }
+            }
+        }
         let run_id: Uuid = sqlx::query_scalar(
             "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot, responsible_user_id, retry_of_run_id)
              SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, i.responsible_user_id::text, $6

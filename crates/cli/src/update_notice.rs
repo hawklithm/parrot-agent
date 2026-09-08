@@ -231,9 +231,14 @@ mod tests {
 
     #[test]
     fn cli_version_constant() {
-        // env!("CARGO_PKG_VERSION") is resolved at compile time
+        // env!("CARGO_PKG_VERSION") is resolved at compile time (e.g. "0.1.0"),
+        // so only the major segment parses as an integer.
         let v = cli_version();
         assert!(!v.is_empty());
-        assert!(v.parse::<u32>().is_ok()); // major version must be numeric
+        let major = v.split('.').next().expect("non-empty version");
+        assert!(
+            major.parse::<u32>().is_ok(),
+            "major version must be numeric, got {major}"
+        );
     }
 }

@@ -21,7 +21,8 @@ pub const PATH_BLOCK_END: &str = "# <<< parrot managed PATH <<<";
 pub const MANAGED_STORE_MARKER: &str = "parrot managed install store v1\n";
 
 /// Channel from which the CLI was installed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InstallChannel {
     Latest,
     Canary,
@@ -45,7 +46,7 @@ impl std::fmt::Display for InstallChannel {
 }
 
 /// A single installed record (one source + version).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstallRecord {
     /// Source: "local" (copied binary) or "download" (fetched from releases).
     pub source: String,
@@ -60,7 +61,7 @@ pub struct InstallRecord {
 }
 
 /// The top-level manifest stored at `~/.local/share/parrot/install-manifest.json`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstallManifest {
     pub version: u64,
     pub current: InstallRecord,
@@ -194,8 +195,8 @@ pub fn current_exe_path() -> Result<PathBuf> {
 /// Detect whether the current executable was installed via the managed store.
 pub fn detect_install_mode(paths: &InstallStorePaths) -> Result<InstallMode> {
     let manifest = match read_install_manifest(paths) {
-        Ok(m) => m,
-        Err(_) | Ok(None) => return Ok(InstallMode::Unknown),
+        Ok(Some(m)) => m,
+        Ok(None) | Err(_) => return Ok(InstallMode::Unknown),
     };
     let current = current_exe_path()?;
     if is_managed_executable(&current, &manifest) {
@@ -331,25 +332,25 @@ mod tests {
         assert!(!paths.manifest_path.exists());
     }
 
-    #[test]
     fn test_is_managed_executable() {
-        let (paths, _dir) = make_tmp_manifest();
+        let (_paths, dir) = make_tmp_manifest();
+        // `is_managed_executable` canonicalizes both sides, so the fixture must
+        // point at a path that actually exists.
+        let managed = dir.path().join("parrot");
+        std::fs::write(&managed, b"binary").unwrap();
+        let other = dir.path().join("other-parrot");
+        std::fs::write(&other, b"binary").unwrap();
+
         let record = InstallRecord {
             source: "local".to_string(),
             version: "1.0.0".to_string(),
             channel: InstallChannel::Latest,
-            executable_path: PathBuf::from("/usr/local/bin/parrot"),
+            executable_path: managed.clone(),
             installed_at: 1000,
         };
         let manifest = build_next_manifest(record, None);
 
-        assert!(is_managed_executable(
-            Path::new("/usr/local/bin/parrot"),
-            &manifest
-        ));
-        assert!(!is_managed_executable(
-            Path::new("/opt/other/parrot"),
-            &manifest
-        ));
+        assert!(is_managed_executable(&managed, &manifest));
+        assert!(!is_managed_executable(&other, &manifest));
     }
 }

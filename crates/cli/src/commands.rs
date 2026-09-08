@@ -41,19 +41,9 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         "uninstall" => cmd_uninstall(rest),
         "update" => cmd_update(rest),
         "onboard" => cmd_onboard(rest),
-        "fix" => cmd_fix(rest),
-        "config" => cmd_config(rest),
-        _ => bail!("unknown command '{{command}}'. Run 'parrot help' for usage."),
+        _ => bail!("unknown command '{command}'. Run 'parrot help' for usage."),
     }
-
-fn get_version() -> Result<()> {
-    println!("parrot {}", env!("CARGO_PKG_VERSION"));
-    // Check for updates if enabled
-    let _ = update_notice::print_update_notice();
-    Ok(())
 }
-}
-
 
 fn get_version() -> Result<()> {
     println!("parrot {}", env!("CARGO_PKG_VERSION"));
@@ -309,6 +299,7 @@ fn cmd_service(args: &[String]) -> Result<()> {
             #[cfg(not(target_family = "unix"))]
             bail!("service restart is only supported on Linux with systemd");
             Ok(())
+        }
         "log" => {
             let tail_lines: usize = args.get(1)
                 .and_then(|s| s.parse().ok())
@@ -400,7 +391,7 @@ fn cmd_install(args: &[String]) -> Result<()> {
         .or_else(|| {
             #[cfg(target_family = "unix")]
             {
-                if std::os::unix::process::geteuid() == 0 {
+                if unsafe { libc::geteuid() } == 0 {
                     Some(PathBuf::from("/etc/systemd/system"))
                 } else {
                     let home = std::env::var("HOME").unwrap_or_default();
@@ -487,14 +478,6 @@ fn cmd_auth(args: &[String]) -> Result<()> {
     }
 }
 
-// ── Update ─────────────────────────────────────────────────────────────
-
-fn cmd_update(args: &[String]) -> Result<()> {
-    let _version = get_flag_value(args, "--version");
-    println!("update: this command will download the latest parrot release");
-    println!("update: not yet implemented — download from https://github.com/parrot/releases");
-    Ok(())
-}
 
 fn cmd_company(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("help");
@@ -1198,8 +1181,7 @@ fn cmd_onboard(args: &[String]) -> Result<()> {
     config.save()?;
     println!("
 configuration saved to {}", path.display());
-
-    let telemetry_enabled = services::telemetry_service::is_telemetry_enabled(Some(&path));
+    let telemetry_enabled = services::telemetry_service::TelemetryConfig::resolve().enabled;
     if !yes && telemetry_enabled {
         println!("
 Telemetry is enabled. Set PARROT_TELEMETRY_DISABLED=1 to opt-out.");

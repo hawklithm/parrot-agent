@@ -8,5 +8,6 @@
 pub enum ServiceStatus {
     Unknown,
     Healthy,
+    Degraded,
     Unavailable,
 }
