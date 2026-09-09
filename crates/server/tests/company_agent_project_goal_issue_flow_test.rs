@@ -27,77 +27,79 @@ async fn connect_and_migrate() -> PgPool {
 }
 
 /// Seed a company, owner user, agent, project, and goal.
-async fn seed(pool: PgPool) -> Fixture {
+async fn seed(pool: &PgPool) -> Fixture {
     let company_id = Uuid::new_v4();
+    let prefix = format!("FL{}", &company_id.simple().to_string()[..6]);
+
+    // Insert company with required issue_prefix
     sqlx::query(
-        "INSERT INTO companies (id, name, created_at, updated_at) VALUES ($1, $2, NOW(), NOW())",
+        "INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)",
     )
     .bind(company_id)
     .bind("Flow Test Company")
+    .bind(prefix)
     .execute(pool)
     .await
     .expect("insert company");
 
     let owner_id = Uuid::new_v4();
+    // Insert auth_user (not users)
     sqlx::query(
-        "INSERT INTO users (id, email, name, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW())",
+        "INSERT INTO auth_users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
     .bind(owner_id)
-    .bind("owner@example.com")
-    .bind("Owner User")
+    .bind(format!("{owner_id}@flow.test"))
+    .bind("Flow Owner")
     .execute(pool)
     .await
-    .expect("insert owner user");
+    .expect("insert auth_user");
 
-    // Add membership for owner
+    // Insert company_membership (correct table name)
     sqlx::query(
-        "INSERT INTO company_members (company_id, user_id, role, joined_at) VALUES ($1, $2, $3, NOW())",
+        "INSERT INTO company_memberships (company_id, principal_type, principal_id, membership_role, status) VALUES ($1, 'user', $2, 'owner', 'active') ON CONFLICT DO NOTHING",
     )
     .bind(company_id)
     .bind(owner_id)
-    .bind("owner")
     .execute(pool)
     .await
     .expect("insert membership");
 
     let agent_id = Uuid::new_v4();
+    // Insert agent with required adapter_type
     sqlx::query(
-        "INSERT INTO agents (id, company_id, name, status, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW())",
+        "INSERT INTO agents (id, company_id, name, adapter_type) VALUES ($1, $2, $3, 'http') ON CONFLICT DO NOTHING",
     )
     .bind(agent_id)
     .bind(company_id)
     .bind("Flow Test Agent")
-    .bind("active")
     .execute(pool)
     .await
     .expect("insert agent");
 
     let project_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO projects (id, company_id, name, status, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW())",
+        "INSERT INTO projects (id, company_id, name, status) VALUES ($1, $2, $3, 'backlog') ON CONFLICT DO NOTHING",
     )
     .bind(project_id)
     .bind(company_id)
     .bind("Flow Test Project")
-    .bind("active")
     .execute(pool)
     .await
     .expect("insert project");
 
     let goal_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO goals (id, company_id, project_id, title, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
+        "INSERT INTO goals (id, company_id, title, level, status) VALUES ($1, $2, $3, 'project', 'planned') ON CONFLICT DO NOTHING",
     )
     .bind(goal_id)
     .bind(company_id)
-    .bind(project_id)
     .bind("Flow Test Goal")
-    .bind("active")
     .execute(pool)
     .await
     .expect("insert goal");
 
     Fixture {
+        pool: pool.clone(),
         company_id,
         owner_id,
         agent_id,
@@ -108,6 +110,7 @@ async fn seed(pool: PgPool) -> Fixture {
 
 #[derive(Debug)]
 struct Fixture {
+    pool: PgPool,
     company_id: Uuid,
     owner_id: Uuid,
     agent_id: Uuid,
@@ -180,7 +183,7 @@ async fn send(
 #[tokio::test]
 async fn company_agent_project_goal_issue_flow() {
     let pool = connect_and_migrate().await;
-    let fixture = seed(pool.clone()).await;
+    let fixture = seed(&pool).await;
 
     let state = build_app_state(pool.clone()).await.expect("build state");
     let app = axum::Router::new()
@@ -238,11 +241,12 @@ async fn company_agent_project_goal_issue_flow() {
     // Step 5: Cross-company isolation
     let other_company_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO companies (id, name, created_at, updated_at) VALUES ($1, $2, NOW(), NOW())",
+        "INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)",
     )
     .bind(other_company_id)
     .bind("Other Company")
-    .execute(pool)
+    .bind(format!("OT{}", &other_company_id.simple().to_string()[..6]))
+    .execute(&fixture.pool)
     .await
     .expect("insert other company");
 
@@ -258,7 +262,7 @@ async fn company_agent_project_goal_issue_flow() {
 #[tokio::test]
 async fn goal_progress_on_issue_complete() {
     let pool = connect_and_migrate().await;
-    let fixture = seed(pool.clone()).await;
+    let fixture = seed(&pool).await;
 
     let state = build_app_state(pool.clone()).await.expect("build state");
     let app = axum::Router::new()
@@ -308,7 +312,7 @@ async fn goal_progress_on_issue_complete() {
 #[tokio::test]
 async fn multiple_goals_and_issues() {
     let pool = connect_and_migrate().await;
-    let fixture = seed(pool.clone()).await;
+    let fixture = seed(&pool).await;
 
     let state = build_app_state(pool.clone()).await.expect("build state");
     let app = axum::Router::new()
