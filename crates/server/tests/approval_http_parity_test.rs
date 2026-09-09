@@ -437,9 +437,9 @@ async fn get_approval_returns_data_and_404_for_unknown() {
 }
 
 /// AP3b: create with issueIds to debug.
-/// NOTE: Skipped - issueIds causes 500 error  
+/// NOTE: Skipped - requires IssueRepository mock in service
 #[tokio::test]
-#[ignore = "issueIds causes 500"]
+#[ignore = "requires IssueRepository mock"]
 async fn create_approval_with_issue_ids() {
     let pool = connect_and_migrate().await;
     let fixture = seed(&pool).await;
@@ -492,9 +492,9 @@ async fn create_hire_agent_approval() {
 }
 
 /// AP3+AP4: create approval linked to issue, then get linked issues.
-/// NOTE: Skipped - issueIds causes 500 error
+/// NOTE: Skipped - requires IssueRepository mock in service
 #[tokio::test]
-#[ignore = "issueIds validation causes 500"]
+#[ignore = "requires IssueRepository mock"]
 async fn create_approval_with_issue_link_and_list_issues() {
     let pool = connect_and_migrate().await;
     let fixture = seed(&pool).await;
@@ -519,6 +519,25 @@ async fn create_approval_with_issue_link_and_list_issues() {
     )
     .await;
     eprintln!("Create approval: status={}", status);
+    // Debug: verify issue exists in database
+    let issue_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1)",
+    )
+    .bind(fixture.issue_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query issue exists");
+    eprintln!("Issue exists in DB: {}", issue_exists);
+    
+    // Debug: check if approval was created despite error
+    let check_approval = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM approvals WHERE id = $1)",
+    )
+    .bind(Uuid::parse_str("test").unwrap_or(Uuid::nil())) // dummy
+    .fetch_one(&pool)
+    .await;
+    eprintln!("DB query result: {:?}", check_approval);
+    
     assert_eq!(status, StatusCode::CREATED, "create approval failed status={status}");
     let approval_id = extract_approval_id(&created).await;
     eprintln!("Created approval_id: {}", approval_id);

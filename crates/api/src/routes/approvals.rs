@@ -308,7 +308,7 @@ async fn list_approval_comments(
     crate::routes::assert_company_access(&actor, approval.approval.company_id, true)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let comments = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, Option<Uuid>, String, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, approval_id, author_user_id, author_agent_id, body, created_at FROM approval_comments WHERE approval_id = $1 ORDER BY created_at ASC")
+        "SELECT id, approval_id, author_user_id, body, created_at FROM approval_comments WHERE approval_id = $1 ORDER BY created_at ASC")
         .bind(id).fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(comments.into_iter().map(|(id, approval_id, author_user_id, author_agent_id, body, created_at)| serde_json::json!({"id": id, "approvalId": approval_id, "authorUserId": author_user_id, "authorAgentId": author_agent_id, "body": body, "createdAt": created_at})).collect()))
 }
@@ -337,13 +337,13 @@ async fn add_approval_comment(
         AuthorizationActor::Agent { agent_id, .. } => (None, Some(agent_id)),
         AuthorizationActor::None => return Err(StatusCode::FORBIDDEN),
     };
-    let comment = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, Option<Uuid>, String, chrono::DateTime<chrono::Utc>)>(
+    let comment = sqlx::query_as::<_, (Uuid, Uuid, Uuid, String, chrono::DateTime<chrono::Utc>)>(
         "INSERT INTO approval_comments (approval_id, author_user_id, author_agent_id, body) VALUES ($1, $2, $3, $4) RETURNING id, approval_id, author_user_id, author_agent_id, body, created_at")
-        .bind(id).bind(author_user_id).bind(author_agent_id).bind(body_text).fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .bind(id).bind(author_user_id).bind(body_text).fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((
         StatusCode::CREATED,
         Json(
-            serde_json::json!({"id": comment.0, "approvalId": comment.1, "authorUserId": comment.2, "authorAgentId": comment.3, "body": comment.4, "createdAt": comment.5}),
+            serde_json::json!({"id": comment.0, "approvalId": comment.1, "authorUserId": comment.2, "authorAgentId": null, "body": comment.3, "createdAt": comment.4}),
         ),
     ))
 }
