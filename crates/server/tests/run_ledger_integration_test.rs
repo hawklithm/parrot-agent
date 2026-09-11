@@ -7,7 +7,7 @@ use api::routes::heartbeat_runs::heartbeat_run_routes;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use parrot_server::build_app_state;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use services::auth::{
     ActorSource, AuthorizationActor, CompanyMembership, MembershipRole, PrincipalType,
 };
@@ -155,7 +155,7 @@ async fn test_list_heartbeat_runs_empty() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "body: {:?}", body);
-    let runs: Vec<_> = body.get("runs").map(|v| v.as_array().unwrap()).unwrap_or(&vec![]);
+    let runs = body.as_array().unwrap();
     assert_eq!(runs.len(), 0, "body: {:?}", body);
 }
 
@@ -184,7 +184,6 @@ async fn test_list_heartbeat_runs_with_runs() {
     .bind(now)
     .bind(&result_json.to_string())
     .execute(pool)
-    .expect("insert run");
     .await
     .expect("insert run");
 
@@ -202,9 +201,10 @@ async fn test_list_heartbeat_runs_with_runs() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "body: {:?}", body);
-    let runs = body["runs"].as_array().unwrap();
+    let empty_runs = vec![];
+    let runs = body.as_array().unwrap();
     assert_eq!(runs.len(), 1, "body: {:?}", body);
-    let run = &runs[0];
+    let run = runs.get(0).expect("run exists");
     assert_eq!(run["id"], run_id.to_string());
     assert_eq!(run["status"], "succeeded");
     assert!(run["usageJson"].is_object());
@@ -292,14 +292,14 @@ async fn test_company_isolation() {
     let user_id = Uuid::new_v4();
     let agent_a_id = Uuid::new_v4();
     let agent_b_id = Uuid::new_v4();
-    let prefix_a = format!("RLA{}", &company_a_id.simple().to_string()[..8]);
-    let prefix_b = format!("RLB{}", &company_b_id.simple().to_string()[..8]);
+    let prefix_a = format!("RA{}", &company_a_id.simple().to_string()[..8]);
+    let prefix_b = format!("RB{}", &company_b_id.simple().to_string()[..8]);
 
     sqlx::query(
         "INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)",
     )
     .bind(company_a_id)
-    .bind("CompA")
+    .bind("CmpA")
     .bind(&prefix_a)
     .execute(&pool)
     .await
@@ -309,7 +309,7 @@ async fn test_company_isolation() {
         "INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)",
     )
     .bind(company_b_id)
-    .bind("CompB")
+    .bind("CmpB")
     .bind(&prefix_b)
     .execute(&pool)
     .await
@@ -410,7 +410,7 @@ async fn test_company_isolation() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "isolation A: {:?}", body);
-    let runs = body["runs"].as_array().unwrap();
+    let runs = body.as_array().unwrap();
     assert_eq!(runs.len(), 1, "isolation A: {:?}", body);
     assert_eq!(runs[0]["id"], run_a_id.to_string());
 
@@ -465,7 +465,6 @@ async fn test_token_aggregation_in_usage_json() {
     .bind(fixture.agent_id)
     .bind(&result_json.to_string())
     .execute(pool)
-    .expect("insert run");
     .await
     .expect("insert run");
 
@@ -482,7 +481,8 @@ async fn test_token_aggregation_in_usage_json() {
     )
     .await;
 
-    let usage = body["usageJson"].as_object().unwrap();
+    let empty_map = Map::new();
+    let usage = body.get("usageJson").and_then(|v| v.as_object()).unwrap_or(&empty_map);
     assert_eq!(usage["inputTokens"], 100, "body: {:?}", body);
     assert_eq!(usage["outputTokens"], 50, "body: {:?}", body);
     assert_eq!(usage["cachedInputTokens"], 25, "body: {:?}", body);
