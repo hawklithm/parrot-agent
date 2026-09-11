@@ -26,7 +26,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Deserializer};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 use sqlx::Row;
 
@@ -159,6 +159,55 @@ fn run_to_json(r: &sqlx::postgres::PgRow) -> Value {
     let context_snapshot: Option<Value> = r.try_get("context_snapshot").unwrap_or(None);
     let output: Option<String> = r.try_get("output").unwrap_or(None);
     let result_json: Option<Value> = r.try_get("result_json").unwrap_or(None);
+
+    // Derive usageJson from result_json token fields for Paperclip parity
+    let usage_json = result_json
+        .as_ref()
+        .filter(|rj| {
+            rj.get("inputTokens").is_some()
+                || rj.get("outputTokens").is_some()
+                || rj.get("cachedInputTokens").is_some()
+                || rj.get("cacheReadInputTokens").is_some()
+                || rj.get("costUsd").is_some()
+                || rj.get("totalCostUsd").is_some()
+        })
+        .map(|rj| {
+            let mut map = serde_json::Map::new();
+            if let Some(v) = rj.get("inputTokens").or_else(|| rj.get("input_tokens")) {
+                map.insert("inputTokens".into(), v.clone());
+            }
+            if let Some(v) = rj.get("outputTokens").or_else(|| rj.get("output_tokens")) {
+                map.insert("outputTokens".into(), v.clone());
+            }
+            if let Some(v) = rj.get("cachedInputTokens")
+                .or_else(|| rj.get("cacheReadInputTokens"))
+                .or_else(|| rj.get("cached_input_tokens"))
+                .or_else(|| rj.get("cache_read_input_tokens"))
+            {
+                map.insert("cachedInputTokens".into(), v.clone());
+            }
+            if let Some(v) = rj.get("inputTokens").or_else(|| rj.get("input_tokens")) {
+                map.insert("inputTokens".into(), v.clone());
+            }
+            if let Some(v) = rj.get("outputTokens").or_else(|| rj.get("output_tokens")) {
+                map.insert("outputTokens".into(), v.clone());
+            }
+            if let Some(v) = rj.get("costUsd").or_else(|| rj.get("totalCostUsd"))
+                .or_else(|| rj.get("cost_usd"))
+                .or_else(|| rj.get("total_cost_usd"))
+            {
+                map.insert("costUsd".into(), v.clone());
+            }
+            if let Some(v) = rj.get("costUsd")
+                .or_else(|| rj.get("totalCostUsd"))
+                .or_else(|| rj.get("cost_usd"))
+                .or_else(|| rj.get("total_cost_usd"))
+            {
+                map.insert("costUsd".into(), v.clone());
+            }
+            Value::Object(map)
+        });
+
     json!({
         "id": r.get::<Uuid, _>("id"),
         "companyId": r.get::<Uuid, _>("company_id"),
@@ -179,7 +228,7 @@ fn run_to_json(r: &sqlx::postgres::PgRow) -> Value {
         "scheduledRetryAt": r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("scheduled_retry_at").unwrap_or(None),
         "scheduledRetryAttempt": r.try_get::<Option<i32>, _>("scheduled_retry_attempt").unwrap_or(None),
         "scheduledRetryReason": r.try_get::<Option<String>, _>("scheduled_retry_reason").unwrap_or(None),
-        "usageJson": Value::Null,
+        "usageJson": usage_json,
         "errorCode": Value::Null,
         "logStore": Value::Null,
         "logRef": Value::Null,
@@ -191,6 +240,8 @@ fn run_to_json(r: &sqlx::postgres::PgRow) -> Value {
         "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
     })
 }
+
+
 
 const RUN_SELECT: &str = r#"SELECT id, company_id, agent_id, invocation_source, status::text,
        responsible_user_id, started_at, finished_at, error, exit_code,

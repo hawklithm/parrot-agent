@@ -201,7 +201,6 @@ async fn test_list_heartbeat_runs_with_runs() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "body: {:?}", body);
-    let empty_runs = vec![];
     let runs = body.as_array().unwrap();
     assert_eq!(runs.len(), 1, "body: {:?}", body);
     let run = runs.get(0).expect("run exists");
@@ -438,7 +437,7 @@ async fn test_company_isolation() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "isolation B: {:?}", body);
-    let runs = body["runs"].as_array().unwrap();
+    let runs = body.as_array().unwrap();
     assert_eq!(runs.len(), 1, "isolation B: {:?}", body);
     assert_eq!(runs[0]["id"], run_b_id.to_string());
 }
@@ -481,8 +480,7 @@ async fn test_token_aggregation_in_usage_json() {
     )
     .await;
 
-    let empty_map = Map::new();
-    let usage = body.get("usageJson").and_then(|v| v.as_object()).unwrap_or(&empty_map);
+let usage = body.get("usageJson").and_then(|v| v.as_object()).expect("usageJson");
     assert_eq!(usage["inputTokens"], 100, "body: {:?}", body);
     assert_eq!(usage["outputTokens"], 50, "body: {:?}", body);
     assert_eq!(usage["cachedInputTokens"], 25, "body: {:?}", body);
