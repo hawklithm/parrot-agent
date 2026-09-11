@@ -131,7 +131,7 @@ async fn document_restore_and_annotation_paths_are_transactional(pool: PgPool) {
         issue_routes().with_state(build_app_state(pool.clone()).await.expect("app state"));
     let document_uri = format!("/issues/{}/documents/plan", fixture.issue_id);
 
-    let (status, _) = send(
+    let (status, body) = send(
         &app,
         &actor,
         "PUT",

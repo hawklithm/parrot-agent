@@ -757,6 +757,7 @@ async fn upsert_issue_document(
     let (created_by_type, created_by_id) = document_revision_creator(&actor);
     let revision_id: Uuid = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO document_revisions
+         (document_id, company_id, revision_number, content, created_by_type, created_by_id)
          VALUES ($1,$2,$3,$4,$5,$6)
          RETURNING id",
     )
@@ -770,7 +771,7 @@ async fn upsert_issue_document(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if revision_number > 1 {
-        if let Err(error) = remap_open_annotation_threads(
+         if let Err(error) = remap_open_annotation_threads(
             &mut tx,
             issue_id,
             document_id,
@@ -904,6 +905,7 @@ async fn restore_issue_document_revision(
     .bind(revision)
     .bind(&content)
     .bind(created_by_type)
+    .bind(created_by_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
