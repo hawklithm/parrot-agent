@@ -117,9 +117,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@localhost:5433/parrot_agent_dev".to_string()
-    });
+    let database_url = std::env::var("DATABASE_URL").map_err(|_| {
+        "DATABASE_URL is not set. Export it before starting parrot-server, e.g.\n  \
+         DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_dev parrot-server"
+    })?;
 
     tracing::info!("connecting to database...");
     let pool = PgPoolOptions::new()
@@ -136,6 +137,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         ensure_local_trusted_principal(&pool).await?;
     }
+
+    // 初始化 Board 认领挑战（Paperclip `index.ts:603`）。
+    // 仅 `authenticated` 模式且唯一实例管理员为本地 board 主体时创建；
+    // `local_trusted` 模式下不留挑战（GET /board-claim/:token 返回 404）。
+    services::auth::initialize_board_claim_challenge(
+        &pool,
+        services::auth::AuthMode::from_env(),
+    )
+    .await?;
 
     // 初始化并启动 Job Scheduler
     tracing::info!("initializing job scheduler...");

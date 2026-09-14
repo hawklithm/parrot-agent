@@ -53,16 +53,10 @@ async fn send(
     (status, value)
 }
 
-async fn migrate(pool: &PgPool) {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(tracing::Level::ERROR)
-        .try_init();
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 struct Fixture {
     pool: PgPool,

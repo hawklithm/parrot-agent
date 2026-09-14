@@ -6,9 +6,8 @@ use axum::{
 };
 
 use crate::app_state::AppState;
-use crate::schemas::{
-    derive_agent_url_key, parse_scheduler_heartbeat_policy, InstanceSchedulerHeartbeatAgent,
-};
+use crate::schemas::{parse_scheduler_heartbeat_policy, InstanceSchedulerHeartbeatAgent};
+use models::agent_url_key::derive_agent_url_key;
 use sqlx::Row;
 
 /// GET /instance/scheduler-heartbeats
@@ -62,7 +61,7 @@ pub async fn list_scheduler_heartbeats(
                 && status != "pending_approval";
 
             // 生成 Agent URL key
-            let agent_url_key = derive_agent_url_key(&agent_name, id);
+            let agent_url_key = derive_agent_url_key(Some(&agent_name), Some(id));
 
             // 判断调度器是否活跃
             let scheduler_active =

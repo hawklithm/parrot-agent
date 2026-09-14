@@ -1,8 +1,8 @@
 # Paperclip ↔ Parrot Schema Diff
 
 自动生成：`scripts/diff_schema.py`
-Paperclip schema dir: `/mnt/d/workspace/paperclip/packages/db/src/schema`
-Parrot migrations dir: `/mnt/d/workspace/parrot/parrot-agent/migrations`
+Paperclip schema dir: `/Users/adazhao/workspace/paperclip/packages/db/src/schema`
+Parrot migrations dir: `/Users/adazhao/workspace/parrot/parrot-agent/migrations`
 
 ## 统计
 

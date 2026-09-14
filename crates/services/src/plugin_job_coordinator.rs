@@ -99,44 +99,56 @@ impl PluginJobCoordinator {
     
     /// 分配作业到最佳节点（负载均衡）
     pub async fn assign_job(&self, job_id: Uuid) -> CoordinatorResult<Uuid> {
-        let workers = self.workers.read().await;
-        
-        // 找到负载最低的健康节点
-        let best_worker = workers.values()
-            .filter(|w| w.can_accept_job())
-            .min_by(|a, b| {
-                a.load_factor()
-                    .partial_cmp(&b.load_factor())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .ok_or(CoordinatorError::NoAvailableWorkers)?;
-        
-        let worker_id = best_worker.id;
-        
-        // 记录分配
-        let mut assignments = self.assignments.write().await;
-        assignments.insert(job_id, JobAssignment {
-            job_id,
-            worker_id,
-            assigned_at: chrono::Utc::now(),
-        });
-        
-        // 更新节点负载
-        drop(assignments);
+        let worker_id = {
+            let workers = self.workers.read().await;
+
+            // 找到负载最低的健康节点
+            workers
+                .values()
+                .filter(|worker| worker.can_accept_job())
+                .min_by(|a, b| {
+                    a.load_factor()
+                        .partial_cmp(&b.load_factor())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|worker| worker.id)
+                .ok_or(CoordinatorError::NoAvailableWorkers)?
+        };
+
+        // Recheck and update the worker after releasing the read lock. This
+        // avoids waiting for a write lock while still holding a read guard.
         let mut workers = self.workers.write().await;
-        if let Some(worker) = workers.get_mut(&worker_id) {
-            worker.current_load += 1;
+        let worker = workers
+            .get_mut(&worker_id)
+            .ok_or(CoordinatorError::WorkerNotFound(worker_id))?;
+        if !worker.can_accept_job() {
+            return Err(CoordinatorError::NoAvailableWorkers);
         }
-        
+        worker.current_load += 1;
+        drop(workers);
+
+        let mut assignments = self.assignments.write().await;
+        assignments.insert(
+            job_id,
+            JobAssignment {
+                job_id,
+                worker_id,
+                assigned_at: chrono::Utc::now(),
+            },
+        );
+
         Ok(worker_id)
     }
     
     /// 完成作业分配
     pub async fn complete_job(&self, job_id: Uuid) -> CoordinatorResult<()> {
-        let mut assignments = self.assignments.write().await;
-        let assignment = assignments.remove(&job_id)
+        let assignment = self
+            .assignments
+            .write()
+            .await
+            .remove(&job_id)
             .ok_or(CoordinatorError::AssignmentFailed("job not assigned".to_string()))?;
-        
+
         // 减少节点负载
         let mut workers = self.workers.write().await;
         if let Some(worker) = workers.get_mut(&assignment.worker_id) {
@@ -148,16 +160,18 @@ impl PluginJobCoordinator {
     
     /// 获取集群状态
     pub async fn get_cluster_status(&self) -> ClusterStatus {
-        let workers = self.workers.read().await;
-        let assignments = self.assignments.read().await;
-        
-        ClusterStatus {
-            total_workers: workers.len(),
-            healthy_workers: workers.values().filter(|w| w.is_healthy).count(),
-            total_capacity: workers.values().map(|w| w.capacity).sum(),
-            total_load: workers.values().map(|w| w.current_load).sum(),
-            active_jobs: assignments.len(),
-        }
+        let (total_workers, healthy_workers, total_capacity, total_load) = {
+            let workers = self.workers.read().await;
+            (
+                workers.len(),
+                workers.values().filter(|worker| worker.is_healthy).count(),
+                workers.values().map(|worker| worker.capacity).sum(),
+                workers.values().map(|worker| worker.current_load).sum(),
+            )
+        };
+        let active_jobs = self.assignments.read().await.len();
+
+        ClusterStatus { total_workers, healthy_workers, total_capacity, total_load, active_jobs }
     }
     
     /// 检查不健康节点

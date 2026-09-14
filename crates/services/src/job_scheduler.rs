@@ -12,6 +12,7 @@
 //! - RecoveryActionRetryJob: 恢复动作巡检与指数退避（每分钟）
 //! - DecisionTrainingCommentScrubJob: 清理训练快照中的已删除评论（每天）
 
+use crate::cron_schedule::parse_cron_schedule;
 use crate::DefaultHeartbeatService;
 use crate::RoutineExecutionService;
 use crate::secret_provider::encrypt_secret_material;
@@ -175,7 +176,7 @@ fn schedule_is_due(
             .map(|started| now.signed_duration_since(started).num_seconds() >= *seconds as i64)
             .unwrap_or(true),
         JobSchedule::CronExpression(expression) => {
-            let Ok(schedule) = expression.parse::<cron::Schedule>() else {
+            let Ok(schedule) = parse_cron_schedule(expression) else {
                 return false;
             };
             let baseline = last_started.unwrap_or(now - ChronoDuration::minutes(2));
@@ -1344,7 +1345,10 @@ mod scheduler_tests {
             .expect("load scheduler leases");
         assert!(leases.iter().any(|lease| lease.job_name == name));
         scheduler.release_lease(&name).await;
-        assert!(scheduler.reap_expired_leases(10).await.unwrap() >= 1);
+        // The database is shared with the running scheduler and other tests,
+        // so use the bounded maximum to avoid leaving this freshly released
+        // row behind an unrelated backlog of expired leases.
+        assert!(scheduler.reap_expired_leases(10_000).await.unwrap() >= 1);
         let leases = scheduler
             .load_persisted_leases()
             .await
@@ -1568,18 +1572,9 @@ impl RoutineCronTrigger {
         after: &DateTime<Utc>,
     ) -> Result<DateTime<Utc>, String> {
         use chrono_tz::Tz;
-        use cron::Schedule;
-        use std::str::FromStr;
 
-        // 应用统一使用 5 字段 cron（分 时 日 月 周）；cron 0.12 需要 6 字段（含秒）。
-        // 5 字段时补秒字段 "0"，与全局约定对齐。
-        let normalized = if cron_expr.split_whitespace().count() == 5 {
-            format!("0 {}", cron_expr)
-        } else {
-            cron_expr.to_string()
-        };
-        let schedule = Schedule::from_str(&normalized)
-            .map_err(|e| format!("Invalid cron expression: {}", e))?;
+        let schedule = parse_cron_schedule(cron_expr)
+            .map_err(|_| format!("Invalid cron expression: {cron_expr}"))?;
 
         let tz: Tz = timezone
             .parse()

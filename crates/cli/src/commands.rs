@@ -1,7 +1,16 @@
-use anyhow::{bail, Result};
-use std::path::PathBuf;
+use anyhow::{bail, Context, Result};
+use std::{
+    fs,
+    io::{self, Write},
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
 
-use crate::{backup, checks, client::ApiClient, config::resolve_config_path, update_notice};
+use crate::{
+    backup, checks, client::ApiClient, config::resolve_config_path, env_lab, update_notice,
+    worktree,
+};
 
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     let raw: Vec<String> = args.into_iter().collect();
@@ -13,9 +22,17 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         "help" | "--help" | "-h" => print_help(),
         "version" | "--version" | "-V" => get_version(),
         "doctor" => cmd_doctor(rest),
+        "env" => cmd_env(rest),
+        "channels" => cmd_channels(rest),
         "configure" => cmd_configure(rest),
+        "connect" => cmd_connect(rest),
+        "config" => cmd_config(rest),
+        "fix" => cmd_fix(rest),
         "db-backup" => backup::run(rest),
         "auth" => cmd_auth(rest),
+        "context" => cmd_context(rest),
+        "token" => cmd_token(rest),
+        "prompt" | "agent-prompt" => cmd_prompt(rest),
         "company" => cmd_company(rest),
         "agent" => cmd_agent(rest),
         "issue" => cmd_issue(rest),
@@ -36,6 +53,11 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         "workspace" => cmd_workspace(rest),
         "run" => cmd_run(rest),
         "channel" => cmd_channel(rest),
+        "heartbeat" => cmd_heartbeat(rest),
+        "worktree" => worktree::run(rest),
+        "env-lab" => env_lab::run(rest),
+        "allowed-hostname" => cmd_allowed_hostname(rest),
+        "zip" => cmd_zip(rest),
         "service" => cmd_service(rest),
         "install" => cmd_install(rest),
         "uninstall" => cmd_uninstall(rest),
@@ -58,11 +80,17 @@ fn print_help() -> Result<()> {
     println!("Usage: parrot <command> [options]");
     println!();
     println!("Configuration:");
+    println!("  env         Show deployment environment resolution");
+    println!("  channels    Show release channels");
     println!("  configure   --server-url URL [--api-token TOKEN]");
+    println!("  connect     --server-url URL [--api-token TOKEN] [--profile NAME]");
     println!("  doctor      [--json]");
     println!();
     println!("Data commands:");
-    println!("  auth        get-session");
+    println!("  auth        get-session | bootstrap-ceo");
+    println!("  context     show | list | use <profile> | set [options]");
+    println!("  token       agent|board create | list | revoke");
+    println!("  prompt      <text...> [--agent-id ID] [--company-id ID]");
     println!("  company     list | get <id> | create | delete <id> | export <id> | import");
     println!("  agent       list <companyId> | get <companyId> <agentId>");
     println!("  issue       list <companyId> | get <companyId> <issueId>");
@@ -85,6 +113,11 @@ fn print_help() -> Result<()> {
     println!("  workspace   list <companyId> | get <id>");
     println!("  run         list <issueId> | get <id>");
     println!("  channel     list <companyId>");
+    println!("  heartbeat   run --agent-id ID [--source SOURCE] [--trigger TRIGGER]");
+    println!("  worktree    list | status | create | remove | env");
+    println!("  env-lab     up | status | doctor | down");
+    println!("  allowed-hostname add <host> | list");
+    println!("  zip         <companyId> [--output FILE]  (export bundle)");
     println!();
     println!("Server management:");
     println!("  service     status | start | stop | restart | log [LINES]");
@@ -142,9 +175,13 @@ fn cmd_configure(args: &[String]) -> Result<()> {
     let path = resolve_config_path(config_path)
         .ok_or_else(|| anyhow::anyhow!("unable to determine a config path; pass --config"))?;
     let url = server_url.unwrap_or_else(|| "http://localhost:3100".to_owned());
+    let allowed_hostnames = crate::config::CliConfig::load_from(Some(path.clone()))
+        .map(|config| config.allowed_hostnames)
+        .unwrap_or_default();
     let config = crate::config::CliConfig {
         server_url: url,
         api_token,
+        allowed_hostnames,
         config_path: Some(path.clone()),
     };
     config.save()?;
@@ -189,6 +226,655 @@ fn cmd_config(args: &[String]) -> Result<()> {
             println!("Options:");
             println!("  --json  Output JSON instead of plain text");
         }
+    }
+    Ok(())
+}
+
+// ── Environment / channels ─────────────────────────────────────────
+
+fn cmd_env(args: &[String]) -> Result<()> {
+    let config = crate::config::CliConfig::load()?;
+    let environment_keys = [
+        "DATABASE_URL",
+        "PARROT_SERVER_URL",
+        "PARROT_API_TOKEN",
+        "PARROT_ALLOWED_HOSTNAMES",
+        "PARROT_TELEMETRY_DISABLED",
+        "DEPLOYMENT_MODE",
+        "DEPLOYMENT_EXPOSURE",
+        "HEARTBEAT_SCHEDULER_ENABLED",
+        "HEARTBEAT_SCHEDULER_INTERVAL_MS",
+    ];
+    let env_state = environment_keys
+        .iter()
+        .map(|key| {
+            (
+                (*key).to_owned(),
+                serde_json::json!({
+                    "set": std::env::var_os(key).is_some(),
+                    "value": if *key == "PARROT_API_TOKEN" { serde_json::Value::Null } else { std::env::var(key).ok().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null) },
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let payload = serde_json::json!({
+        "configPath": config.config_path.as_ref().map(|path| path.display().to_string()),
+        "serverUrl": config.server_url,
+        "apiTokenConfigured": config.api_token.is_some(),
+        "allowedHostnames": config.allowed_hostnames,
+        "contextPath": crate::context::resolve_context_path(None).map(|path| path.display().to_string()),
+        "environment": env_state,
+    });
+    if args.iter().any(|arg| arg == "--json") {
+        println!("{}", format_json(&payload));
+    } else {
+        println!("config: {}", payload["configPath"].as_str().unwrap_or("<none>"));
+        println!("server: {}", payload["serverUrl"].as_str().unwrap_or_default());
+        println!("api token: {}", if config.api_token.is_some() { "configured" } else { "missing" });
+        println!("context: {}", payload["contextPath"].as_str().unwrap_or("<none>"));
+        println!("allowed hostnames: {}", config.allowed_hostnames.join(", "));
+        println!("deployment variables:");
+        for key in environment_keys {
+            let set = payload["environment"][key]["set"].as_bool().unwrap_or(false);
+            println!("  {key}: {}", if set { "set" } else { "missing" });
+        }
+    }
+    Ok(())
+}
+
+fn cmd_channels(args: &[String]) -> Result<()> {
+    let current = crate::install_store::read_install_manifest(
+        &crate::install_store::InstallStorePaths::new(),
+    )?
+    .map(|manifest| manifest.current.channel.to_string())
+    .unwrap_or_else(|| "latest".to_owned());
+    let payload = serde_json::json!({
+        "current": current,
+        "channels": [
+            {"name": "latest", "description": "Stable releases"},
+            {"name": "canary", "description": "Pre-release builds"},
+        ],
+    });
+    if args.iter().any(|arg| arg == "--json") {
+        println!("{}", format_json(&payload));
+    } else {
+        println!("current channel: {}", payload["current"].as_str().unwrap_or("latest"));
+        println!("  latest  stable releases");
+        println!("  canary  pre-release builds");
+    }
+    Ok(())
+}
+
+// ── Context / connection ──────────────────────────────────────────
+
+fn cmd_context(args: &[String]) -> Result<()> {
+    let explicit_path = get_flag_value(args, "--context").map(PathBuf::from);
+    let (path, mut store) = crate::context::load(explicit_path)?;
+    let sub = args.first().map(String::as_str).unwrap_or("show");
+    match sub {
+        "show" => {
+            let requested_profile = get_flag_value(args, "--profile");
+            let (name, profile) = crate::context::active_profile(
+                &store,
+                requested_profile.as_deref(),
+            );
+            let profile_json = serde_json::to_value(profile)?;
+            let payload = serde_json::json!({
+                "contextPath": path,
+                "currentProfile": store.current_profile,
+                "profileName": name,
+                "profile": profile_json,
+                "profiles": store.profiles,
+            });
+            if args.iter().any(|arg| arg == "--json") {
+                println!("{}", format_json(&payload));
+            } else {
+                println!("context: {}", payload["contextPath"].as_str().unwrap_or_default());
+                println!("current profile: {name}");
+                println!("{}", format_json(&serde_json::to_value(profile)?));
+            }
+        }
+        "list" | "ls" => {
+            let rows = store
+                .profiles
+                .iter()
+                .map(|(name, profile)| {
+                    serde_json::json!({
+                        "name": name,
+                        "current": name == &store.current_profile,
+                        "apiBase": profile.api_base,
+                        "companyId": profile.company_id,
+                        "persona": profile.persona,
+                        "agentId": profile.agent_id,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("{}", format_json(&serde_json::Value::Array(rows)));
+        }
+        "use" => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot context use <profile>"))?;
+            if !store.profiles.contains_key(name) {
+                bail!("context profile not found: {name}");
+            }
+            store.current_profile = name.clone();
+            crate::context::save(&path, &store)?;
+            println!("active context profile: {name}");
+        }
+        "set" => {
+            let name = get_flag_value(args, "--profile")
+                .unwrap_or_else(|| store.current_profile.clone());
+            let persona = get_flag_value(args, "--persona");
+            if let Some(value) = persona.as_deref() {
+                if !matches!(value, "board" | "agent") {
+                    bail!("--persona must be board or agent");
+                }
+            }
+            crate::context::upsert_profile(
+                &mut store,
+                &name,
+                crate::context::ContextProfile {
+                    api_base: get_flag_value(args, "--api-base"),
+                    company_id: get_flag_value(args, "--company-id"),
+                    persona,
+                    agent_id: get_flag_value(args, "--agent-id"),
+                    agent_name: get_flag_value(args, "--agent-name"),
+                    api_key_env_var_name: get_flag_value(args, "--api-key-env-var-name"),
+                    token_name: None,
+                    token_id: None,
+                    token_created_at: None,
+                },
+                args.iter().any(|arg| arg == "--use"),
+            )?;
+            crate::context::save(&path, &store)?;
+            let (_, profile) = crate::context::active_profile(&store, Some(&name));
+            let payload = serde_json::json!({
+                "contextPath": path,
+                "currentProfile": store.current_profile,
+                "profileName": name,
+                "profile": profile,
+            });
+            if args.iter().any(|arg| arg == "--json") {
+                println!("{}", format_json(&payload));
+            } else {
+                println!("updated context profile '{}'", name);
+            }
+        }
+        _ => println!("Usage: parrot context show | list | use <profile> | set [--profile NAME] [--api-base URL] [--company-id ID] [--persona board|agent] [--agent-id ID] [--use]"),
+    }
+    Ok(())
+}
+
+fn cmd_connect(args: &[String]) -> Result<()> {
+    let config_path = get_flag_value(args, "--config").map(PathBuf::from);
+    let path = resolve_config_path(config_path)
+        .ok_or_else(|| anyhow::anyhow!("unable to determine a config path; pass --config"))?;
+    let existing = crate::config::CliConfig::load_from(Some(path.clone())).unwrap_or(crate::config::CliConfig {
+        server_url: "http://localhost:3100".to_owned(),
+        api_token: None,
+        allowed_hostnames: Vec::new(),
+        config_path: Some(path.clone()),
+    });
+    let server_url = get_flag_value(args, "--server-url")
+        .or_else(|| get_flag_value(args, "--api-base"))
+        .unwrap_or_else(|| existing.server_url.clone());
+    if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
+        bail!("server URL must start with http:// or https://");
+    }
+    let supplied_token = get_flag_value(args, "--api-token")
+        .or_else(|| get_flag_value(args, "--api-key"));
+    let api_token = supplied_token.clone().or(existing.api_token.clone());
+    if !args.iter().any(|arg| arg == "--no-check") {
+        let client = ApiClient::new(server_url.clone(), api_token.clone())?;
+        if !matches!(client.health_check()?, crate::services::ServiceStatus::Healthy | crate::services::ServiceStatus::Degraded) {
+            bail!("server health check failed for {server_url}; use --no-check to save without probing");
+        }
+    }
+    let saved = crate::config::CliConfig {
+        server_url: server_url.clone(),
+        api_token,
+        allowed_hostnames: existing.allowed_hostnames,
+        config_path: Some(path),
+    };
+    saved.save()?;
+
+    let context_path = crate::context::resolve_context_path(
+        get_flag_value(args, "--context").map(PathBuf::from),
+    )
+    .ok_or_else(|| anyhow::anyhow!("unable to determine context path"))?;
+    let (_, mut store) = crate::context::load(Some(context_path.clone()))?;
+    let profile_name = get_flag_value(args, "--profile")
+        .unwrap_or_else(|| store.current_profile.clone());
+    let env_name = get_flag_value(args, "--api-key-env-var-name")
+        .unwrap_or_else(|| "PARROT_API_TOKEN".to_owned());
+    crate::context::upsert_profile(
+        &mut store,
+        &profile_name,
+        crate::context::ContextProfile {
+            api_base: Some(server_url.clone()),
+            company_id: get_flag_value(args, "--company-id"),
+            persona: get_flag_value(args, "--persona"),
+            agent_id: get_flag_value(args, "--agent-id"),
+            agent_name: None,
+            api_key_env_var_name: Some(env_name),
+            token_name: None,
+            token_id: None,
+            token_created_at: None,
+        },
+        true,
+    )?;
+    crate::context::save(&context_path, &store)?;
+    println!("connected profile '{}' to {}", profile_name, server_url);
+    Ok(())
+}
+
+fn load_client_for_args(args: &[String]) -> Result<ApiClient> {
+    let config_path = get_flag_value(args, "--config").map(PathBuf::from);
+    let config = crate::config::CliConfig::load_from(config_path)?;
+    let context_path = get_flag_value(args, "--context").map(PathBuf::from);
+    let (_, store) = crate::context::load(context_path)?;
+    let requested_profile = get_flag_value(args, "--profile");
+    let (_, profile) = crate::context::active_profile(
+        &store,
+        requested_profile.as_deref(),
+    );
+    let base = get_flag_value(args, "--api-base")
+        .or_else(|| get_flag_value(args, "--server-url"))
+        .or_else(|| profile.api_base.clone())
+        .unwrap_or(config.server_url);
+    let token = get_flag_value(args, "--api-key")
+        .or_else(|| get_flag_value(args, "--api-token"))
+        .or_else(|| crate::context::profile_token(profile))
+        .or(config.api_token);
+    ApiClient::new(base, token)
+}
+
+// ── Allowed hostnames ──────────────────────────────────────────────
+
+fn cmd_allowed_hostname(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let config_path = get_flag_value(args, "--config").map(PathBuf::from);
+    let path = resolve_config_path(config_path)
+        .ok_or_else(|| anyhow::anyhow!("unable to determine a config path; pass --config"))?;
+    let mut config = crate::config::CliConfig::load_from(Some(path.clone()))?;
+    match sub {
+        "add" => {
+            let host = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot allowed-hostname add <host>"))?;
+            let normalized = normalize_hostname(host)?;
+            if !config.allowed_hostnames.iter().any(|value| value == &normalized) {
+                config.allowed_hostnames.push(normalized.clone());
+                config.allowed_hostnames.sort();
+                config.save()?;
+            }
+            if args.iter().any(|arg| arg == "--json") {
+                println!("{}", serde_json::json!({"added": normalized, "allowedHostnames": config.allowed_hostnames}));
+            } else {
+                println!("allowed hostname: {}", normalized);
+                println!("restart the server for the setting to take effect");
+            }
+        }
+        "list" | "ls" => {
+            if args.iter().any(|arg| arg == "--json") {
+                println!("{}", serde_json::json!({"allowedHostnames": config.allowed_hostnames}));
+            } else if config.allowed_hostnames.is_empty() {
+                println!("no allowed hostnames configured");
+            } else {
+                for hostname in config.allowed_hostnames {
+                    println!("{hostname}");
+                }
+            }
+        }
+        _ => println!("Usage: parrot allowed-hostname add <host> | list [--json]"),
+    }
+    Ok(())
+}
+
+fn normalize_hostname(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        bail!("hostname must not be empty or contain whitespace");
+    }
+    let parsed = if value.starts_with("http://") || value.starts_with("https://") {
+        reqwest::Url::parse(value)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+    } else {
+        Some(value.trim_end_matches('/').trim_end_matches('.').to_owned())
+    };
+    let hostname = parsed
+        .filter(|host| !host.is_empty() && !host.contains('/'))
+        .ok_or_else(|| anyhow::anyhow!("invalid hostname: {value}"))?;
+    Ok(hostname.to_ascii_lowercase())
+}
+
+// ── Tokens ──────────────────────────────────────────────────────────
+
+fn cmd_token(args: &[String]) -> Result<()> {
+    let kind = args.first().map(String::as_str).unwrap_or("help");
+    let action = args.get(1).map(String::as_str).unwrap_or("help");
+    let client = load_client_for_args(args)?;
+    match (kind, action) {
+        ("agent", "create") => {
+            let agent_id = get_flag_value_any(args, &["--agent-id", "--agent"])
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot token agent create <agentId> [--name NAME]"))?;
+            let name = get_flag_value(args, "--name").unwrap_or_else(|| "parrot-agent".to_owned());
+            let result = client.create_agent_key(&agent_id, &serde_json::json!({"name": name}))?;
+            println!("{}", format_json(&result));
+        }
+        ("agent", "list") => {
+            let agent_id = get_flag_value_any(args, &["--agent-id", "--agent"])
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot token agent list <agentId>"))?;
+            println!("{}", format_json(&client.list_agent_keys(&agent_id)?));
+        }
+        ("agent", "revoke") => {
+            let agent_id = get_flag_value_any(args, &["--agent-id", "--agent"])
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot token agent revoke <agentId> <keyId>"))?;
+            let key_id = get_flag_value(args, "--key-id")
+                .or_else(|| args.get(3).cloned())
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot token agent revoke <agentId> <keyId>"))?;
+            println!("{}", format_json(&client.revoke_agent_key(&agent_id, &key_id)?));
+        }
+        ("board", "create") => {
+            let mut body = serde_json::json!({
+                "name": get_flag_value(args, "--name").unwrap_or_else(|| "parrot-board".to_owned()),
+            });
+            if let Some(company_id) = get_flag_value(args, "--company-id") {
+                body["requestedCompanyId"] = serde_json::Value::String(company_id);
+            }
+            println!("{}", format_json(&client.create_board_api_key(&body)?));
+        }
+        ("board", "list") => println!("{}", format_json(&client.list_board_api_keys()?)),
+        ("board", "revoke") => {
+            let key_id = get_flag_value(args, "--key-id")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow::anyhow!("Usage: parrot token board revoke <keyId>"))?;
+            println!("{}", format_json(&client.revoke_board_api_key(&key_id)?));
+        }
+        _ => println!("Usage: parrot token agent create|list|revoke <agentId> [<keyId>] | board create|list|revoke [<keyId>]"),
+    }
+    Ok(())
+}
+
+// ── Agent prompt handoff ───────────────────────────────────────────
+
+fn cmd_prompt(args: &[String]) -> Result<()> {
+    let client = load_client_for_args(args)?;
+    let prompt = collect_prompt_text(args);
+    if prompt.trim().is_empty() {
+        bail!("prompt text is required");
+    }
+    let wake = !args.iter().any(|arg| arg == "--no-wake");
+
+    let mut agent = None;
+    let mut agent_id = get_flag_value_any(args, &["--agent-id", "--agent"]);
+    if agent_id.is_none() {
+        if let Ok(current) = client.get_current_agent() {
+            agent_id = current
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+            agent = Some(current);
+        }
+    }
+    let agent_id = agent_id.ok_or_else(|| {
+        anyhow::anyhow!("an agent is required; pass --agent-id or use an agent API token")
+    })?;
+    if agent.is_none() {
+        let company_id = get_flag_value(args, "--company-id")
+            .ok_or_else(|| anyhow::anyhow!("--company-id is required when using a board token"))?;
+        agent = Some(client.get_agent(&company_id, &agent_id)?);
+    }
+    let agent = agent.unwrap_or_else(|| serde_json::json!({}));
+    let company_id = get_flag_value(args, "--company-id")
+        .or_else(|| agent.get("companyId").and_then(|value| value.as_str()).map(str::to_owned))
+        .ok_or_else(|| anyhow::anyhow!("company id is unavailable; pass --company-id"))?;
+    let issue_id = get_flag_value_any(args, &["--issue", "--issue-id"]);
+    let title = get_flag_value(args, "--title").unwrap_or_else(|| prompt_title(&prompt));
+
+    let (mode, issue_or_comment) = if let Some(issue_id) = issue_id.as_deref() {
+        let comment = client.add_issue_comment(
+            issue_id,
+            &serde_json::json!({"body": prompt, "resume": wake}),
+        )?;
+        ("comment", comment)
+    } else {
+        let issue = client.create_issue(
+            &company_id,
+            &serde_json::json!({
+                "title": title,
+                "description": prompt,
+                "status": "todo",
+                "priority": "medium",
+                "assigneeAgentId": agent_id,
+            }),
+        )?;
+        ("issue", issue)
+    };
+
+    let wakeup = if wake {
+        let target_issue_id = issue_or_comment
+            .get("id")
+            .and_then(|value| value.as_str())
+            .or(issue_id.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("API response did not include an issue id"))?;
+        Some(client.wakeup_agent(
+            &agent_id,
+            &serde_json::json!({
+                "source": "on_demand",
+                "triggerDetail": "manual",
+                "reason": "cli_prompt_handoff",
+                "payload": {"issueId": target_issue_id},
+            }),
+        )?)
+    } else {
+        None
+    };
+    println!(
+        "{}",
+        format_json(&serde_json::json!({
+            "ok": true,
+            "mode": mode,
+            "companyId": company_id,
+            "agent": agent,
+            "work": issue_or_comment,
+            "wakeup": wakeup,
+        }))
+    );
+    Ok(())
+}
+
+fn collect_prompt_text(args: &[String]) -> String {
+    let value_flags = [
+        "--agent-id", "--agent", "--company-id", "--issue", "--issue-id", "--title",
+        "--api-base", "--api-key", "--api-token", "--config", "--context", "--profile",
+        "--payload-json", "--context-json", "--reason",
+    ];
+    let mut words = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if value_flags.contains(&arg.as_str()) {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') || arg == "--no-wake" || arg == "--json" {
+            continue;
+        }
+        words.push(arg.as_str());
+    }
+    words.join(" ")
+}
+
+fn prompt_title(prompt: &str) -> String {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Prompt handoff");
+    if line.chars().count() <= 100 {
+        line.to_owned()
+    } else {
+        let short = line.chars().take(97).collect::<String>();
+        format!("{short}...")
+    }
+}
+
+// ── Heartbeat runner ───────────────────────────────────────────────
+
+fn cmd_heartbeat(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    if sub != "run" {
+        println!("Usage: parrot heartbeat run --agent-id ID [--source SOURCE] [--trigger TRIGGER] [--timeout-ms N]");
+        return Ok(());
+    }
+    let agent_id = get_flag_value_any(args, &["--agent-id", "-a"])
+        .or_else(|| {
+            crate::context::load(get_flag_value(args, "--context").map(PathBuf::from))
+                .ok()
+                .and_then(|(_, store)| {
+                    crate::context::active_profile(
+                        &store,
+                        get_flag_value(args, "--profile").as_deref(),
+                    )
+                    .1
+                    .agent_id
+                    .clone()
+                })
+        })
+        .ok_or_else(|| anyhow::anyhow!("Usage: parrot heartbeat run --agent-id ID"))?;
+    let source = get_flag_value(args, "--source").unwrap_or_else(|| "on_demand".to_owned());
+    let trigger = get_flag_value(args, "--trigger").unwrap_or_else(|| "manual".to_owned());
+    let mut body = serde_json::json!({
+        "source": source,
+        "triggerDetail": trigger,
+        "reason": get_flag_value(args, "--reason").unwrap_or_else(|| "cli_heartbeat_run".to_owned()),
+    });
+    if let Some(value) = get_flag_value(args, "--payload-json") {
+        body["payload"] = serde_json::from_str(&value).context("parse --payload-json")?;
+    }
+    if let Some(value) = get_flag_value(args, "--context-json") {
+        body["contextSnapshot"] = serde_json::from_str(&value).context("parse --context-json")?;
+    }
+    if let Some(value) = get_flag_value(args, "--idempotency-key") {
+        body["idempotencyKey"] = serde_json::Value::String(value);
+    }
+    if args.iter().any(|arg| arg == "--force-fresh-session") {
+        body["forceFreshSession"] = serde_json::Value::Bool(true);
+    }
+    let client = load_client_for_args(args)?;
+    let invoked = client.wakeup_agent(&agent_id, &body)?;
+    if invoked.get("status").and_then(|value| value.as_str()) == Some("skipped") {
+        println!("{}", format_json(&invoked));
+        return Ok(());
+    }
+    let run_id = invoked
+        .get("id")
+        .or_else(|| invoked.get("runId"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("heartbeat wakeup response did not contain a run id"))?
+        .to_owned();
+    let json_output = args.iter().any(|arg| arg == "--json");
+    if !json_output {
+        println!("heartbeat run: {run_id}");
+    }
+    let timeout_ms = get_flag_value(args, "--timeout-ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let deadline = (timeout_ms > 0)
+        .then(|| std::time::Instant::now() + Duration::from_millis(timeout_ms));
+    let mut after_seq = 0_i64;
+    loop {
+        let events = client.list_run_events(&run_id, after_seq, 100)?;
+        if let Some(rows) = events.as_array() {
+            for event in rows {
+                after_seq = after_seq.max(
+                    event
+                        .get("seq")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or(after_seq),
+                );
+                print_heartbeat_event(event, json_output);
+            }
+        }
+        let run = client.get_run(&run_id)?;
+        let status = run
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        if matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out") {
+            if json_output {
+                println!("{}", format_json(&run));
+            } else {
+                println!("heartbeat status: {status}");
+            }
+            return Ok(());
+        }
+        if deadline.is_some_and(|value| std::time::Instant::now() >= value) {
+            bail!("heartbeat run {run_id} timed out while status was {status}");
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn print_heartbeat_event(event: &serde_json::Value, json_output: bool) {
+    if json_output {
+        println!("{}", format_json(event));
+        return;
+    }
+    let event_type = event
+        .get("eventType")
+        .or_else(|| event.get("type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("heartbeat.run.event");
+    if event_type == "heartbeat.run.log" {
+        let payload = event.get("payload").cloned().unwrap_or_default();
+        let stream = payload
+            .get("stream")
+            .and_then(|value| value.as_str())
+            .unwrap_or("system");
+        let chunk = payload
+            .get("chunk")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if stream == "stderr" {
+            eprint!("[stderr] {chunk}");
+        } else {
+            print!("[{stream}] {chunk}");
+        }
+        let _ = io::stdout().flush();
+    } else if let Some(message) = event.get("message").and_then(|value| value.as_str()) {
+        println!("[{event_type}] {message}");
+    } else {
+        println!(
+            "[{event_type}] {}",
+            event.get("payload").unwrap_or(&serde_json::Value::Null)
+        );
+    }
+}
+
+// ── Export bundle alias ─────────────────────────────────────────────
+
+fn cmd_zip(args: &[String]) -> Result<()> {
+    let company_id = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Usage: parrot zip <companyId> [--output FILE]"))?;
+    let client = load_client_for_args(args)?;
+    let bundle = client.export_company(company_id)?;
+    if let Some(output) = get_flag_value(args, "--output") {
+        fs::write(&output, serde_json::to_vec_pretty(&bundle)?)
+            .with_context(|| format!("failed to write export bundle {output}"))?;
+        println!("export bundle written to {output}");
+    } else {
+        println!("{}", format_json(&bundle));
     }
     Ok(())
 }
@@ -471,11 +1157,100 @@ fn cmd_auth(args: &[String]) -> Result<()> {
             println!("{}", format_json(&session));
             Ok(())
         }
+        "bootstrap-ceo" => cmd_bootstrap_ceo(&args[1..]),
         _ => {
-            println!("Usage: parrot auth get-session");
+            println!("Usage: parrot auth get-session | bootstrap-ceo [--db-url URL] [--base-url URL] [--force]");
             Ok(())
         }
     }
+}
+
+/// Create a one-time instance bootstrap invite, matching Paperclip's
+/// `auth bootstrap-ceo` command.  This is intentionally a local database
+/// operation: before the first board user exists there is no bearer identity
+/// that could authorize an HTTP request.
+fn cmd_bootstrap_ceo(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("Usage: parrot auth bootstrap-ceo [--db-url URL] [--base-url URL] [--expires-hours N] [--force] [--json]");
+        return Ok(());
+    }
+    let db_url = get_flag_value(args, "--db-url")
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .or_else(|| std::env::var("PARROT_DATABASE_URL").ok())
+        .ok_or_else(|| anyhow::anyhow!("database URL is required; pass --db-url or set DATABASE_URL"))?;
+    let base_url = get_flag_value(args, "--base-url")
+        .or_else(|| std::env::var("PARROT_PUBLIC_URL").ok())
+        .or_else(|| std::env::var("PAPERCLIP_PUBLIC_URL").ok())
+        .or_else(|| crate::config::CliConfig::load().ok().map(|config| config.server_url))
+        .unwrap_or_else(|| "http://localhost:3100".to_owned())
+        .trim_end_matches('/')
+        .to_owned();
+    let force = args.iter().any(|arg| arg == "--force");
+    let expires_hours = get_flag_value(args, "--expires-hours")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(72)
+        .clamp(1, 24 * 30);
+    let json_output = args.iter().any(|arg| arg == "--json");
+    let runtime = tokio::runtime::Runtime::new().context("create bootstrap runtime")?;
+    let result = runtime.block_on(async move {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&db_url)
+            .await
+            .context("connect to database for bootstrap invite")?;
+        let admin_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM instance_user_roles WHERE role = 'instance_admin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .context("check instance administrators")?;
+        if admin_count > 0 && !force {
+            anyhow::bail!("instance already has an admin; pass --force to create another invite");
+        }
+        if force {
+            sqlx::query(
+                "UPDATE invites
+                 SET revoked_at = NOW()
+                 WHERE invite_type = 'bootstrap_ceo'
+                   AND revoked_at IS NULL AND accepted = false AND expires_at > NOW()",
+            )
+            .execute(&pool)
+            .await
+            .context("revoke existing bootstrap invites")?;
+        }
+        let token = format!("pcp_bootstrap_{}", uuid::Uuid::new_v4().simple());
+        let expires_at = chrono::Utc::now() + chrono::Duration::hours(expires_hours);
+        let invite_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO invites
+                (id, company_id, invite_type, invited_by_user_id, token,
+                 allowed_join_types, expires_at, accepted, created_at)
+             VALUES ($1, NULL, 'bootstrap_ceo'::invite_type, NULL, $2,
+                     'human'::allowed_join_types, $3, false, NOW())
+             RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(&token)
+        .bind(expires_at)
+        .fetch_one(&pool)
+        .await
+        .context("create bootstrap CEO invite")?;
+        pool.close().await;
+        Ok::<_, anyhow::Error>(serde_json::json!({
+            "id": invite_id,
+            "token": token,
+            "inviteUrl": format!("{base_url}/invite/{token}"),
+            "expiresAt": expires_at,
+            "inviteType": "bootstrap_ceo",
+        }))
+    })?;
+    if json_output {
+        println!("{}", format_json(&result));
+    } else {
+        println!("created bootstrap CEO invite");
+        println!("invite URL: {}", result["inviteUrl"].as_str().unwrap_or_default());
+        println!("expires: {}", result["expiresAt"]);
+    }
+    Ok(())
 }
 
 
@@ -889,6 +1664,9 @@ fn cmd_channel(args: &[String]) -> Result<()> {
 
 fn cmd_agent(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("help");
+    if sub == "prompt" {
+        return cmd_prompt(&args[1..]);
+    }
     let client = load_client()?;
     match sub {
         "list" | "ls" => {
@@ -911,7 +1689,7 @@ fn cmd_agent(args: &[String]) -> Result<()> {
             Ok(())
         }
         _ => {
-            println!("Usage: parrot agent list <companyId> | get <companyId> <agentId>");
+            println!("Usage: parrot agent list <companyId> | get <companyId> <agentId> | prompt <text...>");
             Ok(())
         }
     }
@@ -1061,10 +1839,14 @@ fn get_flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
+fn get_flag_value_any(args: &[String], flags: &[&str]) -> Option<String> {
+    flags.iter().find_map(|flag| get_flag_value(args, flag))
+}
+
 
 // ── Uninstall ─────────────────────────────────────────────────────────
 
-fn cmd_uninstall(args: &[String]) -> Result<()> {
+fn cmd_uninstall(_args: &[String]) -> Result<()> {
     let paths = crate::install_store::InstallStorePaths::new();
     let self_path = std::env::current_exe()?;
     crate::install_store::remove_install_manifest(&paths)?;
@@ -1177,7 +1959,15 @@ fn cmd_onboard(args: &[String]) -> Result<()> {
 
     let path = resolve_config_path(config_path)
         .ok_or_else(|| anyhow::anyhow!("unable to determine config path; pass --config"))?;
-    let config = crate::config::CliConfig { server_url: url, api_token: token, config_path: Some(path.clone()) };
+    let existing_allowed_hostnames = crate::config::CliConfig::load_from(Some(path.clone()))
+        .map(|config| config.allowed_hostnames)
+        .unwrap_or_default();
+    let config = crate::config::CliConfig {
+        server_url: url,
+        api_token: token,
+        allowed_hostnames: existing_allowed_hostnames,
+        config_path: Some(path.clone()),
+    };
     config.save()?;
     println!("
 configuration saved to {}", path.display());

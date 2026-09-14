@@ -26,6 +26,59 @@ pub trait PluginService: Send + Sync {
     async fn transition(&self, id: Uuid, status: &str) -> PluginResult<Plugin>;
     async fn remove(&self, id: Uuid) -> PluginResult<()>;
     async fn update_config(&self, id: Uuid, config: Value) -> PluginResult<Plugin>;
+    async fn get_company_config(
+        &self,
+        plugin_id: Uuid,
+        company_id: Uuid,
+    ) -> PluginResult<Option<Value>>;
+    async fn update_company_config(
+        &self,
+        plugin_id: Uuid,
+        company_id: Uuid,
+        config: Value,
+    ) -> PluginResult<Value>;
+    async fn list_state(
+        &self,
+        plugin_id: Uuid,
+        scope_kind: Option<&str>,
+        scope_id: Option<&str>,
+        namespace: Option<&str>,
+    ) -> PluginResult<Vec<Value>>;
+    async fn upsert_state(
+        &self,
+        plugin_id: Uuid,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        namespace: &str,
+        state_key: &str,
+        value: Value,
+    ) -> PluginResult<Value>;
+    async fn delete_state(
+        &self,
+        plugin_id: Uuid,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        namespace: &str,
+        state_key: &str,
+    ) -> PluginResult<()>;
+    async fn list_entities(
+        &self,
+        plugin_id: Uuid,
+        company_id: Option<Uuid>,
+        entity_type: Option<&str>,
+    ) -> PluginResult<Vec<Value>>;
+    async fn upsert_entity(
+        &self,
+        plugin_id: Uuid,
+        company_id: Option<Uuid>,
+        entity_type: &str,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        external_id: Option<&str>,
+        title: Option<&str>,
+        status: Option<&str>,
+        data: Value,
+    ) -> PluginResult<Value>;
     async fn get_data(&self, id: Uuid, key: &str) -> PluginResult<Value>;
     async fn set_data(&self, id: Uuid, key: &str, value: Value) -> PluginResult<Value>;
     async fn jobs(&self, id: Uuid) -> PluginResult<Vec<Value>>;
@@ -46,7 +99,7 @@ pub trait PluginService: Send + Sync {
         &self,
         plugin_id: Uuid,
         endpoint_key: &str,
-        company_id: Uuid,
+        company_id: Option<Uuid>,
         payload: Value,
     ) -> PluginResult<Value>;
 
@@ -217,6 +270,261 @@ impl PluginService for DefaultPluginService {
                 .await?;
         Ok(row_plugin(&r))
     }
+    async fn get_company_config(
+        &self,
+        plugin_id: Uuid,
+        company_id: Uuid,
+    ) -> PluginResult<Option<Value>> {
+        self.get(plugin_id).await?;
+        let row = sqlx::query(
+            "SELECT id, plugin_id, company_id, config_json, last_error, created_at, updated_at
+             FROM plugin_config WHERE plugin_id = $1 AND company_id = $2",
+        )
+        .bind(plugin_id)
+        .bind(company_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| {
+            json!({
+                "id": row.get::<Uuid, _>("id"),
+                "pluginId": row.get::<Uuid, _>("plugin_id"),
+                "companyId": row.get::<Uuid, _>("company_id"),
+                "configJson": row.get::<Value, _>("config_json"),
+                "lastError": row.get::<Option<String>, _>("last_error"),
+                "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+            })
+        }))
+    }
+    async fn update_company_config(
+        &self,
+        plugin_id: Uuid,
+        company_id: Uuid,
+        config: Value,
+    ) -> PluginResult<Value> {
+        let plugin = self.get(plugin_id).await?;
+        crate::plugin_config_validator::validate_config(&plugin.manifest, &config)
+            .map_err(PluginServiceError::InvalidState)?;
+        let row = sqlx::query(
+            "INSERT INTO plugin_config
+                (plugin_id, company_id, config_json, last_error)
+             VALUES ($1,$2,$3,NULL)
+             ON CONFLICT (plugin_id, company_id)
+             DO UPDATE SET config_json = EXCLUDED.config_json,
+                           last_error = NULL,
+                           updated_at = NOW()
+             RETURNING id, plugin_id, company_id, config_json, last_error, created_at, updated_at",
+        )
+        .bind(plugin_id)
+        .bind(company_id)
+        .bind(config)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(json!({
+            "id": row.get::<Uuid, _>("id"),
+            "pluginId": row.get::<Uuid, _>("plugin_id"),
+            "companyId": row.get::<Uuid, _>("company_id"),
+            "configJson": row.get::<Value, _>("config_json"),
+            "lastError": row.get::<Option<String>, _>("last_error"),
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+        }))
+    }
+    async fn list_state(
+        &self,
+        plugin_id: Uuid,
+        scope_kind: Option<&str>,
+        scope_id: Option<&str>,
+        namespace: Option<&str>,
+    ) -> PluginResult<Vec<Value>> {
+        self.get(plugin_id).await?;
+        let rows = sqlx::query(
+            "SELECT id, plugin_id, scope_kind, scope_id, namespace, state_key,
+                    value_json, updated_at
+             FROM plugin_state
+             WHERE plugin_id = $1
+               AND ($2::text IS NULL OR scope_kind = $2)
+               AND ($3::text IS NULL OR scope_id = $3)
+               AND ($4::text IS NULL OR namespace = $4)
+             ORDER BY updated_at DESC, state_key ASC",
+        )
+        .bind(plugin_id)
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "pluginId": row.get::<Uuid, _>("plugin_id"),
+                    "scopeKind": row.get::<String, _>("scope_kind"),
+                    "scopeId": row.get::<Option<String>, _>("scope_id"),
+                    "namespace": row.get::<String, _>("namespace"),
+                    "key": row.get::<String, _>("state_key"),
+                    "value": row.get::<Value, _>("value_json"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                })
+            })
+            .collect())
+    }
+    async fn upsert_state(
+        &self,
+        plugin_id: Uuid,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        namespace: &str,
+        state_key: &str,
+        value: Value,
+    ) -> PluginResult<Value> {
+        self.get(plugin_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO plugin_state
+                (plugin_id, scope_kind, scope_id, namespace, state_key, value_json)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             ON CONFLICT (plugin_id, scope_kind, scope_id, namespace, state_key)
+             DO UPDATE SET value_json = EXCLUDED.value_json, updated_at = NOW()
+             RETURNING id, updated_at",
+        )
+        .bind(plugin_id)
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(namespace)
+        .bind(state_key)
+        .bind(&value)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(json!({
+            "id": row.get::<Uuid, _>("id"),
+            "pluginId": plugin_id,
+            "scopeKind": scope_kind,
+            "scopeId": scope_id,
+            "namespace": namespace,
+            "key": state_key,
+            "value": value,
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+        }))
+    }
+    async fn delete_state(
+        &self,
+        plugin_id: Uuid,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        namespace: &str,
+        state_key: &str,
+    ) -> PluginResult<()> {
+        self.get(plugin_id).await?;
+        sqlx::query(
+            "DELETE FROM plugin_state
+             WHERE plugin_id = $1 AND scope_kind = $2
+               AND scope_id IS NOT DISTINCT FROM $3
+               AND namespace = $4 AND state_key = $5",
+        )
+        .bind(plugin_id)
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(namespace)
+        .bind(state_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+    async fn list_entities(
+        &self,
+        plugin_id: Uuid,
+        company_id: Option<Uuid>,
+        entity_type: Option<&str>,
+    ) -> PluginResult<Vec<Value>> {
+        self.get(plugin_id).await?;
+        let rows = sqlx::query(
+            "SELECT id, plugin_id, company_id, entity_type, scope_kind, scope_id,
+                    external_id, title, status, data, created_at, updated_at
+             FROM plugin_entities
+             WHERE plugin_id = $1
+               AND company_id IS NOT DISTINCT FROM $2
+               AND ($3::text IS NULL OR entity_type = $3)
+             ORDER BY updated_at DESC, created_at DESC",
+        )
+        .bind(plugin_id)
+        .bind(company_id)
+        .bind(entity_type)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "pluginId": row.get::<Uuid, _>("plugin_id"),
+                    "companyId": row.get::<Option<Uuid>, _>("company_id"),
+                    "entityType": row.get::<String, _>("entity_type"),
+                    "scopeKind": row.get::<String, _>("scope_kind"),
+                    "scopeId": row.get::<Option<String>, _>("scope_id"),
+                    "externalId": row.get::<Option<String>, _>("external_id"),
+                    "title": row.get::<Option<String>, _>("title"),
+                    "status": row.get::<Option<String>, _>("status"),
+                    "data": row.get::<Value, _>("data"),
+                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+                })
+            })
+            .collect())
+    }
+    async fn upsert_entity(
+        &self,
+        plugin_id: Uuid,
+        company_id: Option<Uuid>,
+        entity_type: &str,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        external_id: Option<&str>,
+        title: Option<&str>,
+        status: Option<&str>,
+        data: Value,
+    ) -> PluginResult<Value> {
+        self.get(plugin_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO plugin_entities
+                (plugin_id, company_id, entity_type, scope_kind, scope_id,
+                 external_id, title, status, data)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+             ON CONFLICT (company_id, plugin_id, entity_type, external_id)
+             DO UPDATE SET scope_kind = EXCLUDED.scope_kind,
+                           scope_id = EXCLUDED.scope_id,
+                           title = EXCLUDED.title,
+                           status = EXCLUDED.status,
+                           data = EXCLUDED.data,
+                           updated_at = NOW()
+             RETURNING id, created_at, updated_at",
+        )
+        .bind(plugin_id)
+        .bind(company_id)
+        .bind(entity_type)
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(external_id)
+        .bind(title)
+        .bind(status)
+        .bind(&data)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(json!({
+            "id": row.get::<Uuid, _>("id"),
+            "pluginId": plugin_id,
+            "companyId": company_id,
+            "entityType": entity_type,
+            "scopeKind": scope_kind,
+            "scopeId": scope_id,
+            "externalId": external_id,
+            "title": title,
+            "status": status,
+            "data": data,
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+        }))
+    }
     async fn get_data(&self, id: Uuid, key: &str) -> PluginResult<Value> {
         self.get(id).await?;
         Ok(
@@ -301,30 +609,106 @@ impl PluginService for DefaultPluginService {
         &self,
         plugin_id: Uuid,
         endpoint_key: &str,
-        _company_id: Uuid,
-        _payload: Value,
+        company_id: Option<Uuid>,
+        payload: Value,
     ) -> PluginResult<Value> {
-        // 确认 plugin 存在（company scope 由路由层校验）
-        self.get(plugin_id).await?;
+        let plugin = self.get(plugin_id).await?;
         if endpoint_key.is_empty() {
             return Err(PluginServiceError::InvalidState(
                 "endpoint key is required".into(),
             ));
         }
-        // parrot 当前未实现 webhook runtime：显式返回 feature-disabled，不伪造成功。
+        if plugin.status != "ready" {
+            return Err(PluginServiceError::InvalidState(format!(
+                "plugin is not ready (current status: {})",
+                plugin.status
+            )));
+        }
+        let receives_webhooks = plugin
+            .manifest
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some("webhooks.receive"))
+            });
+        if !receives_webhooks {
+            return Err(PluginServiceError::InvalidState(
+                "plugin does not have the webhooks.receive capability".into(),
+            ));
+        }
+        let declared = plugin
+            .manifest
+            .get("webhooks")
+            .and_then(Value::as_array)
+            .is_some_and(|webhooks| {
+                webhooks.iter().any(|webhook| {
+                    webhook
+                        .get("endpointKey")
+                        .or_else(|| webhook.get("endpoint_key"))
+                        .and_then(Value::as_str)
+                        == Some(endpoint_key)
+                })
+            });
+        if !declared {
+            return Err(PluginServiceError::InvalidState(format!(
+                "webhook endpoint '{}' is not declared by this plugin",
+                endpoint_key
+            )));
+        }
+
+        // Keep an immutable ingress record even when this installation does
+        // not have a plugin worker manager. This matches Paperclip's delivery
+        // ledger and makes the missing runtime explicit rather than silently
+        // dropping an external request.
+        let started_at = chrono::Utc::now();
+        let delivery_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO plugin_webhook_deliveries
+                (plugin_id, company_id, webhook_key, status, payload, headers, started_at)
+             VALUES ($1, $2, $3, 'pending', $4, '{}'::jsonb, $5)
+             RETURNING id",
+        )
+        .bind(plugin_id)
+        .bind(company_id)
+        .bind(endpoint_key)
+        .bind(&payload)
+        .bind(started_at)
+        .fetch_one(&self.pool)
+        .await?;
+        let finished_at = chrono::Utc::now();
+        let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as i32;
+        let runtime_error =
+            "plugin webhook runtime is not configured in parrot; delivery was recorded";
+        sqlx::query(
+            "UPDATE plugin_webhook_deliveries
+             SET status = 'failed', duration_ms = $2, error = $3, finished_at = $4
+             WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .bind(duration_ms)
+        .bind(runtime_error)
+        .bind(finished_at)
+        .execute(&self.pool)
+        .await?;
+
         Err(PluginServiceError::FeatureDisabled(
-            "plugin webhook ingress is not implemented in parrot".into(),
+            format!("{runtime_error} (deliveryId: {delivery_id})"),
         ))
     }
 
     async fn list_local_folders(
         &self,
         plugin_id: Uuid,
-        _company_id: Uuid,
+        company_id: Uuid,
     ) -> PluginResult<Vec<Value>> {
         let plugin = self.get(plugin_id).await?;
-        let folders = plugin
-            .config
+        let company_config = self
+            .get_company_config(plugin_id, company_id)
+            .await?
+            .and_then(|record| record.get("configJson").cloned());
+        let config = company_config.unwrap_or_else(|| plugin.config.clone());
+        let folders = config
             .get("localFolders")
             .and_then(|f| f.as_array())
             .cloned()
@@ -373,7 +757,11 @@ impl PluginService for DefaultPluginService {
         body: Value,
     ) -> PluginResult<Value> {
         let plugin = self.get(plugin_id).await?;
-        let mut config = plugin.config.clone();
+        let mut config = self
+            .get_company_config(plugin_id, company_id)
+            .await?
+            .and_then(|record| record.get("configJson").cloned())
+            .unwrap_or_else(|| plugin.config.clone());
         let folder_result = {
             let folders = config
                 .get_mut("localFolders")
@@ -403,14 +791,7 @@ impl PluginService for DefaultPluginService {
             folder.clone()
         };
 
-        sqlx::query("UPDATE plugins SET config=$2, updated_at=NOW() WHERE id=$1")
-            .bind(plugin_id)
-            .bind(&config)
-            .execute(&self.pool)
-            .await?;
-
-        // company_id 仅用于 scope 语义（已用），避免未使用变量告警
-        let _ = company_id;
+        self.update_company_config(plugin_id, company_id, config).await?;
         Ok(folder_result)
     }
 

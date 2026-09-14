@@ -183,12 +183,18 @@ pub struct AgentSkillSnapshot {
 }
 
 /// Agent 实体
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+// NOTE: no `sqlx::FromRow` — `url_key` is a derived projection with no column,
+// so every row is built through `repositories::pg_agent_repository::map_agent_row`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Agent {
     pub id: Uuid,
     pub company_id: Uuid,
     pub name: String,
+    /// URL-safe projection of `name`, falling back to `id`. Derived on every
+    /// read (paperclip persists no `url_key` column); the route resolver and the
+    /// skill `usedByAgents` projection both key off this exact value.
+    pub url_key: String,
     pub role: AgentRole,
     pub status: AgentStatus,
     pub adapter_type: String,

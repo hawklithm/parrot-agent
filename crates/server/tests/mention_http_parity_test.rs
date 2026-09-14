@@ -15,17 +15,10 @@ use uuid::Uuid;
 use api::routes::issue_comments::issue_comment_routes;
 use services::auth::AuthorizationActor;
 
-/// Reusable seed helpers — tests call `connect_and_migrate` and `seed` before building a router.
-async fn connect_and_migrate(pool: &PgPool) {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(tracing::Level::WARN)
-        .try_init();
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 async fn seed_company(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
@@ -63,7 +56,7 @@ async fn build_router(pool: PgPool) -> Router {
 
 #[sqlx::test]
 async fn mention_parses_agent_url_and_triggers_wakeup(pool: PgPool) {
-    connect_and_migrate(&pool).await;
+    migrate(&pool).await;
     let cid = seed_company(&pool).await;
     let mentioned = seed_agent(&pool, cid, "idle").await;
     let self_agent = seed_agent(&pool, cid, "running").await;
@@ -119,7 +112,7 @@ async fn mention_parses_agent_url_and_triggers_wakeup(pool: PgPool) {
 
 #[sqlx::test]
 async fn self_mention_does_not_create_wakeup(pool: PgPool) {
-    connect_and_migrate(&pool).await;
+    migrate(&pool).await;
     let cid = seed_company(&pool).await;
     let agent = seed_agent(&pool, cid, "idle").await;
     let (issue_id, _) = seed_issue(&pool, cid, agent).await;
@@ -157,7 +150,7 @@ async fn self_mention_does_not_create_wakeup(pool: PgPool) {
 
 #[sqlx::test]
 async fn cross_company_mention_is_ignored(pool: PgPool) {
-    connect_and_migrate(&pool).await;
+    migrate(&pool).await;
     let cid1 = seed_company(&pool).await;
     let cid2 = seed_company(&pool).await;
     let agent_in_cid1 = seed_agent(&pool, cid1, "idle").await;

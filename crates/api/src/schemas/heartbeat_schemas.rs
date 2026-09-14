@@ -95,23 +95,6 @@ pub fn parse_scheduler_heartbeat_policy(runtime_config: &serde_json::Value) -> S
     }
 }
 
-/// 生成 Agent URL key（名称 + ID 前缀）
-pub fn derive_agent_url_key(name: &str, id: Uuid) -> String {
-    let id_str = id.to_string();
-    let id_prefix = &id_str[..8];
-    let normalized_name = name
-        .to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string();
-
-    if normalized_name.is_empty() {
-        id_prefix.to_string()
-    } else {
-        format!("{}-{}", normalized_name, id_prefix)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,23 +154,6 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_agent_url_key() {
-        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-
-        let key = derive_agent_url_key("Test Agent", id);
-        assert_eq!(key, "test-agent-550e8400");
-
-        let key2 = derive_agent_url_key("My Cool Agent!", id);
-        assert_eq!(key2, "my-cool-agent-550e8400");
-
-        let key3 = derive_agent_url_key("---", id);
-        assert_eq!(key3, "550e8400");
-
-        let key4 = derive_agent_url_key("", id);
-        assert_eq!(key4, "550e8400");
-    }
-
-    #[test]
     fn test_instance_scheduler_heartbeat_agent_serialization() {
         let agent = InstanceSchedulerHeartbeatAgent {
             id: Uuid::nil(),
@@ -195,7 +161,7 @@ mod tests {
             company_name: "Test Company".to_string(),
             company_issue_prefix: "TEST".to_string(),
             agent_name: "Scheduler Agent".to_string(),
-            agent_url_key: "scheduler-agent-00000000".to_string(),
+            agent_url_key: "scheduler-agent".to_string(),
             role: "ceo".to_string(),
             title: Some("Chief Executive Officer".to_string()),
             status: "active".to_string(),

@@ -84,16 +84,24 @@ pub enum PrincipalType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "membership_role", rename_all = "snake_case")]
 pub enum MembershipRole {
     Owner,
-    Member,
+    Admin,
+    Operator,
+    Viewer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "company_membership_status", rename_all = "snake_case")]
 pub enum CompanyMembershipStatus {
+    Pending,
     Active,
+    Suspended,
+    Archived,
+    /// Legacy database value retained for backwards-compatible decoding.
     Inactive,
 }
 

@@ -5,7 +5,7 @@
 //! consistently on company-scoped endpoints.
 //!
 //! Run with a live database, e.g.:
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile \
+//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_compile \
 //!     cargo test -p parrot-server --test auth_identity_parity_test
 
 use axum::body::{to_bytes, Body};
@@ -106,13 +106,18 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .execute(pool)
     .await
     .expect("insert company membership");
+    // The key must carry its responsible user, exactly as
+    // `POST /agents/:id/keys` records it (`routes/agents.ts:4177`). Without it
+    // the key cannot authenticate — see the assertion at the end of this test.
     sqlx::query(
-        "INSERT INTO agent_api_keys (id, company_id, agent_id, key_hash, name) VALUES ($1, $2, $3, $4, 'test')",
+        "INSERT INTO agent_api_keys (id, company_id, agent_id, key_hash, name, responsible_user_id) \
+         VALUES ($1, $2, $3, $4, 'test', $5)",
     )
     .bind(Uuid::new_v4())
     .bind(company_a)
     .bind(agent_a)
     .bind(hash_api_key(&agent_key_token))
+    .bind(user_a)
     .execute(pool)
     .await
     .expect("insert agent api key");
@@ -134,19 +139,10 @@ async fn cleanup_fixture(f: &Fixture) {
         .await;
 }
 
-async fn connect_and_migrate() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect database for auth identity HTTP parity tests");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    pool
-}
+
+mod common;
+use common::connect_and_migrate;
+
 
 /// Agent JWT / Board Session / Agent API Key consistency (plan 3.1).
 #[tokio::test]
@@ -260,6 +256,72 @@ async fn three_identities_resolve_consistently() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "cross-company agent read → 403");
+
+    // 7. A key without a responsible user cannot authenticate.
+    //
+    //    Paperclip answers `RESPONSIBLE_USER_UNAVAILABLE`
+    //    (`middleware/auth.ts:420-425`). Parrot previously read the
+    //    responsible user from `agents.reports_to`, which references
+    //    `agents(id)` — so an *agent* id was silently used as a *user* id and
+    //    the failure surfaced much later as an unexplained 403 on writes.
+    let orphan_key_token = format!("aak_{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO agent_api_keys (id, company_id, agent_id, key_hash, name) \
+         VALUES ($1, $2, $3, $4, 'orphan')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(f.company_a)
+    .bind(f.agent_a)
+    .bind(hash_api_key(&orphan_key_token))
+    .execute(&f.pool)
+    .await
+    .expect("insert orphan agent api key");
+
+    let (status, _) = send(
+        &app,
+        "GET",
+        "/api/auth/get-session",
+        &[("authorization", &format!("Bearer {orphan_key_token}"))],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a key with no responsible user must be refused"
+    );
+
+    // 8. `agents.reports_to` is an agent self-reference and must NOT be used as
+    //    the responsible user: pointing it at the agent's own manager must not
+    //    resurrect the orphan key.
+    let manager_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, company_id, name, role, status) \
+         VALUES ($1, $2, 'Manager Agent', 'manager', 'running')",
+    )
+    .bind(manager_id)
+    .bind(f.company_a)
+    .execute(&f.pool)
+    .await
+    .expect("insert manager agent");
+    sqlx::query("UPDATE agents SET reports_to = $2 WHERE id = $1")
+        .bind(f.agent_a)
+        .bind(manager_id)
+        .execute(&f.pool)
+        .await
+        .expect("point reports_to at manager");
+
+    let (status, _) = send(
+        &app,
+        "GET",
+        "/api/auth/get-session",
+        &[("authorization", &format!("Bearer {orphan_key_token}"))],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "reports_to is an agent, never a responsible user"
+    );
 
     cleanup_fixture(&f).await;
     std::env::remove_var("JWT_SECRET");

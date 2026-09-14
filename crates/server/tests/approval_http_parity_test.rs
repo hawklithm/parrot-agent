@@ -15,19 +15,10 @@ use sqlx::PgPool;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
-async fn connect_and_migrate() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:admin123@localhost:5433/parrot_agent_compile".to_string()
-    });
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect database");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    pool
-}
+
+mod common;
+use common::connect_and_migrate;
+
 
 struct Fixture {
     pool: PgPool,

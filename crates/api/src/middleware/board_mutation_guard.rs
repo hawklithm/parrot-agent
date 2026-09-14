@@ -26,7 +26,7 @@
 //!
 //! See paperclip reference: `server/src/middleware/board-mutation-guard.ts`.
 
-use axum::http::{HeaderName, HeaderValue};
+use axum::http::HeaderValue;
 use axum::{extract::Request, middleware::Next, response::Response};
 
 use services::auth::{ActorSource, AuthorizationActor};
@@ -155,6 +155,7 @@ mod tests {
             source,
             memberships: vec![],
             is_instance_admin: false,
+            key_id: None,
         }
     }
 

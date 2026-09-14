@@ -203,16 +203,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Triggers have no CREATE TRIGGER IF NOT EXISTS; drop-if-exists first so this
+-- migration is replayable against an already-migrated database.
+DROP TRIGGER IF EXISTS tool_applications_updated_at ON tool_applications;
 CREATE TRIGGER tool_applications_updated_at
     BEFORE UPDATE ON tool_applications
     FOR EACH ROW
     EXECUTE FUNCTION update_tool_access_updated_at();
 
+DROP TRIGGER IF EXISTS tool_connections_updated_at ON tool_connections;
 CREATE TRIGGER tool_connections_updated_at
     BEFORE UPDATE ON tool_connections
     FOR EACH ROW
     EXECUTE FUNCTION update_tool_access_updated_at();
 
+DROP TRIGGER IF EXISTS connection_grants_updated_at ON connection_grants;
 CREATE TRIGGER connection_grants_updated_at
     BEFORE UPDATE ON connection_grants
     FOR EACH ROW

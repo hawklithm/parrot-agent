@@ -13,7 +13,7 @@ use crate::errors::AppError;
 use crate::redaction::redact_config;
 use crate::validation::{AgentPermissionsInput, CreateAgentHireSchema, UpdateAgentSchema};
 use models::{AgentPermissions, AgentStatus, ApprovalType, TrustAuthorizationPolicy, TrustPreset};
-use serde_json::json;
+use serde_json::{json, Value};
 use services::approval_service::CreateApprovalInput;
 use services::auth::{AuthorizationAction, AuthorizationActor};
 use services::{CreateAgentInput, HeartbeatWakeupOptions, UpdateAgentInput};
@@ -30,6 +30,18 @@ pub use crate::app_state::AppState;
 #[serde(rename_all = "camelCase")]
 struct AgentReferenceQuery {
     company_id: Option<Uuid>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentWakeupRequest {
+    source: Option<String>,
+    trigger_detail: Option<String>,
+    reason: Option<String>,
+    payload: Option<Value>,
+    idempotency_key: Option<String>,
+    context_snapshot: Option<Value>,
+    force_fresh_session: Option<bool>,
 }
 
 /// 创建Agent路由
@@ -270,25 +282,30 @@ async fn get_agent(
     Path(raw_id): Path<String>,
     Query(query): Query<AgentReferenceQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Paperclip accepts either a UUID or a company-scoped shortname/slug.
-    // Shortname lookup is intentionally scoped by the companyId query value.
+    // Paperclip accepts either a UUID or a company-scoped URL key. The key is a
+    // derived projection of the name, so the comparison uses the same SQL
+    // fragment the row mapper's Rust derivation mirrors.
     let id = match raw_id.parse::<Uuid>() {
         Ok(id) => id,
         Err(_) => {
             let company_id = query.company_id.ok_or_else(|| {
-                AppError::BadRequest(
+                AppError::Unprocessable(
                     "Agent shortname lookup requires companyId query parameter".to_string(),
                 )
             })?;
-            let slug = raw_id.trim().to_lowercase();
-            let matches = sqlx::query_scalar::<_, Uuid>(
+            let Some(url_key) = models::agent_url_key::normalize_agent_url_key(&raw_id) else {
+                return Err(AppError::NotFound("Agent not found".to_string()));
+            };
+            let matches = sqlx::query_scalar::<_, Uuid>(&format!(
                 "SELECT id FROM agents \
                  WHERE company_id = $1 \
-                   AND lower(regexp_replace(trim(name), '[^a-zA-Z0-9]+', '-', 'g')) = $2 \
+                   AND status <> 'terminated' \
+                   AND {url_key_sql} = $2 \
                  ORDER BY created_at ASC",
-            )
+                url_key_sql = models::agent_url_key::agent_url_key_sql("agents"),
+            ))
             .bind(company_id)
-            .bind(&slug)
+            .bind(&url_key)
             .fetch_all(&state.pool)
             .await
             .map_err(|error| {
@@ -867,76 +884,303 @@ fn required_instruction_path(path: Option<String>) -> Result<String, AppError> {
     Ok(path)
 }
 
+/// `GET /agents/:id/keys` 的响应元素 —— Paperclip `listKeys`
+/// （`services/agents.ts:1095-1114`）。
+///
+/// 注意 Paperclip **不**回 `agentId` / `companyId` / `lastUsedAt`；scope 经过
+/// `normalizeAgentApiKeyScope` 归一化后再出网。
+fn agent_key_json(key: &models::AgentApiKey) -> serde_json::Value {
+    json!({
+        "id": key.id,
+        "name": key.name,
+        "scope": normalize_agent_api_key_scope(&key.scope),
+        "responsibleUserId": key.responsible_user_id,
+        "createdAt": key.created_at,
+        "revokedAt": key.revoked_at,
+    })
+}
+
+/// `normalizeAgentApiKeyScope`（`validators/agent.ts:182-185`）。
+///
+/// 任何解析失败都折叠成 `{kind:"standard"}`，因此响应里的 scope 永远是一个
+/// 合法联合成员。
+fn normalize_agent_api_key_scope(scope: &serde_json::Value) -> serde_json::Value {
+    match services::auth::AgentApiKeyScope::from_json(scope.clone()) {
+        Some(parsed) => {
+            // 只出网 Paperclip 认识的字段；Parrot 侧的 `agentId`/`companyId`
+            // 审计信息不外泄。
+            let mut value = serde_json::to_value(&parsed).unwrap_or_else(|_| json!({}));
+            if let Some(object) = value.as_object_mut() {
+                object.retain(|key, _| key != "agentId" && key != "companyId");
+                object.retain(|_, value| !is_empty_json_value(value));
+            }
+            value
+        }
+        None => json!({ "kind": "standard" }),
+    }
+}
+
+fn is_empty_json_value(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Array(items) => items.is_empty(),
+        _ => false,
+    }
+}
+
+/// 校验并归一化 `POST /agents/:id/keys` 的请求体。
+///
+/// 对应 Paperclip `validate(createAgentKeySchema)`
+/// （`validators/agent.ts:187-190` + `middleware/validate.ts`）：任何
+/// Zod failure 都是 **400** `{"error":"Validation error"}`。
+///
+/// 返回值为要落库的 scope（`None` 表示 standard，不落边界配置），与
+/// Paperclip `scopeConfig: scope.kind === "standard" ? null : scope` 一致。
+fn parse_create_agent_key_body(
+    body: &serde_json::Value,
+) -> Result<(String, Option<serde_json::Value>), AppError> {
+    let object = body.as_object().ok_or_else(|| {
+        AppError::Validation("Expected a JSON object body".to_string())
+    })?;
+
+    // `z.object({...})` 在 Zod 里默认剥离未知键而非报错，所以这里同样容忍
+    // 额外字段（Paperclip 该 schema 没有 `.strict()`）。
+    let name = match object.get("name") {
+        None => "default".to_string(),
+        Some(value) => value
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                AppError::Validation("Invalid agent key name".to_string())
+            })?
+            .to_string(),
+    };
+
+    let scope = match object.get("scope") {
+        None | Some(serde_json::Value::Null) => {
+            return Ok((name, None));
+        }
+        Some(value) => value,
+    };
+
+    let scope_object = scope
+        .as_object()
+        .ok_or_else(|| AppError::Validation("Invalid agent key scope".to_string()))?;
+
+    let kind = scope_object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::Validation("Invalid agent key scope".to_string()))?;
+    if !services::auth::actor::AGENT_KEY_SCOPE_KINDS.contains(&kind) {
+        return Err(AppError::Validation("Invalid agent key scope".to_string()));
+    }
+
+    // `standardAgentKeyScopeSchema` / `skillTestAgentKeyScopeSchema` 都是
+    // `.strict()`；`taskBridgeAgentKeyScopeSchema` 亦然。
+    const STANDARD_FIELDS: [&str; 1] = ["kind"];
+    const TASK_BRIDGE_FIELDS: [&str; 6] = [
+        "kind",
+        "projectId",
+        "projectIds",
+        "parentIssueId",
+        "parentIssueIds",
+        "allowedAssigneeAgentIds",
+    ];
+    const SKILL_TEST_FIELDS: [&str; 2] = ["kind", "issueId"];
+    let allowed: &[&str] = match kind {
+        "standard" => &STANDARD_FIELDS,
+        "task_bridge" => &TASK_BRIDGE_FIELDS,
+        _ => &SKILL_TEST_FIELDS,
+    };
+    if let Some(unknown) = scope_object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(AppError::Validation(format!(
+            "Unrecognized key(s) in agent key scope: {unknown}"
+        )));
+    }
+
+    // 形状检查交给 serde；`task_bridge` 的「至少一个边界」与 `skill_test`
+    // 的必填 issue 由 `from_json` 的归一化规则判定（它会折叠成 standard，
+    // 因此这里需要显式判断，见下）。
+    let parsed: services::auth::AgentApiKeyScope = serde_json::from_value(scope.clone())
+        .map_err(|_| AppError::Validation("Invalid agent key scope".to_string()))?;
+
+    match parsed.kind.as_str() {
+        "task_bridge" => {
+            // `superRefine`：`"task_bridge keys require at least one project or
+            // parent issue boundary"`（`validators/agent.ts:154-160`）。
+            if !parsed.has_task_bridge_boundary() {
+                return Err(AppError::Validation(
+                    "task_bridge keys require at least one project or parent issue boundary"
+                        .to_string(),
+                ));
+            }
+            Ok((name, Some(scope.clone())))
+        }
+        "skill_test" => {
+            if parsed.issue_id.is_none() {
+                return Err(AppError::Validation(
+                    "Invalid agent key scope".to_string(),
+                ));
+            }
+            Ok((name, Some(scope.clone())))
+        }
+        _ => Ok((name, None)),
+    }
+}
+
+/// 解析 `GET`/`DELETE /agents/:id/keys*` 的目标 agent，并执行
+/// Paperclip `getAccessibleAgent`（`routes/agents.ts:1294-1301`）的授权。
+///
+/// 顺序很重要：资源查找 + `hasCompanyAccess` 先折叠成 **404**
+/// （`getAccessibleResource`，`authz.ts:182-195`），只有公司可见之后才做
+/// `assertBoardCanManageAgentsForCompany`（`assertBoard` → 403
+/// `"Board access required"`，公司访问 → 403，
+/// `agents:create` 决策 → 403 + 决策说明）。
+async fn accessible_agent_for_keys(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    id: Uuid,
+) -> Result<models::Agent, AppError> {
+    let agent = match state.agent_service.get_by_id(id).await {
+        Ok(agent) => agent,
+        // 仓库层对缺失行返回 `RepositoryError::NotFound`（而不是 `Ok(None)`），
+        // Paperclip 同路径解析成 404 `"Agent not found"`。
+        Err(services::agent_service::ServiceError::Repository(
+            repositories::RepositoryError::NotFound(_),
+        )) => {
+            return Err(AppError::NotFound("Agent not found".to_string()));
+        }
+        Err(error) => return Err(services::errors::ServiceError::from(error).into()),
+    };
+
+    if !crate::routes::has_company_access(actor, agent.company_id) {
+        return Err(AppError::NotFound("Agent not found".to_string()));
+    }
+
+    crate::routes::assert_board(actor).map_err(|_| {
+        AppError::Forbidden("Board access required".to_string())
+    })?;
+    crate::routes::assert_company_access(actor, agent.company_id, false).map_err(|_| {
+        AppError::Forbidden("User does not have access to this company".to_string())
+    })?;
+
+    if !services::auth::decision_engine::decide_access(
+        &state.pool,
+        actor,
+        &AuthorizationAction::AgentCreate {
+            company_id: agent.company_id,
+        },
+        Some(agent.company_id),
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions: Missing agents:create permission".to_string(),
+        ));
+    }
+
+    Ok(agent)
+}
+
 /// GET /agents/:id/keys - 列出 API Key
 async fn list_agent_keys(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
+    let _agent = accessible_agent_for_keys(&state, &auth_actor, id).await?;
     let keys = state.agent_service.list_keys(id).await?;
-    let response: Vec<serde_json::Value> = keys
-        .into_iter()
-        .map(|key| {
-            serde_json::json!({
-                "id": key.id,
-                "agentId": key.agent_id,
-                "companyId": key.company_id,
-                "name": key.name,
-                "scope": key.scope,
-                "lastUsedAt": key.last_used_at,
-                "revokedAt": key.revoked_at,
-                "createdAt": key.created_at,
-            })
-        })
-        .collect();
+    let response: Vec<serde_json::Value> = keys.iter().map(agent_key_json).collect();
     Ok(Json(response))
 }
 
 /// POST /agents/:id/keys - 创建 API Key
 async fn create_agent_key(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    let name = payload
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing 'name' field".to_string()))?
-        .to_string();
-    let scope = payload.get("scope").cloned();
-    if let Some(ref value) = scope {
-        let kind = value
-            .get("scope_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("standard");
-        if !matches!(kind, "standard" | "task_bridge" | "skill_test") {
-            return Err(AppError::BadRequest(
-                "Invalid agent key scope_type".to_string(),
-            ));
-        }
-        if kind == "task_bridge"
-            && (value.get("project_id").is_none() || value.get("parent_issue_id").is_none())
-        {
-            return Err(AppError::BadRequest(
-                "task_bridge scope requires project_id and parent_issue_id".to_string(),
-            ));
-        }
-        if kind == "skill_test" && value.get("issue_id").is_none() {
-            return Err(AppError::BadRequest(
-                "skill_test scope requires issue_id".to_string(),
-            ));
-        }
-    }
-    let key = state.agent_service.create_key(id, name, scope).await?;
-    Ok((StatusCode::CREATED, Json(key)))
+    // Paperclip 把签发 key 的 board 用户记为 key 的 responsible user
+    // （`server/src/routes/agents.ts:4177`）。这个值决定 agent 用该 key
+    // 调用公司级接口时代表谁，缺失即 key 不可用。
+    let responsible_user_id = match &auth_actor {
+        AuthorizationActor::Board { user_id, .. } => Some(*user_id),
+        _ => None,
+    };
+    let agent = accessible_agent_for_keys(&state, &auth_actor, id).await?;
+    let (name, scope) = parse_create_agent_key_body(&payload)?;
+
+    let created = state
+        .agent_service
+        .create_key(id, name, scope, responsible_user_id)
+        .await?;
+
+    crate::routes::log_activity(
+        &state.pool,
+        agent.company_id,
+        "agent.key_created",
+        &auth_actor,
+        "agent",
+        agent.id,
+        json!({
+            "keyId": created.key.id,
+            "name": created.key.name,
+            "scope": agent_key_json(&created.key)["scope"],
+            "responsibleUserId": created.key.responsible_user_id,
+        }),
+    )
+    .await;
+
+    // Paperclip `res.status(201).json(key)` —— 明文 token 只在这里出现一次。
+    let response = json!({
+        "id": created.key.id,
+        "name": created.key.name,
+        "scope": agent_key_json(&created.key)["scope"],
+        "responsibleUserId": created.key.responsible_user_id,
+        "token": created.token,
+        "createdAt": created.key.created_at,
+    });
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// DELETE /agents/:id/keys/:key_id - 吊销 API Key
 async fn revoke_agent_key(
     State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
     Path((id, key_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, AppError> {
-    state.agent_service.revoke_key(id, key_id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let agent = accessible_agent_for_keys(&state, &auth_actor, id).await?;
+
+    // Paperclip 先 `getKeyById` 判断归属（`routes/agents.ts:4207-4211`），
+    // 再按 `where(id, agentId)` 撤销（:4213）。两步都可能 404。
+    let key = state
+        .agent_service
+        .list_keys(id)
+        .await?
+        .into_iter()
+        .find(|key| key.id == key_id)
+        .filter(|key| key.agent_id == agent.id);
+    let Some(key) = key else {
+        return Err(AppError::NotFound("Key not found".to_string()));
+    };
+
+    if state.agent_service.revoke_key(id, key_id).await?.is_none() {
+        return Err(AppError::NotFound("Key not found".to_string()));
+    }
+
+    crate::routes::log_activity(
+        &state.pool,
+        agent.company_id,
+        "agent.key_revoked",
+        &auth_actor,
+        "agent",
+        agent.id,
+        json!({ "keyId": key.id, "name": key.name }),
+    )
+    .await;
+
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// POST /agents/:id/pause - 暂停 Agent
@@ -1016,12 +1260,23 @@ async fn terminate_agent(
 async fn wakeup_agent(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    body: Option<Json<AgentWakeupRequest>>,
 ) -> Result<impl IntoResponse, AppError> {
     let agent = state.agent_service.get_by_id(id).await?;
     let issue_id: Uuid = sqlx::query_scalar("SELECT id FROM issues WHERE company_id=$1 AND assignee_agent_id=$2 AND status IN ('todo','in_progress') ORDER BY updated_at DESC LIMIT 1")
         .bind(agent.company_id).bind(id).fetch_optional(&state.pool).await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?
         .ok_or_else(|| AppError::BadRequest("Agent has no assigned executable issue".to_string()))?;
+    let request = body.map(|Json(value)| value).unwrap_or_default();
+    let mut context_snapshot = request
+        .context_snapshot
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = context_snapshot.as_object_mut() {
+        object.insert("triggeredBy".to_string(), json!("agent_wakeup_route"));
+        if request.force_fresh_session == Some(true) {
+            object.insert("forceFreshSession".to_string(), json!(true));
+        }
+    }
     state
         .heartbeat_service
         .wakeup_with_options(
@@ -1029,15 +1284,69 @@ async fn wakeup_agent(
             issue_id,
             agent.company_id,
             HeartbeatWakeupOptions {
-                source: Some("on_demand".to_string()),
-                trigger_detail: Some("manual".to_string()),
-                reason: Some("manual_agent_wakeup".to_string()),
+                source: Some(request.source.unwrap_or_else(|| "on_demand".to_string())),
+                trigger_detail: Some(
+                    request
+                        .trigger_detail
+                        .unwrap_or_else(|| "manual".to_string()),
+                ),
+                reason: Some(
+                    request
+                        .reason
+                        .unwrap_or_else(|| "manual_agent_wakeup".to_string()),
+                ),
+                payload: request.payload,
+                idempotency_key: request.idempotency_key,
+                context_snapshot: Some(context_snapshot),
                 ..Default::default()
             },
         )
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    Ok(Json(state.agent_service.get_by_id(id).await?))
+
+    // Paperclip returns the queued/running HeartbeatRun (rather than the
+    // agent projection).  The run is inserted before the executor is spawned,
+    // so this query is available even when the adapter starts immediately.
+    let run = sqlx::query(
+        "SELECT id, company_id, agent_id, invocation_source, status::text AS status,
+                responsible_user_id, started_at, finished_at, error, exit_code,
+                context_snapshot, output, result_json, created_at, updated_at
+         FROM heartbeat_runs
+         WHERE company_id = $1 AND agent_id = $2
+           AND context_snapshot->>'issueId' = $3
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(agent.company_id)
+    .bind(id)
+    .bind(issue_id.to_string())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    if let Some(row) = run {
+        use sqlx::Row;
+        return Ok(Json(json!({
+            "id": row.get::<Uuid, _>("id"),
+            "companyId": row.get::<Uuid, _>("company_id"),
+            "agentId": row.get::<Uuid, _>("agent_id"),
+            "invocationSource": row.get::<String, _>("invocation_source"),
+            "status": row.get::<String, _>("status"),
+            "responsibleUserId": row.get::<Option<String>, _>("responsible_user_id"),
+            "startedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at"),
+            "finishedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at"),
+            "error": row.get::<Option<String>, _>("error"),
+            "exitCode": row.get::<Option<i32>, _>("exit_code"),
+            "contextSnapshot": row.get::<Option<Value>, _>("context_snapshot"),
+            "output": row.get::<Option<String>, _>("output"),
+            "resultJson": row.get::<Option<Value>, _>("result_json"),
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+        })));
+    }
+
+    // A budget gate can legitimately skip a wake without creating a run.
+    Ok(Json(json!({ "status": "skipped", "agentId": id })))
 }
 
 /// PATCH /agents/:id/budgets - 更新 Agent 预算
@@ -1410,7 +1719,7 @@ async fn add_agent_permission(
 /// A21: DELETE /agents/:id/permissions/:permission_id
 async fn delete_agent_permission(
     State(_state): State<AppState>,
-    Path((id, permission_id)): Path<(Uuid, Uuid)>,
+    Path((_id, _permission_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1454,10 +1763,10 @@ async fn get_agent_session(
         return Err(AppError::Forbidden("Insufficient permissions: Missing agent:read permission".into()));
     }
     let row = sqlx::query(
-        "SELECT session_id, session_display_id, session_params_json, state_json,
-                last_run_id, last_run_status, last_error, updated_at
-         FROM agent_runtime_states
-         WHERE agent_id = $1 AND session_id = $2",
+        "SELECT id, adapter_type, task_key, session_display_id, session_params_json,
+                last_run_id, last_error, created_at, updated_at
+         FROM agent_task_sessions
+         WHERE agent_id = $1 AND id = $2",
     )
     .bind(id)
     .bind(session_id.to_string())
@@ -1468,13 +1777,16 @@ async fn get_agent_session(
     use sqlx::Row;
     Ok(Json(json!({
         "agentId": id,
-        "sessionId": row.get::<Option<String>, _>("session_id"),
+        "sessionId": row.get::<Uuid, _>("id"),
+        "adapterType": row.get::<String, _>("adapter_type"),
+        "taskKey": row.get::<String, _>("task_key"),
         "sessionDisplayId": row.get::<Option<String>, _>("session_display_id"),
         "sessionParams": row.get::<Option<serde_json::Value>, _>("session_params_json"),
-        "state": row.get::<serde_json::Value, _>("state_json"),
+        "state": json!({}),
         "lastRunId": row.get::<Option<Uuid>, _>("last_run_id"),
-        "lastRunStatus": row.get::<Option<String>, _>("last_run_status"),
+        "lastRunStatus": json!(null),
         "lastError": row.get::<Option<String>, _>("last_error"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
         "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
     })))
 }
@@ -1497,13 +1809,10 @@ async fn delete_agent_session(
         return Err(AppError::Forbidden("Insufficient permissions: Missing agent:update permission".into()));
     }
     let result = sqlx::query(
-        "UPDATE agent_runtime_states
-         SET session_id = NULL, session_display_id = NULL,
-             session_params_json = NULL, updated_at = NOW()
-         WHERE agent_id = $1 AND session_id = $2",
+        "DELETE FROM agent_task_sessions WHERE agent_id = $1 AND id = $2",
     )
     .bind(id)
-    .bind(session_id.to_string())
+    .bind(session_id)
     .execute(&state.pool)
     .await
     .map_err(|error| AppError::InternalServerError(error.to_string()))?;

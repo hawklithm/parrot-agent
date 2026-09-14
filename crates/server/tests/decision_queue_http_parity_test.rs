@@ -9,7 +9,7 @@
 //! full auth stack.
 //!
 //! Run with a live database, e.g.:
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile \
+//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_compile \
 //!     cargo test -p parrot-server --test decision_queue_http_parity_test
 //!
 //! Mirrors `server/src/__tests__/decision-queues-routes.test.ts`.
@@ -214,19 +214,10 @@ async fn cleanup_fixture(f: &Fixture) {
         .await;
 }
 
-async fn connect_and_migrate() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect database for decision queue HTTP parity tests");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    pool
-}
+
+mod common;
+use common::connect_and_migrate;
+
 
 // ===========================================================================
 // Decision Queue — PAPERCLIP_MIGRATION_PLAN.md #139

@@ -9,24 +9,24 @@
 CLI 归属已固定为 `parrot-agent/crates/cli`；后续需逐命令核对参数、认证、退出码和输出。
 
 - Paperclip: **97**
-- Parrot: **7**
+- Parrot: **14**
 
 | Paperclip evidence | Parrot evidence |
 |---|---|
 | `src/adapters/http/format-event.ts` | `Cargo.toml` |
-| `src/adapters/http/index.ts` | `src/checks.rs` |
-| `src/adapters/index.ts` | `src/client.rs` |
-| `src/adapters/process/format-event.ts` | `src/commands.rs` |
-| `src/adapters/process/index.ts` | `src/config.rs` |
-| `src/adapters/registry.ts` | `src/main.rs` |
-| `src/checks/agent-jwt-secret-check.ts` | `src/services.rs` |
-| `src/checks/config-check.ts` | *(no structural counterpart in this slice)* |
-| `src/checks/database-check.ts` | *(no structural counterpart in this slice)* |
-| `src/checks/deployment-auth-check.ts` | *(no structural counterpart in this slice)* |
-| `src/checks/index.ts` | *(no structural counterpart in this slice)* |
-| `src/checks/llm-check.ts` | *(no structural counterpart in this slice)* |
-| `src/checks/log-check.ts` | *(no structural counterpart in this slice)* |
-| `src/checks/managed-install-check.ts` | *(no structural counterpart in this slice)* |
+| `src/adapters/http/index.ts` | `src/backup.rs` |
+| `src/adapters/index.ts` | `src/bin/parrot.rs` |
+| `src/adapters/process/format-event.ts` | `src/checks.rs` |
+| `src/adapters/process/index.ts` | `src/client.rs` |
+| `src/adapters/registry.ts` | `src/commands.rs` |
+| `src/checks/agent-jwt-secret-check.ts` | `src/config.rs` |
+| `src/checks/config-check.ts` | `src/install_store.rs` |
+| `src/checks/database-check.ts` | `src/lib.rs` |
+| `src/checks/deployment-auth-check.ts` | `src/plugin_scaffold.rs` |
+| `src/checks/index.ts` | `src/services.rs` |
+| `src/checks/llm-check.ts` | `src/update_notice.rs` |
+| `src/checks/log-check.ts` | `tests/cli_e2e_import_export_doctor_test.rs` |
+| `src/checks/managed-install-check.ts` | `tests/cli_http_parity_test.rs` |
 | `src/checks/path-resolver.ts` | *(no structural counterpart in this slice)* |
 | `src/checks/port-check.ts` | *(no structural counterpart in this slice)* |
 | `src/checks/secrets-check.ts` | *(no structural counterpart in this slice)* |
@@ -116,7 +116,7 @@ CLI 归属已固定为 `parrot-agent/crates/cli`；后续需逐命令核对参�
 按源文件名和目录做初筛；前端页面可达性、权限、状态和交互需在 UI 阶段逐页验收。
 
 - Paperclip: **506**
-- Parrot: **485**
+- Parrot: **369**
 
 | Paperclip evidence | Parrot evidence |
 |---|---|
@@ -138,473 +138,473 @@ CLI 归属已固定为 `parrot-agent/crates/cli`；后续需逐命令核对参�
 | `components/AgentConfigForm.render.test.tsx` | `components/AgentConfigForm.test.ts` |
 | `components/AgentConfigForm.test.ts` | `components/AgentConfigForm.tsx` |
 | `components/AgentConfigForm.tsx` | `components/AgentIconPicker.tsx` |
-| `components/AgentIconPicker.tsx` | `components/AgentMultiSelect.tsx` |
-| `components/AgentMultiSelect.test.tsx` | `components/AgentProperties.tsx` |
-| `components/AgentMultiSelect.tsx` | `components/BootstrapPendingPage.tsx` |
-| `components/AgentProperties.tsx` | `components/BudgetSidebarMarker.tsx` |
-| `components/AgentSecretAccessEditor.test.tsx` | `components/BuiltInAgentBadges.tsx` |
-| `components/AgentSecretAccessEditor.tsx` | `components/BuiltInAgentGate.test.tsx` |
-| `components/AppConnectionSidebar.test.tsx` | `components/BuiltInAgentGate.tsx` |
-| `components/AppConnectionSidebar.tsx` | `components/CompanySettingsSidebar.test.tsx` |
-| `components/AppsSidebar.test.tsx` | `components/CompanySettingsSidebar.tsx` |
-| `components/AppsSidebar.tsx` | `components/ConfigureBuiltInAgentModal.test.tsx` |
-| `components/BootstrapPendingPage.tsx` | `components/ConfigureBuiltInAgentModal.tsx` |
-| `components/BudgetSidebarMarker.tsx` | `components/InstanceSidebar.test.tsx` |
-| `components/BuiltInAgentBadges.tsx` | `components/InstanceSidebar.tsx` |
-| `components/BuiltInAgentGate.test.tsx` | `components/IssueAssignedBacklogNotice.test.tsx` |
-| `components/BuiltInAgentGate.tsx` | `components/IssueAssignedBacklogNotice.tsx` |
-| `components/CompanySettingsSidebar.test.tsx` | `components/IssueAttachmentsSection.test.tsx` |
-| `components/CompanySettingsSidebar.tsx` | `components/IssueAttachmentsSection.tsx` |
-| `components/ConfigureBuiltInAgentModal.test.tsx` | `components/IssueBlockedNotice.test.tsx` |
-| `components/ConfigureBuiltInAgentModal.tsx` | `components/IssueBlockedNotice.tsx` |
-| `components/InboxAgentPolicyControl.test.tsx` | `components/IssueCasesPanel.test.tsx` |
-| `components/InboxAgentPolicyControl.tsx` | `components/IssueCasesPanel.tsx` |
-| `components/InstanceSidebar.test.tsx` | `components/IssueChatComposerHandoffPreview.test.ts` |
-| `components/InstanceSidebar.tsx` | `components/IssueChatThread.test.tsx` |
-| `components/IssueAssignedBacklogNotice.test.tsx` | `components/IssueChatThread.tsx` |
-| `components/IssueAssignedBacklogNotice.tsx` | `components/IssueChatThreadSystemNotice.test.tsx` |
-| `components/IssueAttachmentsSection.test.tsx` | `components/IssueColumns.test.tsx` |
-| `components/IssueAttachmentsSection.tsx` | `components/IssueColumns.tsx` |
-| `components/IssueBlockedNotice.test.tsx` | `components/IssueContinuationHandoff.test.tsx` |
-| `components/IssueBlockedNotice.tsx` | `components/IssueContinuationHandoff.tsx` |
-| `components/IssueCasesPanel.test.tsx` | `components/IssueDocumentAnnotations.test.tsx` |
-| `components/IssueCasesPanel.tsx` | `components/IssueDocumentAnnotations.tsx` |
-| `components/IssueChatComposerHandoffPreview.test.ts` | `components/IssueDocumentsSection.test.tsx` |
-| `components/IssueChatThread.test.tsx` | `components/IssueDocumentsSection.tsx` |
-| `components/IssueChatThread.tsx` | `components/IssueFiltersPopover.test.tsx` |
-| `components/IssueChatThreadSystemNotice.test.tsx` | `components/IssueFiltersPopover.tsx` |
-| `components/IssueColumns.test.tsx` | `components/IssueGroupHeader.tsx` |
-| `components/IssueColumns.tsx` | `components/IssueLinkQuicklook.test.tsx` |
-| `components/IssueContinuationHandoff.test.tsx` | `components/IssueLinkQuicklook.tsx` |
-| `components/IssueContinuationHandoff.tsx` | `components/IssueMonitorActivityCard.test.tsx` |
-| `components/IssueDocumentAnnotations.test.tsx` | `components/IssueMonitorActivityCard.tsx` |
-| `components/IssueDocumentAnnotations.tsx` | `components/IssueMonitorBanner.tsx` |
-| `components/IssueDocumentsSection.test.tsx` | `components/IssuePlanDecompositionsSection.tsx` |
-| `components/IssueDocumentsSection.tsx` | `components/IssueProperties.test.tsx` |
-| `components/IssueFieldChangeReceipt.test.tsx` | `components/IssueProperties.tsx` |
-| `components/IssueFieldChangeReceipt.tsx` | `components/IssueRecoveryActionCard.test.tsx` |
-| `components/IssueFiltersPopover.test.tsx` | `components/IssueRecoveryActionCard.tsx` |
-| `components/IssueFiltersPopover.tsx` | `components/IssueReferenceActivitySummary.tsx` |
-| `components/IssueGroupHeader.tsx` | `components/IssueReferencePill.tsx` |
-| `components/IssueLinkQuicklook.test.tsx` | `components/IssueRelatedWorkPanel.test.tsx` |
-| `components/IssueLinkQuicklook.tsx` | `components/IssueRelatedWorkPanel.tsx` |
-| `components/IssueMonitorBanner.test.tsx` | `components/IssueRow.test.tsx` |
-| `components/IssueMonitorBanner.tsx` | `components/IssueRow.tsx` |
-| `components/IssuePlanDecompositionsSection.tsx` | `components/IssueRunLedger.test.tsx` |
-| `components/IssueProperties.test.tsx` | `components/IssueRunLedger.tsx` |
-| `components/IssueProperties.tsx` | `components/IssueScheduledRetryCard.test.tsx` |
-| `components/IssueRecoveryActionCard.test.tsx` | `components/IssueScheduledRetryCard.tsx` |
-| `components/IssueRecoveryActionCard.tsx` | `components/IssueSiblingNavigation.test.tsx` |
-| `components/IssueReferenceActivitySummary.tsx` | `components/IssueSiblingNavigation.tsx` |
-| `components/IssueReferencePill.tsx` | `components/IssueThreadInteractionCard.test.tsx` |
-| `components/IssueRelatedWorkPanel.test.tsx` | `components/IssueThreadInteractionCard.tsx` |
-| `components/IssueRelatedWorkPanel.tsx` | `components/IssueWorkspaceCard.test.tsx` |
-| `components/IssueRow.test.tsx` | `components/IssueWorkspaceCard.tsx` |
-| `components/IssueRow.tsx` | `components/IssuesList.test.tsx` |
-| `components/IssueRunLedger.test.tsx` | `components/IssuesList.tsx` |
-| `components/IssueRunLedger.tsx` | `components/IssuesQuicklook.tsx` |
-| `components/IssueScheduledRetryCard.test.tsx` | `components/NewAgentDialog.test.tsx` |
-| `components/IssueScheduledRetryCard.tsx` | `components/NewAgentDialog.tsx` |
-| `components/IssueSiblingNavigation.test.tsx` | `components/NewIssueDialog.test.tsx` |
-| `components/IssueSiblingNavigation.tsx` | `components/NewIssueDialog.tsx` |
-| `components/IssueThreadInteractionCard.test.tsx` | `components/PageSkeleton.tsx` |
-| `components/IssueThreadInteractionCard.tsx` | `components/PageTabBar.tsx` |
-| `components/IssueWorkspaceCard.test.tsx` | `components/RequestCollapsedSidebar.test.tsx` |
-| `components/IssueWorkspaceCard.tsx` | `components/RequestCollapsedSidebar.tsx` |
-| `components/IssueWriteDenialNotice.test.tsx` | `components/RouteErrorBoundary.test.tsx` |
-| `components/IssueWriteDenialNotice.tsx` | `components/RouteErrorBoundary.tsx` |
-| `components/IssuesList.test.tsx` | `components/RoutineSubSidebar.test.tsx` |
-| `components/IssuesList.tsx` | `components/RoutineSubSidebar.tsx` |
-| `components/IssuesQuicklook.tsx` | `components/SecondarySidebar.tsx` |
-| `components/NewAgentDialog.test.tsx` | `components/Sidebar.test.tsx` |
-| `components/NewAgentDialog.tsx` | `components/Sidebar.tsx` |
-| `components/NewIssueDialog.test.tsx` | `components/SidebarAccountMenu.test.tsx` |
-| `components/NewIssueDialog.tsx` | `components/SidebarAccountMenu.tsx` |
-| `components/PageSkeleton.tsx` | `components/SidebarAgents.test.tsx` |
-| `components/PageTabBar.tsx` | `components/SidebarAgents.tsx` |
-| `components/RequestCollapsedSidebar.test.tsx` | `components/SidebarCompanyMenu.test.tsx` |
-| `components/RequestCollapsedSidebar.tsx` | `components/SidebarCompanyMenu.tsx` |
-| `components/RouteErrorBoundary.test.tsx` | `components/SidebarNavItem.test.tsx` |
-| `components/RouteErrorBoundary.tsx` | `components/SidebarNavItem.tsx` |
-| `components/RoutineSubSidebar.test.tsx` | `components/SidebarProjects.test.tsx` |
-| `components/RoutineSubSidebar.tsx` | `components/SidebarProjects.tsx` |
-| `components/SecondarySidebar.tsx` | `components/SidebarSection.test.tsx` |
-| `components/Sidebar.test.tsx` | `components/SidebarSection.tsx` |
-| `components/Sidebar.tsx` | `components/SidebarServerInfo.test.tsx` |
-| `components/SidebarAccountMenu.test.tsx` | `components/SidebarServerInfo.tsx` |
-| `components/SidebarAccountMenu.tsx` | `components/SidebarShell.test.tsx` |
-| `components/SidebarAgents.test.tsx` | `components/SidebarShell.tsx` |
-| `components/SidebarAgents.tsx` | `components/SidebarStarredProjects.test.tsx` |
-| `components/SidebarCompanyMenu.test.tsx` | `components/SidebarStarredProjects.tsx` |
-| `components/SidebarCompanyMenu.tsx` | `components/access/CompanySettingsNav.test.tsx` |
-| `components/SidebarNavItem.test.tsx` | `components/access/CompanySettingsNav.tsx` |
-| `components/SidebarNavItem.tsx` | `components/agent-config-defaults.ts` |
-| `components/SidebarProjects.test.tsx` | `components/agent-config-primitives.tsx` |
-| `components/SidebarProjects.tsx` | `components/issue-output/IssueOutputSection.test.tsx` |
-| `components/SidebarSection.test.tsx` | `components/issue-output/IssueOutputSection.tsx` |
-| `components/SidebarSection.tsx` | `components/issue-output/OutputFileTile.tsx` |
-| `components/SidebarServerInfo.test.tsx` | `components/issue-output/OutputPrimaryCard.tsx` |
-| `components/SidebarServerInfo.tsx` | `components/issue-output/OutputRow.tsx` |
-| `components/SidebarShell.test.tsx` | `components/issue-output/OutputVideoPlayer.tsx` |
-| `components/SidebarShell.tsx` | `components/issue-properties/IssueProperties.tsx` |
-| `components/SidebarStarredProjects.test.tsx` | `components/issue-properties/external-object-rows.tsx` |
-| `components/SidebarStarredProjects.tsx` | `components/issue-properties/helpers.ts` |
-| `components/access/CompanySettingsNav.test.tsx` | `components/issue-properties/index.ts` |
-| `components/access/CompanySettingsNav.tsx` | `components/issue-properties/primitives.tsx` |
-| `components/agent-config-defaults.ts` | `components/issue-properties/property-picker.tsx` |
-| `components/agent-config-primitives.tsx` | `components/issue-properties/relation-controls.tsx` |
-| `components/issue-output/IssueOutputSection.test.tsx` | `components/skill-studio/AgentsUsingSkillDialog.test.tsx` |
-| `components/issue-output/IssueOutputSection.tsx` | `components/skill-studio/AgentsUsingSkillDialog.tsx` |
-| `components/issue-output/OutputFileTile.tsx` | `context/GeneralSettingsContext.tsx` |
-| `components/issue-output/OutputPrimaryCard.tsx` | `context/SidebarContext.test.tsx` |
-| `components/issue-output/OutputRow.tsx` | `context/SidebarContext.tsx` |
-| `components/issue-output/OutputVideoPlayer.tsx` | `fixtures/issueChatLongThreadFixture.test.ts` |
-| `components/issue-properties/IssueProperties.tsx` | `fixtures/issueChatLongThreadFixture.ts` |
-| `components/issue-properties/IssuePropertiesArtifactsTab.tsx` | `fixtures/issueChatUxFixtures.ts` |
-| `components/issue-properties/IssuePropertiesDocumentAnnotations.test.tsx` | `fixtures/issueThreadInteractionFixtures.ts` |
-| `components/issue-properties/IssuePropertiesPlansTab.tsx` | `hooks/useAgentOrder.ts` |
-| `components/issue-properties/external-object-rows.tsx` | `hooks/useCompanyPageMemory.test.ts` |
-| `components/issue-properties/helpers.ts` | `hooks/useCompanyPageMemory.ts` |
-| `components/issue-properties/index.ts` | `hooks/useIssueExternalObjects.ts` |
-| `components/issue-properties/primitives.tsx` | `hooks/usePaperclipIssueRuntime.test.tsx` |
-| `components/issue-properties/property-picker.tsx` | `hooks/usePaperclipIssueRuntime.ts` |
-| `components/issue-properties/relation-controls.tsx` | `lib/agent-config-patch.test.ts` |
-| `components/skill-studio/AgentsUsingSkillDialog.test.tsx` | `lib/agent-config-patch.ts` |
-| `components/skill-studio/AgentsUsingSkillDialog.tsx` | `lib/agent-icons.ts` |
-| `context/GeneralSettingsContext.tsx` | `lib/agent-onboarding-prompt.test.ts` |
-| `context/SidebarContext.test.tsx` | `lib/agent-onboarding-prompt.ts` |
-| `context/SidebarContext.tsx` | `lib/agent-order.test.ts` |
-| `fixtures/issueChatLongThreadFixture.test.ts` | `lib/agent-order.ts` |
-| `fixtures/issueChatLongThreadFixture.ts` | `lib/agent-skills-state.test.ts` |
-| `fixtures/issueChatUxFixtures.ts` | `lib/agent-skills-state.ts` |
-| `fixtures/issueThreadInteractionFixtures.ts` | `lib/built-in-agent-toast.ts` |
-| `hooks/useAgentOrder.ts` | `lib/company-page-memory.ts` |
-| `hooks/useCompanyPageMemory.test.ts` | `lib/company-portability-sidebar.test.ts` |
-| `hooks/useCompanyPageMemory.ts` | `lib/company-portability-sidebar.ts` |
-| `hooks/useIssueDocuments.ts` | `lib/company-routes.test.ts` |
-| `hooks/useIssueExternalObjects.ts` | `lib/company-routes.ts` |
-| `hooks/useIssuePlanDocument.ts` | `lib/company-skill-routes.test.ts` |
-| `hooks/usePaperclipIssueRuntime.test.tsx` | `lib/company-skill-routes.ts` |
-| `hooks/usePaperclipIssueRuntime.ts` | `lib/duplicate-agent-payload.test.ts` |
-| `lib/agent-config-patch.test.ts` | `lib/duplicate-agent-payload.ts` |
-| `lib/agent-config-patch.ts` | `lib/instance-settings.test.ts` |
-| `lib/agent-icons.ts` | `lib/instance-settings.ts` |
-| `lib/agent-onboarding-prompt.test.ts` | `lib/issue-assignee-overrides.test.ts` |
-| `lib/agent-onboarding-prompt.ts` | `lib/issue-assignee-overrides.ts` |
-| `lib/agent-order.test.ts` | `lib/issue-attachments.ts` |
-| `lib/agent-order.ts` | `lib/issue-blockers.ts` |
-| `lib/agent-skills-state.test.ts` | `lib/issue-chat-messages.test.ts` |
-| `lib/agent-skills-state.ts` | `lib/issue-chat-messages.ts` |
-| `lib/built-in-agent-toast.ts` | `lib/issue-chat-scroll.test.ts` |
-| `lib/company-page-memory.ts` | `lib/issue-chat-scroll.ts` |
-| `lib/company-portability-sidebar.test.ts` | `lib/issue-detail-subissues.test.ts` |
-| `lib/company-portability-sidebar.ts` | `lib/issue-detail-subissues.ts` |
-| `lib/company-routes.test.ts` | `lib/issue-execution-policy.test.ts` |
-| `lib/company-routes.ts` | `lib/issue-execution-policy.ts` |
-| `lib/company-skill-routes.test.ts` | `lib/issue-filters.test.ts` |
-| `lib/company-skill-routes.ts` | `lib/issue-filters.ts` |
-| `lib/duplicate-agent-payload.test.ts` | `lib/issue-monitor.ts` |
-| `lib/duplicate-agent-payload.ts` | `lib/issue-output.test.ts` |
-| `lib/instance-settings.test.ts` | `lib/issue-output.ts` |
-| `lib/instance-settings.ts` | `lib/issue-properties-panel-key.test.ts` |
-| `lib/issue-artifacts.test.ts` | `lib/issue-properties-panel-key.ts` |
-| `lib/issue-artifacts.ts` | `lib/issue-reference.test.ts` |
-| `lib/issue-assignee-overrides.test.ts` | `lib/issue-reference.ts` |
-| `lib/issue-assignee-overrides.ts` | `lib/issue-thread-interactions.test.ts` |
-| `lib/issue-attachments.ts` | `lib/issue-thread-interactions.ts` |
-| `lib/issue-blockers.ts` | `lib/issue-timeline-events.test.ts` |
-| `lib/issue-change-receipt.test.ts` | `lib/issue-timeline-events.ts` |
-| `lib/issue-change-receipt.ts` | `lib/issue-tree.test.ts` |
-| `lib/issue-chat-messages.test.ts` | `lib/issue-tree.ts` |
-| `lib/issue-chat-messages.ts` | `lib/issueActiveRun.test.ts` |
-| `lib/issue-chat-scroll.test.ts` | `lib/issueActiveRun.ts` |
-| `lib/issue-chat-scroll.ts` | `lib/issueChatTranscriptRuns.test.ts` |
-| `lib/issue-detail-performance.ts` | `lib/issueChatTranscriptRuns.ts` |
-| `lib/issue-detail-subissues.test.ts` | `lib/issueDetailBreadcrumb.test.ts` |
-| `lib/issue-detail-subissues.ts` | `lib/issueDetailBreadcrumb.ts` |
-| `lib/issue-document-deep-link.test.ts` | `lib/issueDetailCache.test.ts` |
-| `lib/issue-document-deep-link.ts` | `lib/issueDetailCache.ts` |
-| `lib/issue-execution-policy.test.ts` | `lib/issueDetailQuery.test.tsx` |
-| `lib/issue-execution-policy.ts` | `lib/legacy-agent-config.test.ts` |
-| `lib/issue-filters.test.ts` | `lib/legacy-agent-config.ts` |
-| `lib/issue-filters.ts` | `lib/liveIssueIds.test.ts` |
-| `lib/issue-monitor.test.tsx` | `lib/liveIssueIds.ts` |
-| `lib/issue-monitor.ts` | `lib/new-agent-hire-payload.test.ts` |
-| `lib/issue-output.test.ts` | `lib/new-agent-hire-payload.ts` |
-| `lib/issue-output.ts` | `lib/new-agent-runtime-config.test.ts` |
-| `lib/issue-properties-panel-key.test.ts` | `lib/new-agent-runtime-config.ts` |
-| `lib/issue-properties-panel-key.ts` | `lib/onboarding-route.test.ts` |
-| `lib/issue-reference.test.ts` | `lib/onboarding-route.ts` |
-| `lib/issue-reference.ts` | `lib/optimistic-issue-comments.test.ts` |
-| `lib/issue-thread-interactions.test.ts` | `lib/optimistic-issue-comments.ts` |
-| `lib/issue-thread-interactions.ts` | `lib/optimistic-issue-runs.test.ts` |
-| `lib/issue-timeline-events.test.ts` | `lib/optimistic-issue-runs.ts` |
-| `lib/issue-timeline-events.ts` | `lib/page-visibility.test.ts` |
-| `lib/issue-tree.test.ts` | `lib/page-visibility.ts` |
-| `lib/issue-tree.ts` | `lib/paperclip-shared/src/agent-eligibility.test.ts` |
-| `lib/issue-write-denial-activity.ts` | `lib/paperclip-shared/src/agent-eligibility.ts` |
-| `lib/issueActiveRun.test.ts` | `lib/paperclip-shared/src/agent-url-key.ts` |
-| `lib/issueActiveRun.ts` | `lib/paperclip-shared/src/issue-attribution.test.ts` |
-| `lib/issueChatTranscriptRuns.test.ts` | `lib/paperclip-shared/src/issue-attribution.ts` |
-| `lib/issueChatTranscriptRuns.ts` | `lib/paperclip-shared/src/issue-references.test.ts` |
-| `lib/issueDetailBreadcrumb.test.ts` | `lib/paperclip-shared/src/issue-references.ts` |
-| `lib/issueDetailBreadcrumb.ts` | `lib/paperclip-shared/src/issue-thread-interactions.test.ts` |
-| `lib/issueDetailCache.test.ts` | `lib/paperclip-shared/src/types/agent.ts` |
-| `lib/issueDetailCache.ts` | `lib/paperclip-shared/src/types/issue-tree-control.ts` |
-| `lib/issueDetailQuery.test.tsx` | `lib/paperclip-shared/src/types/issue.ts` |
-| `lib/legacy-agent-config.test.ts` | `lib/paperclip-shared/src/types/sidebar-badges.ts` |
-| `lib/legacy-agent-config.ts` | `lib/paperclip-shared/src/types/sidebar-preferences.ts` |
-| `lib/liveIssueIds.test.ts` | `lib/paperclip-shared/src/validators/agent.ts` |
-| `lib/liveIssueIds.ts` | `lib/paperclip-shared/src/validators/issue-tree-control.ts` |
-| `lib/new-agent-hire-payload.test.ts` | `lib/paperclip-shared/src/validators/issue.test.ts` |
-| `lib/new-agent-hire-payload.ts` | `lib/paperclip-shared/src/validators/issue.ts` |
-| `lib/new-agent-runtime-config.test.ts` | `lib/paperclip-shared/src/validators/sidebar-preferences.ts` |
-| `lib/new-agent-runtime-config.ts` | `lib/paperclip-tools-shared/agent-eligibility.test.ts` |
-| `lib/onboarding-route.test.ts` | `lib/paperclip-tools-shared/agent-eligibility.ts` |
-| `lib/onboarding-route.ts` | `lib/paperclip-tools-shared/agent-url-key.ts` |
-| `lib/optimistic-issue-comments.test.ts` | `lib/paperclip-tools-shared/issue-attribution.test.ts` |
-| `lib/optimistic-issue-comments.ts` | `lib/paperclip-tools-shared/issue-attribution.ts` |
-| `lib/optimistic-issue-runs.test.ts` | `lib/paperclip-tools-shared/issue-references.test.ts` |
-| `lib/optimistic-issue-runs.ts` | `lib/paperclip-tools-shared/issue-references.ts` |
-| `lib/page-visibility.test.ts` | `lib/paperclip-tools-shared/issue-thread-interactions.test.ts` |
-| `lib/page-visibility.ts` | `lib/paperclip-tools-shared/issue-write-denial.test.ts` |
-| `lib/prefetchIssueComments.test.ts` | `lib/paperclip-tools-shared/issue-write-denial.ts` |
-| `lib/router.tsx` | `lib/paperclip-tools-shared/types/agent.adapter-auth-session.test.ts` |
-| `lib/subIssueDefaults.test.ts` | `lib/paperclip-tools-shared/types/agent.ts` |
-| `lib/subIssueDefaults.ts` | `lib/paperclip-tools-shared/types/inbox-agent-policy.ts` |
-| `pages/AdapterManager.tsx` | `lib/paperclip-tools-shared/types/issue-tree-control.ts` |
-| `pages/AgentDetail.instructions.test.tsx` | `lib/paperclip-tools-shared/types/issue.ts` |
-| `pages/AgentDetail.liveRun.test.ts` | `lib/paperclip-tools-shared/types/sidebar-badges.ts` |
-| `pages/AgentDetail.progress.test.ts` | `lib/paperclip-tools-shared/types/sidebar-preferences.ts` |
-| `pages/AgentDetail.tsx` | `lib/paperclip-tools-shared/validators/agent.ts` |
-| `pages/AgentToolsTab.test.tsx` | `lib/paperclip-tools-shared/validators/inbox-agent-policy.ts` |
-| `pages/AgentToolsTab.tsx` | `lib/paperclip-tools-shared/validators/issue-tree-control.ts` |
-| `pages/Agents.test.tsx` | `lib/paperclip-tools-shared/validators/issue.test.ts` |
-| `pages/Agents.tsx` | `lib/paperclip-tools-shared/validators/issue.ts` |
-| `pages/ApprovalDetail.tsx` | `lib/paperclip-tools-shared/validators/sidebar-preferences.ts` |
-| `pages/Approvals.tsx` | `lib/router.tsx` |
-| `pages/Artifacts.test.tsx` | `lib/subIssueDefaults.test.ts` |
-| `pages/Artifacts.tsx` | `lib/subIssueDefaults.ts` |
-| `pages/Auth.test.tsx` | `pages/Activity.tsx` |
-| `pages/Auth.tsx` | `pages/AdapterManager.tsx` |
-| `pages/BoardChat.test.tsx` | `pages/AgentDetail.instructions.test.tsx` |
-| `pages/BoardChat.tsx` | `pages/AgentDetail.progress.test.ts` |
-| `pages/BoardClaim.tsx` | `pages/AgentDetail.tsx` |
-| `pages/BootstrapSetupUxLab.tsx` | `pages/AgentToolsTab.tsx` |
-| `pages/CaseDetail.test.tsx` | `pages/Agents.test.tsx` |
-| `pages/CaseDetail.tsx` | `pages/Agents.tsx` |
-| `pages/Cases.test.tsx` | `pages/ApprovalDetail.tsx` |
-| `pages/Cases.tsx` | `pages/Approvals.tsx` |
-| `pages/CliAuth.tsx` | `pages/Artifacts.test.tsx` |
-| `pages/Companies.test.tsx` | `pages/Artifacts.tsx` |
-| `pages/Companies.tsx` | `pages/Auth.test.tsx` |
-| `pages/CompanyAccess.test.tsx` | `pages/Auth.tsx` |
-| `pages/CompanyAccess.tsx` | `pages/BoardChat.test.tsx` |
-| `pages/CompanyEnvironments.test.tsx` | `pages/BoardChat.tsx` |
-| `pages/CompanyEnvironments.tsx` | `pages/BoardClaim.tsx` |
-| `pages/CompanyExport.test.tsx` | `pages/BootstrapSetupUxLab.tsx` |
-| `pages/CompanyExport.tsx` | `pages/CaseDetail.test.tsx` |
-| `pages/CompanyImport.test.tsx` | `pages/CaseDetail.tsx` |
-| `pages/CompanyImport.tsx` | `pages/Cases.test.tsx` |
-| `pages/CompanyInvites.test.tsx` | `pages/Cases.tsx` |
-| `pages/CompanyInvites.tsx` | `pages/CliAuth.tsx` |
-| `pages/CompanySettings.test.tsx` | `pages/CloudUpstream.test.tsx` |
-| `pages/CompanySettings.tsx` | `pages/CloudUpstream.tsx` |
-| `pages/CompanySettingsPluginPage.test.tsx` | `pages/CloudUpstreamUxLab.tsx` |
-| `pages/CompanySettingsPluginPage.tsx` | `pages/Companies.tsx` |
-| `pages/CompanySkills.test.tsx` | `pages/CompanyAccess.test.tsx` |
-| `pages/CompanySkills.tsx` | `pages/CompanyAccess.tsx` |
-| `pages/Costs.tsx` | `pages/CompanyEnvironments.test.tsx` |
-| `pages/CrossIssueCollaborationUxLab.tsx` | `pages/CompanyEnvironments.tsx` |
-| `pages/Dashboard.tsx` | `pages/CompanyExport.tsx` |
-| `pages/DashboardLive.tsx` | `pages/CompanyImport.tsx` |
-| `pages/DecisionQueuePage.tsx` | `pages/CompanyInvites.test.tsx` |
-| `pages/DesignGuide.tsx` | `pages/CompanyInvites.tsx` |
-| `pages/ExecutionWorkspaceDetail.provision-status.test.ts` | `pages/CompanySettings.test.tsx` |
-| `pages/ExecutionWorkspaceDetail.service-ports.test.ts` | `pages/CompanySettings.tsx` |
-| `pages/ExecutionWorkspaceDetail.test.tsx` | `pages/CompanySettingsPluginPage.test.tsx` |
-| `pages/ExecutionWorkspaceDetail.tsx` | `pages/CompanySettingsPluginPage.tsx` |
-| `pages/GoalDetail.test.tsx` | `pages/CompanySkills.test.tsx` |
-| `pages/GoalDetail.tsx` | `pages/CompanySkills.tsx` |
-| `pages/Goals.tsx` | `pages/Costs.tsx` |
-| `pages/Inbox.test.tsx` | `pages/Dashboard.tsx` |
-| `pages/Inbox.tsx` | `pages/DashboardLive.tsx` |
-| `pages/InstanceAccess.tsx` | `pages/DesignGuide.tsx` |
-| `pages/InstanceExperimentalSettings.test.tsx` | `pages/ExecutionWorkspaceDetail.test.tsx` |
-| `pages/InstanceExperimentalSettings.tsx` | `pages/ExecutionWorkspaceDetail.tsx` |
-| `pages/InstanceGeneralSettings.test.tsx` | `pages/GoalDetail.test.tsx` |
-| `pages/InstanceGeneralSettings.tsx` | `pages/GoalDetail.tsx` |
-| `pages/InstanceSettings.tsx` | `pages/Goals.tsx` |
-| `pages/InviteLanding.test.tsx` | `pages/Inbox.test.tsx` |
-| `pages/InviteLanding.tsx` | `pages/Inbox.tsx` |
-| `pages/InviteUxLab.test.tsx` | `pages/InstanceAccess.tsx` |
-| `pages/InviteUxLab.tsx` | `pages/InstanceExperimentalSettings.test.tsx` |
-| `pages/IssueChatLongThreadPerf.tsx` | `pages/InstanceExperimentalSettings.tsx` |
-| `pages/IssueChatUxLab.tsx` | `pages/InstanceGeneralSettings.tsx` |
-| `pages/IssueDetail.test.tsx` | `pages/InstanceSettings.tsx` |
-| `pages/IssueDetail.tsx` | `pages/InviteLanding.test.tsx` |
-| `pages/Issues.test.tsx` | `pages/InviteLanding.tsx` |
-| `pages/Issues.tsx` | `pages/InviteUxLab.test.tsx` |
-| `pages/JoinRequestQueue.tsx` | `pages/InviteUxLab.tsx` |
-| `pages/MyIssues.tsx` | `pages/IssueChatLongThreadPerf.tsx` |
-| `pages/NewAgent.test.tsx` | `pages/IssueChatUxLab.tsx` |
-| `pages/NewAgent.tsx` | `pages/IssueDetail.test.tsx` |
-| `pages/NotFound.tsx` | `pages/IssueDetail.tsx` |
-| `pages/Org.tsx` | `pages/Issues.test.tsx` |
-| `pages/OrgChart.test.tsx` | `pages/Issues.tsx` |
-| `pages/OrgChart.tsx` | `pages/JoinRequestQueue.tsx` |
-| `pages/PipelineSettings.test.ts` | `pages/MyIssues.tsx` |
-| `pages/PipelineSettings.tsx` | `pages/NewAgent.tsx` |
-| `pages/Pipelines.test.tsx` | `pages/NotFound.tsx` |
-| `pages/Pipelines.tsx` | `pages/Org.tsx` |
-| `pages/PluginManager.tsx` | `pages/OrgChart.test.tsx` |
-| `pages/PluginPage.test.tsx` | `pages/OrgChart.tsx` |
-| `pages/PluginPage.tsx` | `pages/PipelineSettings.test.ts` |
-| `pages/PluginSettings.test.tsx` | `pages/PipelineSettings.tsx` |
-| `pages/PluginSettings.tsx` | `pages/Pipelines.test.tsx` |
-| `pages/ProfileSettings.test.tsx` | `pages/Pipelines.tsx` |
-| `pages/ProfileSettings.tsx` | `pages/PluginManager.tsx` |
-| `pages/ProjectDetail.test.tsx` | `pages/PluginPage.test.tsx` |
-| `pages/ProjectDetail.tsx` | `pages/PluginPage.tsx` |
-| `pages/ProjectWorkspaceDetail.test.tsx` | `pages/PluginSettings.test.tsx` |
-| `pages/ProjectWorkspaceDetail.tsx` | `pages/PluginSettings.tsx` |
-| `pages/Projects.test.tsx` | `pages/ProfileSettings.test.tsx` |
-| `pages/Projects.tsx` | `pages/ProfileSettings.tsx` |
-| `pages/ResponsibleUserDenialUxLab.tsx` | `pages/ProjectDetail.test.tsx` |
-| `pages/RoutineDetail.test.tsx` | `pages/ProjectDetail.tsx` |
-| `pages/RoutineDetail.tsx` | `pages/ProjectWorkspaceDetail.test.tsx` |
-| `pages/Routines.test.tsx` | `pages/ProjectWorkspaceDetail.tsx` |
-| `pages/Routines.tsx` | `pages/Projects.test.tsx` |
-| `pages/RunTranscriptUxLab.tsx` | `pages/Projects.tsx` |
-| `pages/Search.test.tsx` | `pages/ResponsibleUserDenialUxLab.tsx` |
-| `pages/Search.tsx` | `pages/RoutineDetail.tsx` |
-| `pages/Secrets.render.test.tsx` | `pages/Routines.test.tsx` |
-| `pages/Secrets.test.ts` | `pages/Routines.tsx` |
-| `pages/Secrets.tsx` | `pages/RunTranscriptUxLab.tsx` |
-| `pages/SkillStudio.test.tsx` | `pages/Search.test.tsx` |
-| `pages/SkillStudio.tsx` | `pages/Search.tsx` |
-| `pages/StatusCards/ArchivedStatusCardRow.tsx` | `pages/Secrets.render.test.tsx` |
-| `pages/StatusCards/CreateStatusCardDialog.tsx` | `pages/Secrets.test.ts` |
-| `pages/StatusCards/StatusCardDetailDrawer.tsx` | `pages/Secrets.tsx` |
-| `pages/StatusCards/StatusCardSettingsForm.test.tsx` | `pages/SkillStudio.test.tsx` |
-| `pages/StatusCards/StatusCardSettingsForm.tsx` | `pages/SkillStudio.tsx` |
-| `pages/StatusCards/StatusCardTile.test.tsx` | `pages/StatusCards.tsx` |
-| `pages/StatusCards/StatusCardTile.tsx` | `pages/SystemNoticeUxLab.tsx` |
-| `pages/StatusCards/SummarizerAgentSelect.tsx` | `pages/TeamCard.test.tsx` |
-| `pages/StatusCards/format.test.ts` | `pages/TeamCatalog.fixtures.ts` |
-| `pages/StatusCards/format.ts` | `pages/TeamCatalog.test.tsx` |
-| `pages/StatusCards/index.tsx` | `pages/TeamCatalog.tsx` |
-| `pages/StatusCards/types.ts` | `pages/Timeline.test.tsx` |
-| `pages/SystemNoticeUxLab.tsx` | `pages/Timeline.tsx` |
-| `pages/TaskChatLab.tsx` | `pages/ToolsCenter.tsx` |
-| `pages/TeamCard.test.tsx` | `pages/UserProfile.tsx` |
-| `pages/TeamCatalog.fixtures.ts` | `pages/WhatNeedsMe.tsx` |
-| `pages/TeamCatalog.test.tsx` | `pages/Workspaces.test.tsx` |
-| `pages/TeamCatalog.tsx` | `pages/Workspaces.tsx` |
-| `pages/Timeline.test.tsx` | `pages/agent-skills/AgentSkillRow.tsx` |
-| `pages/Timeline.tsx` | `pages/agent-skills/AgentSkillsTab.tsx` |
-| `pages/UserProfile.tsx` | `pages/agent-skills/agent-skill-filter.test.ts` |
-| `pages/WhatNeedsMe.test.tsx` | `pages/agent-skills/agent-skill-filter.ts` |
-| `pages/WhatNeedsMe.tsx` | `pages/agent-skills/agent-skill-source.test.ts` |
-| `pages/Workspaces.test.tsx` | `pages/agent-skills/agent-skill-source.ts` |
-| `pages/Workspaces.tsx` | `pages/apps/AppDetail.test.tsx` |
-| `pages/agent-skills/AgentSkillReleasePicker.test.ts` | `pages/apps/AppDetail.tsx` |
-| `pages/agent-skills/AgentSkillReleasePicker.tsx` | `pages/apps/AppLogo.tsx` |
-| `pages/agent-skills/AgentSkillRow.tsx` | `pages/apps/AppNotConnected.test.tsx` |
-| `pages/agent-skills/AgentSkillsTab.test.ts` | `pages/apps/AppNotConnected.tsx` |
-| `pages/agent-skills/AgentSkillsTab.tsx` | `pages/apps/AppsConnect.test.tsx` |
-| `pages/agent-skills/agent-skill-filter.test.ts` | `pages/apps/AppsConnect.tsx` |
-| `pages/agent-skills/agent-skill-filter.ts` | `pages/apps/AppsReview.tsx` |
-| `pages/agent-skills/agent-skill-source.test.ts` | `pages/apps/Browse.test.tsx` |
-| `pages/agent-skills/agent-skill-source.ts` | `pages/apps/Browse.tsx` |
-| `pages/apps/AppDetail.test.tsx` | `pages/apps/Connections.test.tsx` |
-| `pages/apps/AppDetail.tsx` | `pages/apps/Connections.tsx` |
-| `pages/apps/AppLogo.tsx` | `pages/apps/ReviewQueueCard.test.tsx` |
-| `pages/apps/AppNotConnected.test.tsx` | `pages/apps/ReviewQueueCard.tsx` |
-| `pages/apps/AppNotConnected.tsx` | `pages/apps/app-connect-policy.test.ts` |
-| `pages/apps/AppsConnect.test.tsx` | `pages/apps/app-connect-policy.ts` |
-| `pages/apps/AppsConnect.tsx` | `pages/apps/app-definition-display.ts` |
-| `pages/apps/AppsReview.tsx` | `pages/apps/app-detail/ActivityPanel.render.test.tsx` |
-| `pages/apps/Browse.test.tsx` | `pages/apps/app-detail/ActivityPanel.test.tsx` |
-| `pages/apps/Browse.tsx` | `pages/apps/app-detail/ActivityPanel.tsx` |
-| `pages/apps/Connections.test.tsx` | `pages/apps/app-detail/AdvancedPanel.tsx` |
-| `pages/apps/Connections.tsx` | `pages/apps/app-detail/PermissionsPanel.tsx` |
-| `pages/apps/ReviewQueueCard.test.tsx` | `pages/apps/app-detail/ReviewPanel.tsx` |
-| `pages/apps/ReviewQueueCard.tsx` | `pages/apps/app-detail/SetupPanel.tsx` |
-| `pages/apps/app-connect-policy.test.ts` | `pages/apps/app-detail/TestPanel.test.tsx` |
-| `pages/apps/app-connect-policy.ts` | `pages/apps/app-detail/TestPanel.tsx` |
-| `pages/apps/app-definition-display.ts` | `pages/apps/app-detail/types.ts` |
-| `pages/apps/app-detail/ActivityPanel.render.test.tsx` | `pages/apps/app-tabs.ts` |
-| `pages/apps/app-detail/ActivityPanel.test.tsx` | `pages/apps/gateways/AppsSubNav.tsx` |
-| `pages/apps/app-detail/ActivityPanel.tsx` | `pages/apps/gateways/ConnectClientDialog.tsx` |
-| `pages/apps/app-detail/AdvancedPanel.tsx` | `pages/apps/gateways/GatewayDetail.tsx` |
-| `pages/apps/app-detail/PermissionsPanel.tsx` | `pages/apps/gateways/GatewaysList.tsx` |
-| `pages/apps/app-detail/ReviewPanel.tsx` | `pages/apps/gateways/NewGatewayDialog.tsx` |
-| `pages/apps/app-detail/SetupPanel.tsx` | `pages/apps/gateways/gateway-helpers.test.ts` |
-| `pages/apps/app-detail/TestPanel.test.tsx` | `pages/apps/gateways/gateway-helpers.ts` |
-| `pages/apps/app-detail/TestPanel.tsx` | `pages/apps/gateways/gateway-tabs.ts` |
-| `pages/apps/app-detail/types.ts` | `pages/apps/gateways/panels/AppsToolsPanel.tsx` |
-| `pages/apps/app-tabs.ts` | `pages/apps/gateways/panels/GatewayActivityPanel.tsx` |
-| `pages/apps/gateways/AppsSubNav.tsx` | `pages/apps/gateways/panels/GatewayAdvancedPanel.tsx` |
-| `pages/apps/gateways/ConnectClientDialog.tsx` | `pages/apps/gateways/panels/OverviewPanel.tsx` |
-| `pages/apps/gateways/GatewayDetail.tsx` | `pages/apps/gateways/panels/TokensPanel.test.tsx` |
-| `pages/apps/gateways/GatewaysList.tsx` | `pages/apps/gateways/panels/TokensPanel.tsx` |
-| `pages/apps/gateways/NewGatewayDialog.tsx` | `pages/apps/google-sheets.ts` |
-| `pages/apps/gateways/gateway-helpers.test.ts` | `pages/apps/store-cards.tsx` |
-| `pages/apps/gateways/gateway-helpers.ts` | `pages/apps/useReviewCount.ts` |
-| `pages/apps/gateways/gateway-tabs.ts` | `pages/secrets/ImportFromVaultDialog.test.tsx` |
-| `pages/apps/gateways/panels/AppsToolsPanel.tsx` | `pages/secrets/ImportFromVaultDialog.tsx` |
-| `pages/apps/gateways/panels/GatewayActivityPanel.tsx` | `pages/secrets/MissingUserSecretsBanner.test.tsx` |
-| `pages/apps/gateways/panels/GatewayAdvancedPanel.tsx` | `pages/secrets/MissingUserSecretsBanner.tsx` |
-| `pages/apps/gateways/panels/OverviewPanel.tsx` | `pages/secrets/MyUserSecretsTab.tsx` |
-| `pages/apps/gateways/panels/TokensPanel.test.tsx` | `pages/secrets/SetMyUserSecretDialog.tsx` |
-| `pages/apps/gateways/panels/TokensPanel.tsx` | `pages/secrets/UserSecretDefinitionsTab.tsx` |
-| `pages/apps/google-sheets.ts` | `pages/secrets/my-value-state.ts` |
-| `pages/apps/store-cards.tsx` | `pages/secrets/user-secret-presentation.test.ts` |
-| `pages/apps/useReviewCount.ts` | `pages/secrets/user-secret-presentation.tsx` |
-| `pages/audit/AuditFeed.test.tsx` | `pages/tools/AdvancedToolsRoute.tsx` |
-| `pages/audit/AuditFeed.tsx` | `pages/tools/AuditTab.test.tsx` |
-| `pages/audit/CompanyActivity.tsx` | `pages/tools/AuditTab.tsx` |
-| `pages/secrets/ImportFromVaultDialog.test.tsx` | `pages/tools/GatewaysTab.test.tsx` |
-| `pages/secrets/ImportFromVaultDialog.tsx` | `pages/tools/GatewaysTab.tsx` |
-| `pages/secrets/MissingUserSecretsBanner.test.tsx` | `pages/tools/PasteConfigTab.test.tsx` |
-| `pages/secrets/MissingUserSecretsBanner.tsx` | `pages/tools/PasteConfigTab.tsx` |
-| `pages/secrets/MyUserSecretsTab.tsx` | `pages/tools/PoliciesTab.test.tsx` |
-| `pages/secrets/ProposalsTab.render.test.tsx` | `pages/tools/PoliciesTab.tsx` |
-| `pages/secrets/ProposalsTab.tsx` | `pages/tools/ProfilesTab.test.ts` |
-| `pages/secrets/SecretPathName.tsx` | `pages/tools/ProfilesTab.tsx` |
-| `pages/secrets/SetMyUserSecretDialog.tsx` | `pages/tools/RunYourOwnTab.tsx` |
-| `pages/secrets/UserSecretDefinitionsTab.tsx` | `pages/tools/RuntimeTab.test.tsx` |
-| `pages/secrets/my-value-state.ts` | `pages/tools/RuntimeTab.tsx` |
-| `pages/secrets/proposal-review.tsx` | `pages/tools/SmokeLabTab.test.tsx` |
-| `pages/secrets/secret-path.test.ts` | `pages/tools/SmokeLabTab.tsx` |
-| `pages/secrets/secret-path.ts` | `pages/tools/ToolsAccess.test.tsx` |
-| `pages/secrets/user-secret-presentation.test.ts` | `pages/tools/ToolsAccess.tsx` |
-| `pages/secrets/user-secret-presentation.tsx` | `pages/tools/connection-dialogs.tsx` |
-| `pages/skills/ImportSkillsFromProjectDialog.test.tsx` | `pages/tools/profiles/ProfileActionDialog.tsx` |
-| `pages/skills/ImportSkillsFromProjectDialog.tsx` | `pages/tools/profiles/ProfileDetail.test.tsx` |
-| `pages/tools/AdvancedToolsRoute.tsx` | `pages/tools/profiles/ProfileDetail.tsx` |
-| `pages/tools/AuditTab.test.tsx` | `pages/tools/profiles/ProfileDetailRoute.tsx` |
-| `pages/tools/AuditTab.tsx` | `pages/tools/profiles/ProfileWizard.test.tsx` |
-| `pages/tools/GatewaysTab.test.tsx` | `pages/tools/profiles/ProfileWizard.tsx` |
-| `pages/tools/GatewaysTab.tsx` | `pages/tools/profiles/ProfileWizardRoute.tsx` |
-| `pages/tools/PasteConfigTab.test.tsx` | `pages/tools/profiles/ProfilesIndex.test.tsx` |
-| `pages/tools/PasteConfigTab.tsx` | `pages/tools/profiles/ProfilesIndex.tsx` |
-| `pages/tools/PoliciesTab.test.tsx` | `pages/tools/profiles/ToolsAdminGate.tsx` |
-| `pages/tools/PoliciesTab.tsx` | `pages/tools/profiles/WizardToolsStep.test.tsx` |
-| `pages/tools/ProfilesTab.test.ts` | `pages/tools/profiles/WizardToolsStep.tsx` |
-| `pages/tools/ProfilesTab.tsx` | `pages/tools/profiles/profile-model.test.ts` |
-| `pages/tools/RunYourOwnTab.tsx` | `pages/tools/profiles/profile-model.ts` |
-| `pages/tools/RuntimeTab.test.tsx` | `pages/tools/profiles/profile-summary.test.ts` |
-| `pages/tools/RuntimeTab.tsx` | `pages/tools/profiles/profile-summary.ts` |
-| `pages/tools/SmokeLabTab.test.tsx` | `pages/tools/profiles/useProfilesData.ts` |
-| `pages/tools/SmokeLabTab.tsx` | `pages/tools/profiles/wizard-draft.test.ts` |
-| `pages/tools/ToolsAccess.test.tsx` | `pages/tools/profiles/wizard-draft.ts` |
-| `pages/tools/ToolsAccess.tsx` | `pages/tools/shared.tsx` |
-| `pages/tools/connection-dialogs.tsx` | `pages/tools/smoke-lab-matrix.test.ts` |
-| `pages/tools/profiles/ProfileActionDialog.tsx` | `pages/tools/smoke-lab-matrix.ts` |
-| `pages/tools/profiles/ProfileDetail.test.tsx` | `pages/tools/tool-tabs.ts` |
-| `pages/tools/profiles/ProfileDetail.tsx` | `pages/useInstallTeamCatalogEntry.test.tsx` |
+| `components/AgentIconPicker.tsx` | `components/AgentProperties.tsx` |
+| `components/AgentMultiSelect.test.tsx` | `components/BootstrapPendingPage.tsx` |
+| `components/AgentMultiSelect.tsx` | `components/BudgetSidebarMarker.tsx` |
+| `components/AgentProperties.tsx` | `components/BuiltInAgentBadges.tsx` |
+| `components/AgentSecretAccessEditor.test.tsx` | `components/BuiltInAgentGate.test.tsx` |
+| `components/AgentSecretAccessEditor.tsx` | `components/BuiltInAgentGate.tsx` |
+| `components/AppConnectionSidebar.test.tsx` | `components/CompanySettingsSidebar.test.tsx` |
+| `components/AppConnectionSidebar.tsx` | `components/CompanySettingsSidebar.tsx` |
+| `components/AppsSidebar.test.tsx` | `components/ConfigureBuiltInAgentModal.test.tsx` |
+| `components/AppsSidebar.tsx` | `components/ConfigureBuiltInAgentModal.tsx` |
+| `components/BootstrapPendingPage.tsx` | `components/InstanceSidebar.test.tsx` |
+| `components/BudgetSidebarMarker.tsx` | `components/InstanceSidebar.tsx` |
+| `components/BuiltInAgentBadges.tsx` | `components/IssueAssignedBacklogNotice.test.tsx` |
+| `components/BuiltInAgentGate.test.tsx` | `components/IssueAssignedBacklogNotice.tsx` |
+| `components/BuiltInAgentGate.tsx` | `components/IssueAttachmentsSection.test.tsx` |
+| `components/CompanySettingsSidebar.test.tsx` | `components/IssueAttachmentsSection.tsx` |
+| `components/CompanySettingsSidebar.tsx` | `components/IssueBlockedNotice.test.tsx` |
+| `components/ConfigureBuiltInAgentModal.test.tsx` | `components/IssueBlockedNotice.tsx` |
+| `components/ConfigureBuiltInAgentModal.tsx` | `components/IssueCasesPanel.test.tsx` |
+| `components/InboxAgentPolicyControl.test.tsx` | `components/IssueCasesPanel.tsx` |
+| `components/InboxAgentPolicyControl.tsx` | `components/IssueChatComposerHandoffPreview.test.ts` |
+| `components/InstanceSidebar.test.tsx` | `components/IssueChatThread.test.tsx` |
+| `components/InstanceSidebar.tsx` | `components/IssueChatThread.tsx` |
+| `components/IssueAssignedBacklogNotice.test.tsx` | `components/IssueChatThreadSystemNotice.test.tsx` |
+| `components/IssueAssignedBacklogNotice.tsx` | `components/IssueColumns.test.tsx` |
+| `components/IssueAttachmentsSection.test.tsx` | `components/IssueColumns.tsx` |
+| `components/IssueAttachmentsSection.tsx` | `components/IssueContinuationHandoff.test.tsx` |
+| `components/IssueBlockedNotice.test.tsx` | `components/IssueContinuationHandoff.tsx` |
+| `components/IssueBlockedNotice.tsx` | `components/IssueDocumentAnnotations.test.tsx` |
+| `components/IssueCasesPanel.test.tsx` | `components/IssueDocumentAnnotations.tsx` |
+| `components/IssueCasesPanel.tsx` | `components/IssueDocumentsSection.test.tsx` |
+| `components/IssueChatComposerHandoffPreview.test.ts` | `components/IssueDocumentsSection.tsx` |
+| `components/IssueChatThread.test.tsx` | `components/IssueFiltersPopover.test.tsx` |
+| `components/IssueChatThread.tsx` | `components/IssueFiltersPopover.tsx` |
+| `components/IssueChatThreadSystemNotice.test.tsx` | `components/IssueGroupHeader.tsx` |
+| `components/IssueColumns.test.tsx` | `components/IssueLinkQuicklook.test.tsx` |
+| `components/IssueColumns.tsx` | `components/IssueLinkQuicklook.tsx` |
+| `components/IssueContinuationHandoff.test.tsx` | `components/IssueMonitorActivityCard.test.tsx` |
+| `components/IssueContinuationHandoff.tsx` | `components/IssueMonitorActivityCard.tsx` |
+| `components/IssueDocumentAnnotations.test.tsx` | `components/IssuePlanDecompositionsSection.tsx` |
+| `components/IssueDocumentAnnotations.tsx` | `components/IssueProperties.test.tsx` |
+| `components/IssueDocumentsSection.test.tsx` | `components/IssueProperties.tsx` |
+| `components/IssueDocumentsSection.tsx` | `components/IssueRecoveryActionCard.test.tsx` |
+| `components/IssueFieldChangeReceipt.test.tsx` | `components/IssueRecoveryActionCard.tsx` |
+| `components/IssueFieldChangeReceipt.tsx` | `components/IssueReferenceActivitySummary.tsx` |
+| `components/IssueFiltersPopover.test.tsx` | `components/IssueReferencePill.tsx` |
+| `components/IssueFiltersPopover.tsx` | `components/IssueRelatedWorkPanel.test.tsx` |
+| `components/IssueGroupHeader.tsx` | `components/IssueRelatedWorkPanel.tsx` |
+| `components/IssueLinkQuicklook.test.tsx` | `components/IssueRow.test.tsx` |
+| `components/IssueLinkQuicklook.tsx` | `components/IssueRow.tsx` |
+| `components/IssueMonitorBanner.test.tsx` | `components/IssueRunLedger.test.tsx` |
+| `components/IssueMonitorBanner.tsx` | `components/IssueRunLedger.tsx` |
+| `components/IssuePlanDecompositionsSection.tsx` | `components/IssueScheduledRetryCard.test.tsx` |
+| `components/IssueProperties.test.tsx` | `components/IssueScheduledRetryCard.tsx` |
+| `components/IssueProperties.tsx` | `components/IssueSiblingNavigation.test.tsx` |
+| `components/IssueRecoveryActionCard.test.tsx` | `components/IssueSiblingNavigation.tsx` |
+| `components/IssueRecoveryActionCard.tsx` | `components/IssueThreadInteractionCard.test.tsx` |
+| `components/IssueReferenceActivitySummary.tsx` | `components/IssueThreadInteractionCard.tsx` |
+| `components/IssueReferencePill.tsx` | `components/IssueWorkspaceCard.test.tsx` |
+| `components/IssueRelatedWorkPanel.test.tsx` | `components/IssueWorkspaceCard.tsx` |
+| `components/IssueRelatedWorkPanel.tsx` | `components/IssuesList.test.tsx` |
+| `components/IssueRow.test.tsx` | `components/IssuesList.tsx` |
+| `components/IssueRow.tsx` | `components/IssuesQuicklook.tsx` |
+| `components/IssueRunLedger.test.tsx` | `components/NewAgentDialog.test.tsx` |
+| `components/IssueRunLedger.tsx` | `components/NewAgentDialog.tsx` |
+| `components/IssueScheduledRetryCard.test.tsx` | `components/NewIssueDialog.test.tsx` |
+| `components/IssueScheduledRetryCard.tsx` | `components/NewIssueDialog.tsx` |
+| `components/IssueSiblingNavigation.test.tsx` | `components/PageSkeleton.tsx` |
+| `components/IssueSiblingNavigation.tsx` | `components/PageTabBar.tsx` |
+| `components/IssueThreadInteractionCard.test.tsx` | `components/RequestCollapsedSidebar.test.tsx` |
+| `components/IssueThreadInteractionCard.tsx` | `components/RequestCollapsedSidebar.tsx` |
+| `components/IssueWorkspaceCard.test.tsx` | `components/RouteErrorBoundary.test.tsx` |
+| `components/IssueWorkspaceCard.tsx` | `components/RouteErrorBoundary.tsx` |
+| `components/IssueWriteDenialNotice.test.tsx` | `components/RoutineSubSidebar.test.tsx` |
+| `components/IssueWriteDenialNotice.tsx` | `components/RoutineSubSidebar.tsx` |
+| `components/IssuesList.test.tsx` | `components/SecondarySidebar.tsx` |
+| `components/IssuesList.tsx` | `components/Sidebar.test.tsx` |
+| `components/IssuesQuicklook.tsx` | `components/Sidebar.tsx` |
+| `components/NewAgentDialog.test.tsx` | `components/SidebarAccountMenu.test.tsx` |
+| `components/NewAgentDialog.tsx` | `components/SidebarAccountMenu.tsx` |
+| `components/NewIssueDialog.test.tsx` | `components/SidebarAgents.test.tsx` |
+| `components/NewIssueDialog.tsx` | `components/SidebarAgents.tsx` |
+| `components/PageSkeleton.tsx` | `components/SidebarCompanyMenu.test.tsx` |
+| `components/PageTabBar.tsx` | `components/SidebarCompanyMenu.tsx` |
+| `components/RequestCollapsedSidebar.test.tsx` | `components/SidebarNavItem.test.tsx` |
+| `components/RequestCollapsedSidebar.tsx` | `components/SidebarNavItem.tsx` |
+| `components/RouteErrorBoundary.test.tsx` | `components/SidebarProjects.test.tsx` |
+| `components/RouteErrorBoundary.tsx` | `components/SidebarProjects.tsx` |
+| `components/RoutineSubSidebar.test.tsx` | `components/SidebarSection.test.tsx` |
+| `components/RoutineSubSidebar.tsx` | `components/SidebarSection.tsx` |
+| `components/SecondarySidebar.tsx` | `components/SidebarServerInfo.test.tsx` |
+| `components/Sidebar.test.tsx` | `components/SidebarServerInfo.tsx` |
+| `components/Sidebar.tsx` | `components/SidebarShell.test.tsx` |
+| `components/SidebarAccountMenu.test.tsx` | `components/SidebarShell.tsx` |
+| `components/SidebarAccountMenu.tsx` | `components/SidebarStarredProjects.test.tsx` |
+| `components/SidebarAgents.test.tsx` | `components/SidebarStarredProjects.tsx` |
+| `components/SidebarAgents.tsx` | `components/access/CompanySettingsNav.test.tsx` |
+| `components/SidebarCompanyMenu.test.tsx` | `components/access/CompanySettingsNav.tsx` |
+| `components/SidebarCompanyMenu.tsx` | `components/agent-config-defaults.ts` |
+| `components/SidebarNavItem.test.tsx` | `components/agent-config-primitives.tsx` |
+| `components/SidebarNavItem.tsx` | `components/issue-output/IssueOutputSection.test.tsx` |
+| `components/SidebarProjects.test.tsx` | `components/issue-output/IssueOutputSection.tsx` |
+| `components/SidebarProjects.tsx` | `components/issue-output/OutputFileTile.tsx` |
+| `components/SidebarSection.test.tsx` | `components/issue-output/OutputPrimaryCard.tsx` |
+| `components/SidebarSection.tsx` | `components/issue-output/OutputRow.tsx` |
+| `components/SidebarServerInfo.test.tsx` | `components/issue-output/OutputVideoPlayer.tsx` |
+| `components/SidebarServerInfo.tsx` | `components/issue-properties/IssueProperties.tsx` |
+| `components/SidebarShell.test.tsx` | `components/issue-properties/external-object-rows.tsx` |
+| `components/SidebarShell.tsx` | `components/issue-properties/helpers.ts` |
+| `components/SidebarStarredProjects.test.tsx` | `components/issue-properties/index.ts` |
+| `components/SidebarStarredProjects.tsx` | `components/issue-properties/primitives.tsx` |
+| `components/access/CompanySettingsNav.test.tsx` | `components/issue-properties/property-picker.tsx` |
+| `components/access/CompanySettingsNav.tsx` | `components/issue-properties/relation-controls.tsx` |
+| `components/agent-config-defaults.ts` | `components/skill-studio/AgentsUsingSkillDialog.test.tsx` |
+| `components/agent-config-primitives.tsx` | `components/skill-studio/AgentsUsingSkillDialog.tsx` |
+| `components/issue-output/IssueOutputSection.test.tsx` | `context/GeneralSettingsContext.tsx` |
+| `components/issue-output/IssueOutputSection.tsx` | `context/SidebarContext.test.tsx` |
+| `components/issue-output/OutputFileTile.tsx` | `context/SidebarContext.tsx` |
+| `components/issue-output/OutputPrimaryCard.tsx` | `fixtures/issueChatLongThreadFixture.test.ts` |
+| `components/issue-output/OutputRow.tsx` | `fixtures/issueChatLongThreadFixture.ts` |
+| `components/issue-output/OutputVideoPlayer.tsx` | `fixtures/issueChatUxFixtures.ts` |
+| `components/issue-properties/IssueProperties.tsx` | `fixtures/issueThreadInteractionFixtures.ts` |
+| `components/issue-properties/IssuePropertiesArtifactsTab.tsx` | `hooks/useAgentOrder.ts` |
+| `components/issue-properties/IssuePropertiesDocumentAnnotations.test.tsx` | `hooks/useCompanyPageMemory.test.ts` |
+| `components/issue-properties/IssuePropertiesPlansTab.tsx` | `hooks/useCompanyPageMemory.ts` |
+| `components/issue-properties/external-object-rows.tsx` | `hooks/useIssueExternalObjects.ts` |
+| `components/issue-properties/helpers.ts` | `hooks/usePaperclipIssueRuntime.test.tsx` |
+| `components/issue-properties/index.ts` | `hooks/usePaperclipIssueRuntime.ts` |
+| `components/issue-properties/primitives.tsx` | `lib/agent-config-patch.test.ts` |
+| `components/issue-properties/property-picker.tsx` | `lib/agent-config-patch.ts` |
+| `components/issue-properties/relation-controls.tsx` | `lib/agent-icons.ts` |
+| `components/skill-studio/AgentsUsingSkillDialog.test.tsx` | `lib/agent-onboarding-prompt.test.ts` |
+| `components/skill-studio/AgentsUsingSkillDialog.tsx` | `lib/agent-onboarding-prompt.ts` |
+| `context/GeneralSettingsContext.tsx` | `lib/agent-order.test.ts` |
+| `context/SidebarContext.test.tsx` | `lib/agent-order.ts` |
+| `context/SidebarContext.tsx` | `lib/agent-skills-state.test.ts` |
+| `fixtures/issueChatLongThreadFixture.test.ts` | `lib/agent-skills-state.ts` |
+| `fixtures/issueChatLongThreadFixture.ts` | `lib/built-in-agent-toast.ts` |
+| `fixtures/issueChatUxFixtures.ts` | `lib/company-page-memory.ts` |
+| `fixtures/issueThreadInteractionFixtures.ts` | `lib/company-portability-sidebar.test.ts` |
+| `hooks/useAgentOrder.ts` | `lib/company-portability-sidebar.ts` |
+| `hooks/useCompanyPageMemory.test.ts` | `lib/company-routes.test.ts` |
+| `hooks/useCompanyPageMemory.ts` | `lib/company-routes.ts` |
+| `hooks/useIssueDocuments.ts` | `lib/company-skill-routes.test.ts` |
+| `hooks/useIssueExternalObjects.ts` | `lib/company-skill-routes.ts` |
+| `hooks/useIssuePlanDocument.ts` | `lib/duplicate-agent-payload.test.ts` |
+| `hooks/usePaperclipIssueRuntime.test.tsx` | `lib/duplicate-agent-payload.ts` |
+| `hooks/usePaperclipIssueRuntime.ts` | `lib/instance-settings.test.ts` |
+| `lib/agent-config-patch.test.ts` | `lib/instance-settings.ts` |
+| `lib/agent-config-patch.ts` | `lib/issue-assignee-overrides.test.ts` |
+| `lib/agent-icons.ts` | `lib/issue-assignee-overrides.ts` |
+| `lib/agent-onboarding-prompt.test.ts` | `lib/issue-attachments.ts` |
+| `lib/agent-onboarding-prompt.ts` | `lib/issue-blockers.ts` |
+| `lib/agent-order.test.ts` | `lib/issue-chat-messages.test.ts` |
+| `lib/agent-order.ts` | `lib/issue-chat-messages.ts` |
+| `lib/agent-skills-state.test.ts` | `lib/issue-chat-scroll.test.ts` |
+| `lib/agent-skills-state.ts` | `lib/issue-chat-scroll.ts` |
+| `lib/built-in-agent-toast.ts` | `lib/issue-detail-subissues.test.ts` |
+| `lib/company-page-memory.ts` | `lib/issue-detail-subissues.ts` |
+| `lib/company-portability-sidebar.test.ts` | `lib/issue-execution-policy.test.ts` |
+| `lib/company-portability-sidebar.ts` | `lib/issue-execution-policy.ts` |
+| `lib/company-routes.test.ts` | `lib/issue-filters.test.ts` |
+| `lib/company-routes.ts` | `lib/issue-filters.ts` |
+| `lib/company-skill-routes.test.ts` | `lib/issue-monitor.ts` |
+| `lib/company-skill-routes.ts` | `lib/issue-output.test.ts` |
+| `lib/duplicate-agent-payload.test.ts` | `lib/issue-output.ts` |
+| `lib/duplicate-agent-payload.ts` | `lib/issue-properties-panel-key.test.ts` |
+| `lib/instance-settings.test.ts` | `lib/issue-properties-panel-key.ts` |
+| `lib/instance-settings.ts` | `lib/issue-reference.test.ts` |
+| `lib/issue-artifacts.test.ts` | `lib/issue-reference.ts` |
+| `lib/issue-artifacts.ts` | `lib/issue-thread-interactions.test.ts` |
+| `lib/issue-assignee-overrides.test.ts` | `lib/issue-thread-interactions.ts` |
+| `lib/issue-assignee-overrides.ts` | `lib/issue-timeline-events.test.ts` |
+| `lib/issue-attachments.ts` | `lib/issue-timeline-events.ts` |
+| `lib/issue-blockers.ts` | `lib/issue-tree.test.ts` |
+| `lib/issue-change-receipt.test.ts` | `lib/issue-tree.ts` |
+| `lib/issue-change-receipt.ts` | `lib/issueActiveRun.test.ts` |
+| `lib/issue-chat-messages.test.ts` | `lib/issueActiveRun.ts` |
+| `lib/issue-chat-messages.ts` | `lib/issueChatTranscriptRuns.test.ts` |
+| `lib/issue-chat-scroll.test.ts` | `lib/issueChatTranscriptRuns.ts` |
+| `lib/issue-chat-scroll.ts` | `lib/issueDetailBreadcrumb.test.ts` |
+| `lib/issue-detail-performance.ts` | `lib/issueDetailBreadcrumb.ts` |
+| `lib/issue-detail-subissues.test.ts` | `lib/issueDetailCache.test.ts` |
+| `lib/issue-detail-subissues.ts` | `lib/issueDetailCache.ts` |
+| `lib/issue-document-deep-link.test.ts` | `lib/issueDetailQuery.test.tsx` |
+| `lib/issue-document-deep-link.ts` | `lib/legacy-agent-config.test.ts` |
+| `lib/issue-execution-policy.test.ts` | `lib/legacy-agent-config.ts` |
+| `lib/issue-execution-policy.ts` | `lib/liveIssueIds.test.ts` |
+| `lib/issue-filters.test.ts` | `lib/liveIssueIds.ts` |
+| `lib/issue-filters.ts` | `lib/new-agent-hire-payload.test.ts` |
+| `lib/issue-monitor.test.tsx` | `lib/new-agent-hire-payload.ts` |
+| `lib/issue-monitor.ts` | `lib/new-agent-runtime-config.test.ts` |
+| `lib/issue-output.test.ts` | `lib/new-agent-runtime-config.ts` |
+| `lib/issue-output.ts` | `lib/onboarding-route.test.ts` |
+| `lib/issue-properties-panel-key.test.ts` | `lib/onboarding-route.ts` |
+| `lib/issue-properties-panel-key.ts` | `lib/optimistic-issue-comments.test.ts` |
+| `lib/issue-reference.test.ts` | `lib/optimistic-issue-comments.ts` |
+| `lib/issue-reference.ts` | `lib/optimistic-issue-runs.test.ts` |
+| `lib/issue-thread-interactions.test.ts` | `lib/optimistic-issue-runs.ts` |
+| `lib/issue-thread-interactions.ts` | `lib/page-visibility.test.ts` |
+| `lib/issue-timeline-events.test.ts` | `lib/page-visibility.ts` |
+| `lib/issue-timeline-events.ts` | `lib/paperclip-shared/src/agent-eligibility.test.ts` |
+| `lib/issue-tree.test.ts` | `lib/paperclip-shared/src/agent-eligibility.ts` |
+| `lib/issue-tree.ts` | `lib/paperclip-shared/src/agent-url-key.ts` |
+| `lib/issue-write-denial-activity.ts` | `lib/paperclip-shared/src/issue-attribution.test.ts` |
+| `lib/issueActiveRun.test.ts` | `lib/paperclip-shared/src/issue-attribution.ts` |
+| `lib/issueActiveRun.ts` | `lib/paperclip-shared/src/issue-references.test.ts` |
+| `lib/issueChatTranscriptRuns.test.ts` | `lib/paperclip-shared/src/issue-references.ts` |
+| `lib/issueChatTranscriptRuns.ts` | `lib/paperclip-shared/src/issue-thread-interactions.test.ts` |
+| `lib/issueDetailBreadcrumb.test.ts` | `lib/paperclip-shared/src/types/agent.ts` |
+| `lib/issueDetailBreadcrumb.ts` | `lib/paperclip-shared/src/types/issue-tree-control.ts` |
+| `lib/issueDetailCache.test.ts` | `lib/paperclip-shared/src/types/issue.ts` |
+| `lib/issueDetailCache.ts` | `lib/paperclip-shared/src/types/sidebar-badges.ts` |
+| `lib/issueDetailQuery.test.tsx` | `lib/paperclip-shared/src/types/sidebar-preferences.ts` |
+| `lib/legacy-agent-config.test.ts` | `lib/paperclip-shared/src/validators/agent.ts` |
+| `lib/legacy-agent-config.ts` | `lib/paperclip-shared/src/validators/issue-tree-control.ts` |
+| `lib/liveIssueIds.test.ts` | `lib/paperclip-shared/src/validators/issue.test.ts` |
+| `lib/liveIssueIds.ts` | `lib/paperclip-shared/src/validators/issue.ts` |
+| `lib/new-agent-hire-payload.test.ts` | `lib/paperclip-shared/src/validators/sidebar-preferences.ts` |
+| `lib/new-agent-hire-payload.ts` | `lib/router.tsx` |
+| `lib/new-agent-runtime-config.test.ts` | `lib/subIssueDefaults.test.ts` |
+| `lib/new-agent-runtime-config.ts` | `lib/subIssueDefaults.ts` |
+| `lib/onboarding-route.test.ts` | `pages/Activity.tsx` |
+| `lib/onboarding-route.ts` | `pages/AdapterManager.tsx` |
+| `lib/optimistic-issue-comments.test.ts` | `pages/AgentDetail.instructions.test.tsx` |
+| `lib/optimistic-issue-comments.ts` | `pages/AgentDetail.progress.test.ts` |
+| `lib/optimistic-issue-runs.test.ts` | `pages/AgentDetail.tsx` |
+| `lib/optimistic-issue-runs.ts` | `pages/Agents.test.tsx` |
+| `lib/page-visibility.test.ts` | `pages/Agents.tsx` |
+| `lib/page-visibility.ts` | `pages/ApprovalDetail.tsx` |
+| `lib/prefetchIssueComments.test.ts` | `pages/Approvals.tsx` |
+| `lib/router.tsx` | `pages/Artifacts.test.tsx` |
+| `lib/subIssueDefaults.test.ts` | `pages/Artifacts.tsx` |
+| `lib/subIssueDefaults.ts` | `pages/Auth.test.tsx` |
+| `pages/AdapterManager.tsx` | `pages/Auth.tsx` |
+| `pages/AgentDetail.instructions.test.tsx` | `pages/BoardChat.test.tsx` |
+| `pages/AgentDetail.liveRun.test.ts` | `pages/BoardChat.tsx` |
+| `pages/AgentDetail.progress.test.ts` | `pages/BoardClaim.tsx` |
+| `pages/AgentDetail.tsx` | `pages/BootstrapSetupUxLab.tsx` |
+| `pages/AgentToolsTab.test.tsx` | `pages/CaseDetail.test.tsx` |
+| `pages/AgentToolsTab.tsx` | `pages/CaseDetail.tsx` |
+| `pages/Agents.test.tsx` | `pages/Cases.test.tsx` |
+| `pages/Agents.tsx` | `pages/Cases.tsx` |
+| `pages/ApprovalDetail.tsx` | `pages/CliAuth.tsx` |
+| `pages/Approvals.tsx` | `pages/CloudUpstream.test.tsx` |
+| `pages/Artifacts.test.tsx` | `pages/CloudUpstream.tsx` |
+| `pages/Artifacts.tsx` | `pages/CloudUpstreamUxLab.tsx` |
+| `pages/Auth.test.tsx` | `pages/Companies.tsx` |
+| `pages/Auth.tsx` | `pages/CompanyAccess.test.tsx` |
+| `pages/BoardChat.test.tsx` | `pages/CompanyAccess.tsx` |
+| `pages/BoardChat.tsx` | `pages/CompanyEnvironments.test.tsx` |
+| `pages/BoardClaim.tsx` | `pages/CompanyEnvironments.tsx` |
+| `pages/BootstrapSetupUxLab.tsx` | `pages/CompanyExport.tsx` |
+| `pages/CaseDetail.test.tsx` | `pages/CompanyImport.tsx` |
+| `pages/CaseDetail.tsx` | `pages/CompanyInvites.test.tsx` |
+| `pages/Cases.test.tsx` | `pages/CompanyInvites.tsx` |
+| `pages/Cases.tsx` | `pages/CompanySettings.test.tsx` |
+| `pages/CliAuth.tsx` | `pages/CompanySettings.tsx` |
+| `pages/Companies.test.tsx` | `pages/CompanySettingsPluginPage.test.tsx` |
+| `pages/Companies.tsx` | `pages/CompanySettingsPluginPage.tsx` |
+| `pages/CompanyAccess.test.tsx` | `pages/CompanySkills.test.tsx` |
+| `pages/CompanyAccess.tsx` | `pages/CompanySkills.tsx` |
+| `pages/CompanyEnvironments.test.tsx` | `pages/Costs.tsx` |
+| `pages/CompanyEnvironments.tsx` | `pages/Dashboard.tsx` |
+| `pages/CompanyExport.test.tsx` | `pages/DashboardLive.tsx` |
+| `pages/CompanyExport.tsx` | `pages/DesignGuide.tsx` |
+| `pages/CompanyImport.test.tsx` | `pages/ExecutionWorkspaceDetail.test.tsx` |
+| `pages/CompanyImport.tsx` | `pages/ExecutionWorkspaceDetail.tsx` |
+| `pages/CompanyInvites.test.tsx` | `pages/GoalDetail.test.tsx` |
+| `pages/CompanyInvites.tsx` | `pages/GoalDetail.tsx` |
+| `pages/CompanySettings.test.tsx` | `pages/Goals.tsx` |
+| `pages/CompanySettings.tsx` | `pages/Inbox.test.tsx` |
+| `pages/CompanySettingsPluginPage.test.tsx` | `pages/Inbox.tsx` |
+| `pages/CompanySettingsPluginPage.tsx` | `pages/InstanceAccess.tsx` |
+| `pages/CompanySkills.test.tsx` | `pages/InstanceExperimentalSettings.test.tsx` |
+| `pages/CompanySkills.tsx` | `pages/InstanceExperimentalSettings.tsx` |
+| `pages/Costs.tsx` | `pages/InstanceGeneralSettings.tsx` |
+| `pages/CrossIssueCollaborationUxLab.tsx` | `pages/InstanceSettings.tsx` |
+| `pages/Dashboard.tsx` | `pages/InviteLanding.test.tsx` |
+| `pages/DashboardLive.tsx` | `pages/InviteLanding.tsx` |
+| `pages/DecisionQueuePage.tsx` | `pages/InviteUxLab.test.tsx` |
+| `pages/DesignGuide.tsx` | `pages/InviteUxLab.tsx` |
+| `pages/ExecutionWorkspaceDetail.provision-status.test.ts` | `pages/IssueChatLongThreadPerf.tsx` |
+| `pages/ExecutionWorkspaceDetail.service-ports.test.ts` | `pages/IssueChatUxLab.tsx` |
+| `pages/ExecutionWorkspaceDetail.test.tsx` | `pages/IssueDetail.test.tsx` |
+| `pages/ExecutionWorkspaceDetail.tsx` | `pages/IssueDetail.tsx` |
+| `pages/GoalDetail.test.tsx` | `pages/Issues.test.tsx` |
+| `pages/GoalDetail.tsx` | `pages/Issues.tsx` |
+| `pages/Goals.tsx` | `pages/JoinRequestQueue.tsx` |
+| `pages/Inbox.test.tsx` | `pages/MyIssues.tsx` |
+| `pages/Inbox.tsx` | `pages/NewAgent.tsx` |
+| `pages/InstanceAccess.tsx` | `pages/NotFound.tsx` |
+| `pages/InstanceExperimentalSettings.test.tsx` | `pages/Org.tsx` |
+| `pages/InstanceExperimentalSettings.tsx` | `pages/OrgChart.test.tsx` |
+| `pages/InstanceGeneralSettings.test.tsx` | `pages/OrgChart.tsx` |
+| `pages/InstanceGeneralSettings.tsx` | `pages/PipelineSettings.test.ts` |
+| `pages/InstanceSettings.tsx` | `pages/PipelineSettings.tsx` |
+| `pages/InviteLanding.test.tsx` | `pages/Pipelines.test.tsx` |
+| `pages/InviteLanding.tsx` | `pages/Pipelines.tsx` |
+| `pages/InviteUxLab.test.tsx` | `pages/PluginManager.tsx` |
+| `pages/InviteUxLab.tsx` | `pages/PluginPage.test.tsx` |
+| `pages/IssueChatLongThreadPerf.tsx` | `pages/PluginPage.tsx` |
+| `pages/IssueChatUxLab.tsx` | `pages/PluginSettings.test.tsx` |
+| `pages/IssueDetail.test.tsx` | `pages/PluginSettings.tsx` |
+| `pages/IssueDetail.tsx` | `pages/ProfileSettings.test.tsx` |
+| `pages/Issues.test.tsx` | `pages/ProfileSettings.tsx` |
+| `pages/Issues.tsx` | `pages/ProjectDetail.test.tsx` |
+| `pages/JoinRequestQueue.tsx` | `pages/ProjectDetail.tsx` |
+| `pages/MyIssues.tsx` | `pages/ProjectWorkspaceDetail.test.tsx` |
+| `pages/NewAgent.test.tsx` | `pages/ProjectWorkspaceDetail.tsx` |
+| `pages/NewAgent.tsx` | `pages/Projects.test.tsx` |
+| `pages/NotFound.tsx` | `pages/Projects.tsx` |
+| `pages/Org.tsx` | `pages/ResponsibleUserDenialUxLab.tsx` |
+| `pages/OrgChart.test.tsx` | `pages/RoutineDetail.tsx` |
+| `pages/OrgChart.tsx` | `pages/Routines.test.tsx` |
+| `pages/PipelineSettings.test.ts` | `pages/Routines.tsx` |
+| `pages/PipelineSettings.tsx` | `pages/RunTranscriptUxLab.tsx` |
+| `pages/Pipelines.test.tsx` | `pages/Search.test.tsx` |
+| `pages/Pipelines.tsx` | `pages/Search.tsx` |
+| `pages/PluginManager.tsx` | `pages/Secrets.render.test.tsx` |
+| `pages/PluginPage.test.tsx` | `pages/Secrets.test.ts` |
+| `pages/PluginPage.tsx` | `pages/Secrets.tsx` |
+| `pages/PluginSettings.test.tsx` | `pages/SkillStudio.test.tsx` |
+| `pages/PluginSettings.tsx` | `pages/SkillStudio.tsx` |
+| `pages/ProfileSettings.test.tsx` | `pages/SystemNoticeUxLab.tsx` |
+| `pages/ProfileSettings.tsx` | `pages/TeamCard.test.tsx` |
+| `pages/ProjectDetail.test.tsx` | `pages/TeamCatalog.fixtures.ts` |
+| `pages/ProjectDetail.tsx` | `pages/TeamCatalog.test.tsx` |
+| `pages/ProjectWorkspaceDetail.test.tsx` | `pages/TeamCatalog.tsx` |
+| `pages/ProjectWorkspaceDetail.tsx` | `pages/Timeline.test.tsx` |
+| `pages/Projects.test.tsx` | `pages/Timeline.tsx` |
+| `pages/Projects.tsx` | `pages/UserProfile.tsx` |
+| `pages/ResponsibleUserDenialUxLab.tsx` | `pages/Workspaces.test.tsx` |
+| `pages/RoutineDetail.test.tsx` | `pages/Workspaces.tsx` |
+| `pages/RoutineDetail.tsx` | `pages/agent-skills/AgentSkillRow.tsx` |
+| `pages/Routines.test.tsx` | `pages/agent-skills/AgentSkillsTab.tsx` |
+| `pages/Routines.tsx` | `pages/agent-skills/agent-skill-filter.test.ts` |
+| `pages/RunTranscriptUxLab.tsx` | `pages/agent-skills/agent-skill-filter.ts` |
+| `pages/Search.test.tsx` | `pages/agent-skills/agent-skill-source.test.ts` |
+| `pages/Search.tsx` | `pages/agent-skills/agent-skill-source.ts` |
+| `pages/Secrets.render.test.tsx` | `pages/secrets/ImportFromVaultDialog.test.tsx` |
+| `pages/Secrets.test.ts` | `pages/secrets/ImportFromVaultDialog.tsx` |
+| `pages/Secrets.tsx` | `pages/secrets/MissingUserSecretsBanner.test.tsx` |
+| `pages/SkillStudio.test.tsx` | `pages/secrets/MissingUserSecretsBanner.tsx` |
+| `pages/SkillStudio.tsx` | `pages/secrets/MyUserSecretsTab.tsx` |
+| `pages/StatusCards/ArchivedStatusCardRow.tsx` | `pages/secrets/SetMyUserSecretDialog.tsx` |
+| `pages/StatusCards/CreateStatusCardDialog.tsx` | `pages/secrets/UserSecretDefinitionsTab.tsx` |
+| `pages/StatusCards/StatusCardDetailDrawer.tsx` | `pages/secrets/my-value-state.ts` |
+| `pages/StatusCards/StatusCardSettingsForm.test.tsx` | `pages/secrets/user-secret-presentation.test.ts` |
+| `pages/StatusCards/StatusCardSettingsForm.tsx` | `pages/secrets/user-secret-presentation.tsx` |
+| `pages/StatusCards/StatusCardTile.test.tsx` | `pages/useInstallTeamCatalogEntry.test.tsx` |
+| `pages/StatusCards/StatusCardTile.tsx` | *(no structural counterpart in this slice)* |
+| `pages/StatusCards/SummarizerAgentSelect.tsx` | *(no structural counterpart in this slice)* |
+| `pages/StatusCards/format.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/StatusCards/format.ts` | *(no structural counterpart in this slice)* |
+| `pages/StatusCards/index.tsx` | *(no structural counterpart in this slice)* |
+| `pages/StatusCards/types.ts` | *(no structural counterpart in this slice)* |
+| `pages/SystemNoticeUxLab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/TaskChatLab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/TeamCard.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/TeamCatalog.fixtures.ts` | *(no structural counterpart in this slice)* |
+| `pages/TeamCatalog.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/TeamCatalog.tsx` | *(no structural counterpart in this slice)* |
+| `pages/Timeline.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/Timeline.tsx` | *(no structural counterpart in this slice)* |
+| `pages/UserProfile.tsx` | *(no structural counterpart in this slice)* |
+| `pages/WhatNeedsMe.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/WhatNeedsMe.tsx` | *(no structural counterpart in this slice)* |
+| `pages/Workspaces.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/Workspaces.tsx` | *(no structural counterpart in this slice)* |
+| `pages/agent-skills/AgentSkillReleasePicker.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/agent-skills/AgentSkillReleasePicker.tsx` | *(no structural counterpart in this slice)* |
+| `pages/agent-skills/AgentSkillRow.tsx` | *(no structural counterpart in this slice)* |
+| `pages/agent-skills/AgentSkillsTab.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/agent-skills/AgentSkillsTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/agent-skills/agent-skill-filter.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/agent-skills/agent-skill-filter.ts` | *(no structural counterpart in this slice)* |
+| `pages/agent-skills/agent-skill-source.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/agent-skills/agent-skill-source.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/AppDetail.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/AppDetail.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/AppLogo.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/AppNotConnected.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/AppNotConnected.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/AppsConnect.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/AppsConnect.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/AppsReview.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/Browse.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/Browse.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/Connections.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/Connections.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/ReviewQueueCard.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/ReviewQueueCard.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-connect-policy.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-connect-policy.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-definition-display.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/ActivityPanel.render.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/ActivityPanel.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/ActivityPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/AdvancedPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/PermissionsPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/ReviewPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/SetupPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/TestPanel.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/TestPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-detail/types.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/app-tabs.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/AppsSubNav.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/ConnectClientDialog.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/GatewayDetail.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/GatewaysList.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/NewGatewayDialog.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/gateway-helpers.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/gateway-helpers.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/gateway-tabs.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/panels/AppsToolsPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/panels/GatewayActivityPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/panels/GatewayAdvancedPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/panels/OverviewPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/panels/TokensPanel.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/gateways/panels/TokensPanel.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/google-sheets.ts` | *(no structural counterpart in this slice)* |
+| `pages/apps/store-cards.tsx` | *(no structural counterpart in this slice)* |
+| `pages/apps/useReviewCount.ts` | *(no structural counterpart in this slice)* |
+| `pages/audit/AuditFeed.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/audit/AuditFeed.tsx` | *(no structural counterpart in this slice)* |
+| `pages/audit/CompanyActivity.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/ImportFromVaultDialog.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/ImportFromVaultDialog.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/MissingUserSecretsBanner.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/MissingUserSecretsBanner.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/MyUserSecretsTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/ProposalsTab.render.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/ProposalsTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/SecretPathName.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/SetMyUserSecretDialog.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/UserSecretDefinitionsTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/my-value-state.ts` | *(no structural counterpart in this slice)* |
+| `pages/secrets/proposal-review.tsx` | *(no structural counterpart in this slice)* |
+| `pages/secrets/secret-path.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/secrets/secret-path.ts` | *(no structural counterpart in this slice)* |
+| `pages/secrets/user-secret-presentation.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/secrets/user-secret-presentation.tsx` | *(no structural counterpart in this slice)* |
+| `pages/skills/ImportSkillsFromProjectDialog.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/skills/ImportSkillsFromProjectDialog.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/AdvancedToolsRoute.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/AuditTab.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/AuditTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/GatewaysTab.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/GatewaysTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/PasteConfigTab.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/PasteConfigTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/PoliciesTab.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/PoliciesTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/ProfilesTab.test.ts` | *(no structural counterpart in this slice)* |
+| `pages/tools/ProfilesTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/RunYourOwnTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/RuntimeTab.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/RuntimeTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/SmokeLabTab.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/SmokeLabTab.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/ToolsAccess.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/ToolsAccess.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/connection-dialogs.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/profiles/ProfileActionDialog.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/profiles/ProfileDetail.test.tsx` | *(no structural counterpart in this slice)* |
+| `pages/tools/profiles/ProfileDetail.tsx` | *(no structural counterpart in this slice)* |
 | `pages/tools/profiles/ProfileDetailRoute.tsx` | *(no structural counterpart in this slice)* |
 | `pages/tools/profiles/ProfileWizard.test.tsx` | *(no structural counterpart in this slice)* |
 | `pages/tools/profiles/ProfileWizard.tsx` | *(no structural counterpart in this slice)* |
@@ -632,30 +632,30 @@ CLI 归属已固定为 `parrot-agent/crates/cli`；后续需逐命令核对参�
 按 Worker、Job、Scheduler、Cron、Heartbeat 等关键词做初筛；需继续核对触发周期、幂等、恢复和并发策略。
 
 - Paperclip: **65**
-- Parrot: **19**
+- Parrot: **20**
 
 | Paperclip evidence | Parrot evidence |
 |---|---|
-| `__tests__/decision-queues-routes.test.ts` | `heartbeat_service.rs` |
-| `__tests__/heartbeat-accepted-plan-workspace-refresh.test.ts` | `job_scheduler.rs` |
-| `__tests__/heartbeat-active-run-output-watchdog.test.ts` | `monitor_scheduler.rs` |
-| `__tests__/heartbeat-agent-session-message.test.ts` | `plugin_job_coordinator.rs` |
-| `__tests__/heartbeat-archived-company-guard.test.ts` | `plugin_job_scheduler.rs` |
-| `__tests__/heartbeat-auto-checkout.test.ts` | `plugin_worker_manager.rs` |
-| `__tests__/heartbeat-comment-wake-batching.test.ts` | `recovery_action_service.rs` |
-| `__tests__/heartbeat-context-summary.test.ts` | `recovery_observability_service.rs` |
-| `__tests__/heartbeat-cost-accounting.test.ts` | `routine_annotation_service.rs` |
-| `__tests__/heartbeat-dependency-scheduling.test.ts` | `routine_coordinator_service.rs` |
-| `__tests__/heartbeat-issue-liveness-escalation.test.ts` | `routine_execution_service.rs` |
-| `__tests__/heartbeat-issue-rewake-throttle.test.ts` | `routine_service.rs` |
-| `__tests__/heartbeat-ledger-billing-code.test.ts` | `routine_service_impl.rs` |
-| `__tests__/heartbeat-list.test.ts` | `routine_template.rs` |
-| `__tests__/heartbeat-local-environment.test.ts` | `routine_trigger_service.rs` |
-| `__tests__/heartbeat-lock-release-on-reassignment.test.ts` | `routine_variable_service.rs` |
-| `__tests__/heartbeat-managed-clone-credentials.test.ts` | `sagas/routine_trigger_saga.rs` |
-| `__tests__/heartbeat-model-profile.test.ts` | `status_card_worker.rs` |
-| `__tests__/heartbeat-pending-cleanup-sweep.test.ts` | `summary_slot_worker.rs` |
-| `__tests__/heartbeat-plugin-environment.test.ts` | *(no structural counterpart in this slice)* |
+| `__tests__/decision-queues-routes.test.ts` | `decision_retention_sweep_job.rs` |
+| `__tests__/heartbeat-accepted-plan-workspace-refresh.test.ts` | `heartbeat_service.rs` |
+| `__tests__/heartbeat-active-run-output-watchdog.test.ts` | `job_scheduler.rs` |
+| `__tests__/heartbeat-agent-session-message.test.ts` | `monitor_scheduler.rs` |
+| `__tests__/heartbeat-archived-company-guard.test.ts` | `plugin_job_coordinator.rs` |
+| `__tests__/heartbeat-auto-checkout.test.ts` | `plugin_job_scheduler.rs` |
+| `__tests__/heartbeat-comment-wake-batching.test.ts` | `plugin_worker_manager.rs` |
+| `__tests__/heartbeat-context-summary.test.ts` | `recovery_action_service.rs` |
+| `__tests__/heartbeat-cost-accounting.test.ts` | `recovery_observability_service.rs` |
+| `__tests__/heartbeat-dependency-scheduling.test.ts` | `routine_annotation_service.rs` |
+| `__tests__/heartbeat-issue-liveness-escalation.test.ts` | `routine_coordinator_service.rs` |
+| `__tests__/heartbeat-issue-rewake-throttle.test.ts` | `routine_execution_service.rs` |
+| `__tests__/heartbeat-ledger-billing-code.test.ts` | `routine_service.rs` |
+| `__tests__/heartbeat-list.test.ts` | `routine_service_impl.rs` |
+| `__tests__/heartbeat-local-environment.test.ts` | `routine_template.rs` |
+| `__tests__/heartbeat-lock-release-on-reassignment.test.ts` | `routine_trigger_service.rs` |
+| `__tests__/heartbeat-managed-clone-credentials.test.ts` | `routine_variable_service.rs` |
+| `__tests__/heartbeat-model-profile.test.ts` | `sagas/routine_trigger_saga.rs` |
+| `__tests__/heartbeat-pending-cleanup-sweep.test.ts` | `status_card_worker.rs` |
+| `__tests__/heartbeat-plugin-environment.test.ts` | `summary_slot_worker.rs` |
 | `__tests__/heartbeat-process-recovery.test.ts` | *(no structural counterpart in this slice)* |
 | `__tests__/heartbeat-project-env.test.ts` | *(no structural counterpart in this slice)* |
 | `__tests__/heartbeat-referenced-projects.test.ts` | *(no structural counterpart in this slice)* |
@@ -706,8 +706,8 @@ CLI 归属已固定为 `parrot-agent/crates/cli`；后续需逐命令核对参�
 
 按 provider/adapter/sandbox/storage/secret 关键词做初筛；需继续核对运行时能力矩阵和安全边界。
 
-- Paperclip: **475**
-- Parrot: **51**
+- Paperclip: **486**
+- Parrot: **69**
 
 | Paperclip evidence | Parrot evidence |
 |---|---|
@@ -731,55 +731,55 @@ CLI 归属已固定为 `parrot-agent/crates/cli`；后续需逐命令核对参�
 | `adapter-utils/src/acpx-engine/run-site-sandbox.test.ts` | `models/src/secrets.rs` |
 | `adapter-utils/src/acpx-engine/run-site-sandbox.ts` | `models/src/user_secret.rs` |
 | `adapter-utils/src/acpx-engine/session-codec.ts` | `models/src/user_secret_definition.rs` |
-| `adapter-utils/src/acpx-engine/session-reuse-store.test.ts` | `repositories/src/secret_provider_config_repository.rs` |
-| `adapter-utils/src/acpx-engine/session-reuse-store.ts` | `repositories/src/secret_repository.rs` |
-| `adapter-utils/src/acpx-engine/settlement-characterization.test.ts` | `repositories/src/user_secret_repository.rs` |
-| `adapter-utils/src/acpx-engine/settlement-sequence.test.ts` | `services/src/adapter_config_normalizer.rs` |
-| `adapter-utils/src/acpx-engine/settlement-sequence.ts` | `services/src/adapter_executor.rs` |
-| `adapter-utils/src/acpx-engine/spawn-smoke.test.ts` | `services/src/adapter_install_lock.rs` |
-| `adapter-utils/src/acpx-engine/startup-characterization.test.ts` | `services/src/adapter_install_transaction.rs` |
-| `adapter-utils/src/acpx-engine/startup-timing.test.ts` | `services/src/adapter_package_loader.rs` |
-| `adapter-utils/src/acpx-engine/startup-timing.ts` | `services/src/adapter_plugin.rs` |
-| `adapter-utils/src/acpx-engine/turn-characterization.test.ts` | `services/src/adapter_plugin_store.rs` |
-| `adapter-utils/src/acpx-engine/turn-sequence.test.ts` | `services/src/adapter_registry.rs` |
-| `adapter-utils/src/acpx-engine/turn-sequence.ts` | `services/src/adapter_registry_state.rs` |
-| `adapter-utils/src/acpx-engine/ui.ts` | `services/src/adapters/claude_local_adapter.rs` |
-| `adapter-utils/src/billing.test.ts` | `services/src/adapters/codex_local_adapter.rs` |
-| `adapter-utils/src/billing.ts` | `services/src/adapters/mod.rs` |
-| `adapter-utils/src/command-managed-runtime.test.ts` | `services/src/adapters/process_adapter.rs` |
-| `adapter-utils/src/command-managed-runtime.ts` | `services/src/agent_secret_bindings_service.rs` |
-| `adapter-utils/src/command-redaction.test.ts` | `services/src/asset_storage.rs` |
-| `adapter-utils/src/command-redaction.ts` | `services/src/builtin_adapter_types.rs` |
-| `adapter-utils/src/env-bindings.test.ts` | `services/src/database_secret_service.rs` |
-| `adapter-utils/src/env-bindings.ts` | `services/src/environment_driver/sandbox_driver.rs` |
-| `adapter-utils/src/exclude-patterns.ts` | `services/src/github_external_object_provider_service.rs` |
-| `adapter-utils/src/execution-target-sandbox.test.ts` | `services/src/plugin_runtime_sandbox.rs` |
-| `adapter-utils/src/execution-target-stdin-race.test.ts` | `services/src/secret_provider.rs` |
-| `adapter-utils/src/execution-target.test.ts` | `services/src/secret_provider_config_service.rs` |
-| `adapter-utils/src/execution-target.ts` | `services/src/secret_provider_service.rs` |
-| `adapter-utils/src/git-workspace-sync.test.ts` | `services/src/secret_remote_import_service.rs` |
-| `adapter-utils/src/git-workspace-sync.ts` | `services/src/secret_service.rs` |
-| `adapter-utils/src/index.ts` | `services/src/server_adapter.rs` |
-| `adapter-utils/src/local-process-sandbox.test.ts` | `services/src/user_secret_definition_service.rs` |
-| `adapter-utils/src/local-process-sandbox.ts` | `services/src/user_secret_service.rs` |
-| `adapter-utils/src/log-redaction.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/mcp-isolation.integration.test.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/remote-execution-env.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/remote-managed-runtime.test.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/remote-managed-runtime.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/runtime-progress.test.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/runtime-progress.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/sandbox-callback-bridge.test.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/sandbox-callback-bridge.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/sandbox-file-sync.test.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/sandbox-install-command.test.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/sandbox-install-command.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/sandbox-managed-runtime.test.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/sandbox-managed-runtime.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/sandbox-run-log-stream.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/sandbox-shell.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/server-utils-env.test.ts` | *(no structural counterpart in this slice)* |
-| `adapter-utils/src/server-utils.test.ts` | *(no structural counterpart in this slice)* |
+| `adapter-utils/src/acpx-engine/session-reuse-store.test.ts` | `repositories/src/secret_repository.rs` |
+| `adapter-utils/src/acpx-engine/session-reuse-store.ts` | `repositories/src/user_secret_repository.rs` |
+| `adapter-utils/src/acpx-engine/settlement-characterization.test.ts` | `repositories/tests/user_secret_version_test.rs` |
+| `adapter-utils/src/acpx-engine/settlement-sequence.test.ts` | `server/tests/adapter_e2e_test.rs` |
+| `adapter-utils/src/acpx-engine/settlement-sequence.ts` | `server/tests/provider_matrix_test.rs` |
+| `adapter-utils/src/acpx-engine/spawn-smoke.test.ts` | `server/tests/secret_proposals_http_parity_test.rs` |
+| `adapter-utils/src/acpx-engine/startup-characterization.test.ts` | `server/tests/secret_provider_descriptors_http_parity_test.rs` |
+| `adapter-utils/src/acpx-engine/startup-timing.test.ts` | `services/src/adapter_config_normalizer.rs` |
+| `adapter-utils/src/acpx-engine/startup-timing.ts` | `services/src/adapter_executor.rs` |
+| `adapter-utils/src/acpx-engine/turn-characterization.test.ts` | `services/src/adapter_install_lock.rs` |
+| `adapter-utils/src/acpx-engine/turn-sequence.test.ts` | `services/src/adapter_install_transaction.rs` |
+| `adapter-utils/src/acpx-engine/turn-sequence.ts` | `services/src/adapter_package_loader.rs` |
+| `adapter-utils/src/acpx-engine/ui.ts` | `services/src/adapter_plugin.rs` |
+| `adapter-utils/src/billing.test.ts` | `services/src/adapter_plugin_store.rs` |
+| `adapter-utils/src/billing.ts` | `services/src/adapter_registry.rs` |
+| `adapter-utils/src/command-managed-runtime.test.ts` | `services/src/adapter_registry_state.rs` |
+| `adapter-utils/src/command-managed-runtime.ts` | `services/src/adapter_runtime_secrets.rs` |
+| `adapter-utils/src/command-redaction.test.ts` | `services/src/adapters/claude_local_adapter.rs` |
+| `adapter-utils/src/command-redaction.ts` | `services/src/adapters/codex_local_adapter.rs` |
+| `adapter-utils/src/env-bindings.test.ts` | `services/src/adapters/cursor_cloud_adapter.rs` |
+| `adapter-utils/src/env-bindings.ts` | `services/src/adapters/cursor_local_adapter.rs` |
+| `adapter-utils/src/exclude-patterns.ts` | `services/src/adapters/gemini_local_adapter.rs` |
+| `adapter-utils/src/execution-target-sandbox.test.ts` | `services/src/adapters/grok_local_adapter.rs` |
+| `adapter-utils/src/execution-target-stdin-race.test.ts` | `services/src/adapters/hermes_gateway_adapter.rs` |
+| `adapter-utils/src/execution-target.test.ts` | `services/src/adapters/hermes_local_adapter.rs` |
+| `adapter-utils/src/execution-target.ts` | `services/src/adapters/mod.rs` |
+| `adapter-utils/src/git-workspace-sync.test.ts` | `services/src/adapters/openclaw_gateway_adapter.rs` |
+| `adapter-utils/src/git-workspace-sync.ts` | `services/src/adapters/opencode_local_adapter.rs` |
+| `adapter-utils/src/index.ts` | `services/src/adapters/pi_local_adapter.rs` |
+| `adapter-utils/src/local-process-sandbox.test.ts` | `services/src/adapters/process_adapter.rs` |
+| `adapter-utils/src/local-process-sandbox.ts` | `services/src/agent_secret_bindings_service.rs` |
+| `adapter-utils/src/log-redaction.ts` | `services/src/asset_storage.rs` |
+| `adapter-utils/src/mcp-isolation.integration.test.ts` | `services/src/aws_secrets_manager_provider.rs` |
+| `adapter-utils/src/remote-execution-env.ts` | `services/src/builtin_adapter_types.rs` |
+| `adapter-utils/src/remote-managed-runtime.test.ts` | `services/src/database_secret_service.rs` |
+| `adapter-utils/src/remote-managed-runtime.ts` | `services/src/environment_driver/local_fake_sandbox_driver.rs` |
+| `adapter-utils/src/runtime-progress.test.ts` | `services/src/environment_driver/sandbox_capabilities.rs` |
+| `adapter-utils/src/runtime-progress.ts` | `services/src/environment_driver/sandbox_driver.rs` |
+| `adapter-utils/src/sandbox-callback-bridge.test.ts` | `services/src/github_external_object_provider_service.rs` |
+| `adapter-utils/src/sandbox-callback-bridge.ts` | `services/src/plugin_runtime_sandbox.rs` |
+| `adapter-utils/src/sandbox-file-sync.test.ts` | `services/src/s3_storage.rs` |
+| `adapter-utils/src/sandbox-install-command.test.ts` | `services/src/secret_provider.rs` |
+| `adapter-utils/src/sandbox-install-command.ts` | `services/src/secret_provider_config_service.rs` |
+| `adapter-utils/src/sandbox-managed-runtime.test.ts` | `services/src/secret_remote_import_service.rs` |
+| `adapter-utils/src/sandbox-managed-runtime.ts` | `services/src/secret_service.rs` |
+| `adapter-utils/src/sandbox-run-log-stream.ts` | `services/src/server_adapter.rs` |
+| `adapter-utils/src/sandbox-shell.ts` | `services/src/user_secret_definition_service.rs` |
+| `adapter-utils/src/server-utils-env.test.ts` | `services/src/user_secret_service.rs` |
+| `adapter-utils/src/server-utils.test.ts` | `services/tests/adapter_runtime_credentials_test.rs` |
 | `adapter-utils/src/server-utils.ts` | *(no structural counterpart in this slice)* |
 | `adapter-utils/src/session-compaction.ts` | *(no structural counterpart in this slice)* |
 | `adapter-utils/src/setup-token-transport.test.ts` | *(no structural counterpart in this slice)* |
@@ -1172,6 +1172,17 @@ CLI 归属已固定为 `parrot-agent/crates/cli`；后续需逐命令核对参�
 | `plugins/sandbox-providers/novita/src/plugin.ts` | *(no structural counterpart in this slice)* |
 | `plugins/sandbox-providers/novita/src/worker.ts` | *(no structural counterpart in this slice)* |
 | `plugins/sandbox-providers/novita/vitest.config.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/adapter-agnostic-keys.test.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/adapter-type.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/adapter-types.test.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/types/adapter-registry.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/types/adapter-skills.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/types/secrets.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/validators/adapter-registry.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/validators/adapter-registry.test.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/validators/adapter-skills.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/validators/secret.d.ts` | *(no structural counterpart in this slice)* |
+| `shared/dist/validators/secret.test.d.ts` | *(no structural counterpart in this slice)* |
 | `shared/src/adapter-agnostic-keys.test.ts` | *(no structural counterpart in this slice)* |
 | `shared/src/adapter-auth-session.ts` | *(no structural counterpart in this slice)* |
 | `shared/src/adapter-type.ts` | *(no structural counterpart in this slice)* |

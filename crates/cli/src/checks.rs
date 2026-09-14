@@ -120,6 +120,53 @@ pub fn run_doctor(config: &CliConfig, json_output: bool) -> Result<()> {
         }
     }
 
+    // Keep the individual preflight checks visible, matching Paperclip's
+    // checks/* family.  They are warnings when the server can still operate
+    // through a different deployment path; only an unreachable server above
+    // is a hard failure.
+    let jwt_configured = ["PARROT_AGENT_JWT_SECRET", "PAPERCLIP_AGENT_JWT_SECRET"]
+        .iter()
+        .any(|key| std::env::var(key).map(|value| !value.trim().is_empty()).unwrap_or(false));
+    checks.push(if jwt_configured {
+        CheckResult::pass("agent-jwt-secret", "agent JWT secret is configured")
+    } else {
+        CheckResult::warn("agent-jwt-secret", "agent JWT secret is not configured in the environment")
+    });
+
+    let deployment_mode = std::env::var("DEPLOYMENT_MODE").unwrap_or_else(|_| "local_trusted".to_owned());
+    let deployment_exposure = std::env::var("DEPLOYMENT_EXPOSURE").unwrap_or_else(|_| "private".to_owned());
+    checks.push(if matches!(deployment_mode.as_str(), "local_trusted" | "authenticated")
+        && matches!(deployment_exposure.as_str(), "private" | "public")
+    {
+        CheckResult::pass(
+            "deployment-auth",
+            format!("deployment mode {deployment_mode}, exposure {deployment_exposure}"),
+        )
+    } else {
+        CheckResult::warn(
+            "deployment-auth",
+            format!("unrecognized deployment mode/exposure: {deployment_mode}/{deployment_exposure}"),
+        )
+    });
+
+    let executable = std::env::current_exe().ok();
+    checks.push(match executable {
+        Some(path) if path.is_file() => CheckResult::pass(
+            "path-resolver",
+            format!("current executable resolved at {}", path.display()),
+        ),
+        Some(path) => CheckResult::warn(
+            "path-resolver",
+            format!("current executable path is not a file: {}", path.display()),
+        ),
+        None => CheckResult::warn("path-resolver", "current executable path could not be resolved"),
+    });
+
+    checks.push(check_storage_path());
+    checks.push(check_log_path());
+    checks.push(check_port(&config.server_url));
+    checks.push(check_managed_install());
+
     let passed = checks.iter().filter(|c| c.status == "pass").count();
     let warned = checks.iter().filter(|c| c.status == "warn").count();
     let failed = checks.iter().filter(|c| c.status == "fail").count();
@@ -166,6 +213,59 @@ pub fn run_doctor(config: &CliConfig, json_output: bool) -> Result<()> {
         anyhow::bail!("doctor checks failed: {} check(s) failed", failed);
     }
     Ok(())
+}
+
+fn check_storage_path() -> CheckResult {
+    let path = std::env::var_os("PARROT_STORAGE_DIR")
+        .or_else(|| std::env::var_os("PARROT_DATA_DIR"))
+        .map(std::path::PathBuf::from);
+    match path {
+        None => CheckResult::warn("storage", "no explicit storage directory configured (using server defaults)"),
+        Some(path) if path.is_dir() => CheckResult::pass("storage", format!("storage directory exists: {}", path.display())),
+        Some(path) => CheckResult::warn("storage", format!("storage directory does not exist: {}", path.display())),
+    }
+}
+
+fn check_log_path() -> CheckResult {
+    let path = std::env::var_os("PARROT_LOG_DIR").map(std::path::PathBuf::from);
+    match path {
+        None => CheckResult::warn("log", "PARROT_LOG_DIR is not set (journal/default logging may be in use)"),
+        Some(path) if path.is_dir() => CheckResult::pass("log", format!("log directory exists: {}", path.display())),
+        Some(path) => CheckResult::warn("log", format!("log directory does not exist: {}", path.display())),
+    }
+}
+
+fn check_port(server_url: &str) -> CheckResult {
+    let Ok(url) = reqwest::Url::parse(server_url) else {
+        return CheckResult::warn("port", "server URL could not be parsed");
+    };
+    let Some(host) = url.host_str() else {
+        return CheckResult::warn("port", "server URL has no host");
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let address = format!("{host}:{port}");
+    match address
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .and_then(|address| {
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(500)).ok()
+        })
+    {
+        Some(_) => CheckResult::pass("port", format!("server port {address} is reachable")),
+        None => CheckResult::warn("port", format!("server port {address} is not reachable")),
+    }
+}
+
+fn check_managed_install() -> CheckResult {
+    let paths = crate::install_store::InstallStorePaths::new();
+    match crate::install_store::read_install_manifest(&paths) {
+        Ok(Some(manifest)) => CheckResult::pass(
+            "managed-install",
+            format!("managed install manifest is valid (v{})", manifest.current.version),
+        ),
+        Ok(None) => CheckResult::warn("managed-install", "no managed install manifest found"),
+        Err(error) => CheckResult::warn("managed-install", format!("manifest is invalid: {error}")),
+    }
 }
 
 #[cfg(test)]

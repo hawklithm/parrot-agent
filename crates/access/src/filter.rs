@@ -99,10 +99,12 @@ mod tests {
     use chrono::Utc;
 
     fn create_test_agent(company_id: Uuid) -> Agent {
+        let id = Uuid::new_v4();
         Agent {
-            id: Uuid::new_v4(),
+            id,
             company_id,
             name: "Test Agent".to_string(),
+            url_key: models::agent_url_key::derive_agent_url_key(Some("Test Agent"), Some(id)),
             role: AgentRole::General,
             status: AgentStatus::Idle,
             adapter_type: "process".to_string(),

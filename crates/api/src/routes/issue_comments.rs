@@ -16,6 +16,7 @@ use services::{
 };
 use crate::errors::ApiError;
 use crate::app_state::AppState;
+use crate::extractors::IssueId;
 use crate::routes::log_activity;
 use repositories::ISSUE_COMMENT_COLUMNS;
 use services::auth::AuthorizationActor;
@@ -24,13 +25,15 @@ use services::auth::AuthorizationActor;
 ///
 /// `actor_type`/`actor_id`/`actor_run_id` are accepted in snake_case (existing
 /// clients) or camelCase (Paperclip clients). New Paperclip fields use their
-/// canonical camelCase names.
+/// canonical camelCase names. The actor fields are optional for board clients:
+/// Paperclip derives them from the authenticated actor instead of requiring the
+/// browser to echo identity fields in the request body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCommentRequest {
     pub body: String,
     #[serde(alias = "actor_type")]
-    pub actor_type: CommentActorType,
+    pub actor_type: Option<CommentActorType>,
     #[serde(alias = "actor_id")]
     pub actor_id: Option<Uuid>,
     #[serde(alias = "actor_run_id")]
@@ -240,15 +243,23 @@ impl From<CommentServiceError> for ApiError {
 pub async fn add_comment(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
     Json(req): Json<AddCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    assert_issue_company(&state, &actor, issue_id).await?;
+    // Local-trusted Board actors are instance admins and intentionally carry
+    // a nil company id.  Use the issue's resolved company from the access
+    // check below when loading the issue; using actor.company_id() here makes
+    // every comment POST look up the issue in company `00000000-...`.
+    let company_id = assert_issue_company(&state, &actor, issue_id).await?;
     let service = state.issue_comment_service.clone();
     let (expected_actor_type, _, authenticated_actor_id, authenticated_run_id) =
         authenticated_comment_actor(&actor)?;
 
-    if req.actor_type != expected_actor_type {
+    if req
+        .actor_type
+        .as_ref()
+        .is_some_and(|actor_type| actor_type != &expected_actor_type)
+    {
         return Err(ApiError::Forbidden(
             "Comment actor type must match the authenticated actor".to_string(),
         ));
@@ -270,9 +281,6 @@ pub async fn add_comment(
         ));
     }
 
-    let company_id = actor.company_id().ok_or_else(|| {
-        ApiError::Forbidden("Company scope is required for issue comments".into())
-    })?;
     let issue = state
         .issue_service
         .get(issue_id, company_id)
@@ -347,8 +355,10 @@ pub async fn add_comment(
     }
 
     let interrupt_requested = req.interrupt;
-    // Save actor_type before moving req
-    let actor_type = req.actor_type;
+    // Derive the actor type when the Paperclip-compatible browser request does
+    // not echo it; explicit values are retained for legacy clients after the
+    // authenticated-actor consistency check above.
+    let actor_type = req.actor_type.unwrap_or(expected_actor_type);
     let actor_id = Some(authenticated_actor_id);
     let actor_run_id = req.actor_run_id.or(authenticated_run_id);
     
@@ -579,7 +589,9 @@ pub async fn add_comment(
                     issue_id,
                     company_id,
                     HeartbeatWakeupOptions {
-                        source: Some("issue.comment.reopen".to_string()),
+                        // `invocation_source` records how the run was invoked;
+                        // "issue.comment.reopen" stays in context_snapshot.source.
+                        source: Some("automation".to_string()),
                         trigger_detail: Some("system".to_string()),
                         reason: Some("issue_reopened_via_comment".to_string()),
                         requested_by_actor_type: Some(format!("{actor_type:?}").to_lowercase()),
@@ -631,7 +643,8 @@ pub async fn add_comment(
         // We don't fail the comment creation if interaction expiration fails
     }
 
-    Ok((StatusCode::CREATED, Json(CommentResponse { comment })))
+    // Paperclip's UI consumes the created comment directly (not an envelope).
+    Ok((StatusCode::CREATED, Json(comment)))
 }
 
 #[cfg(test)]
@@ -686,7 +699,7 @@ mod tests {
 pub async fn list_comments(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
     Query(query): Query<CommentPaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     assert_issue_company(&state, &actor, issue_id).await?;
@@ -786,6 +799,9 @@ pub async fn get_comment(
     let service = state.issue_comment_service.clone();
     let comment = service.get_comment(comment_id).await?;
 
+    // Keep the legacy `/comments/:comment_id` endpoint envelope-shaped for
+    // older clients. The issue-scoped endpoint below follows Paperclip's
+    // direct-comment response contract.
     Ok(Json(CommentResponse { comment }))
 }
 
@@ -795,7 +811,8 @@ pub async fn get_comment(
 pub async fn get_issue_comment(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, comment_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, comment_id)): Path<(String, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     assert_issue_company(&state, &actor, issue_id).await?;
     let belongs_to_issue = sqlx::query_scalar::<_, bool>(
@@ -810,14 +827,14 @@ pub async fn get_issue_comment(
         return Err(ApiError::NotFound(format!("Comment not found: {comment_id}")));
     }
     let comment = state.issue_comment_service.get_comment(comment_id).await?;
-    Ok(Json(CommentResponse { comment }))
+    Ok(Json(comment))
 }
 
 async fn assert_issue_company(
     state: &AppState,
     actor: &AuthorizationActor,
     issue_id: Uuid,
-) -> Result<(), ApiError> {
+) -> Result<Uuid, ApiError> {
     // Match Paperclip: load the issue first, then authorize using its owning
     // company. A local-trusted Board actor intentionally has no company
     // scope, so comparing actor.company_id() to issue.company_id is invalid.
@@ -830,7 +847,8 @@ async fn assert_issue_company(
         return Err(ApiError::NotFound(format!("Issue not found: {issue_id}")));
     };
     crate::routes::assert_company_access(actor, company_id, true)
-        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))
+        .map_err(|_| ApiError::Forbidden("Issue is outside the actor's company scope".into()))?;
+    Ok(company_id)
 }
 
 /// PUT /comments/:comment_id - Update a comment

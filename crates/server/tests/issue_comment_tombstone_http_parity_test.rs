@@ -11,12 +11,10 @@ use sqlx::PgPool;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
-async fn migrate(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 async fn seed_company(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
@@ -135,7 +133,7 @@ async fn deleting_comment_writes_redacted_tombstone_and_is_idempotent(pool: PgPo
         issue_updated_after > issue_updated_before,
         "creating a comment should refresh issue updated_at"
     );
-    let comment_id = created["comment"]["id"]
+    let comment_id = created["id"]
         .as_str()
         .and_then(|id| Uuid::parse_str(id).ok())
         .expect("created comment id");
@@ -174,9 +172,9 @@ async fn deleting_comment_writes_redacted_tombstone_and_is_idempotent(pool: PgPo
     )
     .await;
     assert_eq!(status, StatusCode::OK, "get={fetched:?}");
-    assert_eq!(fetched["comment"]["body"], "");
-    assert!(fetched["comment"]["deletedAt"].is_string());
-    assert!(fetched["comment"]["metadata"].is_null());
+    assert_eq!(fetched["body"], "");
+    assert!(fetched["deletedAt"].is_string());
+    assert!(fetched["metadata"].is_null());
 
     let (status, body) = send(
         &app,
@@ -213,7 +211,7 @@ async fn only_the_authenticated_comment_author_can_tombstone(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "create={created:?}");
-    let comment_id = Uuid::parse_str(created["comment"]["id"].as_str().expect("comment id"))
+    let comment_id = Uuid::parse_str(created["id"].as_str().expect("comment id"))
         .expect("comment uuid");
 
     let (status, body) = send(

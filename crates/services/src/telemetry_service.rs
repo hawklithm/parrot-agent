@@ -8,7 +8,7 @@
 //! - No PII collection — only operational events and dimensions
 
 use std::fs::{self, File};
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

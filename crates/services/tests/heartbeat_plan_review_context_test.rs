@@ -17,9 +17,10 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 async fn connect() -> Option<PgPool> {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:admin123@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping heartbeat plan review context test: DATABASE_URL is not set");
+        return None;
+    };
     match PgPool::connect(&database_url).await {
         Ok(p) => Some(p),
         Err(_) => {
@@ -156,7 +157,7 @@ async fn planning_wake_persists_plan_review_context() {
         issue_id,
         company_id,
         HeartbeatWakeupOptions {
-            source: Some("test".to_string()),
+            source: Some("on_demand".to_string()),
             context_snapshot: Some(serde_json::json!({ "issueId": issue_id })),
             ..Default::default()
         },
@@ -202,7 +203,7 @@ async fn interaction_wake_without_plan_document_omits_context() {
         issue_id,
         company_id,
         HeartbeatWakeupOptions {
-            source: Some("test".to_string()),
+            source: Some("on_demand".to_string()),
             context_snapshot: Some(serde_json::json!({
                 "issueId": issue_id,
                 "interactionId": Uuid::new_v4(),
@@ -237,7 +238,7 @@ async fn standard_wake_without_markers_omits_context() {
         issue_id,
         company_id,
         HeartbeatWakeupOptions {
-            source: Some("test".to_string()),
+            source: Some("on_demand".to_string()),
             context_snapshot: Some(serde_json::json!({ "issueId": issue_id })),
             ..Default::default()
         },

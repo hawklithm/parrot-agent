@@ -107,38 +107,319 @@ impl PgCompanySkillRepository {
     }
 }
 
+/// `iconUrl`/`color`/`tagline`/`authorName`/`homepageUrl` are not modelled as
+/// dedicated columns in Parrot, so they persist into `company_skills.metadata`.
+/// Only keys the caller actually supplied are included, which keeps this patch
+/// safe to `||` onto an existing metadata object.
+fn company_skill_metadata_patch(data: &JsonValue) -> JsonValue {
+    let mut patch = serde_json::Map::new();
+    for key in ["iconUrl", "color", "tagline", "authorName", "homepageUrl"] {
+        if let Some(value) = data.get(key) {
+            patch.insert(key.to_string(), value.clone());
+        }
+    }
+    JsonValue::Object(patch)
+}
+
+/// Paperclip source badge derived from the persisted source metadata.
+fn company_skill_source_badge(alias: &str) -> String {
+    format!(
+        "CASE \
+           WHEN {alias}.source_type = 'catalog' THEN 'catalog' \
+           WHEN {alias}.is_paperclip_managed THEN 'paperclip' \
+           WHEN {alias}.source_type = 'github' \
+             OR position('github.com' in COALESCE({alias}.source_ref, '')) > 0 THEN 'github' \
+           WHEN {alias}.source_type = 'url' THEN 'url' \
+           WHEN {alias}.source_type = 'skills_sh' THEN 'skills_sh' \
+           ELSE 'local' \
+         END"
+    )
+}
+
+/// Human-readable provenance label, mirroring Paperclip's `deriveSkillSourceInfo`.
+fn company_skill_source_label(alias: &str) -> String {
+    format!(
+        "CASE \
+           WHEN {alias}.source_type = 'catalog' THEN 'Catalog' \
+           WHEN {alias}.is_paperclip_managed THEN 'Paperclip' \
+           WHEN {alias}.source_type = 'github' \
+             OR position('github.com' in COALESCE({alias}.source_ref, '')) > 0 THEN 'GitHub' \
+           WHEN {alias}.source_type = 'url' THEN 'URL' \
+           WHEN {alias}.source_type = 'skills_sh' THEN 'skills.sh' \
+           ELSE COALESCE({alias}.source_locator, 'Local folder') \
+         END"
+    )
+}
+
+/// Paperclip-managed skills are read-only until they are forked.
+fn company_skill_editable(alias: &str) -> String {
+    format!("((NOT {alias}.is_paperclip_managed) OR {alias}.is_fork)")
+}
+
+/// Newest version row, mirroring Paperclip's `current_version_id` column.
+fn company_skill_current_version_id(alias: &str) -> String {
+    format!(
+        "(SELECT sv.id FROM skill_versions sv \
+         WHERE sv.company_id = {alias}.company_id AND sv.skill_id = {alias}.id \
+         ORDER BY sv.created_at DESC, sv.id DESC LIMIT 1)"
+    )
+}
+
+/// Whether an agent's `desired_skills` entry refers to this skill.
+///
+/// Entries are either a bare key string or a `{key, versionId}` object
+/// (`sync_agent_skills` normalizes both), so the match has to consider both
+/// the canonical `key` and the `slug`.
+fn company_skill_desired_entry_matches(alias: &str, entry: &str) -> String {
+    format!(
+        "(CASE jsonb_typeof({entry}) \
+           WHEN 'string' THEN {entry} #>> '{{}}' \
+           ELSE {entry}->>'key' END) IN ({alias}.key, {alias}.slug) \
+         OR {entry}->>'key' = {alias}.slug"
+    )
+}
+
+/// An agent's configured skill set, normalized to an array.
+///
+/// `adapter_config` is `snake_case` at rest (`desired_skills`), unlike the API
+/// projection which serializes it as `desiredSkills`.
+fn desired_skills_array(agent: &str) -> String {
+    format!(
+        "(CASE WHEN jsonb_typeof({agent}.adapter_config->'desired_skills') = 'array' \
+               THEN {agent}.adapter_config->'desired_skills' ELSE '[]'::jsonb END)"
+    )
+}
+
+/// Key/value pairs per `jsonb_build_object` call.
+///
+/// PostgreSQL rejects functions with more than 100 arguments, so the company
+/// skill projection has to be assembled from chunked objects merged with `||`.
+const JSONB_OBJECT_PAIR_LIMIT: usize = 50;
+
+fn jsonb_object_from_pairs(pairs: &[(String, String)]) -> String {
+    pairs
+        .chunks(JSONB_OBJECT_PAIR_LIMIT)
+        .map(|chunk| {
+            let args = chunk
+                .iter()
+                .map(|(key, expr)| format!("'{key}', {expr}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("jsonb_build_object({args})")
+        })
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+fn jsonb_pair(key: &str, expr: impl Into<String>) -> (String, String) {
+    (key.to_string(), expr.into())
+}
+
+/// Full `CompanySkill` projection shared by the list, detail, create and update
+/// reads.
+///
+/// Columns Parrot does not persist as dedicated fields are projected from
+/// `metadata` when an importer captured them, and as JSON `null` otherwise, so
+/// the response always satisfies the Paperclip company-skill contract.
+fn company_skill_fields(alias: &str) -> Vec<(String, String)> {
+    let desired = desired_skills_array("agent");
+    let matches = company_skill_desired_entry_matches(alias, "desired");
+    let editable = company_skill_editable(alias);
+    let metadata_kind =
+        format!("COALESCE({alias}.metadata->>'catalogKind', {alias}.metadata->>'sourceKind')");
+    vec![
+        jsonb_pair("id", format!("{alias}.id")),
+        jsonb_pair("companyId", format!("{alias}.company_id")),
+        jsonb_pair("key", format!("{alias}.key")),
+        jsonb_pair("slug", format!("{alias}.slug")),
+        jsonb_pair("name", format!("{alias}.name")),
+        jsonb_pair("description", format!("NULLIF({alias}.description, '')")),
+        jsonb_pair("markdown", format!("{alias}.markdown")),
+        jsonb_pair("sourceType", format!("{alias}.source_type")),
+        jsonb_pair("sourceLocator", format!("{alias}.source_locator")),
+        jsonb_pair("sourceRef", format!("{alias}.source_ref")),
+        jsonb_pair("trustLevel", format!("{alias}.trust_level")),
+        jsonb_pair("compatibility", format!("{alias}.compatibility")),
+        jsonb_pair("fileInventory", format!("{alias}.file_inventory")),
+        jsonb_pair("iconUrl", format!("{alias}.metadata->>'iconUrl'")),
+        jsonb_pair("color", format!("{alias}.metadata->>'color'")),
+        jsonb_pair("tagline", format!("{alias}.metadata->>'tagline'")),
+        jsonb_pair("authorName", format!("{alias}.metadata->>'authorName'")),
+        jsonb_pair("homepageUrl", format!("{alias}.metadata->>'homepageUrl'")),
+        jsonb_pair("categories", format!("{alias}.categories")),
+        jsonb_pair("sharingScope", format!("{alias}.sharing_scope")),
+        jsonb_pair("publicShareToken", "NULL"),
+        jsonb_pair("forkedFromSkillId", format!("{alias}.forked_from_skill_id")),
+        jsonb_pair(
+            "forkedFromCompanyId",
+            format!(
+                "(SELECT src.company_id FROM company_skills src \
+                 WHERE src.id = {alias}.forked_from_skill_id)"
+            ),
+        ),
+        jsonb_pair(
+            "starCount",
+            format!(
+                "(SELECT COUNT(*) FROM skill_stars ss \
+                 WHERE ss.company_id = {alias}.company_id AND ss.skill_id = {alias}.id)"
+            ),
+        ),
+        jsonb_pair("installCount", format!("{alias}.install_count")),
+        jsonb_pair(
+            "forkCount",
+            format!(
+                "(SELECT COUNT(*) FROM company_skills child \
+                 WHERE child.company_id = {alias}.company_id \
+                   AND child.forked_from_skill_id = {alias}.id)"
+            ),
+        ),
+        jsonb_pair("currentVersionId", company_skill_current_version_id(alias)),
+        jsonb_pair("metadata", format!("{alias}.metadata")),
+        jsonb_pair("createdAt", format!("{alias}.created_at")),
+        jsonb_pair("updatedAt", format!("{alias}.updated_at")),
+        jsonb_pair(
+            "attachedAgentCount",
+            format!(
+                "(SELECT COUNT(DISTINCT agent.id) FROM agents agent \
+                 WHERE agent.company_id = {alias}.company_id AND agent.status <> 'terminated' \
+                   AND EXISTS (SELECT 1 FROM jsonb_array_elements({desired}) AS desired \
+                               WHERE {matches}))"
+            ),
+        ),
+        jsonb_pair("editable", editable.clone()),
+        jsonb_pair(
+            "editableReason",
+            format!(
+                "CASE WHEN {editable} THEN NULL \
+                 ELSE 'Managed skills are read-only. Fork this skill to edit it.' END"
+            ),
+        ),
+        jsonb_pair("sourceBadge", company_skill_source_badge(alias)),
+        jsonb_pair("sourceLabel", company_skill_source_label(alias)),
+        jsonb_pair(
+            "sourcePath",
+            format!("COALESCE({alias}.source_locator, {alias}.metadata->>'directoryRoot')"),
+        ),
+        jsonb_pair(
+            "catalogKind",
+            format!(
+                "CASE WHEN {alias}.source_type = 'catalog' AND {metadata_kind} IN ('bundled', 'optional') \
+                 THEN {metadata_kind} END"
+            ),
+        ),
+        jsonb_pair(
+            "originHash",
+            format!("CASE WHEN {alias}.source_type = 'catalog' THEN {alias}.metadata->>'originHash' END"),
+        ),
+        jsonb_pair(
+            "packageName",
+            format!("CASE WHEN {alias}.source_type = 'catalog' THEN {alias}.metadata->>'packageName' END"),
+        ),
+        jsonb_pair(
+            "packageVersion",
+            format!("CASE WHEN {alias}.source_type = 'catalog' THEN {alias}.metadata->>'packageVersion' END"),
+        ),
+        jsonb_pair("catalogId", format!("{alias}.catalog_id")),
+        jsonb_pair("category", format!("{alias}.category")),
+        jsonb_pair("version", format!("{alias}.version")),
+        jsonb_pair("tags", format!("{alias}.tags")),
+        jsonb_pair("config", format!("{alias}.config")),
+        jsonb_pair("isPaperclipManaged", format!("{alias}.is_paperclip_managed")),
+        jsonb_pair("isFork", format!("{alias}.is_fork")),
+        jsonb_pair("forkedFromCatalogId", format!("{alias}.forked_from_catalog_id")),
+        jsonb_pair("status", format!("{alias}.status")),
+        jsonb_pair("updateAvailable", format!("{alias}.update_available")),
+        jsonb_pair("latestVersion", format!("{alias}.latest_version")),
+    ]
+}
+
+/// `CompanySkillDetail`-only pairs, layered onto [`company_skill_fields`].
+fn company_skill_detail_fields(alias: &str) -> Vec<(String, String)> {
+    let desired = desired_skills_array("agent");
+    let matches = company_skill_desired_entry_matches(alias, "desired");
+    let usage_matches = company_skill_desired_entry_matches(alias, "desired");
+    // `usage` is the outer subquery alias — `agent` is only in scope inside it.
+    let url_key = models::agent_url_key::agent_url_key_sql("usage");
+    vec![
+        jsonb_pair(
+            "usedByAgents",
+            format!(
+                "COALESCE((SELECT jsonb_agg(jsonb_build_object( \
+                    'id', usage.id, 'name', usage.name, 'urlKey', {url_key}, \
+                    'adapterType', usage.adapter_type, 'desired', true, 'actualState', NULL, \
+                    'versionId', usage.version_id) ORDER BY usage.name) \
+                  FROM (SELECT DISTINCT agent.id, agent.name, agent.adapter_type, \
+                          (SELECT NULLIF(desired->>'versionId', '') \
+                           FROM jsonb_array_elements({desired}) AS desired \
+                           WHERE {matches} LIMIT 1) AS version_id \
+                        FROM agents agent \
+                        WHERE agent.company_id = {alias}.company_id \
+                          AND agent.status <> 'terminated' \
+                          AND EXISTS (SELECT 1 FROM jsonb_array_elements({desired}) AS desired \
+                                      WHERE {usage_matches})) usage), '[]'::jsonb)"
+            ),
+        ),
+        jsonb_pair(
+            "existingForks",
+            format!(
+                "COALESCE((SELECT jsonb_agg(jsonb_build_object( \
+                    'id', fork.id, 'name', fork.name, 'slug', fork.slug, \
+                    'sourceType', fork.source_type, 'sourceLocator', fork.source_locator, \
+                    'sourceRef', fork.source_ref, 'key', fork.key, \
+                    'forkedFromSkillId', fork.forked_from_skill_id, \
+                    'forkedFromCompanyId', fork.company_id, \
+                    'currentVersionId', (SELECT sv.id FROM skill_versions sv \
+                        WHERE sv.company_id = fork.company_id AND sv.skill_id = fork.id \
+                        ORDER BY sv.created_at DESC, sv.id DESC LIMIT 1), \
+                    'createdByCurrentActor', false, \
+                    'diverged', (fork.markdown IS DISTINCT FROM {alias}.markdown) \
+                      OR (SELECT COUNT(*) FROM skill_versions sv \
+                          WHERE sv.company_id = fork.company_id AND sv.skill_id = fork.id) > 1, \
+                    'createdAt', fork.created_at, 'updatedAt', fork.updated_at) \
+                    ORDER BY fork.updated_at DESC, fork.name) \
+                  FROM company_skills fork \
+                  WHERE fork.company_id = {alias}.company_id \
+                    AND fork.forked_from_skill_id = {alias}.id), '[]'::jsonb)"
+            ),
+        ),
+        jsonb_pair(
+            "currentVersion",
+            format!(
+                "(SELECT jsonb_build_object( \
+                    'id', sv.id, 'companyId', sv.company_id, 'companySkillId', sv.skill_id, \
+                    'revisionNumber', (SELECT COUNT(*) FROM skill_versions prior \
+                        WHERE prior.skill_id = sv.skill_id \
+                          AND (prior.created_at, prior.id) <= (sv.created_at, sv.id)), \
+                    'label', sv.version, 'fileInventory', '[]'::jsonb, \
+                    'authorAgentId', sv.created_by_agent_id, \
+                    'authorUserId', sv.created_by_user_id, \
+                    'createdAt', sv.created_at) \
+                  FROM skill_versions sv \
+                  WHERE sv.company_id = {alias}.company_id AND sv.skill_id = {alias}.id \
+                  ORDER BY sv.created_at DESC, sv.id DESC LIMIT 1)"
+            ),
+        ),
+        jsonb_pair("starredByCurrentActor", "false"),
+    ]
+}
+
+/// `CompanySkill` JSON object for a `company_skills` row, extended with the
+/// detail-only pairs when requested.
+fn company_skill_object(alias: &str, extra: &[(String, String)]) -> String {
+    let mut pairs = company_skill_fields(alias);
+    pairs.extend_from_slice(extra);
+    jsonb_object_from_pairs(&pairs)
+}
+
+
 #[async_trait]
 impl CompanySkillRepository for PgCompanySkillRepository {
     async fn list_by_company(&self, company_id: Uuid) -> Result<Vec<JsonValue>, RepositoryError> {
-        let rows: Vec<JsonValue> = sqlx::query_scalar(
-            r#"
-            SELECT jsonb_build_object(
-                'id', cs.id,
-                'companyId', cs.company_id,
-                'catalogId', cs.catalog_id,
-                'name', cs.name,
-                'slug', cs.slug,
-                'description', cs.description,
-                'category', cs.category,
-                'version', cs.version,
-                'tags', cs.tags,
-                'config', cs.config,
-                'isPaperclipManaged', cs.is_paperclip_managed,
-                'isFork', cs.is_fork,
-                'forkedFromSkillId', cs.forked_from_skill_id,
-                'forkedFromCatalogId', cs.forked_from_catalog_id,
-                'status', cs.status,
-                'updateAvailable', cs.update_available,
-                'latestVersion', cs.latest_version,
-                'installCount', cs.install_count,
-                'createdAt', cs.created_at,
-                'updatedAt', cs.updated_at
-            )
-            FROM company_skills cs
-            WHERE cs.company_id = $1
-            ORDER BY cs.name
-            "#,
-        )
+        let rows: Vec<JsonValue> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM company_skills cs \
+             WHERE cs.company_id = $1 ORDER BY cs.name",
+            company_skill_object("cs", &[])
+        ))
         .bind(company_id)
         .fetch_all(&self.pool)
         .await
@@ -148,34 +429,11 @@ impl CompanySkillRepository for PgCompanySkillRepository {
     }
 
     async fn get_by_id(&self, company_id: Uuid, skill_id: Uuid) -> Result<Option<JsonValue>, RepositoryError> {
-        let row: Option<JsonValue> = sqlx::query_scalar(
-            r#"
-            SELECT jsonb_build_object(
-                'id', cs.id,
-                'companyId', cs.company_id,
-                'catalogId', cs.catalog_id,
-                'name', cs.name,
-                'slug', cs.slug,
-                'description', cs.description,
-                'category', cs.category,
-                'version', cs.version,
-                'tags', cs.tags,
-                'config', cs.config,
-                'isPaperclipManaged', cs.is_paperclip_managed,
-                'isFork', cs.is_fork,
-                'forkedFromSkillId', cs.forked_from_skill_id,
-                'forkedFromCatalogId', cs.forked_from_catalog_id,
-                'status', cs.status,
-                'updateAvailable', cs.update_available,
-                'latestVersion', cs.latest_version,
-                'installCount', cs.install_count,
-                'createdAt', cs.created_at,
-                'updatedAt', cs.updated_at
-            )
-            FROM company_skills cs
-            WHERE cs.id = $1 AND cs.company_id = $2
-            "#,
-        )
+        let row: Option<JsonValue> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM company_skills cs \
+             WHERE cs.id = $1 AND cs.company_id = $2",
+            company_skill_object("cs", &company_skill_detail_fields("cs"))
+        ))
         .bind(skill_id)
         .bind(company_id)
         .fetch_optional(&self.pool)
@@ -196,31 +454,25 @@ impl CompanySkillRepository for PgCompanySkillRepository {
         let tags = data.get("tags").cloned().unwrap_or(JsonValue::Array(vec![]));
         let config = data.get("config").cloned().unwrap_or(JsonValue::Object(serde_json::Map::new()));
         let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("active");
+        let markdown = data.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
+        let categories = data.get("categories").cloned().unwrap_or(JsonValue::Array(vec![]));
+        let sharing_scope = data.get("sharingScope").and_then(|v| v.as_str()).unwrap_or("company");
+        let metadata = company_skill_metadata_patch(&data);
+        let forked_from_skill_id: Option<Uuid> = data
+            .get("forkedFromSkillId")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse().ok());
 
-        let row: JsonValue = sqlx::query_scalar(
+        let skill_id: Uuid = sqlx::query_scalar(
             r#"
-            INSERT INTO company_skills (company_id, key, catalog_id, name, slug, description, category,
-                                        version, tags, config, status, is_paperclip_managed)
-            VALUES ($1, format('company/%s/%s', $1, $4), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING jsonb_build_object(
-                'id', id,
-                'companyId', company_id,
-                'catalogId', catalog_id,
-                'name', name,
-                'slug', slug,
-                'description', description,
-                'category', category,
-                'version', version,
-                'tags', tags,
-                'config', config,
-                'isPaperclipManaged', is_paperclip_managed,
-                'isFork', is_fork,
-                'status', status,
-                'updateAvailable', update_available,
-                'latestVersion', latest_version,
-                'createdAt', created_at,
-                'updatedAt', updated_at
+            INSERT INTO company_skills (
+                company_id, key, catalog_id, name, slug, description, category,
+                version, tags, config, status, is_paperclip_managed,
+                markdown, categories, sharing_scope, metadata, forked_from_skill_id, is_fork
             )
+            VALUES ($1, format('company/%s/%s', $1, $4), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                    $12, $13, $14, $15, $16, $17)
+            RETURNING id
             "#,
         )
         .bind(company_id)
@@ -234,11 +486,22 @@ impl CompanySkillRepository for PgCompanySkillRepository {
         .bind(&config)
         .bind(status)
         .bind(is_paperclip_managed)
+        .bind(markdown)
+        .bind(&categories)
+        .bind(sharing_scope)
+        .bind(&metadata)
+        .bind(forked_from_skill_id)
+        .bind(forked_from_skill_id.is_some())
         .fetch_one(&self.pool)
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
-        Ok(row)
+        // Re-read so the response carries the full Paperclip company-skill
+        // contract (derived badges, stats, version pointers) rather than the
+        // narrow set of columns the INSERT itself supplies.
+        self.get_by_id(company_id, skill_id)
+            .await?
+            .ok_or_else(|| RepositoryError::NotFound(skill_id))
     }
 
     async fn update(&self, company_id: Uuid, skill_id: Uuid, data: JsonValue) -> Result<JsonValue, RepositoryError> {
@@ -246,50 +509,53 @@ impl CompanySkillRepository for PgCompanySkillRepository {
         let description = data.get("description").and_then(|v| v.as_str());
         let category = data.get("category").and_then(|v| v.as_str());
         let status = data.get("status").and_then(|v| v.as_str());
+        let markdown = data.get("markdown").and_then(|v| v.as_str());
+        let categories = data.get("categories").cloned();
+        let sharing_scope = data.get("sharingScope").and_then(|v| v.as_str());
+        let metadata = company_skill_metadata_patch(&data);
+        let forked_from_skill_id: Option<Uuid> = data
+            .get("forkedFromSkillId")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse().ok());
 
-        let row: JsonValue = sqlx::query_scalar(
+        let updated: Uuid = sqlx::query_scalar(
             r#"
             UPDATE company_skills
             SET
-                name = COALESCE($3, name),
-                description = COALESCE($4, description),
-                category = COALESCE($5, category),
-                status = COALESCE($6, status),
+                name = COALESCE($4, name),
+                description = COALESCE($5, description),
+                category = COALESCE($6, category),
+                status = COALESCE($7, status),
+                markdown = COALESCE($8, markdown),
+                categories = COALESCE($9, categories),
+                sharing_scope = COALESCE($10, sharing_scope),
+                forked_from_skill_id = COALESCE($11, forked_from_skill_id),
+                is_fork = COALESCE($11, forked_from_skill_id) IS NOT NULL,
+                metadata = metadata || $3::jsonb,
                 updated_at = NOW()
             WHERE id = $1 AND company_id = $2
-            RETURNING jsonb_build_object(
-                'id', id,
-                'companyId', company_id,
-                'catalogId', catalog_id,
-                'name', name,
-                'slug', slug,
-                'description', description,
-                'category', category,
-                'version', version,
-                'tags', tags,
-                'config', config,
-                'isPaperclipManaged', is_paperclip_managed,
-                'isFork', is_fork,
-                'status', status,
-                'updateAvailable', update_available,
-                'latestVersion', latest_version,
-                'createdAt', created_at,
-                'updatedAt', updated_at
-            )
+            RETURNING id
             "#,
         )
         .bind(skill_id)
         .bind(company_id)
+        .bind(&metadata)
         .bind(name)
         .bind(description)
         .bind(category)
         .bind(status)
+        .bind(markdown)
+        .bind(&categories)
+        .bind(sharing_scope)
+        .bind(forked_from_skill_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(RepositoryError::DatabaseError)?
         .ok_or_else(|| RepositoryError::NotFound(skill_id))?;
 
-        Ok(row)
+        self.get_by_id(company_id, updated)
+            .await?
+            .ok_or_else(|| RepositoryError::NotFound(updated))
     }
 
     async fn delete(&self, company_id: Uuid, skill_id: Uuid) -> Result<(), RepositoryError> {
@@ -357,8 +623,8 @@ impl CompanySkillRepository for PgCompanySkillRepository {
 
         let row: JsonValue = sqlx::query_scalar(
             r#"
-            INSERT INTO company_skills (company_id, name, slug, description, is_fork, forked_from_skill_id, is_paperclip_managed)
-            VALUES ($1, $2, $3, $4, true, $5, false)
+            INSERT INTO company_skills (company_id, key, name, slug, description, is_fork, forked_from_skill_id, is_paperclip_managed)
+            VALUES ($1, format('company/%s/%s', $1, $3), $2, $3, $4, true, $5, false)
             RETURNING jsonb_build_object(
                 'id', id,
                 'originalSkillId', $6::uuid,

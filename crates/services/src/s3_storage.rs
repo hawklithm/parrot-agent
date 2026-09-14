@@ -14,7 +14,7 @@
 //! provider, so company isolation is preserved on the S3 side.
 
 use crate::asset_storage::{build_object_key, PutFileRequest, StoredObject, StorageService};
-use crate::aws_sigv4::{hex_hmac, hex_sha256, hmac_sha256, urlencode, SigV4Signer};
+use crate::aws_sigv4::{hex_sha256, urlencode, SigV4Signer};
 use crate::errors::{ServiceError, ServiceResult};
 use async_trait::async_trait;
 use uuid::Uuid;

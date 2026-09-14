@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -25,6 +24,8 @@ pub enum AuthorizationActor {
         memberships: Vec<CompanyMembership>,
         /// 是否为实例管理员（跨公司全局权限）
         is_instance_admin: bool,
+        /// 关联的 Board API Key ID（仅 board_key 来源；Paperclip `actor.keyId`）
+        key_id: Option<Uuid>,
     },
     /// Agent 主体
     Agent {
@@ -58,6 +59,7 @@ impl AuthorizationActor {
             source: ActorSource::LocalImplicit,
             memberships: Vec::new(),
             is_instance_admin: false,
+            key_id: None,
         }
     }
 
@@ -74,6 +76,7 @@ impl AuthorizationActor {
             source: ActorSource::LocalImplicit,
             memberships,
             is_instance_admin,
+            key_id: None,
         }
     }
 
@@ -91,6 +94,26 @@ impl AuthorizationActor {
             source,
             memberships,
             is_instance_admin,
+            key_id: None,
+        }
+    }
+
+    /// 附加当前 Board API Key ID（仅对 board_key 来源有意义；其余主体无操作）
+    ///
+    /// Paperclip 的 `req.actor.keyId` 由此对应：`/cli-auth/me` 需据此返回
+    /// `keyId`，`/cli-auth/revoke-current` 需据此只撤销当前这把 Key。
+    pub fn with_key_id(mut self, key_id: Uuid) -> Self {
+        if let Self::Board { key_id: slot, .. } = &mut self {
+            *slot = Some(key_id);
+        }
+        self
+    }
+
+    /// 关联的 Board API Key ID（非 API Key 认证时为 None）
+    pub fn key_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Board { key_id, .. } => *key_id,
+            _ => None,
         }
     }
 
@@ -250,122 +273,162 @@ impl ActorSource {
     }
 }
 
-/// Agent API密钥权限范围
+/// Agent API 密钥的权限范围。
 ///
-/// 限制Agent API密钥的使用范围，防止密钥泄露后的权限滥用
+/// 形状对齐 Paperclip `agentApiKeyScopeSchema`
+/// （`packages/shared/src/validators/agent.ts:144-176`）：`kind` 判别联合，
+/// camelCase 字段。历史上的 `scope_type` 形状通过 serde alias 继续可读，
+/// 因此旧行不需要数据迁移。
+///
+/// 注意：Paperclip 在 `normalizeAgentApiKeyScope` 里对无法解析的 scope
+/// **降级为 `standard`**，而不是拒绝。这一语义由 [`Self::from_json`] 保留，
+/// 调用方不再需要为「scope 不合法」构造 403。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentApiKeyScope {
-    /// Paperclip-compatible scope discriminator: standard, task_bridge, skill_test.
-    #[serde(default = "default_scope_type")]
-    pub scope_type: String,
-    /// 密钥所属Agent ID
-    pub agent_id: Uuid,
-    /// 密钥所属公司ID
-    pub company_id: Uuid,
-    /// 允许的Issue范围（None表示允许所有Issue）
-    pub allowed_issue_ids: Option<Vec<Uuid>>,
-    /// 允许的操作列表（None表示允许所有操作）
-    pub allowed_actions: Option<Vec<String>>,
-    /// 是否允许读取敏感数据（如其他Agent的配置）
-    pub allow_sensitive_read: bool,
-    /// 密钥创建时间
-    pub created_at: DateTime<Utc>,
-    /// 密钥过期时间（None表示永不过期）
-    pub expires_at: Option<DateTime<Utc>>,
-    #[serde(default)]
+    /// 判别符：`standard` / `task_bridge` / `skill_test`。
+    ///
+    /// Paperclip 拼写为 `kind`；`scope_type` 作为 alias 保留，用于读取
+    /// 迁移前的持久化行。
+    #[serde(default = "default_scope_type", alias = "scope_type")]
+    pub kind: String,
+    /// 密钥所属 Agent ID（Parrot 额外记录，用于审计）。
+    #[serde(default, alias = "agent_id")]
+    pub agent_id: Option<Uuid>,
+    /// 密钥所属公司 ID（Parrot 额外记录，用于审计）。
+    #[serde(default, alias = "company_id")]
+    pub company_id: Option<Uuid>,
+    /// `task_bridge` 的单个项目边界。
+    #[serde(default, alias = "project_id")]
     pub project_id: Option<Uuid>,
-    #[serde(default)]
+    /// `task_bridge` 的项目边界集合。
+    #[serde(default, alias = "project_ids")]
+    pub project_ids: Vec<Uuid>,
+    /// `task_bridge` 的单个父 issue 边界。
+    #[serde(default, alias = "parent_issue_id")]
     pub parent_issue_id: Option<Uuid>,
-    #[serde(default)]
-    pub allowed_assignee_agent_ids: Option<Vec<Uuid>>,
-    #[serde(default)]
+    /// `task_bridge` 的父 issue 边界集合。
+    #[serde(default, alias = "parent_issue_ids")]
+    pub parent_issue_ids: Vec<Uuid>,
+    /// `task_bridge` 允许指派到的 agent 集合。
+    #[serde(default, alias = "allowed_assignee_agent_ids")]
+    pub allowed_assignee_agent_ids: Vec<Uuid>,
+    /// `skill_test` 唯一允许访问的 issue。
+    #[serde(default, alias = "issue_id")]
     pub issue_id: Option<Uuid>,
 }
 
-fn default_scope_type() -> String { "standard".to_string() }
+/// Paperclip `agentApiKeyScopeSchema` 的三条分支以 `kind` 字面量区分。
+pub const AGENT_KEY_SCOPE_KINDS: [&str; 3] = ["standard", "task_bridge", "skill_test"];
 
-impl AgentApiKeyScope {
-    /// 创建新的AgentApiKeyScope
-    pub fn new(agent_id: Uuid, company_id: Uuid) -> Self {
+fn default_scope_type() -> String {
+    "standard".to_string()
+}
+
+impl Default for AgentApiKeyScope {
+    fn default() -> Self {
         Self {
-            scope_type: default_scope_type(),
-            agent_id,
-            company_id,
-            allowed_issue_ids: None,
-            allowed_actions: None,
-            allow_sensitive_read: false,
-            created_at: Utc::now(),
-            expires_at: None,
+            kind: default_scope_type(),
+            agent_id: None,
+            company_id: None,
             project_id: None,
+            project_ids: Vec::new(),
             parent_issue_id: None,
-            allowed_assignee_agent_ids: None,
+            parent_issue_ids: Vec::new(),
+            allowed_assignee_agent_ids: Vec::new(),
             issue_id: None,
         }
     }
+}
 
-    /// 设置允许的Issue范围
-    pub fn with_issue_ids(mut self, issue_ids: Vec<Uuid>) -> Self {
-        self.allowed_issue_ids = Some(issue_ids);
-        self
-    }
-
-    /// 设置允许的操作列表
-    pub fn with_actions(mut self, actions: Vec<String>) -> Self {
-        self.allowed_actions = Some(actions);
-        self
-    }
-
-    /// 允许读取敏感数据
-    pub fn with_sensitive_read(mut self, allow: bool) -> Self {
-        self.allow_sensitive_read = allow;
-        self
-    }
-
-    /// 设置过期时间
-    pub fn with_expiration(mut self, expires_at: DateTime<Utc>) -> Self {
-        self.expires_at = Some(expires_at);
-        self
-    }
-
-    /// 检查密钥是否已过期
-    pub fn is_expired(&self) -> bool {
-        if let Some(expires_at) = self.expires_at {
-            Utc::now() > expires_at
-        } else {
-            false
+impl AgentApiKeyScope {
+    /// 标准（无边界）scope。
+    pub fn new(agent_id: Uuid, company_id: Uuid) -> Self {
+        Self {
+            kind: default_scope_type(),
+            agent_id: Some(agent_id),
+            company_id: Some(company_id),
+            ..Default::default()
         }
     }
 
-    /// 检查是否允许访问指定Issue
-    pub fn can_access_issue(&self, issue_id: Uuid) -> bool {
-        match &self.allowed_issue_ids {
-            None => true, // 允许所有Issue
-            Some(ids) => ids.contains(&issue_id),
+    /// `skill_test` scope：只允许访问 `issue_id`。
+    pub fn skill_test(agent_id: Option<Uuid>, company_id: Option<Uuid>, issue_id: Uuid) -> Self {
+        Self {
+            kind: "skill_test".to_string(),
+            agent_id,
+            company_id,
+            issue_id: Some(issue_id),
+            ..Default::default()
         }
     }
 
-    /// 检查是否允许执行指定操作
-    pub fn can_perform_action(&self, action: &str) -> bool {
-        match &self.allowed_actions {
-            None => true, // 允许所有操作
-            Some(actions) => actions.contains(&action.to_string()),
+    /// `task_bridge` scope。
+    pub fn task_bridge(
+        agent_id: Option<Uuid>,
+        company_id: Option<Uuid>,
+        project_ids: Vec<Uuid>,
+        parent_issue_ids: Vec<Uuid>,
+        allowed_assignee_agent_ids: Vec<Uuid>,
+    ) -> Self {
+        Self {
+            kind: "task_bridge".to_string(),
+            agent_id,
+            company_id,
+            project_ids,
+            parent_issue_ids,
+            allowed_assignee_agent_ids,
+            ..Default::default()
         }
     }
 
-    /// Parse and normalize persisted/JWT scope JSON. Unknown or malformed
-    /// scope configurations are rejected instead of silently becoming global.
+    /// 是否是标准 scope（无任何边界约束）。
+    pub fn is_standard(&self) -> bool {
+        self.kind == "standard"
+    }
+
+    /// `task_bridge` / `skill_test` 是否声明了任一项目或父 issue 边界。
+    ///
+    /// Paperclip `taskBridgeAgentKeyScopeSchema.superRefine` 要求二者**至少其一**。
+    pub fn has_task_bridge_boundary(&self) -> bool {
+        self.project_id.is_some()
+            || !self.project_ids.is_empty()
+            || self.parent_issue_id.is_some()
+            || !self.parent_issue_ids.is_empty()
+    }
+
+    /// 解析持久化/JWT 中的 scope JSON。
+    ///
+    /// 与 Paperclip `normalizeAgentApiKeyScope`（`validators/agent.ts:182-185`）
+    /// 一致：**任何**无法通过校验的值都降级为 `{kind:"standard"}`，而不是报错。
+    /// `None` 仅在输入为空（`null` / `{}` / 全空对象）时返回，表示「该行没有
+    /// 记录 scope」，此时调用方应构造 [`Self::new`]。
     pub fn from_json(value: serde_json::Value) -> Option<Self> {
         if value.is_null() || value == serde_json::json!({}) {
             return None;
         }
-        let scope: Self = serde_json::from_value(value).ok()?;
-        let valid = matches!(scope.scope_type.as_str(), "standard" | "task_bridge" | "skill_test");
-        if !valid { return None; }
-        if scope.scope_type == "task_bridge" && (scope.project_id.is_none() || scope.parent_issue_id.is_none()) { return None; }
-        if scope.scope_type == "skill_test" && scope.issue_id.is_none() { return None; }
-        Some(scope)
+        let parsed: Self = match serde_json::from_value(value) {
+            Ok(parsed) => parsed,
+            // 形状不认识 —— 按 Paperclip 的规范化语义降级为 standard。
+            Err(_) => return Some(Self::default()),
+        };
+        if !AGENT_KEY_SCOPE_KINDS.contains(&parsed.kind.as_str()) {
+            return Some(Self::default());
+        }
+        // `task_bridge` 缺边界、`skill_test` 缺 issue 都是 Paperclip 中
+        // `superRefine` 会判失败、从而被 `normalizeAgentApiKeyScope` 折叠成
+        // standard 的情况。
+        if parsed.kind == "task_bridge" && !parsed.has_task_bridge_boundary() {
+            return Some(Self::default());
+        }
+        if parsed.kind == "skill_test" && parsed.issue_id.is_none() {
+            return Some(Self::default());
+        }
+        Some(parsed)
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -424,47 +487,87 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_api_key_scope_issue_access() {
-        let agent_id = Uuid::new_v4();
-        let company_id = Uuid::new_v4();
-        let issue1 = Uuid::new_v4();
-        let issue2 = Uuid::new_v4();
+    fn test_scope_parses_paperclip_kind_union() {
+        let issue_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
 
-        let scope = AgentApiKeyScope::new(agent_id, company_id)
-            .with_issue_ids(vec![issue1]);
+        let standard = AgentApiKeyScope::from_json(serde_json::json!({"kind": "standard"}))
+            .expect("standard scope should parse");
+        assert!(standard.is_standard());
 
-        assert!(scope.can_access_issue(issue1));
-        assert!(!scope.can_access_issue(issue2));
+        let skill_test = AgentApiKeyScope::from_json(serde_json::json!({
+            "kind": "skill_test",
+            "issueId": issue_id,
+        }))
+        .expect("skill_test scope should parse");
+        assert_eq!(skill_test.kind, "skill_test");
+        assert_eq!(skill_test.issue_id, Some(issue_id));
+
+        // Paperclip 的边界是「项目 **或** 父 issue」（`superRefine`），
+        // 不是两者都要。只有 projectId 也必须成立。
+        let bridge = AgentApiKeyScope::from_json(serde_json::json!({
+            "kind": "task_bridge",
+            "projectId": project_id,
+        }))
+        .expect("task_bridge scope should parse");
+        assert_eq!(bridge.kind, "task_bridge");
+        assert_eq!(bridge.project_id, Some(project_id));
     }
 
     #[test]
-    fn test_agent_api_key_scope_action_access() {
+    fn test_scope_accepts_legacy_snake_case_rows() {
+        // 迁移前写入的行使用 `scope_type` 与 snake_case 字段，必须继续可读，
+        // 否则所有既有 key 会在鉴权时被判为无 scope。
         let agent_id = Uuid::new_v4();
         let company_id = Uuid::new_v4();
-
-        let scope = AgentApiKeyScope::new(agent_id, company_id)
-            .with_actions(vec!["read".to_string(), "write".to_string()]);
-
-        assert!(scope.can_perform_action("read"));
-        assert!(scope.can_perform_action("write"));
-        assert!(!scope.can_perform_action("delete"));
+        let scope = AgentApiKeyScope::from_json(serde_json::json!({
+            "scope_type": "standard",
+            "agent_id": agent_id,
+            "company_id": company_id,
+        }))
+        .expect("legacy scope should parse");
+        assert!(scope.is_standard());
+        assert_eq!(scope.agent_id, Some(agent_id));
+        assert_eq!(scope.company_id, Some(company_id));
     }
 
     #[test]
-    fn test_agent_api_key_scope_expiration() {
-        let agent_id = Uuid::new_v4();
-        let company_id = Uuid::new_v4();
+    fn test_scope_normalizes_invalid_shapes_to_standard() {
+        // Paperclip `normalizeAgentApiKeyScope`（`validators/agent.ts:182-185`）
+        // 对任何解析失败都返回 `{kind:"standard"}`，从不报错。
+        let cases = vec![
+            serde_json::json!({"kind": "unknown_kind"}),
+            serde_json::json!({"kind": "task_bridge"}),
+            serde_json::json!({"kind": "skill_test"}),
+            serde_json::json!({"kind": "standard", "unexpected": 1}),
+            serde_json::json!("not-an-object"),
+            serde_json::json!([1, 2, 3]),
+        ];
+        for case in cases {
+            let scope = AgentApiKeyScope::from_json(case.clone())
+                .unwrap_or_else(|| panic!("{case} should normalize, not vanish"));
+            assert!(
+                scope.is_standard(),
+                "{case} should normalize to standard, got {}",
+                scope.kind
+            );
+        }
+    }
 
-        let expired_time = Utc::now() - chrono::Duration::hours(1);
-        let scope = AgentApiKeyScope::new(agent_id, company_id)
-            .with_expiration(expired_time);
+    #[test]
+    fn test_scope_empty_values_mean_no_scope_recorded() {
+        assert!(AgentApiKeyScope::from_json(serde_json::Value::Null).is_none());
+        assert!(AgentApiKeyScope::from_json(serde_json::json!({})).is_none());
+    }
 
-        assert!(scope.is_expired());
-
-        let future_time = Utc::now() + chrono::Duration::hours(1);
-        let scope2 = AgentApiKeyScope::new(agent_id, company_id)
-            .with_expiration(future_time);
-
-        assert!(!scope2.is_expired());
+    #[test]
+    fn test_scope_serializes_back_to_paperclip_shape() {
+        let issue_id = Uuid::new_v4();
+        let scope = AgentApiKeyScope::skill_test(None, None, issue_id);
+        let value = serde_json::to_value(&scope).expect("scope should serialize");
+        assert_eq!(value["kind"], "skill_test");
+        assert_eq!(value["issueId"], issue_id.to_string());
+        // camelCase 契约：不得出现 snake_case 键。
+        assert!(value.get("issue_id").is_none());
     }
 }

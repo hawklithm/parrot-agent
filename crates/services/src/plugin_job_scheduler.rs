@@ -20,12 +20,10 @@
 ///    以便宿主生命周期管理器在插件启动/停止时连接作业调度。
 
 use chrono::{DateTime, Utc};
-use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::Row;
 use std::collections::HashSet;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -33,6 +31,7 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::cron_schedule::parse_cron_schedule;
 use super::plugin_worker_manager::{PluginWorkerManager, WorkerError};
 
 // ---------------------------------------------------------------------------
@@ -87,7 +86,7 @@ pub struct PluginJob {
     pub id: Uuid,
     pub plugin_id: Uuid,
     pub name: String,
-    pub cron_schedule: String,
+    pub schedule: String,
     pub enabled: bool,
     pub next_run_at: Option<DateTime<Utc>>,
     pub last_run_at: Option<DateTime<Utc>>,
@@ -366,7 +365,7 @@ impl PluginJobScheduler {
         // 查询该插件的所有启用的作业
         let jobs = sqlx::query_as::<_, PluginJob>(
             r#"
-            SELECT id, plugin_id, name, cron_schedule, enabled, 
+            SELECT id, plugin_id, name, schedule, enabled, 
                    next_run_at, last_run_at, created_at, updated_at
             FROM plugin_jobs
             WHERE plugin_id = $1 AND enabled = true
@@ -379,7 +378,7 @@ impl PluginJobScheduler {
         // 为缺少 next_run_at 的作业计算它
         for job in jobs {
             if job.next_run_at.is_none() {
-                if let Ok(next_run) = Self::calculate_next_run(&job.cron_schedule, None) {
+                if let Ok(next_run) = Self::calculate_next_run(&job.schedule, None) {
                     sqlx::query(
                         r#"
                         UPDATE plugin_jobs
@@ -454,7 +453,7 @@ impl PluginJobScheduler {
         // 查询作业
         let job: Option<PluginJob> = sqlx::query_as(
             r#"
-            SELECT id, plugin_id, name, cron_schedule, enabled,
+            SELECT id, plugin_id, name, schedule, enabled,
                    next_run_at, last_run_at, created_at, updated_at
             FROM plugin_jobs
             WHERE id = $1
@@ -502,7 +501,7 @@ impl PluginJobScheduler {
         let now = Utc::now();
         let jobs = sqlx::query_as::<_, PluginJob>(
             r#"
-            SELECT id, plugin_id, name, cron_schedule, enabled,
+            SELECT id, plugin_id, name, schedule, enabled,
                    next_run_at, last_run_at, created_at, updated_at
             FROM plugin_jobs
             WHERE enabled = true
@@ -652,7 +651,7 @@ impl PluginJobScheduler {
         }
 
         // 更新作业的 last_run_at 和 next_run_at
-        if let Ok(next_run) = Self::calculate_next_run(&job.cron_schedule, Some(end_time)) {
+        if let Ok(next_run) = Self::calculate_next_run(&job.schedule, Some(end_time)) {
             sqlx::query(
                 r#"
                 UPDATE plugin_jobs
@@ -683,7 +682,7 @@ impl PluginJobScheduler {
         cron_schedule: &str,
         after: Option<DateTime<Utc>>,
     ) -> Result<DateTime<Utc>, SchedulerError> {
-        let schedule = Schedule::from_str(cron_schedule)
+        let schedule = parse_cron_schedule(cron_schedule)
             .map_err(|_| SchedulerError::InvalidCronSchedule(cron_schedule.to_string()))?;
 
         let after = after.unwrap_or_else(Utc::now);
@@ -723,7 +722,7 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for PluginJob {
             id: row.try_get("id")?,
             plugin_id: row.try_get("plugin_id")?,
             name: row.try_get("name")?,
-            cron_schedule: row.try_get("cron_schedule")?,
+            schedule: row.try_get("schedule")?,
             enabled: row.try_get("enabled")?,
             next_run_at: row.try_get("next_run_at")?,
             last_run_at: row.try_get("last_run_at")?,

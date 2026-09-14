@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
+use crate::extractors::IssueId;
 use models::issue_auxiliary::{Attachment, UploadAttachmentInput};
 use services::attachment_types::{
     content_disposition, max_attachment_bytes, parse_range_header, RangeSpec,
@@ -76,7 +77,7 @@ async fn issue_company_id(state: &AppState, issue_id: Uuid) -> Result<Uuid, AppE
 async fn list_issue_attachments(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let company_id = issue_company_id(&state, id).await?;
     require_company_access(&actor, company_id, AttachmentOp::List.access()).map_err(forbidden)?;
@@ -92,7 +93,7 @@ async fn list_issue_attachments(
 async fn upload_issue_attachment_json(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(input): Json<UploadAttachmentInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let company_id = issue_company_id(&state, id).await?;
@@ -112,7 +113,8 @@ async fn upload_issue_attachment_json(
 async fn upload_issue_attachment_multipart(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((company_id, issue_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((company_id, _)): Path<(Uuid, String)>,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     require_company_access(&actor, company_id, AttachmentOp::UploadMultipart.access()).map_err(forbidden)?;

@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
+use crate::extractors::IssueId;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
 
@@ -168,7 +169,7 @@ INSERT INTO activity_logs (id, company_id, actor_type, actor_id, event_type, res
 async fn get_issue_activity(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
         .bind(id)

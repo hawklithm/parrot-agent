@@ -118,12 +118,9 @@ impl AdapterConfigNormalizer {
             obj.insert("command".to_string(), json!("claude"));
         }
 
-        // 标准化引擎配置
-        if let Some(engine) = obj.get("engine") {
-            if engine == "auto" {
-                obj.insert("engine".to_string(), json!("cli"));
-            }
-        }
+        // Keep an explicitly configured engine intact. The current Claude
+        // runtime uses the regular CLI for `auto`/`cli`; unsupported ACP is
+        // rejected when a run starts.
 
         // 标准化 thinking effort
         if let Some(thinking_effort) = obj.get("thinkingEffort") {
@@ -233,7 +230,7 @@ impl AdapterConfigNormalizer {
             obj.entry("model".to_string())
                 .or_insert(json!("codex"));
             obj.entry("engine".to_string())
-                .or_insert(json!("cli"));
+                .or_insert(json!("auto"));
             obj.entry("command".to_string())
                 .or_insert(json!("codex"));
         }
@@ -301,7 +298,7 @@ mod tests {
         let obj = result.as_object().unwrap();
         assert!(!obj.contains_key("_temp"));
         assert!(!obj.contains_key("thinkingEffort"));
-        assert_eq!(obj.get("engine").unwrap(), "cli");
+        assert_eq!(obj.get("engine").unwrap(), "auto");
         assert_eq!(obj.get("model").unwrap(), "DeepSeek-V4-Flash");
         assert_eq!(obj.get("command").unwrap(), "claude");
     }

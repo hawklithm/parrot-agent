@@ -269,6 +269,7 @@ mod authorization_tests {
                 MembershipRole::Owner,
             )],
             is_instance_admin: true,
+            key_id: None,
         };
 
         // 实例管理员应始终通过权限检查
@@ -288,6 +289,7 @@ mod authorization_tests {
             source: ActorSource::Session,
             memberships: vec![],
             is_instance_admin: false,
+            key_id: None,
         };
 
         let result = assert_instance_admin(&actor);
@@ -325,6 +327,7 @@ mod authorization_tests {
                 MembershipRole::Viewer,
             )],
             is_instance_admin: false,
+            key_id: None,
         };
 
         // Viewer 读操作应通过
@@ -349,6 +352,7 @@ mod authorization_tests {
                 MembershipRole::Viewer,
             )],
             is_instance_admin: false,
+            key_id: None,
         };
 
         // Viewer 写操作应被拒绝
@@ -374,6 +378,7 @@ mod authorization_tests {
                 MembershipRole::Owner,
             )],
             is_instance_admin: false,
+            key_id: None,
         };
 
         // 跨公司访问（非实例管理员）应被拒绝

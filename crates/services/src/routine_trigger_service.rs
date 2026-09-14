@@ -1,9 +1,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cron::Schedule;
+use crate::cron_schedule::parse_cron_schedule;
 use repositories::{RoutineRepository, RoutineTriggerRepository};
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -116,7 +115,7 @@ impl DefaultRoutineTriggerService {
 
     /// Parse cron expression
     fn validate_cron_expression(&self, cron_expr: &str) -> Result<(), ServiceError> {
-        Schedule::from_str(cron_expr).map_err(|error| {
+        parse_cron_schedule(cron_expr).map_err(|error| {
             ServiceError::InvalidInput(format!("Invalid cron expression: {error}"))
         })?;
         Ok(())
@@ -128,7 +127,7 @@ impl DefaultRoutineTriggerService {
         timezone: Option<&str>,
         after: DateTime<Utc>,
     ) -> Result<DateTime<Utc>, ServiceError> {
-        let schedule = Schedule::from_str(cron_expr).map_err(|error| {
+        let schedule = parse_cron_schedule(cron_expr).map_err(|error| {
             ServiceError::InvalidInput(format!("Invalid cron expression: {error}"))
         })?;
         let next = if let Some(timezone) = timezone {

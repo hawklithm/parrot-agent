@@ -79,16 +79,29 @@ pub fn secret_routes() -> Router<AppState> {
         .route("/secrets/:id/access-events", get(get_secret_access_events))
 }
 
-/// The canonical provider descriptor list — mirrors Paperclip
-/// `listSecretProviders()` (provider-registry.ts). `local_encrypted` is always
-/// available; the cloud providers are advertised but marked `configured: false`
-/// unless a matching `company_secret_provider_configs` row exists.
-const KNOWN_PROVIDERS: &[(&str, &str)] = &[
-    ("local_encrypted", "Local encrypted store"),
-    ("aws_secrets_manager", "AWS Secrets Manager"),
-    ("gcp_secret_manager", "Google Cloud Secret Manager"),
-    ("vault", "HashiCorp Vault"),
-];
+/// SE5: `GET /companies/:company_id/secret-providers`.
+///
+/// Static capability descriptors, resolved by the provider modules themselves.
+/// Nothing here depends on the requested company beyond access control: in
+/// Paperclip the descriptor list is global, and `configured` reflects
+/// deployment readiness (`getAwsConfigReadiness`), not per-company rows.
+async fn list_secret_providers(
+    State(state): State<AppState>,
+    Path(company_id): Path<Uuid>,
+    Extension(actor): Extension<AuthorizationActor>,
+) -> Result<Json<Vec<Value>>, SecretError> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| SecretError::Forbidden)?;
+
+    let descriptors = serde_json::to_value(state.secret_provider_config_service.list_providers())
+        .map_err(|e| SecretError::Database(e.to_string()))?;
+    match descriptors {
+        Value::Array(items) => Ok(Json(items)),
+        _ => Err(SecretError::Database(
+            "provider descriptors did not serialize to an array".to_string(),
+        )),
+    }
+}
 
 fn validate_secret_name_key(name: &str, key: &str) -> Result<(), SecretError> {
     let name = name.trim();
@@ -136,47 +149,17 @@ async fn validate_provider_config(
     if configured_provider != provider {
         return Err(SecretError::BadRequest("Provider configuration does not match provider".into()));
     }
-    if !matches!(status.as_str(), "ready" | "active") {
-        return Err(SecretError::BadRequest("Provider configuration is disabled".into()));
+    // `warning` is a usable state: it means the operator has flagged the vault
+    // but it still resolves. Only the locked states block use, matching
+    // Paperclip's `readProviderVaultConfig`.
+    if matches!(status.as_str(), "coming_soon" | "disabled") {
+        return Err(SecretError::BadRequest(
+            "Provider configuration is not available".into(),
+        ));
     }
     Ok(())
 }
 
-/// SE5: GET /companies/:company_id/secret-providers
-async fn list_secret_providers(
-    State(state): State<AppState>,
-    Path(company_id): Path<Uuid>,
-    Extension(actor): Extension<AuthorizationActor>,
-) -> Result<Json<Vec<Value>>, SecretError> {
-    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| SecretError::NotFound)?;
-    let pool = &state.pool;
-    // Determine which providers have a configured config row for this company.
-    let configured: Vec<String> = sqlx::query_scalar(
-        r#"SELECT DISTINCT provider::text FROM company_secret_provider_configs
-            WHERE company_id = $1 AND status = 'active'"#,
-    )
-    .bind(company_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| SecretError::Database(e.to_string()))?;
-
-    let descriptors: Vec<Value> = KNOWN_PROVIDERS
-        .iter()
-        .map(|(id, label)| {
-            let is_cloud = *id != "local_encrypted";
-            json!({
-                "id": id,
-                "label": label,
-                "requiresExternalRef": is_cloud,
-                "supportsManagedValues": !is_cloud,
-                "supportsExternalReferences": is_cloud,
-                "configured": *id == "local_encrypted" || configured.iter().any(|c| c == id),
-            })
-        })
-        .collect();
-
-    Ok(Json(descriptors))
-}
 
 const SECRET_SELECT: &str = r#"SELECT id, company_id, scope, owner_user_id, user_secret_definition_id,
        key, name, provider, status, managed_mode, external_ref, provider_config_id,
@@ -229,7 +212,8 @@ async fn list_company_secrets(
     Path(company_id): Path<Uuid>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<Value>>, SecretError> {
-    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| SecretError::NotFound)?;
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| SecretError::Forbidden)?;
     let pool = &state.pool;
     let rows = sqlx::query(&format!(
         "{} WHERE company_id = $1 AND scope = 'company' AND deleted_at IS NULL ORDER BY created_at DESC",
@@ -252,7 +236,8 @@ async fn list_secret_catalog(
     Path(company_id): Path<Uuid>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Result<Json<Vec<Value>>, SecretError> {
-    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| SecretError::NotFound)?;
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| SecretError::Forbidden)?;
     let rows = sqlx::query(
         "SELECT id, name, key, status FROM company_secrets \
          WHERE company_id = $1 AND scope = 'company' AND deleted_at IS NULL \
@@ -294,7 +279,8 @@ async fn create_company_secret(
     Extension(actor): Extension<AuthorizationActor>,
     Json(body): Json<CreateSecretBody>,
 ) -> Result<(StatusCode, Json<Value>), SecretError> {
-    require_company_access(&actor, company_id, AccessMode::Write).map_err(|_| SecretError::NotFound)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| SecretError::Forbidden)?;
 
     let managed_mode = body.managed_mode.as_deref().unwrap_or("paperclip_managed");
     let is_external = managed_mode == "external" || managed_mode == "external_reference";
@@ -327,7 +313,10 @@ async fn create_company_secret(
 
     let key = body.key.unwrap_or_else(|| body.name.replace(' ', "_"));
     let provider = body.provider.unwrap_or_else(|| "local_encrypted".to_string());
-    if !KNOWN_PROVIDERS.iter().any(|(id, _)| *id == provider) {
+    if !models::SecretProvider::ALL
+        .into_iter()
+        .any(|known| known.as_str() == provider)
+    {
         return Err(SecretError::BadRequest("Unsupported secret provider".into()));
     }
     validate_provider_config(&state.pool, company_id, &provider, body.provider_config_id).await?;
@@ -749,6 +738,7 @@ async fn get_secret_access_events(
 #[derive(Debug)]
 pub enum SecretError {
     NotFound,
+    Forbidden,
     BadRequest(String),
     Database(String),
 }
@@ -757,6 +747,10 @@ impl IntoResponse for SecretError {
     fn into_response(self) -> axum::response::Response {
         let (status, msg) = match self {
             SecretError::NotFound => (StatusCode::NOT_FOUND, "Secret not found".to_string()),
+            SecretError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "User does not have access to this company".to_string(),
+            ),
             SecretError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             SecretError::Database(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };

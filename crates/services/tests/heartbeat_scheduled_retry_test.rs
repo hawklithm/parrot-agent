@@ -13,9 +13,10 @@ use repositories::{
 use std::sync::Arc;
 use uuid::Uuid;
 async fn connect() -> Option<PgPool> {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:admin123@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping heartbeat scheduled retry test: DATABASE_URL is not set");
+        return None;
+    };
     match PgPool::connect(&database_url).await {
         Ok(p) => Some(p),
         Err(_) => {
@@ -396,7 +397,7 @@ async fn run_records_responsible_user_from_issue() {
         issue_id,
         company_id,
         services::HeartbeatWakeupOptions {
-            source: Some("test".to_string()),
+            source: Some("on_demand".to_string()),
             reason: Some("responsible_user_invariant".to_string()),
             idempotency_key: Some(format!("responsible_user_test:{}", issue_id)),
             context_snapshot: Some(serde_json::json!({ "issueId": issue_id })),
@@ -500,7 +501,7 @@ async fn wakeup_blocked_by_budget_hard_stop() {
         issue_id,
         company_id,
         services::HeartbeatWakeupOptions {
-            source: Some("test".to_string()),
+            source: Some("on_demand".to_string()),
             reason: Some("budget_hard_stop_invariant".to_string()),
             idempotency_key: Some(idempotency_key.clone()),
             context_snapshot: Some(serde_json::json!({ "issueId": issue_id })),

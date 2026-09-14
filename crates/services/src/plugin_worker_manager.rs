@@ -166,10 +166,7 @@ pub struct WorkerDiagnostics {
 
 /// A pending RPC call waiting for a response
 struct PendingRequest {
-    id: JsonRpcId,
-    method: String,
     sender: tokio::sync::oneshot::Sender<Result<Value, PluginWorkerError>>,
-    sent_at: DateTime<Utc>,
 }
 
 // ============================================================================
@@ -514,10 +511,7 @@ impl PluginWorkerHandle {
         
         // Store pending request
         let pending = PendingRequest {
-            id: JsonRpcId::String(request_id.clone()),
-            method: method.into(),
             sender: tx,
-            sent_at: Utc::now(),
         };
         
         drop(state);

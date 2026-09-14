@@ -22,6 +22,8 @@ serde_json = { workspace = true }
 regex = "1.10"
 uuid = { workspace = true }
 libc = "0.2"
+sqlx = { workspace = true }
+tokio = { workspace = true }
 
 services = { path = "../services" }
 

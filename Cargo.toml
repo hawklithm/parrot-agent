@@ -24,7 +24,8 @@ regex = "1"
 sha2 = "0.10"
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "uuid", "json", "chrono", "macros", "migrate"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "json", "chrono", "macros", "migrate"] }
+# 注意: 未被任何 crate 使用（无 `sea_orm` 引用），数据库访问全部走 SQLx
 sea-orm = { version = "0.12", features = ["sqlx-postgres", "runtime-tokio", "macros"] }
 
 # Serialization
@@ -50,5 +51,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Testing
 mockall = "0.12"
-
 

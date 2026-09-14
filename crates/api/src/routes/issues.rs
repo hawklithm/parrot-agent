@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
+use sha2::{Digest, Sha256};
 use std::path::{Path as FsPath, PathBuf};
 
 use models::event_bus::{EventMetadata, IssueEvent, SystemEvent, SystemEventPayload};
@@ -1418,7 +1419,7 @@ async fn remap_open_annotation_threads(
     next_body: &str,
 ) -> Result<(), sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, status, anchor_state, anchor_selector, anchor_confidence, \
+        "SELECT id, company_id, status, anchor_state, anchor_selector, anchor_confidence, \
          selected_text, prefix_text, suffix_text, normalized_start, normalized_end, \
          markdown_start, markdown_end, original_revision_id, original_revision_number, \
          current_revision_id, current_revision_number \
@@ -1432,7 +1433,9 @@ async fn remap_open_annotation_threads(
 
     for row in rows {
         let thread_id: Uuid = row.get("id");
+        let company_id: Uuid = row.get("company_id");
         let current_revision_id: Option<Uuid> = row.get("current_revision_id");
+        let current_revision_number: i32 = row.get("current_revision_number");
         if current_revision_id == next_revision_id {
             continue;
         }
@@ -1450,6 +1453,48 @@ async fn remap_open_annotation_threads(
         let result = crate::document_anchors::remap_thread(&thread, next_body);
         let patch = crate::document_anchors::remap_result_to_patch(&result);
         let selector = patch.get("anchorSelector").cloned().unwrap_or(serde_json::json!({}));
+        let anchor_state = patch
+            .get("anchorState")
+            .and_then(Value::as_str)
+            .unwrap_or("active");
+        let anchor_confidence = patch
+            .get("anchorConfidence")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        let next_anchor = if patch.get("selectedText").is_some() {
+            Some(patch.clone())
+        } else {
+            None
+        };
+        let failure_reason = (anchor_state == "orphaned")
+            .then(|| "selected anchor could not be located in the new revision".to_string());
+
+        // Keep the before/after pair as an append-only record. The thread row
+        // below is the current projection; this ledger is what lets the UI and
+        // operators explain how an annotation moved (or why it became orphaned)
+        // across document revisions.
+        sqlx::query(
+            "INSERT INTO document_annotation_anchor_snapshots
+                (company_id, thread_id, document_id, from_revision_id,
+                 from_revision_number, to_revision_id, to_revision_number,
+                 previous_anchor, next_anchor, anchor_state, anchor_confidence,
+                 failure_reason)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+        )
+        .bind(company_id)
+        .bind(thread_id)
+        .bind(document_id)
+        .bind(current_revision_id)
+        .bind(current_revision_number)
+        .bind(next_revision_id)
+        .bind(next_revision_number)
+        .bind(&thread)
+        .bind(&next_anchor)
+        .bind(anchor_state)
+        .bind(anchor_confidence)
+        .bind(failure_reason)
+        .execute(&mut **tx)
+        .await?;
 
         sqlx::query(
             "UPDATE document_annotation_threads SET \
@@ -1460,8 +1505,8 @@ async fn remap_open_annotation_threads(
         )
         .bind(next_revision_id)
         .bind(next_revision_number)
-        .bind(patch.get("anchorState").and_then(Value::as_str).unwrap_or("active"))
-        .bind(patch.get("anchorConfidence").and_then(Value::as_str).unwrap_or("missing"))
+        .bind(anchor_state)
+        .bind(anchor_confidence)
         .bind(&selector)
         .bind(patch.get("selectedText").and_then(Value::as_str).unwrap_or(""))
         .bind(patch.get("prefixText").and_then(Value::as_str).unwrap_or(""))
@@ -1742,10 +1787,17 @@ async fn scoped_issue_company(
     actor: &AuthorizationActor,
     issue_id: Uuid,
 ) -> Result<Uuid, StatusCode> {
-    // Paperclip resolves the resource first and authorizes against the
-    // resource's company. This is important for local-trusted Board actors:
-    // their company_id is an instance-level sentinel, not the issue's company.
+    // Paperclip `getAccessibleResource`（`routes/authz.ts:182-195`）：先解析资源，
+    // 再用不抛错的 `hasCompanyAccess` 做公司可见性判定。资源不存在与资源存在但
+    // 属于别家公司都回 404，否则 403/404 的差异会泄漏别的租户的 id 是否存在
+    // （`authz.ts:123-146` 明确把这一点称为“存在性预言”）。
+    //
+    // 注意这里的 404 只负责消除预言；通过该关口的调用方仍要走
+    // `assert_company_access` 处理编写路径的成员资格（viewer 只读等）。
     let company_id = issue_company_id(state, issue_id).await?;
+    if !crate::routes::has_company_access(actor, company_id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     crate::routes::assert_company_access(actor, company_id, true)?;
     Ok(company_id)
 }
@@ -3108,7 +3160,142 @@ async fn get_issue_live_runs(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Accepted plan decompositions (Paperclip `issue_plan_decompositions`)
+// ---------------------------------------------------------------------------
+
+/// Paperclip `ACCEPTED_PLAN_DECOMPOSITION_FINGERPRINT_CHILD_METADATA_KEYS`:
+/// server-assigned child fields that must not contribute to the request
+/// fingerprint, so a replay with the same intent hashes identically.
+const ACCEPTED_PLAN_FINGERPRINT_CHILD_METADATA_KEYS: &[&str] = &[
+    "id",
+    "companyId",
+    "parentId",
+    "identifier",
+    "checkoutRunId",
+    "executionRunId",
+    "executionLockedAt",
+    "startedAt",
+    "completedAt",
+    "cancelledAt",
+    "hiddenAt",
+    "createdAt",
+    "updatedAt",
+    "createdByAgentId",
+    "createdByUserId",
+    "updatedByAgentId",
+    "updatedByUserId",
+    "actorAgentId",
+    "actorUserId",
+    "executionWorkspaceInheritanceMode",
+    "skipExecutionWorkspaceInheritance",
+];
+
+/// Paperclip `normalizeAcceptedPlanDecompositionFingerprintValue`: object keys
+/// are sorted recursively, `undefined` becomes `null`, and arrays preserve
+/// order, so the hash is stable across equivalent payloads.
+fn normalize_plan_fingerprint_value(value: &Value) -> Value {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(normalize_plan_fingerprint_value).collect())
+        }
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            let mut sorted = serde_json::Map::new();
+            for (key, entry) in entries {
+                sorted.insert(key.clone(), normalize_plan_fingerprint_value(entry));
+            }
+            Value::Object(sorted)
+        }
+    }
+}
+
+/// Paperclip `createAcceptedPlanDecompositionRequestFingerprint`: sha256 over
+/// the key-sorted canonical JSON of `{acceptedPlanRevisionId, children}` with
+/// server-assigned child metadata stripped.
+fn accepted_plan_request_fingerprint(revision_id: Uuid, children: &[Value]) -> String {
+    let trimmed_children: Vec<Value> = children
+        .iter()
+        .map(|child| match child {
+            Value::Object(_) => {
+                let Value::Object(map) = normalize_plan_fingerprint_value(child) else {
+                    unreachable!("object input normalizes to object");
+                };
+                let mut kept = serde_json::Map::new();
+                for (key, entry) in map {
+                    if !ACCEPTED_PLAN_FINGERPRINT_CHILD_METADATA_KEYS.contains(&key.as_str()) {
+                        kept.insert(key, entry);
+                    }
+                }
+                Value::Object(kept)
+            }
+            other => other.clone(),
+        })
+        .collect();
+    let canonical = json!({
+        "acceptedPlanRevisionId": revision_id,
+        "children": trimmed_children,
+    });
+    let canonical = normalize_plan_fingerprint_value(&canonical);
+    let encoded = serde_json::to_string(&canonical).unwrap_or_else(|_| "null".to_string());
+    format!("{:x}", Sha256::digest(encoded.as_bytes()))
+}
+
+/// Paperclip `serializeAcceptedPlanDecomposition`. `requestedChildren` is
+/// deliberately omitted: the API exposes stable counts and child ids only.
+fn accepted_plan_decomposition_json(row: &sqlx::postgres::PgRow) -> Value {
+    let raw_child_ids: Value = row.try_get("child_issue_ids").unwrap_or_else(|_| json!([]));
+    let child_issue_ids: Vec<Value> = raw_child_ids
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.as_str().is_some_and(|id| !id.is_empty()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "id": row.get::<Uuid, _>("id"),
+        "companyId": row.get::<Uuid, _>("company_id"),
+        "sourceIssueId": row.get::<Uuid, _>("source_issue_id"),
+        "acceptedPlanRevisionId": row.get::<Uuid, _>("accepted_plan_revision_id"),
+        "acceptedInteractionId": row.get::<Option<Uuid>, _>("accepted_interaction_id"),
+        "status": row.get::<String, _>("status"),
+        "requestFingerprint": row.get::<String, _>("request_fingerprint"),
+        "requestedChildCount": row.get::<i32, _>("requested_child_count"),
+        "childIssueIds": child_issue_ids,
+        "ownerAgentId": row.get::<Option<Uuid>, _>("owner_agent_id"),
+        "ownerUserId": row.get::<Option<String>, _>("owner_user_id"),
+        "ownerRunId": row.get::<Option<Uuid>, _>("owner_run_id"),
+        "completedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at"),
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })
+}
+
+/// Paperclip `normalizeIssuePlanDecompositionChildIds`.
+fn plan_child_ids_from_json(value: &Value) -> Vec<Uuid> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .filter(|id| !id.is_empty())
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// I6: GET /issues/:id/accepted-plan-decompositions
+///
+/// Paperclip `listAcceptedPlanDecompositions`: newest claim per revision, with
+/// the accepted revision number and the live child-issue summaries the UI
+/// renders.
 async fn list_plan_decompositions(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -3116,11 +3303,16 @@ async fn list_plan_decompositions(
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
     let rows = sqlx::query(
-        "SELECT id, company_id, issue_id, plan, accepted_at,
-                accepted_by_type, accepted_by_id, created_at, updated_at
-         FROM plan_decompositions
-         WHERE company_id = $1 AND issue_id = $2 AND accepted_at IS NOT NULL
-         ORDER BY accepted_at DESC, created_at DESC",
+        "SELECT d.id, d.company_id, d.source_issue_id, d.accepted_plan_revision_id,
+                d.accepted_interaction_id, d.status, d.request_fingerprint,
+                d.requested_child_count, d.child_issue_ids,
+                d.owner_agent_id, d.owner_user_id, d.owner_run_id,
+                d.completed_at, d.created_at, d.updated_at,
+                r.revision_number
+         FROM issue_plan_decompositions d
+         LEFT JOIN document_revisions r ON r.id = d.accepted_plan_revision_id
+         WHERE d.company_id = $1 AND d.source_issue_id = $2
+         ORDER BY d.created_at DESC",
     )
     .bind(company_id)
     .bind(id)
@@ -3130,26 +3322,89 @@ async fn list_plan_decompositions(
         tracing::error!(error = %error, issue_id = %id, "failed to list accepted plan decompositions");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    if rows.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    // One batched lookup feeds every claim's `childIssues`.
+    let mut all_child_ids: Vec<Uuid> = Vec::new();
+    for row in &rows {
+        let raw: Value = row.try_get("child_issue_ids").unwrap_or_else(|_| json!([]));
+        for child_id in plan_child_ids_from_json(&raw) {
+            if !all_child_ids.contains(&child_id) {
+                all_child_ids.push(child_id);
+            }
+        }
+    }
+
+    let child_rows = if all_child_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query(
+            "SELECT id, identifier, title, status::text AS status,
+                    priority::text AS priority, assignee_agent_id, assignee_user_id
+             FROM issues
+             WHERE company_id = $1 AND id = ANY($2)",
+        )
+        .bind(company_id)
+        .bind(&all_child_ids)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, issue_id = %id, "failed to load decomposition child issues");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
+
+    let child_map: std::collections::HashMap<Uuid, Value> = child_rows
+        .into_iter()
+        .map(|row| {
+            let child_id: Uuid = row.get("id");
+            (
+                child_id,
+                json!({
+                    "id": child_id,
+                    "identifier": row.get::<Option<String>, _>("identifier"),
+                    "title": row.get::<String, _>("title"),
+                    "status": row.get::<String, _>("status"),
+                    "priority": row.get::<String, _>("priority"),
+                    "assigneeAgentId": row.get::<Option<Uuid>, _>("assignee_agent_id"),
+                    "assigneeUserId": row.get::<Option<Uuid>, _>("assignee_user_id"),
+                }),
+            )
+        })
+        .collect();
+
     Ok(Json(
         rows.into_iter()
             .map(|row| {
-                json!({
-                    "id": row.get::<Uuid, _>("id"),
-                    "companyId": row.get::<Uuid, _>("company_id"),
-                    "issueId": row.get::<Uuid, _>("issue_id"),
-                    "plan": row.get::<Value, _>("plan"),
-                    "acceptedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("accepted_at"),
-                    "acceptedByType": row.get::<Option<String>, _>("accepted_by_type"),
-                    "acceptedById": row.get::<Option<Uuid>, _>("accepted_by_id"),
-                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                    "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
-                })
+                let mut summary = accepted_plan_decomposition_json(&row);
+                let child_issues: Vec<Value> = summary["childIssueIds"]
+                    .as_array()
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(|id| id.as_str())
+                            .filter_map(|id| Uuid::parse_str(id).ok())
+                            .filter_map(|child_id| child_map.get(&child_id).cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                summary["acceptedPlanRevisionNumber"] =
+                    json!(row.get::<Option<i32>, _>("revision_number"));
+                summary["childIssues"] = json!(child_issues);
+                summary
             })
             .collect(),
     ))
 }
 
 /// I7: POST /issues/:id/accepted-plan-decompositions
+///
+/// Paperclip `decomposeAcceptedPlan`: the accepted revision must belong to the
+/// source issue's `plan` document and carry an accepted plan confirmation.
+/// The claim row makes the operation idempotent per revision; children are
+/// created once and the response always reports the full child set.
 async fn submit_plan_decomposition(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -3162,52 +3417,254 @@ async fn submit_plan_decomposition(
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let children = payload
+    let children: Vec<Value> = payload
         .get("children")
         .and_then(Value::as_array)
+        .cloned()
         .ok_or(StatusCode::BAD_REQUEST)?;
+    // Paperclip `createAcceptedPlanDecompositionSchema`: `.min(1).max(25)`.
     if children.is_empty() || children.len() > 25 {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let plan = json!({
-        "acceptedPlanRevisionId": revision_id,
-        "children": children,
-    });
-    let (accepted_by_type, accepted_by_id) = match actor {
-        AuthorizationActor::Board { user_id, .. } => ("user", user_id),
-        AuthorizationActor::Agent { agent_id, .. } => ("agent", agent_id),
-        AuthorizationActor::None => return Err(StatusCode::UNAUTHORIZED),
-    };
-    let row = sqlx::query(
-        "INSERT INTO plan_decompositions
-             (company_id, issue_id, plan, accepted_at, accepted_by_type, accepted_by_id)
-         VALUES ($1, $2, $3, NOW(), $4, $5)
-         RETURNING id, company_id, issue_id, plan, accepted_at,
-                   accepted_by_type, accepted_by_id, created_at, updated_at",
+
+    // The accepted revision must be a revision of this issue's plan document.
+    let belongs_to_plan = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM issue_documents d
+             JOIN document_revisions r ON r.document_id = d.document_id
+             WHERE d.company_id = $1 AND d.issue_id = $2
+               AND d.key = 'plan' AND r.id = $3
+         )",
     )
     .bind(company_id)
     .bind(id)
-    .bind(plan)
-    .bind(accepted_by_type)
-    .bind(accepted_by_id)
+    .bind(revision_id)
     .fetch_one(&state.pool)
     .await
     .map_err(|error| {
-        tracing::error!(error = %error, issue_id = %id, "failed to create plan decomposition");
+        tracing::error!(error = %error, issue_id = %id, "failed to verify plan revision scope");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    if !belongs_to_plan {
+        // Paperclip `unprocessable(...)`.
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // Paperclip `findAcceptedPlanDocumentInteraction`: an accepted
+    // `request_confirmation` whose target is this issue's plan document at this
+    // exact revision is what makes the revision "accepted".
+    let accepted_interaction_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id
+         FROM issue_thread_interactions
+         WHERE company_id = $1 AND issue_id = $2
+           AND kind = 'request_confirmation' AND status = 'accepted'
+           AND payload->'target'->>'type' = 'issue_document'
+           AND payload->'target'->>'key' = 'plan'
+           AND payload->'target'->>'issueId' = $2::text
+           AND payload->'target'->>'revisionId' = $3::text
+         ORDER BY resolved_at DESC NULLS LAST, created_at DESC
+         LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(revision_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to resolve accepted plan confirmation");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if accepted_interaction_id.is_none() {
+        // Paperclip `unprocessable("acceptedPlanRevisionId must have an accepted plan confirmation")`.
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let request_fingerprint = accepted_plan_request_fingerprint(revision_id, &children);
+    let (owner_agent_id, owner_user_id, owner_run_id) = match &actor {
+        AuthorizationActor::Board { user_id, .. } => {
+            (None, Some(user_id.to_string()), None)
+        }
+        AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => (Some(*agent_id), None, *run_id),
+        AuthorizationActor::None => return Err(StatusCode::UNAUTHORIZED),
+    };
+
+    // Idempotent claim: the unique index on
+    // (company_id, source_issue_id, accepted_plan_revision_id) means a replay
+    // keeps the original owner and fingerprint.
+    let claim = sqlx::query(
+        "INSERT INTO issue_plan_decompositions
+             (company_id, source_issue_id, accepted_plan_revision_id, status,
+              request_fingerprint, requested_child_count, requested_children,
+              child_issue_ids, owner_agent_id, owner_user_id, owner_run_id,
+              accepted_interaction_id)
+         VALUES ($1, $2, $3, 'in_flight', $4, $5, $6, '[]'::jsonb, $7, $8, $9, $10)
+         ON CONFLICT (company_id, source_issue_id, accepted_plan_revision_id)
+         DO UPDATE SET updated_at = issue_plan_decompositions.updated_at
+         RETURNING id, company_id, source_issue_id, accepted_plan_revision_id,
+                   accepted_interaction_id, status, request_fingerprint,
+                   requested_child_count, child_issue_ids,
+                   owner_agent_id, owner_user_id, owner_run_id,
+                   completed_at, created_at, updated_at",
+    )
+    .bind(company_id)
+    .bind(id)
+    .bind(revision_id)
+    .bind(&request_fingerprint)
+    .bind(children.len() as i32)
+    .bind(Value::Array(children.clone()))
+    .bind(owner_agent_id)
+    .bind(owner_user_id.as_deref())
+    .bind(owner_run_id)
+    .bind(accepted_interaction_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to claim accepted plan decomposition");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let claim_id: Uuid = claim.get("id");
+    let existing_fingerprint: String = claim.get("request_fingerprint");
+    if existing_fingerprint != request_fingerprint {
+        // Paperclip `conflict(...)`: same revision, different requested children.
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let mut child_issue_ids: Vec<Uuid> =
+        plan_child_ids_from_json(&claim.get::<Value, _>("child_issue_ids"));
+    let claim_status: String = claim.get("status");
+    let mut newly_created_child_issue_ids: Vec<Uuid> = Vec::new();
+
+    // Resume at the first child a previous attempt did not reach and persist
+    // each id as it lands, so an interrupted attempt never re-creates work.
+    if claim_status != "completed" {
+        let service = state.issue_service.clone();
+        for child in children.iter().skip(child_issue_ids.len()) {
+            let Value::Object(child_object) = child else {
+                return Err(StatusCode::BAD_REQUEST);
+            };
+            let title = child_object
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .ok_or(StatusCode::BAD_REQUEST)?
+                .to_string();
+
+            // Paperclip spreads the child body over the create input; unknown
+            // keys are ignored by `CreateIssueInput`.
+            let mut input: CreateIssueInput = serde_json::from_value(child.clone())
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            input.title = title;
+            input.company_id = company_id;
+            input.parent_id = Some(id);
+            input.created_by_agent_id = owner_agent_id;
+            input.created_by_user_id = owner_user_id.as_deref().and_then(|v| Uuid::parse_str(v).ok());
+            input.origin_run_id = owner_run_id;
+            input.origin_kind = Some(
+                if owner_agent_id.is_some() {
+                    "agent"
+                } else {
+                    "manual"
+                }
+                .to_string(),
+            );
+
+            let result = service
+                .create_child(id, input)
+                .await
+                .map_err(|error| {
+                    tracing::error!(error = %error, issue_id = %id, "failed to create decomposition child issue");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            child_issue_ids.push(result.issue.id);
+            newly_created_child_issue_ids.push(result.issue.id);
+
+            let child_id_strings: Vec<String> =
+                child_issue_ids.iter().map(Uuid::to_string).collect();
+            sqlx::query(
+                "UPDATE issue_plan_decompositions
+                 SET child_issue_ids = $2, updated_at = NOW()
+                 WHERE id = $1",
+            )
+            .bind(claim_id)
+            .bind(json!(child_id_strings))
+            .execute(&state.pool)
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, decomposition_id = %claim_id, "failed to record decomposition child issue");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
+
+        // Reached only once every child exists, including the case where a
+        // previous attempt created them all but died before completing.
+        let child_id_strings: Vec<String> =
+            child_issue_ids.iter().map(Uuid::to_string).collect();
+        sqlx::query(
+            "UPDATE issue_plan_decompositions
+             SET status = 'completed', child_issue_ids = $2,
+                 completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(claim_id)
+        .bind(json!(child_id_strings))
+        .execute(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, decomposition_id = %claim_id, "failed to complete accepted plan decomposition");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    // Report the durable row, so a replay reflects the original completion
+    // rather than a freshly invented timestamp.
+    let persisted = sqlx::query(
+        "SELECT id, company_id, source_issue_id, accepted_plan_revision_id,
+                accepted_interaction_id, status, request_fingerprint,
+                requested_child_count, child_issue_ids,
+                owner_agent_id, owner_user_id, owner_run_id,
+                completed_at, created_at, updated_at
+         FROM issue_plan_decompositions
+         WHERE id = $1",
+    )
+    .bind(claim_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, decomposition_id = %claim_id, "failed to reload accepted plan decomposition");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let decomposition = accepted_plan_decomposition_json(&persisted);
+
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.accepted_plan_decomposition_updated",
+        &actor,
+        "issue",
+        id,
+        json!({
+            "acceptedPlanRevisionId": revision_id,
+            "decompositionId": claim_id,
+            "status": "completed",
+            "requestedChildCount": children.len(),
+            "childIssueIds": child_issue_ids,
+            "newlyCreatedChildIssueIds": newly_created_child_issue_ids,
+        }),
+    )
+    .await;
+
+    // Paperclip `res.json({decomposition, childIssueIds, newlyCreatedChildIssueIds})`.
     Ok((
-        StatusCode::CREATED,
+        StatusCode::OK,
         Json(json!({
-            "id": row.get::<Uuid, _>("id"),
-            "companyId": row.get::<Uuid, _>("company_id"),
-            "issueId": row.get::<Uuid, _>("issue_id"),
-            "plan": row.get::<Value, _>("plan"),
-            "acceptedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("accepted_at"),
-            "acceptedByType": row.get::<Option<String>, _>("accepted_by_type"),
-            "acceptedById": row.get::<Option<Uuid>, _>("accepted_by_id"),
-            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+            "decomposition": decomposition,
+            "childIssueIds": child_issue_ids,
+            "newlyCreatedChildIssueIds": newly_created_child_issue_ids,
         })),
     ))
 }
@@ -3369,7 +3826,7 @@ async fn list_child_issues(
 
     // Query child issues from database
     let children = sqlx::query_as::<_, Issue>(
-        "SELECT * FROM issues WHERE parent_issue_id = $1 AND company_id = $2 ORDER BY created_at DESC"
+        "SELECT * FROM issues WHERE parent_id = $1 AND company_id = $2 ORDER BY created_at DESC"
     )
     .bind(id)
     .bind(company_id)
@@ -3557,17 +4014,10 @@ async fn mark_issue_read(
         _ => return Err(StatusCode::FORBIDDEN),
     };
 
-    let company_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT company_id FROM issues WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|error| {
-        tracing::error!(error = %error, issue_id = %id, "failed to load issue company for read state");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    // 读状态是「按 issue id 寻址」的资源，必须与同组路由（unmark/archive/
+    // unarchive）一样先过公司可见性关口，否则任意 Board 都能写入别家公司的
+    // 阅读状态。跨租户按 Paperclip `getAccessibleResource` 的口径回 404。
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
 
     let read_at = chrono::Utc::now();
     let row = sqlx::query_as::<_, (Uuid, Uuid, Uuid, chrono::DateTime<chrono::Utc>)>(
@@ -3587,6 +4037,17 @@ async fn mark_issue_read(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "issue.read_marked",
+        &actor,
+        "issue",
+        id,
+        json!({ "userId": user_id, "lastReadAt": row.3 }),
+    )
+    .await;
+
     Ok(Json(serde_json::json!({
         "id": row.0,
         "companyId": row.1,
@@ -3597,17 +4058,21 @@ async fn mark_issue_read(
 }
 
 /// I13: DELETE /issues/:id/read
+///
+/// Paperclip answers `{id, removed}` where `removed` reports whether a read
+/// state actually existed (`markUnread` returns `deleted.length > 0`). A bare
+/// 204 cannot express that, and the frontend parses the body.
 async fn unmark_issue_read(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let company_id = scoped_issue_company(&state, &actor, id).await?;
     let user_id = match actor {
         AuthorizationActor::Board { user_id, .. } => user_id,
         _ => return Err(StatusCode::FORBIDDEN),
     };
-    sqlx::query(
+    let affected = sqlx::query(
         "DELETE FROM issue_read_status WHERE company_id = $1 AND issue_id = $2 AND user_id = $3",
     )
     .bind(company_id)
@@ -3615,8 +4080,292 @@ async fn unmark_issue_read(
     .bind(user_id)
     .execute(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::NO_CONTENT)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .rows_affected();
+
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "issue.read_unmarked",
+        &actor,
+        "issue",
+        id,
+        json!({ "userId": user_id }),
+    )
+    .await;
+
+    Ok(Json(json!({ "id": id, "removed": affected > 0 })))
+}
+
+/// `inboxArchiveBodySchema` — `.strict().default({})`. An absent body behaves as
+/// `{}`; an unknown key or a non-object body is a 400.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxArchiveBody {
+    #[serde(default, rename = "userId")]
+    user_id: Option<String>,
+}
+
+/// Parses the archive body the way `validate(inboxArchiveBodySchema)` does.
+///
+/// axum's `Option<Json<T>>` cannot express that contract: it folds *every*
+/// rejection, malformed JSON included, into `None`, so a body Paperclip rejects
+/// with 400 would be silently treated as `{}`.
+async fn parse_inbox_archive_body(
+    body: axum::body::Bytes,
+) -> Result<InboxArchiveBody, (StatusCode, Json<serde_json::Value>)> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(InboxArchiveBody::default());
+    }
+    serde_json::from_slice::<InboxArchiveBody>(&body).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Validation error", "message": error.to_string() })),
+        )
+    })
+}
+
+/// Who an inbox-archive request is written for, and why.
+struct InboxArchiveTarget {
+    user_id: Uuid,
+    resolved_from: &'static str,
+    policy_mode: Option<&'static str>,
+}
+
+/// Port of Paperclip `resolveInboxArchiveTarget` (`routes/issues.ts:7884-7925`)
+/// plus the `inbox:manage` arm of `DefaultAccessService.decide`
+/// (`services/authorization.ts:1931-2066`).
+///
+/// Denial codes are part of the wire contract: clients branch on them, so the
+/// messages and codes below are copied verbatim rather than paraphrased.
+async fn resolve_inbox_archive_target(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    body: &InboxArchiveBody,
+) -> Result<InboxArchiveTarget, (StatusCode, Json<serde_json::Value>)> {
+    let forbidden = |message: &str, code: &str, reason: &str| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": message, "code": code, "reason": reason })),
+        )
+    };
+    let internal = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Internal server error" })),
+        )
+    };
+
+    if let AuthorizationActor::Board { user_id, .. } = actor {
+        // Paperclip guards on `req.actor.userId`; a board actor without one is
+        // unrepresentable here, so the target is always the actor itself.
+        return Ok(InboxArchiveTarget {
+            user_id: *user_id,
+            resolved_from: "responsible_user",
+            policy_mode: None,
+        });
+    }
+    let AuthorizationActor::Agent {
+        agent_id,
+        responsible_user_id,
+        on_behalf_of_user_id,
+        ..
+    } = actor
+    else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Authentication required" })),
+        ));
+    };
+
+    let explicit_user_id = body
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    // Paperclip reads only `onBehalfOfUserId` here; Parrot's resolver stores the
+    // responsible user in both fields, so the fallback is equivalent.
+    let responsible_user_id = on_behalf_of_user_id.or(*responsible_user_id);
+    let target_user_id = match explicit_user_id {
+        Some(value) => value.to_string(),
+        None => responsible_user_id.map(|value| value.to_string()).ok_or_else(|| {
+            forbidden(
+                "Inbox target user could not be resolved",
+                "inbox_target_user_unresolved",
+                "inbox_target_user_unresolved",
+            )
+        })?,
+    };
+
+    // Paperclip keeps user ids as text; Parrot stores them as uuid. A malformed
+    // id cannot name a member, so it resolves to a denial rather than a 400.
+    let Ok(target_user_id) = Uuid::parse_str(&target_user_id) else {
+        return Err(forbidden(
+            "Inbox target user could not be resolved",
+            "inbox_target_user_unresolved",
+            "deny_missing_membership",
+        ));
+    };
+
+    // `getResponsibleUserSnapshot`: the user must exist with an active
+    // membership in this company.
+    let target_is_active = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM company_memberships \
+         WHERE company_id = $1 AND principal_type = 'user' AND principal_id = $2 AND status = 'active')",
+    )
+    .bind(company_id)
+    .bind(target_user_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| internal())?;
+    if !target_is_active {
+        return Err(forbidden(
+            &format!("Inbox target user {target_user_id} is not an active member of company {company_id}."),
+            "inbox_target_user_unresolved",
+            "deny_missing_membership",
+        ));
+    }
+
+    let policy = sqlx::query_as::<_, (String, Vec<Uuid>)>(
+        "SELECT mode, allowed_agent_ids FROM user_inbox_agent_policies \
+         WHERE company_id = $1 AND user_id = $2",
+    )
+    .bind(company_id)
+    .bind(target_user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| internal())?;
+
+    // Policy denials are shared by both branches and take precedence over the
+    // "missing grant" fallbacks.
+    let policy_denial = match &policy {
+        Some((mode, allowed)) if mode == "disabled" => Some(forbidden(
+            &format!("Inbox management is disabled for user {target_user_id}."),
+            "inbox_management_disabled",
+            "inbox_management_disabled",
+        )),
+        Some((mode, allowed)) if mode == "allowlist" && !allowed.contains(agent_id) => {
+            Some(forbidden(
+                &format!("Agent {agent_id} is not allowed to manage user {target_user_id}'s inbox."),
+                "inbox_agent_not_allowed",
+                "inbox_agent_not_allowed",
+            ))
+        }
+        _ => None,
+    };
+
+    if Some(target_user_id) != responsible_user_id {
+        // Cross-user: a scoped grant is an administrative override that outranks
+        // even a disabled policy; otherwise a materialized policy is the target
+        // user's explicit consent.
+        let grant_scope = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT scope FROM principal_permission_grants \
+             WHERE company_id = $1 AND principal_type = 'agent' AND principal_id = $2 \
+               AND permission_key = 'inbox:manage' \
+               AND (expires_at IS NULL OR expires_at > NOW())",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| internal())?
+        .flatten();
+
+        if let Some(scope) = grant_scope.as_ref() {
+            if scope_allows_user(scope, target_user_id) {
+                return Ok(InboxArchiveTarget {
+                    user_id: target_user_id,
+                    resolved_from: if explicit_user_id.is_some() {
+                        "explicit"
+                    } else {
+                        "responsible_user"
+                    },
+                    policy_mode: Some("grant_override"),
+                });
+            }
+        }
+        if let Some(denial) = policy_denial {
+            return Err(denial);
+        }
+        if let Some((mode, _)) = policy.filter(|(mode, _)| mode == "open" || mode == "allowlist") {
+            return Ok(InboxArchiveTarget {
+                user_id: target_user_id,
+                resolved_from: if explicit_user_id.is_some() {
+                    "explicit"
+                } else {
+                    "responsible_user"
+                },
+                policy_mode: Some(if mode == "allowlist" { "allowlist" } else { "open" }),
+            });
+        }
+        // The implicit default-open policy is responsible-user-only, so an
+        // absent row never becomes a company-wide cross-user grant.
+        return Err(if grant_scope.is_some() {
+            forbidden(
+                "Permission inbox:manage does not cover the requested user.",
+                "inbox_cross_user_grant_required",
+                "deny_scope",
+            )
+        } else {
+            forbidden(
+                "Missing permission: inbox:manage.",
+                "inbox_cross_user_grant_required",
+                "deny_missing_grant",
+            )
+        });
+    }
+
+    if let Some(denial) = policy_denial {
+        return Err(denial);
+    }
+    Ok(InboxArchiveTarget {
+        user_id: target_user_id,
+        resolved_from: if explicit_user_id.is_some() {
+            "explicit"
+        } else {
+            "responsible_user"
+        },
+        // `policy?.mode ?? "open"` — the responsible user needs no grant.
+        policy_mode: Some(match policy.as_ref().map(|(mode, _)| mode.as_str()) {
+            Some("allowlist") => "allowlist",
+            _ => "open",
+        }),
+    })
+}
+
+/// `scopeAllows` (`services/authorization.ts:368-451`) restricted to the
+/// `userId`/`userIds` constraint — the only one `inbox:manage` is resolved with.
+///
+/// An empty grant scope allows (the caller never sets `requireStructuredScope`),
+/// and unrecognized keys do not constrain, which is why only these two keys are
+/// inspected.
+fn scope_allows_user(scope: &serde_json::Value, user_id: Uuid) -> bool {
+    let Some(object) = scope.as_object() else {
+        return true;
+    };
+    let mut listed: Vec<&str> = Vec::new();
+    for key in ["userId", "userIds"] {
+        match object.get(key) {
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                listed.push(value.trim());
+            }
+            Some(serde_json::Value::Array(values)) => {
+                listed.extend(
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::trim),
+                );
+            }
+            _ => {}
+        }
+    }
+    if listed.is_empty() {
+        return true;
+    }
+    listed.iter().any(|value| *value == user_id.to_string())
 }
 
 /// I14: POST /issues/:id/inbox-archive
@@ -3624,25 +4373,75 @@ async fn archive_issue_inbox(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
-) -> Result<StatusCode, StatusCode> {
-    let company_id = scoped_issue_company(&state, &actor, id).await?;
-    let user_id = match actor {
-        AuthorizationActor::Board { user_id, .. } => user_id,
-        _ => return Err(StatusCode::FORBIDDEN),
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // `getAccessibleResource`: a missing issue and a cross-tenant issue are both
+    // a bare 404 so the response cannot be used to enumerate ids.
+    let company_id = scoped_issue_company(&state, &actor, id)
+        .await
+        .map_err(|status| {
+            (
+                status,
+                Json(json!({ "error": "Issue not found" })),
+            )
+        })?;
+    let body = parse_inbox_archive_body(body).await?;
+    let target = resolve_inbox_archive_target(&state, &actor, company_id, &body).await?;
+
+    let (actor_type, agent_id, run_id) = match &actor {
+        AuthorizationActor::Agent { agent_id, run_id, .. } => ("agent", Some(*agent_id), *run_id),
+        _ => ("user", None, None),
     };
-    sqlx::query(
-        "INSERT INTO issue_inbox_archives (company_id, issue_id, user_id)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (issue_id, user_id) DO UPDATE
-         SET archived_at = NOW(), updated_at = NOW()",
+
+    let archived_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "INSERT INTO issue_inbox_archives \
+            (company_id, issue_id, user_id, archived_by_actor_type, archived_by_agent_id, archived_by_run_id) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (issue_id, user_id) DO UPDATE \
+         SET archived_at = NOW(), updated_at = NOW(), \
+             archived_by_actor_type = EXCLUDED.archived_by_actor_type, \
+             archived_by_agent_id = EXCLUDED.archived_by_agent_id, \
+             archived_by_run_id = EXCLUDED.archived_by_run_id \
+         RETURNING archived_at",
     )
     .bind(company_id)
     .bind(id)
-    .bind(user_id)
-    .execute(&state.pool)
+    .bind(target.user_id)
+    .bind(actor_type)
+    .bind(agent_id)
+    .bind(run_id)
+    .fetch_one(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::NO_CONTENT)
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to archive issue inbox row");
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "database error" })))
+    })?;
+
+    let mut details = json!({
+        "userId": target.user_id,
+        "archivedAt": archived_at,
+        "targetResolvedFrom": target.resolved_from,
+    });
+    if let Some(mode) = target.policy_mode {
+        details["policyMode"] = json!(mode);
+    }
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "issue.inbox_archived",
+        &actor,
+        "issue",
+        id,
+        details,
+    )
+    .await;
+
+    Ok(Json(json!({
+        "id": id,
+        "userId": target.user_id,
+        "archivedAt": archived_at,
+        "targetResolvedFrom": target.resolved_from,
+    })))
 }
 
 /// I15: DELETE /issues/:id/inbox-archive
@@ -3650,23 +4449,54 @@ async fn unarchive_issue_inbox(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     IssueId(id): IssueId,
-) -> Result<StatusCode, StatusCode> {
-    let company_id = scoped_issue_company(&state, &actor, id).await?;
-    let user_id = match actor {
-        AuthorizationActor::Board { user_id, .. } => user_id,
-        _ => return Err(StatusCode::FORBIDDEN),
-    };
-    sqlx::query(
-        "DELETE FROM issue_inbox_archives
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let company_id = scoped_issue_company(&state, &actor, id)
+        .await
+        .map_err(|status| (status, Json(json!({ "error": "Issue not found" }))))?;
+    let body = parse_inbox_archive_body(body).await?;
+    let target = resolve_inbox_archive_target(&state, &actor, company_id, &body).await?;
+
+    let removed = sqlx::query(
+        "DELETE FROM issue_inbox_archives \
          WHERE company_id = $1 AND issue_id = $2 AND user_id = $3",
     )
     .bind(company_id)
     .bind(id)
-    .bind(user_id)
+    .bind(target.user_id)
     .execute(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::NO_CONTENT)
+    .map_err(|error| {
+        tracing::error!(error = %error, issue_id = %id, "failed to remove issue inbox archive row");
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "database error" })))
+    })?
+    .rows_affected()
+        > 0;
+
+    let mut details = json!({
+        "userId": target.user_id,
+        "targetResolvedFrom": target.resolved_from,
+    });
+    if let Some(mode) = target.policy_mode {
+        details["policyMode"] = json!(mode);
+    }
+    crate::routes::log_activity(
+        &state.pool,
+        company_id,
+        "issue.inbox_unarchived",
+        &actor,
+        "issue",
+        id,
+        details,
+    )
+    .await;
+
+    // Paperclip falls back to `{ok, userId}` when no row was present.
+    Ok(Json(if removed {
+        json!({ "id": id, "removed": true, "userId": target.user_id })
+    } else {
+        json!({ "ok": true, "userId": target.user_id })
+    }))
 }
 
 /// I16: POST /issues/:id/monitor/check-now
@@ -4446,12 +5276,9 @@ async fn create_feedback_vote(
         AuthorizationActor::Board { user_id, .. } => user_id,
         _ => return Err(StatusCode::FORBIDDEN),
     };
-    let company_id = sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM issues WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    // 同 `list_feedback_votes`：按 issue id 寻址，必须先过公司可见性关口，
+    // 否则任意 Board 都能给别家公司的 issue 投票。
+    let company_id = scoped_issue_company(&state, &actor, id).await?;
     let target_type = payload
         .get("targetType")
         .and_then(Value::as_str)

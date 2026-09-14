@@ -6,7 +6,7 @@
 //! Uses blocking reqwest (same pattern as `client.rs`) since the CLI is synchronous.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};

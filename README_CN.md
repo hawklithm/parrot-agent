@@ -7,7 +7,7 @@ Paperclip agent 编排后端的 Rust 实现。基于 Axum、SQLx 和 Tokio 构�
 ```
 parrot-agent/
 ├── Cargo.toml                  # 工作区根配置
-├── migrations/                 # SQL 迁移文件 (19 个)
+├── migrations/                 # SQL 迁移文件 (89 个)
 ├── docker-compose.yml          # PostgreSQL 容器配置
 └── crates/
     ├── models/                 # 领域模型、枚举、状态机
@@ -20,8 +20,8 @@ parrot-agent/
     └── server/                 # 主服务器程序
         ├── src/
         │   ├── main.rs         # 服务器入口
-        │   └── bin/            # 20 个工具程序
-        └── examples/           # 3 个示例程序
+        │   └── bin/            # 21 个工具程序
+        └── examples/           # 2 个示例程序
 ```
 
 ## 核心功能模块
@@ -57,7 +57,7 @@ parrot-agent/
 docker compose up -d postgres
 
 # 数据库连接信息
-# Host: localhost:5433
+# Host: localhost:5433（宿主机 5433 映射到容器 5432）
 # User: postgres
 # Password: postgres
 # Database: parrot_agent_dev
@@ -70,7 +70,7 @@ docker compose up -d postgres
 createdb parrot_agent_dev
 
 # 配置环境变量
-export DATABASE_URL=postgres://postgres:admin123@localhost:5432/parrot_agent_dev
+export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_dev
 ```
 
 ### 2. 配置环境变量
@@ -79,7 +79,7 @@ export DATABASE_URL=postgres://postgres:admin123@localhost:5432/parrot_agent_dev
 
 ```bash
 # 数据库连接
-DATABASE_URL=postgres://postgres:postgres@localhost:5433/parrot_agent_dev
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_dev
 
 # 部署模式
 DEPLOYMENT_MODE=local_trusted
@@ -160,14 +160,40 @@ cargo check --workspace
 
 ## 数据库迁移
 
-项目包含 19 个 SQL 迁移文件，自动在服务启动时执行。
+项目包含 **89** 个 SQL 迁移文件。服务连接 PostgreSQL 后，会在开始监听
+HTTP 请求前自动执行所有未执行的 migration。
+
+### 首次使用空数据库
+
+项目大量使用 SQLx 的编译期查询宏（`query!`、`query_as!` 等）。这些宏会
+在 `cargo run` 编译阶段连接数据库并校验表结构，而服务里的自动 migration
+要等编译完成、进入 `main()` 后才会执行。因此，完全空的数据库不能直接靠
+`cargo run` 首次启动，必须先用独立的 SQLx CLI 初始化一次：
+
+```bash
+# 设置为服务实际使用的 PostgreSQL 数据库地址
+# 方式 B（本机 PostgreSQL）用 5432；用 Docker Compose 的改用 5433
+export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_dev
+
+# 如果本机尚未安装 SQLx CLI，先安装一次
+cargo install sqlx-cli --no-default-features --features postgres
+
+# 初始化空数据库；这个命令不需要先编译 Rust workspace
+sqlx migrate run --source migrations
+
+# 后续启动时，服务会自动执行新增的 migration
+cargo run -p parrot-server
+```
+
+不要把 `cargo run -p parrot-server --bin apply_migration` 当作常规初始化命令；
+该工具包含针对性的破坏性修复逻辑，并不是完整的 migration runner。
 
 ```bash
 # 查看迁移列表
 ls -lh migrations/*.sql
 
-# 手动运行迁移
-cargo run -p server --bin apply_migration
+# 查看 migration 状态
+sqlx migrate info --source migrations
 ```
 
 迁移文件采用递增编号命名：
@@ -257,10 +283,10 @@ adapters/
 
 ### 详细文档
 
-- **完整功能文档**: [docs/adapter-env-var-reference.md](docs/adapter-env-var-reference.md)
-- **快速开始指南**: [docs/QUICKSTART-env-var-reference.md](docs/QUICKSTART-env-var-reference.md)
+- **完整功能文档**: `../archive_docs_20260815_230347/adapter-env-var-reference.md`（已归档）
+- **快速开始指南**: `../archive_docs_20260815_230347/QUICKSTART-env-var-reference.md`（已归档）
 - **Adapter 配置说明**: [adapters/README.md](adapters/README.md)
-- **MCP Gateway 运行手册**: [docs/paperclip-mcp-runbook.md](docs/paperclip-mcp-runbook.md)
+- **MCP Gateway 运行手册**: `../archive_docs_20260815_230347/paperclip-mcp-runbook.md`（已归档）
 
 ## 故障排查
 

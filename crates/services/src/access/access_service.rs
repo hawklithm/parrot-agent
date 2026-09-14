@@ -535,10 +535,12 @@ mod tests {
             is_instance_admin: false,
         };
 
+        let agent1_id = Uuid::new_v4();
         let agent1 = models::Agent {
-            id: Uuid::new_v4(),
+            id: agent1_id,
             company_id,
             name: "Agent 1".to_string(),
+            url_key: models::agent_url_key::derive_agent_url_key(Some("Agent 1"), Some(agent1_id)),
             role: models::AgentRole::General,
             status: models::AgentStatus::Idle,
             adapter_type: "process".to_string(),
@@ -559,10 +561,12 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
+        let agent2_id = Uuid::new_v4();
         let agent2 = models::Agent {
-            id: Uuid::new_v4(),
+            id: agent2_id,
             company_id: Uuid::new_v4(), // Different company
             name: "Agent 2".to_string(),
+            url_key: models::agent_url_key::derive_agent_url_key(Some("Agent 2"), Some(agent2_id)),
             role: models::AgentRole::General,
             status: models::AgentStatus::Idle,
             adapter_type: "process".to_string(),
@@ -593,10 +597,12 @@ mod tests {
     #[test]
     fn test_redact_for_restricted_agent_view() {
         let service = DefaultAccessService::new();
+        let agent_id = Uuid::new_v4();
         let mut agent = models::Agent {
-            id: Uuid::new_v4(),
+            id: agent_id,
             company_id: Uuid::new_v4(),
             name: "Test Agent".to_string(),
+            url_key: models::agent_url_key::derive_agent_url_key(Some("Test Agent"), Some(agent_id)),
             role: models::AgentRole::General,
             status: models::AgentStatus::Idle,
             adapter_type: "claude_local".to_string(),

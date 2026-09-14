@@ -1663,14 +1663,6 @@ async fn load_active_agent_run_context(
     })
 }
 
-async fn require_active_agent_run(
-    state: &AppState,
-    actor: &AuthorizationActor,
-) -> Result<(Uuid, Uuid, Uuid), StatusCode> {
-    let context = load_active_agent_run_context(state, actor).await?;
-    Ok((context.agent_id, context.company_id, context.run_id))
-}
-
 fn gateway_audit_like_pattern(value: &str) -> String {
     let escaped = value
         .replace('\\', "\\\\")
@@ -1774,71 +1766,72 @@ async fn gateway_audit(
         r#"
         SELECT e.id,
                e.company_id,
-               e.event_type,
+               e.action AS event_type,
                e.actor_type,
                e.actor_id,
-               COALESCE(e.agent_id, i.agent_id) AS agent_id,
-               COALESCE(e.run_id, i.run_id) AS run_id,
-               COALESCE(e.application_id, i.application_id) AS application_id,
-               COALESCE(e.connection_id, i.connection_id) AS connection_id,
-               e.invocation_id,
-               e.action_request_id,
-               e.tool_name,
-               e.decision,
+               CASE WHEN e.details->>'agentId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                    THEN (e.details->>'agentId')::uuid END AS agent_id,
+               CASE WHEN e.details->>'runId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                    THEN (e.details->>'runId')::uuid END AS run_id,
+               NULL::uuid AS application_id,
+               e.connection_id,
+               CASE WHEN e.correlation_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                    THEN e.correlation_id::uuid END AS invocation_id,
+               NULL::uuid AS action_request_id,
+               e.details->>'toolName' AS tool_name,
+               e.details->>'decision' AS decision,
                e.outcome,
                e.reason_code,
-               e.arguments_summary,
-               e.request_summary,
-               e.result_summary,
-               e.error_code,
-               e.error_message,
-               e.metadata,
+               e.details->'argumentsSummary' AS arguments_summary,
+               e.details->'requestSummary' AS request_summary,
+               e.details->'resultSummary' AS result_summary,
+               e.details->>'errorCode' AS error_code,
+               e.details->>'errorMessage' AS error_message,
+               e.details AS metadata,
                e.created_at,
                a.name AS agent_name,
                c.name AS connection_name,
                c.application_id AS connection_application_id
-          FROM tool_call_events e
-          LEFT JOIN tool_invocations i
-            ON i.id = e.invocation_id AND i.company_id = e.company_id
+          FROM tool_access_audit_events e
           LEFT JOIN agents a
-            ON a.id = COALESCE(e.agent_id, i.agent_id)
+            ON a.id::text = e.details->>'agentId'
            AND a.company_id = e.company_id
           LEFT JOIN tool_connections c
-            ON c.id = COALESCE(e.connection_id, i.connection_id)
+            ON c.id = e.connection_id
            AND c.company_id = e.company_id
          WHERE e.company_id = $1
            AND e.created_at >= $2
            AND ($3::uuid IS NULL
-                OR e.application_id = $3
-                OR i.application_id = $3
                 OR e.connection_id = $3
-                OR i.connection_id = $3
                 OR c.application_id = $3)
-           AND ($4::uuid IS NULL OR COALESCE(e.agent_id, i.agent_id) = $4)
+           AND ($4::uuid IS NULL OR (
+                CASE WHEN e.details->>'agentId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                     THEN (e.details->>'agentId')::uuid END
+               ) = $4)
            AND (
              $5::text IS NULL
-             OR e.event_type ILIKE $5 ESCAPE '\'
-             OR COALESCE(e.tool_name, '') ILIKE $5 ESCAPE '\'
+             OR e.action ILIKE $5 ESCAPE '\'
+             OR COALESCE(e.details->>'toolName', '') ILIKE $5 ESCAPE '\'
              OR COALESCE(e.reason_code, '') ILIKE $5 ESCAPE '\'
-             OR COALESCE(e.error_code, '') ILIKE $5 ESCAPE '\'
+             OR COALESCE(e.details->>'errorCode', '') ILIKE $5 ESCAPE '\'
              OR COALESCE(a.name, '') ILIKE $5 ESCAPE '\'
              OR COALESCE(c.name, '') ILIKE $5 ESCAPE '\'
-             OR COALESCE(e.metadata::text, '') ILIKE $5 ESCAPE '\'
+             OR COALESCE(e.details::text, '') ILIKE $5 ESCAPE '\'
            )
            AND (
              $6::text IS NULL
              OR CASE $6
-                  WHEN 'allowed' THEN e.event_type IN ('call_completed', 'tool_gateway.call_completed')
-                                      OR e.decision IN ('allow', 'approved')
+                  WHEN 'allowed' THEN e.action IN ('call_completed', 'tool_gateway.call_completed')
+                                      OR e.details->>'decision' IN ('allow', 'approved')
                                       OR e.outcome IN ('success', 'allowed')
-                  WHEN 'blocked' THEN e.event_type IN ('call_denied', 'tool_gateway.call_denied')
-                                      OR e.decision IN ('deny', 'rate_limited')
+                  WHEN 'blocked' THEN e.action IN ('call_denied', 'tool_gateway.call_denied')
+                                      OR e.details->>'decision' IN ('deny', 'rate_limited')
                                       OR e.outcome IN ('denied', 'blocked')
-                  WHEN 'asked_first' THEN e.event_type IN ('approval_requested', 'tool_gateway.approval_requested')
-                                      OR e.decision = 'require_approval'
-                  WHEN 'waiting' THEN e.event_type IN ('call_deferred', 'tool_gateway.call_deferred')
-                                      OR e.decision = 'defer_runtime'
-                  WHEN 'failed' THEN e.event_type IN ('call_failed', 'tool_gateway.call_failed')
+                  WHEN 'asked_first' THEN e.action IN ('approval_requested', 'tool_gateway.approval_requested')
+                                      OR e.details->>'decision' = 'require_approval'
+                  WHEN 'waiting' THEN e.action IN ('call_deferred', 'tool_gateway.call_deferred')
+                                      OR e.details->>'decision' = 'defer_runtime'
+                  WHEN 'failed' THEN e.action IN ('call_failed', 'tool_gateway.call_failed')
                                       OR e.outcome IN ('failure', 'failed')
                   ELSE TRUE
                 END
@@ -2267,7 +2260,8 @@ pub fn tool_access_routes() -> Router<AppState> {
 #[derive(Debug, Deserialize)]
 struct UpdateProfileEntryRequest {
     enabled: Option<bool>,
-    order: Option<i32>,
+    #[serde(rename = "order")]
+    _order: Option<i32>,
 }
 async fn update_tool_profile_entry(
     State(state): State<AppState>,

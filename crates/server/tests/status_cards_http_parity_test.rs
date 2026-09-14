@@ -8,7 +8,7 @@
 //! match the card's generating issue.
 //!
 //! Run with a live database, e.g.:
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile \
+//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_compile \
 //!     cargo test -p parrot-server --test status_cards_http_parity_test
 
 use axum::body::{to_bytes, Body};
@@ -123,27 +123,14 @@ async fn cleanup_fixture(f: &Fixture) {
         .await;
 }
 
-async fn connect_and_migrate() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect database for status cards HTTP parity tests");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    pool
-}
+
+mod common;
+use common::connect_and_migrate;
+
 
 /// #109 page family + #110 refresh / archive / authz acceptance.
 #[tokio::test]
 async fn status_card_lifecycle_matches_paperclip() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::ERROR)
-        .with_test_writer()
-        .try_init();
     let pool = connect_and_migrate().await;
     let f = seed_fixture(&pool).await;
     let state = build_app_state(pool.clone()).await.expect("build_app_state");

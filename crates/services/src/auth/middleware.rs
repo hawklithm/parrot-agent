@@ -23,6 +23,7 @@ use repositories::board_api_key_repository::{
     hash_api_key, BoardApiKeyRepository, PgBoardApiKeyRepository,
 };
 use repositories::pg_agent_repository::PgAgentRepository;
+use repositories::RepositoryError;
 
 use crate::auth::{
     load_responsible_user_memberships, resolve_board_access, verify_local_agent_jwt, ActorSource,
@@ -139,7 +140,8 @@ impl ActorResolver for LocalTrustedResolver {
     }
 }
 
-/// Bearer Token 分派：Board API Key (bak_) / Agent API Key (aak_) / Agent JWT。
+/// Bearer Token 分派：先按哈希查 Board API Key，再按 `aak_` 前缀识别 Agent Key，
+/// 最后按 Agent JWT 验签——与 Paperclip `actorMiddleware` 的解析顺序一致。
 pub struct BearerTokenResolver {
     pool: Arc<PgPool>,
     jwt_config: Arc<JwtConfig>,
@@ -312,13 +314,16 @@ impl BearerTokenResolver {
             .map(|m| m.company_id)
             .unwrap_or_else(Uuid::nil);
 
-        Ok(Some(AuthorizationActor::board_with_source(
-            key.user_id,
-            company_id,
-            ActorSource::BoardKey,
-            memberships,
-            is_instance_admin,
-        )))
+        Ok(Some(
+            AuthorizationActor::board_with_source(
+                key.user_id,
+                company_id,
+                ActorSource::BoardKey,
+                memberships,
+                is_instance_admin,
+            )
+            .with_key_id(key.id),
+        ))
     }
 
     async fn resolve_agent_key(&self, token: &str) -> AuthResult<Option<AuthorizationActor>> {
@@ -348,18 +353,44 @@ impl BearerTokenResolver {
             })?
         };
 
-        // 查询关联的 Agent 记录，确认其存在且处于活跃状态。
+        // 查询关联的 Agent 记录，按 Paperclip 的口径做状态门
+        // （`middleware/auth.ts:400-407`）：只有 `terminated` 与
+        // `pending_approval` 被拒，`idle`/`paused` 的 agent 仍可用 key 鉴权。
         let agent_repo = PgAgentRepository::new((*self.pool).clone());
-        let agent = agent_repo
-            .get_by_id(key.agent_id)
-            .await
-            .map_err(|e| AuthError::Internal {
-                message: format!("Agent lookup failed: {}", e),
-            })?;
+        let agent = match agent_repo.get_by_id(key.agent_id).await {
+            Ok(agent) => agent,
+            // 记录不存在与记录被拒同样是「不可再鉴权」，不回 500。
+            Err(RepositoryError::NotFound(_)) => {
+                return Err(AuthError::Forbidden {
+                    reason: "Agent is not active or does not exist".to_string(),
+                    code: Some("AGENT_INACTIVE".to_string()),
+                });
+            }
+            Err(e) => {
+                return Err(AuthError::Internal {
+                    message: format!("Agent lookup failed: {}", e),
+                });
+            }
+        };
 
-        let responsible_user_id = match &agent {
-            a if a.status == AgentStatus::Running => a.reports_to,
-            _ => {
+        if matches!(
+            agent.status,
+            AgentStatus::Terminated | AgentStatus::PendingApproval
+        ) {
+            return Err(AuthError::Forbidden {
+                reason: "Agent is not active or does not exist".to_string(),
+                code: Some("AGENT_INACTIVE".to_string()),
+            });
+        }
+        // responsible user 是**签发这张 key 的人**，存在 key 自己身上。
+        //
+        // 此前这里读的是 `agents.reports_to`，但那一列是 `agents(id)` 的自引用
+        // 外键（组织架构上的上级 agent），于是 agent id 被当成 user id 使用：
+        // `on_behalf_of_memberships` 必然查空，agent 用 key 调用任何公司级写接口
+        // 都会被 403。缺失时按 Paperclip `RESPONSIBLE_USER_UNAVAILABLE` 拒绝。
+        let responsible_user_id = match key.responsible_user_id {
+            Some(uid) => Some(uid),
+            None => {
                 crate::auth::audit::audit_missing_responsible_user(
                     &self.pool,
                     key.agent_id,
@@ -367,8 +398,8 @@ impl BearerTokenResolver {
                 )
                 .await;
                 return Err(AuthError::Forbidden {
-                    reason: "Agent is not active or does not exist".to_string(),
-                    code: Some("AGENT_INACTIVE".to_string()),
+                    reason: "Responsible user is unavailable for this agent key".to_string(),
+                    code: Some("RESPONSIBLE_USER_UNAVAILABLE".to_string()),
                 });
             }
         };
@@ -539,18 +570,55 @@ impl ActorResolver for BearerTokenResolver {
             None => return Ok(None),
         };
 
-        if token.starts_with("bak_") {
-            self.resolve_board_key(&token).await
-        } else if token.starts_with("aak_") {
-            self.resolve_agent_key(&token).await
-        } else {
-            self.resolve_jwt(&token, headers).await
+        // 解析顺序与 Paperclip `actorMiddleware` 一致：先按 key_hash 查
+        // board_api_keys（**无前缀门槛**——CLI 签发的 `pcp_board_` token 只能
+        // 走哈希命中），再查 agent key，最后验 Agent JWT。
+        if let Some(actor) = self.resolve_board_key(&token).await? {
+            return Ok(Some(actor));
         }
+
+        if let Some(actor) = self.resolve_agent_key(&token).await? {
+            return Ok(Some(actor));
+        }
+
+        if let Some(actor) = self.resolve_jwt(&token, headers).await? {
+            return Ok(Some(actor));
+        }
+
+        // 三路皆不通过：携带 Bearer 即表明调用方打算以凭证身份访问，
+        // Paperclip 此时直接 401（`invalidAgentTokenMessage`），**不会**回退到
+        // 部署模式的隐式身份——否则一把已撤销/伪造的 Key 会退化成 local_implicit
+        // 的管理员，绕过 /cli-auth/revoke-current 等仅限凭证来源的端点。
+        Err(AuthError::unauthenticated(invalid_bearer_token_message(&token)))
     }
 
     fn priority(&self) -> u8 {
         10
     }
+}
+
+/// 无效 Bearer 凭证的 401 文案，对齐 Paperclip `invalidAgentTokenMessage`：
+/// JWT 载荷里 `exp` 已过期时给出「过期」文案，其余（畸形/验签失败/未知 Key）
+/// 统一为通用文案。
+fn invalid_bearer_token_message(token: &str) -> String {
+    if let Some(exp) = jwt_expiry_claim(token) {
+        if exp <= chrono::Utc::now().timestamp() {
+            return "Expired agent token; obtain fresh credentials and retry".to_string();
+        }
+    }
+    "Agent token did not verify; obtain fresh credentials and retry".to_string()
+}
+
+/// 从 JWT 中段载荷里读取 `exp`（仅用于挑选 401 文案，不涉及验签）。
+fn jwt_expiry_claim(token: &str) -> Option<i64> {
+    use base64::Engine;
+
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    claims.get("exp").and_then(serde_json::Value::as_i64)
 }
 
 /// Session Cookie 认证：解析 BetterAuth 会话 token 并加载用户身份。
@@ -802,14 +870,32 @@ impl ActorResolver for CloudTenantHeaderResolver {
 
 /// Seed the company-scoped defaults used by CloudTenant users. This mirrors
 /// Paperclip's `ensureHumanRoleDefaultGrants` while remaining idempotent.
-async fn ensure_human_role_default_grants(
+///
+/// 角色差异对齐 Paperclip `grantsForHumanRole`
+/// （`services/company-member-roles.ts:1-48`）：`users:manage_permissions`
+/// **只给 owner**，admin 明确不给——公司 Admin 因此不能管理他人的 inbox
+/// agent 策略（`routes/inbox-agent-policy.ts:19-35` 的 `assertAdmin` 只认
+/// grant 行）。同时它是 `routes/companies.ts:1127` 在创建公司时为 owner
+/// 预置的同一授权，缺了它 owner 反而过不了自己的 `assertAdmin`。
+pub async fn ensure_human_role_default_grants(
     pool: &PgPool,
     company_id: Uuid,
     user_id: Uuid,
     role: crate::auth::MembershipRole,
 ) {
     let permissions: &[&str] = match role {
-        crate::auth::MembershipRole::Owner | crate::auth::MembershipRole::Admin => &[
+        crate::auth::MembershipRole::Owner => &[
+            "users:manage_permissions",
+            "companies:read",
+            "companies:update",
+            "projects:read",
+            "projects:create",
+            "issues:read",
+            "issues:write",
+            "agents:read",
+            "tasks:assign",
+        ],
+        crate::auth::MembershipRole::Admin => &[
             "companies:read",
             "companies:update",
             "projects:read",

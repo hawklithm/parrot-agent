@@ -30,12 +30,10 @@ use services::auth::{
     ActorSource, AuthorizationActor, CompanyMembership, MembershipRole, PrincipalType,
 };
 
-async fn migrate(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 struct Fixture {
     pool: PgPool,
@@ -202,7 +200,7 @@ async fn explicit_on_behalf_of_user_is_persisted(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
 
-    let comment_id = Uuid::parse_str(body["comment"]["id"].as_str().expect("comment id")).expect("uuid");
+    let comment_id = Uuid::parse_str(body["id"].as_str().expect("comment id")).expect("uuid");
     let (stored, author_type) = read_attribution(&f, comment_id).await;
     assert_eq!(stored, Some(on_behalf_of));
     assert_eq!(author_type.as_deref(), Some("agent"));
@@ -234,7 +232,7 @@ async fn agent_comment_derives_on_behalf_of_from_run(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
 
-    let comment_id = Uuid::parse_str(body["comment"]["id"].as_str().expect("comment id")).expect("uuid");
+    let comment_id = Uuid::parse_str(body["id"].as_str().expect("comment id")).expect("uuid");
     let (stored, _) = read_attribution(&f, comment_id).await;
     assert_eq!(
         stored,
@@ -265,13 +263,12 @@ async fn board_comment_has_no_derived_on_behalf_of(pool: PgPool) {
         &format!("/issues/{}/comments", f.issue_id),
         Some(json!({
             "body": "Human comment",
-            "actorType": "user",
         })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
 
-    let comment_id = Uuid::parse_str(body["comment"]["id"].as_str().expect("comment id")).expect("uuid");
+    let comment_id = Uuid::parse_str(body["id"].as_str().expect("comment id")).expect("uuid");
     let (stored, author_type) = read_attribution(&f, comment_id).await;
     assert_eq!(
         stored, None,
@@ -306,7 +303,7 @@ async fn run_without_responsible_user_yields_no_attribution(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
 
-    let comment_id = Uuid::parse_str(body["comment"]["id"].as_str().expect("comment id")).expect("uuid");
+    let comment_id = Uuid::parse_str(body["id"].as_str().expect("comment id")).expect("uuid");
     let (stored, _) = read_attribution(&f, comment_id).await;
     assert_eq!(stored, None);
 
@@ -335,7 +332,7 @@ async fn author_type_override_and_source_trust_round_trip(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
 
-    let comment_id = Uuid::parse_str(body["comment"]["id"].as_str().expect("comment id")).expect("uuid");
+    let comment_id = Uuid::parse_str(body["id"].as_str().expect("comment id")).expect("uuid");
     let (_, author_type) = read_attribution(&f, comment_id).await;
     assert_eq!(
         author_type.as_deref(),

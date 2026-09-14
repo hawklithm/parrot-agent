@@ -14,7 +14,7 @@
 
 use std::io::{BufRead, Write};
 
-use crate::mcp_jsonrpc::{handle_body, JsonRpcError, ToolHandler};
+use crate::mcp_jsonrpc::{handle_body, ToolHandler};
 use serde_json::Value;
 
 /// Run the stdio MCP server loop.

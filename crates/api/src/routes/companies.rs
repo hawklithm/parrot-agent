@@ -55,10 +55,6 @@ pub fn company_routes() -> Router<AppState> {
         // Company archive
         .route("/companies/:company_id/archive", post(archive_company))
         // --- P3: Companies 补齐 (CM1-CM20) ---
-        .route(
-            "/companies/:company_id/members/:member_id/permissions",
-            patch(update_member_permissions),
-        )
         .route("/companies/:company_id/search", get(search_company))
         .route(
             "/companies/:company_id/sidebar-badges",
@@ -194,6 +190,17 @@ async fn create_company(
         .create(input, creator_user_id)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    // 对齐 Paperclip `routes/companies.ts:1110-1140`：建公司时先写 owner
+    // membership（由 company service 完成），紧接着补 owner 的默认角色授权，
+    // 其中包含 `users:manage_permissions`——inbox agent 策略管理的唯一授权来源
+    // （`routes/inbox-agent-policy.ts:19-35` 的 `assertAdmin` 不看角色）。
+    services::auth::middleware::ensure_human_role_default_grants(
+        &state.pool,
+        company.id,
+        creator_user_id,
+        services::auth::MembershipRole::Owner,
+    )
+    .await;
     // 对齐 Paperclip autoProvisionBundledAgents：公司创建后自动 provision 内置
     // Agent，使其 Instructions / Routine / Managed Resource 生命周期被激活。Summarizer
     // 供 status-card / summary-slot 后台任务链使用；Reflection Coach 供
@@ -360,28 +367,6 @@ async fn archive_company(
 // ============================================================================
 // P3: Companies 补齐 Handlers (CM1-CM20)
 // ============================================================================
-
-/// CM3: PATCH /companies/:company_id/members/:member_id/permissions
-async fn update_member_permissions(
-    State(state): State<AppState>,
-    Path((company_id, member_id)): Path<(Uuid, Uuid)>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let role = payload
-        .get("role")
-        .or_else(|| payload.get("membershipRole"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("role is required".into()))?;
-    let result = sqlx::query("UPDATE company_memberships SET role=$1, updated_at=NOW() WHERE id=$2 AND company_id=$3 AND status='active'")
-        .bind(role).bind(member_id).bind(company_id).execute(&state.pool).await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound("Membership not found".into()));
-    }
-    Ok(Json(
-        serde_json::json!({"companyId": company_id, "memberId": member_id, "updated": true}),
-    ))
-}
 
 /// §4C.3 Company Search：对齐 Paperclip `GET /companies/:companyId/search`。
 ///

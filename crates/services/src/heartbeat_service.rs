@@ -1,10 +1,11 @@
 use async_trait::async_trait;
+use crate::issue_comment_service::{CommentAttribution, IssueCommentService};
 use crate::text_utils::truncate_suffix_chars;
 use crate::sse_service::{InMemorySseService, SseService};
 use crate::secret_service::RuntimeSecretManifestEntry;
 use crate::adapter_executor::{AdapterExecutionContext, AdapterExecutor, ExecutionStatus, ExecutionTargetConfig, ExecutionTargetType, HttpExecutor};
 use chrono::{DateTime, Utc};
-use models::{Agent, AgentStatus, SseEvent, SseEventType};
+use models::{Agent, AgentStatus, CommentActorType, SseEvent, SseEventType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -178,6 +179,17 @@ fn build_codex_exec_args(model: Option<&str>, is_acp: bool) -> Vec<String> {
     args
 }
 
+fn resolve_acp_mode(adapter: &str, engine: &str) -> Result<bool, String> {
+    if adapter == "claude_local" && engine == "acp" {
+        return Err(
+            "Claude Code CLI does not support --acp; use engine=cli because ACP is not available in this runtime"
+                .to_string(),
+        );
+    }
+
+    Ok(adapter == "codex_local" && matches!(engine, "acp" | "auto"))
+}
+
 
 /// Heartbeat service for managing agent wake/sleep lifecycle
 #[async_trait]
@@ -230,6 +242,17 @@ pub trait HeartbeatService: Send + Sync {
         company_id: Uuid,
     ) -> Result<HeartbeatContext, HeartbeatError>;
 }
+
+/// The values `heartbeat_runs.invocation_source` accepts, mirroring Paperclip's
+/// `HEARTBEAT_INVOCATION_SOURCES` (`packages/shared/src/constants.ts`):
+/// `timer | assignment | on_demand | automation`.
+///
+/// This column records *how* a run was invoked, not *why* — the describing
+/// string ("issue.comment.reopen") belongs in `context_snapshot.source` and
+/// `reason`, which is where Paperclip keeps it. Keep this in sync with the
+/// `valid_invocation_source` check constraint.
+pub const HEARTBEAT_INVOCATION_SOURCES: [&str; 4] =
+    ["timer", "assignment", "on_demand", "automation"];
 
 #[derive(Debug, Clone, Default)]
 pub struct HeartbeatWakeupOptions {
@@ -295,6 +318,48 @@ struct AdapterCommandOutput {
     resumed_session_id: Option<String>,
     billing_type: String,
     runtime_secret_manifest: Vec<RuntimeSecretManifestEntry>,
+}
+
+const HEARTBEAT_COMMENT_MAX_CHARS: usize = 1_200;
+const WITHHELD_HEARTBEAT_COMMENT: &str =
+    "Run completed. Agent did not post a summary comment this run (transcript withheld — see run log).";
+
+/// Convert an adapter's final result into the normal task conversation entry.
+///
+/// Paperclip deliberately withholds long or obviously narrational adapter
+/// output from the issue thread and leaves the full transcript in the run log.
+/// Keeping the same boundary prevents tool chatter from becoming a misleading
+/// user-facing task reply while still giving successful runs a chat message.
+fn build_heartbeat_run_issue_comment(summary: Option<&str>) -> Option<String> {
+    let summary = summary?.trim();
+    if summary.is_empty() {
+        return None;
+    }
+
+    let lower = summary.to_ascii_lowercase();
+    let starts_with_narration = [
+        "let me ",
+        "i'll ",
+        "i’m ",
+        "i'm ",
+        "i can see",
+        "now i'll ",
+        "now i’ll ",
+        "next i'll ",
+        "next i’ll ",
+        "looking at",
+        "fetching",
+        "checking",
+        "first,",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+
+    if summary.chars().count() > HEARTBEAT_COMMENT_MAX_CHARS || starts_with_narration {
+        return Some(WITHHELD_HEARTBEAT_COMMENT.to_string());
+    }
+
+    Some(summary.to_string())
 }
 
 /// Read the structured result records emitted by Claude/Codex JSONL modes.
@@ -878,6 +943,7 @@ pub struct DefaultHeartbeatService {
     cost_service: Option<Arc<dyn crate::CostService>>,
     budget_service: Option<Arc<dyn crate::BudgetService>>,
     runtime_secret_resolver: Option<Arc<dyn crate::AdapterRuntimeSecretResolver>>,
+    issue_comment_service: Option<Arc<dyn IssueCommentService>>,
 }
 
 async fn publish_live_event(
@@ -905,6 +971,92 @@ async fn publish_live_event(
             },
         )
         .await;
+}
+
+/// Persist the structured event stream used by the run detail UI.
+///
+/// Parrot historically only kept adapter output in `heartbeat_runs.output`
+/// and exposed tool calls as a synthetic event list.  Paperclip's contract is
+/// a durable, ordered event stream, so every lifecycle/log event now gets a
+/// sequence number in its own table.  The transaction-scoped advisory lock
+/// makes sequence allocation safe when stdout and stderr are being drained by
+/// separate tasks or when more than one server process is active.
+async fn persist_heartbeat_run_event(
+    pool: &PgPool,
+    company_id: Uuid,
+    run_id: Uuid,
+    agent_id: Uuid,
+    event_type: &str,
+    stream: Option<&str>,
+    level: Option<&str>,
+    message: Option<&str>,
+    payload: &Value,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(run_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let seq: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM heartbeat_run_events WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO heartbeat_run_events
+            (company_id, run_id, agent_id, seq, event_type, stream, level, message, payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(company_id)
+    .bind(run_id)
+    .bind(agent_id)
+    .bind(seq)
+    .bind(event_type)
+    .bind(stream)
+    .bind(level)
+    .bind(message)
+    .bind(payload)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+async fn persist_agent_task_session(
+    pool: &PgPool,
+    company_id: Uuid,
+    agent_id: Uuid,
+    adapter_type: &str,
+    task_key: &str,
+    run_id: Uuid,
+    session_id: Option<&str>,
+    session_params: &Value,
+    last_error: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO agent_task_sessions
+            (company_id, agent_id, adapter_type, task_key, session_params_json,
+             session_display_id, last_run_id, last_error)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (company_id, agent_id, adapter_type, task_key)
+         DO UPDATE SET
+            session_params_json = COALESCE(EXCLUDED.session_params_json, agent_task_sessions.session_params_json),
+            session_display_id = COALESCE(EXCLUDED.session_display_id, agent_task_sessions.session_display_id),
+            last_run_id = EXCLUDED.last_run_id,
+            last_error = EXCLUDED.last_error,
+            updated_at = NOW()",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(adapter_type)
+    .bind(task_key)
+    .bind(session_params)
+    .bind(session_id)
+    .bind(run_id)
+    .bind(last_error)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -954,6 +1106,7 @@ impl DefaultHeartbeatService {
             cost_service: None,
             budget_service: None,
             runtime_secret_resolver: None,
+            issue_comment_service: None,
         }
     }
 
@@ -980,6 +1133,14 @@ impl DefaultHeartbeatService {
         self
     }
 
+    pub fn with_issue_comment_service(
+        mut self,
+        issue_comment_service: Arc<dyn IssueCommentService>,
+    ) -> Self {
+        self.issue_comment_service = Some(issue_comment_service);
+        self
+    }
+
     /// 克隆 service 用于后台任务
     fn clone_for_background(&self) -> Self {
         Self {
@@ -990,6 +1151,7 @@ impl DefaultHeartbeatService {
             cost_service: self.cost_service.clone(),
             budget_service: self.budget_service.clone(),
             runtime_secret_resolver: self.runtime_secret_resolver.clone(),
+            issue_comment_service: self.issue_comment_service.clone(),
         }
     }
 
@@ -1414,12 +1576,15 @@ impl DefaultHeartbeatService {
     }
 
     async fn load_agent(&self, id: Uuid) -> Result<Agent, HeartbeatError> {
-        sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE id = $1")
+        // `url_key` is a derived projection with no column, so `query_as` cannot
+        // build an `Agent`; go through the canonical row mapper instead.
+        let row = sqlx::query("SELECT * FROM agents WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| HeartbeatError::Internal(e.to_string()))?
-            .ok_or(HeartbeatError::AgentNotFound(id))
+            .ok_or(HeartbeatError::AgentNotFound(id))?;
+        Ok(repositories::map_agent_row(row))
     }
 
     async fn refresh_continuation_summary(
@@ -1505,6 +1670,83 @@ impl DefaultHeartbeatService {
         tracing::debug!(%issue_id, %run_id, %document_id, "refreshed issue continuation summary");
     }
 
+    /// Publish the successful run's final answer as the normal task comment.
+    ///
+    /// Run logs are useful execution history, but the Chat tab is driven by
+    /// issue comments. Paperclip writes this summary at heartbeat completion;
+    /// without it a completed run only appears as a collapsed work item and
+    /// the task conversation looks empty.
+    async fn post_run_summary_comment(
+        &self,
+        run_id: Uuid,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        status: &str,
+        body: Option<&str>,
+    ) {
+        if status != "succeeded" {
+            return;
+        }
+        let Some(body) = body else {
+            return;
+        };
+        let Some(issue_comment_service) = &self.issue_comment_service else {
+            tracing::debug!(%run_id, "issue comment service is not configured; skipping run summary comment");
+            return;
+        };
+
+        // Match Paperclip's opt-out context flag and make retries/idempotent
+        // replays safe when the same terminal run is observed more than once.
+        let should_post: bool = sqlx::query_scalar(
+            "SELECT COALESCE(context_snapshot->>'skipIssueComment', 'false') <> 'true'
+             FROM heartbeat_runs WHERE id = $1 AND company_id = $2",
+        )
+        .bind(run_id)
+        .bind(company_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        if !should_post {
+            return;
+        }
+
+        let already_posted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM issue_comments
+                 WHERE issue_id = $1 AND actor_run_id = $2
+            )",
+        )
+        .bind(issue_id)
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if already_posted {
+            return;
+        }
+
+        if let Err(error) = issue_comment_service
+            .add_comment_attributed(
+                issue_id,
+                body.to_string(),
+                CommentActorType::Agent,
+                Some(agent_id),
+                Some(run_id),
+                Some(serde_json::json!({ "source": "heartbeat_run" })),
+                CommentAttribution::default(),
+            )
+            .await
+        {
+            // A comment write must not turn a successfully completed adapter
+            // run into a failed run. The run log remains the source of truth
+            // for diagnosing a best-effort comment persistence failure.
+            tracing::warn!(%run_id, %issue_id, %error, "failed to persist heartbeat run summary comment");
+        }
+    }
+
     async fn execute_run(&self, run_id: Uuid, agent_id: Uuid, issue_id: Uuid, company_id: Uuid) {
         let pause_blocked: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -1580,6 +1822,20 @@ impl DefaultHeartbeatService {
         .flatten()
         .unwrap_or_else(|| ("unknown".to_string(), None));
         let (adapter_type, configured_model) = adapter_metadata;
+        let task_key: String = sqlx::query_scalar(
+            "SELECT COALESCE(
+                context_snapshot->>'taskKey',
+                context_snapshot->>'issueId',
+                'agent:' || agent_id::text
+             )
+             FROM heartbeat_runs WHERE id = $1",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("issue:{issue_id}"));
         let mut result = self
             .run_command(run_id, agent_id, issue_id, company_id, false)
             .await;
@@ -1593,7 +1849,23 @@ impl DefaultHeartbeatService {
             });
             if let Some(session_id) = stale_session {
                 session_recovery_session = Some(session_id.clone());
-                let cleared = sqlx::query(
+                let task_session_cleared = sqlx::query(
+                    "UPDATE agent_task_sessions
+                     SET session_display_id = NULL, session_params_json = NULL,
+                         last_error = NULL, updated_at = NOW()
+                     WHERE company_id = $1 AND agent_id = $2
+                       AND adapter_type = $3 AND task_key = $4
+                       AND (session_display_id = $5
+                            OR session_params_json->>'sessionId' = $5)",
+                )
+                .bind(company_id)
+                .bind(agent_id)
+                .bind(&adapter_type)
+                .bind(&task_key)
+                .bind(&session_id)
+                .execute(&self.pool)
+                .await;
+                let runtime_session_cleared = sqlx::query(
                     "UPDATE agent_runtime_states
                      SET session_id = NULL, updated_at = NOW()
                      WHERE agent_id = $1 AND session_id = $2",
@@ -1602,8 +1874,10 @@ impl DefaultHeartbeatService {
                 .bind(&session_id)
                 .execute(&self.pool)
                 .await;
-                match cleared {
-                    Ok(update_result) if update_result.rows_affected() > 0 => {
+                match (task_session_cleared, runtime_session_cleared) {
+                    (Ok(task_result), Ok(runtime_result))
+                        if task_result.rows_affected() > 0 || runtime_result.rows_affected() > 0 =>
+                    {
                         session_recovery = Some("fresh_retry");
                         tracing::warn!(
                             %run_id,
@@ -1615,7 +1889,7 @@ impl DefaultHeartbeatService {
                             .run_command(run_id, agent_id, issue_id, company_id, true)
                             .await;
                     }
-                    Ok(_) => {
+                    (Ok(_), Ok(_)) => {
                         session_recovery = Some("cas_conflict");
                         tracing::info!(
                             %run_id,
@@ -1624,7 +1898,7 @@ impl DefaultHeartbeatService {
                             "codex stale-session recovery skipped because runtime state changed"
                         );
                     }
-                    Err(error) => {
+                    (Err(error), _) | (_, Err(error)) => {
                         session_recovery = Some("cas_failed");
                         tracing::warn!(
                             %run_id,
@@ -1745,9 +2019,11 @@ impl DefaultHeartbeatService {
                 outcome.output_tokens,
             );
         }
+        let issue_comment_body = build_heartbeat_run_issue_comment(outcome.result_summary.as_deref());
         let result_json = serde_json::json!({
             "toolCallCount": outcome.tool_call_count,
-            "resultSummary": outcome.result_summary,
+            "resultSummary": outcome.result_summary.as_deref(),
+            "summary": outcome.result_summary.as_deref(),
             "handoff": outcome.handoff,
             "explicitFailure": outcome.explicit_failure,
             "errorCode": outcome.error_code,
@@ -1779,6 +2055,16 @@ impl DefaultHeartbeatService {
             tracing::error!(%run_id, %error, "failed to persist heartbeat run final status");
         }
 
+        self.post_run_summary_comment(
+            run_id,
+            agent_id,
+            issue_id,
+            company_id,
+            status,
+            issue_comment_body.as_deref(),
+        )
+        .await;
+
         // Self-healing: a recoverable failure is rescheduled instead of left
         // terminal. maybe_schedule_retry clears finished_at and records the
         // retry metadata after the failure result has been durably captured.
@@ -1808,6 +2094,27 @@ impl DefaultHeartbeatService {
             {
                 tracing::warn!(%run_id, %agent_id, %error, "failed to persist adapter session id");
             }
+        }
+
+        let session_params = serde_json::json!({
+            "sessionId": outcome.session_id,
+            "adapterType": adapter_type,
+            "runId": run_id,
+        });
+        if let Err(session_error) = persist_agent_task_session(
+            &self.pool,
+            company_id,
+            agent_id,
+            &adapter_type,
+            &task_key,
+            run_id,
+            outcome.session_id.as_deref(),
+            &session_params,
+            (status == "failed").then_some(error.as_deref()).flatten(),
+        )
+        .await
+        {
+            tracing::warn!(%run_id, %agent_id, %session_error, "failed to persist agent task session");
         }
 
         // Update agent runtime state with token usage and cost (incremental)
@@ -1894,19 +2201,36 @@ impl DefaultHeartbeatService {
             }
         }
 
+        let final_event = serde_json::json!({
+            "runId": run_id,
+            "agentId": agent_id,
+            "issueId": issue_id,
+            "status": status,
+            "exitCode": exit_code,
+            "error": error,
+        });
+        if let Err(event_error) = persist_heartbeat_run_event(
+            &self.pool,
+            company_id,
+            run_id,
+            agent_id,
+            "heartbeat.run.status",
+            None,
+            (status == "failed").then_some("error"),
+            Some(status),
+            &final_event,
+        )
+        .await
+        {
+            tracing::warn!(%run_id, %event_error, "failed to persist heartbeat terminal event");
+        }
         publish_live_event(
             &self.sse_service,
             company_id,
             "heartbeat.run.status",
-            serde_json::json!({
-                "runId": run_id,
-                "agentId": agent_id,
-                "issueId": issue_id,
-                "status": status,
-                "exitCode": exit_code,
-                "error": error,
-            }),
-        ).await;
+            final_event,
+        )
+        .await;
         let issue_status = if status == "succeeded" { "done" } else { "todo" };
         let _ = sqlx::query(
             "UPDATE issues SET status = $2::issue_status, checkout_run_id = NULL, execution_run_id = NULL, execution_locked_at = NULL, execution_agent_name_key = NULL, completed_at = CASE WHEN $2 = 'done' THEN NOW() ELSE NULL END, updated_at = NOW() WHERE id = $1 AND company_id = $3 AND execution_run_id = $4",
@@ -1976,7 +2300,7 @@ impl DefaultHeartbeatService {
         let mut runtime_secret_paths = HashSet::new();
         let mut runtime_secret_manifest = Vec::new();
         let cfg = if let Some(resolver) = &self.runtime_secret_resolver {
-            let responsible_user = sqlx::query_scalar::<_, String>(
+            let responsible_user = sqlx::query_scalar::<_, Option<String>>(
                 "SELECT responsible_user_id::text
                  FROM heartbeat_runs
                  WHERE id = $1 AND company_id = $2 AND agent_id = $3",
@@ -1987,6 +2311,7 @@ impl DefaultHeartbeatService {
             .fetch_optional(&self.pool)
             .await
             .map_err(|error| format!("failed to load heartbeat responsible user: {error}"))?
+            .flatten()
             .map(|value| {
                 Uuid::parse_str(&value).map_err(|error| {
                     format!("invalid heartbeat responsible user '{value}': {error}")
@@ -2020,15 +2345,16 @@ impl DefaultHeartbeatService {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty());
-        // Determine execution engine from config (auto/cli/acp).
-        // Auto defaults to CLI for now; explicit ACP launches with --acp flag.
+        // Determine execution engine from config (auto/cli/acp). Codex exposes
+        // an ACP subcommand; the Claude Code CLI does not expose `--acp`, so
+        // Claude stays on its regular print-mode CLI path.
         let engine = cfg
             .get("engine")
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| s == "acp" || s == "cli")
+            .filter(|s| s == "acp" || s == "cli" || s == "auto")
             .unwrap_or_else(|| "auto".to_string());
-        let is_acp = engine == "acp";
+        let is_acp = resolve_acp_mode(adapter, &engine)?;
         if adapter == "http" {
             let result = self
                 .http_executor
@@ -2309,15 +2635,47 @@ impl DefaultHeartbeatService {
                 args.insert(insert_at, "--dangerously-bypass-approvals-and-sandbox".into());
             }
         }
+        let task_key: String = sqlx::query_scalar(
+            "SELECT COALESCE(
+                context_snapshot->>'taskKey',
+                context_snapshot->>'issueId',
+                'agent:' || agent_id::text
+             )
+             FROM heartbeat_runs WHERE id = $1",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| format!("failed to load heartbeat task key: {error}"))?;
         let mut resumed_session_id = None;
         if matches!(adapter, "claude_local" | "codex_local") && !custom_args && !force_fresh_session {
-            let persisted_session: Option<String> = sqlx::query_scalar(
-                "SELECT session_id FROM agent_runtime_states WHERE agent_id = $1",
+            let task_session: Option<String> = sqlx::query_scalar::<_, String>(
+                "SELECT COALESCE(session_display_id, session_params_json->>'sessionId', '')
+                 FROM agent_task_sessions
+                 WHERE company_id = $1 AND agent_id = $2
+                   AND adapter_type = $3 AND task_key = $4
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
             )
+            .bind(company_id)
             .bind(agent_id)
+            .bind(adapter)
+            .bind(&task_key)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|error| format!("failed to load adapter session: {error}"))?;
+            .map_err(|error| format!("failed to load task session: {error}"))?
+            .filter(|session| !session.trim().is_empty());
+            let persisted_session = match task_session {
+                Some(session) => Some(session),
+                None => sqlx::query_scalar::<_, String>(
+                    "SELECT COALESCE(session_id, '') FROM agent_runtime_states WHERE agent_id = $1",
+                )
+                .bind(agent_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| format!("failed to load adapter session: {error}"))?
+                .filter(|session| !session.trim().is_empty()),
+            };
             match adapter {
                 "claude_local" => {
                     if let Some(session_id) = valid_claude_resume_session(persisted_session.as_deref()) {
@@ -2556,17 +2914,34 @@ impl DefaultHeartbeatService {
             .spawn()
             .map_err(|e| e.to_string())?;
         sqlx::query("UPDATE heartbeat_runs SET status = 'running', started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND status = 'queued'").bind(run_id).execute(&self.pool).await.map_err(|e| e.to_string())?;
+        let running_event = serde_json::json!({
+            "runId": run_id,
+            "agentId": agent_id,
+            "issueId": issue_id,
+            "status": "running",
+        });
+        if let Err(event_error) = persist_heartbeat_run_event(
+            &self.pool,
+            company_id,
+            run_id,
+            agent_id,
+            "heartbeat.run.status",
+            None,
+            Some("info"),
+            Some("running"),
+            &running_event,
+        )
+        .await
+        {
+            tracing::warn!(%run_id, %event_error, "failed to persist heartbeat running event");
+        }
         publish_live_event(
             &self.sse_service,
             company_id,
             "heartbeat.run.status",
-            serde_json::json!({
-                "runId": run_id,
-                "agentId": agent_id,
-                "issueId": issue_id,
-                "status": "running",
-            }),
-        ).await;
+            running_event,
+        )
+        .await;
         let child_ref = Arc::new(Mutex::new(child));
         // Release the Heartbeat Start Lock now that the child process is spawned and tracked in
         // self.children (which itself prevents a second concurrent child for this run). The lock
@@ -2592,6 +2967,8 @@ impl DefaultHeartbeatService {
         let sequence = Arc::new(AtomicU64::new(0));
         let stdout_service = self.sse_service.clone();
         let stderr_service = self.sse_service.clone();
+        let stdout_pool = self.pool.clone();
+        let stderr_pool = self.pool.clone();
         let stdout_sequence = sequence.clone();
         let stderr_sequence = sequence.clone();
         let stdout_reader = async move {
@@ -2603,19 +2980,35 @@ impl DefaultHeartbeatService {
                 captured.extend_from_slice(&buffer[..read]);
                 let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
                 let seq = stdout_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                let event = serde_json::json!({
+                    "runId": run_id,
+                    "agentId": agent_id,
+                    "issueId": issue_id,
+                    "seq": seq,
+                    "stream": "stdout",
+                    "chunk": chunk,
+                    "ts": Utc::now(),
+                });
+                if let Err(event_error) = persist_heartbeat_run_event(
+                    &stdout_pool,
+                    company_id,
+                    run_id,
+                    agent_id,
+                    "heartbeat.run.log",
+                    Some("stdout"),
+                    Some("info"),
+                    event.get("chunk").and_then(Value::as_str),
+                    &event,
+                )
+                .await
+                {
+                    tracing::warn!(%run_id, %event_error, "failed to persist heartbeat stdout event");
+                }
                 publish_live_event(
                     &stdout_service,
                     company_id,
                     "heartbeat.run.log",
-                    serde_json::json!({
-                        "runId": run_id,
-                        "agentId": agent_id,
-                        "issueId": issue_id,
-                        "seq": seq,
-                        "stream": "stdout",
-                        "chunk": chunk,
-                        "ts": Utc::now(),
-                    }),
+                    event,
                 ).await;
             }
             Ok::<Vec<u8>, String>(captured)
@@ -2629,19 +3022,35 @@ impl DefaultHeartbeatService {
                 captured.extend_from_slice(&buffer[..read]);
                 let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
                 let seq = stderr_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                let event = serde_json::json!({
+                    "runId": run_id,
+                    "agentId": agent_id,
+                    "issueId": issue_id,
+                    "seq": seq,
+                    "stream": "stderr",
+                    "chunk": chunk,
+                    "ts": Utc::now(),
+                });
+                if let Err(event_error) = persist_heartbeat_run_event(
+                    &stderr_pool,
+                    company_id,
+                    run_id,
+                    agent_id,
+                    "heartbeat.run.log",
+                    Some("stderr"),
+                    Some("error"),
+                    event.get("chunk").and_then(Value::as_str),
+                    &event,
+                )
+                .await
+                {
+                    tracing::warn!(%run_id, %event_error, "failed to persist heartbeat stderr event");
+                }
                 publish_live_event(
                     &stderr_service,
                     company_id,
                     "heartbeat.run.log",
-                    serde_json::json!({
-                        "runId": run_id,
-                        "agentId": agent_id,
-                        "issueId": issue_id,
-                        "seq": seq,
-                        "stream": "stderr",
-                        "chunk": chunk,
-                        "ts": Utc::now(),
-                    }),
+                    event,
                 ).await;
             }
             Ok::<Vec<u8>, String>(captured)
@@ -2776,8 +3185,14 @@ impl DefaultHeartbeatService {
             .unwrap_or_else(|| serde_json::json!({}));
         if let Some(object) = context.as_object_mut() {
             object.insert("issueId".to_string(), serde_json::json!(issue_id));
+            object
+                .entry("taskKey".to_string())
+                .or_insert_with(|| serde_json::json!(format!("issue:{issue_id}")));
         } else {
-            context = serde_json::json!({ "issueId": issue_id });
+            context = serde_json::json!({
+                "issueId": issue_id,
+                "taskKey": format!("issue:{issue_id}"),
+            });
         }
         // Enrich the wake context with plan-review state, mirroring Paperclip's
         // `heartbeat.ts` call to `buildPlanReviewContext`. Best-effort: a context
@@ -2844,7 +3259,7 @@ impl DefaultHeartbeatService {
         )
         .bind(company_id)
         .bind(agent_id)
-        .bind("on_demand")
+        .bind(options.source.as_deref().unwrap_or("on_demand"))
         .bind(&context)
         .bind(issue_id)
         .bind(options.retry_of_run_id)
@@ -2911,17 +3326,33 @@ impl DefaultHeartbeatService {
         tx.commit()
             .await
             .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        let queued_event = serde_json::json!({
+            "runId": run_id,
+            "agentId": agent_id,
+            "issueId": issue_id,
+            "status": "queued",
+            "invocationSource": "on_demand",
+        });
+        if let Err(event_error) = persist_heartbeat_run_event(
+            &self.pool,
+            company_id,
+            run_id,
+            agent_id,
+            "heartbeat.run.queued",
+            None,
+            Some("info"),
+            Some("queued"),
+            &queued_event,
+        )
+        .await
+        {
+            tracing::warn!(%run_id, %event_error, "failed to persist heartbeat queued event");
+        }
         publish_live_event(
             &self.sse_service,
             company_id,
             "heartbeat.run.queued",
-            serde_json::json!({
-                "runId": run_id,
-                "agentId": agent_id,
-                "issueId": issue_id,
-                "status": "queued",
-                "invocationSource": "on_demand",
-            }),
+            queued_event,
         )
         .await;
         let service = self.clone_for_task();
@@ -3551,18 +3982,34 @@ impl DefaultHeartbeatService {
                 .await
                 .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
 
+            let process_lost_event = serde_json::json!({
+                "runId": run_id,
+                "agentId": agent_id,
+                "issueId": issue_id,
+                "status": "failed",
+                "error": error,
+                "errorCode": "process_lost",
+            });
+            if let Err(event_error) = persist_heartbeat_run_event(
+                &self.pool,
+                company_id,
+                run_id,
+                agent_id,
+                "heartbeat.run.status",
+                None,
+                Some("error"),
+                Some("process lost"),
+                &process_lost_event,
+            )
+            .await
+            {
+                tracing::warn!(%run_id, %event_error, "failed to persist process-lost heartbeat event");
+            }
             publish_live_event(
                 &self.sse_service,
                 company_id,
                 "heartbeat.run.status",
-                serde_json::json!({
-                    "runId": run_id,
-                    "agentId": agent_id,
-                    "issueId": issue_id,
-                    "status": "failed",
-                    "error": error,
-                    "errorCode": "process_lost",
-                }),
+                process_lost_event,
             )
             .await;
             reconciled += 1;
@@ -3597,9 +4044,10 @@ impl DefaultHeartbeatService {
                 issue_id,
                 company_id,
                 HeartbeatWakeupOptions {
-                    source: Some("recovery".to_string()),
+                    // `invocation_source` records how the run was invoked;
+                    // "heartbeat.recovery" stays in context_snapshot.source.
+                    source: Some("automation".to_string()),
                     trigger_detail: Some("heartbeat_recovery".to_string()),
-                    reason: Some("issue_assignment_recovery".to_string()),
                     idempotency_key: Some(format!("issue_assignment_recovery:{issue_id}")),
                     payload: Some(serde_json::json!({
                         "issueId": issue_id,
@@ -4006,7 +4454,9 @@ impl DefaultHeartbeatService {
                     issue_id,
                     company_id,
                     HeartbeatWakeupOptions {
-                        source: Some("recovery".to_string()),
+                        // `invocation_source` records how the run was invoked;
+                        // "heartbeat.scheduled_retry" stays in context_snapshot.source.
+                        source: Some("automation".to_string()),
                         trigger_detail: Some("scheduled_retry".to_string()),
                         reason: Some("scheduled_retry_promotion".to_string()),
                         idempotency_key: Some(format!(
@@ -4091,6 +4541,7 @@ impl DefaultHeartbeatService {
             cost_service: self.cost_service.clone(),
             budget_service: self.budget_service.clone(),
             runtime_secret_resolver: self.runtime_secret_resolver.clone(),
+            issue_comment_service: self.issue_comment_service.clone(),
         }
     }
 }
@@ -4100,12 +4551,34 @@ mod adapter_outcome_tests {
     use tokio::time::Duration;
 
     use super::{
-        build_codex_exec_args, classify_adapter_error, is_codex_unknown_session_output,
+        build_codex_exec_args, build_heartbeat_run_issue_comment, classify_adapter_error,
+        is_codex_unknown_session_output,
         is_retryable_provider_status, parse_adapter_outcome, provider_http_retries,
         provider_http_timeout, provider_retry_after, provider_retry_delay,
-        provider_retry_delay_with_hint, redact_adapter_secret, resolve_biller,
+        provider_retry_delay_with_hint, redact_adapter_secret, resolve_acp_mode, resolve_biller,
         valid_claude_resume_session, valid_codex_resume_session, AdapterCommandOutput,
     };
+
+    #[test]
+    fn builds_normal_heartbeat_summary_comment() {
+        assert_eq!(
+            build_heartbeat_run_issue_comment(Some("已完成软件外包团队的任务拆解。")),
+            Some("已完成软件外包团队的任务拆解。".to_string())
+        );
+    }
+
+    #[test]
+    fn withholds_narration_and_overlong_heartbeat_summaries() {
+        assert_eq!(
+            build_heartbeat_run_issue_comment(Some("I'll inspect the task before making changes.")),
+            Some(super::WITHHELD_HEARTBEAT_COMMENT.to_string())
+        );
+        assert_eq!(
+            build_heartbeat_run_issue_comment(Some(&"x".repeat(1_201))),
+            Some(super::WITHHELD_HEARTBEAT_COMMENT.to_string())
+        );
+        assert!(build_heartbeat_run_issue_comment(Some("  ")).is_none());
+    }
 
     #[test]
     fn explicit_structured_error_overrides_zero_exit() {
@@ -4382,6 +4855,15 @@ mod adapter_outcome_tests {
             build_codex_exec_args(None, true),
             vec!["acp"]
         );
+    }
+
+    #[test]
+    fn claude_auto_invocation_does_not_use_unsupported_acp_flag() {
+        assert!(!resolve_acp_mode("claude_local", "auto").unwrap());
+        assert!(!resolve_acp_mode("claude_local", "cli").unwrap());
+        assert!(resolve_acp_mode("claude_local", "acp").is_err());
+        assert!(resolve_acp_mode("codex_local", "auto").unwrap());
+        assert!(resolve_acp_mode("codex_local", "acp").unwrap());
     }
 
     #[test]

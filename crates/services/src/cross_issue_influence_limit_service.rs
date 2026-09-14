@@ -361,13 +361,13 @@ impl CrossIssueInfluenceLimitService for DefaultCrossIssueInfluenceLimitService 
         };
 
         format!(
-            "{} attempted to influence {} different issues in this run. \
-             Paperclip limits cross-issue influence to {} per run to prevent \
+            "{} attempted to influence {}. Paperclip limits cross-issue influence \
+             to {} per run to prevent \
              runaway automation. The current mode is {:?}. \
              Current count: {}/{}. \
              Enforcement started at: {}.",
             actor,
-            decision.count,
+            issue_ref,
             decision.cap,
             decision.mode,
             decision.count,

@@ -5,9 +5,10 @@ use std::collections::HashSet;
 /// 
 /// 这些适配器是 Parrot-Agent 服务器内置的，不能被删除。
 /// 与 Paperclip `server/src/adapters/builtin-adapter-types.ts` 逐项对齐。
+/// `acpx_local` 仍可被旧数据解析，但已经是 retired tombstone，不应再被
+/// 注册为可用的内置适配器。
 /// 外部 plugin 可以 override（registry 会保留 builtin fallback），但不能删除。
-pub const BUILTIN_ADAPTER_TYPE_LIST: [&str; 14] = [
-    "acpx_local",
+pub const BUILTIN_ADAPTER_TYPE_LIST: [&str; 13] = [
     "claude_local",
     "codex_local",
     "cursor_cloud",
@@ -46,6 +47,7 @@ mod tests {
         assert!(is_builtin_adapter_type("claude_local"));
         assert!(is_builtin_adapter_type("codex_local"));
         assert!(!is_builtin_adapter_type("custom_external"));
+        assert!(!is_builtin_adapter_type("acpx_local"));
     }
     
     #[test]

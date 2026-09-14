@@ -2965,7 +2965,7 @@ async fn gateway_decision_full(
     let (explicit_grant, profile_allows) =
         load_profile_decision(state, company_id, agent_id, tool_name).await;
     let tool_name_string = tool_name.to_string();
-    let mut ctx = services::tool_access_contract::EvaluationContext {
+    let ctx = services::tool_access_contract::EvaluationContext {
         tool_name: tool_name_string.clone(),
         explicit_grant,
         profile_allows,

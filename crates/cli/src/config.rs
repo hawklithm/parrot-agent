@@ -11,6 +11,7 @@ const DEFAULT_CONFIG_FILENAME: &str = "config";
 pub struct CliConfig {
     pub server_url: String,
     pub api_token: Option<String>,
+    pub allowed_hostnames: Vec<String>,
     pub config_path: Option<PathBuf>,
 }
 
@@ -43,6 +44,16 @@ impl CliConfig {
                         .cloned()
                         .filter(|v| !v.is_empty())
                 }),
+            allowed_hostnames: env::var("PARROT_ALLOWED_HOSTNAMES")
+                .ok()
+                .map(|value| split_hostnames(&value))
+                .filter(|values| !values.is_empty())
+                .or_else(|| {
+                    file_values
+                        .get("allowed_hostnames")
+                        .map(|value| split_hostnames(value))
+                })
+                .unwrap_or_default(),
             config_path,
         })
     }
@@ -61,6 +72,12 @@ impl CliConfig {
         let mut contents = format!("server_url={}\n", self.server_url);
         if let Some(token) = &self.api_token {
             contents.push_str(&format!("api_token={}\n", token));
+        }
+        if !self.allowed_hostnames.is_empty() {
+            contents.push_str(&format!(
+                "allowed_hostnames={}\n",
+                self.allowed_hostnames.join(",")
+            ));
         }
         fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
@@ -139,12 +156,24 @@ fn read_config_file(path: &Path) -> Result<std::collections::BTreeMap<String, St
                 path.display()
             )
         })?;
-        if !matches!(key.trim(), "server_url" | "api_token") {
+        if !matches!(key.trim(), "server_url" | "api_token" | "allowed_hostnames") {
             bail!("unknown config key '{}' in {}", key.trim(), path.display());
         }
         values.insert(key.trim().to_owned(), value.trim().to_owned());
     }
     Ok(values)
+}
+
+fn split_hostnames(value: &str) -> Vec<String> {
+    let mut values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('.').to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
 }
 
 fn validate_server_url(value: &str) -> Result<()> {

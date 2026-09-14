@@ -345,14 +345,12 @@ pub struct RemapResult {
     anchor_state: AnchorState,
     confidence: Confidence,
     anchor: Option<AnchorSnapshot>,
-    reason: &'static str,
 }
 #[derive(Debug, Clone)]
 struct Candidate {
     start: usize,
     end: usize,
     score: f64,
-    reason: &'static str,
 }
 
 fn find_occurrences(text: &str, quote: &str) -> Vec<usize> {
@@ -374,7 +372,6 @@ fn score_candidate(
     start: usize,
     end: usize,
     previous: &AnchorSnapshot,
-    reason: &'static str,
     context_length: usize,
 ) -> Candidate {
     let before = &projection.text[..start].chars().rev().take(context_length).collect::<String>();
@@ -391,7 +388,6 @@ fn score_candidate(
         start,
         end,
         score: prefix_score * 0.35 + suffix_score * 0.35 + proximity * 0.3,
-        reason,
     }
 }
 
@@ -453,7 +449,6 @@ fn find_fuzzy_candidate(
                 window[0].1,
                 window[window.len() - 1].2,
                 previous,
-                "fuzzy",
                 context_length,
             );
             scored.score = scored.score * 0.35 + similarity * 0.65;
@@ -587,7 +582,6 @@ pub fn remap_document_anchor(previous: &AnchorSnapshot, next_markdown: &str) -> 
             anchor_state: AnchorState::Orphaned,
             confidence: Confidence::Missing,
             anchor: None,
-            reason: "missing",
         };
     }
 
@@ -595,7 +589,7 @@ pub fn remap_document_anchor(previous: &AnchorSnapshot, next_markdown: &str) -> 
     if !exact_starts.is_empty() {
         let mut candidates: Vec<Candidate> = exact_starts
             .iter()
-            .map(|&start| score_candidate(&projection, start, start + quote.len(), previous, "exact", context_length))
+            .map(|&start| score_candidate(&projection, start, start + quote.len(), previous, context_length))
             .collect();
         candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         let best = candidates[0].clone();
@@ -606,7 +600,6 @@ pub fn remap_document_anchor(previous: &AnchorSnapshot, next_markdown: &str) -> 
                     anchor_state: AnchorState::Stale,
                     confidence: Confidence::Ambiguous,
                     anchor: Some(build_anchor_snapshot(&projection, best.start, best.end, context_length)),
-                    reason: "ambiguous",
                 };
             }
         }
@@ -619,7 +612,6 @@ pub fn remap_document_anchor(previous: &AnchorSnapshot, next_markdown: &str) -> 
             anchor_state: AnchorState::Active,
             confidence,
             anchor: Some(build_anchor_snapshot(&projection, best.start, best.end, context_length)),
-            reason: if candidates.len() == 1 { "exact" } else { "duplicate" },
         };
     }
 
@@ -629,7 +621,6 @@ pub fn remap_document_anchor(previous: &AnchorSnapshot, next_markdown: &str) -> 
                 anchor_state: AnchorState::Stale,
                 confidence: Confidence::Fuzzy,
                 anchor: Some(build_anchor_snapshot(&projection, fuzzy.start, fuzzy.end, context_length)),
-                reason: "fuzzy",
             };
         }
     }
@@ -638,7 +629,6 @@ pub fn remap_document_anchor(previous: &AnchorSnapshot, next_markdown: &str) -> 
         anchor_state: AnchorState::Orphaned,
         confidence: Confidence::Missing,
         anchor: None,
-        reason: "missing",
     }
 }
 

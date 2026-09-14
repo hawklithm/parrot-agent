@@ -29,8 +29,12 @@ pub trait BoardApiKeyRepository: Send + Sync {
     /// 记录API Key使用
     async fn record_usage(&self, key_id: Uuid) -> Result<(), RepositoryError>;
 
-    /// 列出用户的所有API Keys
-    async fn list_by_user(&self, user_id: Uuid) -> Result<Vec<BoardApiKey>, RepositoryError>;
+    /// 列出用户名下的 API Keys；`include_inactive` 为真时连同已撤销/已过期的一并返回。
+    async fn list_by_user(
+        &self,
+        user_id: Uuid,
+        include_inactive: bool,
+    ) -> Result<Vec<BoardApiKey>, RepositoryError>;
 }
 
 /// Repository错误类型
@@ -114,14 +118,19 @@ impl BoardApiKeyRepository for PgBoardApiKeyRepository {
         Ok(key)
     }
 
+    /// 撤销 API Key：仅允许撤销 `revoked_by_user_id` 自己名下的 Key。
+    ///
+    /// 归属校验内联在 `WHERE` 里（Paperclip 先在 `getBoardApiKeyForUser`
+    /// 校验归属再撤销），因此他人的 Key 与不存在的 Key 一样返回 `NotFound`。
     async fn revoke(&self, key_id: Uuid, revoked_by_user_id: Uuid) -> Result<(), RepositoryError> {
         let now = Utc::now();
 
         let result = sqlx::query(
             r#"
             UPDATE board_api_keys
-            SET is_revoked = true, revoked_at = $1, revoked_by_user_id = $2, updated_at = $3
-            WHERE id = $4 AND is_revoked = false
+            SET is_revoked = true, revoked_at = $1, last_used_at = $1,
+                revoked_by_user_id = $2, updated_at = $3
+            WHERE id = $4 AND user_id = $2 AND is_revoked = false
             "#,
         )
         .bind(now)
@@ -160,17 +169,25 @@ impl BoardApiKeyRepository for PgBoardApiKeyRepository {
         Ok(())
     }
 
-    async fn list_by_user(&self, user_id: Uuid) -> Result<Vec<BoardApiKey>, RepositoryError> {
+    async fn list_by_user(
+        &self,
+        user_id: Uuid,
+        include_inactive: bool,
+    ) -> Result<Vec<BoardApiKey>, RepositoryError> {
+        // 默认只返回「未撤销且未过期」的 Key；`include_inactive` 时返回全部
+        // （对齐 Paperclip `listBoardApiKeys` 的 `includeInactive` 语义）。
         let rows = sqlx::query_as::<_, BoardApiKey>(
             r#"
             SELECT id, user_id, name, key_hash, key_prefix, last_used_at, expires_at,
                    is_revoked, revoked_at, revoked_by_user_id, created_at, updated_at
             FROM board_api_keys
             WHERE user_id = $1
+              AND ($2 OR (is_revoked = false AND (expires_at IS NULL OR expires_at > NOW())))
             ORDER BY created_at DESC
             "#,
         )
         .bind(user_id)
+        .bind(include_inactive)
         .fetch_all(&self.pool)
         .await?;
 
@@ -198,6 +215,20 @@ pub fn generate_api_key_token(prefix: &str) -> String {
     let random_bytes: [u8; 32] = rand::thread_rng().gen();
     let random_part = hex::encode(random_bytes);
     format!("{}_{}", prefix, random_part)
+}
+
+/// Board API token 的展示前缀长度（`key_prefix` 列是 Parrot 独有的展示字段）。
+pub const KEY_PREFIX_DISPLAY_LEN: usize = 16;
+
+/// 生成 Board API token：`pcp_board_<48 hex>`。
+///
+/// 对齐 Paperclip `createBoardApiToken`（`pcp_board_` + 24 随机字节的十六进制），
+/// 与 CLI 挑战 secret 的 `pcp_cli_auth_` 前缀区分。
+pub fn create_board_api_token() -> String {
+    use rand::Rng;
+    let mut raw = [0u8; 24];
+    rand::thread_rng().fill(&mut raw);
+    format!("pcp_board_{}", hex::encode(raw))
 }
 
 #[cfg(test)]
@@ -279,5 +310,21 @@ mod tests {
             correct_us,
             wrong_us
         );
+    }
+
+    /// Board token 必须与 Paperclip `createBoardApiToken` 同形：
+    /// `pcp_board_` + 48 位十六进制，且每次都不同。
+    #[test]
+    fn test_create_board_api_token_shape() {
+        let token = create_board_api_token();
+        assert!(token.starts_with("pcp_board_"), "unexpected prefix: {token}");
+
+        let random_part = token.trim_start_matches("pcp_board_");
+        assert_eq!(random_part.len(), 48, "24 random bytes as hex");
+        assert!(
+            random_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "random part must be hex: {random_part}"
+        );
+        assert_ne!(token, create_board_api_token());
     }
 }

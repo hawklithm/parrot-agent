@@ -7,7 +7,6 @@
 //! Adapted from Paperclip's install-store.ts; simplified for Rust.
 
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};

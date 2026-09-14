@@ -92,8 +92,12 @@ impl fmt::Display for PrincipalType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MembershipStatus {
+    /// Awaiting company approval.
+    Pending,
     /// 活跃成员
     Active,
+    /// Temporarily suspended without removing the membership record.
+    Suspended,
     /// 已归档（软删除，保留历史记录）
     Archived,
 }
@@ -191,7 +195,9 @@ impl CompanyMembership {
             _ => MembershipRole::Viewer,
         };
         let status = match row.status.to_ascii_lowercase().as_str() {
-            "archived" => MembershipStatus::Archived,
+            "pending" => MembershipStatus::Pending,
+            "suspended" => MembershipStatus::Suspended,
+            "archived" | "inactive" => MembershipStatus::Archived,
             _ => MembershipStatus::Active,
         };
         let principal_type = match row.principal_type.to_ascii_lowercase().as_str() {

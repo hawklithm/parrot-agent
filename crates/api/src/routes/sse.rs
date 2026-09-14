@@ -26,8 +26,12 @@ pub async fn sse_stream(
         Some(Extension(actor)) => actor,
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    if actor.company_id() != Some(company_id) {
-        return StatusCode::FORBIDDEN.into_response();
+    // 与其它 company 路由保持一致：Board 成员、公司直属 actor、以及
+    // local_trusted 的隐式 Board（`company_id() == Uuid::nil()`）都算有权限。
+    // 这里不能只比较 `actor.company_id() == Some(company_id)`——local_trusted
+    // 的 principal 是实例级的，那样会让所有 SSE 订阅 403。
+    if let Err(status) = crate::routes::assert_company_access(&actor, company_id, true) {
+        return status.into_response();
     }
     let actor_id = match actor.principal_id() {
         Some(id) => id,

@@ -10,6 +10,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{app_state::AppState, errors::ApiError};
+use crate::extractors::IssueId;
 use crate::routes::log_activity;
 use models;
 use services::auth::AuthorizationActor;
@@ -169,7 +170,9 @@ async fn queue_interaction_continuation_wakeup(
             wake_issue.id,
             wake_issue.company_id,
             HeartbeatWakeupOptions {
-                source: Some("interaction".into()),
+                // `invocation_source` records how the run was invoked; the
+                // describing string stays in context_snapshot.source.
+                source: Some("automation".into()),
                 trigger_detail: Some("system".into()),
                 reason: Some("issue_continuation_needed".into()),
                 requested_by_actor_type: Some(actor_label(actor).into()),
@@ -257,7 +260,7 @@ async fn guard_cross_issue_resolution(
 pub async fn create_interaction(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
     Json(mut input): Json<models::CreateThreadInteractionInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue's company_id and assert write access
@@ -367,7 +370,7 @@ pub async fn create_interaction(
 pub async fn list_interactions(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue's company_id and assert access
     let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
@@ -395,7 +398,8 @@ pub async fn list_interactions(
 pub async fn accept_interaction(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, interaction_id)): Path<(String, Uuid)>,
     Json(input): Json<models::AcceptThreadInteractionInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue's company_id and assert access
@@ -465,7 +469,8 @@ pub async fn accept_interaction(
 pub async fn reject_interaction(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, interaction_id)): Path<(String, Uuid)>,
     Json(input): Json<models::RejectThreadInteractionInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue's company_id and assert access
@@ -534,7 +539,8 @@ pub async fn reject_interaction(
 pub async fn get_interaction(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, interaction_id)): Path<(String, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue's company_id and assert access
     let company_id: Option<Uuid> = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")
@@ -568,7 +574,8 @@ pub async fn get_interaction(
 pub async fn answer_questions(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, interaction_id)): Path<(String, Uuid)>,
     Json(input): Json<models::AnswerQuestionsInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue's company_id and assert access
@@ -637,7 +644,8 @@ pub async fn answer_questions(
 pub async fn cancel_questions(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, interaction_id)): Path<(String, Uuid)>,
     Json(input): Json<models::CancelQuestionsInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue's company_id and assert access
@@ -706,7 +714,8 @@ pub async fn cancel_questions(
 pub async fn withdraw_interaction(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, interaction_id)): Path<(String, Uuid)>,
     Json(input): Json<models::WithdrawInteractionInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue's company_id and assert access
@@ -791,7 +800,8 @@ pub async fn withdraw_interaction(
 pub async fn submit_item_verdicts(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, interaction_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, interaction_id)): Path<(String, Uuid)>,
     Json(input): Json<models::SubmitItemVerdictsInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue's company_id and assert access

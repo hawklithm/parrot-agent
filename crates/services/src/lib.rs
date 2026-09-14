@@ -14,6 +14,7 @@ pub mod adapters;
 pub mod plugin_worker_manager;
 pub use plugin_worker_manager::PluginWorkerManager;
 pub mod plugin_runtime_sandbox;
+pub mod cron_schedule;
 pub mod plugin_job_scheduler;
 pub use plugin_job_scheduler::{PluginJobScheduler, PluginJobSchedulerOptions};
 pub mod plugin_job_coordinator;
@@ -192,7 +193,6 @@ pub mod mock_environment_services;
 pub mod org_chart_service;
 pub mod org_chart_service_impl;
 pub mod routine_service;
-pub mod secret_provider_service;
 pub mod user_secret_service;
 pub mod workspace_operation_service;
 pub mod workspace_service;
@@ -240,8 +240,7 @@ pub use environment_diagnostics_service::{
     EnvironmentDiagnosticsService, MockEnvironmentDiagnosticsService,
 };
 pub use secret_provider_config_service::{
-    DefaultSecretProviderConfigServiceImpl, MockSecretProviderConfigService,
-    SecretProviderConfigService,
+    DefaultSecretProviderConfigServiceImpl, SecretProviderConfigService,
 };
 pub use secret_remote_import_service::{MockSecretRemoteImportService, SecretRemoteImportService};
 pub use skill_registry_service::{MockSkillRegistryService, SkillRegistryService};

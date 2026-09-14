@@ -27,9 +27,10 @@ async fn test_routine_cron_trigger_basic() {
     let _guard = TEST_LOCK.lock().await;
 
     // 使用回归数据库（与 parity 测试一致）；缺失则跳过而非失败。
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:admin123@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping test_routine_cron_trigger_basic: DATABASE_URL is not set");
+        return;
+    };
 
     let pool = match PgPool::connect(&database_url).await {
         Ok(p) => p,
@@ -227,8 +228,10 @@ async fn test_routine_cron_trigger_basic() {
 async fn test_routine_catch_up_policy() {
     let _guard = TEST_LOCK.lock().await;
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:admin123@127.0.0.1:5433/parrot_agent_compile".to_string());
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping test_routine_catch_up_policy: DATABASE_URL is not set");
+        return;
+    };
 
     let pool = match PgPool::connect(&database_url).await {
         Ok(p) => p,
@@ -335,8 +338,10 @@ async fn test_routine_catch_up_policy() {
 
 #[tokio::test]
 async fn test_routine_project_paused() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:admin123@127.0.0.1:5433/parrot_agent_compile".to_string());
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping test_routine_project_paused: DATABASE_URL is not set");
+        return;
+    };
     let _guard = TEST_LOCK.lock().await;
 
 

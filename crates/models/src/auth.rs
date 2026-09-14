@@ -167,26 +167,6 @@ pub struct BoardApiKey {
     pub created_at: DateTime<Utc>,
 }
 
-/// CLI auth challenge model
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct CliAuthChallenge {
-    pub id: Uuid,
-    pub challenge_code: String,
-    pub user_id: Option<Uuid>,
-    pub approved: bool,
-    pub expires_at: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Instance user role model
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct InstanceUserRole {
-    pub id: Uuid,
-    pub user_id: Uuid,
-    pub role: String,
-    pub created_at: DateTime<Utc>,
-}
-
 /// Permission grant model
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct PrincipalPermissionGrant {

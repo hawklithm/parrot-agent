@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::Utc;
+use models::agent_url_key::derive_agent_url_key;
 use models::{Agent, AgentStatus};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -18,16 +19,20 @@ impl PgAgentRepository {
     }
 }
 
-/// Helper: map a PgRow to Agent via explicit column access.
-/// Uses sqlx::Row::get instead of query_as because sqlx::FromRow cannot
-/// directly handle the Json<serde_json::Value> wrapper types' column
-/// mapping when column names match struct fields exactly.
-fn map_agent_row(row: sqlx::postgres::PgRow) -> Agent {
+/// Canonical `Agent` row projection — the ONLY place an `Agent` is built from a
+/// database row. `url_key` has no column: it is derived from `name` (falling
+/// back to `id`) so every read path agrees with the route resolver and the skill
+/// `usedByAgents` projection, mirroring paperclip's `normalizeAgentBaseRow`.
+pub fn map_agent_row(row: sqlx::postgres::PgRow) -> Agent {
     use sqlx::Row;
+    let id: Uuid = row.get("id");
+    let name: String = row.get("name");
+    let url_key = derive_agent_url_key(Some(&name), Some(id));
     Agent {
-        id: row.get("id"),
+        id,
         company_id: row.get("company_id"),
-        name: row.get("name"),
+        name,
+        url_key,
         role: row.get("role"),
         status: row.get("status"),
         adapter_type: row.get("adapter_type"),
@@ -229,10 +234,12 @@ mod tests {
         let repo = PgAgentRepository::new(pool);
 
         let company_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
         let agent = Agent {
-            id: Uuid::new_v4(),
+            id: agent_id,
             company_id,
             name: "Test Agent".to_string(),
+            url_key: derive_agent_url_key(Some("Test Agent"), Some(agent_id)),
             role: AgentRole::General,
             status: AgentStatus::Idle,
             adapter_type: "process".to_string(),

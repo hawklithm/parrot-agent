@@ -232,7 +232,7 @@ pub fn scaffold_plugin_project(options: &ScaffoldPluginOptions) -> Result<Vec<St
         "tests/plugin.spec.ts",
         &render_spec_ts(template, &manifest["id"].as_str().unwrap_or_default().to_string()),
     )?;
-    write(".gitignore", "dist\nnode_modules\nparrot-sdk\n");
+    write(".gitignore", "dist\nnode_modules\nparrot-sdk\n")?;
     Ok(written)
 }
 

@@ -5,7 +5,7 @@
 //! window, mirroring Paperclip `services/dashboard.ts` summary.
 //!
 //! Run with a live database, e.g.:
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile \
+//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_compile \
 //!     cargo test -p parrot-server --test dashboard_http_parity_test
 
 use axum::body::{to_bytes, Body};
@@ -247,19 +247,10 @@ async fn cleanup_fixture(f: &Fixture) {
         .await;
 }
 
-async fn connect_and_migrate() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect database for dashboard HTTP parity tests");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    pool
-}
+
+mod common;
+use common::connect_and_migrate;
+
 
 /// #108 dashboard summary acceptance.
 #[tokio::test]

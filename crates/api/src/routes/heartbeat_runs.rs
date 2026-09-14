@@ -26,11 +26,12 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Deserializer};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use uuid::Uuid;
 use sqlx::Row;
 
 use crate::app_state::AppState;
+use crate::extractors::IssueId;
 use crate::routes::{require_company_access, AccessMode};
 use services::auth::AuthorizationActor;
 
@@ -159,6 +160,8 @@ fn run_to_json(r: &sqlx::postgres::PgRow) -> Value {
     let context_snapshot: Option<Value> = r.try_get("context_snapshot").unwrap_or(None);
     let output: Option<String> = r.try_get("output").unwrap_or(None);
     let result_json: Option<Value> = r.try_get("result_json").unwrap_or(None);
+    let log_bytes = output.as_ref().map(|value| value.as_bytes().len() as i64);
+    let last_output_seq = r.try_get::<i64, _>("last_output_seq").unwrap_or(0);
 
     // Derive usageJson from result_json token fields for Paperclip parity
     let usage_json = result_json
@@ -230,9 +233,10 @@ fn run_to_json(r: &sqlx::postgres::PgRow) -> Value {
         "scheduledRetryReason": r.try_get::<Option<String>, _>("scheduled_retry_reason").unwrap_or(None),
         "usageJson": usage_json,
         "errorCode": Value::Null,
-        "logStore": Value::Null,
-        "logRef": Value::Null,
-        "logBytes": Value::Null,
+        "logStore": if log_bytes.is_some_and(|bytes| bytes > 0) { json!("database") } else { Value::Null },
+        "logRef": if log_bytes.is_some_and(|bytes| bytes > 0) { json!("heartbeat_runs.output") } else { Value::Null },
+        "logBytes": log_bytes,
+        "lastOutputSeq": last_output_seq,
         "contextSnapshot": context_snapshot.clone(),
         "issueId": context_snapshot.as_ref().and_then(|c| c.get("issueId")).cloned(),
         "taskId": context_snapshot.as_ref().and_then(|c| c.get("taskId")).cloned(),
@@ -247,6 +251,8 @@ const RUN_SELECT: &str = r#"SELECT id, company_id, agent_id, invocation_source, 
        responsible_user_id, started_at, finished_at, error, exit_code,
        context_snapshot, output, result_json, scheduled_retry_at, scheduled_retry_attempt,
        scheduled_retry_reason, created_at, updated_at,
+       (SELECT COALESCE(MAX(seq), 0)::bigint FROM heartbeat_run_events
+          WHERE heartbeat_run_events.run_id = heartbeat_runs.id) AS last_output_seq,
        (SELECT name FROM agents WHERE agents.id = agent_id) AS agent_name,
        (SELECT adapter_type FROM agents WHERE agents.id = agent_id) AS adapter_type
   FROM heartbeat_runs"#;
@@ -444,9 +450,12 @@ async fn cancel_heartbeat_run(
     }
 }
 
-/// X5: GET /heartbeat-runs/:run_id/events.  Tool calls are the durable
-/// execution events available in Parrot's schema, so expose them in the same
-/// cursor-shaped projection consumed by Paperclip's run detail page.
+/// X5: GET /heartbeat-runs/:run_id/events.
+///
+/// Heartbeat lifecycle/log events are stored in the Paperclip-compatible
+/// `heartbeat_run_events` ledger.  Keep a compatibility fallback for runs
+/// created before that ledger was introduced: old tool-call rows still appear
+/// as events, but new runs never need a synthetic projection.
 async fn list_run_events(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -457,23 +466,71 @@ async fn list_run_events(
     let after_seq = q.after_seq.unwrap_or(0);
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let rows = sqlx::query(
-        "SELECT id, event_type, actor_type, actor_id, tool_name, decision, outcome, metadata, created_at
-         FROM tool_call_events WHERE run_id = $1 ORDER BY created_at ASC, id ASC OFFSET $2 LIMIT $3")
-        .bind(run_id).bind(after_seq).bind(limit as i64).fetch_all(&state.pool).await
+        "SELECT id, company_id, run_id, agent_id, seq, event_type, stream, level,
+                color, message, payload, created_at
+         FROM heartbeat_run_events
+         WHERE run_id = $1 AND seq > $2
+         ORDER BY seq ASC
+         LIMIT $3",
+    )
+    .bind(run_id)
+    .bind(after_seq.clamp(0, i32::MAX as i64) as i32)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+    let events: Vec<Value> = if rows.is_empty() && after_seq == 0 {
+        let legacy_rows = sqlx::query(
+            "SELECT id, event_type, actor_type, actor_id, tool_name, decision, outcome, metadata, created_at
+             FROM tool_call_events WHERE run_id = $1 ORDER BY created_at ASC, id ASC LIMIT $2",
+        )
+        .bind(run_id)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await
         .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
-    let events: Vec<Value> = rows.into_iter().enumerate().map(|(i, r)| json!({
-        "seq": after_seq + i as i64 + 1,
-        "id": r.get::<Uuid, _>("id"),
-        "type": r.get::<String, _>("event_type"),
-        "eventType": r.get::<String, _>("event_type"),
-        "actorType": r.get::<String, _>("actor_type"),
-        "actorId": r.get::<Option<String>, _>("actor_id"),
-        "toolName": r.get::<Option<String>, _>("tool_name"),
-        "decision": r.get::<Option<String>, _>("decision"),
-        "outcome": r.get::<String, _>("outcome"),
-        "metadata": r.get::<Option<Value>, _>("metadata"),
-        "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-    })).collect();
+        legacy_rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                json!({
+                    "seq": i as i64 + 1,
+                    "id": r.get::<Uuid, _>("id"),
+                    "type": r.get::<String, _>("event_type"),
+                    "eventType": r.get::<String, _>("event_type"),
+                    "actorType": r.get::<String, _>("actor_type"),
+                    "actorId": r.get::<Option<String>, _>("actor_id"),
+                    "toolName": r.get::<Option<String>, _>("tool_name"),
+                    "decision": r.get::<Option<String>, _>("decision"),
+                    "outcome": r.get::<String, _>("outcome"),
+                    "metadata": r.get::<Option<Value>, _>("metadata"),
+                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                })
+            })
+            .collect()
+    } else {
+        rows.into_iter()
+            .map(|r| {
+                let event_type = r.get::<String, _>("event_type");
+                let payload = r.get::<Option<Value>, _>("payload");
+                json!({
+                    "seq": r.get::<i32, _>("seq") as i64,
+                    "id": r.get::<i64, _>("id"),
+                    "companyId": r.get::<Uuid, _>("company_id"),
+                    "runId": r.get::<Uuid, _>("run_id"),
+                    "agentId": r.get::<Uuid, _>("agent_id"),
+                    "type": event_type,
+                    "eventType": event_type,
+                    "stream": r.get::<Option<String>, _>("stream"),
+                    "level": r.get::<Option<String>, _>("level"),
+                    "color": r.get::<Option<String>, _>("color"),
+                    "message": r.get::<Option<String>, _>("message"),
+                    "payload": payload,
+                    "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                })
+            })
+            .collect()
+    };
     Ok(Json(Value::Array(events)))
 }
 
@@ -793,7 +850,7 @@ async fn get_workspace_operation_log(
 async fn list_issue_runs(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Value>, HeartbeatRunError> {
     let pool = &state.pool;
     let company_id: Uuid = sqlx::query_scalar("SELECT company_id FROM issues WHERE id = $1")

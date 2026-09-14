@@ -2,7 +2,7 @@
 use crate::{app_state::AppState, errors::AppError};
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
     response::Response,
     routing::{get, post, put},
@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::Path as FilePath;
 use uuid::Uuid;
+use services::auth::AuthorizationActor;
 
 pub fn plugin_routes() -> Router<AppState> {
     Router::new()
@@ -93,6 +94,29 @@ pub fn plugin_routes() -> Router<AppState> {
 #[derive(Deserialize)]
 struct PluginFilter {
     status: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginCompanyQuery {
+    company_id: Option<Uuid>,
+}
+
+fn resolve_plugin_company_id(
+    actor: &AuthorizationActor,
+    requested: Option<Uuid>,
+) -> Result<Uuid, AppError> {
+    let company_id = requested
+        .or_else(|| actor.company_id())
+        .ok_or_else(|| AppError::BadRequest("companyId is required".into()))?;
+    if let Some(actor_company_id) = actor.company_id() {
+        if actor_company_id != company_id && !actor.is_instance_admin() {
+            return Err(AppError::Forbidden(
+                "Plugin configuration is outside the current company".into(),
+            ));
+        }
+    }
+    Ok(company_id)
 }
 fn err(e: impl std::fmt::Display) -> AppError {
     AppError::InternalServerError(e.to_string())
@@ -250,18 +274,38 @@ async fn get_plugin_dashboard(
 }
 async fn get_plugin_config(
     State(s): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Value>, AppError> {
-    Ok(Json(s.plugin_service.get(id).await.map_err(err)?.config))
+    Query(query): Query<PluginCompanyQuery>,
+) -> Result<Json<Option<Value>>, AppError> {
+    let company_id = resolve_plugin_company_id(&actor, query.company_id)?;
+    Ok(Json(
+        s.plugin_service
+            .get_company_config(id, company_id)
+            .await
+            .map_err(err)?,
+    ))
 }
 async fn update_plugin_config(
     State(s): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
     Path(id): Path<Uuid>,
     Json(body): Json<Value>,
-) -> Result<Json<models::Plugin>, AppError> {
+) -> Result<Json<Value>, AppError> {
+    let requested_company_id = body
+        .get("companyId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let company_id = resolve_plugin_company_id(&actor, requested_company_id)?;
+    let config = body.get("configJson").cloned().unwrap_or_else(|| body.clone());
+    if !config.is_object() {
+        return Err(AppError::BadRequest(
+            "configJson is required and must be an object".into(),
+        ));
+    }
     Ok(Json(
         s.plugin_service
-            .update_config(id, body)
+            .update_company_config(id, company_id, config)
             .await
             .map_err(err)?,
     ))
@@ -271,10 +315,29 @@ async fn test_plugin_config(
     Path(id): Path<Uuid>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    s.plugin_service.get(id).await.map_err(err)?;
-    Ok(Json(
-        json!({"pluginId":id,"valid":body.is_object(),"testPassed":body.is_object()}),
-    ))
+    let plugin = s.plugin_service.get(id).await.map_err(err)?;
+    let config = body.get("configJson").cloned().unwrap_or(body);
+    if !config.is_object() {
+        return Ok(Json(json!({
+            "pluginId": id,
+            "valid": false,
+            "testPassed": false,
+            "message": "configJson must be an object",
+        })));
+    }
+    match services::plugin_config_validator::validate_config(&plugin.manifest, &config) {
+        Ok(()) => Ok(Json(json!({
+            "pluginId": id,
+            "valid": true,
+            "testPassed": true,
+        }))),
+        Err(message) => Ok(Json(json!({
+            "pluginId": id,
+            "valid": false,
+            "testPassed": false,
+            "message": message,
+        }))),
+    }
 }
 async fn bridge_plugin_data(
     State(s): State<AppState>,
@@ -369,11 +432,13 @@ async fn bridge_plugin_stream(
 async fn plugin_webhook(
     State(s): State<AppState>,
     Path((plugin_id, endpoint_key)): Path<(Uuid, String)>,
+    actor: Option<Extension<AuthorizationActor>>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    let company_id = actor.and_then(|Extension(actor)| actor.company_id());
     let result = s
         .plugin_service
-        .ingest_webhook(plugin_id, &endpoint_key, Uuid::nil(), payload)
+        .ingest_webhook(plugin_id, &endpoint_key, company_id, payload)
         .await
         .map_err(AppError::from)?;
     Ok(Json(result))

@@ -15,9 +15,11 @@ impl CompanyService {
         // Create company with owner membership in a transaction
         let company = self.company_repo.create(input, creator_user_id).await?;
 
-        // Note: Default role grants initialization requires AccessService.ensure_role_default_grants()
-        // implementation. Tracked as tech debt - does not block company creation.
-        
+        // 注意：owner 的默认角色授权（含 `users:manage_permissions`）由
+        // `create_company` 路由在服务调用之后补齐——对齐 Paperclip
+        // `routes/companies.ts:1127` 的 `ensureRoleDefaultGrants`，它位于
+        // 路由层而非 company service 内。
+
         // Note: Budget policy creation requires BudgetService.upsert_policy() implementation.
         // Budget enforcement is optional and does not block company creation.
 

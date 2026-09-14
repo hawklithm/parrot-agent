@@ -9,7 +9,7 @@
 //! activity logs). Cross-company callers get 403.
 //!
 //! Run with a live database, e.g.:
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile \
+//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_compile \
 //!     cargo test -p parrot-server --test company_export_http_parity_test
 
 use axum::body::{to_bytes, Body};
@@ -195,19 +195,10 @@ async fn cleanup_fixture(f: &Fixture) {
         .await;
 }
 
-async fn connect_and_migrate() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect database for company export HTTP parity tests");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    pool
-}
+
+mod common;
+use common::connect_and_migrate;
+
 
 /// #121 company export / preview / fidelity acceptance.
 #[tokio::test]
@@ -325,4 +316,59 @@ async fn company_export_preview_and_fidelity_match_paperclip() {
     assert_eq!(status, StatusCode::FORBIDDEN, "cross-company fidelity → 403");
 
     cleanup_fixture(&f).await;
+}
+
+/// A company with `budget_monthly_cents` unset (NULL) must still export.
+///
+/// `companies.budget_monthly_cents` is nullable and the model types it as
+/// `Option<i64>`, but the export projection used to decode it as a non-null
+/// `i64`. `Row::get` panics on a NULL for a non-nullable target, so every
+/// export of a company without a budget crashed the request task with
+/// `sqlx-core/src/row.rs` in the backtrace instead of returning JSON.
+/// `seed_fixture` always sets 500_000, which is why the other test missed it.
+#[tokio::test]
+async fn company_export_succeeds_when_budget_is_null() {
+    let pool = connect_and_migrate().await;
+    let company = Uuid::new_v4();
+    let prefix = format!("CN{}", &company.simple().to_string()[..8]);
+
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix, budget_monthly_cents) VALUES ($1, $2, $3, NULL)")
+        .bind(company)
+        .bind("Null Budget Co")
+        .bind(&prefix)
+        .execute(&pool)
+        .await
+        .expect("insert company without budget");
+
+    let state = build_app_state(pool.clone()).await.expect("build_app_state");
+    let app = company_routes().with_state(state);
+    let board = board_actor(Uuid::new_v4(), company);
+
+    // `POST /:companyId/exports` is the route the web UI calls; it shares the
+    // handler with `/export`.
+    let (status, body) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{}/exports", company),
+        Some(json!({ "include": { "company": true } })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "export with NULL budget must not panic"
+    );
+    let export = parse(&body);
+    assert_eq!(export["company"]["name"], "Null Budget Co");
+    assert!(
+        export["company"]["budgetMonthlyCents"].is_null(),
+        "NULL budget must project as JSON null, got {:?}",
+        export["company"]["budgetMonthlyCents"]
+    );
+
+    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company)
+        .execute(&pool)
+        .await;
 }

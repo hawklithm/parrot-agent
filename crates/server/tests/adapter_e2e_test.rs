@@ -12,12 +12,10 @@ use sqlx::PgPool;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
-async fn migrate(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 async fn seed(pool: &PgPool) -> (Uuid, Uuid) {
     let company_id = Uuid::new_v4();

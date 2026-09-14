@@ -33,12 +33,10 @@ use sqlx::PgPool;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
-async fn migrate(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 fn board_actor(user_id: Uuid, company_id: Uuid) -> AuthorizationActor {
     AuthorizationActor::board_with_source(
@@ -408,7 +406,9 @@ async fn tree_control_rejects_cross_company_access(pool: PgPool) {
         Some(json!({ "mode": "cancel" })),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Paperclip 的 tree-control 路由走 `getAccessibleResource`，跨租户与
+    // 「资源不存在」同为 404，不泄漏其他公司的 issue id。
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let (status, _) = send(
         &app,
@@ -418,7 +418,7 @@ async fn tree_control_rejects_cross_company_access(pool: PgPool) {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // No hold was created by the rejected request.
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM issue_tree_holds")

@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 use models::{AdapterType, AdapterModel, AdapterEnvironmentTestResult, AdapterEnvironmentTestStatus, AdapterEnvironmentCheck};
 use crate::adapter_registry::ServerAdapterModule;
 use models::TestEnvironmentContext;
-use std::process::Command;
 
 /// Claude Local 适配器
 /// 对接 Claude Code CLI，支持本地 Claude 模型执行
@@ -28,12 +27,28 @@ impl ClaudeLocalAdapter {
     }
 
     const CACHE_TTL: Duration = Duration::from_secs(60);
+    const CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn run_cli_command(args: &[&str]) -> Result<std::process::Output, String> {
+        let mut command = tokio::process::Command::new("claude");
+        command.args(args).kill_on_drop(true);
+
+        tokio::time::timeout(Self::CLI_COMMAND_TIMEOUT, command.output())
+            .await
+            .map_err(|_| {
+                format!(
+                    "Claude CLI command timed out after {} seconds: claude {}",
+                    Self::CLI_COMMAND_TIMEOUT.as_secs(),
+                    args.join(" ")
+                )
+            })?
+            .map_err(|error| format!("Failed to execute Claude CLI: {error}"))
+    }
 
     /// 检查 Claude CLI 是否已安装
-    fn is_claude_cli_installed(&self) -> bool {
-        Command::new("claude")
-            .arg("--version")
-            .output()
+    async fn is_claude_cli_installed(&self) -> bool {
+        Self::run_cli_command(&["--version"])
+            .await
             .map(|output| output.status.success())
             .unwrap_or(false)
     }
@@ -69,7 +84,7 @@ impl ClaudeLocalAdapter {
     }
 
     /// 通过 CLI 发现模型并缓存（参考 paperclip cursor-models.ts 模式）
-    fn discover_and_cache_models(&self) -> Vec<AdapterModel> {
+    async fn discover_and_cache_models(&self) -> Vec<AdapterModel> {
         // 检查缓存是否有效
         if let Ok(cache) = self.models_cache.lock() {
             if let Some((models, expires_at)) = cache.as_ref() {
@@ -80,7 +95,7 @@ impl ClaudeLocalAdapter {
         }
 
         // 尝试通过 CLI 发现模型
-        let discovered = self.discover_models_from_cli();
+        let discovered = self.discover_models_from_cli().await;
         let merged = self.merge_with_defaults(discovered);
 
         // 更新缓存
@@ -92,8 +107,8 @@ impl ClaudeLocalAdapter {
     }
 
     /// 从 CLI 发现模型
-    fn discover_models_from_cli(&self) -> Vec<AdapterModel> {
-        if let Ok(output) = Command::new("claude").arg("models").output() {
+    async fn discover_models_from_cli(&self) -> Vec<AdapterModel> {
+        if let Ok(output) = Self::run_cli_command(&["models"]).await {
             if output.status.success() {
                 if let Ok(stdout) = String::from_utf8(output.stdout) {
                     let parsed = self.parse_models_from_cli(&stdout);
@@ -222,15 +237,7 @@ impl ClaudeLocalAdapter {
 
     /// 测试 Claude CLI 连通性
     async fn test_cli_connectivity(&self) -> Result<(), String> {
-        // 执行简单的 Claude CLI 命令测试
-        let output = tokio::task::spawn_blocking(|| {
-            Command::new("claude")
-                .arg("--version")
-                .output()
-        })
-        .await
-        .map_err(|e| format!("Failed to spawn test command: {}", e))?
-        .map_err(|e| format!("Failed to execute claude --version: {}", e))?;
+        let output = Self::run_cli_command(&["--version"]).await?;
 
         if output.status.success() {
             Ok(())
@@ -265,7 +272,7 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         // 1. 尝试通过 CLI 动态发现模型
         // 2. 如果发现成功，合并默认模型并缓存
         // 3. 如果发现失败，回退到默认模型
-        self.discover_and_cache_models()
+        self.discover_and_cache_models().await
     }
 
     async fn test_environment(&self, ctx: &TestEnvironmentContext)
@@ -274,7 +281,7 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         let mut overall_status = AdapterEnvironmentTestStatus::Pass;
 
         // 检查 1: Claude CLI 是否安装
-        let cli_installed = self.is_claude_cli_installed();
+        let cli_installed = self.is_claude_cli_installed().await;
         checks.push(AdapterEnvironmentCheck {
             name: Some("claude_cli_installed".to_string()),
             status: Some(if cli_installed {
@@ -353,7 +360,7 @@ impl ServerAdapterModule for ClaudeLocalAdapter {
         }
 
         // 检查 4: 模型可用性
-        let models = self.discover_and_cache_models();
+        let models = self.discover_and_cache_models().await;
         checks.push(AdapterEnvironmentCheck {
             name: Some("models_available".to_string()),
             status: Some(if models.is_empty() {
@@ -438,7 +445,7 @@ Authentication:
 Notes:
 - Requires Claude Code CLI: npm install -g @anthropic-ai/claude-code
 - Sessions are managed by Claude's native session handling
-- ACP (Agent Client Protocol) mode provides better performance and reliability
+- The Claude Code CLI in this runtime uses its regular print-mode CLI; it does not expose an ACP flag
 "#
     }
 }

@@ -151,8 +151,8 @@ impl AgentInstructionsService {
 mod tests {
     use super::*;
     
-    #[test]
-    fn test_replace_variables() {
+    #[tokio::test]
+    async fn test_replace_variables() {
         let service = AgentInstructionsService {
             pool: sqlx::PgPool::connect_lazy("postgresql://test").unwrap(),
         };

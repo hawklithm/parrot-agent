@@ -14,6 +14,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::extractors::IssueId;
 use services::{CreateCostEventInput, CreateFinanceEventInput, BudgetIncidentResolveInput, UpsertPolicyInput};
 
 /// Query parameter for issue tree summary
@@ -259,7 +260,7 @@ async fn list_finance_events(
 /// CO15: GET /issues/:id/cost-summary
 async fn get_issue_cost_summary(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let summary = state.cost_service.issue_cost_summary(id).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -275,7 +276,7 @@ async fn get_issue_cost_summary(
 /// CO15b: GET /issues/:id/cost-tree-summary
 async fn get_issue_tree_cost_summary(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Query(params): Query<ExcludeRootParams>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let exclude_root = params.exclude_root.unwrap_or(false);

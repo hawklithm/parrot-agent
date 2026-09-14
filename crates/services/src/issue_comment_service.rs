@@ -221,10 +221,6 @@ where
         actor_run_id: Option<Uuid>,
         metadata: Option<serde_json::Value>,
     ) -> CommentServiceResult<IssueComment> {
-        // Verify issue exists
-        let issue = self.issue_repository.get_by_id(issue_id).await?
-            .ok_or(CommentServiceError::IssueNotFound(issue_id))?;
-
         let comment = self
             .add_comment_attributed(
                 issue_id,

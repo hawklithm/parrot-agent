@@ -1,29 +1,60 @@
 -- Align tool_profile_entries with Paperclip (packages/db/src/schema/tool_access.ts).
 -- The uncommitted tool_access.rs INSERT expects (company_id, profile_id, selector_type, effect, tool_name)
 -- and paperclip has NO selector_value column. Bring the table to parity.
-ALTER TABLE tool_profile_entries
-    ADD COLUMN company_id UUID REFERENCES companies(id) ON DELETE CASCADE;
+-- Guard all structural changes behind existence checks so this migration is
+-- replayable: a fresh install (columns missing) runs the full path, an
+-- already-migrated database (columns present) skips the DDL and only
+-- re-applies the idempotent data normalizations below.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'tool_profile_entries' AND column_name = 'company_id'
+    ) THEN
+        ALTER TABLE tool_profile_entries
+            ADD COLUMN company_id UUID REFERENCES companies(id) ON DELETE CASCADE;
+        UPDATE tool_profile_entries
+            SET company_id = (SELECT tp.company_id FROM tool_profiles tp WHERE tp.id = tool_profile_entries.profile_id)
+            WHERE company_id IS NULL;
+        ALTER TABLE tool_profile_entries
+            ALTER COLUMN company_id SET NOT NULL;
+    END IF;
 
-UPDATE tool_profile_entries
-    SET company_id = (SELECT tp.company_id FROM tool_profiles tp WHERE tp.id = tool_profile_entries.profile_id)
-    WHERE company_id IS NULL;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'tool_profile_entries' AND column_name = 'application_id'
+    ) THEN
+        ALTER TABLE tool_profile_entries
+            ADD COLUMN application_id UUID REFERENCES tool_applications(id) ON DELETE CASCADE;
+    END IF;
 
-ALTER TABLE tool_profile_entries
-    ALTER COLUMN company_id SET NOT NULL;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'tool_profile_entries' AND column_name = 'catalog_entry_id'
+    ) THEN
+        ALTER TABLE tool_profile_entries
+            ADD COLUMN catalog_entry_id UUID REFERENCES tool_catalog_entries(id) ON DELETE CASCADE;
+    END IF;
 
-ALTER TABLE tool_profile_entries
-    ADD COLUMN application_id UUID REFERENCES tool_applications(id) ON DELETE CASCADE;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'tool_profile_entries' AND column_name = 'risk_level'
+    ) THEN
+        ALTER TABLE tool_profile_entries
+            ADD COLUMN risk_level TEXT;
+    END IF;
 
-ALTER TABLE tool_profile_entries
-    ADD COLUMN catalog_entry_id UUID REFERENCES tool_catalog_entries(id) ON DELETE CASCADE;
-
-ALTER TABLE tool_profile_entries
-    ADD COLUMN risk_level TEXT;
-
-ALTER TABLE tool_profile_entries
-    ADD COLUMN conditions JSONB;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'tool_profile_entries' AND column_name = 'conditions'
+    ) THEN
+        ALTER TABLE tool_profile_entries
+            ADD COLUMN conditions JSONB;
+    END IF;
+END $$;
 
 -- Paperclip effect domain is 'include' | 'exclude'; normalize legacy 'allow' rows.
+-- Idempotent: only touches rows still carrying the legacy value.
 UPDATE tool_profile_entries SET effect = 'include' WHERE effect = 'allow';
 ALTER TABLE tool_profile_entries
     ALTER COLUMN effect SET DEFAULT 'include';

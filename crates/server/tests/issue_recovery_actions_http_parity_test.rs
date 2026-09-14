@@ -12,12 +12,10 @@ use sqlx::{PgPool, Row};
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
-async fn migrate(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 struct Fixture {
     pool: PgPool,
@@ -153,7 +151,9 @@ async fn list_returns_paperclip_active_actions_projection_and_resolve_is_scoped(
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Paperclip 的 recovery-actions 路由走 `getAccessibleResource`
+    // （`routes/issues.ts:6598`），跨租户与「资源不存在」同为 404。
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let blocker_id = Uuid::new_v4();
     sqlx::query(

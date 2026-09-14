@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -64,7 +64,7 @@ pub async fn record_tool_runtime_audit_write_failure(pool: &PgPool, company_id: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{Datelike, TimeZone};
 
     #[test]
     fn test_minute_bucket() {

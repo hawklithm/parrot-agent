@@ -16,12 +16,10 @@ use sqlx::PgPool;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
-async fn migrate(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 /// Seed a company with agents, projects, issues, skills, routines matching the
 /// existing export test pattern (company_export_http_parity_test.rs).

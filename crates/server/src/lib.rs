@@ -36,7 +36,6 @@ use repositories::{
     routine_repository::RoutineRepository,
     routine_revision_repository::RoutineRevisionRepository,
     routine_trigger_repository::RoutineTriggerRepository,
-    secret_provider_config_repository::SecretProviderConfigRepository,
     secret_repository::UserSecretDefinitionRepository,
     task_watchdog_repository::{
         AgentWakeupRequestRepository, HeartbeatRunRepository, IssueThreadInteractionRepository,
@@ -185,9 +184,6 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
         repositories::routine_revision_repository::PostgresRoutineRevisionRepository::new(
             pool.clone(),
         ),
-    );
-    let _secret_provider_config_repo: Arc<dyn SecretProviderConfigRepository> = Arc::new(
-        repositories::secret_provider_config_repository::PostgresSecretProviderConfigRepository::new(pool.clone()),
     );
     let user_secret_repo: Arc<dyn UserSecretRepository> = Arc::new(
         repositories::user_secret_repository::PostgresUserSecretRepository::new(pool.clone()),
@@ -428,6 +424,7 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
             .with_sse_service(sse_service.clone())
             .with_cost_service(cost_service.clone())
             .with_budget_service(budget_service.clone())
+            .with_issue_comment_service(issue_comment_service.clone())
             .with_runtime_secret_resolver(Arc::new(
                 services::DatabaseAdapterRuntimeSecretResolver::new(pool.clone()),
             )),

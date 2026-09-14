@@ -270,22 +270,17 @@ pub struct InstanceUserRole {
     pub id: Uuid,
     pub user_id: Uuid,
     pub role: String,
-    pub granted_by_user_id: Option<Uuid>,
-    pub granted_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
 
 impl InstanceUserRole {
     /// 创建新的实例角色
-    pub fn new(user_id: Uuid, role: String, granted_by_user_id: Option<Uuid>) -> Self {
-        let now = Utc::now();
+    pub fn new(user_id: Uuid, role: String) -> Self {
         Self {
             id: Uuid::new_v4(),
             user_id,
             role,
-            granted_by_user_id,
-            granted_at: now,
-            created_at: now,
+            created_at: Utc::now(),
         }
     }
 
@@ -372,7 +367,7 @@ mod tests {
     #[test]
     fn test_instance_user_role_is_admin() {
         let user_id = Uuid::new_v4();
-        let role = InstanceUserRole::new(user_id, "instance_admin".to_string(), None);
+        let role = InstanceUserRole::new(user_id, "instance_admin".to_string());
 
         assert!(role.is_instance_admin());
     }

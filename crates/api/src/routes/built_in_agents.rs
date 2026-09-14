@@ -110,7 +110,7 @@ pub async fn provision_built_in_agent(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
-    Path(key): Path<String>,
+    Path((_company, key)): Path<(String, String)>,
     Json(payload): Json<ProvisionBuiltInAgentRequest>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
     require_company_access(
@@ -167,7 +167,7 @@ pub async fn reconcile_built_in_agent(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
-    Path(key): Path<String>,
+    Path((_company, key)): Path<(String, String)>,
     Json(_payload): Json<ReconcileBuiltInAgentRequest>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
     require_company_access(
@@ -211,7 +211,7 @@ pub async fn get_built_in_agent_status(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
-    Path(key): Path<String>,
+    Path((_company, key)): Path<(String, String)>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
     require_company_access(
         &state,
@@ -250,7 +250,7 @@ pub async fn reset_built_in_agent(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     CompanyIdOrShortname(company_id): CompanyIdOrShortname,
-    Path(key): Path<String>,
+    Path((_company, key)): Path<(String, String)>,
 ) -> Result<Json<BuiltInAgentStateResponse>, (StatusCode, String)> {
     require_company_access(
         &state,

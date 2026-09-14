@@ -540,7 +540,7 @@ async fn heartbeat_wakeup_inserts_request_after_creating_run(pool: PgPool) {
             issue.id,
             company_id,
             HeartbeatWakeupOptions {
-                source: Some("mention".to_string()),
+                source: Some("automation".to_string()),
                 reason: Some("issue_comment_mentioned".to_string()),
                 ..Default::default()
             },

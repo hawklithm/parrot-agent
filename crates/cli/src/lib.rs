@@ -8,10 +8,13 @@ pub mod checks;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod context;
+pub mod env_lab;
 pub mod install_store;
 pub mod plugin_scaffold;
 pub mod services;
 pub mod update_notice;
+pub mod worktree;
 
 // Re-export key types for external access
 pub use client::ApiClient;

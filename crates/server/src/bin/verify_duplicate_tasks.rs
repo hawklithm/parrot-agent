@@ -53,9 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  ID: {}", task.id);
         println!("  Parent ID: {}", task.parent_id.map(|id| id.to_string()).unwrap_or_else(|| "无 (独立任务)".to_string()));
         println!("  Origin Kind: {}", task.origin_kind.as_deref().unwrap_or("NULL"));
+        println!("  Origin Run ID: {}", task.origin_run_id.map(|id| id.to_string()).unwrap_or_else(|| "NULL".to_string()));
         println!("  Created By Agent: {}", task.created_by_agent_id.map(|id| id.to_string()).unwrap_or_else(|| "NULL".to_string()));
         println!("  Created By User: {}", task.created_by_user_id.map(|id| id.to_string()).unwrap_or_else(|| "NULL".to_string()));
+        println!("  Assignee Agent: {}", task.assignee_agent_id.map(|id| id.to_string()).unwrap_or_else(|| "NULL".to_string()));
         println!("  Created At: {}", task.created_at);
+        println!("  Updated At: {}", task.updated_at);
     }
 
     println!("\n{}", "=".repeat(80));

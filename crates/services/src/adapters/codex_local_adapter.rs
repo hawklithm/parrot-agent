@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use models::{
     AdapterEnvironmentTestResult, AdapterEnvironmentTestStatus, AdapterModel, AdapterType,
-    ConfigFieldSchema, TestEnvironmentContext,
+    TestEnvironmentContext,
 };
 
 use crate::adapter_registry::ServerAdapterModule;

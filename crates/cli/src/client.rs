@@ -34,7 +34,6 @@ impl ApiClient {
 
     fn get(&self, path: &str) -> RequestBuilder { self.request(reqwest::Method::GET, path) }
     fn post(&self, path: &str) -> RequestBuilder { self.request(reqwest::Method::POST, path) }
-    fn put(&self, path: &str) -> RequestBuilder { self.request(reqwest::Method::PUT, path) }
     fn delete(&self, path: &str) -> RequestBuilder { self.request(reqwest::Method::DELETE, path) }
 
     // ── Health ──────────────────────────────────────────────────────
@@ -107,6 +106,45 @@ impl ApiClient {
         Ok(resp.json()?)
     }
 
+    pub fn get_current_agent(&self) -> Result<serde_json::Value> {
+        let resp = self.get("/api/agents/me").send()?;
+        if !resp.status().is_success() {
+            bail!("get current agent failed: HTTP {}", resp.status());
+        }
+        Ok(resp.json()?)
+    }
+
+    pub fn wakeup_agent(&self, agent_id: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.send_json(self.post(&format!("/api/agents/{agent_id}/wakeup")), Some(body))
+    }
+
+    pub fn list_agent_runs(&self, company_id: &str, agent_id: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .get(&format!("/api/companies/{company_id}/heartbeat-runs?agentId={agent_id}"))
+            .send()?;
+        if !resp.status().is_success() {
+            bail!("list agent heartbeat runs failed: HTTP {}", resp.status());
+        }
+        Ok(resp.json()?)
+    }
+
+    pub fn list_run_events(
+        &self,
+        run_id: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .get(&format!(
+                "/api/heartbeat-runs/{run_id}/events?afterSeq={after_seq}&limit={limit}"
+            ))
+            .send()?;
+        if !resp.status().is_success() {
+            bail!("list heartbeat run events failed: HTTP {}", resp.status());
+        }
+        Ok(resp.json()?)
+    }
+
     // ── Issues ──────────────────────────────────────────────────────
 
     pub fn list_issues(&self, company_id: &str, query: Option<&str>) -> Result<serde_json::Value> {
@@ -127,6 +165,14 @@ impl ApiClient {
             bail!("get issue failed: HTTP {}", resp.status());
         }
         Ok(resp.json()?)
+    }
+
+    pub fn create_issue(&self, company_id: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.send_json(self.post(&format!("/api/companies/{company_id}/issues")), Some(body))
+    }
+
+    pub fn add_issue_comment(&self, issue_id: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.send_json(self.post(&format!("/api/issues/{issue_id}/comments")), Some(body))
     }
 
     // ── Goals ───────────────────────────────────────────────────────
@@ -318,6 +364,43 @@ impl ApiClient {
 
     pub fn disable_plugin(&self, plugin_id: &str) -> Result<serde_json::Value> {
         self.send_json(self.post(&format!("/api/plugins/{plugin_id}/disable")), None)
+    }
+
+    // ── API tokens ─────────────────────────────────────────────────
+
+    pub fn list_agent_keys(&self, agent_id: &str) -> Result<serde_json::Value> {
+        let resp = self.get(&format!("/api/agents/{agent_id}/keys")).send()?;
+        if !resp.status().is_success() {
+            bail!("list agent API keys failed: HTTP {}", resp.status());
+        }
+        Ok(resp.json()?)
+    }
+
+    pub fn create_agent_key(&self, agent_id: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.send_json(self.post(&format!("/api/agents/{agent_id}/keys")), Some(body))
+    }
+
+    pub fn revoke_agent_key(&self, agent_id: &str, key_id: &str) -> Result<serde_json::Value> {
+        self.send_json(
+            self.delete(&format!("/api/agents/{agent_id}/keys/{key_id}")),
+            None,
+        )
+    }
+
+    pub fn list_board_api_keys(&self) -> Result<serde_json::Value> {
+        let resp = self.get("/api/board-api-keys").send()?;
+        if !resp.status().is_success() {
+            bail!("list board API keys failed: HTTP {}", resp.status());
+        }
+        Ok(resp.json()?)
+    }
+
+    pub fn create_board_api_key(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.send_json(self.post("/api/board-api-keys"), Some(body))
+    }
+
+    pub fn revoke_board_api_key(&self, key_id: &str) -> Result<serde_json::Value> {
+        self.send_json(self.delete(&format!("/api/board-api-keys/{key_id}")), None)
     }
 
     // ── Dashboard ──────────────────────────────────────────────────

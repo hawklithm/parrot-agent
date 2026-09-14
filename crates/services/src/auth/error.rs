@@ -24,6 +24,10 @@ pub enum AuthError {
     BadRequest {
         message: String,
     },
+    /// 资源不存在（404）
+    NotFound {
+        message: String,
+    },
     /// 请求语义正确但不满足当前认证上下文（422）。
     Unprocessable {
         message: String,
@@ -80,6 +84,13 @@ impl AuthError {
     /// 创建无效请求错误
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequest {
+            message: message.into(),
+        }
+    }
+
+    /// 创建资源不存在错误（404）
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound {
             message: message.into(),
         }
     }
@@ -158,6 +169,7 @@ impl AuthError {
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Unprocessable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflict { .. } => StatusCode::CONFLICT,
+            Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -170,6 +182,7 @@ impl AuthError {
             Self::Forbidden { .. } => "auth.forbidden",
             Self::BadRequest { .. } => "auth.bad_request",
             Self::Unprocessable { code: Some(code), .. } => return code.clone(),
+            Self::NotFound { .. } => "auth.not_found",
             Self::Unprocessable { .. } => "auth.unprocessable",
             Self::Conflict { .. } => "auth.conflict",
             Self::Internal { .. } => "auth.internal_error",
@@ -188,6 +201,7 @@ impl AuthError {
             Self::Forbidden { reason, .. } => reason.clone(),
             Self::BadRequest { message } => message.clone(),
             Self::Unprocessable { message, .. } => message.clone(),
+            Self::NotFound { message } => message.clone(),
             Self::Conflict { message } => message.clone(),
             Self::Internal { .. } => "Internal server error".to_string(),
             Self::InvalidToken { .. } => "Invalid authentication token".to_string(),

@@ -89,6 +89,13 @@ pub async fn require_cloud_company_access(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use services::auth::AuthorizationActor;
+    // Paperclip webhook ingress is a public integration surface. The plugin
+    // manifest/endpoint validation and the plugin's signature policy are the
+    // authorization boundary for this route; board authentication would make
+    // GitHub/Stripe-style deliveries impossible.
+    if request.uri().path().contains("/webhooks/") {
+        return next.run(request).await;
+    }
     let Some(actor) = request.extensions().get::<AuthorizationActor>() else {
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
     };
@@ -205,12 +212,19 @@ pub fn require_company_access(
     assert_company_access(actor, company_id, mode.read_only())
 }
 
-pub fn assert_company_access(
+/// Paperclip `hasCompanyAccess`（`routes/authz.ts:157-162`）：不抛错的公司可见性
+/// 判定。它与 `assert_company_access` 共用同一套语义，也正是
+/// `getAccessibleResource`（`routes/authz.ts:182-195`）在授权前用来消除
+/// 「资源存在性预言」的那一步。
+///
+/// 跨租户与匿名一律返回 `false`，调用方据此统一回 404，使「资源不存在」与
+/// 「资源存在但属于别的公司」不可区分——否则任何已认证用户都能靠 403/404 的
+/// 差异枚举出其他公司的 id。
+pub fn has_company_access(
     actor: &services::auth::AuthorizationActor,
     company_id: uuid::Uuid,
-    read_only: bool,
-) -> Result<(), axum::http::StatusCode> {
-    let has_company_access = actor.company_id() == Some(company_id)
+) -> bool {
+    actor.company_id() == Some(company_id)
         || actor.role_in(company_id).is_some()
         || matches!(
             actor,
@@ -218,8 +232,15 @@ pub fn assert_company_access(
                 source: services::auth::ActorSource::LocalImplicit,
                 ..
             }
-        );
-    if actor.is_anonymous() || !has_company_access {
+        )
+}
+
+pub fn assert_company_access(
+    actor: &services::auth::AuthorizationActor,
+    company_id: uuid::Uuid,
+    read_only: bool,
+) -> Result<(), axum::http::StatusCode> {
+    if actor.is_anonymous() || !has_company_access(actor, company_id) {
         return Err(axum::http::StatusCode::FORBIDDEN);
     }
     if !read_only

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use crate::auth::AgentApiKeyScope;
 use uuid::Uuid;
 
 /// ConfigSnapshot - 配置快照
@@ -95,6 +96,54 @@ fn parse_desired_skill_entries(value: Option<&serde_json::Value>) -> Vec<models:
         entries.push(models::AgentDesiredSkillEntry { key, version_id });
     }
     entries
+}
+
+/// 把请求里的 scope 规范化成要落库的 `scope` 值。
+///
+/// 对齐 Paperclip `createApiKey`（`services/agents.ts:1080`）:
+/// `scopeConfig: scope.kind === "standard" ? null : scope`。`standard`
+/// 不带任何边界，落 `{}`（Parrot 的 `scope` 列是 `NOT NULL DEFAULT '{}'`，
+/// 语义上等价于 Paperclip 的 `NULL`）；带边界的 scope 原样保存。
+///
+/// 无法解析成已知 `kind` 的输入按 `normalizeAgentApiKeyScope`
+/// （`validators/agent.ts:182-185`）降级为 `standard`。请求体校验在路由层
+/// 已经做过，所以走到这里的异常形状只可能来自内部调用方。
+fn normalize_key_scope_for_storage(
+    scope: Option<serde_json::Value>,
+    agent_id: Uuid,
+    company_id: Uuid,
+) -> serde_json::Value {
+    let Some(scope) = scope else {
+        return serde_json::json!({});
+    };
+    match AgentApiKeyScope::from_json(scope) {
+        // 无 scope 记录 / 归一化后就是 standard —— 不落边界。
+        None => serde_json::json!({}),
+        Some(parsed) if parsed.is_standard() => {
+            let mut value = serde_json::to_value(&parsed).unwrap_or_else(|_| serde_json::json!({}));
+            // Parrot 在 scope 里额外记录归属，便于审计；Paperclip 只用 kind。
+            if let Some(object) = value.as_object_mut() {
+                object.insert("agentId".to_string(), serde_json::json!(agent_id));
+                object.insert("companyId".to_string(), serde_json::json!(company_id));
+                object.insert("kind".to_string(), serde_json::json!("standard"));
+            }
+            value
+        }
+        Some(parsed) => serde_json::to_value(&parsed).unwrap_or_else(|_| serde_json::json!({})),
+    }
+}
+
+
+/// `create_key` 的结果：持久化行 + **只在签发时可见的明文 token**。
+///
+/// Paperclip 的 create 响应是 `{id, name, scope, responsibleUserId, token, createdAt}`
+/// （`routes/agents.ts:4185-4195`）。`token` 无法从库里再读出来，所以必须
+/// 由这一层向上传递。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedAgentApiKey {
+    pub key: AgentApiKey,
+    pub token: String,
 }
 
 /// AgentService trait - Agent 业务逻辑服务
@@ -212,19 +261,41 @@ pub trait AgentService: Send + Sync {
     /// 获取任务会话
     async fn get_task_sessions(&self, id: Uuid) -> Result<Vec<AgentTaskSession>, ServiceError>;
 
-    /// 列出 API Keys
+    /// 列出 API Keys（含已撤销的，对齐 Paperclip `listKeys`）。
     async fn list_keys(&self, id: Uuid) -> Result<Vec<AgentApiKey>, ServiceError>;
 
-    /// 创建 API Key
+    /// 创建 API Key，并返回**明文 token**。
+    ///
+    /// Paperclip 在响应里回传 `token`（`routes/agents.ts:4195`），因为明文只在
+    /// 这一瞬间存在，之后库里只有 `key_hash`。Parrot 此前把明文丢弃、把
+    /// `key_hash` 返回给调用方，于是签发的 key 根本无法使用。
+    ///
+    /// `scope` 走 Paperclip 的 `createAgentKeySchema`
+    /// （`validators/agent.ts:187-190`）：缺省 `{kind:"standard"}`，
+    /// `standard` 之外才落库（`scopeConfig: scope.kind === "standard" ? null : scope`）。
+    ///
+    /// `responsible_user_id` 是签发这张 key 的 board 用户，对齐 Paperclip
+    /// `createApiKey(..., { responsibleUserId: req.actor.userId })`
+    /// （`server/src/routes/agents.ts:4177`）。它此前被错误地从
+    /// `agents.reports_to` 推导，而那一列指向的是上级 agent。
     async fn create_key(
         &self,
         id: Uuid,
         name: String,
         scope: Option<serde_json::Value>,
-    ) -> Result<AgentApiKey, ServiceError>;
+        responsible_user_id: Option<Uuid>,
+    ) -> Result<CreatedAgentApiKey, ServiceError>;
 
-    /// 吊销 API Key
-    async fn revoke_key(&self, id: Uuid, key_id: Uuid) -> Result<(), ServiceError>;
+    /// 吊销 API Key。
+    ///
+    /// 返回 `None` 表示该 key 不存在**或不属于该 agent** —— Paperclip
+    /// `revokeKey` 的 `and(eq(id), eq(agentId))` 语义
+    /// （`services/agents.ts:1140-1147`），路由据此回 404 `Key not found`。
+    async fn revoke_key(
+        &self,
+        id: Uuid,
+        key_id: Uuid,
+    ) -> Result<Option<AgentApiKey>, ServiceError>;
 
     /// 更新预算
     async fn update_budget(
@@ -300,6 +371,48 @@ fn validate_bundle(bundle: &serde_json::Value) -> Result<(), ServiceError> {
         if !content.is_string() { return Err(ServiceError::InvalidInput(format!("instruction file {path} must contain text"))); }
     }
     Ok(())
+}
+
+/// Normalize a persisted instructions bundle to the canonical flat shape
+/// (`{entryFile, files, ...envelopeSiblings}`).
+///
+/// Bundled agents historically persisted a nested envelope
+/// (`{stockVersion, instructions: {entryFile, files}, skill, routine}`) while
+/// every reader and writer treats the bundle as flat, which made
+/// `get_instructions_bundle` fail its `entryFile` validation for those agents.
+/// Lifting the inner object here repairs both stored and freshly materialized
+/// bundles without a data migration, and keeps the envelope siblings
+/// (`stockVersion`/`skill`/`routine`) addressable at the top level.
+fn canonical_instructions_bundle(bundle: &serde_json::Value) -> serde_json::Value {
+    let mut map = match bundle {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let Some(serde_json::Value::Object(inner)) = map.remove("instructions") {
+        for (key, value) in inner {
+            map.entry(key).or_insert(value);
+        }
+    }
+    if !map.get("entryFile").is_some_and(serde_json::Value::is_string) {
+        map.insert("entryFile".into(), serde_json::json!("AGENTS.md"));
+    }
+    if !map.get("files").is_some_and(serde_json::Value::is_object) {
+        map.insert("files".into(), serde_json::json!({}));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// The `entryFile`/`files` pair of a persisted bundle, after canonicalization.
+///
+/// Callers that only need to detect instruction drift (reconcile) compare this
+/// instead of the raw envelope, so a legacy nested bundle reads as different
+/// from the freshly materialized flat one and gets rewritten.
+pub(crate) fn instructions_snapshot(bundle: Option<&serde_json::Value>) -> serde_json::Value {
+    let canonical = canonical_instructions_bundle(bundle.unwrap_or(&serde_json::Value::Null));
+    serde_json::json!({
+        "entryFile": canonical.get("entryFile").cloned().unwrap_or(serde_json::Value::Null),
+        "files": canonical.get("files").cloned().unwrap_or(serde_json::Value::Null),
+    })
 }
 
 /// 校验 `reports_to` 分配是否合法（对齐 Paperclip `ensureManager` + 自引用检查）。
@@ -555,10 +668,13 @@ where
     A: ActivityLogRepository,
 {
     async fn create(&self, input: CreateAgentInput) -> Result<Agent, ServiceError> {
+        let id = Uuid::new_v4();
+        let url_key = models::agent_url_key::derive_agent_url_key(Some(&input.name), Some(id));
         let agent = Agent {
-            id: Uuid::new_v4(),
+            id,
             company_id: input.company_id,
             name: input.name.clone(),
+            url_key,
             role: input.role,
             status: input.status.unwrap_or(AgentStatus::Idle),
             adapter_type: input.adapter_type,
@@ -1197,6 +1313,11 @@ where
         .execute(&self.pool)
         .await
         .map_err(|error| ServiceError::Internal(format!("Failed to reset agent session: {error}")))?;
+        sqlx::query("DELETE FROM agent_task_sessions WHERE agent_id = $1")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| ServiceError::Internal(format!("Failed to reset task sessions: {error}")))?;
         Ok(())
     }
 
@@ -1242,10 +1363,13 @@ where
 
     async fn get_instructions_bundle(&self, id: Uuid) -> Result<serde_json::Value, ServiceError> {
         let agent = self.repository.get_by_id(id).await?;
-        let bundle = agent.metadata.instructions_bundle.clone().unwrap_or_else(|| serde_json::json!({
-            "entryFile": "AGENTS.md",
-            "files": {}
-        }));
+        let bundle = canonical_instructions_bundle(
+            agent
+                .metadata
+                .instructions_bundle
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        );
         validate_bundle(&bundle)?;
         Ok(public_instructions_bundle(&agent, &bundle))
     }
@@ -1256,15 +1380,17 @@ where
         bundle: serde_json::Value,
     ) -> Result<Agent, ServiceError> {
         let mut agent = self.repository.get_by_id(id).await?;
-        let mut next_bundle = agent
-            .metadata
-            .instructions_bundle
-            .take()
-            .unwrap_or_else(|| serde_json::json!({"entryFile":"AGENTS.md","files":{}}));
+        let mut next_bundle = canonical_instructions_bundle(
+            agent
+                .metadata
+                .instructions_bundle
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        );
 
         if bundle.get("files").is_some() {
             validate_bundle(&bundle)?;
-            next_bundle = bundle;
+            next_bundle = canonical_instructions_bundle(&bundle);
         } else {
             if let Some(entry_file) = bundle.get("entryFile") {
                 next_bundle["entryFile"] = entry_file.clone();
@@ -1281,14 +1407,13 @@ where
     async fn get_bundle_file(&self, id: Uuid, file_path: &str) -> Result<String, ServiceError> {
         let path = normalize_bundle_path(file_path)?;
         let agent = self.repository.get_by_id(id).await?;
-        let bundle = agent
-            .metadata
-            .instructions_bundle
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({
-                "entryFile": "AGENTS.md",
-                "files": {}
-            }));
+        let bundle = canonical_instructions_bundle(
+            agent
+                .metadata
+                .instructions_bundle
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        );
         validate_bundle(&bundle)?;
         bundle.get("files").and_then(|files| files.get(&path)).and_then(|v| v.as_str())
             .map(ToOwned::to_owned)
@@ -1303,9 +1428,18 @@ where
     ) -> Result<Agent, ServiceError> {
         let path = normalize_bundle_path(file_path)?;
         let mut agent = self.repository.get_by_id(id).await?;
-        let mut bundle = agent.metadata.instructions_bundle.take().unwrap_or_else(|| serde_json::json!({"entryFile":"AGENTS.md","files":{}}));
+        let mut bundle = canonical_instructions_bundle(
+            agent
+                .metadata
+                .instructions_bundle
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        );
         validate_bundle(&bundle)?;
-        bundle["files"].as_object_mut().expect("validated bundle files object").insert(path.clone(), serde_json::Value::String(content));
+        bundle["files"]
+            .as_object_mut()
+            .ok_or_else(|| ServiceError::InvalidInput("instructions bundle requires files object".to_string()))?
+            .insert(path.clone(), serde_json::Value::String(content));
         if bundle.get("entryFile").and_then(|v| v.as_str()).is_none() { bundle["entryFile"] = serde_json::Value::String(path); }
         agent.metadata.0.instructions_bundle = Some(bundle);
         agent.updated_at = Utc::now();
@@ -1316,9 +1450,18 @@ where
     async fn delete_bundle_file(&self, id: Uuid, file_path: &str) -> Result<Agent, ServiceError> {
         let path = normalize_bundle_path(file_path)?;
         let mut agent = self.repository.get_by_id(id).await?;
-        let mut bundle = agent.metadata.instructions_bundle.take().unwrap_or_else(|| serde_json::json!({"entryFile":"AGENTS.md","files":{}}));
+        let mut bundle = canonical_instructions_bundle(
+            agent
+                .metadata
+                .instructions_bundle
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        );
         validate_bundle(&bundle)?;
-        bundle["files"].as_object_mut().expect("validated bundle files object").remove(&path);
+        bundle["files"]
+            .as_object_mut()
+            .ok_or_else(|| ServiceError::InvalidInput("instructions bundle requires files object".to_string()))?
+            .remove(&path);
         agent.metadata.0.instructions_bundle = Some(bundle);
         agent.updated_at = Utc::now();
         self.repository.update(agent.clone()).await?;
@@ -1370,20 +1513,15 @@ where
 
     async fn get_task_sessions(&self, id: Uuid) -> Result<Vec<AgentTaskSession>, ServiceError> {
         let agent = self.repository.get_by_id(id).await?;
-        // Paperclip stores one row per adapter/task key in agent_task_sessions.
-        // Parrot currently has no separate session table, so expose the durable
-        // heartbeat executions as the equivalent session history instead of
-        // returning a misleading empty list.
         let Some(pool) = &self.heartbeat_pool else {
             return Ok(Vec::new());
         };
         let rows = sqlx::query(
-            "SELECT id, agent_id, status::text AS status,
-                    COALESCE(started_at, created_at) AS started_at,
-                    finished_at, context_snapshot
-             FROM heartbeat_runs
+            "SELECT id, agent_id, adapter_type, task_key, session_display_id,
+                    last_run_id, last_error, created_at, updated_at, session_params_json
+             FROM agent_task_sessions
              WHERE company_id = $1 AND agent_id = $2
-             ORDER BY COALESCE(started_at, created_at) DESC, created_at DESC",
+             ORDER BY updated_at DESC, created_at DESC",
         )
         .bind(agent.company_id)
         .bind(agent.id)
@@ -1393,13 +1531,38 @@ where
 
         rows.into_iter()
             .map(|row| {
+                let last_error: Option<String> = row
+                    .try_get("last_error")
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let status = if last_error.is_some() { "failed" } else { "active" };
+                let task_key: String = row
+                    .try_get("task_key")
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let adapter_type: String = row
+                    .try_get("adapter_type")
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let session_display_id: Option<String> = row
+                    .try_get("session_display_id")
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let session_params: Option<serde_json::Value> = row
+                    .try_get("session_params_json")
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let metadata = serde_json::json!({
+                    "taskKey": task_key,
+                    "adapterType": adapter_type,
+                    "sessionDisplayId": session_display_id,
+                    "sessionParams": session_params,
+                    "lastRunId": row.try_get::<Option<Uuid>, _>("last_run_id")
+                        .map_err(|e| ServiceError::Internal(e.to_string()))?,
+                    "lastError": last_error,
+                });
                 Ok(AgentTaskSession {
                     id: row.try_get("id").map_err(|e| ServiceError::Internal(e.to_string()))?,
                     agent_id: row.try_get("agent_id").map_err(|e| ServiceError::Internal(e.to_string()))?,
-                    status: row.try_get("status").map_err(|e| ServiceError::Internal(e.to_string()))?,
-                    started_at: row.try_get("started_at").map_err(|e| ServiceError::Internal(e.to_string()))?,
-                    ended_at: row.try_get("finished_at").map_err(|e| ServiceError::Internal(e.to_string()))?,
-                    metadata: row.try_get("context_snapshot").map_err(|e| ServiceError::Internal(e.to_string()))?,
+                    status: status.to_string(),
+                    started_at: row.try_get("created_at").map_err(|e| ServiceError::Internal(e.to_string()))?,
+                    ended_at: None,
+                    metadata: Some(metadata),
                 })
             })
             .collect()
@@ -1416,35 +1579,59 @@ where
         id: Uuid,
         name: String,
         scope: Option<serde_json::Value>,
-    ) -> Result<AgentApiKey, ServiceError> {
+        responsible_user_id: Option<Uuid>,
+    ) -> Result<CreatedAgentApiKey, ServiceError> {
         let agent = self.repository.get_by_id(id).await?;
-        let raw_key = format!("aak_{}", Uuid::new_v4().simple());
-        let mut digest = Sha256::new();
-        digest.update(raw_key.as_bytes());
-        let scope = scope.unwrap_or_else(|| serde_json::json!({"scope_type":"standard","agent_id":id,"company_id":agent.company_id}));
+        // Paperclip 只禁止给 `pending_approval` / `terminated` 的 agent 签发 key
+        // （`services/agents.ts:1064-1069`），其余状态（含 idle/paused）都可签发。
+        match agent.status {
+            AgentStatus::PendingApproval => {
+                return Err(ServiceError::Conflict(
+                    "Cannot create keys for pending approval agents".to_string(),
+                ));
+            }
+            AgentStatus::Terminated => {
+                return Err(ServiceError::Conflict(
+                    "Cannot create keys for terminated agents".to_string(),
+                ));
+            }
+            _ => {}
+        }
+
+        // Paperclip `createToken`（`services/agents.ts:51`）：
+        // `pcp_` + 24 随机字节的十六进制。Parrot 历史上用 `aak_<uuid-simple>`，
+        // 熵只有 122 bit 且带自身命名空间前缀；这里对齐 Paperclip 的格式，
+        // 因为令牌前缀是客户端可见的线格式。
+        let token = repositories::board_api_key_repository::generate_api_key_token("pcp");
+        let key_hash = repositories::board_api_key_repository::hash_api_key(&token);
+
+        // `scopeConfig: scope.kind === "standard" ? null : scope`
+        // （`services/agents.ts:1080`）——标准 scope 不落边界配置。
+        let scope = normalize_key_scope_for_storage(scope, id, agent.company_id);
+
         let key = AgentApiKey {
             id: Uuid::new_v4(),
             agent_id: id,
             company_id: agent.company_id,
             name,
             scope,
-            key_hash: digest
-                .finalize()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
+            key_hash,
+            responsible_user_id,
             last_used_at: None,
             revoked_at: None,
             created_at: Utc::now(),
         };
-        self.api_key_repo.create(key.clone()).await?;
-        Ok(key)
+        let key = self.api_key_repo.create(key).await?;
+        Ok(CreatedAgentApiKey { key, token })
     }
 
-    async fn revoke_key(&self, id: Uuid, key_id: Uuid) -> Result<(), ServiceError> {
+    async fn revoke_key(
+        &self,
+        id: Uuid,
+        key_id: Uuid,
+    ) -> Result<Option<AgentApiKey>, ServiceError> {
         let _agent = self.repository.get_by_id(id).await?;
-        self.api_key_repo.revoke(key_id).await?;
-        Ok(())
+        Ok(self.api_key_repo.revoke(id, key_id).await?)
     }
 
     async fn update_budget(

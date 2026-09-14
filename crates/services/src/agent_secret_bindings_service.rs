@@ -197,8 +197,8 @@ mod tests {
         assert!(binding.is_expired());
     }
     
-    #[test]
-    fn test_scope_check() {
+    #[tokio::test]
+    async fn test_scope_check() {
         let service = AgentSecretBindingsService::new(
             PgPool::connect_lazy("postgres://postgres:postgres@localhost:5432/parrot_agent_dev")
                 .unwrap(),

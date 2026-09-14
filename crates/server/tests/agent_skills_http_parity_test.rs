@@ -6,7 +6,7 @@
 //! adapter_config (and therefore the desired skills).
 //!
 //! Run with a live database, e.g.:
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile \
+//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_compile \
 //!     cargo test -p parrot-server --test agent_skills_http_parity_test
 
 use axum::body::{to_bytes, Body};
@@ -144,19 +144,10 @@ async fn cleanup_fixture(f: &Fixture) {
         .await;
 }
 
-async fn connect_and_migrate() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect database for agent skills HTTP parity tests");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    pool
-}
+
+mod common;
+use common::connect_and_migrate;
+
 
 /// #129 adapter runtime skills materialize / sync / rollback acceptance.
 #[tokio::test]
@@ -274,6 +265,97 @@ async fn agent_skills_sync_materialize_and_rollback_match_paperclip() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "cross-company sync → 403");
+
+    cleanup_fixture(&f).await;
+}
+
+/// Regression: a legacy nested `instructions` envelope must still serve reads.
+///
+/// Built-in agents materialized `{stockVersion, instructions:{entryFile,files},
+/// skill, routine}`, which made `GET /agents/:id/instructions-bundle` fail its
+/// `entryFile` validation with 400 and blanked the Instructions tab. Reads
+/// must flatten the envelope, and writes must persist the canonical flat shape.
+#[tokio::test]
+async fn instructions_bundle_reads_flatten_legacy_nested_envelope() {
+    let pool = connect_and_migrate().await;
+    let f = seed_fixture(&pool).await;
+    let state = build_app_state(pool.clone())
+        .await
+        .expect("build_app_state");
+    let app = agent_routes().with_state(state);
+    let board = board_actor(Uuid::new_v4(), f.company_a);
+    let uri = format!("/agents/{}/instructions-bundle", f.agent_a);
+
+    // The shape the built-in agent provisioner historically persisted.
+    // `AgentMetadata` serializes camelCase, so the persisted key is
+    // `instructionsBundle`.
+    sqlx::query("UPDATE agents SET metadata = $2 WHERE id = $1")
+        .bind(f.agent_a)
+        .bind(json!({
+            "instructionsBundle": {
+                "stockVersion": "1.0.0",
+                "instructions": {
+                    "entryFile": "AGENTS.md",
+                    "files": { "AGENTS.md": "# Coach\n\nReflect on the week." }
+                },
+                "skill": { "canonical_key": "parrot/bundled/reflection-coach" },
+                "routine": {}
+            }
+        }))
+        .execute(&f.pool)
+        .await
+        .expect("seed nested instructions bundle");
+
+    let (status, body) = send(&app, &board, "GET", &uri, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "nested bundle read → 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let bundle = parse(&body);
+    assert_eq!(bundle["entryFile"], "AGENTS.md");
+    let files = bundle["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1, "the nested entry file is served");
+    assert_eq!(files[0]["path"], "AGENTS.md");
+    assert_eq!(files[0]["isEntryFile"], true);
+
+    // A single-file write rewrites the stored bundle in canonical flat form
+    // and preserves the envelope siblings.
+    let (status, body) = send(
+        &app,
+        &board,
+        "PUT",
+        &format!("{uri}/file"),
+        Some(json!({ "path": "NOTES.md", "content": "note body" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bundle file save → 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let stored: Value =
+        sqlx::query_scalar("SELECT metadata->'instructionsBundle' FROM agents WHERE id = $1")
+            .bind(f.agent_a)
+            .fetch_one(&f.pool)
+            .await
+            .expect("read stored bundle");
+    assert_eq!(stored["entryFile"], "AGENTS.md", "flat entryFile persisted");
+    assert!(
+        stored.get("instructions").is_none(),
+        "legacy nested envelope is dropped, got {stored}"
+    );
+    assert!(
+        stored["files"]["NOTES.md"] == json!("note body"),
+        "write landed at the top level"
+    );
+    assert_eq!(
+        stored["stockVersion"], "1.0.0",
+        "envelope siblings survive canonicalization"
+    );
 
     cleanup_fixture(&f).await;
 }

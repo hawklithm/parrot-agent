@@ -9,12 +9,12 @@
 - **Limitation**：状态为结构性判定；`partial` 语义、`by-design-candidate` 最终清单需人工复核。
 
 - Paperclip endpoints: **606**
-- Parrot endpoints: **799**
+- Parrot endpoints: **818**
 - implemented: **605**
 - partial: **0**
 - by-design-candidate: **0**
 - missing: **1**
-- Parrot-only (extension): **194**
+- Parrot-only (extension): **213**
 
 ## 1. Implemented
 
@@ -45,7 +45,7 @@
 | `DELETE /api/decision-training/:param` | `routes/decision-training.ts:221` |
 | `DELETE /api/environments/:param` | `routes/environments.ts:1220` |
 | `DELETE /api/environments/:param/custom-image-template` | `routes/environments.ts:955` |
-| `DELETE /api/goals/:param` | `routes/goals.ts:75` |
+| `DELETE /api/goals/:param` | `routes/goals.ts:76` |
 | `DELETE /api/issues/:param` | `routes/issues.ts:10498` |
 | `DELETE /api/issues/:param/approvals/:param` | `routes/issues.ts:8027` |
 | `DELETE /api/issues/:param/comments/:param` | `routes/issues.ts:11396` |
@@ -395,7 +395,7 @@
 | `PATCH /api/decision-training/:param` | `routes/decision-training.ts:187` |
 | `PATCH /api/environments/:param` | `routes/environments.ts:1084` |
 | `PATCH /api/execution-workspaces/:param` | `routes/execution-workspaces.ts:705` |
-| `PATCH /api/goals/:param` | `routes/goals.ts:50` |
+| `PATCH /api/goals/:param` | `routes/goals.ts:51` |
 | `PATCH /api/issues/:param` | `routes/issues.ts:8943` |
 | `PATCH /api/pipelines/:param` | `routes/pipelines.ts:1171` |
 | `PATCH /api/pipelines/:param/stages/:param` | `routes/pipelines.ts:1211` |
@@ -652,6 +652,7 @@
 | `DELETE /api/comments/:param` | `issue_comments.rs` |
 | `DELETE /api/companies/:param/decision-queues/:param/items/:param/:param` | `decisions.rs` |
 | `DELETE /api/companies/:param/skills/:param/files` | `skills.rs` |
+| `DELETE /api/issues/:param/relations/:param` | `issues.rs` |
 | `DELETE /api/mcp/gateways/:param` | `tools.rs` |
 | `DELETE /api/pipelines/:param/runs/:param` | `pipelines.rs` |
 | `DELETE /api/pipelines/:param/triggers/:param` | `pipelines.rs` |
@@ -680,15 +681,18 @@
 | `GET /api/companies/:param/me/user-secrets/:param` | `user_secret_definitions.rs` |
 | `GET /api/companies/:param/me/user-secrets/:param/bindings` | `user_secret_definitions.rs` |
 | `GET /api/companies/:param/org-chart.svg` | `org_chart.rs` |
+| `GET /api/companies/:param/secret-proposals/:param` | `secret_proposals.rs` |
 | `GET /api/companies/:param/teams-catalog` | `companies.rs` |
 | `GET /api/companies/:param/user-secret-definitions/:param` | `user_secret_definitions.rs` |
 | `GET /api/goals/:param/children` | `goals.rs` |
 | `GET /api/goals/:param/hierarchy` | `goals.rs` |
 | `GET /api/goals/:param/progress` | `goals.rs` |
 | `GET /api/heartbeat-runs/:param/watchdog-decisions` | `heartbeat_runs.rs` |
+| `GET /api/instance/database-backups` | `instance_settings.rs` |
 | `GET /api/issues/:param/children` | `issues.rs` |
 | `GET /api/issues/:param/cost-tree-summary` | `costs.rs` |
 | `GET /api/issues/:param/interactions/:param` | `interactions.rs` |
+| `GET /api/issues/:param/relations` | `issues.rs` |
 | `GET /api/issues/:param/transcript` | `issues.rs` |
 | `GET /api/issues/:param/tree-holds/:param/members` | `issue_tree_control.rs` |
 | `GET /api/issues/low-trust` | `low_trust.rs` |
@@ -704,17 +708,21 @@
 | `GET /api/plugins/:param/ui/:param` | `plugins.rs` |
 | `GET /api/routines/:param/triggers` | `routines.rs` |
 | `GET /api/runs/:param` | `routines.rs` |
+| `GET /api/scheduler/jobs` | `scheduler_routes.rs` |
+| `GET /api/scheduler/jobs/:param/executions` | `scheduler_routes.rs` |
+| `GET /api/scheduler/leases` | `scheduler_routes.rs` |
 | `GET /api/secrets/:param` | `secrets.rs` |
 | `GET /api/secrets/:param/bindings` | `user_secret_definitions.rs` |
 | `GET /api/skills/catalog/files` | `skills.rs` |
 | `GET /api/stats` | `llms.rs` |
 | `GET /api/tool-gateway/mcp` | `tools.rs` |
+| `GET /api/version` | `version.rs` |
 | `PATCH /api/cases/:param/advance` | `cases.rs` |
 | `PATCH /api/cases/:param/documents/:param/annotations/:param` | `cases.rs` |
 | `PATCH /api/companies/:param/decision-retention/:param/:param` | `decisions.rs` |
 | `PATCH /api/companies/:param/me/user-secrets/:param` | `user_secret_definitions.rs` |
 | `PATCH /api/companies/:param/members/:param` | `access_control.rs` |
-| `PATCH /api/companies/:param/members/:param/permissions` | `companies.rs` |
+| `PATCH /api/companies/:param/members/:param/permissions` | `access_control.rs` |
 | `PATCH /api/companies/:param/members/:param/role-and-grants` | `access_control.rs` |
 | `PATCH /api/companies/:param/skill-test-run-templates/:param` | `skills.rs` |
 | `PATCH /api/companies/:param/skills/:param/comments/:param` | `skills.rs` |
@@ -727,8 +735,8 @@
 | `PATCH /api/issues/:param/documents/:param/annotations/:param` | `issues.rs` |
 | `PATCH /api/projects/:param/workspaces/:param` | `projects.rs` |
 | `PATCH /api/routines/:param/description/annotations/:param` | `routine_annotations.rs` |
-| `POST /api/admin/users/:param/demote-instance-admin` | `access_control.rs` |
-| `POST /api/admin/users/:param/promote-instance-admin` | `access_control.rs` |
+| `POST /api/admin/users/:param/demote-instance-admin` | `auth.rs` |
+| `POST /api/admin/users/:param/promote-instance-admin` | `auth.rs` |
 | `POST /api/agents/:param/interrupt` | `agents.rs` |
 | `POST /api/agents/:param/permissions` | `agents.rs` |
 | `POST /api/agents/:param/reset-credentials` | `agents.rs` |
@@ -738,7 +746,6 @@
 | `POST /api/auth/sign-out` | `auth.rs` |
 | `POST /api/auth/sign-up/email` | `auth.rs` |
 | `POST /api/board-api-keys` | `access_control.rs` |
-| `POST /api/board-claim/:param` | `access_control.rs` |
 | `POST /api/cases/:param/automation/retry-plan` | `cases.rs` |
 | `POST /api/cases/:param/documents/:param` | `cases.rs` |
 | `POST /api/cases/:param/documents/:param/annotations` | `cases.rs` |
@@ -785,6 +792,7 @@
 | `POST /api/companies/:param/skill-policy` | `skill_policy.rs` |
 | `POST /api/companies/:param/skill-policy/simulate` | `skill_policy.rs` |
 | `POST /api/companies/:param/skill-test-run-templates` | `skills.rs` |
+| `POST /api/companies/:param/skills` | `skills.rs` |
 | `POST /api/companies/:param/skills/:param/audit` | `skills.rs` |
 | `POST /api/companies/:param/skills/:param/comments` | `skills.rs` |
 | `POST /api/companies/:param/skills/:param/fork` | `skills.rs` |
@@ -797,6 +805,7 @@
 | `POST /api/companies/:param/summary-slots/:param/:param/generate` | `summary_slots.rs` |
 | `POST /api/companies/:param/teams/catalog/:param/install` | `teams_catalog.rs` |
 | `POST /api/companies/:param/teams/catalog/:param/preview` | `teams_catalog.rs` |
+| `POST /api/companies/:param/tools/stdio-templates/:param/disable` | `tool_access.rs` |
 | `POST /api/companies/:param/user-secret-definitions` | `user_secret_definitions.rs` |
 | `POST /api/companies/:param/watchdogs/evaluate` | `watchdogs.rs` |
 | `POST /api/environment-custom-image-setup-sessions/:param/cancel` | `environments.rs` |
@@ -806,6 +815,7 @@
 | `POST /api/environments/:param/custom-image-setup-sessions` | `environments.rs` |
 | `POST /api/goals/:param/abandon` | `goals.rs` |
 | `POST /api/goals/:param/complete` | `goals.rs` |
+| `POST /api/instance/database-backups/:param/restore` | `instance_settings.rs` |
 | `POST /api/instance/settings/experimental/issue-graph-liveness-auto-recovery/preview` | `instance_settings.rs` |
 | `POST /api/instance/settings/experimental/issue-graph-liveness-auto-recovery/run` | `instance_settings.rs` |
 | `POST /api/invites/:param/accept` | `access_control.rs` |
@@ -817,6 +827,10 @@
 | `POST /api/issues/:param/interactions/:param/answer` | `interactions.rs` |
 | `POST /api/issues/:param/interactions/:param/cancel` | `interactions.rs` |
 | `POST /api/issues/:param/interactions/:param/reject` | `interactions.rs` |
+| `POST /api/issues/:param/interactions/:param/respond` | `interactions.rs` |
+| `POST /api/issues/:param/interactions/:param/verdicts` | `interactions.rs` |
+| `POST /api/issues/:param/interactions/:param/withdraw` | `interactions.rs` |
+| `POST /api/issues/:param/relations/blocked-by` | `issues.rs` |
 | `POST /api/issues/:param/tree-holds/:param/release` | `issue_tree_control.rs` |
 | `POST /api/join-requests/:param/claim-api-key` | `auth.rs` |
 | `POST /api/pipelines/:param/runs` | `pipelines.rs` |
@@ -831,6 +845,7 @@
 | `POST /api/routines/:param/pause` | `routines.rs` |
 | `POST /api/routines/:param/resume` | `routines.rs` |
 | `POST /api/routines/:param/trigger` | `routines.rs` |
+| `POST /api/scheduler/jobs/:param/trigger` | `scheduler_routes.rs` |
 | `POST /api/tool-gateway/mcp` | `tools.rs` |
 | `PUT /api/admin/users/:param/company-access` | `auth.rs` |
 | `PUT /api/comments/:param` | `issue_comments.rs` |
@@ -838,5 +853,9 @@
 | `PUT /api/companies/:param/resource-memberships/me/agents/:param` | `resource_memberships.rs` |
 | `PUT /api/companies/:param/resource-memberships/me/projects/:param` | `resource_memberships.rs` |
 | `PUT /api/companies/:param/sidebar-preferences/me` | `sidebar_preferences.rs` |
+| `PUT /api/companies/:param/skill-policy` | `skill_policy.rs` |
 | `PUT /api/companies/:param/summary-slots/:param/:param` | `summary_slots.rs` |
+| `PUT /api/companies/:param/users/:param/inbox-agent-policy` | `automation_misc.rs` |
+| `PUT /api/companies/:param/users/me/inbox-agent-policy` | `automation_misc.rs` |
 | `PUT /api/companies/:param/watchdogs/:param/status` | `watchdogs.rs` |
+| `PUT /api/tool-connections/:param/installs` | `tool_access.rs` |

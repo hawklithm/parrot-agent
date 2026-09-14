@@ -88,7 +88,7 @@ impl<'q> sqlx::Encode<'q, sqlx::Postgres> for IssuePlanDecompositionStatus {
     fn encode_by_ref(
         &self,
         buf: &mut sqlx::postgres::PgArgumentBuffer,
-    ) -> sqlx::encode::IsNull {
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
         let s = self.to_string();
         <String as sqlx::Encode<sqlx::Postgres>>::encode(s, buf)
     }

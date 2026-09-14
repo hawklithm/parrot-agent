@@ -5,7 +5,7 @@
 //! company access enforcement (Paperclip `assertCompanyAccess`).
 //!
 //! Run with a live database, e.g.:
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile \
+//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_compile \
 //!     cargo test -p parrot-server --test skills_http_parity_test
 
 use axum::body::{to_bytes, Body};
@@ -164,19 +164,10 @@ async fn cleanup_fixture(f: &Fixture) {
         .await;
 }
 
-async fn connect_and_migrate() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@127.0.0.1:5433/parrot_agent_compile".to_string()
-    });
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect database for skills HTTP parity tests");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    pool
-}
+
+mod common;
+use common::connect_and_migrate;
+
 
 /// #124 company-skills acceptance.
 #[tokio::test]
@@ -209,6 +200,32 @@ async fn company_skills_list_detail_versions_and_authz_match_paperclip() {
     assert_eq!(skill["status"], "active", "release status");
     assert_eq!(skill["category"], "releases");
     assert_eq!(skill["installCount"], 7, "install statistics (migration 54)");
+    // The Paperclip company-skill contract fields the skills store reads.
+    // `key` and `categories` in particular are dereferenced unconditionally by
+    // `SkillCardIcon`; omitting them crashed the page.
+    assert!(
+        skill["key"]
+            .as_str()
+            .is_some_and(|k| k.starts_with("legacy/")),
+        "rows inserted without a key take migration 71's legacy default: {}",
+        skill["key"]
+    );
+    assert_eq!(skill["categories"], json!([]));
+    assert_eq!(skill["metadata"], json!({}));
+    assert_eq!(skill["sourceType"], "local_path");
+    assert_eq!(skill["trustLevel"], "markdown_only");
+    assert_eq!(skill["compatibility"], "unknown");
+    assert_eq!(skill["sharingScope"], "company");
+    assert_eq!(skill["sourceBadge"], "local", "manual skills are local");
+    assert_eq!(skill["attachedAgentCount"], 0);
+    assert!(skill["publicShareToken"].is_null());
+    assert!(skill["forkedFromSkillId"].is_null());
+    assert!(skill["iconUrl"].is_null());
+    assert_eq!(skill["forkCount"], 0, "no forks");
+    assert_eq!(skill["starCount"], 0, "no stars");
+    assert!(skill["markdown"].is_string(), "list carries markdown");
+    // Legacy slim fields must survive alongside the contract fields.
+    assert_eq!(skill["latestVersion"], "2.2.0");
 
     // 2. Detail returns the same projection.
     let (status, body) = send(
@@ -633,6 +650,30 @@ async fn create_independent_skill_persists_row_and_files() {
     assert_eq!(created["isPaperclipManaged"], false, "independent skill is not paperclip-managed");
     assert_eq!(created["tags"], json!(["lint", "ci"]), "tags persisted");
     assert_eq!(created["config"], json!({ "enabled": true }), "config persisted");
+    // The create response must already carry the full CompanySkill contract —
+    // the UI dereferences `key`/`categories`/`metadata` straight off it, and a
+    // slim projection crashed the skills store with
+    // `Cannot read properties of undefined (reading 'length')`.
+    assert_eq!(
+        created["key"],
+        format!("company/{}/{}", f.company_a, "standalone-lint"),
+        "create derives the canonical company key"
+    );
+    assert_eq!(created["categories"], json!([]));
+    assert_eq!(created["metadata"], json!({}));
+    assert_eq!(created["sourceBadge"], "local");
+    assert_eq!(
+        created["editable"], true,
+        "company-owned skills are editable"
+    );
+    assert_eq!(created["attachedAgentCount"], 0);
+    assert_eq!(created["starCount"], 0);
+    assert_eq!(created["forkCount"], 0);
+    assert_eq!(created["installCount"], 0);
+    assert!(
+        created["usedByAgents"].is_array(),
+        "list/create contract fields"
+    );
 
     // Detail read-back proves the row actually landed.
     let (status, body) = send(
@@ -662,6 +703,39 @@ async fn create_independent_skill_persists_row_and_files() {
     let files = files_body.as_array().expect("files is an array");
     assert_eq!(files.len(), 1, "one bundled file persisted");
     assert_eq!(files[0]["path"], "skill.md");
+
+    // Forking must mint a canonical company key rather than fall through to
+    // migration 71's `legacy/<uuid>` default, which would leave the fork's
+    // identity out of sync with its `forked_from_skill_id` ledger.
+    let (status, body) = send(
+        &app,
+        &board,
+        "POST",
+        &format!("/companies/{}/skills/{}/fork", f.company_a, new_id),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fork → 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let fork = parse(&body);
+    let fork_id = fork["forkedSkillId"].as_str().expect("forked id");
+    let fork_key: String = sqlx::query_scalar("SELECT key FROM company_skills WHERE id = $1")
+        .bind(Uuid::parse_str(fork_id).expect("fork id is a uuid"))
+        .fetch_one(&f.pool)
+        .await
+        .expect("read fork key");
+    assert!(
+        fork_key.starts_with(&format!("company/{}/", f.company_a)),
+        "fork derives a canonical company key, got {fork_key}"
+    );
+    assert!(
+        !fork_key.starts_with("legacy/"),
+        "fork must not take the legacy default, got {fork_key}"
+    );
 
     // Cross-company board cannot create a skill in this company.
     let outsider = session_board_actor(Uuid::new_v4(), Uuid::new_v4());

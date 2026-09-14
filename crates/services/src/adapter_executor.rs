@@ -369,11 +369,11 @@ async fn join_stream(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> 
     match task { Some(task) => task.await.unwrap_or_default(), None => Vec::new() }
 }
 
-async fn terminate_process(pid: u32, grace_seconds: u64) {
+async fn terminate_process(pid: u32, _grace_seconds: u64) {
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T"]).status().await;
-        if grace_seconds > 0 { tokio::time::sleep(Duration::from_secs(grace_seconds)).await; }
+        if _grace_seconds > 0 { tokio::time::sleep(Duration::from_secs(_grace_seconds)).await; }
     }
     kill_process(pid).await;
 }
@@ -546,9 +546,33 @@ mod http_tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0_u8; 8192];
-            let size = socket.read(&mut request).await.unwrap();
-            if status == 200 { assert!(String::from_utf8_lossy(&request[..size]).contains("agent-1")); }
+            let mut request = Vec::with_capacity(8192);
+            let mut chunk = [0_u8; 8192];
+            loop {
+                let size = socket.read(&mut chunk).await.unwrap();
+                if size == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..size]);
+
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let content_length = String::from_utf8_lossy(&request[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length:")
+                            .or_else(|| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            if status == 200 {
+                assert!(String::from_utf8_lossy(&request).contains("agent-1"));
+            }
             tokio::time::sleep(delay).await;
             let response = format!("HTTP/1.1 {} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", status, body.len(), body);
             let _ = socket.write_all(response.as_bytes()).await;

@@ -26,6 +26,14 @@ pub struct AgentApiKey {
     pub revoked_at: Option<DateTime<Utc>>,
     /// 创建时间
     pub created_at: DateTime<Utc>,
+    /// Responsible human user for this key.
+    ///
+    /// Mirrors Paperclip `agent_api_keys.responsible_user_id`
+    /// (`packages/db/src/schema/agent_api_keys.ts:14`). Parrot previously read
+    /// `agents.reports_to` for this — but that column references `agents(id)`,
+    /// so an agent id was being used as a user id.
+    #[sqlx(default)]
+    pub responsible_user_id: Option<Uuid>,
 }
 
 impl AgentApiKey {

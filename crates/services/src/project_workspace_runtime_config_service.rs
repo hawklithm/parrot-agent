@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 /// 项目workspace运行时配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectWorkspaceRuntimeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_runtime: Option<HashMap<String, serde_json::Value>>,

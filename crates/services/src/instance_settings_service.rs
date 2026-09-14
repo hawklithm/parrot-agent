@@ -920,6 +920,7 @@ fn safe_database_target_label(connection_string: &str) -> String {
     }
 }
 
+#[cfg(test)]
 async fn prune_database_backups(directory: &Path, retention_days: u64) -> std::io::Result<u32> {
     prune_database_backups_with_policy(
         directory,

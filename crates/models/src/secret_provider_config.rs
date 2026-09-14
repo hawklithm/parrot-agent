@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Secret provider type enum (aws_secrets_manager, gcp_secret_manager, vault, local_encrypted)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Secret provider identifier (`SECRET_PROVIDERS`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretProvider {
     LocalEncrypted,
@@ -12,8 +12,34 @@ pub enum SecretProvider {
     Vault,
 }
 
-/// Provider configuration status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl SecretProvider {
+    /// Canonical wire/DB string. Matches the `provider` column values.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LocalEncrypted => "local_encrypted",
+            Self::AwsSecretsManager => "aws_secrets_manager",
+            Self::GcpSecretManager => "gcp_secret_manager",
+            Self::Vault => "vault",
+        }
+    }
+
+    /// Registry order, mirroring Paperclip's `provider-registry.ts`.
+    pub const ALL: [SecretProvider; 4] = [
+        SecretProvider::LocalEncrypted,
+        SecretProvider::AwsSecretsManager,
+        SecretProvider::GcpSecretManager,
+        SecretProvider::Vault,
+    ];
+}
+
+impl std::fmt::Display for SecretProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Provider configuration status (`SECRET_PROVIDER_CONFIG_STATUSES`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretProviderConfigStatus {
     Ready,
@@ -22,8 +48,24 @@ pub enum SecretProviderConfigStatus {
     Disabled,
 }
 
-/// Provider configuration health status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl SecretProviderConfigStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Warning => "warning",
+            Self::ComingSoon => "coming_soon",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// A vault in one of these states can never be the company default.
+    pub fn blocks_default(&self) -> bool {
+        matches!(self, Self::ComingSoon | Self::Disabled)
+    }
+}
+
+/// Per-config health status (`SECRET_PROVIDER_CONFIG_HEALTH_STATUSES`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretProviderConfigHealthStatus {
     Ready,
@@ -33,79 +75,72 @@ pub enum SecretProviderConfigHealthStatus {
     Disabled,
 }
 
-/// Local encrypted provider configuration
+/// Health status reported by a provider module (not a stored config).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretProviderHealthStatus {
+    Ok,
+    Warn,
+    Error,
+}
+
+/// Deployment-level health check for one provider module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LocalEncryptedProviderConfig {
+pub struct SecretProviderHealthCheck {
+    pub provider: SecretProvider,
+    pub status: SecretProviderHealthStatus,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_guidance: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backup_reminder_acknowledged: Option<bool>,
+    pub details: Option<serde_json::Value>,
 }
 
-/// AWS Secrets Manager provider configuration
+/// `GET /companies/:companyId/secret-providers/health` response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretProviderHealthResponse {
+    pub providers: Vec<SecretProviderHealthCheck>,
+}
+
+/// Static capability descriptor for one provider module.
+///
+/// `GET /companies/:companyId/secret-providers` returns these verbatim, so the
+/// field set mirrors Paperclip's `SecretProviderDescriptor`
+/// (`packages/shared/src/types/secrets.ts`). `configured` is not stored state:
+/// it reports whether the *deployment* is ready to serve the provider, which is
+/// why only `aws_secrets_manager` computes it from the environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AwsSecretsManagerProviderConfig {
-    pub region: String,
-    pub endpoint: String,
-    pub deployment_id: String,
-    pub prefix: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kms_key_id: Option<String>,
-    pub environment_tag: String,
-    pub provider_owner_tag: String,
-    #[serde(default = "default_recovery_window")]
-    pub delete_recovery_window_days: i32,
+pub struct SecretProviderDescriptor {
+    pub id: SecretProvider,
+    pub label: String,
+    pub requires_external_ref: bool,
+    pub supports_managed_values: bool,
+    pub supports_external_references: bool,
+    pub supports_external_value_writes: bool,
+    pub configured: bool,
 }
 
-fn default_recovery_window() -> i32 {
-    30
-}
-
-/// GCP Secret Manager provider configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GcpSecretManagerProviderConfig {
-    pub project_id: String,
-    pub service_account_email: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub secret_path_prefix: Option<String>,
-}
-
-/// Vault provider configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VaultProviderConfig {
-    pub address: String,
-    pub mount_path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub secret_path_prefix: Option<String>,
-}
-
-/// Union type for provider-specific configurations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SecretProviderConfigPayload {
-    LocalEncrypted(LocalEncryptedProviderConfig),
-    AwsSecretsManager(AwsSecretsManagerProviderConfig),
-    GcpSecretManager(GcpSecretManagerProviderConfig),
-    Vault(VaultProviderConfig),
-}
-
-/// Health check details
+/// Health check details block on a stored configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretProviderConfigHealthDetails {
     pub code: String,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub missing_fields: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub guidance: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guidance: Vec<String>,
 }
 
-/// Company secret provider configuration
+/// Stored provider configuration as returned by the API.
+///
+/// `config` is echoed back exactly as persisted; it is not re-typed into a
+/// provider-specific struct so that unknown-but-permitted keys survive a
+/// read/write round trip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompanySecretProviderConfig {
@@ -115,49 +150,58 @@ pub struct CompanySecretProviderConfig {
     pub display_name: String,
     pub status: SecretProviderConfigStatus,
     pub is_default: bool,
-    pub config: SecretProviderConfigPayload,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: serde_json::Value,
     pub health_status: Option<SecretProviderConfigHealthStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub health_checked_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub health_message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub health_details: Option<SecretProviderConfigHealthDetails>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by_agent_id: Option<Uuid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_by_user_id: Option<Uuid>,
+    pub created_by_user_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// Request to create a new provider configuration
+/// `POST /companies/:companyId/secret-provider-configs` request body.
+///
+/// Field names mirror Paperclip's `createSecretProviderConfigSchema`
+/// verbatim — notably `isDefault`, not `setAsDefault`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSecretProviderConfigRequest {
     pub provider: SecretProvider,
     pub display_name: String,
-    pub config: SecretProviderConfigPayload,
-    #[serde(default)]
-    pub set_as_default: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SecretProviderConfigStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
+    /// Paperclip's schema applies `.default({})`, so an absent `config` must
+    /// behave exactly like an explicit `{}`. `serde_json::Value`'s own default
+    /// is `Null`, which no provider schema accepts.
+    #[serde(default = "empty_object")]
+    pub config: serde_json::Value,
 }
 
-/// Request to update an existing provider configuration
+/// Serde default for a provider `config` field: Paperclip's `.default({})`.
+pub fn empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// `PATCH /secret-provider-configs/:id` request body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSecretProviderConfigRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config: Option<SecretProviderConfigPayload>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<SecretProviderConfigStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
 }
 
-/// Health check response
+/// `POST /secret-provider-configs/:id/health` response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretProviderConfigHealthResponse {
@@ -173,15 +217,10 @@ pub struct SecretProviderConfigHealthResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretProviderConfigDiscoverySignal {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_name_prefix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub environment_tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub kms_key_id: Option<String>,
     pub has_kms_key: bool,
     pub sample_count: usize,
@@ -204,7 +243,7 @@ pub struct SecretProviderConfigDiscoverySample {
 pub struct SecretProviderConfigDiscoveryCandidate {
     pub provider: SecretProvider,
     pub display_name: String,
-    pub config: SecretProviderConfigPayload,
+    pub config: serde_json::Value,
     pub sample_count: usize,
     pub samples: Vec<SecretProviderConfigDiscoverySample>,
     pub signals: SecretProviderConfigDiscoverySignal,
@@ -216,15 +255,15 @@ pub struct SecretProviderConfigDiscoveryCandidate {
 #[serde(rename_all = "camelCase")]
 pub struct SecretProviderConfigDiscoveryPreviewRequest {
     pub provider: SecretProvider,
-    pub config: SecretProviderConfigPayload,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Same `.default({})` contract as the create body.
+    #[serde(default = "empty_object")]
+    pub config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
-    #[serde(default = "default_max_results")]
-    pub max_results: usize,
-}
-
-fn default_max_results() -> usize {
-    100
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
 }
 
 /// Discovery preview result
@@ -232,7 +271,7 @@ fn default_max_results() -> usize {
 #[serde(rename_all = "camelCase")]
 pub struct SecretProviderConfigDiscoveryPreviewResult {
     pub provider: SecretProvider,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
     pub sampled_secret_count: usize,
     pub skipped_foreign_paperclip_sample_count: usize,

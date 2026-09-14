@@ -9,7 +9,7 @@ Rust implementation of Paperclip's agent orchestration backend. Built with Axum,
 ```
 parrot-agent/
 ├── Cargo.toml                  # Workspace root configuration
-├── migrations/                 # SQL migration files (83 files)
+├── migrations/                 # SQL migration files (89 files)
 ├── docker-compose.yml          # PostgreSQL + application container
 ├── adapters/                   # Default adapter JSON configs (claude-local.json)
 ├── docs/                       # E2E test cases & database reset docs
@@ -77,7 +77,7 @@ docker compose -f docker-compose.yml up -d postgres
 createdb parrot_agent_dev
 
 # Configure environment variable
-export DATABASE_URL=postgres://postgres:postgres@localhost:5433/parrot_agent_dev
+export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_dev
 ```
 
 ### 2. Configure Environment Variables
@@ -86,7 +86,7 @@ Edit the `.env` file:
 
 ```bash
 # Database connection (match your postgres port)
-DATABASE_URL=postgres://postgres:postgres@localhost:5433/parrot_agent_dev
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_dev
 
 # Deployment mode
 DEPLOYMENT_MODE=local_trusted
@@ -179,14 +179,43 @@ cargo check --workspace
 
 ## Database Migrations
 
-The project contains 83 SQL migration files, automatically executed on server startup.
+The project contains 89 SQL migration files. Pending migrations are automatically
+executed by the server after it connects to PostgreSQL and before it starts
+listening for HTTP requests.
+
+### First-time setup with an empty database
+
+The server uses SQLx compile-time query macros (`query!`, `query_as!`, etc.).
+Those macros validate SQL against the database while `cargo run` is compiling,
+but the server's automatic migration runs later inside `main()`. Therefore a
+completely empty database must be initialized once with the standalone SQLx
+CLI before the first `cargo run`:
+
+```bash
+# Set this to the same PostgreSQL database used by the server.
+# Option B (local PostgreSQL) uses port 5432; Docker Compose users use 5433.
+export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_dev
+
+# Install the CLI once if it is not available.
+cargo install sqlx-cli --no-default-features --features postgres
+
+# Bootstrap an empty database. This does not compile the Rust workspace.
+sqlx migrate run --source migrations
+
+# From this point on, pending migrations run automatically at server startup.
+cargo run -p parrot-server
+```
+
+Do not use `cargo run -p parrot-server --bin apply_migration` as the normal
+bootstrap command; that utility contains targeted/destructive repair logic and
+is not the same as the complete migration runner.
 
 ```bash
 # View migration list
 ls migrations/*.sql | wc -l
 
-# Manually run migrations
-cargo run -p parrot-server --bin apply_migration
+# Check migration status
+sqlx migrate info --source migrations
 
 # Verify migration status
 cargo run -p parrot-server --bin verify_migrations
@@ -194,15 +223,15 @@ cargo run -p parrot-server --bin verify_migrations
 
 Migration files use incremental numbering:
 - `00_init_schema_unified.sql` — Initial complete schema
-- `01_*.sql` ~ `80_*.sql` — Incremental migrations (80 files)
-- `20260818*.sql`, `20260829*.sql` — Date-stamped migrations
+- `01_*.sql` ~ `85_*.sql` — Incremental migrations (85 files)
+- `20260818*.sql`, `20260829*.sql`, `20260912*.sql` — Date-stamped migrations
 
 ## Main Dependencies
 
 | Category | Dependencies |
 |----------|-------------|
 | **Web Framework** | Axum 0.7, Tower 0.4/0.5, Tower-HTTP 0.5 |
-| **Database** | SQLx 0.7 (PostgreSQL), SeaORM 0.12 |
+| **Database** | SQLx 0.7 (PostgreSQL) — SeaORM 0.12 在 workspace 中声明但**未被任何 crate 使用** |
 | **Async Runtime** | Tokio (full features) |
 | **Serialization** | Serde, Serde JSON |
 | **UUID/Time** | UUID 1.6, Chrono 0.4 |
@@ -297,7 +326,7 @@ When creating an agent, if the database configuration is missing fields, the sys
 - **Adapter Configuration**: [adapters/README.md](adapters/README.md)
 - **E2E Test Cases**: [docs/E2E_TEST_CASES.md](docs/E2E_TEST_CASES.md)
 - **Database Reset Tools**: [docs/RESET_TOOLS.md](docs/RESET_TOOLS.md)
-- **MCP Gateway Runbook**: [docs/paperclip-mcp-runbook.md](docs/paperclip-mcp-runbook.md)
+- **MCP Gateway Runbook**: `../archive_docs_20260815_230347/paperclip-mcp-runbook.md`（已于 2026-08-15 归档）
 
 ## Troubleshooting
 
@@ -353,7 +382,7 @@ RUST_LOG=services=debug cargo run -p parrot-server
 | `crates/migrations/` | Migration runner |
 | `crates/cli/` | CLI client binary (`parrot-cli`) |
 | `crates/server/` | Server binary + 21 utility programs + 2 examples |
-| `migrations/` | 83 SQL migration files |
+| `migrations/` | 89 SQL migration files |
 | `adapters/` | Default adapter JSON configs |
 | `scripts/` | Migration & API tooling (Python, MJS, Shell) |
 | `tests/` | Server integration tests + testing guide |

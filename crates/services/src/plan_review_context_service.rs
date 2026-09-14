@@ -389,9 +389,6 @@ async fn build_from_plan_document(
             }
             let allowed = std::cmp::min(MAX_BODY_CHARS, remaining_body_chars);
             let (body, body_truncated) = truncate_text(&comment.body, allowed);
-            if body_truncated {
-                truncated = true;
-            }
             remaining_body_chars -= body.chars().count();
             included_comment_count += 1;
             comments.push(PlanReviewContextComment {
@@ -500,6 +497,7 @@ fn limits() -> PlanReviewContextLimits {
     }
 }
 
+#[cfg(test)]
 impl PlanReviewContextTotals {
     fn empty() -> Self {
         Self {

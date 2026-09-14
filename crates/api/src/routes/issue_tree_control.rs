@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{app_state::AppState, errors::ApiError, routes::{require_company_access, AccessMode}};
+use crate::extractors::IssueId;
 use models::{
     ActiveIssueTreePauseHoldGate, CreateIssueTreeHoldInput, IssueTreeControlMode, IssueTreeHold,
     IssueTreeHoldMember, IssueTreeHoldReleasePolicy, IssueTreeHoldReleasePolicyStrategy,
@@ -22,6 +23,10 @@ async fn authorized_issue_company(
     issue_id: Uuid,
     mode: AccessMode,
 ) -> Result<Uuid, ApiError> {
+    // Paperclip 的 tree-control 路由全部走 `getAccessibleResource`
+    // （`routes/issue-tree-control.ts:48,75,304,312,330,352`），因此资源不存在与
+    // 跨租户统一回 404，避免 403/404 差异泄漏其他公司的 issue id
+    // （`routes/authz.ts:123-146`）。过了这道可见性关口后再按读写模式校验成员资格。
     let company_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT company_id FROM issues WHERE id = $1",
     )
@@ -30,6 +35,9 @@ async fn authorized_issue_company(
     .await
     .map_err(|error| ApiError::InternalServerError(error.to_string()))?
     .ok_or_else(|| ApiError::NotFound(format!("Issue not found: {}", issue_id)))?;
+    if !crate::routes::has_company_access(actor, company_id) {
+        return Err(ApiError::NotFound(format!("Issue not found: {}", issue_id)));
+    }
     require_company_access(actor, company_id, mode)
         .map_err(|_| ApiError::Forbidden("Issue tree control access denied".to_string()))?;
     Ok(company_id)
@@ -110,7 +118,7 @@ impl From<TreeControlServiceError> for ApiError {
 pub async fn preview_tree_control(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
     Json(req): Json<PreviewTreeControlRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
@@ -126,7 +134,7 @@ pub async fn preview_tree_control(
 pub async fn create_tree_hold(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
     Json(req): Json<CreateTreeHoldRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Get issue to determine company_id
@@ -162,7 +170,7 @@ pub async fn create_tree_hold(
 pub async fn list_tree_holds(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
 ) -> Result<impl IntoResponse, ApiError> {
     authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
     let holds = state
@@ -177,7 +185,8 @@ pub async fn list_tree_holds(
 pub async fn get_tree_hold(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, hold_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, hold_id)): Path<(String, Uuid)>,
     ) -> Result<impl IntoResponse, ApiError> {
     authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
     let hold = state
@@ -192,7 +201,8 @@ pub async fn get_tree_hold(
 pub async fn release_tree_hold(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, hold_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, hold_id)): Path<(String, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorized_issue_company(&state, &actor, issue_id, AccessMode::Write).await?;
     let hold = state
@@ -211,7 +221,7 @@ pub async fn release_tree_hold(
 pub async fn get_pause_state(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
 ) -> Result<impl IntoResponse, ApiError> {
     authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
     let gate = state
@@ -228,7 +238,8 @@ pub async fn get_pause_state(
 pub async fn get_hold_members(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, hold_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, hold_id)): Path<(String, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorized_issue_company(&state, &actor, issue_id, AccessMode::Read).await?;
     let members = state

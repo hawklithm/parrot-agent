@@ -10,6 +10,7 @@ use crate::built_in_agent_service::{
 };
 use repositories;
 use repositories::BuiltInManagedResourceRepository;
+use crate::agent_service::instructions_snapshot;
 
 #[derive(Debug, Error)]
 pub enum BuiltInAgentError {
@@ -316,9 +317,10 @@ where
         });
         let skill_id: Uuid = sqlx::query_scalar(
             r#"INSERT INTO company_skills
-               (company_id, name, slug, description, version, config, is_paperclip_managed, status)
-               VALUES ($1, $2, $3, $4, $5, $6, TRUE, 'active')
+               (company_id, key, name, slug, description, version, config, is_paperclip_managed, status)
+               VALUES ($1, $7, $2, $3, $4, $5, $6, TRUE, 'active')
                ON CONFLICT (company_id, slug) DO UPDATE SET
+                   key = EXCLUDED.key,
                    name = EXCLUDED.name,
                    description = EXCLUDED.description,
                    version = EXCLUDED.version,
@@ -334,6 +336,7 @@ where
         .bind(&definition.short_purpose)
         .bind(&bundle.stock_version)
         .bind(config)
+        .bind(&bundle.skill.canonical_key)
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| BuiltInAgentError::RepositoryError(e.to_string()))?;
@@ -681,10 +684,14 @@ where
             .or(definition.default_budget_monthly_cents)
             .unwrap_or(0);
 
+        let id = Uuid::new_v4();
+        let url_key =
+            models::agent_url_key::derive_agent_url_key(Some(&definition.display_name), Some(id));
         let agent = models::Agent {
-            id: Uuid::new_v4(),
+            id,
             company_id,
             name: definition.display_name.clone(),
+            url_key,
             role: definition.default_role,
             status: definition.default_status.unwrap_or(models::AgentStatus::Idle),
             adapter_type,
@@ -777,13 +784,12 @@ where
                 )
             })
             .unwrap_or((serde_json::Value::Null, serde_json::Value::Null));
-        let instructions = serde_json::json!({
+        // `entryFile`/`files` 必须位于顶层（与读路径的规范形态一致）：旧的嵌套
+        // `instructions` envelope 会让 `/instructions-bundle` 校验失败。
+        let bundle = serde_json::json!({
             "entryFile": entry_file,
             "files": files,
-        });
-        let bundle = serde_json::json!({
             "stockVersion": definition.bundle.as_ref().map(|b| b.stock_version.clone()),
-            "instructions": instructions,
             "skill": skill,
             "routine": routine,
         });
@@ -929,13 +935,9 @@ where
             .ok_or(BuiltInAgentError::NotFound(key))?;
         self.materialize_bundle(&mut agent, definition).await?;
         let after_bundle = agent.metadata.0.instructions_bundle.as_ref();
-        let before_instructions = before_bundle
-            .as_ref()
-            .and_then(|bundle| bundle.get("instructions"))
-            .or_else(|| before_bundle.as_ref());
-        let after_instructions = after_bundle.and_then(|bundle| bundle.get("instructions"));
+        // 仅比较指令快照：`stockVersion` 等 envelope siblings 的变更不代表指令漂移。
         result.instructions_materialized = before_path != agent.metadata.0.instructions_path
-            || before_instructions != after_instructions;
+            || instructions_snapshot(before_bundle.as_ref()) != instructions_snapshot(after_bundle);
 
         // 同步受管资源绑定并检测/修复漂移。
         let (managed_changed, managed_changes) =

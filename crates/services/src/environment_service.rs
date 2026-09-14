@@ -364,8 +364,13 @@ mod probe_tests {
     use sqlx::postgres::PgPoolOptions;
 
     fn service() -> DefaultEnvironmentService {
+        // The pool is lazy and `probe_config` never dials the database, so the URL
+        // is a pure placeholder here; prefer DATABASE_URL when the caller set one.
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_compile".to_string()
+        });
         let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:postgres@localhost:5433/parrot_agent_compile")
+            .connect_lazy(&database_url)
             .expect("lazy pool should be constructible");
         DefaultEnvironmentService::new(Arc::new(PgEnvironmentRepository::new(pool)))
     }

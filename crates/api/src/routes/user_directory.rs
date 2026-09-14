@@ -5,15 +5,16 @@ use axum::{
     response::{IntoResponse, Response},
     Json, Router,
 };
-use models::UserDirectoryQuery;
+use models::AdminUserDirectoryQuery;
 use services::auth::AuthorizationActor;
 use uuid::Uuid;
 
 /// GET /companies/:companyId/user-directory
-/// List company user directory with search/pagination
+///
+/// Paperclip（`access.ts:4465-4470`）不接收任何查询参数，直接返回
+/// `{ users }`（全部活跃用户成员，按成员更新时间倒序）。
 pub async fn list_company_user_directory(
     Path(company_id): Path<Uuid>,
-    Query(query): Query<UserDirectoryQuery>,
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
@@ -23,7 +24,7 @@ pub async fn list_company_user_directory(
 
     match state
         .user_directory_service
-        .list_company_users(company_id, query)
+        .list_company_users(company_id)
         .await
     {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -38,10 +39,13 @@ pub async fn list_company_user_directory(
     }
 }
 
-/// GET /api/admin/users
-/// List instance admin user directory with search filtering
+/// GET /admin/users
+///
+/// Paperclip（`access.ts:4783-4841`）返回**裸数组**，前端
+/// `parrot-web-ui/src/api/access.ts:402` 亦声明为数组并用
+/// `.find()` / `[0]` 取值，故此处同样返回数组而非 `{users,total}`。
 pub async fn list_admin_user_directory(
-    Query(query): Query<UserDirectoryQuery>,
+    Query(query): Query<AdminUserDirectoryQuery>,
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
 ) -> Response {
@@ -50,7 +54,7 @@ pub async fn list_admin_user_directory(
     }
 
     match state.user_directory_service.list_admin_users(query).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => (StatusCode::OK, Json(response.users)).into_response(),
         Err(e) => {
             let status = match e {
                 services::errors::ServiceError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -69,8 +73,5 @@ pub fn user_directory_routes() -> Router<AppState> {
             "/companies/:companyId/user-directory",
             axum::routing::get(list_company_user_directory),
         )
-        .route(
-            "/api/admin/users",
-            axum::routing::get(list_admin_user_directory),
-        )
+        .route("/admin/users", axum::routing::get(list_admin_user_directory))
 }

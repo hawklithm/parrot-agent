@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use sqlx::Type;
 use uuid::Uuid;
 
@@ -71,35 +70,6 @@ pub enum SecretProviderType {
     Vault,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct SecretProviderConfig {
-    pub id: Uuid,
-    pub company_id: Uuid,
-    pub provider_type: SecretProviderType,
-    pub name: String,
-    pub config: JsonValue,
-    pub is_default: bool,
-    pub status: SecretStatus,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateSecretProviderConfigInput {
-    pub company_id: Uuid,
-    pub provider_type: SecretProviderType,
-    pub name: String,
-    pub config: JsonValue,
-    pub is_default: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateSecretProviderConfigInput {
-    pub name: Option<String>,
-    pub config: Option<JsonValue>,
-    pub is_default: Option<bool>,
-    pub status: Option<SecretStatus>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct UserSecretDefinition {
@@ -183,21 +153,4 @@ pub enum SecretBindingTargetType {
     Environment,
     Project,
     Routine,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderHealthStatus {
-    pub provider_id: Uuid,
-    pub status: HealthStatus,
-    pub message: Option<String>,
-    pub checked_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum HealthStatus {
-    Healthy,
-    Degraded,
-    Unhealthy,
-    Unknown,
 }

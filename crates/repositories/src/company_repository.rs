@@ -2,6 +2,13 @@ use models::{Company, CompanyMembership, CompanyStats, CreateCompanyInput, Updat
 use sqlx::{PgPool, Result};
 use uuid::Uuid;
 
+/// SQLSTATE `23505`: unique constraint violation.
+const SQLSTATE_UNIQUE_VIOLATION: &str = "23505";
+
+/// Unique constraint backing the per-company issue prefix (see
+/// `migrations/00_init_schema_unified.sql`, `UNIQUE(issue_prefix)`).
+const ISSUE_PREFIX_CONSTRAINT: &str = "companies_issue_prefix_key";
+
 #[derive(Clone)]
 pub struct CompanyRepository {
     pub pool: PgPool,
@@ -103,14 +110,18 @@ impl CompanyRepository {
         }
     }
 
+    /// Whether a failed insert lost the race for the `issue_prefix` unique
+    /// constraint, meaning the caller should advance to the next candidate.
+    ///
+    /// Matched on the structured error (SQLSTATE + constraint name) rather than
+    /// message text so a collision cannot be mistaken for an unrelated failure:
+    /// any other error must propagate instead of being retried 10000 times.
     fn is_issue_prefix_conflict(error: &sqlx::Error) -> bool {
-        if let sqlx::Error::Database(db_err) = error {
-            let message = db_err.message();
-            // Check for PostgreSQL unique constraint violation on issue_prefix
-            return message.contains("companies_issue_prefix_key") 
-                || message.contains("duplicate key value");
-        }
-        false
+        let sqlx::Error::Database(db_err) = error else {
+            return false;
+        };
+        db_err.code().as_deref() == Some(SQLSTATE_UNIQUE_VIOLATION)
+            && db_err.constraint() == Some(ISSUE_PREFIX_CONSTRAINT)
     }
 
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<Company>> {

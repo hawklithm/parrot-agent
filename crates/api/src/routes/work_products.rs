@@ -7,6 +7,7 @@
 
 use crate::app_state::AppState;
 use crate::errors::AppError;
+use crate::extractors::IssueId;
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
@@ -133,7 +134,7 @@ fn forbidden(_: StatusCode) -> AppError {
 async fn list_work_products(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
 ) -> Result<Json<Vec<WorkProduct>>, AppError> {
     let company_id = get_company_id_for_issue(&state, id).await?;
     require_company_access(&actor, company_id, WorkProductOp::List.access()).map_err(forbidden)?;
@@ -150,7 +151,7 @@ async fn list_work_products(
 async fn create_work_product(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(id): Path<Uuid>,
+    IssueId(id): IssueId,
     Json(mut input): Json<CreateWorkProductInput>,
 ) -> Result<(StatusCode, Json<WorkProduct>), AppError> {
     let company_id = get_company_id_for_issue(&state, id).await?;

@@ -332,7 +332,7 @@ async fn add_approval_comment(
         .and_then(|v| v.as_str())
         .filter(|v| !v.trim().is_empty())
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let (author_user_id, author_agent_id) = match actor {
+    let (author_user_id, _author_agent_id) = match actor {
         AuthorizationActor::Board { user_id, .. } => (Some(user_id), None),
         AuthorizationActor::Agent { agent_id, .. } => (None, Some(agent_id)),
         AuthorizationActor::None => return Err(StatusCode::FORBIDDEN),

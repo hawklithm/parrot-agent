@@ -50,12 +50,10 @@ async fn send(
     (status, value)
 }
 
-async fn migrate(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 struct Fixture {
     pool: PgPool,

@@ -312,7 +312,10 @@ fn model_options(models: &[ModelInfo]) -> Vec<serde_json::Value> {
 
 fn local_engine_options(supports_acp: bool) -> Vec<serde_json::Value> {
     let mut options = vec![
-        serde_json::json!({ "value": "auto", "label": "Auto (CLI)" }),
+        serde_json::json!({
+            "value": "auto",
+            "label": if supports_acp { "Auto (ACP preferred)" } else { "Auto (CLI)" }
+        }),
         serde_json::json!({ "value": "cli", "label": "Local CLI" }),
     ];
     if supports_acp {
@@ -648,7 +651,7 @@ not advertised until a server-side ACP executor is enabled.\n",
     }
 
     fn supports_acp(&self) -> bool {
-        true
+        false
     }
 
     fn requires_materialized_runtime_skills(&self) -> bool {
@@ -1099,7 +1102,7 @@ mod tests {
         assert!(claude.supports_skills());
         assert!(claude.supports_local_agent_jwt());
         assert!(claude.supports_model_profiles());
-        assert!(claude.supports_acp());
+        assert!(!claude.supports_acp());
         assert!(!claude.requires_materialized_runtime_skills());
 
         let codex = CodexLocalAdapter::new();

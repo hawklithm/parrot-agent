@@ -148,7 +148,7 @@ impl ExportService for DefaultCompanyPortabilityService {
                     "id": id,
                     "name": r.get::<String, _>("name"),
                     "issuePrefix": r.get::<String, _>("issue_prefix"),
-                    "budgetMonthlyCents": r.get::<i64, _>("budget_monthly_cents"),
+                    "budgetMonthlyCents": r.get::<Option<i64>, _>("budget_monthly_cents"),
                     "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
                 })
             })

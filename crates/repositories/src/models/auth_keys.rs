@@ -156,96 +156,47 @@ impl AgentApiKey {
 
 /// CLI认证挑战表 - cli_auth_challenges
 ///
-/// 存储CLI认证流程的挑战码，支持设备授权流程
+/// 对齐 Paperclip 设备授权流程：服务端只保存挑战 secret 与待生效 Board token 的哈希，
+/// 两者的明文仅在创建时返回一次。
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct CliAuthChallenge {
     pub id: Uuid,
-    pub user_id: Uuid,
-    pub company_id: Option<Uuid>,
-    pub challenge_code: String,
-    pub device_name: Option<String>,
-    pub requested_access: sqlx::types::JsonValue,
-    pub status: String,
-    pub approved_at: Option<DateTime<Utc>>,
+    pub secret_hash: String,
+    pub command: String,
+    pub client_name: Option<String>,
+    pub requested_access: String,
+    pub requested_company_id: Option<Uuid>,
+    pub pending_key_hash: String,
+    pub pending_key_name: String,
     pub approved_by_user_id: Option<Uuid>,
-    pub api_key_id: Option<Uuid>,
+    pub board_api_key_id: Option<Uuid>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl CliAuthChallenge {
-    /// 创建新的CLI认证挑战
-    pub fn new(
-        user_id: Uuid,
-        company_id: Option<Uuid>,
-        challenge_code: String,
-        device_name: Option<String>,
-        requested_access: sqlx::types::JsonValue,
-        ttl_seconds: i64,
-    ) -> Self {
-        let now = Utc::now();
-        Self {
-            id: Uuid::new_v4(),
-            user_id,
-            company_id,
-            challenge_code,
-            device_name,
-            requested_access,
-            status: "pending".to_string(),
-            approved_at: None,
-            approved_by_user_id: None,
-            api_key_id: None,
-            expires_at: now + chrono::Duration::seconds(ttl_seconds),
-            created_at: now,
-            updated_at: now,
+    /// 派生挑战状态（对齐 Paperclip `challengeStatusForRow`）。
+    ///
+    /// 优先级：`cancelled` > `expired` > `approved` > `pending`。
+    /// 其中 `approved` 要求 `approved_at` 与 `board_api_key_id` 同时存在。
+    pub fn status(&self) -> &'static str {
+        if self.cancelled_at.is_some() {
+            "cancelled"
+        } else if self.is_expired() {
+            "expired"
+        } else if self.approved_at.is_some() && self.board_api_key_id.is_some() {
+            "approved"
+        } else {
+            "pending"
         }
     }
 
-    /// 生成挑战码（8位随机字符）
-    pub fn generate_challenge_code() -> String {
-        use rand::Rng;
-        const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        let mut rng = rand::thread_rng();
-        (0..8)
-            .map(|_| {
-                let idx = rng.gen_range(0..CHARSET.len());
-                CHARSET[idx] as char
-            })
-            .collect()
-    }
-
-    /// 检查挑战是否已过期
+    /// 检查挑战是否已过期（对齐 Paperclip `expiresAt <= now`）。
     pub fn is_expired(&self) -> bool {
-        Utc::now() > self.expires_at
-    }
-
-    /// 检查挑战状态
-    pub fn is_pending(&self) -> bool {
-        self.status == "pending"
-    }
-
-    pub fn is_approved(&self) -> bool {
-        self.status == "approved"
-    }
-
-    pub fn is_rejected(&self) -> bool {
-        self.status == "rejected"
-    }
-
-    /// 批准挑战
-    pub fn approve(&mut self, approved_by_user_id: Uuid, api_key_id: Uuid) {
-        self.status = "approved".to_string();
-        self.approved_at = Some(Utc::now());
-        self.approved_by_user_id = Some(approved_by_user_id);
-        self.api_key_id = Some(api_key_id);
-        self.updated_at = Utc::now();
-    }
-
-    /// 拒绝挑战
-    pub fn reject(&mut self) {
-        self.status = "rejected".to_string();
-        self.updated_at = Utc::now();
+        Utc::now() >= self.expires_at
     }
 }
 
@@ -308,32 +259,58 @@ mod tests {
         assert!(!key.is_expired());
     }
 
-    #[test]
-    fn test_cli_auth_challenge_generation() {
-        let code = CliAuthChallenge::generate_challenge_code();
-        assert_eq!(code.len(), 8);
-        assert!(code.chars().all(|c| c.is_alphanumeric()));
+    fn cli_challenge_with(expires_at: DateTime<Utc>) -> CliAuthChallenge {
+        let now = Utc::now();
+        CliAuthChallenge {
+            id: Uuid::new_v4(),
+            secret_hash: "secret_hash".to_string(),
+            command: "paperclipai company import".to_string(),
+            client_name: None,
+            requested_access: "board".to_string(),
+            requested_company_id: None,
+            pending_key_hash: "pending_key_hash".to_string(),
+            pending_key_name: "paperclipai cli (board)".to_string(),
+            approved_by_user_id: None,
+            board_api_key_id: None,
+            approved_at: None,
+            cancelled_at: None,
+            expires_at,
+            created_at: now,
+            updated_at: now,
+        }
     }
 
     #[test]
-    fn test_cli_auth_challenge_approval() {
-        let user_id = Uuid::new_v4();
-        let mut challenge = CliAuthChallenge::new(
-            user_id,
-            None,
-            "ABCD1234".to_string(),
-            Some("My Device".to_string()),
-            serde_json::json!({}),
-            300,
-        );
+    fn test_cli_auth_challenge_status_derivation() {
+        let future = Utc::now() + chrono::Duration::minutes(10);
+        let past = Utc::now() - chrono::Duration::minutes(1);
 
-        assert!(challenge.is_pending());
+        assert_eq!(cli_challenge_with(future).status(), "pending");
+        assert_eq!(cli_challenge_with(past).status(), "expired");
 
-        let approver_id = Uuid::new_v4();
-        let api_key_id = Uuid::new_v4();
-        challenge.approve(approver_id, api_key_id);
+        let mut approved = cli_challenge_with(future);
+        approved.approved_at = Some(Utc::now());
+        approved.board_api_key_id = Some(Uuid::new_v4());
+        assert_eq!(approved.status(), "approved");
 
-        assert!(challenge.is_approved());
-        assert_eq!(challenge.api_key_id, Some(api_key_id));
+        // approved_at 存在但缺少 board_api_key_id → 仍为 pending（对齐 Paperclip）
+        let mut half_approved = cli_challenge_with(future);
+        half_approved.approved_at = Some(Utc::now());
+        assert_eq!(half_approved.status(), "pending");
+
+        let mut cancelled = cli_challenge_with(future);
+        cancelled.cancelled_at = Some(Utc::now());
+        assert_eq!(cancelled.status(), "cancelled");
+
+        // 优先级：cancelled 覆盖 approved，也覆盖 expired
+        let mut cancelled_after_approval = cli_challenge_with(future);
+        cancelled_after_approval.approved_at = Some(Utc::now());
+        cancelled_after_approval.board_api_key_id = Some(Uuid::new_v4());
+        cancelled_after_approval.cancelled_at = Some(Utc::now());
+        assert_eq!(cancelled_after_approval.status(), "cancelled");
+
+        let mut cancelled_when_expired = cli_challenge_with(past);
+        cancelled_when_expired.cancelled_at = Some(Utc::now());
+        assert_eq!(cancelled_when_expired.status(), "cancelled");
     }
 }

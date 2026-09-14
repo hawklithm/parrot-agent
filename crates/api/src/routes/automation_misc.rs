@@ -1,10 +1,10 @@
 //! 自动化与杂项补齐域：issues watchdog/comments、cases claim/release/transition、
-//! companies 审计/导出/恢复可观测/search/inbox 策略/import、board-claim、cloud stacks、
+//! companies 审计/导出/恢复可观测/search/inbox 策略/import、cloud stacks、
 //! environments leases/secret-refs、health、skills catalog files、pipelines、projects
 //! runtime、_plugins ui-static、import preview。全部对齐 Paperclip 对应 route 文件。
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{rejection::JsonRejection, Extension, Path, State},
     http::StatusCode,
     routing::{delete, get, patch, post},
     Json, Router,
@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::extractors::IssueId;
 use crate::routes::{log_activity, require_company_access, AccessMode};
 use services::auth::{
     ActorSource, AuthorizationAction, AuthorizationActor, AuthorizationService, PermissionKey,
@@ -110,7 +111,7 @@ mod environment_secret_ref_tests {
 async fn get_issue_watchdog(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sqlx::Row;
     let row = sqlx::query(
@@ -148,7 +149,7 @@ struct UpsertWatchdogRequest {
 async fn upsert_issue_watchdog(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
     Json(request): Json<UpsertWatchdogRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sqlx::Row;
@@ -202,7 +203,7 @@ async fn upsert_issue_watchdog(
 async fn delete_issue_watchdog(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path(issue_id): Path<Uuid>,
+    IssueId(issue_id): IssueId,
 ) -> Result<StatusCode, StatusCode> {
     use sqlx::Row;
     let row = sqlx::query(
@@ -236,7 +237,8 @@ async fn delete_issue_watchdog(
 async fn delete_issue_comment(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
-    Path((issue_id, comment_id)): Path<(Uuid, Uuid)>,
+    IssueId(issue_id): IssueId,
+    Path((_, comment_id)): Path<(String, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     
     let row = sqlx::query_scalar::<_, Option<Uuid>>(
@@ -543,63 +545,149 @@ async fn company_search_extract(
     ))
 }
 
-/// GET /companies/:company_id/users/me/inbox-agent-policy（及 /users/:user_id/...）
+/// GET `/companies/:company_id/users/me/inbox-agent-policy`。
+///
+/// 对齐 Paperclip `routes/inbox-agent-policy.ts:68-72`：只有
+/// `assertCompanyAccess` 与 `selfUserId`，**没有** `assertActiveUserMembership`
+/// ——目标用户的 active membership 仅 `/:userId` 两条路由校验。
 async fn company_inbox_agent_policy(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<Value>)> {
+    require_company_access(&actor, company_id, AccessMode::Read)
+        .map_err(|_| company_access_denied(&actor))?;
     let user_id = board_user_id(&actor)?;
-    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| StatusCode::FORBIDDEN)?;
     get_user_inbox_agent_policy(&state, company_id, user_id).await
 }
 
-fn board_user_id(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
+/// `assertCompanyAccess`（`routes/authz.ts:75-121`）的拒绝体：匿名主体先经
+/// `assertAuthenticated` 拿到 401，其余情况是 403。
+fn company_access_denied(actor: &AuthorizationActor) -> (StatusCode, Json<Value>) {
+    if actor.is_anonymous() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Unauthorized" })),
+        );
+    }
+    let message = match actor {
+        AuthorizationActor::Agent { .. } => "Agent key cannot access another company",
+        _ => "User does not have access to this company",
+    };
+    (StatusCode::FORBIDDEN, Json(json!({ "error": message })))
+}
+
+/// Paperclip `selfUserId`（`routes/inbox-agent-policy.ts:14-17`）：`/users/me/...`
+/// 两条路由只接受 board 主体，其余一律 **401**。
+fn board_user_id(actor: &AuthorizationActor) -> Result<Uuid, (StatusCode, Json<Value>)> {
     match actor {
         AuthorizationActor::Board { user_id, .. } => Ok(*user_id),
-        _ => Err(StatusCode::FORBIDDEN),
+        _ => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Board user context required" })),
+        )),
     }
 }
 
-fn can_manage_inbox_agent_policy(actor: &AuthorizationActor, company_id: Uuid) -> bool {
-    if actor.is_instance_admin()
-        || actor.role_in(company_id).is_some_and(|role| role.can_manage_members())
-        || matches!(
-            actor,
-            AuthorizationActor::Board {
-                source: ActorSource::LocalImplicit,
-                ..
-            }
-        )
-    {
-        return true;
-    }
+/// Paperclip `access.hasPermission(...)` 最终落到
+/// `authorization.decidePrincipalGrant`（`services/authorization.ts:648-705`）：
+/// 放行条件是「active membership + 该权限的 grant 行」，**角色本身不构成授权**。
+/// 其中 `scopeAllows`（`:368-451`）在 grant 带非空 scope 而请求未带 scope 时
+/// 一律 `deny_scope`，因此 `users:manage_permissions` 只认空 scope 的 grant。
+async fn has_unscoped_grant(
+    state: &AppState,
+    company_id: Uuid,
+    principal_type: &str,
+    principal_id: Uuid,
+    permission_key: &str,
+) -> Result<bool, (StatusCode, Json<Value>)> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM principal_permission_grants \
+         WHERE company_id = $1 AND principal_type = $2::principal_type \
+         AND principal_id = $3 AND permission_key = $4 AND scope = '{}'::jsonb)",
+    )
+    .bind(company_id)
+    .bind(principal_type)
+    .bind(principal_id)
+    .bind(permission_key)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| database_error())
+}
 
-    match actor {
-        AuthorizationActor::Agent {
-            key_scope,
-            on_behalf_of_memberships,
+/// Paperclip `assertAdmin`（`routes/inbox-agent-policy.ts:19-35`）。
+///
+/// `assertCompanyAccess` 之后，board 侧只认 `local_implicit`、实例管理员，
+/// 或该用户自己的 `users:manage_permissions` grant 行；agent 侧只认 agent
+/// 主体的 grant 行。**公司 Admin 与 Owner 的角色本身都不构成授权**：
+/// Paperclip 的 `grantsForHumanRole`（`services/company-member-roles.ts:1-48`）
+/// 只给 owner 预置该权限、admin 明确不给，且 `authorization.ts:1682-1814` 里
+/// 那条 `allow_simple_company_member` 快捷路径嵌套在 `tasks:assign` 分支内，
+/// 不会短路本权限。
+async fn assert_inbox_agent_policy_admin(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    mode: AccessMode,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    require_company_access(actor, company_id, mode).map_err(|_| company_access_denied(actor))?;
+
+    let permitted = match actor {
+        AuthorizationActor::Board {
+            user_id,
+            source,
+            is_instance_admin,
             ..
         } => {
-            let delegated_role = on_behalf_of_memberships.iter().any(|membership| {
-                membership.company_id == company_id
-                    && membership.status.is_active()
-                    && membership.role.can_manage_members()
-            });
-            let delegated_key = key_scope.as_ref().is_some_and(|scope| {
-                scope.can_perform_action(PermissionKey::USERS_MANAGE_PERMISSIONS)
-            });
-            delegated_role || delegated_key
+            matches!(source, ActorSource::LocalImplicit)
+                || *is_instance_admin
+                || has_unscoped_grant(
+                    state,
+                    company_id,
+                    "user",
+                    *user_id,
+                    PermissionKey::USERS_MANAGE_PERMISSIONS,
+                )
+                .await?
         }
-        _ => false,
+        AuthorizationActor::Agent { agent_id, .. } => {
+            has_unscoped_grant(
+                state,
+                company_id,
+                "agent",
+                *agent_id,
+                PermissionKey::USERS_MANAGE_PERMISSIONS,
+            )
+            .await?
+        }
+        AuthorizationActor::None => false,
+    };
+    if permitted {
+        return Ok(());
     }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "Inbox agent policy administration authority required",
+            "code": "inbox_agent_policy_admin_required",
+            "details": { "code": "inbox_agent_policy_admin_required" },
+        })),
+    ))
+}
+
+/// Parrot 其余路由沿用的数据库错误体（对齐 `issues.rs:4135`）。
+fn database_error() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "database error" })),
+    )
 }
 
 async fn get_user_inbox_agent_policy(
     state: &AppState,
     company_id: Uuid,
     user_id: Uuid,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<Value>)> {
     use sqlx::Row;
     let row = sqlx::query(
         "SELECT mode, allowed_agent_ids, created_at, updated_at \
@@ -609,7 +697,7 @@ async fn get_user_inbox_agent_policy(
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| database_error())?;
     let response = match row {
         Some(row) => json!({
             "companyId": company_id,
@@ -633,11 +721,13 @@ async fn get_user_inbox_agent_policy(
     Ok(Json(response))
 }
 
+/// Paperclip `assertActiveUserMembership`（`routes/inbox-agent-policy.ts:37-42`）：
+/// 目标用户没有 active 的公司成员关系时回 404。
 async fn require_active_company_user(
     state: &AppState,
     company_id: Uuid,
     user_id: Uuid,
-) -> Result<(), StatusCode> {
+) -> Result<(), (StatusCode, Json<Value>)> {
     let active = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM company_memberships \
          WHERE company_id = $1 AND principal_type = 'user' AND principal_id = $2 AND status = 'active')",
@@ -646,37 +736,85 @@ async fn require_active_company_user(
     .bind(user_id)
     .fetch_one(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if active { Ok(()) } else { Err(StatusCode::NOT_FOUND) }
+    .map_err(|_| database_error())?;
+    if active {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Active company user membership not found" })),
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateInboxAgentPolicyRequest {
     mode: String,
     #[serde(default, rename = "allowedAgentIds")]
     allowed_agent_ids: Vec<Uuid>,
 }
 
-async fn update_user_inbox_agent_policy(
-    State(state): State<AppState>,
-    Extension(actor): Extension<AuthorizationActor>,
-    Path((company_id, user_id)): Path<(Uuid, Uuid)>,
-    Json(request): Json<UpdateInboxAgentPolicyRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Write).map_err(|_| StatusCode::FORBIDDEN)?;
-    let self_user = board_user_id(&actor)?;
-    if user_id != self_user && !can_manage_inbox_agent_policy(&actor, company_id) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    require_active_company_user(&state, company_id, user_id).await?;
-    if request.mode != "open" && request.mode != "allowlist" {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
-    }
-    if request.mode == "open" && !request.allowed_agent_ids.is_empty() {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
-    }
+/// `Mode` 的取值集合对齐 `inboxAgentPolicyModeSchema`
+/// （`packages/shared/src/validators/inbox-agent-policy.ts:3`）。
+/// `disabled` 会关闭该用户收件箱的 agent 代管，是 Paperclip
+/// `inbox_management_disabled` 拒绝码的唯一触发条件。
+const INBOX_AGENT_POLICY_MODES: [&str; 3] = ["open", "allowlist", "disabled"];
 
-    let mut allowed_agent_ids = request.allowed_agent_ids;
+/// `updateInboxAgentPolicySchema` 是路由级 Zod 校验：`.strict()` 拒未知键、
+/// `mode` 是三元枚举、`allowedAgentIds` 上限 100 且非 allowlist 模式必须为空
+/// （`superRefine`）。`middleware/validate.ts:6` 的 `schema.parse` 抛错后由
+/// `middleware/error-handler.ts:127-131` 统一回 400。
+///
+/// 这一步必须在任何授权/存在性检查之前完成，Paperclip 的中间件顺序决定了
+/// `PUT` 的响应码优先级是 **400 → 403 → 404**。
+fn extract_update_inbox_agent_policy(
+    payload: Result<Json<UpdateInboxAgentPolicyRequest>, JsonRejection>,
+) -> Result<UpdateInboxAgentPolicyRequest, (StatusCode, Json<Value>)> {
+    let bad_request = || {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Validation error" })),
+        )
+    };
+    let Json(request) = payload.map_err(|_| bad_request())?;
+    let mode_is_known = INBOX_AGENT_POLICY_MODES.contains(&request.mode.as_str());
+    let list_overflow = request.allowed_agent_ids.len() > 100;
+    let list_requires_allowlist =
+        request.mode != "allowlist" && !request.allowed_agent_ids.is_empty();
+    if !mode_is_known || list_overflow || list_requires_allowlist {
+        return Err(bad_request());
+    }
+    Ok(request)
+}
+
+/// Paperclip `writePolicy`（`routes/inbox-agent-policy.ts:44-66`）：读旧策略、
+/// 写新策略、记录活动日志。授权与 `assertActiveUserMembership` 由调用方完成。
+async fn write_user_inbox_agent_policy(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    user_id: Uuid,
+    request: UpdateInboxAgentPolicyRequest,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<Value>)> {
+    use sqlx::Row;
+    let previous_mode = sqlx::query_scalar::<_, String>(
+        "SELECT mode FROM user_inbox_agent_policies WHERE company_id = $1 AND user_id = $2",
+    )
+    .bind(company_id)
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| database_error())?
+    .unwrap_or_else(|| "open".to_string());
+
+    // Paperclip 仅在 allowlist 模式保留 id 列表，其余模式一律清空
+    // （`services/inbox-agent-policy.ts:30`）。
+    let mut allowed_agent_ids = if request.mode == "allowlist" {
+        request.allowed_agent_ids
+    } else {
+        Vec::new()
+    };
     allowed_agent_ids.sort_unstable();
     allowed_agent_ids.dedup();
     if !allowed_agent_ids.is_empty() {
@@ -687,9 +825,27 @@ async fn update_user_inbox_agent_policy(
         .bind(&allowed_agent_ids)
         .fetch_all(&state.pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| database_error())?;
         if matching.len() != allowed_agent_ids.len() {
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            // `services/inbox-agent-policy.ts:39-42` 的 service 层
+            // `unprocessable(...)`：与上面的 400 形状错误严格区分。
+            let matched: HashSet<Uuid> = matching.into_iter().collect();
+            let invalid_agent_ids: Vec<Uuid> = allowed_agent_ids
+                .iter()
+                .copied()
+                .filter(|agent_id| !matched.contains(agent_id))
+                .collect();
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "Inbox agent policy contains agents outside the company",
+                    "code": "inbox_agent_policy_invalid_agents",
+                    "details": {
+                        "code": "inbox_agent_policy_invalid_agents",
+                        "invalidAgentIds": invalid_agent_ids,
+                    },
+                })),
+            ));
         }
     }
 
@@ -706,8 +862,7 @@ async fn update_user_inbox_agent_policy(
     .bind(&allowed_agent_ids)
     .fetch_one(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    use sqlx::Row;
+    .map_err(|_| database_error())?;
     let response = json!({
         "companyId": company_id,
         "userId": user_id,
@@ -721,41 +876,59 @@ async fn update_user_inbox_agent_policy(
         &state.pool,
         company_id,
         "inbox.agent_policy_updated",
-        &actor,
+        actor,
         "user_inbox_agent_policy",
         user_id,
-        json!({ "userId": user_id, "mode": request.mode, "allowedAgentIds": allowed_agent_ids }),
+        json!({
+            "userId": user_id,
+            "previousMode": previous_mode,
+            "mode": response["mode"],
+            "allowedAgentIds": response["allowedAgentIds"],
+        }),
     )
     .await;
     Ok(Json(response))
 }
 
+/// `PUT /companies/:company_id/users/me/inbox-agent-policy`
+/// （`routes/inbox-agent-policy.ts:74-82`）：`assertCompanyAccess` + `selfUserId`，
+/// 没有 `assertActiveUserMembership` —— 用户对自己的策略无需公司成员关系。
 async fn update_current_user_inbox_agent_policy(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(company_id): Path<Uuid>,
-    Json(request): Json<UpdateInboxAgentPolicyRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+    payload: Result<Json<UpdateInboxAgentPolicyRequest>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<Value>)> {
+    let request = extract_update_inbox_agent_policy(payload)?;
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| company_access_denied(&actor))?;
     let user_id = board_user_id(&actor)?;
-    update_user_inbox_agent_policy(
-        State(state),
-        Extension(actor),
-        Path((company_id, user_id)),
-        Json(request),
-    )
-    .await
+    write_user_inbox_agent_policy(&state, &actor, company_id, user_id, request).await
+}
+
+/// `PUT /companies/:company_id/users/:user_id/inbox-agent-policy`
+/// （`routes/inbox-agent-policy.ts:92-102`）。`/:userId` 路径**没有**自我豁免：
+/// 即便是本人，也必须先通过 `assertAdmin`（Paperclip 只对 `/me` 提供自读自写）。
+async fn update_user_inbox_agent_policy(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, user_id)): Path<(Uuid, Uuid)>,
+    payload: Result<Json<UpdateInboxAgentPolicyRequest>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<Value>)> {
+    let request = extract_update_inbox_agent_policy(payload)?;
+    assert_inbox_agent_policy_admin(&state, &actor, company_id, AccessMode::Write).await?;
+    require_active_company_user(&state, company_id, user_id).await?;
+    write_user_inbox_agent_policy(&state, &actor, company_id, user_id, request).await
 }
 
 /// GET /companies/:company_id/users/:user_id/inbox-agent-policy
+/// （`routes/inbox-agent-policy.ts:84-90`）：`assertAdmin` → 目标用户成员关系 → 读取。
 async fn user_inbox_agent_policy(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, user_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_company_access(&actor, company_id, AccessMode::Read).map_err(|_| StatusCode::FORBIDDEN)?;
-    if !can_manage_inbox_agent_policy(&actor, company_id) {
-        return Err(StatusCode::FORBIDDEN);
-    }
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<Value>)> {
+    assert_inbox_agent_policy_admin(&state, &actor, company_id, AccessMode::Read).await?;
     require_active_company_user(&state, company_id, user_id).await?;
     get_user_inbox_agent_policy(&state, company_id, user_id).await
 }
@@ -799,67 +972,7 @@ async fn preview_company_import(
     })))
 }
 
-// ============ board-claim / cloud / environments / health / skills / pipelines / projects ============
-
-/// GET /board-claim/:token —— 返回 claim 状态。
-async fn get_board_claim(
-    State(state): State<AppState>,
-    Extension(_actor): Extension<AuthorizationActor>,
-    Path(token): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let row = sqlx::query(
-        "SELECT company_id, status FROM board_claims WHERE token = $1",
-    )
-    .bind(&token)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to load board claim: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let Some(row) = row else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-    use sqlx::Row;
-    Ok(Json(json!({
-        "token": token,
-        "companyId": row.get::<Uuid, _>("company_id"),
-        "status": row.get::<String, _>("status"),
-    })))
-}
-
-/// POST /board-claim/:token/claim —— 认领（幂等）。
-async fn claim_board_token(
-    State(state): State<AppState>,
-    Extension(actor): Extension<AuthorizationActor>,
-    Path(token): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let user_id = match &actor {
-        AuthorizationActor::Board { user_id, .. } => *user_id,
-        _ => return Err(StatusCode::FORBIDDEN),
-    };
-    let row = sqlx::query(
-        "UPDATE board_claims SET status = 'claimed', claimed_by_user_id = $2, claimed_at = NOW() \
-         WHERE token = $1 RETURNING company_id, status",
-    )
-    .bind(&token)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to claim board token: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let Some(row) = row else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-    use sqlx::Row;
-    Ok(Json(json!({
-        "token": token,
-        "companyId": row.get::<Uuid, _>("company_id"),
-        "status": row.get::<String, _>("status"),
-    })))
-}
+// ============ cloud / environments / health / skills / pipelines / projects ============
 
 /// GET /cloud/stacks —— 静态空栈列表。
 async fn cloud_stacks(
@@ -1194,8 +1307,6 @@ pub fn automation_misc_routes() -> Router<AppState> {
         )
         .route("/companies/import/jobs/:job_id", get(get_import_job))
         .route("/companies/import/preview", post(preview_company_import))
-        .route("/board-claim/:token", get(get_board_claim))
-        .route("/board-claim/:token/claim", post(claim_board_token))
         .route("/cloud/stacks", get(cloud_stacks))
         .route("/environments/:environment_id/leases", get(environment_leases))
         .route("/environments/:environment_id/secret-refs", get(environment_secret_refs))
@@ -1210,52 +1321,4 @@ pub fn automation_misc_routes() -> Router<AppState> {
             "/projects/:project_id/workspaces/:workspace_id/runtime-services/:service_id",
             post(project_runtime_service),
         )
-}
-
-#[cfg(test)]
-mod inbox_agent_policy_tests {
-    use super::can_manage_inbox_agent_policy;
-    use services::auth::{AgentApiKeyScope, AuthorizationActor, CompanyMembership, MembershipRole, PermissionKey, PrincipalType};
-    use uuid::Uuid;
-
-    #[test]
-    fn board_admin_can_manage_other_user_policy() {
-        let company_id = Uuid::new_v4();
-        let membership = CompanyMembership::new(
-            company_id,
-            PrincipalType::User,
-            Uuid::new_v4(),
-            MembershipRole::Admin,
-        );
-        let actor = AuthorizationActor::board_with_memberships(
-            Uuid::new_v4(),
-            company_id,
-            vec![membership],
-            false,
-        );
-        assert!(can_manage_inbox_agent_policy(&actor, company_id));
-    }
-
-    #[test]
-    fn agent_key_scope_can_delegate_policy_management() {
-        let company_id = Uuid::new_v4();
-        let scope = AgentApiKeyScope::new(Uuid::new_v4(), company_id).with_actions(vec![
-            PermissionKey::USERS_MANAGE_PERMISSIONS.to_string(),
-        ]);
-        let actor = AuthorizationActor::agent_with_key(
-            scope.agent_id,
-            company_id,
-            Uuid::new_v4(),
-            scope,
-            None,
-        );
-        assert!(can_manage_inbox_agent_policy(&actor, company_id));
-    }
-
-    #[test]
-    fn unrelated_agent_cannot_manage_policy() {
-        let company_id = Uuid::new_v4();
-        let actor = AuthorizationActor::agent(Uuid::new_v4(), company_id, None);
-        assert!(!can_manage_inbox_agent_policy(&actor, company_id));
-    }
 }

@@ -30,10 +30,14 @@ pub use actor::{ActorSource, AgentApiKeyScope, AuthorizationActor};
 pub use board_access::{
     load_responsible_user_memberships, resolve_board_access, resolve_instance_admin,
 };
-pub use board_claim::{BoardClaimService, ClaimChallenge};
+pub use board_claim::{
+    BoardClaimInspection, BoardClaimOutcome, ClaimChallenge, ClaimStatus, FirstAdminClaimOutcome,
+    claim_board_ownership, claim_first_instance_admin, get_board_claim_warning_url,
+    get_challenge_status, initialize_board_claim_challenge, inspect_board_claim_challenge,
+};
 pub use cli_auth::{
     approve_cli_auth_challenge, cancel_cli_auth_challenge, create_cli_auth_challenge,
-    get_cli_auth_challenge,
+    describe_cli_auth_challenge,
 };
 pub use decision::{AuthorizationAction, AuthorizationDecision, DecisionReason};
 pub use decision_engine::{

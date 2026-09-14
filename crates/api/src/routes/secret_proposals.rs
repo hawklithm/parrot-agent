@@ -19,6 +19,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use sqlx::Row;
@@ -803,6 +804,7 @@ async fn list_agent_secrets(
     Ok(Json(json!({ "secrets": secrets })))
 }
 
+#[cfg(test)]
 fn json_fingerprint(v: &Value) -> String {
     Sha256::digest(v.to_string().as_bytes())
         .iter()

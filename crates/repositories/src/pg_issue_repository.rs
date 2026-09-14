@@ -717,17 +717,26 @@ impl IssueRepository for PgIssueRepository {
             }
         });
         
-        // Generate identifier for the issue (e.g., "ISSUE-1", "ISSUE-2")
-        // Get the next issue number for this company
-        let issue_number: i32 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(issue_number), 0) + 1 FROM issues WHERE company_id = $1"
+        // Paperclip `create` (services/issues.ts:7162-7179): reserve from the
+        // company counter, self-corrected against the highest `issue_number`
+        // already stored so a drifted counter cannot mint a colliding
+        // identifier. `issues.identifier` is globally unique, so the
+        // per-company `issue_prefix` is what keeps it unique across companies.
+        let (issue_number, issue_prefix): (i32, String) = sqlx::query_as(
+            "UPDATE companies
+             SET issue_counter = GREATEST(
+                     issue_counter,
+                     COALESCE((SELECT MAX(issue_number) FROM issues WHERE company_id = $1), 0)
+                 ) + 1
+             WHERE id = $1
+             RETURNING issue_counter, issue_prefix",
         )
         .bind(input.company_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(RepositoryError::DatabaseError)?;
-        
-        let identifier = format!("ISSUE-{}", issue_number);
+
+        let identifier = format!("{}-{}", issue_prefix, issue_number);
         
         let mut issue = sqlx::query_as::<_, Issue>(
             r#"

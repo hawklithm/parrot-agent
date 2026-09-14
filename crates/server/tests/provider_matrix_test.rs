@@ -20,30 +20,20 @@ use parrot_server::build_app_state;
 use services::auth::{
     ActorSource, AuthorizationActor, CompanyMembership, MembershipRole, PrincipalType,
 };
+use services::errors::ServiceError;
 
 // ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
 
-async fn connect_and_migrate() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:admin123@localhost:5433/parrot_agent_compile".to_string()
-    });
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect database");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    pool
-}
+
+mod common;
+use common::connect_and_migrate;
+
 
 struct Fixture {
-    pool: PgPool,
     company_id: Uuid,
     user_id: Uuid,
-    agent_id: Uuid,
 }
 
 async fn seed(pool: &PgPool) -> Fixture {
@@ -71,7 +61,7 @@ async fn seed(pool: &PgPool) -> Fixture {
     .expect("insert auth_user");
 
     sqlx::query(
-        "INSERT INTO company_memberships (company_id, principal_type, principal_id, membership_role, status) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        "INSERT INTO company_memberships (company_id, principal_type, principal_id, membership_role, status) VALUES ($1, $2::principal_type, $3, $4::membership_role, $5::company_membership_status) ON CONFLICT DO NOTHING",
     )
     .bind(company_id)
     .bind("user")
@@ -95,10 +85,8 @@ async fn seed(pool: &PgPool) -> Fixture {
     .expect("insert agent");
 
     Fixture {
-        pool: pool.clone(),
         company_id,
         user_id,
-        agent_id,
     }
 }
 
@@ -146,6 +134,45 @@ fn parse_json(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("response body must be JSON")
 }
 
+/// Create a provider vault and return its id, asserting the documented `201`.
+async fn create_config(
+    app: &Router,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    body: Value,
+) -> Uuid {
+    let (status, resp_body) = send(
+        app,
+        actor,
+        "POST",
+        &format!("/companies/{company_id}/secret-provider-configs"),
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "expected 201 Created, got {}: {}",
+        status,
+        String::from_utf8_lossy(&resp_body)
+    );
+    parse_json(&resp_body)["id"]
+        .as_str()
+        .expect("created config id must be a string")
+        .parse()
+        .expect("created config id must be a UUID")
+}
+
+/// Assert a response status, printing the body verbatim on mismatch.
+fn assert_status(actual: StatusCode, expected: StatusCode, label: &str, body: &[u8]) {
+    assert_eq!(
+        actual,
+        expected,
+        "{label}: expected {expected}, got {actual}: {}",
+        String::from_utf8_lossy(body)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // PM1: List secret provider configs is empty initially
 // ---------------------------------------------------------------------------
@@ -185,13 +212,13 @@ async fn test_create_local_encrypted_provider() {
     let app = secret_provider_config_routes().with_state(state);
     let actor = owner_actor(&f);
 
+    // `local_encrypted.config` is `.strict()` and accepts only a single
+    // optional boolean, so there is no meaningful config to send.
     let body = json!({
         "provider": "local_encrypted",
         "displayName": "Local Encrypted Store",
-        "config": {
-            "keyPath": "/etc/parrot/secrets.key"
-        },
-        "setAsDefault": false
+        "config": {},
+        "isDefault": false
     });
 
     let (status, resp_body) = send(
@@ -214,6 +241,10 @@ async fn test_create_local_encrypted_provider() {
     let json = parse_json(&resp_body);
     assert_eq!(json["provider"], "local_encrypted");
     assert_eq!(json["displayName"], "Local Encrypted Store");
+    // A non-coming-soon provider defaults to `ready`.
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["isDefault"], false);
+    assert_eq!(json["companyId"], f.company_id.to_string());
 
     // Verify it persists via list
     let (status, list_body) = send(
@@ -246,9 +277,9 @@ async fn test_create_aws_secrets_manager_provider() {
         "displayName": "AWS Secrets Manager",
         "config": {
             "region": "us-east-1",
-            "secretPrefix": "parrot/"
+            "secretNamePrefix": "parrot/"
         },
-        "setAsDefault": false
+        "isDefault": false
     });
 
     let (status, resp_body) = send(
@@ -270,6 +301,9 @@ async fn test_create_aws_secrets_manager_provider() {
 
     let json = parse_json(&resp_body);
     assert_eq!(json["provider"], "aws_secrets_manager");
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["config"]["region"], "us-east-1");
+    assert_eq!(json["config"]["secretNamePrefix"], "parrot/");
 }
 
 // ---------------------------------------------------------------------------
@@ -289,9 +323,9 @@ async fn test_create_gcp_secret_manager_provider() {
         "displayName": "GCP Secret Manager",
         "config": {
             "projectId": "my-gcp-project",
-            "secretPrefix": "parrot/"
+            "secretNamePrefix": "parrot/"
         },
-        "setAsDefault": false
+        "isDefault": false
     });
 
     let (status, resp_body) = send(
@@ -303,6 +337,8 @@ async fn test_create_gcp_secret_manager_provider() {
     )
     .await;
 
+    // Creating a `coming_soon` draft is explicitly allowed: only a *live*
+    // status is rejected.
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -313,6 +349,11 @@ async fn test_create_gcp_secret_manager_provider() {
 
     let json = parse_json(&resp_body);
     assert_eq!(json["provider"], "gcp_secret_manager");
+    assert_eq!(
+        json["status"], "coming_soon",
+        "gcp_secret_manager defaults to coming_soon, got: {json}"
+    );
+    assert_eq!(json["config"]["projectId"], "my-gcp-project");
 }
 
 // ---------------------------------------------------------------------------
@@ -332,9 +373,9 @@ async fn test_create_vault_provider() {
         "displayName": "HashiCorp Vault",
         "config": {
             "address": "https://vault.example.com:8200",
-            "mountPoint": "secret"
+            "mountPath": "secret"
         },
-        "setAsDefault": false
+        "isDefault": false
     });
 
     let (status, resp_body) = send(
@@ -356,6 +397,13 @@ async fn test_create_vault_provider() {
 
     let json = parse_json(&resp_body);
     assert_eq!(json["provider"], "vault");
+    assert_eq!(
+        json["status"], "coming_soon",
+        "vault defaults to coming_soon, got: {json}"
+    );
+    // `vaultAddressSchema` normalizes an origin-only URL to its origin.
+    assert_eq!(json["config"]["address"], "https://vault.example.com:8200");
+    assert_eq!(json["config"]["mountPath"], "secret");
 }
 
 // ---------------------------------------------------------------------------
@@ -371,21 +419,18 @@ async fn test_multiple_providers_coexist() {
     let actor = owner_actor(&f);
 
     let providers = vec![
-        (
-            "local_encrypted",
-            json!({"keyPath": "/etc/parrot/secrets.key"}),
-        ),
+        ("local_encrypted", json!({})),
         (
             "aws_secrets_manager",
-            json!({"region": "us-east-1", "secretPrefix": "parrot/"}),
+            json!({"region": "us-east-1", "secretNamePrefix": "parrot/"}),
         ),
         (
             "gcp_secret_manager",
-            json!({"projectId": "my-gcp-project", "secretPrefix": "parrot/"}),
+            json!({"projectId": "my-gcp-project", "secretNamePrefix": "parrot/"}),
         ),
         (
             "vault",
-            json!({"address": "https://vault.example.com:8200", "mountPoint": "secret"}),
+            json!({"address": "https://vault.example.com:8200", "mountPath": "secret"}),
         ),
     ];
 
@@ -394,10 +439,10 @@ async fn test_multiple_providers_coexist() {
             "provider": provider_type,
             "displayName": format!("{} Provider", provider_type),
             "config": config,
-            "setAsDefault": false
+            "isDefault": false
         });
 
-        let (status, _) = send(
+        let (status, resp_body) = send(
             &app,
             &actor,
             "POST",
@@ -406,7 +451,14 @@ async fn test_multiple_providers_coexist() {
         )
         .await;
 
-        assert_eq!(status, StatusCode::CREATED, "create {} failed", provider_type);
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create {} failed, got {}: {}",
+            provider_type,
+            status,
+            String::from_utf8_lossy(&resp_body)
+        );
     }
 
     // List should return all 4
@@ -430,6 +482,19 @@ async fn test_multiple_providers_coexist() {
     assert!(types.contains(&"aws_secrets_manager"));
     assert!(types.contains(&"gcp_secret_manager"));
     assert!(types.contains(&"vault"));
+
+    // Only the non-coming-soon providers are live.
+    for row in items {
+        let expected = match row["provider"].as_str().unwrap() {
+            "gcp_secret_manager" | "vault" => "coming_soon",
+            _ => "ready",
+        };
+        assert_eq!(
+            row["status"], expected,
+            "unexpected default status for {}: {}",
+            row["provider"], row
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,33 +513,21 @@ async fn test_set_default_provider() {
     let config_1_body = json!({
         "provider": "local_encrypted",
         "displayName": "Local",
-        "config": {"keyPath": "/etc/parrot/secrets.key"},
-        "setAsDefault": false
+        "config": {},
+        "isDefault": false
     });
-    let (_, body_1) = send(
-        &app, &actor, "POST",
-        &format!("/companies/{}/secret-provider-configs", f.company_id),
-        Some(config_1_body),
-    )
-    .await;
-    let config_1_id: Uuid = parse_json(&body_1)["id"].as_str().unwrap().parse().unwrap();
+    let config_1_id = create_config(&app, &actor, f.company_id, config_1_body).await;
 
     let config_2_body = json!({
         "provider": "aws_secrets_manager",
         "displayName": "AWS",
         "config": {"region": "us-east-1"},
-        "setAsDefault": false
+        "isDefault": false
     });
-    let (_, body_2) = send(
-        &app, &actor, "POST",
-        &format!("/companies/{}/secret-provider-configs", f.company_id),
-        Some(config_2_body),
-    )
-    .await;
-    let config_2_id: Uuid = parse_json(&body_2)["id"].as_str().unwrap().parse().unwrap();
+    let config_2_id = create_config(&app, &actor, f.company_id, config_2_body).await;
 
     // Set config_2 as default
-    let (status, _) = send(
+    let (status, body) = send(
         &app,
         &actor,
         "POST",
@@ -486,9 +539,13 @@ async fn test_set_default_provider() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "expected 200, got {}",
-        status
+        "expected 200, got {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
     );
+    let promoted = parse_json(&body);
+    assert_eq!(promoted["id"], config_2_id.to_string());
+    assert_eq!(promoted["isDefault"], true);
 
     // Verify via list that one is default
     let (status, list_body) = send(
@@ -509,6 +566,7 @@ async fn test_set_default_provider() {
         .collect();
     assert_eq!(defaults.len(), 1, "expected exactly 1 default provider");
     assert_eq!(defaults[0], config_2_id.to_string());
+    let _ = config_1_id;
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +599,7 @@ async fn test_secret_provider_configs_company_isolation() {
     .await
     .expect("insert user A");
     sqlx::query(
-        "INSERT INTO company_memberships (company_id, principal_type, principal_id, membership_role, status) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        "INSERT INTO company_memberships (company_id, principal_type, principal_id, membership_role, status) VALUES ($1, $2::principal_type, $3, $4::membership_role, $5::company_membership_status) ON CONFLICT DO NOTHING",
     )
     .bind(company_a_id)
     .bind("user")
@@ -565,23 +623,17 @@ async fn test_secret_provider_configs_company_isolation() {
         true,
     );
 
+    let app_state_a = build_app_state(pool.clone()).await.unwrap();
+    let app_a = secret_provider_config_routes().with_state(app_state_a);
+
     // Create a provider config in company A
     let config_a_body = json!({
         "provider": "local_encrypted",
         "displayName": "Local Encrypted",
-        "config": {"keyPath": "/etc/parrot/secrets.key"},
-        "setAsDefault": false
+        "config": {},
+        "isDefault": false
     });
-
-    let app_state_a = build_app_state(pool.clone()).await.unwrap();
-    let app_a = secret_provider_config_routes().with_state(app_state_a);
-
-    let (_, _) = send(
-        &app_a, &actor_a, "POST",
-        &format!("/companies/{}/secret-provider-configs", company_a_id),
-        Some(config_a_body),
-    )
-    .await;
+    let config_a_id = create_config(&app_a, &actor_a, company_a_id, config_a_body).await;
 
     // Now seed company B
     let company_b_id = Uuid::new_v4();
@@ -605,7 +657,7 @@ async fn test_secret_provider_configs_company_isolation() {
     .await
     .expect("insert user B");
     sqlx::query(
-        "INSERT INTO company_memberships (company_id, principal_type, principal_id, membership_role, status) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        "INSERT INTO company_memberships (company_id, principal_type, principal_id, membership_role, status) VALUES ($1, $2::principal_type, $3, $4::membership_role, $5::company_membership_status) ON CONFLICT DO NOTHING",
     )
     .bind(company_b_id)
     .bind("user")
@@ -647,6 +699,35 @@ async fn test_secret_provider_configs_company_isolation() {
         0,
         "company B should see 0 secret provider configs"
     );
+
+    // Addressing company A's row *by id* is a 404 for B, not a 403: the
+    // resource is the address, so a miss and a foreign row are indistinguishable.
+    let (status, body) = send(
+        &app_b,
+        &actor_b,
+        "GET",
+        &format!("/secret-provider-configs/{config_a_id}"),
+        None,
+    )
+    .await;
+    assert_status(status, StatusCode::NOT_FOUND, "foreign GET by id", &body);
+    assert_eq!(parse_json(&body)["error"], "Provider vault not found");
+
+    // Address by id under company B's own path is a 403 (company is the address).
+    let (status, body) = send(
+        &app_b,
+        &actor_b,
+        "GET",
+        &format!("/companies/{}/secret-provider-configs", company_a_id),
+        None,
+    )
+    .await;
+    assert_status(
+        status,
+        StatusCode::FORBIDDEN,
+        "foreign company-scoped list",
+        &body,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -661,29 +742,17 @@ async fn test_storage_providers_supported() {
 
     // local_disk should work (always available)
     let local_result = registry.provider(Some("local_disk"));
-    assert!(
-        local_result.is_ok(),
-        "local_disk should be supported"
-    );
+    assert!(local_result.is_ok(), "local_disk should be supported");
 
-    // s3 should fail with NotImplementedError (needs env vars)
+    // s3 without credentials must fail with the typed NotImplemented error.
+    // `ServiceError::NotImplemented` Display is "Not implemented: {0}" — capital
+    // N, so match the variant instead of lowercasing the message.
     let s3_result = registry.provider(Some("s3"));
     assert!(
-        s3_result.is_err(),
-        "s3 should require env config"
+        matches!(s3_result, Err(ServiceError::NotImplemented(_))),
+        "s3 without env config must be NotImplemented, got: {:?}",
+        s3_result.map(|_| "Ok(Arc<dyn StorageService>)").err()
     );
-    // Check error without unwrapping (Arc<dyn StorageService> doesn't impl Debug)
-    match s3_result {
-        Ok(_) => panic!("s3 should fail without env config"),
-        Err(e) => {
-            let err_msg = e.to_string();
-            assert!(
-                err_msg.contains("not implemented") || err_msg.contains("s3"),
-                "s3 error should mention not implemented, got: {}",
-                err_msg
-            );
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -702,18 +771,10 @@ async fn test_all_paperclip_storage_providers_have_parrot_equivalent() {
         if provider == "local_disk" {
             assert!(result.is_ok(), "local_disk must be available");
         } else {
-            // Check error without unwrapping (Arc<dyn StorageService> doesn't impl Debug)
-            match result {
-                Ok(_) => panic!("s3 should fail without env config"),
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    assert!(
-                        err_msg.contains("not implemented"),
-                        "s3 should return 'not implemented' (missing env), got: {}",
-                        err_msg
-                    );
-                }
-            }
+            assert!(
+                matches!(result, Err(ServiceError::NotImplemented(_))),
+                "s3 without env config must be NotImplemented"
+            );
         }
     }
 }
@@ -739,7 +800,7 @@ async fn test_all_paperclip_secret_providers_have_parrot_equivalent() {
 
     for provider_type in &paperclip_secret_providers {
         let config = match *provider_type {
-            "local_encrypted" => json!({"keyPath": "/etc/parrot/secrets.key"}),
+            "local_encrypted" => json!({}),
             "aws_secrets_manager" => json!({"region": "us-east-1"}),
             "gcp_secret_manager" => json!({"projectId": "test-project"}),
             "vault" => json!({"address": "https://vault.example.com:8200"}),
@@ -750,10 +811,10 @@ async fn test_all_paperclip_secret_providers_have_parrot_equivalent() {
             "provider": provider_type,
             "displayName": format!("{} Provider", provider_type),
             "config": config,
-            "setAsDefault": false
+            "isDefault": false
         });
 
-        let (status, _) = send(
+        let (status, resp_body) = send(
             &app,
             &actor,
             "POST",
@@ -765,9 +826,24 @@ async fn test_all_paperclip_secret_providers_have_parrot_equivalent() {
         assert_eq!(
             status,
             StatusCode::CREATED,
-            "Paperclip provider '{}' must be creatable in Parrot, got {}",
+            "Paperclip provider '{}' must be creatable in Parrot, got {}: {}",
             provider_type,
-            status
+            status,
+            String::from_utf8_lossy(&resp_body)
+        );
+
+        let created = parse_json(&resp_body);
+        let expected_status = if matches!(
+            *provider_type,
+            "gcp_secret_manager" | "vault"
+        ) {
+            "coming_soon"
+        } else {
+            "ready"
+        };
+        assert_eq!(
+            created["status"], expected_status,
+            "unexpected default status for {provider_type}: {created}"
         );
     }
 }
@@ -788,24 +864,618 @@ async fn test_health_check_endpoint() {
     let body = json!({
         "provider": "local_encrypted",
         "displayName": "Local",
-        "config": {"keyPath": "/etc/parrot/secrets.key"},
-        "setAsDefault": false
+        "config": {},
+        "isDefault": false
     });
+    let config_id = create_config(&app, &actor, f.company_id, body).await;
 
-    let (_, resp_body) = send(
-        &app, &actor, "POST",
-        &format!("/companies/{}/secret-provider-configs", f.company_id),
-        Some(body),
-    )
-    .await;
-    let config_id: Uuid = parse_json(&resp_body)["id"].as_str().unwrap().parse().unwrap();
-
-    // Company-level health should return 200
+    // Company-level health should return 200 with the registry-shaped body.
     let (status, body) = send(
-        &app, &actor, "GET",
+        &app,
+        &actor,
+        "GET",
         &format!("/companies/{}/secret-providers/health", f.company_id),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "company health should return 200");
+    let json = parse_json(&body);
+    let providers = json["providers"]
+        .as_array()
+        .expect("health body must carry a providers array");
+    assert_eq!(providers.len(), 4, "registry must report 4 providers");
+
+    // Per-config health of a `ready` local_encrypted vault probes the module.
+    let (status, health_body) = send(
+        &app,
+        &actor,
+        "POST",
+        &format!("/secret-provider-configs/{config_id}/health"),
+        None,
+    )
+    .await;
+    assert_status(status, StatusCode::OK, "per-config health", &health_body);
+    let health = parse_json(&health_body);
+    assert_eq!(health["configId"], config_id.to_string());
+    assert_eq!(health["provider"], "local_encrypted");
+    assert!(
+        health["status"].is_string(),
+        "health status must be a string: {health}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PM13: Cross-tenant by-id access is a 404, never a 403 or a 200
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_cross_tenant_by_id_is_404() {
+    let pool = connect_and_migrate().await;
+
+    // Company A (the owner of the row) and company B (the attacker).
+    let f_a = seed(&pool).await;
+    let f_b = seed(&pool).await;
+    let actor_a = owner_actor(&f_a);
+    let actor_b = owner_actor(&f_b);
+
+    let state = build_app_state(pool.clone()).await.unwrap();
+    let app = secret_provider_config_routes().with_state(state);
+
+    let a_id = create_config(
+        &app,
+        &actor_a,
+        f_a.company_id,
+        json!({
+            "provider": "local_encrypted",
+            "displayName": "A Local",
+            "config": {},
+            "isDefault": false
+        }),
+    )
+    .await;
+
+    // Every by-id verb must be an indistinguishable 404 for actor B.
+    let null_body: Option<Value> = None;
+    let by_id_cases: Vec<(&str, String, Option<Value>)> = vec![
+        (
+            "GET",
+            format!("/secret-provider-configs/{a_id}"),
+            null_body.clone(),
+        ),
+        (
+            "PATCH",
+            format!("/secret-provider-configs/{a_id}"),
+            Some(json!({"displayName": "stolen"})),
+        ),
+        ("DELETE", format!("/secret-provider-configs/{a_id}"), null_body.clone()),
+        (
+            "POST",
+            format!("/secret-provider-configs/{a_id}/default"),
+            null_body.clone(),
+        ),
+        (
+            "POST",
+            format!("/secret-provider-configs/{a_id}/health"),
+            null_body.clone(),
+        ),
+    ];
+
+    for (method, uri, body) in by_id_cases {
+        let (status, resp_body) = send(&app, &actor_b, method, &uri, body).await;
+        assert_status(
+            status,
+            StatusCode::NOT_FOUND,
+            &format!("cross-tenant {method} {uri}"),
+            &resp_body,
+        );
+        assert_eq!(
+            parse_json(&resp_body)["error"],
+            "Provider vault not found",
+            "cross-tenant {method} must not disclose the row"
+        );
+    }
+
+    // No leakage into B's own list.
+    let (status, body) = send(
+        &app,
+        &actor_b,
+        "GET",
+        &format!("/companies/{}/secret-provider-configs", f_b.company_id),
+        null_body.clone(),
+    )
+    .await;
+    assert_status(status, StatusCode::OK, "company B list", &body);
+    let b_items = parse_json(&body);
+    assert_eq!(
+        b_items.as_array().unwrap().len(),
+        0,
+        "company B must not see company A's config: {b_items}"
+    );
+
+    // The row survived every rejected verb and is still readable by its owner.
+    let (status, body) = send(
+        &app,
+        &actor_a,
+        "GET",
+        &format!("/secret-provider-configs/{a_id}"),
+        None,
+    )
+    .await;
+    assert_status(status, StatusCode::OK, "owner GET after attacks", &body);
+    let owned = parse_json(&body);
+    assert_eq!(owned["id"], a_id.to_string());
+    assert_eq!(
+        owned["displayName"], "A Local",
+        "owner's row must be unchanged: {owned}"
+    );
+    assert_eq!(owned["isDefault"], false, "default flag must be untouched");
+}
+
+// ---------------------------------------------------------------------------
+// PM14: DELETE responds 200 with the removed row (not 204)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_delete_returns_removed_row() {
+    let pool = connect_and_migrate().await;
+    let f = seed(&pool).await;
+    let state = build_app_state(pool.clone()).await.unwrap();
+    let app = secret_provider_config_routes().with_state(state);
+    let actor = owner_actor(&f);
+
+    let config_id = create_config(
+        &app,
+        &actor,
+        f.company_id,
+        json!({
+            "provider": "aws_secrets_manager",
+            "displayName": "Doomed AWS",
+            "config": {"region": "us-west-2"},
+            "isDefault": false
+        }),
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        &actor,
+        "DELETE",
+        &format!("/secret-provider-configs/{config_id}"),
+        None,
+    )
+    .await;
+
+    assert_status(
+        status,
+        StatusCode::OK,
+        "DELETE must be 200 with the removed row, not 204",
+        &body,
+    );
+    let removed = parse_json(&body);
+    assert_eq!(removed["id"], config_id.to_string());
+    assert_eq!(removed["provider"], "aws_secrets_manager");
+    assert_eq!(removed["displayName"], "Doomed AWS");
+    assert_eq!(removed["companyId"], f.company_id.to_string());
+
+    // The row is really gone.
+    let (status, body) = send(
+        &app,
+        &actor,
+        "GET",
+        &format!("/secret-provider-configs/{config_id}"),
+        None,
+    )
+    .await;
+    assert_status(status, StatusCode::NOT_FOUND, "GET after DELETE", &body);
+    assert_eq!(parse_json(&body)["error"], "Provider vault not found");
+
+    // And it no longer appears in the company list.
+    let (status, body) = send(
+        &app,
+        &actor,
+        "GET",
+        &format!("/companies/{}/secret-provider-configs", f.company_id),
+        None,
+    )
+    .await;
+    assert_status(status, StatusCode::OK, "list after DELETE", &body);
+    assert_eq!(parse_json(&body).as_array().unwrap().len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// PM15: Per-config health states
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_config_health_states() {
+    let pool = connect_and_migrate().await;
+    let f = seed(&pool).await;
+    let state = build_app_state(pool.clone()).await.unwrap();
+    let app = secret_provider_config_routes().with_state(state);
+    let actor = owner_actor(&f);
+
+    // (a) A coming_soon provider's runtime is locked.
+    let gcp_id = create_config(
+        &app,
+        &actor,
+        f.company_id,
+        json!({
+            "provider": "gcp_secret_manager",
+            "displayName": "GCP Draft",
+            "config": {"projectId": "test-project"},
+            "isDefault": false
+        }),
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        &actor,
+        "POST",
+        &format!("/secret-provider-configs/{gcp_id}/health"),
+        None,
+    )
+    .await;
+    assert_status(status, StatusCode::OK, "coming_soon health", &body);
+    let health = parse_json(&body);
+    assert_eq!(health["configId"], gcp_id.to_string(), "configId must echo: {health}");
+    assert_eq!(health["provider"], "gcp_secret_manager");
+    assert_eq!(health["status"], "coming_soon", "body: {health}");
+    assert_eq!(health["details"]["code"], "runtime_locked", "body: {health}");
+
+    // (b) A local_encrypted vault patched to `disabled` reports `disabled`,
+    // and the same PATCH clears the default flag.
+    let local_id = create_config(
+        &app,
+        &actor,
+        f.company_id,
+        json!({
+            "provider": "local_encrypted",
+            "displayName": "Local Default",
+            "config": {},
+            "isDefault": true
+        }),
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        &actor,
+        "PATCH",
+        &format!("/secret-provider-configs/{local_id}"),
+        Some(json!({"status": "disabled"})),
+    )
+    .await;
+    assert_status(status, StatusCode::OK, "PATCH to disabled", &body);
+    let patched = parse_json(&body);
+    assert_eq!(patched["status"], "disabled", "body: {patched}");
+    assert_eq!(
+        patched["isDefault"], false,
+        "disabling a vault must clear isDefault: {patched}"
+    );
+
+    let (status, body) = send(
+        &app,
+        &actor,
+        "POST",
+        &format!("/secret-provider-configs/{local_id}/health"),
+        None,
+    )
+    .await;
+    assert_status(status, StatusCode::OK, "disabled health", &body);
+    let health = parse_json(&body);
+    assert_eq!(health["configId"], local_id.to_string());
+    assert_eq!(health["status"], "disabled", "body: {health}");
+    assert_eq!(health["details"]["code"], "disabled", "body: {health}");
+}
+
+// ---------------------------------------------------------------------------
+// PM16: Company health wrapper shape
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_company_health_wrapper_shape() {
+    let pool = connect_and_migrate().await;
+    let f = seed(&pool).await;
+    let state = build_app_state(pool.clone()).await.unwrap();
+    let app = secret_provider_config_routes().with_state(state);
+    let actor = owner_actor(&f);
+
+    let (status, body) = send(
+        &app,
+        &actor,
+        "GET",
+        &format!("/companies/{}/secret-providers/health", f.company_id),
+        None,
+    )
+    .await;
+    assert_status(status, StatusCode::OK, "company health", &body);
+
+    let json = parse_json(&body);
+    assert!(
+        json.is_object(),
+        "health body must be an object wrapper, got: {json}"
+    );
+    let providers = json["providers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("body must carry a providers array: {json}"));
+    assert_eq!(providers.len(), 4, "expected exactly 4 providers: {json}");
+
+    let ids: Vec<&str> = providers
+        .iter()
+        .map(|p| {
+            p["provider"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every check needs a provider id: {p}"))
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "local_encrypted",
+            "aws_secrets_manager",
+            "gcp_secret_manager",
+            "vault"
+        ],
+        "providers must appear in registry order: {json}"
+    );
+
+    for check in providers {
+        let status = check["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("every check needs a status: {check}"));
+        assert!(
+            matches!(status, "ok" | "warn" | "error"),
+            "health status must be ok|warn|error, got {status}: {check}"
+        );
+        let message = check["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("every check needs a message: {check}"));
+        assert!(
+            !message.trim().is_empty(),
+            "health message must not be empty: {check}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PM17: The 400 / 422 split
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_validation_status_code_split() {
+    let pool = connect_and_migrate().await;
+    let f = seed(&pool).await;
+    let state = build_app_state(pool.clone()).await.unwrap();
+    let app = secret_provider_config_routes().with_state(state);
+    let actor = owner_actor(&f);
+    let create_uri = format!("/companies/{}/secret-provider-configs", f.company_id);
+
+    // Each case is a request-shape violation, rejected before any state is read.
+    let bad_creates: Vec<(&str, Value)> = vec![
+        (
+            "sensitive config key",
+            json!({
+                "provider": "local_encrypted",
+                "displayName": "Sensitive",
+                "config": {"token": "x"}
+            }),
+        ),
+        (
+            "unknown config key",
+            json!({
+                "provider": "local_encrypted",
+                "displayName": "Unknown Key",
+                "config": {"nope": 1}
+            }),
+        ),
+        (
+            "malformed aws region",
+            json!({
+                "provider": "aws_secrets_manager",
+                "displayName": "Bad Region",
+                "config": {"region": "us_gov_east"}
+            }),
+        ),
+        (
+            "gcp forced live",
+            json!({
+                "provider": "gcp_secret_manager",
+                "displayName": "GCP Live",
+                "status": "ready",
+                "config": {"projectId": "test-project"}
+            }),
+        ),
+        (
+            "disabled default",
+            json!({
+                "provider": "local_encrypted",
+                "displayName": "Disabled Default",
+                "status": "disabled",
+                "isDefault": true,
+                "config": {}
+            }),
+        ),
+        (
+            "blank displayName",
+            json!({
+                "provider": "local_encrypted",
+                "displayName": "   ",
+                "config": {}
+            }),
+        ),
+        (
+            "unknown provider",
+            json!({
+                "provider": "nope",
+                "displayName": "Unknown Provider",
+                "config": {}
+            }),
+        ),
+        (
+            "missing aws region",
+            json!({
+                "provider": "aws_secrets_manager",
+                "displayName": "No Region",
+                "config": {}
+            }),
+        ),
+    ];
+
+    for (label, body) in bad_creates {
+        let (status, resp_body) = send(&app, &actor, "POST", &create_uri, Some(body)).await;
+        assert_status(
+            status,
+            StatusCode::BAD_REQUEST,
+            &format!("POST must be 400 for {label}"),
+            &resp_body,
+        );
+    }
+
+    // (i) `POST /:id/default` on a coming_soon gcp draft: semantically understood,
+    // refused by the service.
+    let gcp_id = create_config(
+        &app,
+        &actor,
+        f.company_id,
+        json!({
+            "provider": "gcp_secret_manager",
+            "displayName": "GCP Draft",
+            "config": {"projectId": "test-project"}
+        }),
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        &actor,
+        "POST",
+        &format!("/secret-provider-configs/{gcp_id}/default"),
+        None,
+    )
+    .await;
+    assert_status(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "defaulting a coming_soon vault must be 422",
+        &body,
+    );
+
+    // (j) PATCH that would promote a gcp draft out of coming_soon → 422.
+    let (status, body) = send(
+        &app,
+        &actor,
+        "PATCH",
+        &format!("/secret-provider-configs/{gcp_id}"),
+        Some(json!({"status": "ready"})),
+    )
+    .await;
+    assert_status(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "promoting a gcp vault via PATCH must be 422",
+        &body,
+    );
+
+    // (k) PATCH's narrow pre-check does not inspect unknown keys, so the same
+    // key that is a 400 on POST reaches the service and surfaces as 422.
+    let local_id = create_config(
+        &app,
+        &actor,
+        f.company_id,
+        json!({
+            "provider": "local_encrypted",
+            "displayName": "Local"
+        }),
+    )
+    .await;
+    let (status, body) = send(
+        &app,
+        &actor,
+        "PATCH",
+        &format!("/secret-provider-configs/{local_id}"),
+        Some(json!({"config": {"nope": 1}})),
+    )
+    .await;
+    assert_status(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "PATCH with an unknown config key must be 422",
+        &body,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PM18: An absent `config` means `{}`, not a rejection
+// ---------------------------------------------------------------------------
+
+/// Paperclip's create schema is `config: providerConfigSchema.default({})`, so a
+/// payload that omits `config` entirely is valid and stores `{}`. This guards the
+/// regression where `serde_json::Value` defaulted to `Null` and the service
+/// rejected the non-object as `400 Invalid provider vault config`.
+#[tokio::test]
+async fn test_absent_config_defaults_to_empty_object() {
+    let pool = connect_and_migrate().await;
+    let f = seed(&pool).await;
+    let state = build_app_state(pool.clone()).await.unwrap();
+    let app = secret_provider_config_routes().with_state(state);
+    let actor = owner_actor(&f);
+
+    let (status, body) = send(
+        &app,
+        &actor,
+        "POST",
+        &format!("/companies/{}/secret-provider-configs", f.company_id),
+        Some(json!({
+            "provider": "local_encrypted",
+            "displayName": "No Config Field"
+        })),
+    )
+    .await;
+    assert_status(
+        status,
+        StatusCode::CREATED,
+        "an omitted config must default to an empty object",
+        &body,
+    );
+    let created = parse_json(&body);
+    assert_eq!(created["config"], json!({}), "body: {created}");
+    assert_eq!(created["status"], "ready", "body: {created}");
+    assert_eq!(created["isDefault"], false, "body: {created}");
+
+    // A PATCH without `config` leaves the stored object untouched.
+    let config_id = created["id"].as_str().expect("created id").to_string();
+    let (status, body) = send(
+        &app,
+        &actor,
+        "PATCH",
+        &format!("/secret-provider-configs/{config_id}"),
+        Some(json!({"displayName": "Renamed"})),
+    )
+    .await;
+    assert_status(status, StatusCode::OK, "rename without config", &body);
+    let patched = parse_json(&body);
+    assert_eq!(patched["config"], json!({}), "body: {patched}");
+    assert_eq!(patched["displayName"], "Renamed", "body: {patched}");
+
+    // `.default({})` fires only on an ABSENT key: an explicit `null` is still a
+    // shape violation, which is what makes the assertion above meaningful.
+    let (status, body) = send(
+        &app,
+        &actor,
+        "POST",
+        &format!("/companies/{}/secret-provider-configs", f.company_id),
+        Some(json!({
+            "provider": "local_encrypted",
+            "displayName": "Null Config",
+            "config": null
+        })),
+    )
+    .await;
+    assert_status(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an explicit null config must still be rejected",
+        &body,
+    );
 }

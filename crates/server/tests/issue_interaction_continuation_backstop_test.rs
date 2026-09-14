@@ -11,12 +11,10 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-async fn migrate(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("run migrations");
-}
+
+mod common;
+use common::migrate;
+
 
 struct Fixture {
     pool: PgPool,
@@ -384,7 +382,7 @@ async fn duplicate_wakeup_key_after_completion_does_not_create_second_run(pool: 
     let key = "same-interaction-wake";
     let heartbeat = DefaultHeartbeatService::new(pool.clone());
     let options = HeartbeatWakeupOptions {
-        source: Some("interaction".to_string()),
+        source: Some("automation".to_string()),
         reason: Some("issue_continuation_needed".to_string()),
         idempotency_key: Some(key.to_string()),
         payload: Some(serde_json::json!({"issueId": f.issue_id})),

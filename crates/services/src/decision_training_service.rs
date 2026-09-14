@@ -1150,6 +1150,7 @@ impl DefaultDecisionTrainingService {
     }
 
     /// 从决策数据中提取commit SHA
+    #[cfg(test)]
     fn extract_commit_sha(value: &serde_json::Value) -> Option<String> {
         // 尝试从不同可能的路径提取commit SHA
         value

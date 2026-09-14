@@ -3,6 +3,7 @@ pub mod agent_runtime_state;
 pub mod adapter;
 pub mod agent;
 pub mod agent_api_key;
+pub mod agent_url_key;
 pub mod approval;
 pub mod assets;
 pub mod auth;
@@ -76,7 +77,6 @@ pub use execution_environment::{
     UpdateExecutionWorkspaceInput, UpdateRuntimeLeaseInput, WorkspaceMode, WorkspaceStatus,
     WorkspaceStrategyType,
 };
-pub use secret_provider::{ProviderHealthStatus, SecretProviderConfig};
 pub use secrets::{SecretBinding, UserSecret, UserSecretDefinition};
 pub use state_machine::AgentStateMachine;
 

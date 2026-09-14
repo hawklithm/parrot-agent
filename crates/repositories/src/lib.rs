@@ -1,6 +1,5 @@
 pub mod activity_log_repository;
 pub mod user_secret_repository;
-pub mod secret_provider_config_repository;
 pub mod routine_repository;
 pub mod routine_trigger_repository;
 pub mod routine_revision_repository;
@@ -8,7 +7,6 @@ pub mod goal_repository;
 pub mod agent_repository;
 pub mod pg_agent_repository;
 pub mod agent_api_key_repository;
-pub mod agent_api_key_repository_ext;
 pub mod cost_event_repository;
 pub mod config_revision_repository;
 pub mod pg_config_revision_repository;
@@ -40,7 +38,7 @@ pub mod label_repository;
 pub use repository::{CrudOps, Repository, RepositoryExt};
 
 pub use agent_repository::{AgentRepository, ListAgentsOptions, RepositoryError, RepositoryResult};
-pub use pg_agent_repository::PgAgentRepository;
+pub use pg_agent_repository::{map_agent_row, PgAgentRepository};
 pub use agent_api_key_repository::{AgentApiKeyRepository, PgAgentApiKeyRepository};
 pub use cost_event_repository::{CostEventRepository, PgCostEventRepository};
 pub use config_revision_repository::ConfigRevisionRepository;
