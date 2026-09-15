@@ -33,6 +33,31 @@ pub enum AgentRole {
     General,
 }
 
+impl AgentRole {
+    /// Parse the role names used by Paperclip and map them to Parrot's
+    /// intentionally smaller role enum. Paperclip exposes specialist roles
+    /// (for example `cto` and `engineer`), while Parrot persists the broader
+    /// `manager`/`general` buckets in its database schema.
+    pub fn from_compatible_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ceo" | "chief-executive-officer" => Some(Self::Ceo),
+            "vp" | "vice-president" => Some(Self::Vp),
+            "manager" | "engineering-manager" | "lead" | "cto" => Some(Self::Manager),
+            "researcher" | "research" | "analyst" => Some(Self::Researcher),
+            "general"
+            | "cmo"
+            | "cfo"
+            | "security"
+            | "engineer"
+            | "designer"
+            | "pm"
+            | "qa"
+            | "devops" => Some(Self::General),
+            _ => None,
+        }
+    }
+}
+
 impl Default for AgentRole {
     fn default() -> Self {
         Self::General
@@ -411,3 +436,4 @@ mod tests {
         );
     }
 }
+

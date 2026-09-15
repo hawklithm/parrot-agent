@@ -1017,11 +1017,24 @@ impl TeamsCatalogService for DefaultTeamsCatalogService {
 
             let agent_id = Uuid::new_v4();
             let role = map_agent_role(&agent.role);
+            let instructions_bundle =
+                std::fs::read_to_string(PathBuf::from(&team.path).join(&agent.path))
+                    .ok()
+                    .map(|content| {
+                        json!({
+                            "entryFile": "AGENTS.md",
+                            "files": {"AGENTS.md": content},
+                        })
+                    });
+            let adapter_config = json!({
+                "desired_skills": agent.skills,
+            });
             let metadata = json!({
                 "catalogTeamId": team.id,
                 "catalogAgentSlug": agent.slug,
                 "catalogTitle": agent.title,
                 "catalogSkills": agent.skills,
+                "instructionsBundle": instructions_bundle,
             });
 
             sqlx::query(
@@ -1031,8 +1044,8 @@ impl TeamsCatalogService for DefaultTeamsCatalogService {
                     adapter_config, runtime_config, permissions, metadata,
                     budget_monthly_cents, reports_to, created_at, updated_at
                 )
-                VALUES ($1, $2, $3, $4::agent_role, 'active'::agent_status, 'claude_code',
-                        '{}'::jsonb, '{}'::jsonb, $5::jsonb, $6::jsonb,
+                VALUES ($1, $2, $3, $4, 'idle', 'claude_local',
+                        $5::jsonb, '{}'::jsonb, $6::jsonb, $7::jsonb,
                         0, NULL, NOW(), NOW())
                 "#,
             )
@@ -1040,6 +1053,7 @@ impl TeamsCatalogService for DefaultTeamsCatalogService {
             .bind(company_id)
             .bind(&final_name)
             .bind(role)
+            .bind(&adapter_config)
             .bind(json!({
                 "can_create_agents": role == "ceo",
                 "can_create_skills": true,
@@ -1327,3 +1341,4 @@ mod tests {
         assert!(team.files.iter().any(|f| f.path == "TEAM.md" && f.kind == "team"));
     }
 }
+

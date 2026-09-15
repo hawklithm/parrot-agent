@@ -94,7 +94,7 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
     const TOOLS: &[(&str, &str)] = &[
         ("paperclipMe", "Get the current authenticated Paperclip actor details"),
         ("paperclipInboxLite", "Get the current authenticated agent inbox-lite assignment list"),
-        ("paperclipHireAgent", "Request to hire a new agent (creates an approval request that requires board approval)"),
+        ("paperclipHireAgent", "Request to hire a new agent (creates a pending hire approval when the company requires board approval)"),
         ("paperclipListAgents", "List agents in a company"),
         ("paperclipGetAgent", "Get a single agent by id"),
         ("paperclipListIssues", "List issues for a company with optional filters"),
@@ -300,7 +300,7 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                     "properties": {
                         "companyId": {"type": ["string", "null"], "format": "uuid"},
                         "name": {"type": "string", "minLength": 1, "maxLength": 255, "description": "Agent name"},
-                        "role": {"type": "string", "enum": ["ceo", "vp", "manager", "researcher", "general"], "description": "Agent role"},
+                        "role": {"type": "string", "enum": ["ceo", "vp", "manager", "researcher", "general", "cto", "cmo", "cfo", "security", "engineer", "designer", "pm", "qa", "devops"], "description": "Agent role (Paperclip specialist roles are mapped to Parrot's role buckets)"},
                         "title": {"type": ["string", "null"], "maxLength": 255, "description": "Agent job title"},
                         "icon": {"type": ["string", "null"], "description": "Agent icon"},
                         "reportsTo": {"type": ["string", "null"], "format": "uuid", "description": "ID of the agent this agent reports to"},
@@ -314,7 +314,9 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                         "metadata": {"type": ["object", "null"], "description": "Additional metadata"},
                         "desiredSkills": {"type": ["array", "null"], "items": {"type": "string"}, "description": "List of desired skills"},
                         "instructionsBundle": {"type": ["object", "null"], "description": "Instructions bundle"},
-                        "issueIds": {"type": ["array", "null"], "items": {"type": "string", "format": "uuid"}, "description": "Related issue IDs"}
+                        "sourceIssueId": {"type": ["string", "null"], "format": "uuid", "description": "Issue that requested this hire"},
+                        "sourceIssueIds": {"type": ["array", "null"], "items": {"type": "string", "format": "uuid"}, "description": "Issues that requested this hire"},
+                        "issueIds": {"type": ["array", "null"], "items": {"type": "string", "format": "uuid"}, "description": "Legacy alias for sourceIssueIds"}
                     },
                     "required": ["name", "role", "adapterType"],
                     "additionalProperties": false
@@ -565,6 +567,21 @@ fn is_paperclip_builtin_tool(name: &str) -> bool {
         .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
 }
 
+fn allow_first_party_tool_on_default_deny(
+    tool_name: &str,
+    reason_code: &str,
+    has_active_profile: bool,
+) -> bool {
+    // Paperclip's built-in API tools are part of the agent runtime contract;
+    // they must be discoverable even when the company has not configured an
+    // optional tool profile. This exception is deliberately narrow: a block,
+    // approval requirement, rate limit, or any other explicit decision still
+    // wins, and connected/plugin tools remain default-deny.
+    reason_code == "deny_default"
+        && !has_active_profile
+        && is_paperclip_builtin_tool(tool_name)
+}
+
 fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(), String> {
     let Some(object) = parameters.as_object() else {
         return Err("tool arguments must be a JSON object".to_string());
@@ -704,6 +721,7 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
         "executionWorkspaceId",
         "sourceCommentId",
         "sourceRunId",
+        "sourceIssueId",
         "baseRevisionId",
         "requestedByAgentId",
         "parentCaseId",
@@ -715,7 +733,7 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
             Uuid::parse_str(raw).map_err(|_| format!("{key} must be a valid UUID"))?;
         }
     }
-    for key in ["blockedByIssueIds", "labelIds", "issueIds"] {
+    for key in ["blockedByIssueIds", "labelIds", "issueIds", "sourceIssueIds"] {
         if let Some(values) = object.get(key) {
             let values = values
                 .as_array()
@@ -2832,17 +2850,22 @@ async fn load_profile_decision(
     company_id: Uuid,
     agent_id: Uuid,
     tool_name: &str,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     // Paperclip: an exclude entry on any effective profile blocks the tool;
     // otherwise defaultAction=allow or an include match allows it. The query
     // mirrors the previous precedence: exact tool match wins, excludes win.
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT e.effect FROM tool_profile_entries e
-           JOIN tool_profile_bindings b
-             ON b.profile_id = e.profile_id AND b.company_id = e.company_id
-          WHERE b.company_id = $1 AND e.company_id = $1
-            AND b.target_type = 'agent' AND b.target_id = $2
+    // LEFT JOIN is important: a profile with defaultAction=allow and no
+    // entries is still an allow profile.
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT p.default_action, e.effect FROM tool_profile_bindings b
+           JOIN tool_profiles p
+             ON p.id = b.profile_id AND p.company_id = b.company_id
+           LEFT JOIN tool_profile_entries e
+             ON e.profile_id = p.id AND e.company_id = p.company_id
             AND (e.tool_name = $3 OR e.tool_name = '*')
+          WHERE b.company_id = $1
+            AND b.target_type = 'agent' AND b.target_id = $2
+            AND p.status = 'active'
           ORDER BY CASE WHEN e.tool_name = $3 THEN 0 ELSE 1 END,
                    CASE WHEN e.effect IN ('exclude', 'deny') THEN 0 ELSE 1 END",
     )
@@ -2852,18 +2875,21 @@ async fn load_profile_decision(
     .fetch_all(&state.pool)
     .await
     .unwrap_or_default();
+    let has_active_profile = !rows.is_empty();
     let mut has_include = false;
-    for (effect,) in rows {
-        match effect.as_str() {
-            "exclude" | "deny" => return (false, false),
-            "include" | "allow" => has_include = true,
+    let mut default_allows = false;
+    for (default_action, effect) in rows {
+        if default_action == "allow" {
+            default_allows = true;
+        }
+        match effect.as_deref() {
+            Some("exclude") | Some("deny") => return (false, false, true),
+            Some("include") | Some("allow") => has_include = true,
             _ => {}
         }
     }
-    (false, has_include)
+    (false, default_allows || has_include, has_active_profile)
 }
-
-
 
 /// Structured decision from the ladder, carrying rate-limit state so callers
 /// can shape Paperclip's 429 response.
@@ -2880,7 +2906,9 @@ async fn gateway_decision(
     agent_id: Uuid,
     tool_name: &str,
 ) -> String {
-    gateway_decision_full(state, company_id, agent_id, tool_name, true)
+    // Discovery must be side-effect free. In particular, listing tools must
+    // not consume a rate-limit token before the agent has called anything.
+    gateway_decision_full(state, company_id, agent_id, tool_name, false)
         .await
         .decision
 }
@@ -2962,7 +2990,7 @@ async fn gateway_decision_full(
         }
     }
 
-    let (explicit_grant, profile_allows) =
+    let (explicit_grant, profile_allows, has_active_profile) =
         load_profile_decision(state, company_id, agent_id, tool_name).await;
     let tool_name_string = tool_name.to_string();
     let ctx = services::tool_access_contract::EvaluationContext {
@@ -3073,12 +3101,17 @@ async fn gateway_decision_full(
 
     let decision = match outcome.decision {
         "allow" | "require_approval" | "rate_limited" => outcome.decision.to_string(),
-        "deny" => "deny".to_string(),
-        _ => if tool_name.starts_with("paperclip") {
+        "deny"
+            if allow_first_party_tool_on_default_deny(
+                tool_name,
+                outcome.reason_code,
+                has_active_profile,
+            ) =>
+        {
             "allow".to_string()
-        } else {
-            "deny".to_string()
-        },
+        }
+        "deny" => "deny".to_string(),
+        _ => "deny".to_string(),
     };
     GatewayDecision {
         decision,
@@ -3130,6 +3163,34 @@ fn object_without(parameters: &Value, omitted: &[&str]) -> Value {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
     )
+}
+
+fn build_hire_agent_request_body(parameters: &Value) -> Result<Value, String> {
+    let mut body = object_without(
+        parameters,
+        &["companyId", "issueIds", "requestedByAgentId"],
+    );
+    let object = body
+        .as_object_mut()
+        .ok_or("hire agent arguments must be an object")?;
+    if object
+        .get("adapterConfig")
+        .is_none_or(Value::is_null)
+    {
+        object.insert("adapterConfig".to_string(), serde_json::json!({}));
+    }
+    if object
+        .get("runtimeConfig")
+        .is_none_or(Value::is_null)
+    {
+        object.insert("runtimeConfig".to_string(), serde_json::json!({}));
+    }
+    if object.get("sourceIssueIds").is_none_or(Value::is_null) {
+        if let Some(issue_ids) = parameters.get("issueIds").filter(|value| !value.is_null()) {
+            object.insert("sourceIssueIds".to_string(), issue_ids.clone());
+        }
+    }
+    Ok(body)
 }
 
 fn optional_query(parameters: &Value, key: &str) -> String {
@@ -3423,29 +3484,20 @@ async fn call_paperclip_builtin_tool(
                 })
             }),
         ),
-        "paperclipHireAgent" => (
-            "POST",
-            format!("/companies/{company_id}/approvals"),
-            Some({
-                // 构建hire_agent的payload
-                let mut hire_payload = object_without(&parameters, &["companyId", "issueIds"]);
-
-                // 如果没有adapterConfig，添加默认值
-                if let Some(obj) = hire_payload.as_object_mut() {
-                    if !obj.contains_key("adapterConfig") {
-                        obj.insert("adapterConfig".to_string(), serde_json::json!({}));
-                    }
-                }
-
-                // 构建approval请求
-                serde_json::json!({
-                    "type": "hire_agent",
-                    "requestedByAgentId": agent_id,
-                    "payload": hire_payload,
-                    "issueIds": parameters.get("issueIds").cloned().unwrap_or_else(|| serde_json::json!([]))
-                })
-            }),
-        ),
+        "paperclipHireAgent" => {
+            // Reuse the canonical hire endpoint so the request follows the
+            // same path as the UI/skill: permission check, pending agent
+            // creation, source-issue linking, and (when configured) board
+            // approval are handled in one place. The old implementation
+            // posted a hand-built approval directly, which skipped the
+            // pending-agent identity and made the downstream approval path
+            // diverge from Paperclip.
+            (
+                "POST",
+                format!("/companies/{company_id}/agent-hires"),
+                Some(build_hire_agent_request_body(&parameters)?),
+            )
+        }
         "paperclipGetApproval" => (
             "GET",
             format!(
@@ -6551,6 +6603,71 @@ mod tests {
             &serde_json::json!({"issueId":"ABC-1", "order":"sideways"})
         )
         .is_err());
+
+        let source_issue_id = Uuid::new_v4();
+        assert!(validate_paperclip_arguments(
+            "paperclipHireAgent",
+            &serde_json::json!({
+                "name": "CTO",
+                "role": "cto",
+                "adapterType": "claude_local",
+                "reportsTo": Uuid::new_v4(),
+                "sourceIssueId": source_issue_id,
+            })
+        )
+        .is_ok());
+        assert!(validate_paperclip_arguments(
+            "paperclipHireAgent",
+            &serde_json::json!({
+                "name": "Engineer",
+                "role": "not-a-role",
+                "adapterType": "claude_local",
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hire_agent_request_body_uses_canonical_endpoint_fields() {
+        let issue_id = Uuid::new_v4();
+        let body = build_hire_agent_request_body(&serde_json::json!({
+            "companyId": Uuid::new_v4(),
+            "name": "Engineer",
+            "role": "engineer",
+            "adapterType": "claude_local",
+            "issueIds": [issue_id],
+        }))
+        .expect("hire body should be built");
+
+        assert!(body.get("companyId").is_none());
+        assert!(body.get("issueIds").is_none());
+        assert_eq!(body["sourceIssueIds"], serde_json::json!([issue_id]));
+        assert_eq!(body["adapterConfig"], serde_json::json!({}));
+        assert_eq!(body["runtimeConfig"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn first_party_tools_are_default_allowed_but_explicit_denies_remain() {
+        assert!(allow_first_party_tool_on_default_deny(
+            "paperclipHireAgent",
+            "deny_default",
+            false,
+        ));
+        assert!(!allow_first_party_tool_on_default_deny(
+            "paperclipHireAgent",
+            "deny_policy_block",
+            false,
+        ));
+        assert!(!allow_first_party_tool_on_default_deny(
+            "paperclipHireAgent",
+            "deny_default",
+            true,
+        ));
+        assert!(!allow_first_party_tool_on_default_deny(
+            "mcp.example:dangerous_tool",
+            "deny_default",
+            false,
+        ));
     }
 
     #[test]

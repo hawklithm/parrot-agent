@@ -1,8 +1,17 @@
 use garde::Validate;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 use models::{AgentRole, AgentStatus};
+
+fn deserialize_compatible_agent_role<'de, D>(deserializer: D) -> Result<AgentRole, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    AgentRole::from_compatible_str(&raw)
+        .ok_or_else(|| de::Error::custom(format!("unsupported agent role: {raw}")))
+}
 
 /// Agent 创建请求验证
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
@@ -15,6 +24,7 @@ pub struct CreateAgentHireSchema {
     /// Agent 角色
     #[garde(skip)]
     #[serde(default = "default_role")]
+    #[serde(deserialize_with = "deserialize_compatible_agent_role")]
     pub role: AgentRole,
 
     /// Agent 标题（可选）
@@ -342,6 +352,19 @@ mod tests {
     }
 
     #[test]
+    fn test_create_agent_hire_schema_accepts_paperclip_specialist_roles() {
+        let schema: CreateAgentHireSchema = serde_json::from_value(serde_json::json!({
+            "name": "CTO",
+            "role": "cto",
+            "adapterType": "claude_local"
+        }))
+        .expect("Paperclip role should be accepted at the API boundary");
+
+        assert_eq!(schema.role, AgentRole::Manager);
+        assert!(schema.validate(&()).is_ok());
+    }
+
+    #[test]
     fn test_update_agent_schema_partial() {
         let schema = UpdateAgentSchema {
             name: Some("Updated Name".to_string()),
@@ -399,3 +422,4 @@ mod tests {
         assert!(schema.validate(&()).is_ok());
     }
 }
+

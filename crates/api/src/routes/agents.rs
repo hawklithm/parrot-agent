@@ -11,7 +11,9 @@ use uuid::Uuid;
 
 use crate::errors::AppError;
 use crate::redaction::redact_config;
-use crate::validation::{AgentPermissionsInput, CreateAgentHireSchema, UpdateAgentSchema};
+use crate::validation::{
+    AgentPermissionsInput, CreateAgentHireSchema, InstructionsBundleInput, UpdateAgentSchema,
+};
 use models::{AgentPermissions, AgentStatus, ApprovalType, TrustAuthorizationPolicy, TrustPreset};
 use serde_json::{json, Value};
 use services::approval_service::CreateApprovalInput;
@@ -182,13 +184,46 @@ async fn create_agent(
         AuthorizationActor::None => (None, None),
     };
 
-    let source_issue_ids = payload
+    let mut source_issue_ids = payload
         .source_issue_ids
         .clone()
         .unwrap_or_default()
         .into_iter()
         .chain(payload.source_issue_id.iter().copied())
         .collect::<Vec<_>>();
+    let mut seen_source_issue_ids = std::collections::HashSet::new();
+    source_issue_ids.retain(|issue_id| seen_source_issue_ids.insert(*issue_id));
+
+    // Paperclip keeps the requested skill set in the adapter configuration so
+    // the runtime sees it immediately, including while the agent is waiting
+    // for board approval. Normalize null configs the same way the shared
+    // Paperclip validator does.
+    let mut adapter_config = payload.adapter_config.clone();
+    if adapter_config.is_null() {
+        adapter_config = json!({});
+    }
+    if let Some(desired_skills) = payload.desired_skills.as_ref() {
+        let object = adapter_config.as_object_mut().ok_or_else(|| {
+            AppError::Validation("adapterConfig must be a JSON object".to_string())
+        })?;
+        object.insert("desired_skills".to_string(), json!(desired_skills));
+    }
+
+    // The API accepts an omitted entryFile and Paperclip defaults it to
+    // AGENTS.md. Store the canonical flat bundle shape that heartbeat and
+    // instructions readers consume.
+    let instructions_bundle = payload
+        .instructions_bundle
+        .as_ref()
+        .map(|bundle: &InstructionsBundleInput| {
+            json!({
+                "entryFile": bundle
+                    .entry_file
+                    .clone()
+                    .unwrap_or_else(|| "AGENTS.md".to_string()),
+                "files": bundle.files.clone(),
+            })
+        });
 
     // 创建Agent
     let input = CreateAgentInput {
@@ -201,7 +236,8 @@ async fn create_agent(
             AgentStatus::Idle
         }),
         adapter_type: payload.adapter_type.clone(),
-        adapter_config: payload.adapter_config.clone(),
+        adapter_config,
+        instructions_bundle: instructions_bundle.clone(),
         runtime_config: Some(payload.runtime_config.clone()),
         permissions: payload.permissions.map(agent_permissions_from_input),
         budget_monthly_cents: Some(payload.budget_monthly_cents),
@@ -227,11 +263,14 @@ async fn create_agent(
             "reportsTo": payload.reports_to,
             "capabilities": payload.capabilities,
             "desiredSkills": payload.desired_skills,
+            "instructionsBundle": instructions_bundle,
             "adapterType": agent.adapter_type,
             "adapterConfig": agent.adapter_config.0,
             "runtimeConfig": agent.runtime_config.0,
             "budgetMonthlyCents": agent.budget_monthly_cents,
             "metadata": payload.metadata,
+            "sourceIssueId": payload.source_issue_id,
+            "sourceIssueIds": source_issue_ids,
             "agentId": agent.id,
             "requestedByAgentId": requested_by_agent_id,
             "requestedConfigurationSnapshot": {
@@ -239,6 +278,8 @@ async fn create_agent(
                 "adapterConfig": agent.adapter_config.0,
                 "runtimeConfig": agent.runtime_config.0,
                 "budgetMonthlyCents": agent.budget_monthly_cents,
+                "desiredSkills": payload.desired_skills,
+                "instructionsBundle": instructions_bundle,
             },
         });
 

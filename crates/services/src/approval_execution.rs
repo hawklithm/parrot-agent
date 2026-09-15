@@ -43,7 +43,7 @@ impl HireAgentPayload {
         let role = payload
             .get("role")
             .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str::<models::AgentRole>(&format!("\"{}\"", s)).ok())
+            .and_then(models::AgentRole::from_compatible_str)
             .ok_or_else(|| ServiceError::InvalidInput("Missing or invalid 'role' in payload".to_string()))?;
 
         let adapter_type = payload
@@ -84,7 +84,7 @@ impl HireAgentPayload {
         let metadata = payload.get("metadata").cloned();
         let desired_skills = payload
             .get("desiredSkills")
-            .or_else(|| payload.get("ls"))
+            .or_else(|| payload.get("desired_skills"))
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect());
         let instructions_bundle = payload
@@ -240,13 +240,38 @@ impl DefaultApprovalExecutor {
         payload: &HireAgentPayload,
         _decided_by_user_id: Uuid,
     ) -> Result<Agent, ServiceError> {
+        let mut adapter_config = payload.adapter_config.clone();
+        if adapter_config.is_null() {
+            adapter_config = serde_json::json!({});
+        }
+        if let Some(desired_skills) = payload.desired_skills.as_ref() {
+            let object = adapter_config.as_object_mut().ok_or_else(|| {
+                ServiceError::InvalidInput("adapterConfig must be a JSON object".to_string())
+            })?;
+            object.insert("desired_skills".to_string(), serde_json::json!(desired_skills));
+        }
+
+        let instructions_bundle = payload.instructions_bundle.as_ref().map(|bundle| {
+            let mut bundle = bundle.clone();
+            if let Some(object) = bundle.as_object_mut() {
+                if !object
+                    .get("entryFile")
+                    .is_some_and(serde_json::Value::is_string)
+                {
+                    object.insert("entryFile".to_string(), serde_json::json!("AGENTS.md"));
+                }
+            }
+            bundle
+        });
+
         let input = CreateAgentInput {
             company_id,
             name: payload.name.clone(),
             role: payload.role.clone(),
             status: Some(AgentStatus::Idle),
             adapter_type: payload.adapter_type.clone(),
-            adapter_config: payload.adapter_config.clone(),
+            adapter_config,
+            instructions_bundle,
             runtime_config: payload.runtime_config.clone(),
             permissions: payload.permissions.clone(),
             budget_monthly_cents: payload.budget_monthly_cents,
@@ -388,14 +413,27 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_hire_agent_payload_rejects_invalid_role() {
+    fn test_parse_hire_agent_payload_accepts_paperclip_specialist_role() {
         let payload = serde_json::json!({
             "name": "Test Agent",
             "role": "engineer",
             "adapterType": "claude_local",
         });
 
-        let err = HireAgentPayload::from_json(&payload).expect_err("invalid role must fail");
+        let parsed = HireAgentPayload::from_json(&payload)
+            .expect("Paperclip specialist role should map to Parrot's general bucket");
+        assert_eq!(parsed.role, models::AgentRole::General);
+    }
+
+    #[test]
+    fn test_parse_hire_agent_payload_rejects_unknown_role() {
+        let payload = serde_json::json!({
+            "name": "Test Agent",
+            "role": "not-a-role",
+            "adapterType": "claude_local",
+        });
+
+        let err = HireAgentPayload::from_json(&payload).expect_err("unknown role must fail");
         assert!(matches!(err, ServiceError::InvalidInput(_)));
     }
 
@@ -408,6 +446,7 @@ mod tests {
             "adapter_type": "process",
             "agent_id": agent_id.to_string(),
             "budget_monthly_cents": 12_345,
+            "desired_skills": ["task-planning"],
         });
 
         let parsed =
@@ -415,5 +454,6 @@ mod tests {
         assert_eq!(parsed.adapter_type, "process");
         assert_eq!(parsed.agent_id, Some(agent_id));
         assert_eq!(parsed.budget_monthly_cents, Some(12_345));
+        assert_eq!(parsed.desired_skills, Some(vec!["task-planning".to_string()]));
     }
 }

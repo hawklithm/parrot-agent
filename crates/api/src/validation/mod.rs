@@ -4,6 +4,7 @@ pub mod issue_schemas;
 pub use agent_schemas::{
     AgentPermissionsInput,
     CreateAgentHireSchema,
+    InstructionsBundleInput,
     UpdateAgentSchema,
     TestAdapterEnvironmentSchema,
 };

@@ -190,6 +190,31 @@ fn resolve_acp_mode(adapter: &str, engine: &str) -> Result<bool, String> {
     Ok(adapter == "codex_local" && matches!(engine, "acp" | "auto"))
 }
 
+fn reject_unsupported_claude_args(adapter: &str, args: &[String]) -> Result<(), String> {
+    if adapter == "claude_local" && args.iter().any(|arg| arg == "--acp") {
+        return Err(
+            "Claude Code CLI does not support --acp; remove it from args/extraArgs or use engine=cli"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn instructions_bundle_entry_content(agent: &Agent) -> Option<String> {
+    let bundle = agent.metadata.0.instructions_bundle.as_ref()?;
+    let entry_file = bundle
+        .get("entryFile")
+        .and_then(Value::as_str)
+        .unwrap_or("AGENTS.md");
+    bundle
+        .get("files")
+        .and_then(Value::as_object)
+        .and_then(|files| files.get(entry_file))
+        .and_then(Value::as_str)
+        .filter(|content| !content.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
 
 /// Heartbeat service for managing agent wake/sleep lifecycle
 #[async_trait]
@@ -2579,6 +2604,31 @@ impl DefaultHeartbeatService {
             {
                 args.extend(["--append-system-prompt-file".into(), instructions_path.to_owned()]);
             }
+            // Catalog-installed agents carry a managed instructions bundle in
+            // metadata. When no explicit prompt/file is configured, pass its
+            // entry file to Claude directly so the catalog instructions are
+            // effective in the runtime rather than only visible in the UI.
+            let has_explicit_instruction_arg = args.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--append-system-prompt" | "--append-system-prompt-file" | "--system-prompt"
+                )
+            });
+            let has_explicit_instruction_config = [
+                "instructionsFilePath",
+                "instructions_file_path",
+                "systemPrompt",
+                "system_prompt",
+                "appendSystemPrompt",
+                "append_system_prompt",
+            ]
+            .iter()
+            .any(|key| cfg.get(*key).and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty()));
+            if !has_explicit_instruction_arg && !has_explicit_instruction_config {
+                if let Some(instructions) = instructions_bundle_entry_content(&agent) {
+                    args.extend(["--append-system-prompt".into(), instructions]);
+                }
+            }
             if let Some(system_prompt) = cfg
                 .get("systemPrompt")
                 .or_else(|| cfg.get("system_prompt"))
@@ -2635,6 +2685,11 @@ impl DefaultHeartbeatService {
                 args.insert(insert_at, "--dangerously-bypass-approvals-and-sandbox".into());
             }
         }
+        // A persisted legacy adapter config may still carry `--acp` in its
+        // custom args/extraArgs even when `engine` is absent or `auto`. Fail
+        // before spawning a process with an actionable message instead of
+        // turning the issue into a silent heartbeat failure.
+        reject_unsupported_claude_args(adapter, &args)?;
         let task_key: String = sqlx::query_scalar(
             "SELECT COALESCE(
                 context_snapshot->>'taskKey',
@@ -4556,7 +4611,8 @@ mod adapter_outcome_tests {
         is_retryable_provider_status, parse_adapter_outcome, provider_http_retries,
         provider_http_timeout, provider_retry_after, provider_retry_delay,
         provider_retry_delay_with_hint, redact_adapter_secret, resolve_acp_mode, resolve_biller,
-        valid_claude_resume_session, valid_codex_resume_session, AdapterCommandOutput,
+        reject_unsupported_claude_args, valid_claude_resume_session, valid_codex_resume_session,
+        AdapterCommandOutput,
     };
 
     #[test]
@@ -4864,6 +4920,25 @@ mod adapter_outcome_tests {
         assert!(resolve_acp_mode("claude_local", "acp").is_err());
         assert!(resolve_acp_mode("codex_local", "auto").unwrap());
         assert!(resolve_acp_mode("codex_local", "acp").unwrap());
+    }
+
+    #[test]
+    fn rejects_legacy_claude_acp_args_before_process_start() {
+        assert!(reject_unsupported_claude_args(
+            "claude_local",
+            &["--print".to_string(), "--acp".to_string()]
+        )
+        .is_err());
+        assert!(reject_unsupported_claude_args(
+            "claude_local",
+            &["--print".to_string()]
+        )
+        .is_ok());
+        assert!(reject_unsupported_claude_args(
+            "codex_local",
+            &["--acp".to_string()]
+        )
+        .is_ok());
     }
 
     #[test]
