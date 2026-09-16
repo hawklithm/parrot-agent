@@ -257,6 +257,27 @@ const RUN_SELECT: &str = r#"SELECT id, company_id, agent_id, invocation_source, 
        (SELECT adapter_type FROM agents WHERE agents.id = agent_id) AS adapter_type
   FROM heartbeat_runs"#;
 
+// `RUN_SELECT` is intentionally unaliased because it is reused by queries
+// that append predicates directly to `FROM heartbeat_runs`.  Issue history
+// uses a complete, separate query so its outer references consistently use
+// the `hr` alias without relying on SQL string concatenation.
+const ISSUE_RUN_QUERY: &str = r#"SELECT hr.id, hr.company_id, hr.agent_id, hr.invocation_source, hr.status::text,
+       hr.responsible_user_id, hr.started_at, hr.finished_at, hr.error, hr.exit_code,
+       hr.context_snapshot, hr.output, hr.result_json, hr.scheduled_retry_at, hr.scheduled_retry_attempt,
+       hr.scheduled_retry_reason, hr.created_at, hr.updated_at,
+       (SELECT COALESCE(MAX(seq), 0)::bigint FROM heartbeat_run_events
+          WHERE heartbeat_run_events.run_id = hr.id) AS last_output_seq,
+       (SELECT name FROM agents WHERE agents.id = hr.agent_id) AS agent_name,
+       (SELECT adapter_type FROM agents WHERE agents.id = hr.agent_id) AS adapter_type
+  FROM heartbeat_runs AS hr
+ WHERE EXISTS (SELECT 1 FROM issues i WHERE i.id = $1 AND i.company_id = hr.company_id)
+   AND (hr.context_snapshot->>'issueId' = $1::text
+     OR EXISTS (SELECT 1 FROM activity_logs al WHERE al.company_id = hr.company_id
+                   AND al.resource_type = 'issue' AND al.resource_id = $1
+                   AND al.run_id = hr.id)
+     OR EXISTS (SELECT 1 FROM issues i WHERE i.id = $1 AND i.execution_run_id = hr.id))
+ ORDER BY hr.created_at DESC"#;
+
 /// X1: GET /companies/:company_id/heartbeat-runs
 async fn list_company_heartbeat_runs(
     State(state): State<AppState>,
@@ -861,24 +882,11 @@ async fn list_issue_runs(
         .ok_or(HeartbeatRunError::NotFound(id))?;
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| HeartbeatRunError::NotFound(id))?;
-    // Keep one projection for both discovery paths.  The previous UNION used
-    // `hr.*` for the second branch, which made the enum `status` disagree with
-    // the `status::text` projection in RUN_SELECT and caused PostgreSQL to
-    // return 500 for issues with execution runs.
-    let rows = sqlx::query(&format!(
-        "{} hr WHERE EXISTS (SELECT 1 FROM issues i WHERE i.id = $1 AND i.company_id = hr.company_id) \
-          AND (hr.context_snapshot->>'issueId' = $1::text \
-            OR EXISTS (SELECT 1 FROM activity_logs al WHERE al.company_id = hr.company_id \
-                      AND al.resource_type = 'issue' AND al.resource_id = $1 \
-                      AND al.run_id = hr.id) \
-            OR EXISTS (SELECT 1 FROM issues i WHERE i.id = $1 AND i.execution_run_id = hr.id)) \
-          ORDER BY hr.created_at DESC",
-        RUN_SELECT
-    ))
-    .bind(id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
+    let rows = sqlx::query(ISSUE_RUN_QUERY)
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| HeartbeatRunError::Database(e.to_string()))?;
 
     // Paperclip's issue-run client uses `runId` (while the general heartbeat
     // run contract uses `id`). Keep both names here so the UI can construct
@@ -907,16 +915,27 @@ pub enum HeartbeatRunError {
 
 impl IntoResponse for HeartbeatRunError {
     fn into_response(self) -> axum::response::Response {
-        let (status, msg) = match self {
+        let (status, msg, error_name) = match self {
             HeartbeatRunError::NotFound(id) => (
                 StatusCode::NOT_FOUND,
                 format!("Heartbeat run not found: {}", id),
+                "NotFound",
             ),
-            HeartbeatRunError::Database(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            HeartbeatRunError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            HeartbeatRunError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
+            HeartbeatRunError::Database(msg) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, msg, "Database")
+            }
+            HeartbeatRunError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg, "BadRequest"),
+            HeartbeatRunError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg, "Forbidden"),
         };
-        (status, Json(json!({ "error": msg }))).into_response()
+        let mut response = (status, Json(json!({ "error": msg.clone() }))).into_response();
+        if status.is_server_error() {
+            response.extensions_mut().insert(crate::errors::ErrorContext {
+                message: msg.clone(),
+                name: error_name,
+                details: Some(json!({ "message": msg })),
+            });
+        }
+        response
     }
 }
 
@@ -929,5 +948,25 @@ mod tests {
     #[test]
     fn heartbeat_run_router_constructs() {
         let _ = heartbeat_run_routes();
+    }
+
+    #[test]
+    fn issue_run_query_uses_one_consistent_table_alias() {
+        assert!(ISSUE_RUN_QUERY.contains("FROM heartbeat_runs AS hr"));
+        assert!(ISSUE_RUN_QUERY.contains("heartbeat_run_events.run_id = hr.id"));
+        assert!(ISSUE_RUN_QUERY.contains("agents.id = hr.agent_id"));
+        assert!(!ISSUE_RUN_QUERY.contains("heartbeat_runs.id"));
+        assert!(!ISSUE_RUN_QUERY.contains("= agent_id"));
+    }
+
+    #[test]
+    fn database_errors_carry_http_log_context() {
+        let response = HeartbeatRunError::Database("query failed".to_string()).into_response();
+        let context = response
+            .extensions()
+            .get::<crate::errors::ErrorContext>()
+            .expect("database errors must carry ErrorContext");
+        assert_eq!(context.name, "Database");
+        assert_eq!(context.message, "query failed");
     }
 }
