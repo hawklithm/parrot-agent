@@ -1044,6 +1044,18 @@ async fn persist_heartbeat_run_event(
     .bind(payload)
     .execute(&mut *tx)
     .await?;
+    // Run recovery uses heartbeat_runs.updated_at as its durable activity
+    // watermark. Keep that watermark in sync with the event stream so a run
+    // that is still producing output is not selected as an orphan after a
+    // restart (or when the in-memory child registry is temporarily absent).
+    sqlx::query(
+        "UPDATE heartbeat_runs
+         SET updated_at = NOW()
+         WHERE id = $1 AND status IN ('queued', 'running')",
+    )
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await
 }
 
@@ -2968,6 +2980,7 @@ impl DefaultHeartbeatService {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| e.to_string())?;
+        let child_ref = self.register_child(run_id, child).await;
         sqlx::query("UPDATE heartbeat_runs SET status = 'running', started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND status = 'queued'").bind(run_id).execute(&self.pool).await.map_err(|e| e.to_string())?;
         let running_event = serde_json::json!({
             "runId": run_id,
@@ -2997,7 +3010,6 @@ impl DefaultHeartbeatService {
             running_event,
         )
         .await;
-        let child_ref = Arc::new(Mutex::new(child));
         // Release the Heartbeat Start Lock now that the child process is spawned and tracked in
         // self.children (which itself prevents a second concurrent child for this run). The lock
         // only guarded the spawn race; a release failure is non-fatal (rows auto-expire).
@@ -3144,6 +3156,17 @@ impl DefaultHeartbeatService {
             },
             runtime_secret_manifest,
         })
+    }
+
+    /// Keep the spawned process addressable by cancellation and orphan
+    /// reconciliation for the whole lifetime of the adapter command.
+    async fn register_child(&self, run_id: Uuid, child: Child) -> Arc<Mutex<Child>> {
+        let child_ref = Arc::new(Mutex::new(child));
+        self.children
+            .lock()
+            .await
+            .insert(run_id, Arc::clone(&child_ref));
+        child_ref
     }
 }
 
@@ -3987,7 +4010,8 @@ impl DefaultHeartbeatService {
 
             let updated = sqlx::query(
                 "UPDATE heartbeat_runs
-                 SET status = 'failed', error = $2, finished_at = NOW(), updated_at = NOW(),
+                 SET status = 'failed', error = $2, error_code = 'process_lost',
+                     error_family = 'process', finished_at = NOW(), updated_at = NOW(),
                      result_json = COALESCE(result_json, '{}'::jsonb) || '{\"processLost\":true}'::jsonb
                  WHERE id = $1 AND status = 'running'",
             )
@@ -5278,5 +5302,176 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.cancel_call_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod process_liveness_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test]
+    async fn register_child_makes_process_visible_to_reconciliation() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/parrot_agent_test")
+            .expect("test pool URL should parse");
+        let service = DefaultHeartbeatService::new(pool);
+        let run_id = Uuid::new_v4();
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn test child");
+
+        let child_ref = service.register_child(run_id, child).await;
+        assert!(service.children.lock().await.contains_key(&run_id));
+
+        let mut child = child_ref.lock().await;
+        child.kill().await.expect("kill test child");
+        child.wait().await.expect("wait for test child");
+        drop(child);
+        service.children.lock().await.remove(&run_id);
+        assert!(!service.children.lock().await.contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn persisted_run_event_refreshes_running_run_activity() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping run liveness test: DATABASE_URL is not set");
+            return;
+        };
+        let Ok(pool) = PgPool::connect(&database_url).await else {
+            eprintln!("skipping run liveness test: DATABASE_URL is not reachable");
+            return;
+        };
+
+        let company_id = Uuid::new_v4();
+        let issue_prefix = format!("L{}", &company_id.simple().to_string()[..6]);
+        sqlx::query(
+            "INSERT INTO companies (id, name, issue_prefix)
+             VALUES ($1, 'Heartbeat Liveness Test Co', $2)",
+        )
+        .bind(company_id)
+        .bind(&issue_prefix)
+        .execute(&pool)
+        .await
+        .expect("insert liveness test company");
+
+        let agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents (id, company_id, name)
+             VALUES ($1, $2, 'Heartbeat Liveness Test Agent')",
+        )
+        .bind(agent_id)
+        .bind(company_id)
+        .execute(&pool)
+        .await
+        .expect("insert liveness test agent");
+
+        let run_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO heartbeat_runs
+                (id, company_id, agent_id, invocation_source, status,
+                 context_snapshot, created_at, updated_at)
+             VALUES ($1, $2, $3, 'on_demand', 'running', $4::jsonb,
+                     NOW() - INTERVAL '10 minutes',
+                     NOW() - INTERVAL '10 minutes')",
+        )
+        .bind(run_id)
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(serde_json::json!({ "test": "liveness" }))
+        .execute(&pool)
+        .await
+        .expect("insert stale running test run");
+
+        let before: DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM heartbeat_runs WHERE id = $1")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read stale run timestamp");
+        persist_heartbeat_run_event(
+            &pool,
+            company_id,
+            run_id,
+            agent_id,
+            "heartbeat.run.log",
+            Some("stdout"),
+            Some("info"),
+            Some("still working"),
+            &serde_json::json!({ "chunk": "still working" }),
+        )
+        .await
+        .expect("persist liveness event");
+
+        let after: DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM heartbeat_runs WHERE id = $1")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read refreshed run timestamp");
+        assert!(after > before, "run activity timestamp must advance");
+
+        let service = DefaultHeartbeatService::new(pool.clone());
+        assert_eq!(
+            service
+                .reconcile_orphaned_runs(300)
+                .await
+                .expect("reconcile test runs"),
+            0,
+            "a run with a recent event must not be marked process-lost"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status::text FROM heartbeat_runs WHERE id = $1")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read liveness test status");
+        assert_eq!(status, "running");
+
+        sqlx::query(
+            "UPDATE heartbeat_runs
+             SET updated_at = NOW() - INTERVAL '10 minutes'
+             WHERE id = $1",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("age liveness test run");
+        assert_eq!(
+            service
+                .reconcile_orphaned_runs(300)
+                .await
+                .expect("reconcile stale test run"),
+            1,
+            "an actually stale run should be reconciled"
+        );
+        let process_lost: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status::text, error_code, error_family
+             FROM heartbeat_runs WHERE id = $1",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read process-lost metadata");
+        assert_eq!(process_lost.0, "failed");
+        assert_eq!(process_lost.1.as_deref(), Some("process_lost"));
+        assert_eq!(process_lost.2.as_deref(), Some("process"));
+
+        sqlx::query("DELETE FROM heartbeat_runs WHERE id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM agents WHERE id = $1")
+            .bind(agent_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM companies WHERE id = $1")
+            .bind(company_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }

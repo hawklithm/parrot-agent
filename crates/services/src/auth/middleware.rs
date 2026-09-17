@@ -173,7 +173,9 @@ impl ToolGatewayTokenResolver {
                     .and_then(|value| value.strip_prefix("Bearer "))
             })
             .map(str::trim)
-            .filter(|value| value.starts_with("ptg_") && !value.is_empty())
+            .filter(|value| {
+                !value.is_empty() && (value.starts_with("ptg_") || value.starts_with("pcgw_"))
+            })
             .map(ToOwned::to_owned)
     }
 }
@@ -188,11 +190,46 @@ impl ActorResolver for ToolGatewayTokenResolver {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
         let token_hash = hex::encode(hasher.finalize());
+        // Named Paperclip-compatible gateway tokens are materialized as a
+        // session lazily, just like the MCP route's session loader. This lets
+        // built-in Paperclip tools reuse the normal REST authorization
+        // middleware even though no heartbeat run exists.
+        let _ = sqlx::query(
+            "INSERT INTO tool_gateway_sessions
+                (id, company_id, agent_id, run_id, issue_id, token_hash, expires_at,
+                 gateway_id, gateway_token_id, gateway_public_id,
+                 client_subject_type, client_subject_id, client_name, mcp_session_id)
+             SELECT gen_random_uuid(), g.company_id, g.agent_id, NULL, g.issue_id, t.token_hash,
+                    COALESCE(t.expires_at, NOW() + INTERVAL '10 years'),
+                    t.gateway_id, t.id, g.gateway_public_id,
+                    t.subject_type, t.subject_id, t.client_label, NULL
+               FROM tool_mcp_gateway_tokens t
+               JOIN tool_mcp_gateways g ON g.id = t.gateway_id AND g.company_id = t.company_id
+              WHERE t.token_hash = $1 AND t.revoked_at IS NULL
+             ON CONFLICT (token_hash) DO NOTHING",
+        )
+        .bind(&token_hash)
+        .execute(&*self.pool)
+        .await;
+        let _ = sqlx::query(
+            "UPDATE tool_gateway_sessions
+                SET mcp_session_id = COALESCE(mcp_session_id, id::text),
+                    updated_at = NOW()
+              WHERE token_hash = $1",
+        )
+        .bind(&token_hash)
+        .execute(&*self.pool)
+        .await;
         let row = sqlx::query(
             "SELECT s.company_id, s.agent_id, s.run_id, s.expires_at, s.revoked_at,
-                    r.status::text AS run_status
+                    r.status::text AS run_status,
+                    t.id AS gateway_token_id, t.expires_at AS gateway_token_expires_at,
+                    t.revoked_at AS gateway_token_revoked_at,
+                    g.status AS gateway_status
              FROM tool_gateway_sessions s
-             JOIN heartbeat_runs r ON r.id = s.run_id
+             LEFT JOIN heartbeat_runs r ON r.id = s.run_id
+             LEFT JOIN tool_mcp_gateway_tokens t ON t.token_hash = s.token_hash
+             LEFT JOIN tool_mcp_gateways g ON g.id = t.gateway_id
             WHERE s.token_hash = $1",
         )
         .bind(&token_hash)
@@ -215,38 +252,79 @@ impl ActorResolver for ToolGatewayTokenResolver {
         if revoked_at.is_some() || expires_at <= chrono::Utc::now() {
             return Ok(None);
         }
-        let run_status: String = sqlx::Row::try_get(&row, "run_status").map_err(|error| AuthError::Internal {
-            message: format!("Tool gateway session is malformed: {error}"),
-        })?;
-        if !matches!(run_status.as_str(), "queued" | "running") {
-            return Ok(None);
+        let gateway_token_id: Option<Uuid> =
+            sqlx::Row::try_get(&row, "gateway_token_id").map_err(|error| {
+                AuthError::Internal {
+                    message: format!("Tool gateway session is malformed: {error}"),
+                }
+            })?;
+        if let Some(_gateway_token_id) = gateway_token_id {
+            let gateway_status: Option<String> =
+                sqlx::Row::try_get(&row, "gateway_status").map_err(|error| {
+                    AuthError::Internal {
+                        message: format!("Tool gateway session is malformed: {error}"),
+                    }
+                })?;
+            let token_revoked_at: Option<chrono::DateTime<chrono::Utc>> =
+                sqlx::Row::try_get(&row, "gateway_token_revoked_at").map_err(|error| {
+                    AuthError::Internal {
+                        message: format!("Tool gateway session is malformed: {error}"),
+                    }
+                })?;
+            let token_expires_at: Option<chrono::DateTime<chrono::Utc>> =
+                sqlx::Row::try_get(&row, "gateway_token_expires_at").map_err(|error| {
+                    AuthError::Internal {
+                        message: format!("Tool gateway session is malformed: {error}"),
+                    }
+                })?;
+            if gateway_status.as_deref() != Some("active")
+                || token_revoked_at.is_some()
+                || token_expires_at.is_some_and(|expires_at| expires_at <= chrono::Utc::now())
+            {
+                return Ok(None);
+            }
+        } else {
+            let run_status: Option<String> =
+                sqlx::Row::try_get(&row, "run_status").map_err(|error| {
+                    AuthError::Internal {
+                        message: format!("Tool gateway session is malformed: {error}"),
+                    }
+                })?;
+            if !matches!(run_status.as_deref(), Some("queued") | Some("running")) {
+                return Ok(None);
+            }
         }
         let company_id: Uuid = sqlx::Row::try_get(&row, "company_id").map_err(|error| {
             AuthError::Internal {
                 message: format!("Tool gateway session is malformed: {error}"),
             }
         })?;
-        let agent_id: Uuid = sqlx::Row::try_get(&row, "agent_id").map_err(|error| {
+        let agent_id: Option<Uuid> = sqlx::Row::try_get(&row, "agent_id").map_err(|error| {
             AuthError::Internal {
                 message: format!("Tool gateway session is malformed: {error}"),
             }
         })?;
-        let run_id: Uuid = sqlx::Row::try_get(&row, "run_id").map_err(|error| {
+        let run_id: Option<Uuid> = sqlx::Row::try_get(&row, "run_id").map_err(|error| {
             AuthError::Internal {
                 message: format!("Tool gateway session is malformed: {error}"),
             }
         })?;
+        let Some(agent_id) = agent_id else {
+            // Agent-less named gateways are valid for catalog MCP access, but
+            // cannot impersonate a REST agent actor.
+            return Ok(None);
+        };
         let _ = sqlx::query(
             "UPDATE tool_gateway_sessions SET last_used_at = NOW(), updated_at = NOW()
              WHERE token_hash = $1",
         )
-        .bind(token_hash)
+        .bind(&token_hash)
         .execute(&*self.pool)
         .await;
         Ok(Some(AuthorizationActor::agent_with_source(
             agent_id,
             company_id,
-            Some(run_id),
+            run_id,
             ActorSource::AgentJwt,
         )))
     }

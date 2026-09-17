@@ -12,12 +12,12 @@ use uuid::Uuid;
 pub(crate) struct PaperclipInternalClient {
     client: Client,
     token: String,
-    run_id: Uuid,
+    run_id: Option<Uuid>,
     base_url: String,
 }
 
 impl PaperclipInternalClient {
-    pub(crate) fn new(token: &str, run_id: Uuid) -> Self {
+    pub(crate) fn new(token: &str, run_id: Option<Uuid>) -> Self {
         let configured = std::env::var("PAPERCLIP_API_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3100/api".to_string());
         let base_url = configured.trim_end_matches('/');
@@ -46,8 +46,10 @@ impl PaperclipInternalClient {
             .client
             .request(method.clone(), &url)
             .header("x-paperclip-tool-gateway-token", &self.token)
-            .header("x-paperclip-run-id", self.run_id.to_string())
             .header("accept", "application/json");
+        if let Some(run_id) = self.run_id {
+            request = request.header("x-paperclip-run-id", run_id.to_string());
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }

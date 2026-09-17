@@ -27,7 +27,7 @@ tracing = { workspace = true }
 sha2 = "0.10"
 base64 = "0.22"
 urlencoding = "2.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 url = "2"
 rand = { workspace = true }
 resvg = "0.45"

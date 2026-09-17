@@ -1,9 +1,9 @@
-//! Tool access read endpoints.
+//! Tool access read endpoints and the hosted MCP gateway.
 //!
-//! The tool-access persistence/service layer has not been migrated yet, but
-//! Paperclip's UI expects these company-scoped read contracts to exist. Return
-//! the same empty, typed envelopes until tool connections, profiles and
-//! policies are backed by their repositories.
+//! This module owns the Paperclip-compatible MCP protocol surface: built-in
+//! API tools, remote/stdio discovery and execution, gateway sessions and
+//! policy/audit integration. The companion `tool_access` module owns the
+//! board-facing connection/profile setup workflow.
 
 use axum::{
     body::to_bytes,
@@ -14,28 +14,53 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::Engine as _;
 use futures::StreamExt;
 use models::{CommentActorType, CreateIssueInput, UpdateIssueInput};
-use serde_json::Value;
+use serde_json::{json, Value};
 use services::issue_service::{
     CheckoutInput, IssueQueryFilter, Pagination as IssuePagination, ReleaseInput,
 };
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::collections::HashMap;
 use std::convert::Infallible;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use std::net::IpAddr;
+use std::time::Duration;
+use rand::{rngs::OsRng, RngCore};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::mcp::{request_kind, McpInvocationContext, McpRequestKind, McpToolDefinition};
+use crate::mcp::{request_kind, McpRequestKind, McpToolDefinition};
 use crate::paperclip_internal::PaperclipInternalClient;
 use services::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService, PermissionKey};
+use services::mcp_http::{mcp_http_request_headers, parse_mcp_http_response_body};
+
+const TOOL_POLICY_QUERY: &str = r#"SELECT id, policy_type, selectors, config, description
+     FROM tool_policies
+    WHERE company_id = $1 AND enabled = true
+    ORDER BY priority ASC, created_at ASC"#;
+
+const TRUST_RULE_HIT_UPDATE: &str = r#"UPDATE tool_policies SET config = jsonb_set(
+     jsonb_set(config, '{trustRule,hitCount}',
+         (((COALESCE(config->'trustRule'->>'hitCount','0'))::int + 1))::text::jsonb),
+     '{trustRule,lastHitAt}', to_jsonb(NOW()))
+ WHERE id = $1"#;
+const TOOL_APPROVAL_DESCRIPTION_SUFFIX: &str =
+    "Requires human approval: calling it posts an approval card on your task and you will be woken with the result once decided.";
 
 fn hash_gateway_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn random_named_gateway_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn gateway_token(headers: &HeaderMap) -> Option<String> {
@@ -68,8 +93,80 @@ pub(crate) async fn mcp_http_request(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    let response = reqwest::Client::new()
-        .post(url)
+    mcp_http_request_with_config(url, method, params, None).await
+}
+
+/// Execute one MCP Streamable HTTP request using the connection's transport
+/// configuration. Paperclip always advertises JSON + SSE and accepts either
+/// response shape; keeping that behavior in this shared path also fixes
+/// catalog refresh, gateway discovery, and tool calls at once.
+pub(crate) async fn mcp_http_request_with_config(
+    url: &str,
+    method: &str,
+    params: Value,
+    transport_config: Option<&Value>,
+) -> Result<Value, String> {
+    mcp_http_request_with_headers(url, method, params, transport_config, None).await
+}
+
+pub(crate) async fn mcp_http_request_with_headers(
+    url: &str,
+    method: &str,
+    params: Value,
+    transport_config: Option<&Value>,
+    resolved_headers: Option<&HashMap<String, String>>,
+) -> Result<Value, String> {
+    validate_mcp_http_endpoint(url).await?;
+    let mut extra_headers = transport_config
+        .and_then(|config| config.get("headers"))
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    let value = value.as_str()?.to_string();
+                    let name = name.trim().to_ascii_lowercase();
+                    if !valid_mcp_header_name(&name)
+                        || name.is_empty()
+                        || matches!(
+                            name.as_str(),
+                            "accept" | "content-type" | "content-length" | "host" | "connection"
+                        )
+                        || value.contains('\r')
+                        || value.contains('\n')
+                    {
+                        return None;
+                    }
+                    Some((name, value))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    if let Some(resolved_headers) = resolved_headers {
+        for (name, value) in resolved_headers {
+            add_mcp_header(&mut extra_headers, name, value);
+        }
+    }
+    let headers = mcp_http_request_headers(Some(&extra_headers));
+    let timeout_ms = transport_config
+        .and_then(|config| {
+            config
+                .get("timeoutMs")
+                .or_else(|| config.get("timeout_ms"))
+                .or_else(|| config.get("requestTimeoutMs"))
+        })
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000)
+        .clamp(1_000, 60_000);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .map_err(|error| format!("MCP HTTP client initialization failed: {error}"))?;
+    let mut request = client.post(url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": Uuid::new_v4(),
@@ -78,16 +175,174 @@ pub(crate) async fn mcp_http_request(
         }))
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("MCP HTTP request failed: {error}"))?;
     let status = response.status();
-    let body: Value = response.json().await.map_err(|error| error.to_string())?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    if response
+        .content_length()
+        .is_some_and(|length| length > 1_000_000)
+    {
+        return Err("MCP response exceeded the 1 MB gateway limit".to_string());
+    }
+    let mut response_body = Vec::new();
+    let mut response_stream = response.bytes_stream();
+    while let Some(chunk) = response_stream.next().await {
+        let chunk = chunk.map_err(|error| format!("MCP response body read failed: {error}"))?;
+        if response_body.len().saturating_add(chunk.len()) > 1_000_000 {
+            return Err("MCP response exceeded the 1 MB gateway limit".to_string());
+        }
+        response_body.extend_from_slice(&chunk);
+    }
+    let body_text = String::from_utf8(response_body)
+        .map_err(|error| format!("MCP response body was not valid UTF-8: {error}"))?;
+    let body = parse_mcp_http_response_body(&body_text, content_type.as_deref())
+        .map_err(|error| format!("MCP response is not valid JSON/SSE: {error}"))?;
     if !status.is_success() {
-        return Err(format!("MCP server returned HTTP {}", status));
+        return Err(format!("MCP server returned HTTP {status}"));
     }
     if let Some(error) = body.get("error") {
-        return Err(error.to_string());
+        return Err(format!("MCP server returned JSON-RPC error: {error}"));
     }
-    Ok(body.get("result").cloned().unwrap_or(body))
+    let mut result = body.get("result").cloned().unwrap_or_else(|| body.clone());
+    // A few MCP servers attach an elicitation request beside the JSON-RPC
+    // result rather than inside it. Preserve that metadata for the gateway's
+    // interaction bridge instead of dropping it while unwrapping `result`.
+    if let (Some(body_object), Some(result_object)) = (body.as_object(), result.as_object_mut()) {
+        for key in ["elicitation", "elicitationRequest"] {
+            if !result_object.contains_key(key) {
+                if let Some(value) = body_object.get(key) {
+                    result_object.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        if !result_object.contains_key("_meta") {
+            if let Some(value) = body_object.get("_meta") {
+                result_object.insert("_meta".to_string(), value.clone());
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Validate the URL before handing it to reqwest. The deployment-specific
+/// private-network policy belongs at connection activation time; this shared
+/// transport guard still rejects malformed or non-HTTP endpoints on every
+/// execution path and prevents credentials from being sent to URL userinfo.
+async fn validate_mcp_http_endpoint(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|_| "MCP endpoint URL is invalid".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("MCP endpoint URL must use http or https and include a host".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err("MCP endpoint URL must not contain credentials or a fragment".to_string());
+    }
+    if mcp_private_endpoints_disallowed() {
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "MCP endpoint URL must include a host".to_string())?
+            .trim_matches(['[', ']'])
+            .to_ascii_lowercase();
+        if host == "localhost" || host.ends_with(".localhost") {
+            return Err(
+                "MCP endpoint URL cannot target private or reserved network addresses".to_string(),
+            );
+        }
+        if let Ok(address) = host.parse::<IpAddr>() {
+            if mcp_private_or_reserved_ip(address) {
+                return Err(
+                    "MCP endpoint URL cannot target private or reserved network addresses"
+                        .to_string(),
+                );
+            }
+        } else {
+            let port = parsed.port_or_known_default().ok_or_else(|| {
+                "MCP endpoint URL must use a scheme with a known port".to_string()
+            })?;
+            let addresses = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|_| "MCP endpoint hostname could not be resolved".to_string())?
+                .collect::<Vec<_>>();
+            if addresses.is_empty() {
+                return Err("MCP endpoint hostname did not resolve".to_string());
+            }
+            if addresses
+                .into_iter()
+                .any(|address| mcp_private_or_reserved_ip(address.ip()))
+            {
+                return Err(
+                    "MCP endpoint URL cannot resolve to private or reserved network addresses"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mcp_private_endpoints_disallowed() -> bool {
+    std::env::var("DEPLOYMENT_MODE")
+        .ok()
+        .as_deref()
+        == Some("authenticated")
+        && std::env::var("DEPLOYMENT_EXPOSURE")
+            .ok()
+            .as_deref()
+            == Some("public")
+}
+
+fn mcp_private_or_reserved_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [a, b, c, _] = address.octets();
+            a == 0
+                || a == 10
+                || (a == 100 && (64..=127).contains(&b))
+                || a == 127
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 168)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            let mapped_ipv4 = if segments[..5] == [0, 0, 0, 0, 0]
+                && segments[5] == 0xffff
+            {
+                Some(IpAddr::V4(std::net::Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                )))
+            } else {
+                None
+            };
+            mapped_ipv4.is_some_and(mcp_private_or_reserved_ip)
+                || address.is_unspecified()
+                || address.is_loopback()
+                || address.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x0100
+                    && segments[1] == 0
+                    && segments[2] == 0
+                    && segments[3] == 0)
+                || (segments[0] == 0x2001
+                    && (segments[1] == 0xdb8 || segments[1] == 0x0002))
+                || segments[0] == 0x2002
+                || (segments[0] == 0x64 && segments[1] == 0xff9b)
+        }
+    }
 }
 
 fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
@@ -135,8 +390,71 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
         ("paperclipAddApprovalComment", "Add a comment to an approval"),
         ("paperclipApiRequest", "Make a JSON request to an existing /api endpoint"),
     ];
+    // These are Parrot's already-implemented Paperclip API extensions. They
+    // were present in the argument schema/dispatcher, but were missing from
+    // the registry, which made them impossible to discover or invoke through
+    // MCP. Keep them separate from the 41-tool Paperclip standalone contract
+    // so parity tests can distinguish upstream tools from Parrot additions.
+    const PARROT_EXTENDED_TOOLS: &[(&str, &str)] = &[
+        ("paperclipCreateCase", "Create a case"),
+        ("paperclipGetCase", "Get a case by id or identifier"),
+        ("paperclipUpdateCase", "Update a case"),
+        ("paperclipListCases", "List cases in a company"),
+        ("paperclipGetCaseChildren", "List child cases"),
+        ("paperclipGetCaseEvents", "List case events"),
+        ("paperclipGetIssueCases", "List cases linked to an issue"),
+        ("paperclipGetCaseDocument", "Get a case document"),
+        ("paperclipListCaseDocuments", "List case documents"),
+        ("paperclipUpsertCaseDocument", "Create or update a case document"),
+        ("paperclipDeleteCaseDocument", "Delete a case document"),
+        ("paperclipRestoreCaseDocumentRevision", "Restore a case document revision"),
+        ("paperclipLockCaseDocument", "Lock a case document"),
+        ("paperclipUnlockCaseDocument", "Unlock a case document"),
+        ("paperclipListCaseDocumentRevisions", "List case document revisions"),
+        ("paperclipListCaseDocumentAnnotations", "List case document annotations"),
+        ("paperclipCreateCaseDocumentAnnotation", "Create a case document annotation"),
+        ("paperclipGetCaseDocumentAnnotationThread", "Get a case document annotation thread"),
+        ("paperclipReplyCaseDocumentAnnotation", "Reply to a case document annotation"),
+        ("paperclipUpdateCaseDocumentAnnotation", "Update a case document annotation"),
+        ("paperclipCreateCaseLink", "Link a case to another resource"),
+        ("paperclipListIssueAttachments", "List issue attachments"),
+        ("paperclipCreateIssueAttachment", "Create an issue attachment"),
+        ("paperclipDeleteAttachment", "Delete an attachment"),
+        ("paperclipGetAttachmentContent", "Get attachment content"),
+        ("paperclipListIssueDocumentAnnotations", "List issue document annotations"),
+        ("paperclipCreateIssueDocumentAnnotation", "Create an issue document annotation"),
+        ("paperclipGetIssueDocumentAnnotationThread", "Get an issue document annotation thread"),
+        ("paperclipReplyIssueDocumentAnnotation", "Reply to an issue document annotation"),
+        ("paperclipUpdateIssueDocumentAnnotation", "Update an issue document annotation"),
+        ("paperclipListIssueExternalObjects", "List issue external objects"),
+        ("paperclipRefreshIssueExternalObjects", "Refresh issue external objects"),
+        ("paperclipListIssueFileResources", "List issue file resources"),
+        ("paperclipGetIssueFileResourceContent", "Get issue file resource content"),
+        ("paperclipResolveIssueFileResource", "Resolve an issue file resource"),
+        ("paperclipListLabels", "List labels"),
+        ("paperclipCreateLabel", "Create a label"),
+        ("paperclipDeleteLabel", "Delete a label"),
+        ("paperclipListRoutines", "List routines"),
+        ("paperclipGetRoutine", "Get a routine"),
+        ("paperclipCreateRoutine", "Create a routine"),
+        ("paperclipUpdateRoutine", "Update a routine"),
+        ("paperclipListRoutineRevisions", "List routine revisions"),
+        ("paperclipRestoreRoutineRevision", "Restore a routine revision"),
+        ("paperclipListRoutineDescriptionAnnotations", "List routine description annotations"),
+        ("paperclipCreateRoutineDescriptionAnnotation", "Create a routine description annotation"),
+        ("paperclipGetRoutineDescriptionAnnotationThread", "Get a routine description annotation thread"),
+        ("paperclipReplyRoutineDescriptionAnnotation", "Reply to a routine description annotation"),
+        ("paperclipUpdateRoutineDescriptionAnnotation", "Update a routine description annotation"),
+        ("paperclipListRoutineRuns", "List routine runs"),
+        ("paperclipRunRoutine", "Run a routine"),
+        ("paperclipCreateRoutineTrigger", "Create a routine trigger"),
+        ("paperclipUpdateRoutineTrigger", "Update a routine trigger"),
+        ("paperclipDeleteRoutineTrigger", "Delete a routine trigger"),
+        ("paperclipRotateRoutineTriggerSecret", "Rotate a routine trigger secret"),
+    ];
     TOOLS
         .iter()
+        .chain(PARROT_EXTENDED_TOOLS.iter())
         .map(|(name, description)| {
             let input_schema = match *name {
                 "paperclipMe" | "paperclipInboxLite" => serde_json::json!({
@@ -567,6 +885,10 @@ fn is_paperclip_builtin_tool(name: &str) -> bool {
         .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
 }
 
+fn is_gateway_virtual_tool(name: &str) -> bool {
+    matches!(name, "search_tools" | "run_tool")
+}
+
 fn allow_first_party_tool_on_default_deny(
     tool_name: &str,
     reason_code: &str,
@@ -579,7 +901,7 @@ fn allow_first_party_tool_on_default_deny(
     // wins, and connected/plugin tools remain default-deny.
     reason_code == "deny_default"
         && !has_active_profile
-        && is_paperclip_builtin_tool(tool_name)
+        && (is_paperclip_builtin_tool(tool_name) || is_gateway_virtual_tool(tool_name))
 }
 
 fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(), String> {
@@ -1279,7 +1601,7 @@ async fn direct_paperclip_service_call(
     state: &AppState,
     company_id: Uuid,
     agent_id: Uuid,
-    run_id: Uuid,
+    run_id: Option<Uuid>,
     tool_name: &str,
     parameters: &Value,
 ) -> Result<Option<Value>, String> {
@@ -1559,6 +1881,8 @@ async fn direct_paperclip_service_call(
                     .unwrap_or_default(),
             )
             .map_err(|error| error.to_string())?;
+            let active_run_id =
+                run_id.ok_or("paperclipCheckoutIssue requires an active heartbeat run")?;
             let requested_agent =
                 optional_uuid_parameter(parameters, "agentId")?.unwrap_or(agent_id);
             if requested_agent != agent_id {
@@ -1590,7 +1914,7 @@ async fn direct_paperclip_service_call(
                         agent_id: Some(agent_id),
                         user_id: None,
                         expected_statuses,
-                        checkout_run_id: run_id,
+                        checkout_run_id: active_run_id,
                     },
                 )
                 .await
@@ -1600,7 +1924,7 @@ async fn direct_paperclip_service_call(
             )
             .bind(issue_id)
             .bind(agent_id)
-            .bind(run_id)
+            .bind(active_run_id)
             .bind(company_id)
             .execute(&state.pool)
             .await
@@ -1632,13 +1956,15 @@ async fn direct_paperclip_service_call(
                     .unwrap_or_default(),
             )
             .map_err(|error| error.to_string())?;
+            let active_run_id =
+                run_id.ok_or("paperclipReleaseIssue requires an active heartbeat run")?;
             state
                 .issue_service
                 .release(
                     issue_id,
                     company_id,
                     ReleaseInput {
-                        release_run_id: run_id,
+                        release_run_id: active_run_id,
                         result: parameters
                             .get("result")
                             .and_then(Value::as_str)
@@ -1699,7 +2025,7 @@ async fn direct_paperclip_service_call(
                                 .to_string(),
                             CommentActorType::Agent,
                             Some(agent_id),
-                            Some(run_id),
+                            run_id,
                             parameters
                                 .get("metadata")
                                 .filter(|value| !value.is_null())
@@ -1722,48 +2048,1363 @@ pub(crate) async fn mcp_stdio_request(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    let mut child = Command::new(command)
+    mcp_stdio_request_with_env(command, args, method, params, None).await
+}
+
+/// Execute an MCP stdio request with an optional, explicitly allow-listed
+/// environment. Local MCP commands are reviewed through a Paperclip-compatible
+/// command template; callers that supply an environment must therefore pass
+/// only the variables approved by that template.
+pub(crate) async fn mcp_stdio_request_with_env(
+    command: &str,
+    args: &[String],
+    method: &str,
+    params: Value,
+    environment: Option<&HashMap<String, String>>,
+) -> Result<Value, String> {
+    if command.trim().is_empty() {
+        return Err("MCP stdio command is empty".to_string());
+    }
+    let mut child_command = Command::new(command);
+    child_command
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let request =
-        serde_json::json!({"jsonrpc":"2.0","id":Uuid::new_v4(),"method":method,"params":params})
-            .to_string()
-            + "\n";
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|error| error.to_string())?;
+        .stderr(std::process::Stdio::piped());
+    if let Some(environment) = environment {
+        child_command.env_clear();
+        child_command.envs(environment);
     }
-    let mut stdout = child.stdout.take().ok_or("MCP stdio stdout unavailable")?;
-    let mut bytes = Vec::new();
-    stdout
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut child = child_command.spawn().map_err(|error| error.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("MCP stdio stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("MCP stdio stdout unavailable")?;
+    let stderr = child.stderr.take().ok_or("MCP stdio stderr unavailable")?;
+    let mut stdout = BufReader::new(stdout).lines();
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = BufReader::new(stderr).take(16_000);
+        let mut output = String::new();
+        let _ = stderr.read_to_string(&mut output).await;
+        output
+    });
+    let timeout = Duration::from_secs(30);
+    let result = async {
+        let initialize_id = Uuid::new_v4().to_string();
+        write_mcp_stdio_message(
+            &mut stdin,
+            Some(&initialize_id),
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "parrot-tool-gateway", "version": env!("CARGO_PKG_VERSION")}
+            }),
+        )
+        .await?;
+        let initialize_result = read_mcp_stdio_response(&mut stdout, &initialize_id, timeout).await?;
+        if method == "initialize" {
+            return Ok(initialize_result);
+        }
+
+        write_mcp_stdio_message(
+            &mut stdin,
+            None,
+            "notifications/initialized",
+            serde_json::json!({}),
+        )
+        .await?;
+        let request_id = Uuid::new_v4().to_string();
+        write_mcp_stdio_message(&mut stdin, Some(&request_id), method, params).await?;
+        read_mcp_stdio_response(&mut stdout, &request_id, timeout).await
+    }
+    .await;
     let _ = child.kill().await;
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    let line = text
-        .lines()
-        .find(|line| line.trim_start().starts_with('{'))
-        .ok_or("MCP stdio returned no JSON")?;
-    let body: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
-    if let Some(error) = body.get("error") {
-        return Err(error.to_string());
+    let _ = child.wait().await;
+    let stderr = stderr_task.await.unwrap_or_default();
+    result.map_err(|error: String| {
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            error
+        } else {
+            format!("{error}; MCP stderr: {}", stderr.chars().take(4_000).collect::<String>())
+        }
+    })
+}
+
+async fn write_mcp_stdio_message(
+    stdin: &mut ChildStdin,
+    id: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<(), String> {
+    let mut message = serde_json::Map::new();
+    message.insert("jsonrpc".to_string(), Value::String("2.0".to_string()));
+    if let Some(id) = id {
+        message.insert("id".to_string(), Value::String(id.to_string()));
     }
-    Ok(body.get("result").cloned().unwrap_or(body))
+    message.insert("method".to_string(), Value::String(method.to_string()));
+    message.insert("params".to_string(), params);
+    let encoded = serde_json::to_vec(&Value::Object(message)).map_err(|error| error.to_string())?;
+    stdin
+        .write_all(&encoded)
+        .await
+        .map_err(|error| format!("MCP stdio write failed: {error}"))?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|error| format!("MCP stdio write failed: {error}"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| format!("MCP stdio flush failed: {error}"))
+}
+
+async fn read_mcp_stdio_response(
+    stdout: &mut Lines<BufReader<ChildStdout>>,
+    expected_id: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
+    loop {
+        let line = tokio::time::timeout(timeout, stdout.next_line())
+            .await
+            .map_err(|_| format!("MCP stdio request {expected_id} timed out"))?
+            .map_err(|error| format!("MCP stdio read failed: {error}"))?
+            .ok_or_else(|| format!("MCP stdio exited before responding to request {expected_id}"))?;
+        if line.len() > 1_000_000 {
+            return Err("MCP stdio response exceeded the 1 MB gateway limit".to_string());
+        }
+        let message: Value = serde_json::from_str(line.trim())
+            .map_err(|error| format!("MCP stdio returned invalid JSON: {error}"))?;
+        if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+            // The server may ask for user input as a JSON-RPC request while a
+            // tools/call response is pending. Return it to the gateway bridge
+            // so it can create an issue interaction instead of silently
+            // discarding the request as an unrelated response.
+            return Ok(message);
+        }
+        let Some(id) = message.get("id") else {
+            // Notifications and server-initiated messages do not complete the
+            // request that is currently pending.
+            continue;
+        };
+        let matches = id.as_str() == Some(expected_id) || id.to_string() == expected_id;
+        if !matches {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            return Err(format!("MCP stdio returned JSON-RPC error: {error}"));
+        }
+        return Ok(message.get("result").cloned().unwrap_or(message));
+    }
 }
 
 fn connection_url(config: &Value) -> Option<String> {
     config
         .get("url")
         .or_else(|| config.get("endpoint"))
+        .or_else(|| config.get("remoteUrl"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct McpStdioTemplate {
+    pub(crate) template_id: String,
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env_keys: Vec<String>,
+    pub(crate) tools: Value,
+    pub(crate) builtin: bool,
+}
+
+/// Paperclip ships a deterministic in-process stdio fixture for validating
+/// catalog discovery and profile policy without depending on an external
+/// executable. Keep the same fixture available to Parrot's local example and
+/// smoke-test paths; production user templates still require a real command.
+pub(crate) fn builtin_mcp_template_tools(template_id: &str) -> Option<Value> {
+    if template_id != "paperclip.synthetic-todo-kv" {
+        return None;
+    }
+    Some(json!([
+        {
+            "name": "list_items",
+            "description": "List deterministic todo items (read-only).",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "annotations": {"readOnlyHint": true}
+        },
+        {
+            "name": "create_item",
+            "description": "Create a todo item.",
+            "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"], "additionalProperties": false},
+            "annotations": {}
+        },
+        {
+            "name": "mark_done",
+            "description": "Mark a todo item done.",
+            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"], "additionalProperties": false},
+            "annotations": {}
+        },
+        {
+            "name": "delete_item",
+            "description": "Delete a todo item.",
+            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"], "additionalProperties": false},
+            "annotations": {"destructiveHint": true}
+        },
+        {
+            "name": "get_value",
+            "description": "Read a deterministic key/value entry (read-only).",
+            "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"], "additionalProperties": false},
+            "annotations": {"readOnlyHint": true}
+        },
+        {
+            "name": "set_value",
+            "description": "Set a deterministic key/value entry.",
+            "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, "value": {}}, "required": ["key", "value"], "additionalProperties": false},
+            "annotations": {}
+        }
+    ]))
+}
+
+pub(crate) fn builtin_mcp_request(
+    template_id: &str,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
+    let tools = builtin_mcp_template_tools(template_id)
+        .ok_or_else(|| format!("unknown built-in MCP template {template_id}"))?;
+    match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": template_id, "version": "1.0.0"}
+        })),
+        "tools/list" => Ok(json!({"tools": tools})),
+        "tools/call" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "built-in MCP tools/call requires a tool name".to_string())?;
+            if !tools
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool.get("name").and_then(Value::as_str) == Some(name)))
+            {
+                return Err(format!("built-in MCP tool {name} was not found"));
+            }
+            let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let content = match name {
+                "list_items" => json!([{"type": "text", "text": "[]"}]),
+                "get_value" => json!([{"type": "text", "text": format!("value={}", arguments.get("key").and_then(Value::as_str).unwrap_or_default())}]),
+                "create_item" => json!([{"type": "text", "text": "created:item-1"}]),
+                "mark_done" => json!([{"type": "text", "text": "done"}]),
+                "delete_item" => json!([{"type": "text", "text": "deleted"}]),
+                "set_value" => json!([{"type": "text", "text": "set"}]),
+                _ => return Err(format!("built-in MCP tool {name} was not found")),
+            };
+            Ok(json!({"content": content}))
+        }
+        _ => Err(format!("built-in MCP method {method} was not found")),
+    }
+}
+
+fn configured_mcp_stdio_template_id(
+    connection_config: &Value,
+    transport_config: &Value,
+) -> Option<String> {
+    connection_config
+        .get("templateId")
+        .or_else(|| connection_config.get("template_id"))
+        .or_else(|| transport_config.get("templateId"))
+        .or_else(|| transport_config.get("template_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn json_string_array(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the reviewed local stdio command. A configured template is the
+/// source of truth for command, arguments, environment allow-list, and the
+/// declared tool descriptors; raw command fields remain a compatibility
+/// fallback for old draft connections that predate the template table.
+pub(crate) async fn resolve_mcp_stdio_template(
+    state: &AppState,
+    company_id: Uuid,
+    connection_config: &Value,
+    transport_config: &Value,
+) -> Result<Option<McpStdioTemplate>, String> {
+    let Some(template_id) = configured_mcp_stdio_template_id(connection_config, transport_config)
+    else {
+        return Ok(None);
+    };
+    if let Some(tools) = builtin_mcp_template_tools(&template_id) {
+        return Ok(Some(McpStdioTemplate {
+            template_id,
+            command: String::new(),
+            args: Vec::new(),
+            env_keys: Vec::new(),
+            tools,
+            builtin: true,
+        }));
+    }
+    let row = sqlx::query(
+        "SELECT template_key, status, command, args, env_keys, tools
+           FROM tool_stdio_command_templates
+          WHERE company_id = $1 AND template_key = $2",
+    )
+    .bind(company_id)
+    .bind(&template_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| format!("MCP stdio template lookup failed: {error}"))?
+    .ok_or_else(|| format!("MCP stdio template {template_id} was not found"))?;
+    let status: String = row.get("status");
+    if status != "active" {
+        return Err(format!("MCP stdio template {template_id} is not active"));
+    }
+    let command: String = row.get("command");
+    if command.trim().is_empty() {
+        return Err(format!("MCP stdio template {template_id} has no executable command"));
+    }
+    Ok(Some(McpStdioTemplate {
+        template_id: row.get("template_key"),
+        command,
+        args: json_string_array(&row.get::<Value, _>("args")),
+        env_keys: json_string_array(&row.get::<Value, _>("env_keys")),
+        tools: row.get("tools"),
+        builtin: false,
+    }))
+}
+
+fn mcp_stdio_template_tool_name(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("name").and_then(Value::as_str))
+}
+
+fn mcp_stdio_template_allows_tool(template: &McpStdioTemplate, tool_name: &str) -> bool {
+    let Some(tools) = template.tools.as_array() else {
+        return false;
+    };
+    tools
+        .iter()
+        .filter_map(mcp_stdio_template_tool_name)
+        .any(|name| name == tool_name)
+}
+
+pub(crate) fn mcp_stdio_environment(
+    connection_config: &Value,
+    transport_config: &Value,
+    template: &McpStdioTemplate,
+) -> HashMap<String, String> {
+    let mut environment = HashMap::new();
+    // Preserve only the small set of process variables needed to resolve a
+    // command and start a child process. Credentials and arbitrary server
+    // process state are never inherited by a reviewed MCP command.
+    for key in ["PATH", "Path", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
+        if let Ok(value) = std::env::var(key) {
+            environment.insert(key.to_string(), value);
+        }
+    }
+    let config_env = connection_config
+        .get("env")
+        .or_else(|| transport_config.get("env"))
+        .and_then(Value::as_object);
+    for key in &template.env_keys {
+        if let Some(value) = config_env
+            .and_then(|values| values.get(key))
+            .and_then(Value::as_str)
+        {
+            environment.insert(key.clone(), value.to_string());
+        }
+    }
+    environment
+}
+
+#[derive(Debug, Clone)]
+struct McpCatalogTool {
+    catalog_entry_id: Uuid,
+    connection_id: Uuid,
+    connection_uid: String,
+    connection_name: String,
+    transport: String,
+    transport_config: Value,
+    connection_config: Value,
+    credential_refs: Value,
+    credential_secret_refs: Value,
+    connection_status: String,
+    enabled: bool,
+    health_status: String,
+    application_id: Uuid,
+    application_key: Option<String>,
+    application_name: String,
+    application_type: String,
+    catalog_name: String,
+    upstream_tool_name: String,
+    title: Option<String>,
+    description: Option<String>,
+    input_schema: Value,
+    output_schema: Option<Value>,
+    annotations: Value,
+    version_hash: Option<String>,
+    schema_hash: Option<String>,
+    risk_level: String,
+    is_read_only: bool,
+    is_write: bool,
+    is_destructive: bool,
+    gateway_name: String,
+}
+
+fn mcp_slug_segment(value: &str, fallback: &str) -> String {
+    let mut slug = String::new();
+    for ch in value.trim().to_ascii_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+        if slug.len() >= 64 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        fallback.to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn mcp_short_stable_id(id: Uuid) -> String {
+    id.simple().to_string()[..8].to_string()
+}
+
+fn mcp_on_demand_enabled(config: &Value) -> bool {
+    let raw = config
+        .get("onDemandTools")
+        .or_else(|| config.get("loadToolsOnDemand"));
+    raw.and_then(Value::as_bool).unwrap_or(false)
+        || raw
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn valid_mcp_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
+                    | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~')
+        })
+}
+
+fn add_mcp_header(headers: &mut HashMap<String, String>, name: &str, value: &str) {
+    let name = name.trim().to_ascii_lowercase();
+    if !valid_mcp_header_name(&name)
+        || matches!(
+            name.as_str(),
+            "accept" | "content-type" | "content-length" | "host" | "connection"
+        )
+        || value.contains('\r')
+        || value.contains('\n')
+    {
+        return;
+    }
+    headers.insert(name, value.to_string());
+}
+
+fn collect_mcp_static_headers(value: &Value, headers: &mut HashMap<String, String>) {
+    match value {
+        Value::Object(values) => {
+            for (name, value) in values {
+                if let Some(value) = value.as_str() {
+                    add_mcp_header(headers, name, value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                let Some(object) = value.as_object() else {
+                    continue;
+                };
+                let Some(name) = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| object.get("key").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                if let Some(value) = object.get("value").and_then(Value::as_str) {
+                    add_mcp_header(headers, name, value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn configured_mcp_static_headers(
+    connection_config: &Value,
+    transport_config: &Value,
+) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if let Some(value) = transport_config.get("headers") {
+        collect_mcp_static_headers(value, &mut headers);
+    }
+    if let Some(policy) = connection_config
+        .get("headerPolicy")
+        .or_else(|| connection_config.get("header_policy"))
+        .and_then(Value::as_object)
+    {
+        if let Some(value) = policy.get("staticHeaders") {
+            collect_mcp_static_headers(value, &mut headers);
+        } else if let Some(value) = policy.get("static_headers") {
+            collect_mcp_static_headers(value, &mut headers);
+        }
+    }
+    if let Some(policy) = transport_config
+        .get("headerPolicy")
+        .or_else(|| transport_config.get("header_policy"))
+        .and_then(Value::as_object)
+    {
+        if let Some(value) = policy
+            .get("staticHeaders")
+            .or_else(|| policy.get("static_headers"))
+        {
+            collect_mcp_static_headers(value, &mut headers);
+        }
+    }
+    headers
+}
+
+fn mcp_sensitive_passthrough_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if name.starts_with("x-paperclip-") {
+        return true;
+    }
+    if matches!(
+        name.as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+    ) {
+        return true;
+    }
+    let parts = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty());
+    parts.clone().any(|part| {
+        matches!(
+            part,
+            "auth" | "authorization" | "cookie" | "secret" | "session" | "token"
+        )
+    }) || name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|parts| parts == ["api", "key"])
+}
+
+fn mcp_header_policy<'a>(
+    connection_config: &'a Value,
+    transport_config: &'a Value,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    connection_config
+        .get("headerPolicy")
+        .or_else(|| connection_config.get("header_policy"))
+        .and_then(Value::as_object)
+        .or_else(|| {
+            transport_config
+                .get("headerPolicy")
+                .or_else(|| transport_config.get("header_policy"))
+                .and_then(Value::as_object)
+        })
+}
+
+fn mcp_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn mcp_header_context_value(
+    field: &str,
+    company_id: Uuid,
+    agent_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    run_id: Option<Uuid>,
+    session_id: Uuid,
+    correlation_id: Uuid,
+) -> Option<String> {
+    match field {
+        "company_id" => Some(company_id.to_string()),
+        "agent_id" => agent_id.map(|value| value.to_string()),
+        "issue_id" => issue_id.map(|value| value.to_string()),
+        "project_id" => project_id.map(|value| value.to_string()),
+        "run_id" => run_id.map(|value| value.to_string()),
+        "gateway_session_id" => Some(session_id.to_string()),
+        "correlation_id" => Some(correlation_id.to_string()),
+        _ => None,
+    }
+}
+
+fn apply_mcp_connection_header_policy(
+    headers: &mut HashMap<String, String>,
+    connection_config: &Value,
+    transport_config: &Value,
+    caller_headers: Option<&HeaderMap>,
+    company_id: Uuid,
+    agent_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    run_id: Option<Uuid>,
+    session_id: Option<Uuid>,
+) {
+    let Some(policy) = mcp_header_policy(connection_config, transport_config) else {
+        return;
+    };
+    let passthrough = policy
+        .get("passthrough")
+        .or_else(|| policy.get("callerPassthrough"))
+        .and_then(Value::as_object);
+    let passthrough_enabled = passthrough
+        .and_then(|value| value.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut allowlist = mcp_string_array(
+        passthrough.and_then(|value| {
+            value
+                .get("allow")
+                .or_else(|| value.get("allowedHeaders"))
+        }),
+    );
+    allowlist.extend(mcp_string_array(
+        policy
+            .get("allowedPassthroughHeaders")
+            .or_else(|| policy.get("allowed_passthrough_headers")),
+    ));
+    allowlist.sort();
+    allowlist.dedup();
+
+    if passthrough_enabled {
+        if let Some(caller_headers) = caller_headers {
+            for (name, value) in caller_headers {
+                let name = name.as_str().to_ascii_lowercase();
+                let Ok(value) = value.to_str() else {
+                    continue;
+                };
+                if !valid_mcp_header_name(&name)
+                    || mcp_sensitive_passthrough_header(&name)
+                    || !allowlist.iter().any(|allowed| allowed == &name)
+                    || headers
+                        .keys()
+                        .any(|existing| existing.eq_ignore_ascii_case(&name))
+                {
+                    continue;
+                }
+                add_mcp_header(headers, &name, value);
+            }
+        }
+    }
+
+    let metadata = policy
+        .get("metadata")
+        .or_else(|| policy.get("generatedMetadata"))
+        .and_then(Value::as_object);
+    let mut metadata_fields = mcp_string_array(metadata.and_then(|value| {
+        value
+            .get("forward")
+            .or_else(|| value.get("headers"))
+            .or_else(|| value.get("allowedHeaders"))
+    }));
+    metadata_fields.extend(mcp_string_array(
+        policy
+            .get("forwardContextHeaders")
+            .or_else(|| policy.get("forward_context_headers")),
+    ));
+    let Some(session_id) = session_id else {
+        return;
+    };
+    metadata_fields.sort();
+    metadata_fields.dedup();
+    let correlation_id = Uuid::new_v4();
+    for field in metadata_fields {
+        let Some(value) = mcp_header_context_value(
+            &field,
+            company_id,
+            agent_id,
+            issue_id,
+            project_id,
+            run_id,
+            session_id,
+            correlation_id,
+        ) else {
+            continue;
+        };
+        let header_name = format!("x-paperclip-{}", field.replace('_', "-"));
+        if headers
+            .keys()
+            .any(|existing| existing.eq_ignore_ascii_case(&header_name))
+        {
+            continue;
+        }
+        add_mcp_header(headers, &header_name, &value);
+    }
+}
+
+fn mcp_secret_id(reference: &Value) -> Option<Uuid> {
+    reference
+        .get("secretId")
+        .or_else(|| reference.get("secret_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn mcp_secret_version(reference: &Value) -> String {
+    reference
+        .get("versionSelector")
+        .or_else(|| reference.get("version_selector"))
+        .or_else(|| reference.get("version"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("latest")
+        .to_string()
+}
+
+fn mcp_secret_header_name(reference: &Value) -> Option<String> {
+    let direct = reference
+        .get("key")
+        .or_else(|| reference.get("header"))
+        .or_else(|| reference.get("headerName"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(name) = direct {
+        return Some(name.to_string());
+    }
+    let path = reference
+        .get("configPath")
+        .or_else(|| reference.get("config_path"))
+        .and_then(Value::as_str)?;
+    if matches!(
+        path.to_ascii_lowercase().as_str(),
+        "oauth.access_token" | "oauth.access-token" | "oauth.accesstoken"
+    ) {
+        // OAuth callback persistence stores the access-token binding in
+        // credentialSecretRefs (the secret reference intentionally has no
+        // plaintext header metadata).  The MCP transport projection is
+        // always the standard Bearer Authorization header.
+        return Some("Authorization".to_string());
+    }
+    path.strip_prefix("headers.")
+        .or_else(|| path.strip_prefix("header."))
+        .map(str::to_string)
+}
+
+fn mcp_secret_header_prefix(reference: &Value) -> &'static str {
+    let path = reference
+        .get("configPath")
+        .or_else(|| reference.get("config_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(
+        path.to_ascii_lowercase().as_str(),
+        "oauth.access_token" | "oauth.access-token" | "oauth.accesstoken"
+    ) {
+        "Bearer "
+    } else {
+        ""
+    }
+}
+
+pub(crate) async fn resolve_mcp_connection_headers(
+    state: &AppState,
+    company_id: Uuid,
+    connection_id: Uuid,
+    connection_config: &Value,
+    transport_config: &Value,
+    credential_refs: &Value,
+    credential_secret_refs: &Value,
+) -> Result<HashMap<String, String>, String> {
+    let mut headers = configured_mcp_static_headers(connection_config, transport_config);
+    for references in [credential_refs, credential_secret_refs] {
+        let Some(references) = references.as_array() else {
+            continue;
+        };
+        for reference in references {
+            if reference
+                .get("placement")
+                .and_then(Value::as_str)
+                .is_some_and(|placement| placement != "header")
+            {
+                continue;
+            }
+            let Some(header_name) = mcp_secret_header_name(reference) else {
+                // Non-header credentials (for example oauth.refresh_token)
+                // are intentionally not projected into an HTTP header.
+                continue;
+            };
+            let required = reference
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let Some(secret_id) = mcp_secret_id(reference) else {
+                if required {
+                    return Err(format!(
+                        "MCP connection {connection_id} has an invalid credential reference for {header_name}"
+                    ));
+                }
+                continue;
+            };
+            let version = mcp_secret_version(reference);
+            let material = if version.eq_ignore_ascii_case("latest") {
+                sqlx::query_scalar::<_, Value>(
+                    "SELECT v.material
+                       FROM company_secret_versions v
+                       JOIN company_secrets s ON s.id = v.secret_id
+                      WHERE s.id = $1 AND s.company_id = $2
+                        AND s.status = 'active' AND s.deleted_at IS NULL
+                        AND v.status = 'current' AND v.revoked_at IS NULL
+                      ORDER BY v.version DESC
+                      LIMIT 1",
+                )
+                .bind(secret_id)
+                .bind(company_id)
+                .fetch_optional(&state.pool)
+                .await
+            } else {
+                let version_number = version.parse::<i32>().map_err(|_| {
+                    format!("MCP credential version must be latest or an integer, got {version}")
+                })?;
+                sqlx::query_scalar::<_, Value>(
+                    "SELECT v.material
+                       FROM company_secret_versions v
+                       JOIN company_secrets s ON s.id = v.secret_id
+                      WHERE s.id = $1 AND s.company_id = $2
+                        AND s.status = 'active' AND s.deleted_at IS NULL
+                        AND v.version = $3 AND v.revoked_at IS NULL
+                      LIMIT 1",
+                )
+                .bind(secret_id)
+                .bind(company_id)
+                .bind(version_number)
+                .fetch_optional(&state.pool)
+                .await
+            }
+            .map_err(|error| format!("MCP credential lookup failed: {error}"))?;
+            let Some(material) = material else {
+                if required {
+                    return Err(format!(
+                        "MCP credential {secret_id} is missing or revoked for connection {connection_id}"
+                    ));
+                }
+                continue;
+            };
+            let value = services::secret_provider::decrypt_secret_material(&material)
+                .map_err(|error| format!("MCP credential {secret_id} could not be decrypted: {error}"))?;
+            let prefix = reference
+                .get("prefix")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| mcp_secret_header_prefix(reference));
+            add_mcp_header(&mut headers, &header_name, &format!("{prefix}{value}"));
+        }
+    }
+    Ok(headers)
+}
+
+fn mcp_gateway_base_name(tool: &McpCatalogTool) -> String {
+    let connection_namespace = format!(
+        "{}-{}",
+        mcp_slug_segment(
+            tool.application_key
+                .as_deref()
+                .unwrap_or(&tool.connection_name),
+            "mcp"
+        ),
+        mcp_short_stable_id(tool.connection_id)
+    );
+    format!(
+        "mcp.{}:{}",
+        connection_namespace,
+        mcp_slug_segment(&tool.upstream_tool_name, "tool")
+    )
+}
+
+fn mcp_catalog_tool_json(tool: &McpCatalogTool) -> Value {
+    serde_json::json!({
+        "name": tool.gateway_name,
+        "title": tool.title.clone().unwrap_or_else(|| tool.upstream_tool_name.clone()),
+        "description": tool.description.clone().unwrap_or_else(|| format!("Connected MCP tool {} from {}.", tool.upstream_tool_name, tool.connection_name)),
+        "inputSchema": tool.input_schema,
+        "outputSchema": tool.output_schema,
+        "annotations": tool.annotations,
+        "source": "mcp_catalog",
+        "provider": if tool.transport == "local_stdio" { "mcp_local_stdio" } else { "mcp_remote_http" },
+        "applicationId": tool.application_id,
+        "applicationKey": tool.application_key,
+        "applicationName": tool.application_name,
+        "connectionId": tool.connection_id,
+        "connectionUid": tool.connection_uid,
+        "connectionStatus": tool.connection_status,
+        "enabled": tool.enabled,
+        "healthStatus": tool.health_status,
+        "applicationType": tool.application_type,
+        "catalogEntryId": tool.catalog_entry_id,
+        "catalogName": tool.catalog_name,
+        "upstreamToolName": tool.upstream_tool_name,
+        "risk": tool.risk_level,
+        "isReadOnly": tool.is_read_only,
+        "isWrite": tool.is_write,
+        "isDestructive": tool.is_destructive,
+    })
+}
+
+async fn load_mcp_catalog_tools(
+    state: &AppState,
+    company_id: Uuid,
+) -> Result<Vec<McpCatalogTool>, String> {
+    let rows = sqlx::query(
+        "SELECT c.id AS catalog_entry_id, c.connection_id, c.name AS catalog_name,
+                c.tool_name AS upstream_tool_name, c.title, c.description,
+                c.input_schema, c.output_schema, c.annotations, c.version_hash, c.schema_hash,
+                c.risk_level,
+                c.is_read_only, c.is_write, c.is_destructive,
+                tc.uid AS connection_uid, tc.name AS connection_name,
+                tc.transport, tc.transport_config, tc.config AS connection_config,
+                tc.credential_refs, tc.credential_secret_refs,
+                tc.status AS connection_status, tc.enabled, tc.health_status,
+                ta.id AS application_id, ta.application_key,
+                ta.name AS application_name, ta.type AS application_type
+           FROM tool_catalog_entries c
+           JOIN tool_connections tc ON tc.id = c.connection_id
+           JOIN tool_applications ta ON ta.id = tc.application_id
+          WHERE c.company_id = $1
+            AND tc.company_id = $1
+            AND ta.company_id = $1
+            AND c.entry_kind = 'tool'
+            AND c.status = 'active'
+            AND c.quarantined_at IS NULL
+            AND tc.transport IN ('mcp_remote', 'local_stdio')
+            AND tc.status = 'active'
+            AND tc.enabled = true
+            AND tc.health_status IN ('ok', 'healthy')
+            AND ta.status = 'active'
+          ORDER BY tc.name ASC, c.name ASC",
+    )
+    .bind(company_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| format!("MCP catalog query failed: {error}"))?;
+
+    let mut tools = rows
+        .into_iter()
+        .filter_map(|row| {
+            let transport: String = row.get("transport");
+            let application_type = row
+                .get::<Option<String>, _>("application_type")
+                .unwrap_or_default();
+            let expected_type = if transport == "local_stdio" {
+                "mcp_stdio"
+            } else {
+                "mcp_http"
+            };
+            if application_type != expected_type {
+                return None;
+            }
+            Some(McpCatalogTool {
+                catalog_entry_id: row.get("catalog_entry_id"),
+                connection_id: row.get("connection_id"),
+                connection_uid: row.get("connection_uid"),
+                connection_name: row.get("connection_name"),
+                transport,
+                transport_config: row.get("transport_config"),
+                connection_config: row.get("connection_config"),
+                credential_refs: row.get("credential_refs"),
+                credential_secret_refs: row.get("credential_secret_refs"),
+                connection_status: row.get("connection_status"),
+                enabled: row.get("enabled"),
+                health_status: row.get("health_status"),
+                application_id: row.get("application_id"),
+                application_key: row.get("application_key"),
+                application_name: row.get("application_name"),
+                application_type,
+                catalog_name: row.get("catalog_name"),
+                upstream_tool_name: row.get("upstream_tool_name"),
+                title: row.get("title"),
+                description: row.get("description"),
+                input_schema: row.get("input_schema"),
+                output_schema: row.get("output_schema"),
+                annotations: row.get("annotations"),
+                version_hash: row.get("version_hash"),
+                schema_hash: row.get("schema_hash"),
+                risk_level: row.get("risk_level"),
+                is_read_only: row.get("is_read_only"),
+                is_write: row.get("is_write"),
+                is_destructive: row.get("is_destructive"),
+                gateway_name: String::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut base_name_counts = HashMap::new();
+    for tool in &tools {
+        *base_name_counts.entry(mcp_gateway_base_name(tool)).or_insert(0usize) += 1;
+    }
+    for tool in &mut tools {
+        let base_name = mcp_gateway_base_name(tool);
+        tool.gateway_name = if base_name_counts.get(&base_name).copied().unwrap_or(0) > 1 {
+            format!("{}-{}", base_name, mcp_short_stable_id(tool.catalog_entry_id))
+        } else {
+            base_name
+        };
+    }
+    Ok(tools)
+}
+
+async fn find_mcp_catalog_tool(
+    state: &AppState,
+    company_id: Uuid,
+    gateway_name: &str,
+) -> Result<Option<McpCatalogTool>, String> {
+    Ok(load_mcp_catalog_tools(state, company_id)
+        .await?
+        .into_iter()
+        .find(|tool| tool.gateway_name == gateway_name))
+}
+
+fn virtual_mcp_tools() -> Vec<Value> {
+    vec![
+        serde_json::json!({
+            "name": "search_tools",
+            "displayName": "Search available tools",
+            "description": "Search connected MCP tools without loading every target tool into the tool list.",
+            "inputSchema": {"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"number"}},"additionalProperties":false},
+            "source": "paperclip_virtual",
+            "provider": "paperclip_virtual",
+        }),
+        serde_json::json!({
+            "name": "run_tool",
+            "displayName": "Run a selected tool",
+            "description": "Run a selected connected MCP tool after applying the target tool's policy checks.",
+            "inputSchema": {"type":"object","properties":{"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["tool"],"additionalProperties":false},
+            "source": "paperclip_virtual",
+            "provider": "paperclip_virtual",
+        }),
+    ]
+}
+
+async fn execute_catalog_mcp_tool(
+    state: &AppState,
+    company_id: Uuid,
+    tool: &McpCatalogTool,
+    parameters: Value,
+    invocation_id: Option<Uuid>,
+    caller_headers: Option<&HeaderMap>,
+    session_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    run_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+) -> Result<Value, String> {
+    if tool.transport == "mcp_remote" {
+        let url = connection_url(&tool.transport_config)
+            .ok_or_else(|| "MCP connection has no remote URL".to_string())?;
+        let headers = resolve_mcp_connection_headers(
+            state,
+            company_id,
+            tool.connection_id,
+            &tool.connection_config,
+            &tool.transport_config,
+            &tool.credential_refs,
+            &tool.credential_secret_refs,
+        )
+        .await?;
+        let mut headers = headers;
+        apply_mcp_connection_header_policy(
+            &mut headers,
+            &tool.connection_config,
+            &tool.transport_config,
+            caller_headers,
+            company_id,
+            agent_id,
+            issue_id,
+            project_id,
+            run_id,
+            session_id,
+        );
+        let result = mcp_http_request_with_headers(
+            &url,
+            "tools/call",
+            serde_json::json!({
+                "name": tool.upstream_tool_name,
+                "arguments": parameters,
+            }),
+            Some(&tool.transport_config),
+            Some(&headers),
+        )
+        .await;
+        let result = match result {
+            Ok(result) => {
+                mark_mcp_connection_health(state, company_id, tool.connection_id, true, None).await;
+                result
+            }
+            Err(error) => {
+                mark_mcp_connection_health(
+                    state,
+                    company_id,
+                    tool.connection_id,
+                    false,
+                    Some(&error),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        if let Some(request) = extract_mcp_elicitation_request(&result) {
+            return defer_mcp_elicitation(
+                state,
+                company_id,
+                tool,
+                request,
+                invocation_id,
+                session_id,
+                agent_id,
+                run_id,
+                issue_id,
+            )
+            .await;
+        }
+        return Ok(result);
+    }
+    let template = resolve_mcp_stdio_template(
+        state,
+        company_id,
+        &tool.connection_config,
+        &tool.transport_config,
+    )
+    .await?;
+    let (command, args, environment) = match template.as_ref() {
+        Some(template) => {
+            if !mcp_stdio_template_allows_tool(template, &tool.upstream_tool_name) {
+                return Err(format!(
+                    "MCP stdio template {} does not expose tool {}",
+                    template.template_id, tool.upstream_tool_name
+                ));
+            }
+            (
+                template.command.as_str(),
+                template.args.clone(),
+                Some(mcp_stdio_environment(
+                    &tool.connection_config,
+                    &tool.transport_config,
+                    template,
+                )),
+            )
+        }
+        None => {
+            return Err(
+                "MCP local stdio connection requires an active approved command template"
+                    .to_string(),
+            );
+        }
+    };
+    let result = if template.as_ref().is_some_and(|template| template.builtin) {
+        builtin_mcp_request(
+            &template
+                .as_ref()
+                .map(|template| template.template_id.as_str())
+                .unwrap_or_default(),
+            "tools/call",
+            &serde_json::json!({
+                "name": tool.upstream_tool_name,
+                "arguments": parameters,
+            }),
+        )
+    } else {
+        mcp_stdio_request_with_env(
+            command,
+            &args,
+            "tools/call",
+            serde_json::json!({
+                "name": tool.upstream_tool_name,
+                "arguments": parameters,
+            }),
+            environment.as_ref(),
+        )
+        .await
+    };
+    let result = match result {
+        Ok(result) => {
+            mark_mcp_connection_health(state, company_id, tool.connection_id, true, None).await;
+            result
+        }
+        Err(error) => {
+            mark_mcp_connection_health(
+                state,
+                company_id,
+                tool.connection_id,
+                false,
+                Some(&error),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if let Some(request) = extract_mcp_elicitation_request(&result) {
+        return defer_mcp_elicitation(
+            state,
+            company_id,
+            tool,
+            request,
+            invocation_id,
+            session_id,
+            agent_id,
+            run_id,
+            issue_id,
+        )
+        .await;
+    }
+    Ok(result)
+}
+
+async fn mark_mcp_connection_health(
+    state: &AppState,
+    company_id: Uuid,
+    connection_id: Uuid,
+    healthy: bool,
+    error_message: Option<&str>,
+) {
+    let result = if healthy {
+        sqlx::query(
+            "UPDATE tool_connections
+                SET health_status = 'healthy', health_message = NULL,
+                    health_checked_at = NOW(), last_healthy_at = NOW(),
+                    last_error = NULL, updated_at = NOW()
+              WHERE id = $1 AND company_id = $2",
+        )
+        .bind(connection_id)
+        .bind(company_id)
+        .execute(&state.pool)
+        .await
+    } else {
+        sqlx::query(
+            "UPDATE tool_connections
+                SET health_status = 'unhealthy', health_message = $3,
+                    health_checked_at = NOW(), last_error = $3, updated_at = NOW()
+              WHERE id = $1 AND company_id = $2",
+        )
+        .bind(connection_id)
+        .bind(company_id)
+        .bind(error_message.unwrap_or("MCP connection request failed"))
+        .execute(&state.pool)
+        .await
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, %connection_id, "failed to persist MCP connection health");
+    }
+}
+
+async fn execute_legacy_mcp_tool(
+    state: &AppState,
+    company_id: Uuid,
+    connection_id: Uuid,
+    transport: &str,
+    transport_config: &Value,
+    upstream_tool_name: &str,
+    parameters: Value,
+) -> Result<Value, String> {
+    let connection = sqlx::query(
+        "SELECT config, credential_refs, credential_secret_refs
+           FROM tool_connections
+          WHERE id = $1 AND company_id = $2",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| format!("MCP connection lookup failed: {error}"))?
+    .ok_or_else(|| "MCP connection not found".to_string())?;
+    let connection_config: Value = connection.get("config");
+    let credential_refs: Value = connection.get("credential_refs");
+    let credential_secret_refs: Value = connection.get("credential_secret_refs");
+    if transport == "mcp_remote" {
+        let url = connection_url(transport_config)
+            .ok_or_else(|| "MCP connection has no remote URL".to_string())?;
+        let headers = resolve_mcp_connection_headers(
+            state,
+            company_id,
+            connection_id,
+            &connection_config,
+            transport_config,
+            &credential_refs,
+            &credential_secret_refs,
+        )
+        .await?;
+        return mcp_http_request_with_headers(
+            &url,
+            "tools/call",
+            serde_json::json!({
+                "name": upstream_tool_name,
+                "arguments": parameters,
+            }),
+            Some(transport_config),
+            Some(&headers),
+        )
+        .await;
+    }
+    let template = resolve_mcp_stdio_template(
+        state,
+        company_id,
+        &connection_config,
+        transport_config,
+    )
+    .await?
+    .ok_or_else(|| "MCP local stdio connection requires an active approved command template".to_string())?;
+    if !mcp_stdio_template_allows_tool(&template, upstream_tool_name) {
+        return Err(format!(
+            "MCP stdio template {} does not expose tool {}",
+            template.template_id, upstream_tool_name
+        ));
+    }
+    if template.builtin {
+        return builtin_mcp_request(
+            &template.template_id,
+            "tools/call",
+            &serde_json::json!({
+                "name": upstream_tool_name,
+                "arguments": parameters,
+            }),
+        );
+    }
+    let environment = mcp_stdio_environment(&connection_config, transport_config, &template);
+    mcp_stdio_request_with_env(
+        &template.command,
+        &template.args,
+        "tools/call",
+        serde_json::json!({
+            "name": upstream_tool_name,
+            "arguments": parameters,
+        }),
+        Some(&environment),
+    )
+    .await
 }
 
 async fn execute_mcp_connection(
@@ -1771,53 +3412,316 @@ async fn execute_mcp_connection(
     company_id: Uuid,
     tool_name: &str,
     parameters: Value,
+    invocation_id: Option<Uuid>,
+    session_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    run_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
 ) -> Result<Value, String> {
+    // Paperclip dispatches connected tools through the reviewed catalog entry,
+    // not through a fresh tools/list response or an arbitrary connection uid.
+    // Keep the legacy uid form below for already-persisted approval records
+    // created before catalog names were introduced.
+    if let Some(tool) = find_mcp_catalog_tool(state, company_id, tool_name).await? {
+        return execute_catalog_mcp_tool(
+            state,
+            company_id,
+            &tool,
+            parameters,
+            invocation_id,
+            None,
+            session_id,
+            agent_id,
+            run_id,
+            issue_id,
+            project_id,
+        )
+        .await;
+    }
     let raw = tool_name
         .strip_prefix("mcp.")
         .ok_or("MCP tool name must start with mcp.")?;
     let (uid, upstream_name) = raw
         .split_once(':')
         .ok_or("MCP tool name must be mcp.<connection>:<tool>")?;
-    let connection = sqlx::query("SELECT transport, transport_config FROM tool_connections WHERE company_id=$1 AND uid=$2 AND enabled=true")
+    let connection = sqlx::query("SELECT id, transport, transport_config FROM tool_connections WHERE company_id=$1 AND uid=$2 AND enabled=true")
         .bind(company_id).bind(uid).fetch_optional(&state.pool).await.map_err(|error| error.to_string())?
         .ok_or("MCP connection not found or disabled")?;
+    let connection_id: Uuid = connection.get("id");
     let transport: String = connection.get("transport");
     let config: Value = connection.get("transport_config");
-    if transport == "mcp_remote" {
-        match connection_url(&config) {
-            Some(url) => {
-                mcp_http_request(
-                    &url,
-                    "tools/call",
-                    serde_json::json!({"name": upstream_name, "arguments": parameters}),
-                )
-                .await
-            }
-            None => Err("MCP connection has no remote URL".to_string()),
-        }
+    execute_legacy_mcp_tool(
+        state,
+        company_id,
+        connection_id,
+        &transport,
+        &config,
+        upstream_name,
+        parameters,
+    )
+    .await
+}
+
+/// Execute a connection-bound MCP tool from the Tool Access "test call" UI.
+///
+/// Paperclip runs test calls through the same catalog, policy, invocation and
+/// approval machinery as an agent call, but without a heartbeat run. Keeping
+/// this entry point here prevents the management route from falling back to a
+/// fake `passed` response or bypassing the reviewed catalog.
+pub(crate) async fn execute_mcp_connection_test_call(
+    state: &AppState,
+    company_id: Uuid,
+    connection_id: Uuid,
+    agent_id: Uuid,
+    tool_name: &str,
+    parameters: Value,
+) -> Result<Value, String> {
+    let agent_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM agents WHERE id = $1 AND company_id = $2
+         )",
+    )
+    .bind(agent_id)
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| format!("failed to validate test-call agent: {error}"))?;
+    if !agent_exists {
+        return Err("test-call agent does not belong to the company".to_string());
+    }
+
+    let tool = load_mcp_catalog_tools(state, company_id)
+        .await?
+        .into_iter()
+        .find(|candidate| {
+            candidate.connection_id == connection_id
+                && (candidate.gateway_name == tool_name
+                    || candidate.upstream_tool_name == tool_name)
+        })
+        .ok_or_else(|| format!("MCP tool {tool_name} was not found in the active catalog"))?;
+    let parameters = if parameters.is_null() {
+        serde_json::json!({})
     } else {
-        match config.get("command").and_then(Value::as_str) {
-            Some(command) => {
-                let args = config
-                    .get("args")
-                    .and_then(Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                mcp_stdio_request(
-                    command,
-                    &args,
-                    "tools/call",
-                    serde_json::json!({"name": upstream_name, "arguments": parameters}),
-                )
-                .await
-            }
-            None => Err("MCP connection has no executable transport configuration".to_string()),
+        parameters
+    };
+    validate_schema_value(&parameters, &tool.input_schema, "$")?;
+    let arguments_summary = serde_json::json!({
+        "valueType": "object",
+        "keys": parameters.as_object().map_or(0, serde_json::Map::len),
+    });
+    let decision = gateway_decision_full_for_catalog_with_gateway(
+        state,
+        company_id,
+        Some(agent_id),
+        &tool.gateway_name,
+        true,
+        &tool,
+        Some(&parameters),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    if decision.decision == "rate_limited" {
+        return Ok(serde_json::json!({
+            "decision": "off",
+            "error": "Tool access rate limit exceeded.",
+            "reasonCode": "rate_limited",
+            "rateLimitState": decision.rate_limit_state,
+        }));
+    }
+    if decision.decision == "deny" {
+        let invocation_id = match reserve_gateway_invocation(
+            state,
+            company_id,
+            Some(agent_id),
+            None,
+            Some(connection_id),
+            &tool.gateway_name,
+            &parameters,
+            &arguments_summary,
+            "deny",
+            "denied",
+            None,
+            Some("policy_denied"),
+            Some("Tool call denied by policy"),
+        )
+        .await
+        .map_err(|(_, Json(error))| error.to_string())?
+        {
+            GatewayInvocationReservation::Created { invocation_id } => invocation_id,
+            GatewayInvocationReservation::Replayed((_, Json(value))) => return Ok(value),
+        };
+        let _ = sqlx::query(
+            "INSERT INTO tool_call_events
+                (company_id, event_type, actor_type, actor_id, agent_id, connection_id,
+                 tool_name, decision, outcome, invocation_id, reason_code, metadata)
+             VALUES ($1, 'call_denied', 'agent', $2, $3, $4, $5, 'deny', 'denied', $6,
+                     'policy_denied', '{\"source\":\"test\"}'::jsonb)",
+        )
+        .bind(company_id)
+        .bind(agent_id.to_string())
+        .bind(agent_id)
+        .bind(connection_id)
+        .bind(&tool.gateway_name)
+        .bind(invocation_id)
+        .execute(&state.pool)
+        .await;
+        return Ok(serde_json::json!({
+            "decision": "off",
+            "invocationId": invocation_id,
+            "error": "Tool call denied by policy",
+            "reasonCode": "policy_denied",
+        }));
+    }
+    if decision.decision == "require_approval" {
+        let (invocation_id, action_request_id) = match reserve_gateway_approval(
+            state,
+            company_id,
+            Some(agent_id),
+            None,
+            None,
+            Some(connection_id),
+            &tool.gateway_name,
+            &parameters,
+            &arguments_summary,
+            "require_approval",
+            None,
+        )
+        .await
+        .map_err(|(_, Json(error))| error.to_string())?
+        {
+            GatewayApprovalReservation::Created {
+                invocation_id,
+                action_id,
+            } => (invocation_id, action_id),
+            GatewayApprovalReservation::Replayed((_, Json(value))) => return Ok(value),
+        };
+        let _ = sqlx::query(
+            "INSERT INTO tool_call_events
+                (company_id, event_type, actor_type, actor_id, agent_id, connection_id,
+                 tool_name, decision, outcome, invocation_id, action_request_id, reason_code,
+                 metadata)
+             VALUES ($1, 'approval_requested', 'agent', $2, $3, $4, $5,
+                     'require_approval', 'pending', $6, $7, 'policy_requires_approval',
+                     '{\"source\":\"test\"}'::jsonb)",
+        )
+        .bind(company_id)
+        .bind(agent_id.to_string())
+        .bind(agent_id)
+        .bind(connection_id)
+        .bind(&tool.gateway_name)
+        .bind(invocation_id)
+        .bind(action_request_id)
+        .execute(&state.pool)
+        .await;
+        return Ok(serde_json::json!({
+            "decision": "ask_first",
+            "status": "pending",
+            "invocationId": invocation_id,
+            "actionRequestId": action_request_id,
+        }));
+    }
+
+    let invocation_id = match reserve_gateway_invocation(
+        state,
+        company_id,
+        Some(agent_id),
+        None,
+        Some(connection_id),
+        &tool.gateway_name,
+        &parameters,
+        &arguments_summary,
+        "allow",
+        "executing",
+        None,
+        None,
+        None,
+    )
+    .await
+    .map_err(|(_, Json(error))| error.to_string())?
+    {
+        GatewayInvocationReservation::Created { invocation_id } => invocation_id,
+        GatewayInvocationReservation::Replayed((_, Json(value))) => return Ok(value),
+    };
+    let result = execute_catalog_mcp_tool(
+        state,
+        company_id,
+        &tool,
+        parameters,
+        Some(invocation_id),
+        None,
+        None,
+        Some(agent_id),
+        None,
+        None,
+        None,
+    )
+    .await;
+    match result {
+        Ok(value) => {
+            let _ = sqlx::query(
+                "UPDATE tool_invocations
+                    SET status = 'succeeded', result_summary = $2,
+                        completed_at = NOW(), updated_at = NOW()
+                  WHERE id = $1",
+            )
+            .bind(invocation_id)
+            .bind(serde_json::json!({"valueType": "json"}))
+            .execute(&state.pool)
+            .await;
+            let _ = sqlx::query(
+                "INSERT INTO tool_call_events
+                    (company_id, event_type, actor_type, actor_id, agent_id, connection_id,
+                     tool_name, decision, outcome, invocation_id, metadata)
+                 VALUES ($1, 'call_completed', 'agent', $2, $3, $4, $5, 'allow',
+                         'success', $6, '{\"source\":\"test\"}'::jsonb)",
+            )
+            .bind(company_id)
+            .bind(agent_id.to_string())
+            .bind(agent_id)
+            .bind(connection_id)
+            .bind(&tool.gateway_name)
+            .bind(invocation_id)
+            .execute(&state.pool)
+            .await;
+            Ok(serde_json::json!({
+                "decision": "allowed",
+                "invocationId": invocation_id,
+                "result": value,
+            }))
+        }
+        Err(error) => {
+            let _ = sqlx::query(
+                "UPDATE tool_invocations
+                    SET status = 'failed', error_code = 'mcp_tool_execution_failed',
+                        error_message = $2, completed_at = NOW(), updated_at = NOW()
+                  WHERE id = $1",
+            )
+            .bind(invocation_id)
+            .bind(&error)
+            .execute(&state.pool)
+            .await;
+            let _ = sqlx::query(
+                "INSERT INTO tool_call_events
+                    (company_id, event_type, actor_type, actor_id, agent_id, connection_id,
+                     tool_name, decision, outcome, invocation_id, reason_code, error_message,
+                     metadata)
+                 VALUES ($1, 'call_failed', 'agent', $2, $3, $4, $5, 'allow', 'failure',
+                         $6, 'mcp_tool_execution_failed', $7, '{\"source\":\"test\"}'::jsonb)",
+            )
+            .bind(company_id)
+            .bind(agent_id.to_string())
+            .bind(agent_id)
+            .bind(connection_id)
+            .bind(&tool.gateway_name)
+            .bind(invocation_id)
+            .bind(&error)
+            .execute(&state.pool)
+            .await;
+            Err(error)
         }
     }
 }
@@ -1826,14 +3730,51 @@ async fn load_gateway_session(
     state: &AppState,
     token: &str,
 ) -> Result<sqlx::postgres::PgRow, (StatusCode, Json<Value>)> {
+    let token_hash = hash_gateway_token(token);
+    // A named gateway token is a durable credential rather than a heartbeat
+    // run credential. Materialize its session lazily so the existing session
+    // table remains the single source of truth for last-use/revocation while
+    // still allowing agent_id/run_id to be NULL.
+    let _ = sqlx::query(
+        "INSERT INTO tool_gateway_sessions
+            (id, company_id, agent_id, run_id, issue_id, token_hash, expires_at,
+             gateway_id, gateway_token_id, gateway_public_id,
+             client_subject_type, client_subject_id, client_name, mcp_session_id)
+         SELECT gen_random_uuid(), g.company_id, g.agent_id, NULL, g.issue_id, t.token_hash,
+                COALESCE(t.expires_at, NOW() + INTERVAL '10 years'),
+                t.gateway_id, t.id, g.gateway_public_id,
+                t.subject_type, t.subject_id, t.client_label, NULL
+           FROM tool_mcp_gateway_tokens t
+           JOIN tool_mcp_gateways g ON g.id = t.gateway_id AND g.company_id = t.company_id
+          WHERE t.token_hash = $1 AND t.revoked_at IS NULL
+         ON CONFLICT (token_hash) DO NOTHING",
+    )
+    .bind(&token_hash)
+    .execute(&state.pool)
+    .await;
+    let _ = sqlx::query(
+        "UPDATE tool_gateway_sessions
+            SET mcp_session_id = COALESCE(mcp_session_id, id::text),
+                updated_at = NOW()
+          WHERE token_hash = $1",
+    )
+    .bind(&token_hash)
+    .execute(&state.pool)
+    .await;
     let row = sqlx::query(
-        "SELECT s.id, s.company_id, s.agent_id, s.run_id, s.issue_id, s.expires_at, s.revoked_at,
-                r.status::text AS run_status
+        "SELECT s.id, s.company_id, s.agent_id, s.run_id, s.issue_id, s.project_id,
+                s.expires_at, s.revoked_at,
+                r.status::text AS run_status,
+                t.id AS gateway_token_id, t.allowed_actions AS gateway_token_allowed_actions,
+                t.expires_at AS gateway_token_expires_at, t.revoked_at AS gateway_token_revoked_at,
+                g.id AS gateway_id, g.gateway_public_id, g.status AS gateway_status
            FROM tool_gateway_sessions s
-           JOIN heartbeat_runs r ON r.id = s.run_id
+           LEFT JOIN heartbeat_runs r ON r.id = s.run_id
+           LEFT JOIN tool_mcp_gateway_tokens t ON t.token_hash = s.token_hash
+           LEFT JOIN tool_mcp_gateways g ON g.id = t.gateway_id
           WHERE s.token_hash = $1",
     )
-    .bind(hash_gateway_token(token))
+    .bind(&token_hash)
     .fetch_optional(&state.pool)
     .await
     .map_err(|error| {
@@ -1843,25 +3784,65 @@ async fn load_gateway_session(
         )
     })?;
     let Some(row) = row else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Tool gateway session is invalid"})),
-        ));
+        return Err(
+            mcp_gateway_auth_failure_response(state, token, "gateway_token_invalid", "Tool gateway session is invalid")
+                .await,
+        );
     };
     let revoked_at: Option<chrono::DateTime<chrono::Utc>> = row.get("revoked_at");
     let expires_at: chrono::DateTime<chrono::Utc> = row.get("expires_at");
     if revoked_at.is_some() || expires_at <= chrono::Utc::now() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Tool gateway session is expired or revoked"})),
-        ));
+        return Err(
+            mcp_gateway_auth_failure_response(
+                state,
+                token,
+                "gateway_session_expired",
+                "Tool gateway session is expired or revoked",
+            )
+            .await,
+        );
     }
-    let run_status: String = row.get("run_status");
-    if !matches!(run_status.as_str(), "queued" | "running") {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Tool gateway run is no longer active"})),
-        ));
+    let gateway_token_id: Option<Uuid> = row.get("gateway_token_id");
+    if gateway_token_id.is_some() {
+        let gateway_status: Option<String> = row.get("gateway_status");
+        let token_revoked_at: Option<chrono::DateTime<chrono::Utc>> =
+            row.get("gateway_token_revoked_at");
+        let token_expires_at: Option<chrono::DateTime<chrono::Utc>> =
+            row.get("gateway_token_expires_at");
+        if gateway_status.as_deref() != Some("active")
+            || token_revoked_at.is_some()
+            || token_expires_at.is_some_and(|expires_at| expires_at <= chrono::Utc::now())
+        {
+            let reason_code = if gateway_status.as_deref() != Some("active") {
+                "gateway_disabled"
+            } else if token_revoked_at.is_some() {
+                "gateway_token_revoked"
+            } else {
+                "gateway_token_expired"
+            };
+            return Err(
+                mcp_gateway_auth_failure_response(
+                    state,
+                    token,
+                    reason_code,
+                    "Tool gateway token is expired, revoked, or inactive",
+                )
+                .await,
+            );
+        }
+    } else {
+        let run_status: Option<String> = row.get("run_status");
+        if !matches!(run_status.as_deref(), Some("queued") | Some("running")) {
+            return Err(
+                mcp_gateway_auth_failure_response(
+                    state,
+                    token,
+                    "gateway_token_run_inactive",
+                    "Tool gateway run is no longer active",
+                )
+                .await,
+            );
+        }
     }
     let _ = sqlx::query(
         "UPDATE tool_gateway_sessions SET last_used_at = NOW(), updated_at = NOW() WHERE id = $1",
@@ -1869,7 +3850,280 @@ async fn load_gateway_session(
     .bind(row.get::<Uuid, _>("id"))
     .execute(&state.pool)
     .await;
+    if gateway_token_id.is_some() {
+        let _ = sqlx::query(
+            "UPDATE tool_mcp_gateway_tokens SET last_used_at = NOW(), updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(gateway_token_id)
+        .execute(&state.pool)
+        .await;
+    }
     Ok(row)
+}
+
+fn gateway_token_action_allowed(session: &sqlx::postgres::PgRow, action: &str) -> bool {
+    let allowed_actions: Option<Value> = session
+        .try_get("gateway_token_allowed_actions")
+        .unwrap_or(None);
+    let Some(allowed_actions) = allowed_actions else {
+        // Per-run sessions predate named gateway tokens and have no action
+        // list; their normal tool policy remains authoritative.
+        return true;
+    };
+    allowed_actions
+        .as_array()
+        .is_some_and(|actions| actions.iter().any(|value| value.as_str() == Some(action)))
+}
+
+fn mcp_protocol_rate_limit(method: &str) -> (i64, i32) {
+    if method == "initialize" {
+        // Paperclip's session setup bucket: 30 requests per minute.
+        (60_000, 30)
+    } else {
+        // Paperclip's gateway protocol bucket: 300 requests per minute.
+        (60_000, 300)
+    }
+}
+
+/// Increment a durable, company-scoped MCP protocol counter. The operation is
+/// deliberately atomic so concurrent requests cannot bypass the limit between
+/// a read and an update. `reason_code` is returned to callers as part of the
+/// structured rate-limit state so auth throttles and protocol throttles remain
+/// distinguishable in logs and clients.
+async fn consume_mcp_rate_limit_counter(
+    state: &AppState,
+    company_id: Uuid,
+    counter_key: &str,
+    window_ms: i64,
+    limit: i32,
+    reason_code: &str,
+) -> Result<Option<Value>, String> {
+    let now = chrono::Utc::now();
+    let now_ms = now.timestamp_millis();
+    let window_start_ms = now_ms.div_euclid(window_ms) * window_ms;
+    let window_start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(window_start_ms)
+        .ok_or_else(|| "MCP rate-limit window timestamp is invalid".to_string())?;
+    let reset_at = window_start + chrono::Duration::milliseconds(window_ms);
+    sqlx::query(
+        "DELETE FROM tool_gateway_rate_limit_counters
+          WHERE company_id = $1 AND reset_at <= NOW()",
+    )
+    .bind(company_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| format!("MCP protocol rate-limit cleanup failed: {error}"))?;
+    let (count, reset_at): (i32, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "INSERT INTO tool_gateway_rate_limit_counters
+            (company_id, counter_key, window_start_at, window_ms, \"limit\", count, reset_at)
+         VALUES ($1, $2, $3, $4, $5, 1, $6)
+         ON CONFLICT (company_id, counter_key, window_start_at)
+         DO UPDATE SET
+             count = LEAST(
+                 tool_gateway_rate_limit_counters.count + 1,
+                 tool_gateway_rate_limit_counters.\"limit\" + 1
+             ),
+             window_ms = EXCLUDED.window_ms,
+             \"limit\" = EXCLUDED.\"limit\",
+             reset_at = EXCLUDED.reset_at,
+             updated_at = NOW()
+         RETURNING count, reset_at",
+    )
+    .bind(company_id)
+    .bind(counter_key)
+    .bind(window_start)
+    .bind(window_ms as i32)
+    .bind(limit)
+    .bind(reset_at)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| format!("MCP protocol rate-limit increment failed: {error}"))?;
+    if count <= limit {
+        return Ok(None);
+    }
+    let retry_after_ms = (reset_at - now).num_milliseconds().max(0);
+    Ok(Some(serde_json::json!({
+        "reasonCode": reason_code,
+        "limit": limit,
+        "count": count,
+        "windowMs": window_ms,
+        "retryAfterMs": retry_after_ms,
+    })))
+}
+
+/// Throttle repeated invalid/revoked named-gateway credentials in the same
+/// way as Paperclip. Unknown tokens cannot be attributed to a company, so they
+/// still receive a normal 401; known token/session hashes are bounded by both
+/// a gateway bucket and a token bucket.
+async fn mcp_gateway_auth_failure_response(
+    state: &AppState,
+    token: &str,
+    reason_code: &str,
+    message: &str,
+) -> (StatusCode, Json<Value>) {
+    let token_hash = hash_gateway_token(token);
+    let named_gateway = sqlx::query(
+        "SELECT t.company_id, t.gateway_id, g.gateway_public_id
+           FROM tool_mcp_gateway_tokens t
+           JOIN tool_mcp_gateways g ON g.id = t.gateway_id AND g.company_id = t.company_id
+          WHERE t.token_hash = $1
+          LIMIT 1",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.pool)
+    .await;
+    let context = match named_gateway {
+        Ok(Some(row)) => Some((
+            row.get::<Uuid, _>("company_id"),
+            format!("gateway:{}", row.get::<Uuid, _>("gateway_id")),
+            format!("gateway:{}", row.get::<String, _>("gateway_public_id")),
+        )),
+        Ok(None) => sqlx::query("SELECT company_id FROM tool_gateway_sessions WHERE token_hash = $1")
+            .bind(&token_hash)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|row| {
+                (
+                    row.get::<Uuid, _>("company_id"),
+                    "session:unknown".to_string(),
+                    "session:unknown".to_string(),
+                )
+            }),
+        Err(error) => {
+            tracing::warn!(%error, "MCP gateway auth-failure context lookup failed");
+            None
+        }
+    };
+    let Some((company_id, gateway_key, gateway_label)) = context else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": message, "reasonCode": reason_code})),
+        );
+    };
+    let gateway_state = consume_mcp_rate_limit_counter(
+        state,
+        company_id,
+        &format!("mcp_gateway_auth_failure:{gateway_key}"),
+        5 * 60 * 1000,
+        20,
+        "gateway_auth_throttled",
+    )
+    .await;
+    let token_state = consume_mcp_rate_limit_counter(
+        state,
+        company_id,
+        &format!(
+            "mcp_gateway_auth_failure:{gateway_label}:token:{}",
+            &token_hash[..24]
+        ),
+        5 * 60 * 1000,
+        20,
+        "gateway_auth_throttled",
+    )
+    .await;
+    let gateway_state = gateway_state.ok().flatten();
+    let token_state = token_state.ok().flatten();
+    if gateway_state.is_some() || token_state.is_some() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "MCP gateway authentication was throttled",
+                "reasonCode": "gateway_auth_throttled",
+                "gateway": gateway_state,
+                "token": token_state,
+            })),
+        );
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": message, "reasonCode": reason_code})),
+    )
+}
+
+async fn consume_mcp_protocol_rate_limit(
+    state: &AppState,
+    company_id: Uuid,
+    session_id: Uuid,
+    method: &str,
+) -> Result<Option<Value>, String> {
+    let (window_ms, limit) = mcp_protocol_rate_limit(method);
+    let counter_key = format!(
+        "{}:session:{}",
+        if method == "initialize" {
+            "session_setup"
+        } else {
+            "gateway_request"
+        },
+        session_id
+    );
+    consume_mcp_rate_limit_counter(
+        state,
+        company_id,
+        &counter_key,
+        window_ms,
+        limit,
+        "gateway_rate_limited",
+    )
+    .await
+}
+
+async fn mcp_token_request_rate_limit_response(
+    state: &AppState,
+    company_id: Uuid,
+    scope: &str,
+) -> Option<(StatusCode, Json<Value>)> {
+    match consume_mcp_rate_limit_counter(
+        state,
+        company_id,
+        &format!("mcp_gateway_token_request:{scope}"),
+        60_000,
+        120,
+        "gateway_token_request_rate_limited",
+    )
+    .await
+    {
+        Ok(Some(rate_limit_state)) => Some((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "MCP gateway token requests are rate limited",
+                "reasonCode": "gateway_token_request_rate_limited",
+                "rateLimitState": rate_limit_state,
+            })),
+        )),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::error!(%error, %company_id, "MCP gateway token rate-limit check failed");
+            Some((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "MCP gateway token rate-limit check failed",
+                    "reasonCode": "gateway_rate_limit_unavailable",
+                })),
+            ))
+        }
+    }
+}
+
+fn mcp_protocol_rate_limited_error(
+    id: Value,
+    state: Value,
+    session_id: Option<Uuid>,
+) -> Response {
+    mcp_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32000,
+                "message": "MCP gateway protocol rate limit exceeded",
+                "data": state,
+            }
+        }),
+        session_id,
+    )
 }
 
 async fn create_gateway_session(
@@ -1904,6 +4158,15 @@ async fn create_gateway_session(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "runId is not an active run for this agent"})),
         );
+    }
+    if let Some(response) = mcp_token_request_rate_limit_response(
+        &state,
+        company_id,
+        &format!("session:{agent_id}:{run_id}"),
+    )
+    .await
+    {
+        return response;
     }
     let session_id = Uuid::new_v4();
     let token = format!("ptg_{}", Uuid::new_v4().simple());
@@ -2042,12 +4305,12 @@ async fn revoke_gateway_session(
         }
     };
     if let Some(agent_id) = scope.agent_id {
-        let existing_agent_id: Uuid = existing.get("agent_id");
-        let existing_run_id: Uuid = existing.get("run_id");
-        if existing_agent_id != agent_id
+        let existing_agent_id: Option<Uuid> = existing.get("agent_id");
+        let existing_run_id: Option<Uuid> = existing.get("run_id");
+        if existing_agent_id != Some(agent_id)
             || scope
                 .run_id
-                .is_some_and(|run_id| existing_run_id != run_id)
+                .is_some_and(|run_id| existing_run_id != Some(run_id))
         {
             return (
                 StatusCode::FORBIDDEN,
@@ -2109,13 +4372,32 @@ async fn gateway_matches_selector(
         )
             .into_response());
     };
+    // Materialize/validate named-token sessions before checking the gateway
+    // selector. Per-run sessions have no named gateway association and are
+    // intentionally not accepted on this route.
+    if let Err((status, Json(error))) = load_gateway_session(state, &token).await {
+        return Err(mcp_error(
+            status,
+            Value::Null,
+            -32001,
+            error
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("MCP gateway authentication failed"),
+            None,
+        ));
+    }
     let matches = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(
-           SELECT 1 FROM tool_mcp_gateways g
-           JOIN tool_gateway_sessions s ON s.company_id = g.company_id
-          WHERE s.token_hash = $1
+           SELECT 1
+             FROM tool_mcp_gateway_tokens t
+             JOIN tool_mcp_gateways g ON g.id = t.gateway_id AND g.company_id = t.company_id
+             JOIN tool_gateway_sessions s ON s.token_hash = t.token_hash
+            WHERE t.token_hash = $1
             AND (g.gateway_public_id = $2 OR g.id::text = $2)
-            AND g.status <> 'archived'
+            AND g.status = 'active'
+            AND t.revoked_at IS NULL
+            AND (t.expires_at IS NULL OR t.expires_at > NOW())
         )",
     )
     .bind(hash_gateway_token(&token))
@@ -2209,7 +4491,7 @@ async fn mcp_session_info_for_gateway(
             "transport": "streamable_http",
             "authentication": "bearer",
             "sessionId": session_id,
-            "runId": session.get::<Uuid, _>("run_id"),
+            "runId": session.get::<Option<Uuid>, _>("run_id"),
         })),
     )
         .into_response();
@@ -2356,6 +4638,311 @@ fn mcp_error(
         }),
         session_id,
     )
+}
+
+fn normalize_mcp_wire_result(result: Value) -> Result<Value, String> {
+    let Some(record) = result.as_object() else {
+        return Ok(serde_json::json!({
+            "content": [{"type": "text", "text": result.to_string()}],
+            "isError": false
+        }));
+    };
+    let Some(content) = record.get("content") else {
+        let mut tool_result = serde_json::json!({
+            "content": [{"type": "text", "text": result.to_string()}],
+            "isError": record.get("isError").and_then(Value::as_bool).unwrap_or(false)
+        });
+        if record
+            .get("structuredContent")
+            .is_some_and(Value::is_object)
+        {
+            tool_result["structuredContent"] = record["structuredContent"].clone();
+        } else {
+            tool_result["structuredContent"] = Value::Object(record.clone());
+        }
+        return Ok(tool_result);
+    };
+    let Some(content) = content.as_array() else {
+        return Err("MCP tool result content must be an array".to_string());
+    };
+    let mut normalized_content = Vec::with_capacity(content.len());
+    for item in content {
+        let Some(item_object) = item.as_object() else {
+            return Err("MCP tool result content items must be objects".to_string());
+        };
+        let Some(kind) = item_object.get("type").and_then(Value::as_str) else {
+            return Err("MCP tool result content items require a type".to_string());
+        };
+        if kind == "text"
+            && item_object
+                .get("text")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return Err("MCP text content requires a string text field".to_string());
+        }
+        normalized_content.push(item.clone());
+    }
+    let mut tool_result = serde_json::json!({
+        "content": normalized_content,
+        "isError": record.get("isError").and_then(Value::as_bool).unwrap_or(false)
+    });
+    if record
+        .get("structuredContent")
+        .is_some_and(Value::is_object)
+    {
+        tool_result["structuredContent"] = record["structuredContent"].clone();
+    }
+    Ok(tool_result)
+}
+
+#[derive(Debug, Clone)]
+struct McpElicitationRequest {
+    message: String,
+    requested_schema: Option<Value>,
+}
+
+/// MCP servers use both the draft `elicitationRequest` spelling and the
+/// current `elicitation` spelling. Some Streamable HTTP implementations put
+/// the request in `_meta`; accepting all of these shapes keeps the bridge
+/// compatible with the Paperclip gateway and older MCP servers.
+fn extract_mcp_elicitation_request(value: &Value) -> Option<McpElicitationRequest> {
+    let record = value.as_object()?;
+    let meta = record.get("_meta").and_then(Value::as_object);
+    let candidate = if record.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+        record.get("params")
+    } else {
+        record
+            .get("elicitation")
+            .or_else(|| record.get("elicitationRequest"))
+            .or_else(|| meta.and_then(|meta| meta.get("elicitation")))
+            .or_else(|| meta.and_then(|meta| meta.get("elicitationRequest")))
+    };
+    let candidate = candidate?.as_object()?;
+    let message = candidate
+        .get("message")
+        .or_else(|| candidate.get("prompt"))
+        .or_else(|| candidate.get("title"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("The MCP tool needs more information before it can continue.")
+        .chars()
+        .take(500)
+        .collect::<String>();
+    let requested_schema = candidate
+        .get("requestedSchema")
+        .or_else(|| candidate.get("schema"))
+        .or_else(|| candidate.get("inputSchema"))
+        .filter(|value| value.is_object())
+        .cloned();
+    Some(McpElicitationRequest {
+        message,
+        requested_schema,
+    })
+}
+
+fn mcp_elicitation_enum_options(value: &Value) -> Vec<Value> {
+    value
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .take(10)
+                .enumerate()
+                .map(|(index, value)| {
+                    let label = match value {
+                        Value::String(value) => value.clone(),
+                        Value::Number(value) => value.to_string(),
+                        Value::Bool(value) => value.to_string(),
+                        _ => format!("Option {}", index + 1),
+                    };
+                    serde_json::json!({
+                        "id": mcp_slug_segment(&label, &format!("option-{}", index + 1)),
+                        "label": label.chars().take(120).collect::<String>(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn mcp_elicitation_questions(request: &McpElicitationRequest) -> Vec<Value> {
+    let schema = request.requested_schema.as_ref().and_then(Value::as_object);
+    let properties = schema
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object);
+    let required = schema
+        .and_then(|schema| schema.get("required"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut questions = Vec::new();
+    if let Some(properties) = properties {
+        for (key, raw_property) in properties.iter().take(10) {
+            let property = raw_property.as_object();
+            let enum_values = property
+                .and_then(|property| property.get("enum"))
+                .map(mcp_elicitation_enum_options)
+                .unwrap_or_default();
+            let prompt = property
+                .and_then(|property| property.get("title"))
+                .or_else(|| property.and_then(|property| property.get("description")))
+                .and_then(Value::as_str)
+                .unwrap_or(key)
+                .chars()
+                .take(500)
+                .collect::<String>();
+            let options = if enum_values.is_empty() {
+                vec![serde_json::json!({"id":"answer","label":"Provide answer"})]
+            } else {
+                enum_values
+            };
+            questions.push(serde_json::json!({
+                "id": key.chars().take(120).collect::<String>(),
+                "prompt": prompt,
+                "helpText": if options.len() == 1 && options[0]["id"] == "answer" {
+                    Value::String("Use Other to enter the requested value.".to_string())
+                } else {
+                    Value::Null
+                },
+                "selectionMode": "single",
+                "required": required.contains(key.as_str()),
+                "options": options,
+            }));
+        }
+    }
+    if questions.is_empty() {
+        questions.push(serde_json::json!({
+            "id": "response",
+            "prompt": request.message,
+            "helpText": "Use Other to enter the requested response.",
+            "selectionMode": "single",
+            "required": true,
+            "options": [{"id":"answer","label":"Provide response"}],
+        }));
+    }
+    questions
+}
+
+/// Convert an MCP elicitation into the existing issue-thread interaction
+/// workflow. The invocation is intentionally left in `awaiting_approval` so
+/// the regular interaction continuation can wake the agent after a user
+/// submits answers; no remote call is retried in this request.
+async fn defer_mcp_elicitation(
+    state: &AppState,
+    company_id: Uuid,
+    tool: &McpCatalogTool,
+    request: McpElicitationRequest,
+    invocation_id: Option<Uuid>,
+    session_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    run_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+) -> Result<Value, String> {
+    let Some(invocation_id) = invocation_id else {
+        return Err("MCP elicitation is not supported without a recorded gateway invocation".to_string());
+    };
+    let Some(issue_id) = issue_id else {
+        return Err("MCP elicitation is not supported for non-interactive gateway clients".to_string());
+    };
+    let issue = sqlx::query_as::<_, models::Issue>(
+        "SELECT * FROM issues WHERE id = $1 AND company_id = $2",
+    )
+    .bind(issue_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| format!("MCP elicitation issue lookup failed: {error}"))?
+    .ok_or_else(|| "MCP elicitation issue context is no longer available".to_string())?;
+    let interaction = services::IssueThreadInteractionService::new(state.pool.clone())
+        .create(
+            &issue,
+            models::CreateThreadInteractionInput {
+                kind: "ask_user_questions".to_string(),
+                payload: serde_json::json!({
+                    "version": 1,
+                    "title": request.message,
+                    "submitLabel": "Send response",
+                    "questions": mcp_elicitation_questions(&request),
+                }),
+                title: Some("Tool needs input".to_string()),
+                summary: Some(format!(
+                    "{} asked for more information before it can continue.",
+                    tool.gateway_name
+                )),
+                continuation_policy: "wake_assignee".to_string(),
+                resolver_policy: None,
+                idempotency_key: Some(format!("mcp-elicitation:{invocation_id}")),
+                addressee_agent_id: None,
+                source_run_id: run_id,
+                source_comment_id: None,
+            },
+            services::InteractionCreator {
+                agent_id,
+                user_id: None,
+            },
+        )
+        .await
+        .map_err(|error| format!("MCP elicitation interaction creation failed: {error}"))?;
+    let error_message =
+        "Remote MCP tool requested additional input; an issue interaction was created.";
+    sqlx::query(
+        "UPDATE tool_invocations
+            SET status = 'awaiting_approval', error_code = 'elicitation_required',
+                error_message = $2, updated_at = NOW()
+          WHERE id = $1",
+    )
+    .bind(invocation_id)
+    .bind(error_message)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| format!("MCP elicitation invocation update failed: {error}"))?;
+    let actor_type = if agent_id.is_some() { "agent" } else { "system" };
+    let actor_id = agent_id.map(|value| value.to_string());
+    sqlx::query(
+        "INSERT INTO tool_call_events
+            (company_id, event_type, actor_type, actor_id, agent_id, run_id, issue_id,
+             application_id, connection_id, catalog_entry_id, tool_name, decision, outcome,
+             invocation_id, reason_code, metadata, error_code, error_message)
+         VALUES ($1, 'call_failed', $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 'defer_runtime', 'pending', $11, 'elicitation_required', $12, $13, $14)",
+    )
+    .bind(company_id)
+    .bind(actor_type)
+    .bind(actor_id)
+    .bind(agent_id)
+    .bind(run_id)
+    .bind(issue_id)
+    .bind(tool.application_id)
+    .bind(tool.connection_id)
+    .bind(tool.catalog_entry_id)
+    .bind(&tool.gateway_name)
+    .bind(invocation_id)
+    .bind(serde_json::json!({
+        "interactionId": interaction.id,
+        "gatewaySessionId": session_id,
+        "elicitation": {
+            "message": request.message,
+            "requestedSchema": request.requested_schema,
+        },
+    }))
+    .bind("elicitation_required")
+    .bind(error_message)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| format!("MCP elicitation event creation failed: {error}"))?;
+    Err(format!("MCP_ELICITATION_REQUIRED:{}", interaction.id))
+}
+
+fn mcp_elicitation_interaction_id(error: &str) -> Option<Uuid> {
+    error
+        .strip_prefix("MCP_ELICITATION_REQUIRED:")
+        .and_then(|value| Uuid::parse_str(value.trim()).ok())
 }
 
 async fn mcp_session_protocol(
@@ -2628,6 +5215,24 @@ async fn mcp_session_protocol_json(
             Some(session_id),
         );
     };
+    match consume_mcp_protocol_rate_limit(&state, session.get("company_id"), session_id, method)
+        .await
+    {
+        Ok(Some(rate_limit_state)) => {
+            return mcp_protocol_rate_limited_error(id.clone(), rate_limit_state, Some(session_id));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%error, %session_id, "MCP protocol rate-limit check failed");
+            return mcp_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                id,
+                -32603,
+                "MCP protocol rate-limit check failed",
+                Some(session_id),
+            );
+        }
+    }
     if method == "initialize" && request_session_id.is_some() {
         return mcp_error(
             StatusCode::BAD_REQUEST,
@@ -2670,6 +5275,15 @@ async fn mcp_session_protocol_json(
         ),
         "notifications/initialized" => mcp_accepted(Some(session_id)),
         "tools/list" => {
+            if !gateway_token_action_allowed(&session, "tools/list") {
+                return mcp_error(
+                    StatusCode::FORBIDDEN,
+                    id,
+                    -32003,
+                    "Gateway token is not allowed to list tools",
+                    Some(session_id),
+                );
+            }
             let (status, Json(value)) = list_gateway_tools(State(state), headers).await;
             if !status.is_success() {
                 return mcp_response(
@@ -2689,6 +5303,15 @@ async fn mcp_session_protocol_json(
             )
         }
         "tools/call" => {
+            if !gateway_token_action_allowed(&session, "tools/call") {
+                return mcp_error(
+                    StatusCode::FORBIDDEN,
+                    id,
+                    -32003,
+                    "Gateway token is not allowed to call tools",
+                    Some(session_id),
+                );
+            }
             let params = body
                 .get("params")
                 .cloned()
@@ -2726,18 +5349,20 @@ async fn mcp_session_protocol_json(
                 .get("result")
                 .cloned()
                 .unwrap_or_else(|| value.clone());
-            // Paperclip's MCP server returns text content. Keep structuredContent
-            // only for object-shaped values: Claude Code validates structured
-            // content as a record, while list tools legitimately return arrays.
-            // Arrays remain fully available as JSON text and match Paperclip's
-            // wire contract instead of causing an SDK schema error.
-            let mut tool_result = serde_json::json!({
-                "content": [{"type":"text","text":result.to_string()}],
-                "isError":false
-            });
-            if result.is_object() {
-                tool_result["structuredContent"] = result;
-            }
+            let tool_result = match normalize_mcp_wire_result(result) {
+                Ok(tool_result) => tool_result,
+                Err(error) => {
+                    return mcp_response(
+                        StatusCode::BAD_GATEWAY,
+                        serde_json::json!({
+                            "jsonrpc":"2.0",
+                            "id":id,
+                            "error":{"code":-32000,"message":error}
+                        }),
+                        Some(session_id),
+                    )
+                }
+            };
             mcp_response(
                 StatusCode::OK,
                 serde_json::json!({"jsonrpc":"2.0","id":id,"result":tool_result}),
@@ -2768,6 +5393,15 @@ async fn list_gateway_tools(
         Ok(row) => row,
         Err(response) => return response,
     };
+    if !gateway_token_action_allowed(&session, "tools/list") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Gateway token is not allowed to list tools",
+                "reasonCode": "gateway_token_action_denied"
+            })),
+        );
+    }
     let rows = sqlx::query("SELECT id, plugin_key, manifest FROM plugins WHERE status = 'ready'")
         .fetch_all(&state.pool)
         .await
@@ -2781,114 +5415,316 @@ async fn list_gateway_tools(
             Some(serde_json::json!({"name": name, "description": tool.get("description").and_then(Value::as_str).unwrap_or(""), "inputSchema": tool.get("inputSchema").cloned().unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})), "pluginId": plugin_id, "pluginKey": plugin_key}))
         })
     }).collect();
-    let connections = sqlx::query("SELECT id, uid, transport, transport_config FROM tool_connections WHERE company_id = $1 AND enabled = true")
-        .bind(session.get::<Uuid, _>("company_id")).fetch_all(&state.pool).await.unwrap_or_default();
-    for connection in connections {
-        let connection_id: Uuid = connection.get("id");
-        let uid: String = connection.get("uid");
-        let transport: String = connection.get("transport");
-        let config: Value = connection.get("transport_config");
-        let result = if transport == "mcp_remote" {
-            if let Some(url) = connection_url(&config) {
-                mcp_http_request(&url, "tools/list", serde_json::json!({})).await
-            } else {
-                Err("MCP remote connection has no URL".to_string())
-            }
-        } else {
-            if let Some(command) = config.get("command").and_then(Value::as_str) {
-                let args = config
-                    .get("args")
-                    .and_then(Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                mcp_stdio_request(command, &args, "tools/list", serde_json::json!({})).await
-            } else {
-                Err("MCP stdio connection has no command".to_string())
-            }
-        };
-        if let Ok(result) = result {
-            for tool in result
-                .get("tools")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-            {
-                if let Some(upstream_name) = tool.get("name").and_then(Value::as_str) {
-                    tools.push(serde_json::json!({
-                        "name": format!("mcp.{}:{}", uid, upstream_name),
-                        "description": tool.get("description").and_then(Value::as_str).unwrap_or(""),
-                        "inputSchema": tool.get("inputSchema").cloned().unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
-                        "connectionId": connection_id,
-                        "upstreamToolName": upstream_name,
-                    }));
-                }
-            }
+    let company_id: Uuid = session.get("company_id");
+    let catalog_tools = match load_mcp_catalog_tools(&state, company_id).await {
+        Ok(tools) => tools,
+        Err(error) => {
+            tracing::error!(%company_id, %error, "Failed to load MCP tool catalog");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "MCP tool catalog unavailable",
+                    "reasonCode": "mcp_catalog_unavailable"
+                })),
+            );
         }
+    };
+    let agent_id: Option<Uuid> = session.get("agent_id");
+    let gateway_id: Option<Uuid> = session.get("gateway_id");
+    let issue_id: Option<Uuid> = session.get("issue_id");
+    let project_id: Option<Uuid> = session.get("project_id");
+    let mut has_visible_on_demand_tools = false;
+    for tool in catalog_tools.iter().filter(|tool| {
+        tool.transport == "mcp_remote" && mcp_on_demand_enabled(&tool.connection_config)
+    }) {
+        let decision = gateway_decision_full_for_catalog_with_gateway(
+            &state,
+            company_id,
+            agent_id,
+            &tool.gateway_name,
+            false,
+            tool,
+            None,
+            gateway_id,
+            issue_id,
+            project_id,
+        )
+        .await;
+        if decision.decision != "deny" {
+            has_visible_on_demand_tools = true;
+            break;
+        }
+    }
+    tools.extend(
+        catalog_tools
+            .iter()
+            .filter(|tool| !mcp_on_demand_enabled(&tool.connection_config))
+            .map(mcp_catalog_tool_json),
+    );
+    if has_visible_on_demand_tools {
+        tools.extend(virtual_mcp_tools());
     }
     tools.extend(paperclip_builtin_tools());
-    let company_id: Uuid = session.get("company_id");
-    let agent_id: Uuid = session.get("agent_id");
+    let catalog_by_name = catalog_tools
+        .iter()
+        .map(|tool| (tool.gateway_name.as_str(), tool))
+        .collect::<HashMap<_, _>>();
     let mut visible = Vec::with_capacity(tools.len());
     for tool in tools.drain(..) {
-        let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
-        if gateway_decision(&state, company_id, agent_id, name).await != "deny" {
-            visible.push(tool);
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let mut tool = tool;
+        // Named gateways may be intentionally agent-less. Paperclip's
+        // heartbeat context hides agent-bound first-party/plugin tools in that
+        // case; connected catalog tools remain governed by the gateway
+        // profile and can still be listed explicitly.
+        if agent_id.is_none()
+            && (is_paperclip_builtin_tool(&name) || tool.get("pluginId").is_some())
+        {
+            continue;
         }
+        let decision = match catalog_by_name.get(name.as_str()) {
+            Some(catalog) => {
+                gateway_decision_full_for_catalog_with_gateway(
+                    &state,
+                    company_id,
+                    agent_id,
+                    &name,
+                    false,
+                    catalog,
+                    None,
+                    gateway_id,
+                    issue_id,
+                    project_id,
+                )
+                .await
+                .decision
+            }
+            None => {
+                gateway_decision_for_gateway(
+                    &state,
+                    company_id,
+                    agent_id,
+                    &name,
+                    gateway_id,
+                    issue_id,
+                    project_id,
+                )
+                    .await
+            }
+        };
+        if decision == "deny" {
+            continue;
+        }
+        if decision == "require_approval" {
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            tool["description"] = Value::String(if description.is_empty() {
+                TOOL_APPROVAL_DESCRIPTION_SUFFIX.to_string()
+            } else {
+                format!("{description} {TOOL_APPROVAL_DESCRIPTION_SUFFIX}")
+            });
+        }
+        visible.push(tool);
     }
     (StatusCode::OK, Json(Value::Array(visible)))
+}
+
+async fn execute_virtual_search_tools(
+    state: &AppState,
+    company_id: Uuid,
+    agent_id: Option<Uuid>,
+    gateway_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    parameters: &Value,
+) -> Result<Value, String> {
+    let params = parameters
+        .as_object()
+        .ok_or_else(|| "search_tools arguments must be an object".to_string())?;
+    let query = params
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
+    let catalog_tools = load_mcp_catalog_tools(state, company_id).await?;
+    let mut visible = Vec::new();
+    for tool in catalog_tools.into_iter().filter(|tool| {
+        tool.transport == "mcp_remote" && mcp_on_demand_enabled(&tool.connection_config)
+    }) {
+        let matches_query = query.is_empty()
+            || [
+                tool.gateway_name.as_str(),
+                tool.title.as_deref().unwrap_or_default(),
+                tool.description.as_deref().unwrap_or_default(),
+                tool.application_key.as_deref().unwrap_or_default(),
+                tool.upstream_tool_name.as_str(),
+            ]
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains(&query));
+        if !matches_query {
+            continue;
+        }
+        let decision = gateway_decision_full_for_catalog_with_gateway(
+            state,
+            company_id,
+            agent_id,
+            &tool.gateway_name,
+            false,
+            &tool,
+            None,
+            gateway_id,
+            issue_id,
+            project_id,
+        )
+        .await
+        .decision;
+        if decision != "deny" {
+            visible.push(mcp_catalog_tool_json(&tool));
+        }
+        if visible.len() >= limit {
+            break;
+        }
+    }
+    Ok(serde_json::json!({"tools": visible}))
 }
 
 /// Load the profile decision inputs for the ladder's profile fallback stage.
 async fn load_profile_decision(
     state: &AppState,
     company_id: Uuid,
-    agent_id: Uuid,
+    agent_id: Option<Uuid>,
     tool_name: &str,
+    catalog_entry_id: Option<Uuid>,
+    connection_id: Option<Uuid>,
+    application_id: Option<Uuid>,
+    risk_level: Option<&str>,
+    gateway_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
 ) -> (bool, bool, bool) {
-    // Paperclip: an exclude entry on any effective profile blocks the tool;
-    // otherwise defaultAction=allow or an include match allows it. The query
-    // mirrors the previous precedence: exact tool match wins, excludes win.
+    // Paperclip: an exclude entry on the current profile blocks that profile;
+    // otherwise defaultAction=allow or an include match allows it. Match all
+    // five selector types from the shared schema, not only legacy tool-name
+    // entries.
     // LEFT JOIN is important: a profile with defaultAction=allow and no
     // entries is still an allow profile.
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT p.default_action, e.effect FROM tool_profile_bindings b
+    if let Some(gateway_id) = gateway_id {
+        // Older Parrot rows stored the profile directly on the gateway but
+        // predated the generic binding row. Backfill that representation
+        // lazily so both schemas participate in the same policy ladder.
+        let _ = sqlx::query(
+            "INSERT INTO tool_profile_bindings (company_id, profile_id, target_type, target_id)
+             SELECT company_id, profile_id, 'gateway', id::text
+               FROM tool_mcp_gateways
+              WHERE id = $1 AND company_id = $2 AND profile_id IS NOT NULL
+             ON CONFLICT (company_id, target_type, target_id, profile_id)
+             DO NOTHING",
+        )
+        .bind(gateway_id)
+        .bind(company_id)
+        .execute(&state.pool)
+        .await;
+    }
+    // Paperclip first narrows bindings to the most specific matching scope
+    // (gateway > issue > routine > agent > project > company), then evaluates
+    // profiles in binding priority/creation order. Keeping that scope step in
+    // SQL prevents a broad company profile from overriding a narrower agent
+    // or gateway profile.
+    let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+        "WITH matching_bindings AS (
+             SELECT b.profile_id, b.priority, b.created_at, b.target_type,
+                    CASE b.target_type
+                        WHEN 'gateway' THEN 0
+                        WHEN 'issue' THEN 1
+                        WHEN 'routine' THEN 2
+                        WHEN 'agent' THEN 3
+                        WHEN 'project' THEN 4
+                        WHEN 'company' THEN 5
+                        ELSE 99
+                    END AS scope_rank
+               FROM tool_profile_bindings b
+              WHERE b.company_id = $1
+                AND ((b.target_type = 'agent' AND $2::uuid IS NOT NULL AND b.target_id = $2::text)
+                  OR (b.target_type = 'company' AND b.target_id = $1::text)
+                  OR (b.target_type = 'project' AND $7::uuid IS NOT NULL AND b.target_id = $7::text)
+                  OR (b.target_type = 'issue' AND $8::uuid IS NOT NULL AND b.target_id = $8::text)
+                  OR (b.target_type = 'gateway' AND $6::uuid IS NOT NULL AND b.target_id = $6::text))
+         ), winning_scope AS (
+             SELECT MIN(scope_rank) AS scope_rank FROM matching_bindings
+         )
+         SELECT p.id, p.default_action, e.effect
+           FROM matching_bindings b
+           JOIN winning_scope w ON w.scope_rank = b.scope_rank
            JOIN tool_profiles p
-             ON p.id = b.profile_id AND p.company_id = b.company_id
+             ON p.id = b.profile_id AND p.company_id = $1
            LEFT JOIN tool_profile_entries e
              ON e.profile_id = p.id AND e.company_id = p.company_id
-            AND (e.tool_name = $3 OR e.tool_name = '*')
-          WHERE b.company_id = $1
-            AND b.target_type = 'agent' AND b.target_id = $2
-            AND p.status = 'active'
-          ORDER BY CASE WHEN e.tool_name = $3 THEN 0 ELSE 1 END,
-                   CASE WHEN e.effect IN ('exclude', 'deny') THEN 0 ELSE 1 END",
+            AND ((e.selector_type = 'tool_name' AND (e.tool_name = $3 OR e.tool_name = '*'))
+                 OR (e.selector_type = 'catalog_entry' AND $4::uuid IS NOT NULL AND e.catalog_entry_id = $4)
+                 OR (e.selector_type = 'connection' AND $5::uuid IS NOT NULL AND e.connection_id = $5)
+                 OR (e.selector_type = 'application' AND $9::uuid IS NOT NULL AND e.application_id = $9)
+                 OR (e.selector_type = 'risk_level' AND $10::text IS NOT NULL AND e.risk_level = $10))
+          WHERE p.status = 'active'
+          ORDER BY b.priority ASC, b.created_at ASC, p.id ASC,
+                   CASE WHEN e.selector_type = 'tool_name' AND e.tool_name = $3 THEN 0
+                        WHEN e.selector_type = 'catalog_entry' AND $4::uuid IS NOT NULL AND e.catalog_entry_id = $4 THEN 1
+                        WHEN e.selector_type = 'connection' AND $5::uuid IS NOT NULL AND e.connection_id = $5 THEN 2
+                        WHEN e.selector_type = 'application' AND $9::uuid IS NOT NULL AND e.application_id = $9 THEN 3
+                        WHEN e.selector_type = 'risk_level' AND $10::text IS NOT NULL AND e.risk_level = $10 THEN 4
+                        ELSE 3 END",
     )
     .bind(company_id)
     .bind(agent_id)
     .bind(tool_name)
+    .bind(catalog_entry_id)
+    .bind(connection_id)
+    .bind(gateway_id)
+    .bind(project_id)
+    .bind(issue_id)
+    .bind(application_id)
+    .bind(risk_level)
     .fetch_all(&state.pool)
     .await
     .unwrap_or_default();
     let has_active_profile = !rows.is_empty();
-    let mut has_include = false;
-    let mut default_allows = false;
-    for (default_action, effect) in rows {
-        if default_action == "allow" {
-            default_allows = true;
-        }
+    let mut profile_order = Vec::new();
+    let mut profile_states: HashMap<Uuid, (String, bool, bool)> = HashMap::new();
+    for (profile_id, default_action, effect) in rows {
+        let state = profile_states.entry(profile_id).or_insert_with(|| {
+            profile_order.push(profile_id);
+            (default_action, false, false)
+        });
         match effect.as_deref() {
-            Some("exclude") | Some("deny") => return (false, false, true),
-            Some("include") | Some("allow") => has_include = true,
+            Some("exclude") | Some("deny") => state.1 = true,
+            Some("include") | Some("allow") => state.2 = true,
             _ => {}
         }
     }
-    (false, default_allows || has_include, has_active_profile)
+    for profile_id in profile_order {
+        let Some((default_action, excluded, included)) = profile_states.remove(&profile_id) else {
+            continue;
+        };
+        // An excluded entry disables only this profile, matching Paperclip's
+        // per-profile loop; a later profile in the same winning scope may
+        // still explicitly allow the call.
+        if !excluded && (default_action == "allow" || included) {
+            return (false, true, has_active_profile);
+        }
+    }
+    (false, false, has_active_profile)
 }
 
 /// Structured decision from the ladder, carrying rate-limit state so callers
@@ -2900,35 +5736,99 @@ pub(crate) struct GatewayDecision {
     pub rate_limit_state: Option<serde_json::Value>,
 }
 
-async fn gateway_decision(
+async fn gateway_decision_for_gateway(
     state: &AppState,
     company_id: Uuid,
-    agent_id: Uuid,
+    agent_id: Option<Uuid>,
     tool_name: &str,
+    gateway_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
 ) -> String {
-    // Discovery must be side-effect free. In particular, listing tools must
-    // not consume a rate-limit token before the agent has called anything.
-    gateway_decision_full(state, company_id, agent_id, tool_name, false)
-        .await
-        .decision
+    gateway_decision_full_with_context(
+        state,
+        company_id,
+        agent_id,
+        tool_name,
+        false,
+        None,
+        None,
+        gateway_id,
+        issue_id,
+        project_id,
+    )
+    .await
+    .decision
+}
+
+async fn gateway_decision_full_for_gateway(
+    state: &AppState,
+    company_id: Uuid,
+    agent_id: Option<Uuid>,
+    tool_name: &str,
+    consume: bool,
+    gateway_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+) -> GatewayDecision {
+    gateway_decision_full_with_context(
+        state,
+        company_id,
+        agent_id,
+        tool_name,
+        consume,
+        None,
+        None,
+        gateway_id,
+        issue_id,
+        project_id,
+    )
+    .await
 }
 
 /// Paperclip `decide()`: `consumeRateLimit === true` for real calls (each
 /// consumes one token per matching rate_limit policy); discovery/list
 /// evaluation passes consume=false and observes without consuming.
-async fn gateway_decision_full(
+async fn gateway_decision_full_for_catalog_with_gateway(
     state: &AppState,
     company_id: Uuid,
-    agent_id: Uuid,
+    agent_id: Option<Uuid>,
     tool_name: &str,
     consume: bool,
+    catalog: &McpCatalogTool,
+    arguments: Option<&Value>,
+    gateway_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
 ) -> GatewayDecision {
-    let rows = match sqlx::query(
-        "SELECT id, policy_type, selectors, config, description \\
-           FROM tool_policies \\
-          WHERE company_id = $1 AND enabled = true \\
-          ORDER BY priority ASC, created_at ASC",
+    gateway_decision_full_with_context(
+        state,
+        company_id,
+        agent_id,
+        tool_name,
+        consume,
+        Some(catalog),
+        arguments,
+        gateway_id,
+        issue_id,
+        project_id,
     )
+    .await
+}
+
+async fn gateway_decision_full_with_context(
+    state: &AppState,
+    company_id: Uuid,
+    agent_id: Option<Uuid>,
+    tool_name: &str,
+    consume: bool,
+    catalog: Option<&McpCatalogTool>,
+    arguments: Option<&Value>,
+    gateway_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+) -> GatewayDecision {
+    let rows = match sqlx::query(TOOL_POLICY_QUERY)
     .bind(company_id)
     .fetch_all(&state.pool)
     .await
@@ -2990,18 +5890,30 @@ async fn gateway_decision_full(
         }
     }
 
-    let (explicit_grant, profile_allows, has_active_profile) =
-        load_profile_decision(state, company_id, agent_id, tool_name).await;
+    let (explicit_grant, profile_allows, has_active_profile) = load_profile_decision(
+        state,
+        company_id,
+        agent_id,
+        tool_name,
+        catalog.map(|tool| tool.catalog_entry_id),
+        catalog.map(|tool| tool.connection_id),
+        catalog.map(|tool| tool.application_id),
+        catalog.map(|tool| tool.risk_level.as_str()),
+        gateway_id,
+        issue_id,
+        project_id,
+    )
+    .await;
     let tool_name_string = tool_name.to_string();
     let ctx = services::tool_access_contract::EvaluationContext {
         tool_name: tool_name_string.clone(),
         explicit_grant,
         profile_allows,
-        arguments: None,
+        arguments: arguments.cloned(),
         arguments_hash: None,
-        catalog_status: None,
-        catalog_version_hash: None,
-        catalog_schema_hash: None,
+        catalog_status: catalog.map(|_| "active".to_string()),
+        catalog_version_hash: catalog.and_then(|tool| tool.version_hash.clone()),
+        catalog_schema_hash: catalog.and_then(|tool| tool.schema_hash.clone()),
         last_rate_limit_state: None,
     };
 
@@ -3021,9 +5933,9 @@ async fn gateway_decision_full(
                 &rule,
                 &services::tool_access_contract::RateLimitContext {
                     company_id: company_id.to_string(),
-                    agent_id: Some(agent_id.to_string()),
-                    application_id: None,
-                    connection_id: None,
+                    agent_id: agent_id.map(|id| id.to_string()),
+                    application_id: catalog.map(|tool| tool.application_id.to_string()),
+                    connection_id: catalog.map(|tool| tool.connection_id.to_string()),
                     tool_name: tool_name_string.clone(),
                 },
             );
@@ -3075,13 +5987,7 @@ async fn gateway_decision_full(
         if let Some(policy_id) = &outcome.policy_id {
             let policy_id = policy_id.parse::<Uuid>().ok();
             if let Some(policy_id) = policy_id {
-                let _ = sqlx::query(
-                    "UPDATE tool_policies SET config = jsonb_set( \\
-                         jsonb_set(config, '{trustRule,hitCount}', \\
-                             (((COALESCE(config->'trustRule'->>'hitCount','0'))::int + 1))::text::jsonb), \\
-                         '{trustRule,lastHitAt}', to_jsonb(NOW())) \\
-                     WHERE id = $1",
-                )
+                let _ = sqlx::query(TRUST_RULE_HIT_UPDATE)
                 .bind(policy_id)
                 .execute(&state.pool)
                 .await;
@@ -3102,7 +6008,8 @@ async fn gateway_decision_full(
     let decision = match outcome.decision {
         "allow" | "require_approval" | "rate_limited" => outcome.decision.to_string(),
         "deny"
-            if allow_first_party_tool_on_default_deny(
+            if agent_id.is_some()
+                && allow_first_party_tool_on_default_deny(
                 tool_name,
                 outcome.reason_code,
                 has_active_profile,
@@ -3217,7 +6124,7 @@ async fn call_paperclip_builtin_tool(
     token: &str,
     company_id: Uuid,
     agent_id: Uuid,
-    run_id: Uuid,
+    run_id: Option<Uuid>,
     tool_name: &str,
     parameters: &Value,
 ) -> Result<Value, String> {
@@ -3580,6 +6487,8 @@ async fn call_paperclip_builtin_tool(
                 path_part(parameters.get("issueId"), "issueId")?
             ),
             {
+                let active_run_id =
+                    run_id.ok_or("paperclipCheckoutIssue requires an active heartbeat run")?;
                 let requested_agent = parameters
                     .get("agentId")
                     .and_then(Value::as_str)
@@ -3588,7 +6497,7 @@ async fn call_paperclip_builtin_tool(
                 Some(serde_json::json!({
                     "agentId": requested_agent,
                     "expectedStatuses": parameters.get("expectedStatuses").cloned().unwrap_or_else(|| serde_json::json!(["todo", "backlog", "blocked"])),
-                    "checkoutRunId": run_id
+                    "checkoutRunId": active_run_id
                 }))
             },
         ),
@@ -3598,11 +6507,19 @@ async fn call_paperclip_builtin_tool(
                 "/issues/{}/release",
                 path_part(parameters.get("issueId"), "issueId")?
             ),
-            Some(serde_json::json!({
-                "releaseRunId": run_id,
-                "result": parameters.get("result"),
-                "targetStatus": parameters.get("targetStatus")
-            })),
+            Some({
+                let active_run_id =
+                    run_id.ok_or("paperclipReleaseIssue requires an active heartbeat run")?;
+                let mut body = serde_json::json!({ "releaseRunId": active_run_id });
+                if let Some(object) = body.as_object_mut() {
+                    for key in ["result", "targetStatus"] {
+                        if let Some(value) = parameters.get(key).filter(|value| !value.is_null()) {
+                            object.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                body
+            }),
         ),
         "paperclipAddComment" => (
             "POST",
@@ -3615,10 +6532,12 @@ async fn call_paperclip_builtin_tool(
                 if let Some(object) = body.as_object_mut() {
                     object.insert("actor_type".to_string(), Value::String("agent".to_string()));
                     object.insert("actor_id".to_string(), Value::String(agent_id.to_string()));
-                    object.insert(
-                        "actor_run_id".to_string(),
-                        Value::String(run_id.to_string()),
-                    );
+                    if let Some(run_id) = run_id {
+                        object.insert(
+                            "actor_run_id".to_string(),
+                            Value::String(run_id.to_string()),
+                        );
+                    }
                 }
                 body
             }),
@@ -3676,14 +6595,30 @@ async fn call_paperclip_builtin_tool(
             None,
         ),
         "paperclipControlIssueWorkspaceServices" => {
-            let workspace_id = path_part(parameters.get("workspaceId"), "workspaceId")?;
+            let runtime = Box::pin(call_paperclip_builtin_tool(
+                state,
+                token,
+                company_id,
+                agent_id,
+                run_id,
+                "paperclipGetIssueWorkspaceRuntime",
+                &serde_json::json!({
+                    "issueId": parameters.get("issueId").cloned().unwrap_or(Value::Null)
+                }),
+            ))
+            .await?;
+            let workspace_id = runtime
+                .get("workspace")
+                .and_then(|workspace| workspace.get("id"))
+                .and_then(Value::as_str)
+                .ok_or("Issue has no current execution workspace")?;
             let action = path_part(parameters.get("action"), "action")?;
             (
                 "POST",
                 format!("/execution-workspaces/{workspace_id}/runtime-services/{action}"),
                 Some(object_without(
                     &parameters,
-                    &["issueId", "workspaceId", "action"],
+                    &["issueId", "action"],
                 )),
             )
         }
@@ -4597,8 +7532,8 @@ async fn load_gateway_invocation_replay(
 async fn reserve_gateway_invocation(
     state: &AppState,
     company_id: Uuid,
-    agent_id: Uuid,
-    run_id: Uuid,
+    agent_id: Option<Uuid>,
+    run_id: Option<Uuid>,
     connection_id: Option<Uuid>,
     tool_name: &str,
     parameters: &Value,
@@ -4619,14 +7554,16 @@ async fn reserve_gateway_invocation(
             (id, company_id, idempotency_key, actor_type, actor_id, agent_id, run_id,
              connection_id, tool_name, arguments_hash, arguments_summary, policy_decision,
              status, error_code, error_message, started_at, completed_at)
-         VALUES ($1,$2,$3,'agent',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+         VALUES ($1,$2,$3,
+                 CASE WHEN $5::uuid IS NULL THEN 'system' ELSE 'agent' END,
+                 COALESCE($4, $2::text),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
          ON CONFLICT (company_id, idempotency_key) DO NOTHING
          RETURNING id",
     )
     .bind(invocation_id)
     .bind(company_id)
     .bind(idempotency_key)
-    .bind(agent_id.to_string())
+    .bind(agent_id.map(|id| id.to_string()))
     .bind(agent_id)
     .bind(run_id)
     .bind(connection_id)
@@ -4670,8 +7607,8 @@ async fn reserve_gateway_invocation(
 async fn reserve_gateway_approval(
     state: &AppState,
     company_id: Uuid,
-    agent_id: Uuid,
-    run_id: Uuid,
+    agent_id: Option<Uuid>,
+    run_id: Option<Uuid>,
     issue_id: Option<Uuid>,
     connection_id: Option<Uuid>,
     tool_name: &str,
@@ -4694,14 +7631,16 @@ async fn reserve_gateway_approval(
             (id, company_id, idempotency_key, actor_type, actor_id, agent_id, run_id,
              connection_id, tool_name, arguments_hash, arguments_summary, policy_decision,
              status, approval_state)
-         VALUES ($1,$2,$3,'agent',$4,$5,$6,$7,$8,$9,$10,$11,'pending','pending')
+         VALUES ($1,$2,$3,
+                 CASE WHEN $5::uuid IS NULL THEN 'system' ELSE 'agent' END,
+                 COALESCE($4, $2::text),$5,$6,$7,$8,$9,$10,$11,'pending','pending')
          ON CONFLICT (company_id, idempotency_key) DO NOTHING
          RETURNING id",
     )
     .bind(invocation_id)
     .bind(company_id)
     .bind(idempotency_key)
-    .bind(agent_id.to_string())
+    .bind(agent_id.map(|id| id.to_string()))
     .bind(agent_id)
     .bind(run_id)
     .bind(connection_id)
@@ -4787,6 +7726,15 @@ async fn call_gateway_tool(
         Ok(row) => row,
         Err(response) => return response,
     };
+    if !gateway_token_action_allowed(&session, "tools/call") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Gateway token is not allowed to call tools",
+                "reasonCode": "gateway_token_action_denied"
+            })),
+        );
+    }
     let tool_name = body
         .get("tool")
         .and_then(Value::as_str)
@@ -4803,16 +7751,137 @@ async fn call_gateway_tool(
         Err(response) => return response,
     };
     let company_id: Uuid = session.get("company_id");
-    let agent_id: Uuid = session.get("agent_id");
-    let run_id: Uuid = session.get("run_id");
-    let _invocation_context = McpInvocationContext {
-        session_id: session.get("id"),
-        company_id,
-        agent_id,
-        run_id,
-        issue_id: session.get("issue_id"),
-    };
+    let agent_id: Option<Uuid> = session.get("agent_id");
+    let run_id: Option<Uuid> = session.get("run_id");
+    let gateway_id: Option<Uuid> = session.get("gateway_id");
+    let issue_id: Option<Uuid> = session.get("issue_id");
+    let project_id: Option<Uuid> = session.get("project_id");
+    let agent_id_text = agent_id.map(|id| id.to_string());
+    if is_gateway_virtual_tool(tool_name) {
+        let parameters = body
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if tool_name == "search_tools" {
+            let decision = gateway_decision_for_gateway(
+                &state,
+                company_id,
+                agent_id,
+                tool_name,
+                gateway_id,
+                issue_id,
+                project_id,
+            )
+            .await;
+            if decision == "deny" {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "Tool call denied by policy",
+                        "reasonCode": "policy_denied",
+                        "decision": "deny"
+                    })),
+                );
+            }
+            return match execute_virtual_search_tools(
+                &state,
+                company_id,
+                agent_id,
+                gateway_id,
+                issue_id,
+                project_id,
+                &parameters,
+            )
+            .await
+            {
+                Ok(value) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"decision":"allowed","result":value})),
+                ),
+                Err(error) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": error,
+                        "reasonCode": "virtual_tool_execution_failed"
+                    })),
+                ),
+            };
+        }
+
+        let Some(target_name) = parameters
+            .get("tool")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "run_tool requires a target tool name",
+                    "reasonCode": "invalid_tool_arguments"
+                })),
+            );
+        };
+        if is_gateway_virtual_tool(target_name) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "run_tool cannot target another virtual tool",
+                    "reasonCode": "invalid_tool_arguments"
+                })),
+            );
+        }
+        let target = match find_mcp_catalog_tool(&state, company_id, target_name).await {
+            Ok(Some(tool))
+                if tool.transport == "mcp_remote"
+                    && mcp_on_demand_enabled(&tool.connection_config) => tool,
+            Ok(_) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Target tool is not an on-demand remote MCP tool",
+                        "reasonCode": "tool_not_found"
+                    })),
+                )
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": error,
+                        "reasonCode": "mcp_catalog_unavailable"
+                    })),
+                )
+            }
+        };
+        let target_parameters = parameters
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        // Re-enter the normal gateway path so the selected catalog tool gets
+        // the same argument validation, policy, approval, idempotency, audit,
+        // and execution behavior as a directly listed tool.
+        let _ = target;
+        return Box::pin(call_gateway_tool(
+            State(state),
+            headers,
+            Json(serde_json::json!({
+                "tool": target_name,
+                "parameters": target_parameters
+            })),
+        ))
+        .await;
+    }
     if tool_name.starts_with("paperclip") {
+        let Some(agent_id) = agent_id else {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "This Paperclip tool requires an agent-bound gateway session",
+                    "reasonCode": "agent_context_required"
+                })),
+            );
+        };
         let parameters = body
             .get("parameters")
             .cloned()
@@ -4837,7 +7906,17 @@ async fn call_gateway_tool(
             "valueType": "object",
             "keys": parameters.as_object().map(|value| value.len()).unwrap_or(0)
         });
-        let decision = gateway_decision_full(&state, company_id, agent_id, tool_name, true).await;
+        let decision = gateway_decision_full_for_gateway(
+            &state,
+            company_id,
+            Some(agent_id),
+            tool_name,
+            true,
+            gateway_id,
+            issue_id,
+            project_id,
+        )
+        .await;
         if decision.decision == "rate_limited" {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -4853,7 +7932,7 @@ async fn call_gateway_tool(
             let invocation_id = match reserve_gateway_invocation(
                 &state,
                 company_id,
-                agent_id,
+                Some(agent_id),
                 run_id,
                 None,
                 tool_name,
@@ -4884,7 +7963,7 @@ async fn call_gateway_tool(
             let (invocation_id, action_id) = match reserve_gateway_approval(
                 &state,
                 company_id,
-                agent_id,
+                Some(agent_id),
                 run_id,
                 issue_id,
                 None,
@@ -4914,7 +7993,7 @@ async fn call_gateway_tool(
         let invocation_id = match reserve_gateway_invocation(
             &state,
             company_id,
-            agent_id,
+            Some(agent_id),
             run_id,
             None,
             tool_name,
@@ -4999,19 +8078,80 @@ async fn call_gateway_tool(
     let plugin = sqlx::query("SELECT id, manifest FROM plugins WHERE status = 'ready' AND EXISTS (SELECT 1 FROM jsonb_array_elements(manifest->'tools') item WHERE item->>'name' = $1)")
         .bind(tool_name).fetch_optional(&state.pool).await.unwrap_or(None);
     if plugin.is_none() && tool_name.starts_with("mcp.") {
-        let raw = &tool_name[4..];
-        if let Some((uid, upstream_name)) = raw.split_once(':') {
-            let connection = sqlx::query("SELECT id, transport, transport_config FROM tool_connections WHERE company_id=$1 AND uid=$2 AND enabled=true")
-                .bind(company_id).bind(uid).fetch_optional(&state.pool).await.unwrap_or(None);
-            if let Some(connection) = connection {
-                let connection_id: Uuid = connection.get("id");
-                let transport: String = connection.get("transport");
-                let config: Value = connection.get("transport_config");
+        let catalog_tool = find_mcp_catalog_tool(&state, company_id, tool_name)
+            .await
+            .ok()
+            .flatten();
+        let catalog_target = catalog_tool
+            .clone()
+            .map(|tool| {
+                (
+                    tool.connection_id,
+                    tool.transport,
+                    tool.transport_config,
+                    tool.upstream_tool_name,
+                )
+            });
+        let legacy_target = if catalog_target.is_none() {
+            let raw = &tool_name[4..];
+            if let Some((uid, upstream_name)) = raw.split_once(':') {
+                sqlx::query("SELECT id, transport, transport_config FROM tool_connections WHERE company_id=$1 AND uid=$2 AND enabled=true")
+                    .bind(company_id)
+                    .bind(uid)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .unwrap_or(None)
+                    .map(|connection| {
+                        (
+                            connection.get("id"),
+                            connection.get("transport"),
+                            connection.get("transport_config"),
+                            upstream_name.to_string(),
+                        )
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((connection_id, transport, config, upstream_name)) =
+            catalog_target.or(legacy_target)
+        {
                 let parameters = body
                     .get("parameters")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                let decision = gateway_decision_full(&state, company_id, agent_id, tool_name, true).await;
+                let decision = match catalog_tool.as_ref() {
+                    Some(catalog) => {
+                        gateway_decision_full_for_catalog_with_gateway(
+                            &state,
+                            company_id,
+                            agent_id,
+                            tool_name,
+                            true,
+                            catalog,
+                            Some(&parameters),
+                            gateway_id,
+                            issue_id,
+                            project_id,
+                        )
+                        .await
+                    }
+                    None => {
+                        gateway_decision_full_for_gateway(
+                            &state,
+                            company_id,
+                            agent_id,
+                            tool_name,
+                            true,
+                            gateway_id,
+                            issue_id,
+                            project_id,
+                        )
+                        .await
+                    }
+                };
                 if decision.decision == "rate_limited" {
                     return (
                         StatusCode::TOO_MANY_REQUESTS,
@@ -5108,50 +8248,37 @@ async fn call_gateway_tool(
                     Ok(GatewayInvocationReservation::Replayed(response)) => return response,
                     Err(response) => return response,
                 };
-                let result = if transport == "mcp_remote" {
-                    match connection_url(&config) {
-                        Some(url) => {
-                            mcp_http_request(
-                                &url,
-                                "tools/call",
-                                serde_json::json!({"name": upstream_name, "arguments": parameters}),
-                            )
-                            .await
-                        }
-                        None => Err("MCP connection has no remote URL".to_string()),
-                    }
+                let result = if let Some(catalog) = catalog_tool.as_ref() {
+                    execute_catalog_mcp_tool(
+                        &state,
+                        company_id,
+                        catalog,
+                        parameters,
+                        Some(invocation_id),
+                        Some(&headers),
+                        session.get("id"),
+                        agent_id,
+                        run_id,
+                        session.get("issue_id"),
+                        session.get("project_id"),
+                    )
+                    .await
                 } else {
-                    match config.get("command").and_then(Value::as_str) {
-                        Some(command) => {
-                            let args = config
-                                .get("args")
-                                .and_then(Value::as_array)
-                                .map(|values| {
-                                    values
-                                        .iter()
-                                        .filter_map(Value::as_str)
-                                        .map(ToOwned::to_owned)
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
-                            mcp_stdio_request(
-                                command,
-                                &args,
-                                "tools/call",
-                                serde_json::json!({"name": upstream_name, "arguments": parameters}),
-                            )
-                            .await
-                        }
-                        None => {
-                            Err("MCP connection has no executable transport configuration"
-                                .to_string())
-                        }
-                    }
+                    execute_legacy_mcp_tool(
+                        &state,
+                        company_id,
+                        connection_id,
+                        &transport,
+                        &config,
+                        &upstream_name,
+                        parameters,
+                    )
+                    .await
                 };
                 return match result {
                     Ok(value) => {
                         let _ = sqlx::query("UPDATE tool_invocations SET status='succeeded',result_summary=$2,completed_at=NOW(),updated_at=NOW() WHERE id=$1").bind(invocation_id).bind(serde_json::json!({"valueType":"json"})).execute(&state.pool).await;
-                        let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,connection_id,tool_name,decision,outcome,invocation_id) VALUES ($1,'call_completed','agent',$2,$3,$4,$5,$6,$7,'success',$8)").bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(connection_id).bind(tool_name).bind(&decision).bind(invocation_id).execute(&state.pool).await;
+                        let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,connection_id,tool_name,decision,outcome,invocation_id) VALUES ($1,'call_completed',CASE WHEN $3::uuid IS NULL THEN 'system' ELSE 'agent' END,COALESCE($2,$1::text),$3,$4,$5,$6,$7,'success',$8)").bind(company_id).bind(agent_id_text.clone()).bind(agent_id).bind(run_id).bind(connection_id).bind(tool_name).bind(&decision).bind(invocation_id).execute(&state.pool).await;
                         (
                             StatusCode::OK,
                             Json(
@@ -5160,7 +8287,19 @@ async fn call_gateway_tool(
                         )
                     }
                     Err(error) => {
+                        if let Some(interaction_id) = mcp_elicitation_interaction_id(&error) {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({
+                                    "error": "MCP tool requested additional input",
+                                    "reasonCode": "elicitation_required",
+                                    "invocationId": invocation_id,
+                                    "interactionId": interaction_id,
+                                })),
+                            );
+                        }
                         let _ = sqlx::query("UPDATE tool_invocations SET status='failed',error_message=$2,completed_at=NOW(),updated_at=NOW() WHERE id=$1").bind(invocation_id).bind(&error).execute(&state.pool).await;
+                        let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,connection_id,tool_name,decision,outcome,invocation_id,reason_code,error_message) VALUES ($1,'call_failed',CASE WHEN $3::uuid IS NULL THEN 'system' ELSE 'agent' END,COALESCE($2,$1::text),$3,$4,$5,$6,$7,'failure',$8,'mcp_tool_execution_failed',$9)").bind(company_id).bind(agent_id_text.clone()).bind(agent_id).bind(run_id).bind(connection_id).bind(tool_name).bind(&decision).bind(invocation_id).bind(&error).execute(&state.pool).await;
                         (
                             StatusCode::BAD_GATEWAY,
                             Json(
@@ -5170,7 +8309,6 @@ async fn call_gateway_tool(
                     }
                 };
             }
-        }
     }
     let Some(plugin) = plugin else {
         return (
@@ -5178,12 +8316,31 @@ async fn call_gateway_tool(
             Json(serde_json::json!({"error": "Tool not found", "reasonCode": "tool_not_found"})),
         );
     };
+    if agent_id.is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Plugin tools require an agent-bound gateway session",
+                "reasonCode": "agent_context_required"
+            })),
+        );
+    }
     let plugin_id: Uuid = plugin.get("id");
     let parameters = body
         .get("parameters")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let decision = gateway_decision_full(&state, company_id, agent_id, tool_name, true).await;
+    let decision = gateway_decision_full_for_gateway(
+        &state,
+        company_id,
+        agent_id,
+        tool_name,
+        true,
+        gateway_id,
+        issue_id,
+        project_id,
+    )
+    .await;
     if decision.decision == "rate_limited" {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -5219,7 +8376,7 @@ async fn call_gateway_tool(
             Err(response) => return response,
         };
         let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,invocation_id,reason_code) VALUES ($1,'call_denied','agent',$2,$3,$4,$5,'deny','denied',$6,'policy_denied')")
-            .bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).execute(&state.pool).await;
+        .bind(company_id).bind(agent_id_text.clone()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).execute(&state.pool).await;
         return (
             StatusCode::FORBIDDEN,
             Json(
@@ -5252,7 +8409,7 @@ async fn call_gateway_tool(
             Err(response) => return response,
         };
         let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,invocation_id,action_request_id,reason_code) VALUES ($1,'approval_requested','agent',$2,$3,$4,$5,'require_approval','pending',$6,$7,'policy_requires_approval')")
-            .bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).bind(action_id).execute(&state.pool).await;
+            .bind(company_id).bind(agent_id_text.clone()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).bind(action_id).execute(&state.pool).await;
         return (
             StatusCode::OK,
             Json(
@@ -5282,7 +8439,7 @@ async fn call_gateway_tool(
         Err(response) => return response,
     };
     let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,arguments_summary,invocation_id) VALUES ($1,'call_started','agent',$2,$3,$4,$5,'allow','pending',$6,$7)")
-        .bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(&args_summary).bind(invocation_id).execute(&state.pool).await;
+        .bind(company_id).bind(agent_id_text.clone()).bind(agent_id).bind(run_id).bind(tool_name).bind(&args_summary).bind(invocation_id).execute(&state.pool).await;
     let result = state
         .plugin_service
         .dispatch_tool(plugin_id, tool_name, parameters)
@@ -5292,7 +8449,7 @@ async fn call_gateway_tool(
             let _ = sqlx::query("UPDATE tool_invocations SET status='succeeded', result_summary=$2, completed_at=NOW(), updated_at=NOW() WHERE id=$1")
                 .bind(invocation_id).bind(serde_json::json!({"valueType":"json"})).execute(&state.pool).await;
             let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,invocation_id,result_summary) VALUES ($1,'call_completed','agent',$2,$3,$4,$5,'allow','success',$6,$7)")
-                .bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).bind(serde_json::json!({"valueType":"json"})).execute(&state.pool).await;
+                .bind(company_id).bind(agent_id_text.clone()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).bind(serde_json::json!({"valueType":"json"})).execute(&state.pool).await;
             (
                 StatusCode::OK,
                 Json(
@@ -5305,7 +8462,7 @@ async fn call_gateway_tool(
             let _ = sqlx::query("UPDATE tool_invocations SET status='failed', error_message=$2, completed_at=NOW(), updated_at=NOW() WHERE id=$1")
                 .bind(invocation_id).bind(&message).execute(&state.pool).await;
             let _ = sqlx::query("INSERT INTO tool_call_events (company_id,event_type,actor_type,actor_id,agent_id,run_id,tool_name,decision,outcome,invocation_id,error_message) VALUES ($1,'call_failed','agent',$2,$3,$4,$5,'allow','failure',$6,$7)")
-                .bind(company_id).bind(agent_id.to_string()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).bind(&message).execute(&state.pool).await;
+                .bind(company_id).bind(agent_id_text.clone()).bind(agent_id).bind(run_id).bind(tool_name).bind(invocation_id).bind(&message).execute(&state.pool).await;
             (
                 StatusCode::BAD_GATEWAY,
                 Json(
@@ -5412,7 +8569,7 @@ async fn approve_gateway_action(
             AND ar.status = 'pending'
             AND i.id = ar.invocation_id
             AND i.company_id = ar.company_id
-       RETURNING ar.invocation_id, ar.signed_arguments, i.tool_name, i.agent_id, i.run_id",
+       RETURNING ar.invocation_id, ar.signed_arguments, i.tool_name, i.agent_id, i.run_id, i.issue_id",
     )
     .bind(action_id)
     .bind(company_id)
@@ -5437,8 +8594,9 @@ async fn approve_gateway_action(
     };
     let invocation_id: Uuid = row.get("invocation_id");
     let tool_name: String = row.get("tool_name");
-    let agent_id: Uuid = row.get("agent_id");
-    let run_id: Uuid = row.get("run_id");
+    let agent_id: Option<Uuid> = row.get("agent_id");
+    let run_id: Option<Uuid> = row.get("run_id");
+    let issue_id: Option<Uuid> = row.get("issue_id");
     let parameters = row
         .get::<Option<String>, _>("signed_arguments")
         .and_then(|value| serde_json::from_str::<Value>(&value).ok())
@@ -5469,7 +8627,19 @@ async fn approve_gateway_action(
             .await
             .map_err(|error| error.to_string())
     } else if tool_name.starts_with("mcp.") {
-        execute_mcp_connection(&state, company_id, &tool_name, parameters).await
+        execute_mcp_connection(
+            &state,
+            company_id,
+            &tool_name,
+            parameters,
+            Some(invocation_id),
+            None,
+            agent_id,
+            run_id,
+            issue_id,
+            None,
+        )
+        .await
     } else {
         return (
             StatusCode::NOT_FOUND,
@@ -5617,12 +8787,39 @@ async fn list_named_gateways(
     let gateways = sqlx::query_scalar::<_, Value>(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
           'id',g.id,'companyId',g.company_id,'gatewayPublicId',g.gateway_public_id,
-          'name',g.name,'slug',g.slug,'description',g.description,'status',g.status,
-          'profileId',g.profile_id,'agentId',g.agent_id,'issueId',g.issue_id,
-          'metadata',g.metadata,'createdAt',g.created_at,'updatedAt',g.updated_at,
-          'tokens',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',t.id,'gatewayId',t.gateway_id,'name',t.name,'tokenPrefix',t.token_prefix,'allowedActions',t.allowed_actions,'expiresAt',t.expires_at,'lastUsedAt',t.last_used_at,'revokedAt',t.revoked_at,'createdAt',t.created_at,'updatedAt',t.updated_at) ORDER BY t.created_at DESC) FROM tool_mcp_gateway_tokens t WHERE t.gateway_id=g.id),'[]'::jsonb)
-        ) ORDER BY g.name),'[]'::jsonb) FROM tool_mcp_gateways g WHERE g.company_id=$1 AND g.status <> 'archived'",
-    ).bind(company_id).fetch_one(&state.pool).await.unwrap_or(Value::Array(vec![]));
+          'name',g.name,'slug',g.slug,'displaySlug',g.display_slug,
+          'description',g.description,'status',g.status,
+          'profileId',g.profile_id,'defaultProfileMode',g.default_profile_mode,
+          'contextScopeType',g.context_scope_type,'contextScopeId',g.context_scope_id,
+          'agentId',g.agent_id,'projectId',g.project_id,'issueId',g.issue_id,
+          'approvalIssueId',g.approval_issue_id,'authConfig',g.auth_config,
+          'headerPolicy',g.header_policy,'metadataPolicy',g.metadata_policy,
+          'onDemandToolsConfig',g.on_demand_tools_config,
+          'metadata',g.metadata,'createdByAgentId',g.created_by_agent_id,
+          'createdByUserId',g.created_by_user_id,'archivedAt',g.archived_at,
+          'createdAt',g.created_at,'updatedAt',g.updated_at,
+          'tokens',COALESCE((SELECT jsonb_agg(jsonb_build_object(
+              'id',t.id,'gatewayId',t.gateway_id,'name',t.name,
+              'tokenPrefix',t.token_prefix,'subjectType',t.subject_type,
+              'subjectId',t.subject_id,'clientLabel',t.client_label,
+              'ownerNote',t.owner_note,'allowedActions',t.allowed_actions,
+              'expiresAt',t.expires_at,'expiryOverrideReason',t.expiry_override_reason,
+              'expiryOverrideByUserId',t.expiry_override_by_user_id,
+              'expiryOverrideByAgentId',t.expiry_override_by_agent_id,
+              'expiryOverrideAt',t.expiry_override_at,'lastUsedAt',t.last_used_at,
+              'revokedAt',t.revoked_at,'createdByAgentId',t.created_by_agent_id,
+              'createdByUserId',t.created_by_user_id,'createdAt',t.created_at,
+              'updatedAt',t.updated_at) ORDER BY t.created_at DESC)
+              FROM tool_mcp_gateway_tokens t
+             WHERE t.gateway_id=g.id AND t.company_id=g.company_id),'[]'::jsonb)
+        ) ORDER BY g.name),'[]'::jsonb)
+           FROM tool_mcp_gateways g
+          WHERE g.company_id=$1 AND g.status <> 'archived'",
+    )
+    .bind(company_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Value::Array(vec![]));
     (
         StatusCode::OK,
         Json(serde_json::json!({"gateways": gateways})),
@@ -5651,23 +8848,191 @@ async fn create_named_gateway(
     };
     let slug = body
         .get("slug")
+        .or_else(|| body.get("displaySlug"))
         .and_then(Value::as_str)
         .unwrap_or(name)
         .trim()
         .to_lowercase()
         .replace(' ', "-");
-    let row = sqlx::query("INSERT INTO tool_mcp_gateways (company_id,name,slug,description,agent_id,issue_id,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,gateway_public_id,created_at,updated_at")
+    if slug.is_empty()
+        || slug.len() > 120
+        || !slug.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+        })
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"slug must contain only letters, numbers, '-', '_' or '.'"})),
+        );
+    }
+    let profile_id = body
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(Uuid::parse_str)
+        .transpose();
+    let Ok(profile_id) = profile_id else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"profileId must be a valid UUID"})),
+        );
+    };
+    if let Some(profile_id) = profile_id {
+        let profile_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM tool_profiles WHERE id = $1 AND company_id = $2)",
+        )
+        .bind(profile_id)
+        .bind(company_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(false);
+        if !profile_exists {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"profileId does not belong to the company"})),
+            );
+        }
+    }
+    let parse_context_id = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_str)
+            .map(Uuid::parse_str)
+            .transpose()
+    };
+    let agent_id = match parse_context_id("agentId") {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"gateway context ids must be valid UUIDs"})),
+            )
+        }
+    };
+    let project_id = match parse_context_id("projectId") {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"gateway context ids must be valid UUIDs"})),
+            )
+        }
+    };
+    let issue_id = match parse_context_id("issueId") {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"gateway context ids must be valid UUIDs"})),
+            )
+        }
+    };
+    let approval_issue_id = match parse_context_id("approvalIssueId") {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"gateway context ids must be valid UUIDs"})),
+            )
+        }
+    };
+    let default_profile_mode = body
+        .get("defaultProfileMode")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway_only");
+    if !matches!(
+        default_profile_mode,
+        "gateway_only" | "inherit_context_then_gateway" | "gateway_then_context"
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"defaultProfileMode is invalid"})),
+        );
+    }
+    let context_scope_type = body
+        .get("contextScopeType")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    if !matches!(context_scope_type, "none" | "company" | "project" | "routine" | "issue" | "agent") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"contextScopeType is invalid"})),
+        );
+    }
+    let metadata = body.get("metadata").cloned().unwrap_or_else(|| json!({}));
+    if !metadata.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"metadata must be an object"})),
+        );
+    }
+    let auth_config = body.get("authConfig").cloned().unwrap_or_else(|| json!({
+        "version": 1,
+        "bearer": {
+            "enabled": true,
+            "tokenPrefix": "pcgw",
+            "defaultTtlSeconds": 7_776_000,
+            "requireFiniteExpiry": true,
+            "longLivedTokenRequiresOverride": true,
+        },
+        "oauth": {"enabled": false, "reservedFor": "v1_5", "dynamicClientRegistration": false, "authorizationCodePkce": false}
+    }));
+    let header_policy = body.get("headerPolicy").cloned().unwrap_or_else(|| json!({
+        "version": 1,
+        "callerPassthrough": {"enabled": false, "allowedHeaders": []},
+        "staticHeaders": [],
+        "generatedMetadata": {"enabled": false, "allowedHeaders": []},
+        "responseHeaders": {"forwardMcpRequiredHeaders": true, "forwardSafeCacheHeaders": true}
+    }));
+    let metadata_policy = body.get("metadataPolicy").cloned().unwrap_or_else(|| json!({
+        "version": 1,
+        "forwardCompanyId": false,
+        "forwardGatewayId": false,
+        "forwardProjectId": false,
+        "forwardIssueId": false,
+        "forwardAgentId": false,
+        "forwardRunId": false,
+        "forwardCorrelationId": true
+    }));
+    let on_demand_tools_config = body.get("onDemandToolsConfig").cloned().unwrap_or_else(|| json!({
+        "enabled": false, "searchToolName": "search_tools", "runToolName": "run_tool"
+    }));
+    let created_by_user_id = actor.principal_id().map(|value| value.to_string());
+    let row = sqlx::query("INSERT INTO tool_mcp_gateways (company_id,name,slug,display_slug,description,profile_id,default_profile_mode,context_scope_type,context_scope_id,agent_id,project_id,issue_id,approval_issue_id,auth_config,header_policy,metadata_policy,on_demand_tools_config,metadata,created_by_user_id) VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id,gateway_public_id,created_at,updated_at")
         .bind(company_id).bind(name).bind(&slug).bind(body.get("description").and_then(Value::as_str))
-        .bind(body.get("agentId").and_then(Value::as_str).and_then(|v| Uuid::parse_str(v).ok()))
-        .bind(body.get("issueId").and_then(Value::as_str).and_then(|v| Uuid::parse_str(v).ok()))
-        .bind(body.get("metadata").cloned().unwrap_or_else(|| serde_json::json!({}))).fetch_one(&state.pool).await;
+        .bind(profile_id).bind(default_profile_mode).bind(context_scope_type)
+        .bind(body.get("contextScopeId").and_then(Value::as_str))
+        .bind(agent_id).bind(project_id).bind(issue_id).bind(approval_issue_id)
+        .bind(&auth_config).bind(&header_policy).bind(&metadata_policy).bind(&on_demand_tools_config)
+        .bind(metadata.clone()).bind(created_by_user_id.clone()).fetch_one(&state.pool).await;
     match row {
-        Ok(row) => (
-            StatusCode::CREATED,
-            Json(
-                serde_json::json!({"id":row.get::<Uuid,_>("id"),"companyId":company_id,"gatewayPublicId":row.get::<String,_>("gateway_public_id"),"name":name,"slug":slug,"description":body.get("description"),"status":"active","agentId":body.get("agentId"),"issueId":body.get("issueId"),"metadata":body.get("metadata").cloned().unwrap_or_else(||serde_json::json!({})),"tokens":[],"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
-            ),
-        ),
+        Ok(row) => {
+            if let Some(profile_id) = profile_id {
+                if let Err(error) = sqlx::query(
+                    "INSERT INTO tool_profile_bindings
+                        (company_id, profile_id, target_type, target_id)
+                     VALUES ($1, $2, 'gateway', $3::text)
+                     ON CONFLICT (company_id, target_type, target_id, profile_id)
+                     DO NOTHING",
+                )
+                .bind(company_id)
+                .bind(profile_id)
+                .bind(row.get::<Uuid, _>("id"))
+                .execute(&state.pool)
+                .await
+                {
+                    tracing::error!(%error, "failed to bind profile to named MCP gateway");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error":"gateway profile binding failed"})),
+                    );
+                }
+            }
+            (
+                StatusCode::CREATED,
+                Json(
+                    serde_json::json!({"id":row.get::<Uuid,_>("id"),"companyId":company_id,"gatewayPublicId":row.get::<String,_>("gateway_public_id"),"name":name,"slug":slug,"displaySlug":slug,"description":body.get("description"),"status":"active","profileId":profile_id,"defaultProfileMode":default_profile_mode,"contextScopeType":context_scope_type,"contextScopeId":body.get("contextScopeId"),"agentId":agent_id,"projectId":project_id,"issueId":issue_id,"approvalIssueId":approval_issue_id,"authConfig":auth_config,"headerPolicy":header_policy,"metadataPolicy":metadata_policy,"onDemandToolsConfig":on_demand_tools_config,"metadata":metadata,"createdByUserId":created_by_user_id,"tokens":[],"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
+                ),
+            )
+        }
         Err(error) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error":error.to_string()})),
@@ -5694,15 +9059,167 @@ async fn update_named_gateway(
     if let Err(response) = require_named_gateway_admin(&state, &actor, company_id).await {
         return response;
     }
-    let row = sqlx::query("UPDATE tool_mcp_gateways SET name=COALESCE($3,name), description=COALESCE($4,description), status=COALESCE($5,status), updated_at=NOW() WHERE id=$1 AND company_id=$2 RETURNING id,gateway_public_id,name,slug,description,status,agent_id,issue_id,metadata,created_at,updated_at")
-        .bind(gateway_id).bind(company_id).bind(body.get("name").and_then(Value::as_str)).bind(body.get("description").and_then(Value::as_str)).bind(body.get("status").and_then(Value::as_str)).fetch_optional(&state.pool).await;
+    let previous_profile_id = match sqlx::query(
+        "SELECT profile_id FROM tool_mcp_gateways WHERE id = $1 AND company_id = $2",
+    )
+    .bind(gateway_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(row) => row.map(|row| row.get::<Option<Uuid>, _>("profile_id")),
+        Err(error) => {
+            tracing::error!(%error, %gateway_id, "Failed to load named gateway before update");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"Failed to load gateway"})),
+            );
+        }
+    };
+    let profile_id = body
+        .get("profileId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    if let Some(profile_id) = profile_id {
+        let profile_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM tool_profiles WHERE id = $1 AND company_id = $2)",
+        )
+        .bind(profile_id)
+        .bind(company_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(false);
+        if !profile_exists {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"profileId does not belong to the company"})),
+            );
+        }
+    }
+    let next_slug = body
+        .get("slug")
+        .or_else(|| body.get("displaySlug"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .map(|value| value.replace(' ', "-"));
+    if next_slug.as_deref().is_some_and(|slug| {
+        slug.len() > 120
+            || !slug
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"slug must contain only letters, numbers, '-', '_' or '.'"})),
+        );
+    }
+    let status = body.get("status").and_then(Value::as_str);
+    if status.is_some_and(|status| !matches!(status, "draft" | "active" | "disabled" | "archived")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"status is invalid"})),
+        );
+    }
+    let default_profile_mode = body.get("defaultProfileMode").and_then(Value::as_str);
+    if default_profile_mode.is_some_and(|mode| {
+        !matches!(mode, "gateway_only" | "inherit_context_then_gateway" | "gateway_then_context")
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"defaultProfileMode is invalid"})),
+        );
+    }
+    let context_scope_type = body.get("contextScopeType").and_then(Value::as_str);
+    if context_scope_type.is_some_and(|scope| {
+        !matches!(scope, "none" | "company" | "project" | "routine" | "issue" | "agent")
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"contextScopeType is invalid"})),
+        );
+    }
+    let metadata = body.get("metadata");
+    if metadata.is_some_and(|value| !value.is_object()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"metadata must be an object"})),
+        );
+    }
+    let row = sqlx::query("UPDATE tool_mcp_gateways SET name=COALESCE($3,name), slug=COALESCE($4,slug), display_slug=COALESCE($4,display_slug), description=COALESCE($5,description), status=COALESCE($6,status), profile_id=COALESCE($7,profile_id), default_profile_mode=COALESCE($8,default_profile_mode), context_scope_type=COALESCE($9,context_scope_type), context_scope_id=COALESCE($10,context_scope_id), agent_id=COALESCE($11,agent_id), project_id=COALESCE($12,project_id), issue_id=COALESCE($13,issue_id), approval_issue_id=COALESCE($14,approval_issue_id), auth_config=COALESCE($15,auth_config), header_policy=COALESCE($16,header_policy), metadata_policy=COALESCE($17,metadata_policy), on_demand_tools_config=COALESCE($18,on_demand_tools_config), metadata=COALESCE($19,metadata), updated_at=NOW() WHERE id=$1 AND company_id=$2 RETURNING id,gateway_public_id,name,slug,display_slug,description,status,profile_id,default_profile_mode,context_scope_type,context_scope_id,agent_id,project_id,issue_id,approval_issue_id,auth_config,header_policy,metadata_policy,on_demand_tools_config,metadata,created_by_agent_id,created_by_user_id,archived_at,created_at,updated_at")
+        .bind(gateway_id)
+        .bind(company_id)
+        .bind(body.get("name").and_then(Value::as_str))
+        .bind(next_slug.as_deref())
+        .bind(body.get("description").and_then(Value::as_str))
+        .bind(status)
+        .bind(profile_id)
+        .bind(default_profile_mode)
+        .bind(context_scope_type)
+        .bind(body.get("contextScopeId").and_then(Value::as_str))
+        .bind(body.get("agentId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()))
+        .bind(body.get("projectId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()))
+        .bind(body.get("issueId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()))
+        .bind(body.get("approvalIssueId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()))
+        .bind(body.get("authConfig"))
+        .bind(body.get("headerPolicy"))
+        .bind(body.get("metadataPolicy"))
+        .bind(body.get("onDemandToolsConfig"))
+        .bind(metadata)
+        .fetch_optional(&state.pool).await;
     match row {
-        Ok(Some(row)) => (
-            StatusCode::OK,
-            Json(
-                serde_json::json!({"id":row.get::<Uuid,_>("id"),"companyId":company_id,"gatewayPublicId":row.get::<String,_>("gateway_public_id"),"name":row.get::<String,_>("name"),"slug":row.get::<String,_>("slug"),"description":row.get::<Option<String>,_>("description"),"status":row.get::<String,_>("status"),"agentId":row.get::<Option<Uuid>,_>("agent_id"),"issueId":row.get::<Option<Uuid>,_>("issue_id"),"metadata":row.get::<Value,_>("metadata"),"tokens":[],"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
-            ),
-        ),
+        Ok(Some(row)) => {
+            let next_profile_id = row.get::<Option<Uuid>, _>("profile_id");
+            if previous_profile_id != Some(next_profile_id) {
+                if let Some(previous_profile_id) = previous_profile_id.flatten() {
+                    if let Err(error) = sqlx::query(
+                        "DELETE FROM tool_profile_bindings
+                          WHERE company_id = $1 AND target_type = 'gateway'
+                            AND target_id = $2::text AND profile_id = $3",
+                    )
+                    .bind(company_id)
+                    .bind(gateway_id)
+                    .bind(previous_profile_id)
+                    .execute(&state.pool)
+                    .await
+                    {
+                        tracing::error!(%error, %gateway_id, "Failed to remove stale gateway profile binding");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error":"Gateway profile binding update failed"})),
+                        );
+                    }
+                }
+                if let Some(next_profile_id) = next_profile_id {
+                    if let Err(error) = sqlx::query(
+                        "INSERT INTO tool_profile_bindings
+                            (company_id, profile_id, target_type, target_id, priority)
+                         VALUES ($1, $2, 'gateway', $3::text, 100)
+                         ON CONFLICT (company_id, target_type, target_id, profile_id)
+                         DO UPDATE SET updated_at = NOW()",
+                    )
+                    .bind(company_id)
+                    .bind(next_profile_id)
+                    .bind(gateway_id)
+                    .execute(&state.pool)
+                    .await
+                    {
+                        tracing::error!(%error, %gateway_id, "Failed to create gateway profile binding");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error":"Gateway profile binding update failed"})),
+                        );
+                    }
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"id":row.get::<Uuid,_>("id"),"companyId":company_id,"gatewayPublicId":row.get::<String,_>("gateway_public_id"),"name":row.get::<String,_>("name"),"slug":row.get::<String,_>("slug"),"displaySlug":row.get::<String,_>("display_slug"),"description":row.get::<Option<String>,_>("description"),"status":row.get::<String,_>("status"),"profileId":row.get::<Option<Uuid>,_>("profile_id"),"defaultProfileMode":row.get::<String,_>("default_profile_mode"),"contextScopeType":row.get::<String,_>("context_scope_type"),"contextScopeId":row.get::<Option<String>,_>("context_scope_id"),"agentId":row.get::<Option<Uuid>,_>("agent_id"),"projectId":row.get::<Option<Uuid>,_>("project_id"),"issueId":row.get::<Option<Uuid>,_>("issue_id"),"approvalIssueId":row.get::<Option<Uuid>,_>("approval_issue_id"),"authConfig":row.get::<Value,_>("auth_config"),"headerPolicy":row.get::<Value,_>("header_policy"),"metadataPolicy":row.get::<Value,_>("metadata_policy"),"onDemandToolsConfig":row.get::<Value,_>("on_demand_tools_config"),"metadata":row.get::<Value,_>("metadata"),"createdByAgentId":row.get::<Option<Uuid>,_>("created_by_agent_id"),"createdByUserId":row.get::<Option<String>,_>("created_by_user_id"),"archivedAt":row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("archived_at"),"tokens":[],"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
+                ),
+            )
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error":"Gateway not found"})),
@@ -5733,19 +9250,147 @@ async fn create_named_gateway_token(
     if let Err(response) = require_named_gateway_admin(&state, &actor, company_id).await {
         return response;
     }
-    let token = format!("pcgw_{}", Uuid::new_v4().simple());
+    if let Some(response) = mcp_token_request_rate_limit_response(
+        &state,
+        company_id,
+        &format!("gateway:{gateway_id}"),
+    )
+    .await
+    {
+        return response;
+    }
     let token_id = Uuid::new_v4();
+    let token_secret = random_named_gateway_secret();
+    let token = format!("pcgw_{}.{}", token_id, token_secret);
+    let token_prefix = format!("pcgw_{}", &token_id.simple().to_string()[..8]);
     let name = body
         .get("name")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .unwrap_or("Gateway token");
-    let row = sqlx::query("INSERT INTO tool_mcp_gateway_tokens (id,company_id,gateway_id,name,token_hash,token_prefix,allowed_actions,expires_at) SELECT $1,$2,$3,$4,$5,$6,COALESCE($7,'[\"tools/list\",\"tools/call\"]'::jsonb),$8 WHERE EXISTS (SELECT 1 FROM tool_mcp_gateways WHERE id=$3 AND company_id=$2) RETURNING id,gateway_id,token_prefix,created_at,updated_at,expires_at,allowed_actions")
-        .bind(token_id).bind(company_id).bind(gateway_id).bind(name).bind(hash_gateway_token(&token)).bind(&token[..12.min(token.len())]).bind(body.get("allowedActions")).bind(body.get("expiresAt").and_then(Value::as_str).and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok()).map(|v|v.with_timezone(&chrono::Utc))).fetch_optional(&state.pool).await;
+    if name.len() > 160 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"name must be at most 160 characters"})),
+        );
+    }
+    let client_label = body
+        .get("clientLabel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(name);
+    let owner_note = body
+        .get("ownerNote")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Created through the Parrot MCP gateway API.");
+    if client_label.len() > 160 || owner_note.len() > 1000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"clientLabel or ownerNote is too long"})),
+        );
+    }
+    let subject_type = body
+        .get("subjectType")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway_client");
+    if subject_type != "gateway_client" {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error":"public named gateway tokens only support gateway_client subjects"})),
+        );
+    }
+    let subject_id = body.get("subjectId").and_then(Value::as_str).map(str::trim);
+    if subject_id.is_some_and(|value| value.is_empty() || value.len() > 240) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"subjectId must contain 1 to 240 characters"})),
+        );
+    }
+    let allowed_actions = match body.get("allowedActions") {
+        None => json!(["tools/list", "tools/call"]),
+        Some(value) => {
+            let Some(actions) = value.as_array() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"allowedActions must be an array"})),
+                );
+            };
+            if actions.is_empty()
+                || actions.len() > 2
+                || actions.iter().any(|action| {
+                    !matches!(action.as_str(), Some("tools/list") | Some("tools/call"))
+                })
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"allowedActions must contain tools/list and/or tools/call"})),
+                );
+            }
+            let mut unique = Vec::new();
+            for action in actions.iter().filter_map(Value::as_str) {
+                if !unique.iter().any(|existing| *existing == action) {
+                    unique.push(action);
+                }
+            }
+            if unique.len() != actions.len() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"allowedActions must not contain duplicates"})),
+                );
+            }
+            Value::Array(unique.into_iter().map(|value| json!(value)).collect())
+        }
+    };
+    let expires_at = match body.get("expiresAt") {
+        None => None,
+        Some(Value::Null) => None,
+        Some(Value::String(value)) => match chrono::DateTime::parse_from_rfc3339(value) {
+            Ok(value) => Some(value.with_timezone(&chrono::Utc)),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"expiresAt must be RFC3339"})),
+                )
+            }
+        },
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"expiresAt must be RFC3339 or null"})),
+            )
+        }
+    };
+    let expiry_override_reason = body
+        .get("expiryOverrideReason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if body.get("expiresAt").is_some_and(Value::is_null) && expiry_override_reason.is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error":"non-expiring gateway tokens require expiryOverrideReason"})),
+        );
+    }
+    if expiry_override_reason.is_some_and(|value| value.len() > 1000) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"expiryOverrideReason is too long"})),
+        );
+    }
+    let actor_user_id = actor.principal_id().map(|value| value.to_string());
+    let row = sqlx::query("INSERT INTO tool_mcp_gateway_tokens (id,company_id,gateway_id,name,token_hash,token_prefix,subject_type,subject_id,client_label,owner_note,allowed_actions,expires_at,expiry_override_reason,expiry_override_by_user_id,expiry_override_at,created_by_user_id) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,CASE WHEN $13 IS NULL THEN NULL ELSE NOW() END,$14 WHERE EXISTS (SELECT 1 FROM tool_mcp_gateways WHERE id=$3 AND company_id=$2) RETURNING id,gateway_id,token_prefix,subject_type,subject_id,client_label,owner_note,created_at,updated_at,expires_at,expiry_override_reason,expiry_override_by_user_id,expiry_override_at,allowed_actions")
+        .bind(token_id).bind(company_id).bind(gateway_id).bind(name).bind(hash_gateway_token(&token)).bind(&token_prefix)
+        .bind(subject_type).bind(subject_id).bind(client_label).bind(owner_note).bind(&allowed_actions).bind(expires_at)
+        .bind(expiry_override_reason).bind(actor_user_id.clone()).fetch_optional(&state.pool).await;
     match row {
         Ok(Some(row)) => (
             StatusCode::CREATED,
             Json(
-                serde_json::json!({"id":row.get::<Uuid,_>("id"),"gatewayId":row.get::<Uuid,_>("gateway_id"),"companyId":company_id,"name":name,"token":token,"tokenPrefix":row.get::<String,_>("token_prefix"),"allowedActions":row.get::<Value,_>("allowed_actions"),"expiresAt":row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("expires_at"),"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
+                serde_json::json!({"id":row.get::<Uuid,_>("id"),"gatewayId":row.get::<Uuid,_>("gateway_id"),"companyId":company_id,"name":name,"token":token,"tokenPrefix":row.get::<String,_>("token_prefix"),"subjectType":row.get::<String,_>("subject_type"),"subjectId":row.get::<Option<String>,_>("subject_id"),"clientLabel":row.get::<String,_>("client_label"),"ownerNote":row.get::<String,_>("owner_note"),"allowedActions":row.get::<Value,_>("allowed_actions"),"expiresAt":row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("expires_at"),"expiryOverrideReason":row.get::<Option<String>,_>("expiry_override_reason"),"expiryOverrideByUserId":row.get::<Option<String>,_>("expiry_override_by_user_id"),"expiryOverrideAt":row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("expiry_override_at"),"createdByUserId":actor_user_id,"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
             ),
         ),
         Ok(None) => (
@@ -5861,7 +9506,7 @@ async fn list_policies(
             'selectors', selectors, 'conditions', conditions, 'config', config,\
             'createdByAgentId', created_by_agent_id, 'createdByUserId', created_by_user_id,\
             'createdAt', created_at, 'updatedAt', updated_at) ORDER BY priority, name), '[]'::jsonb)\
-         FROM tool_policies WHERE company_id = $1",
+         FROM tool_policies WHERE company_id = $1 AND policy_type <> 'trust_rule'",
     ).bind(company_id).fetch_one(&state.pool).await.unwrap_or(Value::Array(vec![]));
     (
         StatusCode::OK,
@@ -5899,7 +9544,7 @@ async fn create_policy(
         .unwrap_or("allow");
     if !matches!(
         policy_type,
-        "allow" | "deny" | "block" | "require_approval" | "approval" | "ask_first"
+        "allow" | "block" | "require_approval" | "rate_limit"
     ) {
         return (
             StatusCode::BAD_REQUEST,
@@ -5919,11 +9564,20 @@ async fn create_policy(
     let priority = body
         .get("priority")
         .and_then(Value::as_i64)
-        .unwrap_or(0)
-        .clamp(-1_000_000, 1_000_000) as i32;
+        .unwrap_or(100)
+        .clamp(0, 10_000) as i32;
     let enabled = body.get("enabled").and_then(Value::as_bool).unwrap_or(true);
     let description = body.get("description").and_then(Value::as_str);
-    let config = body.get("config").cloned().filter(Value::is_object);
+    let config = match body.get("config") {
+        Some(Value::Null) | None => None,
+        Some(value) if value.is_object() => Some(value.clone()),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"config must be an object or null"})),
+            );
+        }
+    };
     let row = sqlx::query(
         "INSERT INTO tool_policies (company_id,name,description,policy_type,priority,enabled,selectors,conditions,config,created_by_user_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
@@ -5963,7 +9617,7 @@ async fn delete_policy(
         );
     }
     let deleted =
-        sqlx::query("DELETE FROM tool_policies WHERE id=$1 AND company_id=$2 RETURNING id")
+        sqlx::query("DELETE FROM tool_policies WHERE id=$1 AND company_id=$2 AND policy_type <> 'trust_rule' RETURNING id")
             .bind(policy_id)
             .bind(company_id)
             .fetch_optional(&state.pool)
@@ -6041,7 +9695,7 @@ async fn effective_profiles_for_agent(
            AND b.company_id = p.company_id
          WHERE p.company_id = $1
            AND b.target_type = 'agent'
-           AND b.target_id = $2
+           AND b.target_id = $2::text
         "#,
     )
     .bind(company_id)
@@ -6055,7 +9709,7 @@ async fn effective_profiles_for_agent(
           FROM tool_profile_bindings AS b
          WHERE b.company_id = $1
            AND b.target_type = 'agent'
-           AND b.target_id = $2
+           AND b.target_id = $2::text
         "#,
     )
     .bind(company_id)
@@ -6090,7 +9744,7 @@ async fn effective_profiles_for_agent(
                   FROM tool_profile_bindings AS b
                  WHERE b.company_id = $1
                    AND b.target_type = 'agent'
-                   AND b.target_id = $2
+                   AND b.target_id = $2::text
            )
         "#,
     )
@@ -6116,7 +9770,7 @@ async fn effective_profiles_for_agent(
                   FROM tool_profile_bindings AS b
                  WHERE b.company_id = $1
                    AND b.target_type = 'agent'
-                   AND b.target_id = $2
+                   AND b.target_id = $2::text
            )
         "#,
     )
@@ -6162,7 +9816,7 @@ async fn effective_profiles_for_agent(
                   FROM tool_profile_bindings AS b
                  WHERE b.company_id = $1
                    AND b.target_type = 'agent'
-                   AND b.target_id = $2
+                   AND b.target_id = $2::text
            )
         "#,
     )
@@ -6521,6 +10175,8 @@ mod tests {
     const PAPERCLIP_PARITY_TOOL_COUNT: usize = 41;
     /// Parrot 在 Paperclip 基础上额外提供的工具：`paperclipHireAgent`（走 approval 流程）。
     const PARROT_EXTRA_TOOL_COUNT: usize = 1;
+    /// Parrot 已有 API dispatcher 覆盖、此前漏注册到 MCP tools/list 的扩展工具。
+    const PARROT_EXTENDED_TOOL_COUNT: usize = 55;
 
     #[test]
     fn paperclip_builtin_registry_contains_core_tools() {
@@ -6546,10 +10202,40 @@ mod tests {
         assert_eq!(names.len(), tools.len(), "MCP tool names must be unique");
         assert_eq!(
             tools.len(),
-            PAPERCLIP_PARITY_TOOL_COUNT + PARROT_EXTRA_TOOL_COUNT,
-            "MCP registry size drifted from the Paperclip reference"
+            PAPERCLIP_PARITY_TOOL_COUNT + PARROT_EXTRA_TOOL_COUNT + PARROT_EXTENDED_TOOL_COUNT,
+            "MCP registry size drifted from the Paperclip reference and Parrot extensions"
         );
         assert!(names.contains("paperclipHireAgent"));
+        for extended in [
+            "paperclipCreateCase", "paperclipGetCase", "paperclipUpdateCase",
+            "paperclipListCases", "paperclipGetCaseChildren", "paperclipGetCaseEvents",
+            "paperclipGetIssueCases", "paperclipGetCaseDocument", "paperclipListCaseDocuments",
+            "paperclipUpsertCaseDocument", "paperclipDeleteCaseDocument",
+            "paperclipRestoreCaseDocumentRevision", "paperclipLockCaseDocument",
+            "paperclipUnlockCaseDocument", "paperclipListCaseDocumentRevisions",
+            "paperclipListCaseDocumentAnnotations", "paperclipCreateCaseDocumentAnnotation",
+            "paperclipGetCaseDocumentAnnotationThread", "paperclipReplyCaseDocumentAnnotation",
+            "paperclipUpdateCaseDocumentAnnotation", "paperclipCreateCaseLink",
+            "paperclipListIssueAttachments", "paperclipCreateIssueAttachment",
+            "paperclipDeleteAttachment", "paperclipGetAttachmentContent",
+            "paperclipListIssueDocumentAnnotations", "paperclipCreateIssueDocumentAnnotation",
+            "paperclipGetIssueDocumentAnnotationThread", "paperclipReplyIssueDocumentAnnotation",
+            "paperclipUpdateIssueDocumentAnnotation", "paperclipListIssueExternalObjects",
+            "paperclipRefreshIssueExternalObjects", "paperclipListIssueFileResources",
+            "paperclipGetIssueFileResourceContent", "paperclipResolveIssueFileResource",
+            "paperclipListLabels", "paperclipCreateLabel", "paperclipDeleteLabel",
+            "paperclipListRoutines", "paperclipGetRoutine", "paperclipCreateRoutine",
+            "paperclipUpdateRoutine", "paperclipListRoutineRevisions",
+            "paperclipRestoreRoutineRevision", "paperclipListRoutineDescriptionAnnotations",
+            "paperclipCreateRoutineDescriptionAnnotation",
+            "paperclipGetRoutineDescriptionAnnotationThread",
+            "paperclipReplyRoutineDescriptionAnnotation",
+            "paperclipUpdateRoutineDescriptionAnnotation", "paperclipListRoutineRuns",
+            "paperclipRunRoutine", "paperclipCreateRoutineTrigger", "paperclipUpdateRoutineTrigger",
+            "paperclipDeleteRoutineTrigger", "paperclipRotateRoutineTriggerSecret",
+        ] {
+            assert!(names.contains(extended), "missing Parrot MCP extension {extended}");
+        }
         assert!(tools.iter().all(|tool| tool
             .get("inputSchema")
             .and_then(|schema| schema.get("type"))
@@ -6668,6 +10354,14 @@ mod tests {
             "deny_default",
             false,
         ));
+    }
+
+    #[test]
+    fn gateway_policy_queries_are_valid_sql_literals() {
+        assert!(!TOOL_POLICY_QUERY.contains('\\'));
+        assert!(TOOL_POLICY_QUERY.contains("FROM tool_policies"));
+        assert!(!TRUST_RULE_HIT_UPDATE.contains('\\'));
+        assert!(TRUST_RULE_HIT_UPDATE.contains("UPDATE tool_policies"));
     }
 
     #[test]
@@ -6805,12 +10499,54 @@ mod tests {
         let definitions = paperclip_builtin_tool_definitions();
         assert_eq!(
             definitions.len(),
-            PAPERCLIP_PARITY_TOOL_COUNT + PARROT_EXTRA_TOOL_COUNT
+            PAPERCLIP_PARITY_TOOL_COUNT + PARROT_EXTRA_TOOL_COUNT + PARROT_EXTENDED_TOOL_COUNT
         );
         assert!(definitions.iter().all(|definition| {
             definition.name.starts_with("paperclip")
-                && definition.input_schema.get("type").is_some()
+            && definition.input_schema.get("type").is_some()
         }));
+    }
+
+    #[test]
+    fn mcp_wire_result_preserves_content_and_structured_content() {
+        let result = normalize_mcp_wire_result(serde_json::json!({
+            "content": [{"type":"text", "text":"hello"}],
+            "structuredContent": {"ok": true},
+            "isError": false
+        }))
+        .expect("valid MCP content");
+        assert_eq!(result["content"][0]["text"], "hello");
+        assert_eq!(result["structuredContent"]["ok"], true);
+        assert_eq!(result["isError"], false);
+    }
+
+    #[test]
+    fn mcp_wire_result_rejects_malformed_content() {
+        assert!(normalize_mcp_wire_result(serde_json::json!({
+            "content": [{"type":"text"}]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn named_gateway_tokens_use_paperclip_wire_shape() {
+        let token_id = Uuid::new_v4();
+        let token = format!("pcgw_{}.{}", token_id, random_named_gateway_secret());
+        assert!(token.starts_with("pcgw_"));
+        assert_eq!(token.split('.').count(), 2);
+        assert_eq!(token.split('.').next(), Some(format!("pcgw_{token_id}").as_str()));
+    }
+
+    #[test]
+    fn oauth_secret_references_project_to_bearer_authorization() {
+        let reference = serde_json::json!({"configPath": "oauth.access_token"});
+        assert_eq!(mcp_secret_header_name(&reference).as_deref(), Some("Authorization"));
+        assert_eq!(mcp_secret_header_prefix(&reference), "Bearer ");
+        assert_eq!(
+            mcp_secret_header_name(&serde_json::json!({"configPath": "headers.X-Trace"}))
+                .as_deref(),
+            Some("X-Trace")
+        );
     }
 
     #[test]

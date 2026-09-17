@@ -7,6 +7,7 @@
 .env.*.local
 *.md
 *.log
+!MCP_PARITY_CHECKLIST.md
 
 # Temporary scripts and setup files
 *.sh
