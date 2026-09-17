@@ -36,6 +36,9 @@ use crate::app_state::AppState;
 use crate::mcp::{request_kind, McpRequestKind, McpToolDefinition};
 use crate::paperclip_internal::PaperclipInternalClient;
 use services::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService, PermissionKey};
+use services::mcp_client_config::{
+    named_gateway_client_snippets, named_gateway_endpoint_path,
+};
 use services::mcp_http::{mcp_http_request_headers, parse_mcp_http_response_body};
 
 const TOOL_POLICY_QUERY: &str = r#"SELECT id, policy_type, selectors, config, description
@@ -8776,6 +8779,30 @@ async fn require_named_gateway_admin(
     Ok(())
 }
 
+fn add_named_gateway_client_snippets(mut gateway: Value) -> Value {
+    let name = gateway
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway")
+        .to_owned();
+    let public_id = gateway
+        .get("gatewayPublicId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if let Some(object) = gateway.as_object_mut() {
+        object.insert(
+            "endpointPath".to_string(),
+            Value::String(named_gateway_endpoint_path(&public_id)),
+        );
+        object.insert(
+            "clientSnippets".to_string(),
+            named_gateway_client_snippets(&name, &public_id),
+        );
+    }
+    gateway
+}
+
 async fn list_named_gateways(
     Path(company_id): Path<Uuid>,
     State(state): State<AppState>,
@@ -8820,6 +8847,14 @@ async fn list_named_gateways(
     .fetch_one(&state.pool)
     .await
     .unwrap_or(Value::Array(vec![]));
+    let gateways = match gateways {
+        Value::Array(rows) => Value::Array(
+            rows.into_iter()
+                .map(add_named_gateway_client_snippets)
+                .collect(),
+        ),
+        other => other,
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({"gateways": gateways})),
@@ -9026,10 +9061,13 @@ async fn create_named_gateway(
                     );
                 }
             }
+            let gateway_public_id = row.get::<String, _>("gateway_public_id");
+            let endpoint_path = named_gateway_endpoint_path(&gateway_public_id);
+            let client_snippets = named_gateway_client_snippets(name, &gateway_public_id);
             (
                 StatusCode::CREATED,
                 Json(
-                    serde_json::json!({"id":row.get::<Uuid,_>("id"),"companyId":company_id,"gatewayPublicId":row.get::<String,_>("gateway_public_id"),"name":name,"slug":slug,"displaySlug":slug,"description":body.get("description"),"status":"active","profileId":profile_id,"defaultProfileMode":default_profile_mode,"contextScopeType":context_scope_type,"contextScopeId":body.get("contextScopeId"),"agentId":agent_id,"projectId":project_id,"issueId":issue_id,"approvalIssueId":approval_issue_id,"authConfig":auth_config,"headerPolicy":header_policy,"metadataPolicy":metadata_policy,"onDemandToolsConfig":on_demand_tools_config,"metadata":metadata,"createdByUserId":created_by_user_id,"tokens":[],"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
+                    serde_json::json!({"id":row.get::<Uuid,_>("id"),"companyId":company_id,"gatewayPublicId":gateway_public_id,"endpointPath":endpoint_path,"name":name,"slug":slug,"displaySlug":slug,"description":body.get("description"),"status":"active","profileId":profile_id,"defaultProfileMode":default_profile_mode,"contextScopeType":context_scope_type,"contextScopeId":body.get("contextScopeId"),"agentId":agent_id,"projectId":project_id,"issueId":issue_id,"approvalIssueId":approval_issue_id,"authConfig":auth_config,"headerPolicy":header_policy,"metadataPolicy":metadata_policy,"onDemandToolsConfig":on_demand_tools_config,"metadata":metadata,"createdByUserId":created_by_user_id,"tokens":[],"clientSnippets":client_snippets,"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
                 ),
             )
         }
@@ -9213,10 +9251,15 @@ async fn update_named_gateway(
                     }
                 }
             }
+            let gateway_public_id = row.get::<String, _>("gateway_public_id");
+            let gateway_name = row.get::<String, _>("name");
+            let endpoint_path = named_gateway_endpoint_path(&gateway_public_id);
+            let client_snippets =
+                named_gateway_client_snippets(&gateway_name, &gateway_public_id);
             (
                 StatusCode::OK,
                 Json(
-                    serde_json::json!({"id":row.get::<Uuid,_>("id"),"companyId":company_id,"gatewayPublicId":row.get::<String,_>("gateway_public_id"),"name":row.get::<String,_>("name"),"slug":row.get::<String,_>("slug"),"displaySlug":row.get::<String,_>("display_slug"),"description":row.get::<Option<String>,_>("description"),"status":row.get::<String,_>("status"),"profileId":row.get::<Option<Uuid>,_>("profile_id"),"defaultProfileMode":row.get::<String,_>("default_profile_mode"),"contextScopeType":row.get::<String,_>("context_scope_type"),"contextScopeId":row.get::<Option<String>,_>("context_scope_id"),"agentId":row.get::<Option<Uuid>,_>("agent_id"),"projectId":row.get::<Option<Uuid>,_>("project_id"),"issueId":row.get::<Option<Uuid>,_>("issue_id"),"approvalIssueId":row.get::<Option<Uuid>,_>("approval_issue_id"),"authConfig":row.get::<Value,_>("auth_config"),"headerPolicy":row.get::<Value,_>("header_policy"),"metadataPolicy":row.get::<Value,_>("metadata_policy"),"onDemandToolsConfig":row.get::<Value,_>("on_demand_tools_config"),"metadata":row.get::<Value,_>("metadata"),"createdByAgentId":row.get::<Option<Uuid>,_>("created_by_agent_id"),"createdByUserId":row.get::<Option<String>,_>("created_by_user_id"),"archivedAt":row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("archived_at"),"tokens":[],"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
+                    serde_json::json!({"id":row.get::<Uuid,_>("id"),"companyId":company_id,"gatewayPublicId":gateway_public_id,"endpointPath":endpoint_path,"name":gateway_name,"slug":row.get::<String,_>("slug"),"displaySlug":row.get::<String,_>("display_slug"),"description":row.get::<Option<String>,_>("description"),"status":row.get::<String,_>("status"),"profileId":row.get::<Option<Uuid>,_>("profile_id"),"defaultProfileMode":row.get::<String,_>("default_profile_mode"),"contextScopeType":row.get::<String,_>("context_scope_type"),"contextScopeId":row.get::<Option<String>,_>("context_scope_id"),"agentId":row.get::<Option<Uuid>,_>("agent_id"),"projectId":row.get::<Option<Uuid>,_>("project_id"),"issueId":row.get::<Option<Uuid>,_>("issue_id"),"approvalIssueId":row.get::<Option<Uuid>,_>("approval_issue_id"),"authConfig":row.get::<Value,_>("auth_config"),"headerPolicy":row.get::<Value,_>("header_policy"),"metadataPolicy":row.get::<Value,_>("metadata_policy"),"onDemandToolsConfig":row.get::<Value,_>("on_demand_tools_config"),"metadata":row.get::<Value,_>("metadata"),"createdByAgentId":row.get::<Option<Uuid>,_>("created_by_agent_id"),"createdByUserId":row.get::<Option<String>,_>("created_by_user_id"),"archivedAt":row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("archived_at"),"tokens":[],"clientSnippets":client_snippets,"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),"updatedAt":row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")}),
                 ),
             )
         }

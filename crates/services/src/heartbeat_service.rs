@@ -4,6 +4,11 @@ use crate::text_utils::truncate_suffix_chars;
 use crate::sse_service::{InMemorySseService, SseService};
 use crate::secret_service::RuntimeSecretManifestEntry;
 use crate::adapter_executor::{AdapterExecutionContext, AdapterExecutor, ExecutionStatus, ExecutionTargetConfig, ExecutionTargetType, HttpExecutor};
+use crate::mcp_client_config::{
+    claude_mcp_server, codex_mcp_overrides, cursor_mcp_server, gemini_mcp_server,
+    merge_mcp_server, merge_opencode_mcp_server, RestorableJsonConfig,
+    write_private_temp_json,
+};
 use chrono::{DateTime, Utc};
 use models::{Agent, AgentStatus, CommentActorType, SseEvent, SseEventType};
 use serde::{Deserialize, Serialize};
@@ -11,6 +16,7 @@ use serde_json::Value;
 use sqlx::{PgPool, Row};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2545,7 +2551,12 @@ impl DefaultHeartbeatService {
             .unwrap_or(match adapter {
                 "claude_local" => "claude",
                 "codex_local" => "codex",
-                "opencode" => "opencode",
+                "opencode" | "opencode_local" => "opencode",
+                "cursor" => "agent",
+                "gemini_local" => "gemini",
+                "grok_local" => "grok",
+                "pi_local" => "pi",
+                "hermes_local" => "hermes",
                 _ => "sh",
             });
         let mut args: Vec<String> = cfg
@@ -2664,14 +2675,6 @@ impl DefaultHeartbeatService {
                 .unwrap_or(false)
             {
                 args.push("--exclude-dynamic-system-prompt-sections".into());
-            }
-            if cfg
-                .get("strictMcpConfig")
-                .or_else(|| cfg.get("strict_mcp_config"))
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-            {
-                args.push("--strict-mcp-config".into());
             }
             if let Some(extra_args) = cfg.get("extraArgs").or_else(|| cfg.get("extra_args")) {
                 if let Some(extra_args) = extra_args.as_array() {
@@ -2798,31 +2801,72 @@ impl DefaultHeartbeatService {
         // Make the per-run gateway discoverable by the local CLIs. Environment
         // variables alone are not consumed by Codex/Claude as MCP servers.
         let mcp_url = format!("{}/mcp", gateway_url.trim_end_matches('/'));
+        let mut runtime_mcp_env = HashMap::<String, String>::new();
+        let mut runtime_mcp_temp_dirs = Vec::new();
+        let mut runtime_mcp_workspace_configs = Vec::new();
         match adapter {
             "claude_local" => {
                 let config = serde_json::json!({
                     "mcpServers": {
-                        "paperclip": {
-                            "type": "http",
-                            "url": mcp_url,
-                            "headers": {"Authorization": format!("Bearer {gateway_token}")}
-                        }
-                    }
+                        "paperclip": claude_mcp_server(&mcp_url, &gateway_token),
+                    },
                 });
-                args.splice(0..0, ["--mcp-config".to_string(), config.to_string()]);
+                let (temp_dir, config_path) = write_private_temp_json("parrot-claude-mcp-", &config)?;
+                runtime_mcp_temp_dirs.push(temp_dir);
+                args.splice(
+                    0..0,
+                    [
+                        "--mcp-config".to_string(),
+                        config_path.to_string_lossy().into_owned(),
+                        "--strict-mcp-config".to_string(),
+                    ],
+                );
             }
             "codex_local" => {
-                args.splice(0..0, [
-                    "-c".to_string(),
-                    format!("mcp_servers.paperclip.url={mcp_url:?}"),
-                    "-c".to_string(),
-                    // Codex 0.144.x reads `env_http_headers` for Streamable
-                    // HTTP bearer auth. `bearer_token_env_var` is accepted by
-                    // its config printer but is not emitted on requests in
-                    // this CLI version. Keep the value in a dedicated env var
-                    // whose value already contains the required scheme.
-                    "mcp_servers.paperclip.env_http_headers.Authorization=\"PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION\"".to_string(),
-                ]);
+                // Codex supports process-scoped `-c` overrides. This avoids
+                // mutating a user's persistent config.toml while preserving
+                // the same mcp_servers shape used by Paperclip's managed home.
+                args.splice(0..0, codex_mcp_overrides("paperclip", &mcp_url));
+            }
+            "opencode_local" | "opencode" => {
+                let existing_config = cfg
+                    .get("env")
+                    .and_then(|value| value.as_object())
+                    .and_then(|env| env.get("OPENCODE_CONFIG_CONTENT"))
+                    .and_then(Value::as_str)
+                    .map(resolve_env_value)
+                    .map(String::into_bytes)
+                    .or_else(|| {
+                        std::env::var("OPENCODE_CONFIG_CONTENT")
+                            .ok()
+                            .map(String::into_bytes)
+                    });
+                let config = merge_opencode_mcp_server(
+                    existing_config.as_deref(),
+                    "paperclip",
+                    &mcp_url,
+                    &gateway_token,
+                )?;
+                runtime_mcp_env.insert(
+                    "OPENCODE_CONFIG_CONTENT".to_string(),
+                    serde_json::to_string(&config)
+                        .map_err(|error| format!("failed to serialize OpenCode MCP config: {error}"))?,
+                );
+            }
+            "gemini_local" => {
+                // Gemini exposes a system settings path override. A private
+                // run-scoped settings file lets us avoid touching ~/.gemini.
+                let config = serde_json::json!({
+                    "mcpServers": {
+                        "paperclip": gemini_mcp_server(&mcp_url, &gateway_token),
+                    },
+                });
+                let (temp_dir, config_path) = write_private_temp_json("parrot-gemini-mcp-", &config)?;
+                runtime_mcp_temp_dirs.push(temp_dir);
+                runtime_mcp_env.insert(
+                    "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
+                    config_path.to_string_lossy().into_owned(),
+                );
             }
             _ => {}
         }
@@ -2903,6 +2947,23 @@ impl DefaultHeartbeatService {
             
             default_dir
         };
+
+        if adapter == "cursor" {
+            // Cursor's CLI discovers MCP from the project `.cursor/mcp.json`
+            // and has no portable per-process MCP path flag. Preserve the
+            // existing file and restore it when this run exits.
+            let config_path = PathBuf::from(&effective_cwd).join(".cursor").join("mcp.json");
+            let existing = std::fs::read(&config_path).ok();
+            let config = merge_mcp_server(
+                existing.as_deref(),
+                "mcpServers",
+                "paperclip",
+                cursor_mcp_server(&mcp_url, &gateway_token),
+            )?;
+            runtime_mcp_workspace_configs.push(
+                RestorableJsonConfig::install(config_path, &config).await?,
+            );
+        }
         
         let shell_command_text = shell_command(
             command,
@@ -2910,11 +2971,14 @@ impl DefaultHeartbeatService {
             Some(&effective_cwd),
             stdin_prompt.then_some(prompt.as_str()),
         );
-        let configured_env_keys = cfg
+        let mut configured_env_keys = cfg
             .get("env")
             .and_then(|value| value.as_object())
             .map(|env| env.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        configured_env_keys.extend(runtime_mcp_env.keys().cloned());
+        configured_env_keys.sort();
+        configured_env_keys.dedup();
         let logged_shell_command = redact_gateway_token(&shell_command_text, &gateway_token);
         let logged_argv = std::iter::once(command.to_owned())
             .chain(args.iter().cloned())
@@ -2930,6 +2994,15 @@ impl DefaultHeartbeatService {
         if let Some(env) = cfg.get("env").and_then(|v| v.as_object()) {
             for k in env.keys() {
                 full_cmd_with_env.push_str(&format!("{}=[REDACTED] ", k));
+            }
+        }
+        for key in runtime_mcp_env.keys() {
+            if cfg
+                .get("env")
+                .and_then(|value| value.as_object())
+                .map_or(true, |env| !env.contains_key(key))
+            {
+                full_cmd_with_env.push_str(&format!("{}=[REDACTED] ", key));
             }
         }
         full_cmd_with_env.push_str(&shell_command_text);
@@ -2974,6 +3047,9 @@ impl DefaultHeartbeatService {
                     cmd.env(k, resolved_value);
                 }
             }
+        }
+        for (key, value) in &runtime_mcp_env {
+            cmd.env(key, value);
         }
         let child = cmd
             .stdout(std::process::Stdio::piped())

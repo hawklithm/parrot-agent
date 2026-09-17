@@ -39,7 +39,7 @@
     "instructionsFilePath": null,
     "appendSystemPrompt": null,
     "excludeDynamicSystemPromptSections": false,
-    "strictMcpConfig": false,
+    "strictMcpConfig": true,
     "extraArgs": []
   },
   "runtime_config": {
