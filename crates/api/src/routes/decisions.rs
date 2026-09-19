@@ -5566,6 +5566,33 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup issues");
+        // approvals / issue_approvals / heartbeat_runs / agents all reference
+        // the company with NO ACTION, so they go first (children before
+        // parents: issue_approvals pins the approval, which pins the agent).
+        sqlx::query("DELETE FROM issue_approvals WHERE company_id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup issue approvals");
+        sqlx::query("DELETE FROM approvals WHERE company_id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup approvals");
+        sqlx::query("DELETE FROM heartbeat_runs WHERE company_id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup heartbeat runs");
+        sqlx::query("DELETE FROM agents WHERE company_id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup agents");
         sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
             .bind(company_id)
             .bind(other_company_id)

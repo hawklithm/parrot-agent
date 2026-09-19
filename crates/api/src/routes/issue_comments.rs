@@ -835,20 +835,39 @@ pub async fn add_comment(
 mod tests {
     use super::should_reopen_issue_after_comment;
     use models::IssueStatus;
+    use uuid::Uuid;
 
     #[test]
-    fn explicit_reopen_allows_agent_or_board_comments_on_terminal_issues() {
+    fn explicit_reopen_allows_bodyless_terminal_comments() {
+        // A structured edit (no body) carries no conversational intent, so only
+        // the explicit flag can reopen — and it does, for board actors.
         assert!(should_reopen_issue_after_comment(
             IssueStatus::Done,
             false,
             false,
             true,
+            false,
+            false,
+            true,
+            false,
+            None,
+            None,
+            None,
         ));
+        // An agent's explicit reopen of a terminal issue it is not assigned to
+        // is not the self-comment case, so it stands.
         assert!(should_reopen_issue_after_comment(
             IssueStatus::Cancelled,
             true,
             false,
+            false,
             true,
+            false,
+            true,
+            false,
+            None,
+            None,
+            None,
         ));
     }
 
@@ -858,23 +877,82 @@ mod tests {
             IssueStatus::Blocked,
             true,
             true,
+            true,
             false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn assignee_self_comment_on_terminal_issue_suppresses_even_explicit_reopen() {
+        // Paperclip's `isAssigneeSelfCommentOnTerminalIssue`: the assignee's own
+        // log-class comment on a finished issue is not a reopen signal.
+        assert!(!should_reopen_issue_after_comment(
+            IssueStatus::Done,
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            false,
+            None,
+            None,
+            None,
+        ));
+        // ...unless the caller explicitly asked to resume.
+        assert!(should_reopen_issue_after_comment(
+            IssueStatus::Done,
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            None,
+            None,
+            None,
         ));
     }
 
     #[test]
     fn ordinary_comments_do_not_reopen_without_explicit_intent() {
+        // The issue lock's own run posting under user auth (local-CLI agents):
+        // the comment comes from the run that already owns the issue, so it
+        // must not silently reopen the work it just closed.
+        let run_id = Uuid::new_v4();
         assert!(!should_reopen_issue_after_comment(
             IssueStatus::Done,
             true,
+            true,
+            true,
             false,
             false,
+            false,
+            false,
+            Some(run_id),
+            Some(run_id),
+            None,
         ));
+        // Agent-authored comments stay communicative without an explicit flag.
         assert!(!should_reopen_issue_after_comment(
             IssueStatus::InProgress,
             true,
             true,
+            false,
             true,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
         ));
     }
 }
