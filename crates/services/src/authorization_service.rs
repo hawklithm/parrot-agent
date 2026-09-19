@@ -589,6 +589,25 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup execution workspaces");
+        // Agents reference the company with NO ACTION, so they go first.
+        sqlx::query("DELETE FROM agents WHERE company_id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup runtime authz agents");
+        sqlx::query("DELETE FROM projects WHERE company_id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup runtime authz projects");
+        sqlx::query("DELETE FROM principal_permission_grants WHERE company_id IN ($1, $2)")
+            .bind(company_id)
+            .bind(other_company_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup runtime authz grants");
         sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
             .bind(company_id)
             .bind(other_company_id)

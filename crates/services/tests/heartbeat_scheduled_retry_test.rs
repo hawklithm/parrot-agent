@@ -332,6 +332,24 @@ async fn promote_due_scheduled_retries_rewakes_run() {
     .expect("query promoted run link");
     assert!(linked, "promoted retry run must point retry_of_run_id at the parent run");
 
+    // The attempt counter must travel with the promotion: `maybe_schedule_retry`
+    // reads the attempt off the run it disposes, so a promoted run that started
+    // at 0 would retry at attempt 1 forever instead of reaching the cap.
+    let promoted_attempt: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(scheduled_retry_attempt, 0) FROM heartbeat_runs
+         WHERE company_id = $1 AND agent_id = $2 AND retry_of_run_id = $3",
+    )
+    .bind(company_id)
+    .bind(agent_id)
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query promoted run attempt");
+    assert_eq!(
+        promoted_attempt, 2,
+        "promoted retry run must inherit the disposed run's attempt"
+    );
+
     // The run-continuation ledger must record the promotion (run -> parent).
     let continuation: Option<(String,)> = sqlx::query_as(
         "SELECT reason FROM run_continuations

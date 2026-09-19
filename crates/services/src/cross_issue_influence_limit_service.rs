@@ -562,10 +562,20 @@ mod tests {
         assert_eq!(rejected, 1);
         assert_eq!(service.get_influence_count(run_id, company_id).await.unwrap(), 20);
 
-        sqlx::query("DELETE FROM companies WHERE id = $1")
-            .bind(company_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Agents and runs reference the company with NO ACTION, so they go
+        // first; activity logs are written by the service under test and have
+        // to clear before the company row can.
+        for statement in [
+            "DELETE FROM activity_logs WHERE company_id = $1",
+            "DELETE FROM heartbeat_runs WHERE company_id = $1",
+            "DELETE FROM agents WHERE company_id = $1",
+            "DELETE FROM companies WHERE id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(company_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 }

@@ -16,6 +16,8 @@ use serde_json::Value;
 use sqlx::{PgPool, Row};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -297,9 +299,19 @@ pub struct HeartbeatWakeupOptions {
     pub context_snapshot: Option<Value>,
     /// When this wakeup is a scheduled-retry promotion, the run it continues
     /// (the original failed run). Persisted on the created heartbeat run so the
-    /// dashboard `recovered` counter can identify retry-succeeded runs.
+    /// dashboard `recovered` counter can identify retry-succeeded runs, and
+    /// read by the funnel to keep a retry wake out of an in-flight run's
+    /// coalescing: the caller re-runs a run that has already ended.
     pub retry_of_run_id: Option<Uuid>,
+    /// The retry attempt the promoted run starts from when `retry_of_run_id` is
+    /// set. Paperclip's retry row owns its own `scheduledRetryAttempt`
+    /// (`heartbeat.ts:11582-11600`); Parrot keeps the attempt on the run, so it
+    /// has to travel with the promotion — `maybe_schedule_retry` reads the
+    /// attempt off the run it disposes, and a promoted run that started at 0
+    /// would retry at attempt 1 forever instead of reaching the cap.
+    pub scheduled_retry_attempt: Option<i32>,
 }
+
 
 /// Heartbeat context information for an issue
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1324,7 +1336,20 @@ impl DefaultHeartbeatService {
     /// 启动队列中的下一个 run（从 paperclip 完整迁移）
     /// Phase 2: 依赖就绪检查 + 4级排序
     /// Phase 3: Claim验证（简化版，不包括预算和组织结构检查）
-    async fn start_next_queued_run_for_agent(&self, agent_id: Uuid) -> Result<Vec<Uuid>, String> {
+    ///
+    /// The return type is spelled out as an explicitly `Send` boxed future:
+    /// the promoter starts queued runs by spawning `execute_run`, so its
+    /// inferred future type would otherwise depend on the `Send`-ness of
+    /// `execute_run` — which in turn promotes queued runs on completion.
+    fn start_next_queued_run_for_agent(
+        &self,
+        agent_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Uuid>, String>> + Send>> {
+        let service = self.clone_for_background();
+        Box::pin(async move { service.start_queued_runs_for_agent(agent_id).await })
+    }
+
+    async fn start_queued_runs_for_agent(&self, agent_id: Uuid) -> Result<Vec<Uuid>, String> {
         // 1. 检查 agent 是否存在
         let agent = self.load_agent(agent_id).await.map_err(|e| e.to_string())?;
         let company_id = agent.company_id;
@@ -2216,6 +2241,20 @@ impl DefaultHeartbeatService {
         {
             tracing::warn!(%run_id, %agent_id, %session_error, "failed to persist agent task session");
         }
+        // Correlation chain for Task Chat: `context_snapshot.commentId` on this
+        // run identifies the operator comment, and this pair shows which
+        // provider session served it. A task key that resumes another task's
+        // session is visible as a `session_before` that was never written for
+        // this `task_key`.
+        tracing::info!(
+            %run_id,
+            %agent_id,
+            %task_key,
+            adapter = %adapter_type,
+            session_before = output.resumed_session_id.as_deref(),
+            session_after = outcome.session_id.as_deref(),
+            "heartbeat run provider session"
+        );
 
         // Update agent runtime state with token usage and cost (incremental)
         let has_token_usage = outcome.input_tokens > 0 || outcome.output_tokens > 0 || outcome.cached_input_tokens > 0;
@@ -2342,13 +2381,128 @@ impl DefaultHeartbeatService {
             .execute(&self.pool)
             .await;
         self.refresh_continuation_summary(issue_id, run_id, agent_id, status, error.as_deref(), &output.stdout).await;
-        let _ = sqlx::query("UPDATE agent_wakeup_requests SET status = 'completed', updated_at = NOW() WHERE company_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running') AND payload->>'issueId' = $3")
-            .bind(company_id).bind(agent_id).bind(issue_id.to_string()).execute(&self.pool).await;
+        // A comment that arrived while this run held the agent+issue slot was
+        // parked on its own wakeup request. Parked rows carry *this* run's id
+        // (that is their "blocked by" marker), so they must be excluded here —
+        // otherwise the sweep consumes them and the replay below finds nothing.
+        self.complete_run_wakeup_requests(company_id, agent_id, issue_id, run_id)
+            .await;
         let _ = sqlx::query("UPDATE tool_gateway_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE run_id = $1 AND revoked_at IS NULL")
             .bind(run_id).execute(&self.pool).await;
         let _ = sqlx::query("UPDATE agents SET status = 'idle', updated_at = NOW() WHERE id = $1 AND status = 'running'")
             .bind(agent_id).execute(&self.pool).await;
         self.children.lock().await.remove(&run_id);
+        // A comment that arrived while this run held the agent+issue slot was
+        // parked on its wakeup request. Replay it now that the slot is free —
+        // synchronously, because the queued row this run occupied is already
+        // terminal (updated above), so the replay's own slot check sees it as
+        // free. `reconcile_deferred_comment_wakes` starts the follow-up run via
+        // `tokio::spawn`, so calling it from here does not recurse.
+        if let Err(error) = self
+            .reconcile_deferred_comment_wakes(agent_id, company_id)
+            .await
+        {
+            tracing::warn!(%run_id, %agent_id, %error, "failed to replay deferred comment wakes");
+        }
+    }
+
+    /// Closes the wakeup requests a finished run delivered.
+    ///
+    /// Parked comment wakes are excluded: they carry the blocking run's id as
+    /// their "blocked by" marker, so a plain `run_id = $4` match would consume
+    /// them before [`Self::reconcile_deferred_comment_wakes`] can replay them.
+    ///
+    /// `pub` so the Task Chat integration test can drive the real sweep and
+    /// then the real replay in the order `execute_run` uses them; the pair's
+    /// ordering is the invariant, and a reimplementation in the test would not
+    /// catch a regression here.
+    pub async fn complete_run_wakeup_requests(
+        &self,
+        company_id: Uuid,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        run_id: Uuid,
+    ) {
+        let _ = sqlx::query(
+            "UPDATE agent_wakeup_requests SET status = 'completed', updated_at = NOW()
+             WHERE company_id = $1 AND agent_id = $2
+               AND status IN ('queued','dispatched','running')
+               AND payload->>'issueId' = $3
+               AND NOT (payload ? 'deferredContext')
+               AND (run_id IS NULL OR run_id = $4)",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(issue_id.to_string())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await;
+    }
+
+    /// Resolves the provider session a run may resume, scoped to its task key.
+    ///
+    /// A task-scoped run only ever resumes the session recorded for *its*
+    /// `task_key`. The agent's global runtime session is reachable only from an
+    /// agent-level run (no `taskKey`/`issueId` of its own); letting a task-scoped
+    /// run fall back to it is what made three different task keys resume the
+    /// same Claude session (`1e5a1e18`), sharing history across unrelated
+    /// issues. A task-scoped run with no task session starts fresh instead.
+    ///
+    /// `pub` so the Task Chat integration test asserts the isolation directly
+    /// rather than duplicating this query.
+    pub async fn resolve_persisted_session(
+        &self,
+        company_id: Uuid,
+        agent_id: Uuid,
+        adapter: &str,
+        task_key: &str,
+        run_id: Uuid,
+    ) -> Result<Option<String>, String> {
+        let task_session: Option<String> = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(session_display_id, session_params_json->>'sessionId', '')
+             FROM agent_task_sessions
+             WHERE company_id = $1 AND agent_id = $2
+               AND adapter_type = $3 AND task_key = $4
+             ORDER BY updated_at DESC
+             LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(adapter)
+        .bind(task_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| format!("failed to load task session: {error}"))?
+        .filter(|session| !session.trim().is_empty());
+        if task_session.is_some() {
+            return Ok(task_session);
+        }
+        let agent_level_run: bool = sqlx::query_scalar(
+            "SELECT COALESCE(context_snapshot->>'taskKey', context_snapshot->>'issueId') IS NULL
+             FROM heartbeat_runs WHERE id = $1",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| format!("failed to load heartbeat task scope: {error}"))?;
+        if !agent_level_run {
+            tracing::info!(
+                %run_id,
+                %agent_id,
+                %task_key,
+                adapter,
+                "no task session for task key; starting a fresh provider session"
+            );
+            return Ok(None);
+        }
+        sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(session_id, '') FROM agent_runtime_states WHERE agent_id = $1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| format!("failed to load adapter session: {error}"))
+        .map(|session| session.filter(|value| !value.trim().is_empty()))
     }
 
     async fn run_command(
@@ -2428,7 +2582,7 @@ impl DefaultHeartbeatService {
         } else {
             merged_config
         };
-        let prompt = cfg
+        let base_prompt = cfg
             .get("promptTemplate")
             .or_else(|| cfg.get("prompt_template"))
             .and_then(|value| value.as_str())
@@ -2440,6 +2594,63 @@ impl DefaultHeartbeatService {
                     .replace("{{issueId}}", &issue_id.to_string())
             })
             .unwrap_or(default_prompt);
+        // The wake context carries comment ids, not bodies. Load them once here
+        // so both the argv-based adapters below and the stdin prompt can see the
+        // operator's actual feedback instead of only the task template.
+        let wake_snapshot: Value = sqlx::query_scalar(
+            "SELECT COALESCE(context_snapshot, '{}'::jsonb) FROM heartbeat_runs WHERE id = $1 AND company_id = $2",
+        )
+        .bind(run_id)
+        .bind(company_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| format!("failed to load heartbeat wake context: {error}"))?
+        .unwrap_or_else(|| serde_json::json!({}));
+        let wake_comment_ids = crate::wake_prompt_service::extract_wake_comment_ids(&wake_snapshot);
+        let wake_reason: Option<String> = wake_snapshot
+            .get("wakeReason")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let wake_comments = if wake_comment_ids.is_empty() {
+            Vec::new()
+        } else {
+            crate::wake_prompt_service::load_wake_comments(&self.pool, company_id, &wake_comment_ids)
+                .await
+                .map_err(|error| format!("failed to load wake comments: {error}"))?
+        };
+        // Invariant: a comment-shaped wake must name its comment. Without an id
+        // the run cannot load the operator's feedback and degrades into a plain
+        // assignment turn — the defect this path exists to prevent. No producer
+        // currently violates this, so it is a tripwire, not a live branch.
+        if wake_comment_ids.is_empty()
+            && crate::wake_prompt_service::is_comment_shaped_wake_reason(wake_reason.as_deref())
+        {
+            tracing::warn!(
+                %run_id,
+                %agent_id,
+                %issue_id,
+                wake_reason = wake_reason.as_deref().unwrap_or("unknown"),
+                "comment-shaped wake carries no comment id; the operator comment cannot be loaded"
+            );
+        }
+        let issue_identifier: Option<String> =
+            sqlx::query_scalar("SELECT identifier FROM issues WHERE id = $1 AND company_id = $2")
+                .bind(issue_id)
+                .bind(company_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let mut rendered_prompt = crate::wake_prompt_service::render_run_prompt(
+            base_prompt.clone(),
+            false,
+            wake_reason.as_deref(),
+            issue_identifier.as_deref(),
+            &title,
+            &wake_comments,
+            &wake_comment_ids,
+        );
+        let mut prompt = rendered_prompt.prompt.clone();
         let configured_model = cfg
             .get("model")
             .and_then(|v| v.as_str())
@@ -2776,33 +2987,9 @@ impl DefaultHeartbeatService {
         .map_err(|error| format!("failed to load heartbeat task key: {error}"))?;
         let mut resumed_session_id = None;
         if matches!(adapter, "claude_local" | "codex_local") && !custom_args && !force_fresh_session {
-            let task_session: Option<String> = sqlx::query_scalar::<_, String>(
-                "SELECT COALESCE(session_display_id, session_params_json->>'sessionId', '')
-                 FROM agent_task_sessions
-                 WHERE company_id = $1 AND agent_id = $2
-                   AND adapter_type = $3 AND task_key = $4
-                 ORDER BY updated_at DESC
-                 LIMIT 1",
-            )
-            .bind(company_id)
-            .bind(agent_id)
-            .bind(adapter)
-            .bind(&task_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|error| format!("failed to load task session: {error}"))?
-            .filter(|session| !session.trim().is_empty());
-            let persisted_session = match task_session {
-                Some(session) => Some(session),
-                None => sqlx::query_scalar::<_, String>(
-                    "SELECT COALESCE(session_id, '') FROM agent_runtime_states WHERE agent_id = $1",
-                )
-                .bind(agent_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|error| format!("failed to load adapter session: {error}"))?
-                .filter(|session| !session.trim().is_empty()),
-            };
+            let persisted_session = self
+                .resolve_persisted_session(company_id, agent_id, adapter, &task_key, run_id)
+                .await?;
             match adapter {
                 "claude_local" => {
                     if let Some(session_id) = valid_claude_resume_session(persisted_session.as_deref()) {
@@ -2821,6 +3008,20 @@ impl DefaultHeartbeatService {
                 }
                 _ => {}
             }
+        }
+        // A resumed session must not replay the original task template: it
+        // already received the brief, so only the new wake delta is sent.
+        if resumed_session_id.is_some() {
+            rendered_prompt = crate::wake_prompt_service::render_run_prompt(
+                base_prompt.clone(),
+                true,
+                wake_reason.as_deref(),
+                issue_identifier.as_deref(),
+                &title,
+                &wake_comments,
+                &wake_comment_ids,
+            );
+            prompt.clone_from(&rendered_prompt.prompt);
         }
         let mut cmd = Command::new(command);
         let gateway_token = format!("ptg_{}", Uuid::new_v4().simple());
@@ -3124,6 +3325,12 @@ impl DefaultHeartbeatService {
             full_command_with_env = %full_cmd_with_env,
             stdin_prompt,
             prompt_bytes = prompt.len(),
+            prompt_source = rendered_prompt.source.as_str(),
+            resumed_session = resumed_session_id.as_deref(),
+            wake_reason = wake_reason.as_deref(),
+            comment_ids = ?rendered_prompt.comment_ids,
+            comment_count = rendered_prompt.comment_ids.len(),
+            missing_comment_count = rendered_prompt.missing_comment_count,
             "starting local adapter process"
         );
         cmd.args(args)
@@ -3332,14 +3539,20 @@ impl DefaultHeartbeatService {
 }
 
 impl DefaultHeartbeatService {
-    async fn wakeup_with_context(
+    /// Enqueue a wakeup from a caller that already owns its request row.
+    ///
+    /// The internal half of the wakeup funnel: budget gate, throttle gate, and
+    /// run creation, without the idempotency claim. The scheduled-retry
+    /// promoter claims its own request and calls this directly, so a promoted
+    /// retry runs through exactly the same gates as any other wakeup.
+    pub(super) async fn wakeup_with_context(
         &self,
         agent_id: Uuid,
         issue_id: Uuid,
         company_id: Uuid,
         options: HeartbeatWakeupOptions,
         idempotency_row_id: Option<Uuid>,
-    ) -> Result<(), HeartbeatError> {
+    ) -> Result<Option<Uuid>, HeartbeatError> {
         let _agent = self.load_agent(agent_id).await?;
 
         // Serialize all enqueue decisions for an agent.  The Paperclip
@@ -3381,12 +3594,12 @@ impl DefaultHeartbeatService {
                 tx.commit()
                     .await
                     .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-                return Ok(());
+                return Ok(None);
             }
         }
 
-        let active_run: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM heartbeat_runs
+        let active_run: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, status::text FROM heartbeat_runs
              WHERE company_id = $1 AND agent_id = $2
                AND status IN ('queued','running','scheduled_retry')
                AND (context_snapshot->>'issueId' = $3 OR context_snapshot->>'taskId' = $3)
@@ -3400,15 +3613,358 @@ impl DefaultHeartbeatService {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-        if active_run.is_some() {
+        // A scheduled-retry wake re-runs a run that already ended: its snapshot
+        // is the retry's own, so it is neither merged into the run in flight nor
+        // parked behind it. The promoter holds such a wake back instead
+        // (`promote_due_scheduled_retries`) until the agent is free, and leaves
+        // the claim in place so the next scan resumes the retry.
+        if active_run.is_some() && options.retry_of_run_id.is_some() {
+            tx.commit()
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+            return Ok(None);
+        }
+        if let Some((active_run_id, active_status)) = active_run {
+            // A wake that arrives while a run is already in flight must not be
+            // dropped, or the operator's comment is silently lost.
+            //
+            //  - `queued` / `scheduled_retry`: the run has not built its prompt
+            //    yet, so its context is merged in place and the later run
+            //    delivers the comment. A second comment therefore coalesces
+            //    into the same pending turn instead of queueing a third.
+            //  - `running`: the prompt is already on the child's stdin and the
+            //    snapshot it read is gone. The comment cannot reach this turn,
+            //    so a follow-up queued run is created and promoted when the
+            //    current run terminates.
+            let incoming_context = options
+                .context_snapshot
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let incoming_comment_ids =
+                crate::wake_prompt_service::extract_wake_comment_ids(&incoming_context);
+            if incoming_comment_ids.is_empty() {
+                if let Some(request_id) = idempotency_row_id {
+                    sqlx::query(
+                        "UPDATE agent_wakeup_requests
+                         SET status = 'dispatched', run_id = $2, updated_at = NOW()
+                         WHERE id = $1",
+                    )
+                    .bind(request_id)
+                    .bind(active_run_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                return Ok(None);
+            }
+
+            let existing_context: Value = sqlx::query_scalar(
+                "SELECT COALESCE(context_snapshot, '{}'::jsonb) FROM heartbeat_runs
+                 WHERE id = $1 FOR UPDATE",
+            )
+            .bind(active_run_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+
+            if active_status == "running" {
+                // A second `queued`/`running` row for the same agent + issue is
+                // forbidden by `idx_heartbeat_runs_unique_active_agent_issue`
+                // (migration 18, which deleted exactly the duplicates a
+                // follow-up row would recreate). The comment instead stays on a
+                // wakeup request parked as `queued` and is replayed once this
+                // run releases the agent+issue slot.
+                //
+                // Exactly one row may be parked per blocking run, because the
+                // replay turns each parked row into its own run. A comment that
+                // arrives after the parked row exists therefore extends it
+                // rather than parking a second one.
+                let parked = sqlx::query_as::<_, (Uuid, Value)>(
+                    "SELECT id, COALESCE(payload, '{}'::jsonb) FROM agent_wakeup_requests
+                     WHERE company_id = $1 AND agent_id = $2 AND status = 'queued'
+                       AND payload->>'deferredBehindRunId' = $3
+                     ORDER BY requested_at DESC
+                     LIMIT 1
+                     FOR UPDATE",
+                )
+                .bind(company_id)
+                .bind(agent_id)
+                .bind(active_run_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+
+                // Parked-context seeding, aligned with Paperclip's deferred
+                // wake path (`heartbeat.ts:18359-18408`): the row that waits
+                // behind a running run carries the context of the wake that is
+                // parking, extended by later wakes — never the running run's
+                // `contextSnapshot`. Seeding from the blocking run would replay
+                // that run's own wake (its template, its assignment marker)
+                // as if a human had just sent it.
+                //
+                // Comments still riding on the parked row are re-emitted so a
+                // batch coalesced before the row is replayed is not lost; those
+                // that this running run already received are dropped, because
+                // Parrot delivers them into the run's prompt
+                // (`render_run_prompt`) and re-sending them would duplicate the
+                // operator's words. Paperclip has no equivalent filter: its
+                // running turn always keeps its own snapshot and never drains
+                // from the parked row, so it has nothing to subtract.
+                let base_context: Value = match parked.as_ref() {
+                    Some((_, parked_payload)) => parked_payload
+                        .get("deferredContext")
+                        .filter(|value| value.is_object())
+                        .cloned()
+                        .unwrap_or_else(|| incoming_context.clone()),
+                    None => incoming_context.clone(),
+                };
+                let delivered_ids =
+                    crate::wake_prompt_service::extract_wake_comment_ids(&existing_context);
+                let undelivered: Vec<Uuid> =
+                    crate::wake_prompt_service::extract_wake_comment_ids(&base_context)
+                        .into_iter()
+                        .filter(|id| !delivered_ids.contains(id))
+                        .collect();
+                let mut base_context = base_context;
+                if let Some(object) = base_context.as_object_mut() {
+                    match undelivered.last() {
+                        Some(latest) => {
+                            object.insert(
+                                "wakeCommentIds".to_string(),
+                                serde_json::json!(undelivered),
+                            );
+                            object
+                                .insert("wakeCommentId".to_string(), serde_json::json!(latest));
+                            object.insert("commentId".to_string(), serde_json::json!(latest));
+                        }
+                        None => {
+                            object.remove("wakeCommentIds");
+                            object.remove("wakeCommentId");
+                            object.remove("commentId");
+                        }
+                    }
+                    // The parked wake's reason/source describe the wake that is
+                    // waiting, not the run it waits behind.
+                    if !incoming_comment_ids.is_empty() {
+                        if let Some(reason) = options.reason.as_ref() {
+                            object.insert("wakeReason".to_string(), serde_json::json!(reason));
+                        }
+                        if let Some(source) = options.source.as_ref() {
+                            object.insert("source".to_string(), serde_json::json!(source));
+                        }
+                    }
+                }
+                let parked_context = crate::wake_prompt_service::merge_wake_context(
+                    &base_context,
+                    &incoming_context,
+                );
+
+                match parked {
+                    Some((parked_id, mut parked_payload)) => {
+                        if let Some(object) = parked_payload.as_object_mut() {
+                            object.insert(
+                                "deferredContext".to_string(),
+                                parked_context,
+                            );
+                        } else {
+                            parked_payload = serde_json::json!({
+                                "deferredContext": parked_context,
+                            });
+                        }
+                        sqlx::query(
+                            "UPDATE agent_wakeup_requests
+                             SET payload = $2, reason = COALESCE($3, reason),
+                                 coalesced_count = coalesced_count + 1,
+                                 requested_at = NOW(), updated_at = NOW()
+                             WHERE id = $1",
+                        )
+                        .bind(parked_id)
+                        .bind(&parked_payload)
+                        .bind(options.reason.as_deref())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                        // The incoming comment now lives on the parked row, so
+                        // its own row is closed against this run instead of
+                        // being parked a second time.
+                        if let Some(request_id) = idempotency_row_id {
+                            let mut payload =
+                                options.payload.clone().unwrap_or_else(|| serde_json::json!({}));
+                            if let Some(object) = payload.as_object_mut() {
+                                object.insert(
+                                    "issueId".to_string(),
+                                    serde_json::json!(issue_id),
+                                );
+                                object.insert(
+                                    "deferredIntoRequestId".to_string(),
+                                    serde_json::json!(parked_id),
+                                );
+                            }
+                            sqlx::query(
+                                "UPDATE agent_wakeup_requests
+                                 SET status = 'dispatched', run_id = $2, payload = $3,
+                                     reason = COALESCE($4, reason),
+                                     coalesced_count = coalesced_count + 1,
+                                     updated_at = NOW()
+                                 WHERE id = $1",
+                            )
+                            .bind(request_id)
+                            .bind(active_run_id)
+                            .bind(&payload)
+                            .bind(options.reason.as_deref())
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                        }
+                        tracing::info!(
+                            %active_run_id,
+                            %parked_id,
+                            %agent_id,
+                            %issue_id,
+                            comment_ids = ?incoming_comment_ids,
+                            "extended the parked comment wake behind the running run"
+                        );
+                        tx.commit()
+                            .await
+                            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                        return Ok(None);
+                    }
+                    None => {}
+                }
+
+                let mut payload = options.payload.clone().unwrap_or_else(|| serde_json::json!({}));
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("issueId".to_string(), serde_json::json!(issue_id));
+                    object.insert(
+                        "deferredBehindRunId".to_string(),
+                        serde_json::json!(active_run_id),
+                    );
+                    object.insert("deferredContext".to_string(), parked_context);
+                }
+                match idempotency_row_id {
+                    Some(request_id) => {
+                        sqlx::query(
+                            "UPDATE agent_wakeup_requests
+                             SET status = 'queued', run_id = $2, payload = $3,
+                                 source = COALESCE($4, source),
+                                 trigger_detail = COALESCE($5, trigger_detail),
+                                 reason = COALESCE($6, reason),
+                                 requested_by_actor_type = COALESCE($7, requested_by_actor_type),
+                                 requested_by_actor_id = COALESCE($8, requested_by_actor_id),
+                                 requested_at = NOW(), claimed_at = NULL, finished_at = NULL,
+                                 updated_at = NOW()
+                             WHERE id = $1",
+                        )
+                        .bind(request_id)
+                        .bind(active_run_id)
+                        .bind(&payload)
+                        .bind(options.source.as_deref())
+                        .bind(options.trigger_detail.as_deref())
+                        .bind(options.reason.as_deref())
+                        .bind(options.requested_by_actor_type.as_deref())
+                        .bind(options.requested_by_actor_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                    }
+                    None => {
+                        sqlx::query(
+                            "INSERT INTO agent_wakeup_requests
+                             (company_id, agent_id, status, payload, source, trigger_detail,
+                              reason, requested_by_actor_type, requested_by_actor_id,
+                              run_id, coalesced_count, requested_at, updated_at)
+                             VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, 1, NOW(), NOW())",
+                        )
+                        .bind(company_id)
+                        .bind(agent_id)
+                        .bind(&payload)
+                        .bind(options.source.as_deref().unwrap_or("on_demand"))
+                        .bind(options.trigger_detail.as_deref())
+                        .bind(options.reason.as_deref())
+                        .bind(options.requested_by_actor_type.as_deref())
+                        .bind(options.requested_by_actor_id)
+                        .bind(active_run_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                    }
+                }
+                tracing::info!(
+                    %active_run_id,
+                    %agent_id,
+                    %issue_id,
+                    comment_ids = ?incoming_comment_ids,
+                    request_id = ?idempotency_row_id,
+                    "deferred comment wake behind the running run"
+                );
+                tx.commit()
+                    .await
+                    .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                return Ok(None);
+            }
+
+            let merged_context = crate::wake_prompt_service::merge_wake_context(
+                &existing_context,
+                &incoming_context,
+            );
+            sqlx::query(
+                "UPDATE heartbeat_runs SET context_snapshot = $2, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(active_run_id)
+            .bind(&merged_context)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+            tracing::info!(
+                %active_run_id,
+                %agent_id,
+                %issue_id,
+                comment_ids = ?incoming_comment_ids,
+                active_status = %active_status,
+                "coalesced comment wake into pending run"
+            );
+
+            // Record the delivery so the comment is auditable as consumed.
+            let mut payload = options.payload.clone().unwrap_or_else(|| serde_json::json!({}));
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("issueId".to_string(), serde_json::json!(issue_id));
+                object.insert("runId".to_string(), serde_json::json!(active_run_id));
+            }
             if let Some(request_id) = idempotency_row_id {
                 sqlx::query(
                     "UPDATE agent_wakeup_requests
-                     SET status = 'dispatched', run_id = $2, updated_at = NOW()
+                     SET status = 'dispatched', run_id = $2, payload = $3,
+                         reason = COALESCE($4, reason),
+                         coalesced_count = coalesced_count + 1, updated_at = NOW()
                      WHERE id = $1",
                 )
                 .bind(request_id)
-                .bind(active_run)
+                .bind(active_run_id)
+                .bind(&payload)
+                .bind(options.reason.as_deref())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO agent_wakeup_requests
+                     (company_id, agent_id, status, payload, source, trigger_detail,
+                      reason, requested_by_actor_type, requested_by_actor_id,
+                      run_id, coalesced_count, requested_at, updated_at)
+                     VALUES ($1, $2, 'dispatched', $3, $4, $5, $6, $7, $8, $9, 1, NOW(), NOW())",
+                )
+                .bind(company_id)
+                .bind(agent_id)
+                .bind(&payload)
+                .bind(options.source.as_deref().unwrap_or("on_demand"))
+                .bind(options.trigger_detail.as_deref())
+                .bind(options.reason.as_deref())
+                .bind(options.requested_by_actor_type.as_deref())
+                .bind(options.requested_by_actor_id)
+                .bind(active_run_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
@@ -3416,7 +3972,7 @@ impl DefaultHeartbeatService {
             tx.commit()
                 .await
                 .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-            return Ok(());
+            return Ok(None);
         }
 
         let mut context = options
@@ -3487,11 +4043,11 @@ impl DefaultHeartbeatService {
             }
         }
         let run_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot, responsible_user_id, retry_of_run_id)
-             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, i.responsible_user_id::text, $6
+            "INSERT INTO heartbeat_runs (company_id, agent_id, invocation_source, status, context_snapshot, responsible_user_id, retry_of_run_id, scheduled_retry_attempt)
+             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, i.responsible_user_id::text, $6, COALESCE($7, 0)
              FROM issues i WHERE i.id = $5
              UNION ALL
-             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, NULL::text, $6
+             SELECT $1, $2, $3, 'queued'::heartbeat_run_status, $4, NULL::text, $6, COALESCE($7, 0)
              WHERE NOT EXISTS (SELECT 1 FROM issues WHERE id = $5)
              LIMIT 1
              RETURNING id",
@@ -3502,6 +4058,7 @@ impl DefaultHeartbeatService {
         .bind(&context)
         .bind(issue_id)
         .bind(options.retry_of_run_id)
+        .bind(options.scheduled_retry_attempt)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
@@ -3596,7 +4153,110 @@ impl DefaultHeartbeatService {
         .await;
         let service = self.clone_for_task();
         tokio::spawn(async move { service.execute_run(run_id, agent_id, issue_id, company_id).await; });
-        Ok(())
+        Ok(Some(run_id))
+    }
+
+    /// Claim (or create) the `agent_wakeup_requests` row for a wake, without
+    /// dispatching anything.
+    ///
+    /// The same insert-or-claim logic the wakeup funnel starts with, split out
+    /// so a caller can own the request lifecycle around a dispatch it drives
+    /// itself — Paperclip likewise keeps a wakeup request as the durable owner
+    /// of a wake across enqueue, dispatch, and skip (`heartbeat.ts:10025`).
+    ///
+    /// `Ok(None)` means an earlier wake under the same idempotency key already
+    /// dispatched a run, so this wake is a no-op.
+    async fn claim_wakeup_request(
+        &self,
+        agent_id: Uuid,
+        issue_id: Uuid,
+        company_id: Uuid,
+        options: &HeartbeatWakeupOptions,
+    ) -> Result<Option<Uuid>, HeartbeatError> {
+        let Some(idempotency_key) = options.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        let inserted = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agent_wakeup_requests
+             (company_id, agent_id, status, payload, source, trigger_detail, reason,
+              requested_by_actor_type, requested_by_actor_id, idempotency_key,
+              requested_at, updated_at)
+             VALUES ($1, $2, 'queued', $3, COALESCE($4, 'on_demand'), $5, $6, $7, $8, $9, NOW(), NOW())
+             ON CONFLICT (company_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+             RETURNING id",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(serde_json::json!({ "issueId": issue_id }))
+        .bind(options.source.as_deref())
+        .bind(options.trigger_detail.as_deref())
+        .bind(options.reason.as_deref())
+        .bind(options.requested_by_actor_type.as_deref())
+        .bind(options.requested_by_actor_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        let row = match inserted {
+            Some(row_id) => Some(row_id),
+            None => {
+                let existing: Option<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
+                    "SELECT id, status::text, run_id
+                     FROM agent_wakeup_requests
+                     WHERE company_id = $1 AND idempotency_key = $2
+                     FOR UPDATE",
+                )
+                .bind(company_id)
+                .bind(idempotency_key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                let Some((existing_id, status, existing_run_id)) = existing else {
+                    return Err(HeartbeatError::WakeupFailed(
+                        "idempotency conflict did not resolve to a wake request".to_string(),
+                    ));
+                };
+                if matches!(status.as_str(), "dispatched" | "running" | "completed")
+                    || (status == "queued" && existing_run_id.is_some())
+                {
+                    None
+                } else {
+                    if matches!(status.as_str(), "failed" | "cancelled" | "skipped") {
+                        sqlx::query(
+                            "UPDATE agent_wakeup_requests
+                             SET status = 'queued', payload = $3,
+                                 source = COALESCE($4, source), trigger_detail = $5,
+                                 reason = $6, requested_by_actor_type = $7,
+                                 requested_by_actor_id = $8, run_id = NULL,
+                                 error = NULL, finished_at = NULL,
+                                 requested_at = NOW(), updated_at = NOW()
+                             WHERE id = $1 AND status = $2::agent_wakeup_request_status",
+                        )
+                        .bind(existing_id)
+                        .bind(&status)
+                        .bind(serde_json::json!({ "issueId": issue_id }))
+                        .bind(options.source.as_deref())
+                        .bind(options.trigger_detail.as_deref())
+                        .bind(options.reason.as_deref())
+                        .bind(options.requested_by_actor_type.as_deref())
+                        .bind(options.requested_by_actor_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+                    }
+                    Some(existing_id)
+                }
+            }
+        };
+        tx.commit()
+            .await
+            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
+        Ok(row)
     }
 
     /// Mark an agent wakeup as `skipped` for an external gate (budget hard-stop),
@@ -3659,94 +4319,15 @@ impl HeartbeatService for DefaultHeartbeatService {
         company_id: Uuid,
         options: HeartbeatWakeupOptions,
     ) -> Result<(), HeartbeatError> {
-        let idempotency_row_id = if let Some(idempotency_key) = options.idempotency_key.as_deref() {
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-            let inserted = sqlx::query_scalar::<_, Uuid>(
-                "INSERT INTO agent_wakeup_requests
-                 (company_id, agent_id, status, payload, source, trigger_detail, reason,
-                  requested_by_actor_type, requested_by_actor_id, idempotency_key,
-                  requested_at, updated_at)
-                 VALUES ($1, $2, 'queued', $3, COALESCE($4, 'on_demand'), $5, $6, $7, $8, $9, NOW(), NOW())
-                 ON CONFLICT (company_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-                 RETURNING id",
-            )
-            .bind(company_id)
-            .bind(agent_id)
-            .bind(serde_json::json!({ "issueId": issue_id }))
-            .bind(options.source.as_deref())
-            .bind(options.trigger_detail.as_deref())
-            .bind(options.reason.as_deref())
-            .bind(options.requested_by_actor_type.as_deref())
-            .bind(options.requested_by_actor_id)
-            .bind(idempotency_key)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-            let row = if inserted.is_some() {
-                inserted
-            } else {
-                let existing: Option<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
-                    "SELECT id, status::text, run_id
-                     FROM agent_wakeup_requests
-                     WHERE company_id = $1 AND idempotency_key = $2
-                     FOR UPDATE",
-                )
-                .bind(company_id)
-                .bind(idempotency_key)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-                let Some((existing_id, status, existing_run_id)) = existing else {
-                    return Err(HeartbeatError::WakeupFailed(
-                        "idempotency conflict did not resolve to a wake request".to_string(),
-                    ));
-                };
-
-                if matches!(status.as_str(), "dispatched" | "running" | "completed")
-                    || (status == "queued" && existing_run_id.is_some())
-                {
-                    tx.commit()
-                        .await
-                        .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-                    return Ok(());
-                }
-
-                if matches!(status.as_str(), "failed" | "cancelled" | "skipped") {
-                    sqlx::query(
-                        "UPDATE agent_wakeup_requests
-                         SET status = 'queued', payload = $3,
-                             source = COALESCE($4, source), trigger_detail = $5,
-                             reason = $6, requested_by_actor_type = $7,
-                             requested_by_actor_id = $8, run_id = NULL,
-                             error = NULL, finished_at = NULL,
-                             requested_at = NOW(), updated_at = NOW()
-                         WHERE id = $1 AND status = $2::agent_wakeup_request_status",
-                    )
-                    .bind(existing_id)
-                    .bind(&status)
-                    .bind(serde_json::json!({ "issueId": issue_id }))
-                    .bind(options.source.as_deref())
-                    .bind(options.trigger_detail.as_deref())
-                    .bind(options.reason.as_deref())
-                    .bind(options.requested_by_actor_type.as_deref())
-                    .bind(options.requested_by_actor_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-                }
-                Some(existing_id)
-            };
-            tx.commit()
-                .await
-                .map_err(|e| HeartbeatError::WakeupFailed(e.to_string()))?;
-            row
-        } else {
-            None
-        };
+        let has_idempotency_key = options.idempotency_key.is_some();
+        let idempotency_row_id = self
+            .claim_wakeup_request(agent_id, issue_id, company_id, &options)
+            .await?;
+        // A request that already dispatched a run under this key owns the wake:
+        // re-enqueueing it is a no-op rather than a second run.
+        if idempotency_row_id.is_none() && has_idempotency_key {
+            return Ok(());
+        }
 
         // ── Budget hard-stop enforcement ──────────────────────────────────────
         // Hard-stop is the verifiable "硬停止" contract: when a company/agent budget
@@ -3957,7 +4538,7 @@ impl HeartbeatService for DefaultHeartbeatService {
             .execute(&self.pool)
             .await;
         }
-        result
+        result.map(|_: Option<Uuid>| ())
     }
 
     async fn wakeup(
@@ -3974,6 +4555,7 @@ impl HeartbeatService for DefaultHeartbeatService {
             None,
         )
         .await
+        .map(|_: Option<Uuid>| ())
     }
 
 
@@ -4641,120 +5223,358 @@ impl DefaultHeartbeatService {
         }
     }
 
-    /// Self-healing promotion: find `scheduled_retry` runs whose
-    /// `scheduled_retry_at` is due and re-wake them via the normal wakeup path
-    /// (which resets the run back to a queued wakeup request). Idempotent per
-    /// run; safe to call from the heartbeat_recovery scheduler job.
-    pub async fn promote_due_scheduled_retries(&self) -> Result<usize, HeartbeatError> {
+    /// Replays comment wakes that were parked because their issue already had
+    /// an active run.
+    ///
+    /// A comment arriving on a running turn cannot reach that turn (its prompt
+    /// is already on the child's stdin) and cannot get a follow-up run
+    /// (`idx_heartbeat_runs_unique_active_agent_issue` forbids a second
+    /// `queued`/`running` row for the same agent + issue). It waits on its
+    /// `agent_wakeup_requests` row instead, and is replayed here once the
+    /// blocking run is gone.
+    ///
+    /// Idempotent: the parked row is only replayed while its blocking run is
+    /// terminal, and `wakeup_with_options` refuses to start a second run while
+    /// one is active, so a double scan cannot double-deliver a comment.
+    pub async fn reconcile_deferred_comment_wakes(
+        &self,
+        agent_id: Uuid,
+        company_id: Uuid,
+    ) -> Result<usize, HeartbeatError> {
+        const MAX_DEFERRED_ATTEMPTS: i32 = 5;
+
         let rows = sqlx::query(
-            "SELECT id, agent_id, company_id, context_snapshot, scheduled_retry_attempt
-             FROM heartbeat_runs
-             WHERE status = 'scheduled_retry'
-               AND scheduled_retry_at IS NOT NULL
-               AND scheduled_retry_at <= NOW()
-             ORDER BY scheduled_retry_at ASC
+            "SELECT id, payload, source, trigger_detail, reason,
+                    requested_by_actor_type, requested_by_actor_id, attempt_count
+             FROM agent_wakeup_requests
+             WHERE company_id = $1 AND agent_id = $2
+               AND status = 'queued' AND run_id IS NOT NULL
+               AND EXISTS (
+                     SELECT 1 FROM heartbeat_runs r
+                     WHERE r.id = agent_wakeup_requests.run_id
+                       AND r.status NOT IN ('queued','running')
+                   )
+             ORDER BY requested_at ASC
+             LIMIT 50",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+        let mut replayed = 0;
+        for row in rows {
+            let request_id: Uuid = row
+                .try_get("id")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let attempt_count: i32 = row
+                .try_get("attempt_count")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            let payload: Value = row
+                .try_get("payload")
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            if attempt_count >= MAX_DEFERRED_ATTEMPTS {
+                sqlx::query(
+                    "UPDATE agent_wakeup_requests
+                     SET status = 'failed',
+                         error = COALESCE(error, 'deferred comment wake exhausted its replay attempts'),
+                         finished_at = NOW(), updated_at = NOW()
+                     WHERE id = $1",
+                )
+                .bind(request_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+                tracing::warn!(%request_id, %agent_id, %attempt_count, "gave up replaying a deferred comment wake");
+                continue;
+            }
+
+            let Some(issue_id) = payload
+                .get("issueId")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                continue;
+            };
+
+            // The parked row carries the snapshot the comment was merged into;
+            // the replay builds a brand-new run, so replay it explicitly.
+            let context_snapshot = payload.get("deferredContext").cloned();
+            let mut replay_payload = payload.clone();
+            if let Some(object) = replay_payload.as_object_mut() {
+                object.remove("deferredContext");
+                object.remove("deferredBehindRunId");
+            }
+
+            let options = HeartbeatWakeupOptions {
+                source: row.try_get("source").ok(),
+                trigger_detail: row.try_get("trigger_detail").ok(),
+                reason: row.try_get("reason").ok(),
+                requested_by_actor_type: row.try_get("requested_by_actor_type").ok(),
+                requested_by_actor_id: row.try_get("requested_by_actor_id").ok(),
+                context_snapshot,
+                payload: Some(replay_payload),
+                // Crash safety: if this process dies after the funnel enqueues
+                // but before the parked row is closed, the next scan must not
+                // deliver the same comment twice.
+                idempotency_key: Some(format!("deferred-comment-wake:{request_id}")),
+                ..Default::default()
+            };
+
+            // The replay is a fresh wake, so the parked row is released and the
+            // funnel records an equivalent one. Bump the attempt count first so
+            // a wake that fails to enqueue is still bounded.
+            sqlx::query(
+                "UPDATE agent_wakeup_requests
+                 SET attempt_count = attempt_count + 1, updated_at = NOW()
+                 WHERE id = $1",
+            )
+            .bind(request_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+            if let Err(error) = self
+                .wakeup_with_options(agent_id, issue_id, company_id, options)
+                .await
+            {
+                tracing::warn!(%request_id, %agent_id, %issue_id, %error, "failed to replay a deferred comment wake");
+                continue;
+            }
+
+            sqlx::query(
+                "UPDATE agent_wakeup_requests
+                 SET status = 'completed', finished_at = NOW(), updated_at = NOW()
+                 WHERE id = $1 AND status = 'queued'",
+            )
+            .bind(request_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
+            tracing::info!(%request_id, %agent_id, %issue_id, "replayed a deferred comment wake");
+            replayed += 1;
+        }
+
+        Ok(replayed)
+    }
+
+    /// Scans every agent for parked comment wakes whose blocking run is gone.
+    ///
+    /// The safety net behind the run-completion replay: if a process dies
+    /// between a run finishing and its parked wake being replayed, the periodic
+    /// recovery job picks it up. Also the mechanism that retries a replay whose
+    /// enqueue attempt failed.
+    pub async fn reconcile_deferred_comment_wakes_for_all_agents(
+        &self,
+    ) -> Result<usize, HeartbeatError> {
+        let agents: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT DISTINCT company_id, agent_id FROM agent_wakeup_requests
+             WHERE status = 'queued' AND run_id IS NOT NULL
+               AND EXISTS (
+                     SELECT 1 FROM heartbeat_runs r
+                     WHERE r.id = agent_wakeup_requests.run_id
+                       AND r.status NOT IN ('queued','running')
+                   )
              LIMIT 200",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
 
+        let mut replayed = 0;
+        for (company_id, agent_id) in agents {
+            match self
+                .reconcile_deferred_comment_wakes(agent_id, company_id)
+                .await
+            {
+                Ok(count) => replayed += count,
+                Err(error) => {
+                    tracing::warn!(%agent_id, %company_id, %error, "deferred comment wake scan failed for agent");
+                }
+            }
+        }
+        Ok(replayed)
+    }
+
+    /// Self-healing promotion: find `scheduled_retry` runs whose
+    /// `scheduled_retry_at` is due and relaunch them through the wakeup funnel.
+    ///
+    /// Mirrors Paperclip's `promoteDueScheduledRetry` (`heartbeat.ts:11105`):
+    /// a due retry is promoted by **re-enqueueing a wakeup for its issue**
+    /// (`scheduleBoundedRetryForRun` → `enqueueWakeupForIssue`), not by flipping
+    /// the due row in place. Paperclip's promoted wake carries `retryOfRunId`
+    /// to the run it continues (`heartbeat.ts:11582-11600`), so the retry is a
+    /// new run linked back to the run that failed.
+    ///
+    /// Parrot's scheduling half diverges: `maybe_schedule_retry` flips the
+    /// failed row itself to `scheduled_retry` instead of inserting a pre-linked
+    /// retry row, so the link is established here, at promotion time.
+    ///
+    /// Two invariants keep the promotion from stranding or duplicating a retry:
+    ///
+    /// 1. The due row is retired to `failed` **before** the funnel call.
+    ///    `wakeup_with_context`'s active-run query matches
+    ///    `status IN ('queued','running','scheduled_retry')`, so a due row still
+    ///    present would match itself, the wake would coalesce into it, and the
+    ///    cleared `scheduled_retry_at` would leave the retry unreachable.
+    /// 2. The retry is only dispatched while the agent is free, and a wake that
+    ///    still ends up held back is put back on the retry clock. Handing the
+    ///    retry to the run in flight would dispose its request while
+    ///    `scheduled_retry_at` is already cleared — a permanently lost retry.
+    pub async fn promote_due_scheduled_retries(&self) -> Result<usize, HeartbeatError> {
+        let rows: Vec<(Uuid, Uuid, Uuid, Option<DateTime<Utc>>, i32, Option<String>, Value)> =
+            sqlx::query_as(
+                "SELECT id, agent_id, company_id, scheduled_retry_at,
+                        COALESCE(scheduled_retry_attempt, 0), scheduled_retry_reason,
+                        COALESCE(context_snapshot, '{}'::jsonb)
+                 FROM heartbeat_runs
+                 WHERE status = 'scheduled_retry'
+                   AND scheduled_retry_at IS NOT NULL
+                   AND scheduled_retry_at <= NOW()
+                 ORDER BY scheduled_retry_at ASC
+                 LIMIT 200",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+
         let mut promoted = 0;
-        for row in rows {
-            let run_id: Uuid = row
-                .try_get("id")
-                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
-            let agent_id: Uuid = row
-                .try_get("agent_id")
-                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
-            let company_id: Uuid = row
-                .try_get("company_id")
-                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
-            let attempt: i32 = row
-                .try_get("scheduled_retry_attempt")
-                .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
-            let issue_id = row
-                .try_get::<Option<serde_json::Value>, _>("context_snapshot")
-                .ok()
-                .flatten()
-                .and_then(|snapshot| {
-                    snapshot
-                        .get("issueId")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned)
-                })
-                .and_then(|value| Uuid::parse_str(&value).ok());
-            let Some(issue_id) = issue_id else {
+        for (run_id, agent_id, company_id, due_at, attempt, retry_reason, run_context) in rows {
+            let Some(issue_id) = run_context
+                .get("issueId")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                // Nothing to re-wake: retire the row so the scan stops
+                // reconsidering it on every tick.
+                let _ = sqlx::query(
+                    "UPDATE heartbeat_runs
+                     SET status = 'failed'::heartbeat_run_status,
+                         scheduled_retry_at = NULL,
+                         result_json = COALESCE(result_json, '{}'::jsonb)
+                             || jsonb_build_object('retryPromoted', false,
+                                                   'retryPromotionSkipped', 'missing_issue_id'),
+                         updated_at = NOW()
+                     WHERE id = $1 AND status = 'scheduled_retry'",
+                )
+                .bind(run_id)
+                .execute(&self.pool)
+                .await;
                 continue;
             };
 
-            if let Err(e) = self
-                .wakeup_with_options(
-                    agent_id,
-                    issue_id,
-                    company_id,
-                    HeartbeatWakeupOptions {
-                        // `invocation_source` records how the run was invoked;
-                        // "heartbeat.scheduled_retry" stays in context_snapshot.source.
-                        source: Some("automation".to_string()),
-                        trigger_detail: Some("scheduled_retry".to_string()),
-                        reason: Some("scheduled_retry_promotion".to_string()),
-                        idempotency_key: Some(format!(
-                            "scheduled_retry_promotion:{}:{}",
-                            issue_id, attempt
-                        )),
-                        payload: Some(serde_json::json!({
-                            "issueId": issue_id,
-                            "scheduledRetry": true,
-                            "scheduledRetryAttempt": attempt,
-                        })),
-                        context_snapshot: Some(serde_json::json!({
-                            "issueId": issue_id,
-                            "source": "heartbeat.scheduled_retry",
-                            "reason": "scheduled_retry_promotion",
-                        })),
-                        retry_of_run_id: Some(run_id),
-                        ..Default::default()
-                    },
-                )
-                .await
+            // Invariant 2: never take the retry's wake while the agent is busy.
+            // Leaving the row untouched keeps `scheduled_retry_at` due, so the
+            // next scan (or the run-completion replay) promotes it.
+            if self
+                .run_other_than(agent_id, company_id, run_id)
+                .await?
+                .is_some()
             {
-                tracing::error!(
-                    run_id = %run_id,
-                    error = %e,
-                    "failed to promote scheduled retry"
-                );
                 continue;
             }
-            // Clear the scheduled_retry marker now that a fresh wakeup exists.
-            let _ = sqlx::query(
+
+            // Invariant 1: retire the due row before waking, so the funnel does
+            // not coalesce the retry into the row being promoted.
+            let updated = sqlx::query(
                 "UPDATE heartbeat_runs
-                 SET scheduled_retry_at = NULL, updated_at = NOW()
+                 SET status = 'failed'::heartbeat_run_status,
+                     scheduled_retry_at = NULL,
+                     result_json = COALESCE(result_json, '{}'::jsonb)
+                         || jsonb_build_object('retryPromoted', true,
+                                               'retryPromotedAt', NOW(),
+                                               'retryPromotedAttempt', $2),
+                     updated_at = NOW()
                  WHERE id = $1 AND status = 'scheduled_retry'",
             )
             .bind(run_id)
+            .bind(attempt)
             .execute(&self.pool)
-            .await;
+            .await
+            .map_err(|e| HeartbeatError::Internal(e.to_string()))?;
+            if updated.rows_affected() == 0 {
+                continue;
+            }
 
-            // Record the run-continuation ledger entry (PAPERCLIP_MIGRATION_PLAN
-            // §4B.2 line 325): the freshly created retry run continues the run
-            // being promoted. Best-effort — the promotion itself already
-            // succeeded; a failed ledger write must not fail the promotion.
-            let new_run_id = sqlx::query_scalar(
-                "SELECT payload->>'runId' FROM agent_wakeup_requests
-                 WHERE company_id = $1 AND agent_id = $2 AND payload->>'issueId' = $3
-                   AND payload->>'runId' IS NOT NULL
-                 ORDER BY updated_at DESC LIMIT 1",
+            // A stable per-attempt key makes the promotion idempotent: a crash
+            // between waking and linking leaves the request claimed, and the
+            // resumed attempt finds it already linked rather than waking twice.
+            let idempotency_key = format!("scheduled-retry-promotion:{run_id}:{attempt}");
+            let options = HeartbeatWakeupOptions {
+                source: Some("automation".to_string()),
+                trigger_detail: Some("system".to_string()),
+                reason: Some("scheduled_retry".to_string()),
+                payload: Some(serde_json::json!({
+                    "issueId": issue_id,
+                    "scheduledRetry": true,
+                    "scheduledRetryAttempt": attempt,
+                })),
+                context_snapshot: Some(run_context.clone()),
+                retry_of_run_id: Some(run_id),
+                scheduled_retry_attempt: Some(attempt),
+                idempotency_key: Some(idempotency_key.clone()),
+                ..Default::default()
+            };
+            if let Err(error) = self
+                .wakeup_with_options(agent_id, issue_id, company_id, options)
+                .await
+            {
+                tracing::warn!(
+                    %run_id, %agent_id, %issue_id, %attempt, %error,
+                    "failed to promote a due scheduled retry"
+                );
+                continue;
+            }
+
+            // The funnel records the run it created on the claiming request
+            // row, so the retry link is read back from there rather than from
+            // the wakeup signature every other caller shares.
+            let new_run_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT run_id FROM agent_wakeup_requests
+                 WHERE company_id = $1 AND idempotency_key = $2",
             )
             .bind(company_id)
-            .bind(agent_id)
-            .bind(issue_id.to_string())
+            .bind(&idempotency_key)
             .fetch_optional(&self.pool)
             .await
-            .ok()
-            .flatten()
-            .and_then(|value: Option<String>| value.and_then(|v| Uuid::parse_str(&v).ok()));
-            if let Some(new_run_id) = new_run_id {
+            .map_err(|e| HeartbeatError::Internal(e.to_string()))?
+            .flatten();
+            let Some(new_run_id) = new_run_id else {
+                // The wake was held back (another run took the agent between the
+                // free check and the dispatch, or a gate recorded it). The due
+                // row was already retired, so put it back on the retry clock —
+                // otherwise the retry would be consumed without ever running.
+                let restored = sqlx::query(
+                    "UPDATE heartbeat_runs
+                     SET status = 'scheduled_retry'::heartbeat_run_status,
+                         scheduled_retry_at = NOW() + INTERVAL '30 seconds',
+                         result_json = COALESCE(result_json, '{}'::jsonb) - 'retryPromoted',
+                         updated_at = NOW()
+                     WHERE id = $1 AND status = 'failed'",
+                )
+                .bind(run_id)
+                .execute(&self.pool)
+                .await;
+                match restored {
+                    Ok(restored) if restored.rows_affected() > 0 => tracing::info!(
+                        %run_id, %agent_id, %issue_id, %attempt,
+                        "scheduled retry held back; re-armed for the next scan"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        %run_id, %error,
+                        "failed to re-arm a held-back scheduled retry"
+                    ),
+                }
+                continue;
+            };
+
+            // The claiming `agent_wakeup_requests` row already records the run
+            // that owns the wake (the funnel sets it on dispatch), so the retry
+            // chain is auditable from either side.
+            if new_run_id != run_id {
                 let _ = crate::run_continuations_service::RunContinuationsService::new(
                     self.pool.clone(),
                 )
@@ -4767,9 +5587,61 @@ impl DefaultHeartbeatService {
                 )
                 .await;
             }
+
+            let _ = publish_live_event(
+                &self.sse_service,
+                company_id,
+                "heartbeat.run.queued",
+                serde_json::json!({
+                    "runId": new_run_id,
+                    "agentId": agent_id,
+                    "issueId": issue_id,
+                    "status": "queued",
+                    "invocationSource": "automation",
+                    "scheduledRetryAttempt": attempt,
+                    "scheduledRetryAt": due_at,
+                    "scheduledRetryReason": retry_reason,
+                    "idempotencyKey": idempotency_key,
+                }),
+            )
+            .await;
+
+            tracing::info!(
+                %run_id,
+                %new_run_id,
+                %agent_id,
+                attempt = %attempt,
+                "promoted a due scheduled retry into a fresh linked run"
+            );
             promoted += 1;
         }
         Ok(promoted)
+    }
+
+    /// A run that would hold this agent back if a wake were enqueued now,
+    /// ignoring `excluded_run_id` (the caller's own row).
+    ///
+    /// The same predicate `wakeup_with_context` uses to decide whether a wake
+    /// can start a run, so the promoter's "is the agent free" check cannot
+    /// disagree with the funnel it hands the retry to.
+    async fn run_other_than(
+        &self,
+        agent_id: Uuid,
+        company_id: Uuid,
+        excluded_run_id: Uuid,
+    ) -> Result<Option<Uuid>, HeartbeatError> {
+        sqlx::query_scalar(
+            "SELECT id FROM heartbeat_runs
+             WHERE company_id = $1 AND agent_id = $2 AND id <> $3
+               AND status IN ('queued','running','scheduled_retry')
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(agent_id)
+        .bind(excluded_run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| HeartbeatError::Internal(e.to_string()))
     }
 
     fn clone_for_task(&self) -> Self {

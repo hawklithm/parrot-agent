@@ -395,6 +395,8 @@ pub use plan_decomposition_service::*;
 pub mod issue_diagnostics_service;
 pub use issue_diagnostics_service::*;
 pub mod heartbeat_service;
+pub mod wake_prompt_service;
+pub use wake_prompt_service::*;
 pub mod issue_assignment_wakeup;
 pub use issue_assignment_wakeup::*;
 pub mod low_trust_service;

@@ -87,19 +87,122 @@ pub struct CommentResponse {
     pub comment: IssueComment,
 }
 
+/// Parrot port of Paperclip's `isClosedIssueStatus`
+/// (`server/src/routes/issues.ts:1841`). Only `done` and `cancelled` are
+/// terminal; `blocked` is still an open work state.
+fn is_closed_issue_status(status: models::IssueStatus) -> bool {
+    matches!(
+        status,
+        models::IssueStatus::Done | models::IssueStatus::Cancelled
+    )
+}
+
+/// Parrot port of Paperclip's `isAssigneeSelfCommentOnTerminalIssue`
+/// (`server/src/routes/issues.ts:1899-1913`).
+///
+/// A log-class comment from the assignee agent on a terminal issue is not a
+/// reopen signal. When the caller did not pass `resume: true` this forces the
+/// reopen path off even if `reopen: true` was sent.
+fn is_assignee_self_comment_on_terminal_issue(
+    has_comment_body: bool,
+    resume_requested: bool,
+    status: models::IssueStatus,
+    has_assignee: bool,
+    actor_is_agent: bool,
+    actor_is_assignee: bool,
+) -> bool {
+    if !has_comment_body {
+        return false;
+    }
+    if resume_requested {
+        return false;
+    }
+    if !is_closed_issue_status(status) {
+        return false;
+    }
+    if !has_assignee {
+        return false;
+    }
+    if !actor_is_agent {
+        return false;
+    }
+    actor_is_assignee
+}
+
+/// Parrot port of Paperclip's `shouldImplicitlyMoveCommentedIssueToTodo`
+/// (`server/src/routes/issues.ts:1843-1878`).
+///
+/// A plain conversational comment ("please continue") on a finished or blocked
+/// issue implicitly reopens it. Structured dependency edits and an agent's own
+/// closing comment do not.
+fn should_implicitly_move_commented_issue_to_todo(
+    status: models::IssueStatus,
+    has_assignee: bool,
+    actor_is_user: bool,
+    actor_run_id: Option<Uuid>,
+    checkout_run_id: Option<Uuid>,
+    execution_run_id: Option<Uuid>,
+) -> bool {
+    // Local-CLI agents post comments under user auth, so the actor type is
+    // "user" even though the comment originates from the same heartbeat run
+    // that owns the issue lock. Without this guard, an agent that closes its
+    // own issue and then posts a follow-up comment in the same run silently
+    // reopens it.
+    if let Some(run_id) = actor_run_id {
+        if Some(run_id) == checkout_run_id || Some(run_id) == execution_run_id {
+            return false;
+        }
+    }
+    // Only human comments implicitly reopen finished work. Agent-authored
+    // comments remain communicative unless reopen was explicit.
+    if !actor_is_user {
+        return false;
+    }
+    if !is_closed_issue_status(status) && status != models::IssueStatus::Blocked {
+        return false;
+    }
+    has_assignee
+}
+
+/// Composite reopen decision, mirroring Paperclip's `effectiveMoveToTodoRequested`
+/// (`server/src/routes/issues.ts:9094-9110`): the assignee's own terminal-issue
+/// log comment suppresses even an explicit reopen, and otherwise either an
+/// explicit reopen flag or the implicit conversational reopen applies.
+#[allow(clippy::too_many_arguments)]
 fn should_reopen_issue_after_comment(
     status: models::IssueStatus,
     has_assignee: bool,
-    board_comment: bool,
+    has_comment_body: bool,
+    actor_is_user: bool,
+    actor_is_agent: bool,
+    actor_is_assignee: bool,
     explicit_reopen: bool,
+    resume_requested: bool,
+    actor_run_id: Option<Uuid>,
+    checkout_run_id: Option<Uuid>,
+    execution_run_id: Option<Uuid>,
 ) -> bool {
-    let reopenable = matches!(
+    let assignee_self_comment = is_assignee_self_comment_on_terminal_issue(
+        has_comment_body,
+        resume_requested,
         status,
-        models::IssueStatus::Done
-            | models::IssueStatus::Cancelled
-            | models::IssueStatus::Blocked
+        has_assignee,
+        actor_is_agent,
+        actor_is_assignee,
     );
-    reopenable && (explicit_reopen || (board_comment && has_assignee))
+    if assignee_self_comment {
+        return false;
+    }
+    explicit_reopen
+        || (has_comment_body
+            && should_implicitly_move_commented_issue_to_todo(
+                status,
+                has_assignee,
+                actor_is_user,
+                actor_run_id,
+                checkout_run_id,
+                execution_run_id,
+            ))
 }
 
 /// A structured `[label](scheme://id)` mention extracted from comment markdown.
@@ -338,11 +441,19 @@ pub async fn add_comment(
     let explicit_resume = req.resume;
     let explicit_reopen = req.reopen || explicit_resume;
     let board_comment = matches!(actor, AuthorizationActor::Board { .. });
+    let actor_is_assignee = issue.assignee_agent_id == Some(authenticated_actor_id);
     let should_reopen = should_reopen_issue_after_comment(
         issue.status,
         issue.assignee_agent_id.is_some(),
+        !req.body.trim().is_empty(),
         board_comment,
+        !board_comment,
+        actor_is_assignee,
         explicit_reopen,
+        explicit_resume,
+        authenticated_run_id,
+        issue.checkout_run_id,
+        issue.execution_run_id,
     );
 
     if explicit_resume
@@ -390,9 +501,15 @@ pub async fn add_comment(
                     continue;
                 }
             }
-            // Verify mentioned agent belongs to same company and fetch its status
-            let mentioned_agent: Option<(String,)> = sqlx::query_as(
-                r#"SELECT status::text FROM agents WHERE id = $1 AND company_id = $2"#
+            // Paperclip's `findMentionedAgents`
+            // (`server/src/services/issues.ts:8968-8976`) filters structured
+            // agent mentions by company membership only; the wake itself is
+            // unconditional (`server/src/routes/issues.ts:12252-12268`). Agent
+            // status must not gate it: a `running` agent's wake is coalesced or
+            // deferred by `wakeup_with_options`, and a paused/terminated agent
+            // is rejected there too, so pre-filtering here only loses mentions.
+            let mentioned_agent: Option<(Uuid,)> = sqlx::query_as(
+                r#"SELECT id FROM agents WHERE id = $1 AND company_id = $2"#,
             )
             .bind(mentioned_id)
             .bind(company_id)
@@ -400,66 +517,60 @@ pub async fn add_comment(
             .await
             .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
 
-            if let Some((agent_status,)) = mentioned_agent {
-                // Only wake active agents (not paused/terminated)
-                if agent_status == "running" || agent_status == "idle" || agent_status == "paused" || agent_status == "pending_approval" {
-                    log_activity(
-                        &state.pool,
-                        company_id,
-                        "issue_comment_mentioned",
-                        &actor,
-                        "agent",
-                        *mentioned_id,
-                        serde_json::json!({
-                            "mentionedAgentId": mentioned_id,
-                            "commentId": comment.id,
-                            "issueId": issue_id,
-                        }),
-                    )
-                    .await;
+            if let Some(_mentioned_agent) = mentioned_agent {
+                log_activity(
+                    &state.pool,
+                    company_id,
+                    "issue_comment_mentioned",
+                    &actor,
+                    "agent",
+                    *mentioned_id,
+                    serde_json::json!({
+                        "mentionedAgentId": mentioned_id,
+                        "commentId": comment.id,
+                        "issueId": issue_id,
+                    }),
+                )
+                .await;
 
-                    // Wake mentioned agent with proper context
-                    if agent_status == "idle" || agent_status == "paused" {
-                        if let Err(error) = state
-                            .heartbeat_service
-                            .wakeup_with_options(
-                                *mentioned_id,
-                                issue_id,
-                                company_id,
-                                HeartbeatWakeupOptions {
-                                    source: Some("automation".to_string()),
-                                    trigger_detail: Some("system".to_string()),
-                                    reason: Some("issue_comment_mentioned".to_string()),
-                                    requested_by_actor_type: Some(format!("{:?}", actor_type).to_lowercase()),
-                                    requested_by_actor_id: actor_id,
-                                    payload: Some(serde_json::json!({
-                                        "issueId": issue_id,
-                                        "commentId": comment.id,
-                                    })),
-                                    context_snapshot: Some(serde_json::json!({
-                                        "issueId": issue_id,
-                                        "taskId": issue_id,
-                                        "commentId": comment.id,
-                                        "wakeCommentId": comment.id,
-                                        "wakeReason": "issue_comment_mentioned",
-                                        "source": "comment.mention",
-                                        "requestedByActorType": format!("{:?}", actor_type).to_lowercase(),
-                                        "requestedByActorId": actor_id,
-                                    })),
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                company_id = %company_id,
-                                agent_id = %mentioned_id,
-                                issue_id = %issue_id,
-                                error = %error,
-                                "failed to wake mentioned agent"
-                            );
-                        }
-                    }
+                if let Err(error) = state
+                    .heartbeat_service
+                    .wakeup_with_options(
+                        *mentioned_id,
+                        issue_id,
+                        company_id,
+                        HeartbeatWakeupOptions {
+                            source: Some("automation".to_string()),
+                            trigger_detail: Some("system".to_string()),
+                            reason: Some("issue_comment_mentioned".to_string()),
+                            requested_by_actor_type: Some(format!("{:?}", actor_type).to_lowercase()),
+                            requested_by_actor_id: actor_id,
+                            payload: Some(serde_json::json!({
+                                "issueId": issue_id,
+                                "commentId": comment.id,
+                            })),
+                            context_snapshot: Some(serde_json::json!({
+                                "issueId": issue_id,
+                                "taskId": issue_id,
+                                "commentId": comment.id,
+                                "wakeCommentId": comment.id,
+                                "wakeReason": "issue_comment_mentioned",
+                                "source": "comment.mention",
+                                "requestedByActorType": format!("{:?}", actor_type).to_lowercase(),
+                                "requestedByActorId": actor_id,
+                            })),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        company_id = %company_id,
+                        agent_id = %mentioned_id,
+                        issue_id = %issue_id,
+                        error = %error,
+                        "failed to wake mentioned agent"
+                    );
                 }
             }
         }
@@ -596,6 +707,7 @@ pub async fn add_comment(
                         reason: Some("issue_reopened_via_comment".to_string()),
                         requested_by_actor_type: Some(format!("{actor_type:?}").to_lowercase()),
                         requested_by_actor_id: actor_id,
+                        idempotency_key: Some(format!("issue-comment-reopen:{}", comment.id)),
                         payload: Some(serde_json::json!({
                             "issueId": issue_id,
                             "commentId": comment.id,
@@ -603,9 +715,12 @@ pub async fn add_comment(
                         })),
                         context_snapshot: Some(serde_json::json!({
                             "issueId": issue_id,
+                            "taskId": issue_id,
                             "source": "issue.comment.reopen",
                             "wakeReason": "issue_reopened_via_comment",
                             "commentId": comment.id,
+                            "wakeCommentId": comment.id,
+                            "wakeCommentIds": [comment.id],
                             "requestedByActorType": format!("{actor_type:?}").to_lowercase(),
                             "requestedByActorId": actor_id,
                         })),
@@ -619,6 +734,75 @@ pub async fn add_comment(
                     %issue_id,
                     %assignee_agent_id,
                     "Failed to wake assignee after issue comment reopen"
+                );
+            }
+        }
+    }
+
+    // A plain board comment on an assigned, non-terminal issue is a follow-up
+    // turn for the assignee.  Before this wake existed the comment was stored
+    // but never delivered, so the agent only ever saw the original task
+    // template.  Terminal issues are handled by the reopen wake above.
+    //
+    // The status guard is Paperclip's `skipWake`
+    // (`server/src/routes/issues.ts:12163-12170`): only a closed issue
+    // (`done`/`cancelled`) suppresses the wake. `in_review` and `blocked` issues
+    // are still live work, so a comment on them must reach the assignee;
+    // gating on `todo | in_progress` silently dropped those comments.
+    if !should_reopen
+        && board_comment
+        && !comment.body.trim().is_empty()
+        && issue.assignee_agent_id.is_some()
+        && !is_closed_issue_status(issue.status)
+    {
+        if let Some(assignee_agent_id) = issue.assignee_agent_id {
+            let wake_reason = if interrupt_requested {
+                // The interrupt handler above cancels the active run; this
+                // queued run becomes the next turn carrying the comment.
+                "issue_commented_after_interrupt"
+            } else {
+                "issue_commented"
+            };
+            if let Err(error) = state
+                .heartbeat_service
+                .wakeup_with_options(
+                    assignee_agent_id,
+                    issue_id,
+                    company_id,
+                    HeartbeatWakeupOptions {
+                        source: Some("automation".to_string()),
+                        trigger_detail: Some("system".to_string()),
+                        reason: Some(wake_reason.to_string()),
+                        requested_by_actor_type: Some(format!("{actor_type:?}").to_lowercase()),
+                        requested_by_actor_id: actor_id,
+                        idempotency_key: Some(format!("issue-comment:{}", comment.id)),
+                        payload: Some(serde_json::json!({
+                            "issueId": issue_id,
+                            "commentId": comment.id,
+                            "mutation": "comment_followup",
+                        })),
+                        context_snapshot: Some(serde_json::json!({
+                            "issueId": issue_id,
+                            "taskId": issue_id,
+                            "source": "issue.comment",
+                            "wakeReason": wake_reason,
+                            "commentId": comment.id,
+                            "wakeCommentId": comment.id,
+                            "wakeCommentIds": [comment.id],
+                            "requestedByActorType": format!("{actor_type:?}").to_lowercase(),
+                            "requestedByActorId": actor_id,
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    %issue_id,
+                    %assignee_agent_id,
+                    comment_id = %comment.id,
+                    "Failed to wake assignee after issue comment"
                 );
             }
         }

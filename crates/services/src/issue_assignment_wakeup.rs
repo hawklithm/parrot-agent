@@ -80,6 +80,7 @@ impl IssueAssignmentWakeupService {
                     })),
                     idempotency_key: input.idempotency_key.clone(),
                     retry_of_run_id: None,
+                    scheduled_retry_attempt: None,
                 },
             )
             .await;

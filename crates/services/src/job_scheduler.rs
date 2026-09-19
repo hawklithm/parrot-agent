@@ -718,8 +718,13 @@ impl ScheduledJob for HeartbeatRecoveryJob {
             .promote_due_scheduled_retries()
             .await
             .map_err(|e| e.to_string())?;
+        let deferred = self
+            .heartbeat
+            .reconcile_deferred_comment_wakes_for_all_agents()
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(format!(
-            "reconciled {orphaned} orphaned runs, {pending} pending issues, {dependency_wakes} dependency wakes, {interaction_wakes} interaction continuation wakes, and promoted {promoted} scheduled retries"
+            "reconciled {orphaned} orphaned runs, {pending} pending issues, {dependency_wakes} dependency wakes, {interaction_wakes} interaction continuation wakes, promoted {promoted} scheduled retries, and replayed {deferred} deferred comment wakes"
         ))
     }
 }
