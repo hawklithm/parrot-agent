@@ -17,7 +17,7 @@ use crate::validation::{
 use models::{AgentPermissions, AgentStatus, ApprovalType, TrustAuthorizationPolicy, TrustPreset};
 use serde_json::{json, Value};
 use services::approval_service::CreateApprovalInput;
-use services::auth::{AuthorizationAction, AuthorizationActor};
+use services::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService};
 use services::{CreateAgentInput, HeartbeatWakeupOptions, UpdateAgentInput};
 
 use crate::routes::heartbeats::list_scheduler_heartbeats;
@@ -153,14 +153,21 @@ async fn create_agent(
     // Paperclip's assertCanCreateAgentsForCompany behavior, including the
     // local_implicit development bypass and company-scoped role/grant checks.
     let action = AuthorizationAction::AgentHire { company_id };
-    if !services::auth::decision_engine::decide_access(
+    let authorization_decision = AuthorizationService::decide(
         &state.pool,
         &auth_actor,
         &action,
         Some(company_id),
     )
-    .await
-    {
+    .await;
+    if !authorization_decision.allowed {
+        tracing::warn!(
+            company_id = %company_id,
+            actor_id = ?auth_actor.principal_id(),
+            decision_reason = %authorization_decision.reason,
+            decision_code = ?authorization_decision.code,
+            "agent hire authorization denied"
+        );
         return Err(AppError::Forbidden(
             "Insufficient permissions: Missing agents:create permission".to_string(),
         ));

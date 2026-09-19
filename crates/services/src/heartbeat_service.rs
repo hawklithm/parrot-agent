@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1132,6 +1132,63 @@ fn shell_command(
     match cwd {
         Some(cwd) => format!("cd {} && {{ {}; }}", shell_quote(cwd), invocation),
         None => invocation,
+    }
+}
+
+fn is_sensitive_env_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "authorization",
+        "bearer",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "private_key",
+        "privatekey",
+        "cookie",
+        "jwt",
+        "token",
+        "opencode_config_content",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn redact_logged_env_value(value: &str, sensitive: bool, gateway_token: &str) -> String {
+    if sensitive {
+        return "[REDACTED]".to_string();
+    }
+    redact_gateway_token(value, gateway_token)
+}
+
+fn command_with_env(
+    environment: &BTreeMap<String, String>,
+    sensitive_env_keys: &HashSet<String>,
+    command: &str,
+    gateway_token: &str,
+) -> String {
+    let env_prefix = environment
+        .iter()
+        .map(|(key, value)| {
+            let logged_value = redact_logged_env_value(
+                value,
+                sensitive_env_keys.contains(key),
+                gateway_token,
+            );
+            format!("{}={}", shell_quote(key), shell_quote(&logged_value))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if env_prefix.is_empty() {
+        command.to_string()
+    } else {
+        format!("{env_prefix} {command}")
     }
 }
 
@@ -2965,6 +3022,55 @@ impl DefaultHeartbeatService {
             );
         }
         
+        // Build the exact environment overlay once. The same resolved values
+        // are used for both `Command::env` and the diagnostic command string;
+        // otherwise the log can describe a different process from the one we
+        // actually spawn (especially for values such as `ANTHROPIC_AUTH_TOKEN`
+        // configured as `ANTHROPIC_AUTH_TOKEN`).
+        let mut effective_env = BTreeMap::<String, String>::new();
+        let mut sensitive_env_keys = HashSet::<String>::new();
+        effective_env.insert("PAPERCLIP_RUN_ID".to_string(), run_id.to_string());
+        effective_env.insert("PAPERCLIP_AGENT_ID".to_string(), agent_id.to_string());
+        effective_env.insert("PAPERCLIP_TOOL_GATEWAY_URL".to_string(), gateway_url.clone());
+        effective_env.insert(
+            "PAPERCLIP_TOOL_GATEWAY_TOKEN".to_string(),
+            gateway_token.clone(),
+        );
+        effective_env.insert(
+            "PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION".to_string(),
+            format!("Bearer {gateway_token}"),
+        );
+        for key in [
+            "PAPERCLIP_TOOL_GATEWAY_TOKEN",
+            "PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION",
+        ] {
+            sensitive_env_keys.insert(key.to_string());
+        }
+
+        if let Some(env) = cfg.get("env").and_then(|value| value.as_object()) {
+            for (key, value) in env {
+                if let Some(value) = value.as_str() {
+                    let resolved_value = if runtime_secret_paths.contains(&format!("env.{key}")) {
+                        value.to_owned()
+                    } else {
+                        resolve_env_value(value)
+                    };
+                    if runtime_secret_paths.contains(&format!("env.{key}"))
+                        || is_sensitive_env_key(key)
+                    {
+                        sensitive_env_keys.insert(key.clone());
+                    }
+                    effective_env.insert(key.clone(), resolved_value);
+                }
+            }
+        }
+        for (key, value) in &runtime_mcp_env {
+            if is_sensitive_env_key(key) {
+                sensitive_env_keys.insert(key.clone());
+            }
+            effective_env.insert(key.clone(), value.clone());
+        }
+
         let shell_command_text = shell_command(
             command,
             &args,
@@ -2984,28 +3090,25 @@ impl DefaultHeartbeatService {
             .chain(args.iter().cloned())
             .map(|value| redact_gateway_token(&value, &gateway_token))
             .collect::<Vec<_>>();
-        // 构造包含所有环境变量的完整 shell 命令
-        let mut full_cmd_with_env = String::new();
-        full_cmd_with_env.push_str(&format!("PAPERCLIP_RUN_ID={} ", shell_quote(&run_id.to_string())));
-        full_cmd_with_env.push_str(&format!("PAPERCLIP_AGENT_ID={} ", shell_quote(&agent_id.to_string())));
-        full_cmd_with_env.push_str(&format!("PAPERCLIP_TOOL_GATEWAY_URL={} ", shell_quote(&gateway_url)));
-        full_cmd_with_env.push_str("PAPERCLIP_TOOL_GATEWAY_TOKEN=[REDACTED] ");
-        full_cmd_with_env.push_str("PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION=[REDACTED] ");
-        if let Some(env) = cfg.get("env").and_then(|v| v.as_object()) {
-            for k in env.keys() {
-                full_cmd_with_env.push_str(&format!("{}=[REDACTED] ", k));
-            }
-        }
-        for key in runtime_mcp_env.keys() {
-            if cfg
-                .get("env")
-                .and_then(|value| value.as_object())
-                .map_or(true, |env| !env.contains_key(key))
-            {
-                full_cmd_with_env.push_str(&format!("{}=[REDACTED] ", key));
-            }
-        }
-        full_cmd_with_env.push_str(&shell_command_text);
+        let logged_env = effective_env
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    redact_logged_env_value(
+                        value,
+                        sensitive_env_keys.contains(key),
+                        &gateway_token,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let full_cmd_with_env = command_with_env(
+            &effective_env,
+            &sensitive_env_keys,
+            &logged_shell_command,
+            &gateway_token,
+        );
         
         tracing::info!(
             run_id = %run_id,
@@ -3016,6 +3119,8 @@ impl DefaultHeartbeatService {
             argv = ?logged_argv,
             working_dir = %effective_cwd,
             configured_env_keys = ?configured_env_keys,
+            resolved_env = ?logged_env,
+            final_command = %full_cmd_with_env,
             full_command_with_env = %full_cmd_with_env,
             stdin_prompt,
             prompt_bytes = prompt.len(),
@@ -3027,28 +3132,8 @@ impl DefaultHeartbeatService {
             } else {
                 std::process::Stdio::null()
             })
-            .env("PAPERCLIP_RUN_ID", run_id.to_string())
-            .env("PAPERCLIP_AGENT_ID", agent_id.to_string())
-            .env("PAPERCLIP_TOOL_GATEWAY_URL", gateway_url)
-            .env("PAPERCLIP_TOOL_GATEWAY_TOKEN", &gateway_token)
-            .env(
-                "PAPERCLIP_TOOL_GATEWAY_AUTHORIZATION",
-                format!("Bearer {gateway_token}"),
-            )
             .current_dir(&effective_cwd);
-        if let Some(env) = cfg.get("env").and_then(|v| v.as_object()) {
-            for (k, v) in env {
-                if let Some(s) = v.as_str() {
-                    let resolved_value = if runtime_secret_paths.contains(&format!("env.{k}")) {
-                        s.to_owned()
-                    } else {
-                        resolve_env_value(s)
-                    };
-                    cmd.env(k, resolved_value);
-                }
-            }
-        }
-        for (key, value) in &runtime_mcp_env {
+        for (key, value) in &effective_env {
             cmd.env(key, value);
         }
         let child = cmd
@@ -5209,6 +5294,28 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_with_env_logs_resolved_values_and_redacts_sensitive_values() {
+        let environment = BTreeMap::from([
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "secret-token".to_string()),
+            ("ANTHROPIC_MODEL".to_string(), "claude-sonnet".to_string()),
+        ]);
+        let sensitive = HashSet::from(["ANTHROPIC_AUTH_TOKEN".to_string()]);
+
+        let logged = command_with_env(
+            &environment,
+            &sensitive,
+            "cd /tmp && claude --print",
+            "ptg_gateway_secret",
+        );
+
+        assert!(logged.contains("ANTHROPIC_MODEL=claude-sonnet"));
+        assert!(logged.contains("ANTHROPIC_AUTH_TOKEN="));
+        assert!(logged.contains("[REDACTED]"));
+        assert!(!logged.contains("secret-token"));
+        assert!(logged.ends_with("cd /tmp && claude --print"));
+    }
 
     #[test]
     fn local_command_logs_redact_gateway_token_without_redacting_the_real_argv() {

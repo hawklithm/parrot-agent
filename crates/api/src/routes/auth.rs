@@ -13,7 +13,7 @@ use axum::{
     extract::{Extension, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -38,12 +38,29 @@ pub fn auth_routes(state: AppState) -> Router<AppState> {
         .route("/auth/sign-out", post(sign_out))
         .route("/auth/get-session", get(get_session))
         .route("/auth/profile", get(get_profile).patch(update_profile))
+        // Better Auth mounts one wildcard handler below `/api/auth`. Parrot's
+        // native email/session handlers remain explicit, while this
+        // compatibility route makes unsupported Better Auth methods return a
+        // stable JSON error instead of Axum's HTML 404. This is important for
+        // clients that probe the Better Auth surface during bootstrap.
+        .route("/auth/*auth_path", any(better_auth_compatibility))
         // --- P3: Admin routes (AU1-AU5) ---
         .route("/admin/users/:user_id/promote-instance-admin", post(promote_instance_admin))
         .route("/admin/users/:user_id/demote-instance-admin", post(demote_instance_admin))
         .route("/admin/users/:user_id/company-access", get(get_user_company_access).put(update_user_company_access))
         .route("/join-requests/:request_id/claim-api-key", post(claim_join_request_api_key))
         .with_state(state)
+}
+
+async fn better_auth_compatibility(Path(auth_path): Path<String>) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "auth_endpoint_not_supported",
+            "path": format!("/api/auth/{auth_path}"),
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]

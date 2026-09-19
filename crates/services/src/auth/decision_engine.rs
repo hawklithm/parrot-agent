@@ -7,7 +7,7 @@
 //! - `RolePermissions` 角色默认权限映射：`default_permissions_for_role`
 //! - onBehalfOf 委托：Agent 以 responsible user 的成员关系进行权限检查
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use repositories::auth_repositories::{
@@ -226,6 +226,76 @@ pub async fn check_explicit_grants(
         .await
         .unwrap_or(None)
         .is_some()
+}
+
+/// Paperclip keeps a small legacy creator rule in addition to the normal
+/// access-grant graph: a CEO, or an agent whose persisted permissions contain
+/// `canCreateAgents`, may hire agents even when the agent has no human
+/// membership or explicit `agents:create` grant.
+///
+/// Parrot's gateway actor is intentionally agent-scoped (there is no human
+/// membership on a short-lived `ptg_` run token), so omitting this fallback
+/// makes the canonical `/agent-hires` endpoint reject the same CEO that
+/// Paperclip accepts. Keep this check narrowly scoped to the two agent-create
+/// actions and fail closed on database/shape errors.
+async fn can_create_agents_legacy(
+    pool: &PgPool,
+    actor: &AuthorizationActor,
+    resource_company: Option<Uuid>,
+) -> bool {
+    let AuthorizationActor::Agent {
+        agent_id,
+        company_id,
+        on_behalf_of_user_id,
+        ..
+    } = actor
+    else {
+        return false;
+    };
+
+    // Paperclip applies this compatibility rule to the agent principal. If
+    // the request is already delegated to a responsible human, that human's
+    // membership/grants must pass the normal intersection check instead.
+    if on_behalf_of_user_id.is_some()
+        || resource_company != Some(*company_id)
+    {
+        return false;
+    }
+
+    let row = match sqlx::query(
+        "SELECT role::text AS role, permissions
+           FROM agents
+          WHERE id = $1 AND company_id = $2 AND status <> 'terminated'",
+    )
+    .bind(agent_id)
+    .bind(company_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) | Err(_) => return false,
+    };
+
+    let role = row
+        .try_get::<String, _>("role")
+        .unwrap_or_default();
+    let permissions = row
+        .try_get::<serde_json::Value, _>("permissions")
+        .unwrap_or(serde_json::Value::Null);
+
+    agent_has_legacy_create_permission(&role, &permissions)
+}
+
+fn agent_has_legacy_create_permission(role: &str, permissions: &serde_json::Value) -> bool {
+    role.eq_ignore_ascii_case("ceo")
+        || permissions
+            .get("canCreateAgents")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || permissions
+            .get("can_create_agents")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// 检查管理者继承链：若 `principal_id` 是资源所有者（`resource_owner_id`）的管理者，
@@ -484,6 +554,22 @@ impl AuthorizationService {
             }
         }
 
+        // Compatibility path copied from Paperclip's
+        // `canCreateAgentsLegacy(actorAgent)`. This must run after explicit
+        // grants (for audit precedence), but before the final deny.
+        if matches!(
+            action,
+            AuthorizationAction::AgentCreate { .. } | AuthorizationAction::AgentHire { .. }
+        ) && can_create_agents_legacy(pool, actor, resource_company).await
+        {
+            return AuthorizationDecision::allow(
+                action.clone(),
+                DecisionReason::AllowLegacyAgentCreator,
+                "Agent role or persisted canCreateAgents permission allows hiring agents"
+                    .to_string(),
+            );
+        }
+
         // 拒绝：缺少权限。若使用了 onBehalfOf 但 responsible user 无活跃成员关系，
         // 设置专用决策代码 RESPONSIBLE_USER_UNAVAILABLE（对应 §7 阶段三）。
         let mut decision = AuthorizationDecision::deny(
@@ -663,6 +749,23 @@ mod tests {
         assert!(!role_has_permission(
             MembershipRole::Viewer,
             &PermissionKey::from_const(PermissionKey::AGENTS_DELETE)
+        ));
+    }
+
+    #[test]
+    fn test_paperclip_legacy_agent_creator_rule_supports_role_and_both_permission_shapes() {
+        assert!(agent_has_legacy_create_permission("ceo", &serde_json::json!({})));
+        assert!(agent_has_legacy_create_permission(
+            "general",
+            &serde_json::json!({"canCreateAgents": true})
+        ));
+        assert!(agent_has_legacy_create_permission(
+            "general",
+            &serde_json::json!({"can_create_agents": true})
+        ));
+        assert!(!agent_has_legacy_create_permission(
+            "general",
+            &serde_json::json!({"canCreateAgents": false})
         ));
     }
 

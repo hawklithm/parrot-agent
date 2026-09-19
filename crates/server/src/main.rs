@@ -138,6 +138,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ensure_local_trusted_principal(&pool).await?;
     }
 
+    // Reconcile the compatibility rows that Paperclip creates during startup.
+    // This is intentionally after the local-trusted bootstrap so the first
+    // authenticated user also receives the canonical role grants.
+    let principal_compatibility =
+        services::principal_access_compatibility_service::PrincipalAccessCompatibilityService::new(
+            pool.clone(),
+        );
+    let (agent_memberships_inserted, human_memberships_processed) =
+        principal_compatibility
+            .backfill_principal_access_compatibility()
+            .await?;
+    if agent_memberships_inserted > 0 || human_memberships_processed > 0 {
+        tracing::info!(
+            agent_memberships_inserted,
+            human_memberships_processed,
+            "reconciled principal access compatibility"
+        );
+    }
+
     // 初始化 Board 认领挑战（Paperclip `index.ts:603`）。
     // 仅 `authenticated` 模式且唯一实例管理员为本地 board 主体时创建；
     // `local_trusted` 模式下不留挑战（GET /board-claim/:token 返回 404）。

@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +47,8 @@ pub struct OAuthProvider {
 pub struct ToolOAuthService {
     tokens: Arc<RwLock<HashMap<(Uuid, String), OAuthToken>>>,
     providers: Arc<RwLock<HashMap<String, OAuthProvider>>>,
+    refresh_leases: Arc<Mutex<HashMap<(Uuid, String), Arc<Mutex<()>>>>>,
+    client: reqwest::Client,
 }
 
 impl ToolOAuthService {
@@ -54,6 +56,8 @@ impl ToolOAuthService {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             providers: Arc::new(RwLock::new(HashMap::new())),
+            refresh_leases: Arc::new(Mutex::new(HashMap::new())),
+            client: reqwest::Client::new(),
         }
     }
     
@@ -83,30 +87,112 @@ impl ToolOAuthService {
     
     /// 刷新 Token
     pub async fn refresh_token(&self, agent_id: Uuid, provider: &str) -> OAuthResult<OAuthToken> {
-        let mut tokens = self.tokens.write().await;
-        let providers = self.providers.read().await;
-        
-        let old_token = tokens.get(&(agent_id, provider.to_string()))
+        let key = (agent_id, provider.to_string());
+        let old_token = self
+            .tokens
+            .read()
+            .await
+            .get(&key)
+            .cloned()
             .ok_or_else(|| OAuthError::TokenNotFound(format!("{}:{}", agent_id, provider)))?;
-        
-        let _provider_config = providers.get(provider)
+        let provider_config = self
+            .providers
+            .read()
+            .await
+            .get(provider)
+            .cloned()
             .ok_or_else(|| OAuthError::ProviderNotSupported(provider.to_string()))?;
-        
-        // 实际刷新逻辑需要调用 OAuth 提供商的 API
-        // 这里是简化实现
-        let refresh_token = old_token.refresh_token.as_ref()
-            .ok_or_else(|| OAuthError::RefreshFailed("No refresh token".to_string()))?;
-        
-        let new_token = OAuthToken {
-            access_token: format!("refreshed_{}", refresh_token),
-            refresh_token: old_token.refresh_token.clone(),
-            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-            provider: provider.to_string(),
-            scope: old_token.scope.clone(),
+
+        let lease = {
+            let mut leases = self.refresh_leases.lock().await;
+            leases
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
         };
-        
-        tokens.insert((agent_id, provider.to_string()), new_token.clone());
-        
+        let _lease_guard = lease.lock().await;
+
+        // Another caller may have completed a rotating refresh while this
+        // caller waited for the lease. Reuse that result instead of replaying
+        // a single-use refresh token.
+        if let Some(current) = self.tokens.read().await.get(&key).cloned() {
+            if current.access_token != old_token.access_token && !self.is_token_expired(&current) {
+                return Ok(current);
+            }
+        }
+
+        let refresh_token = old_token
+            .refresh_token
+            .as_ref()
+            .ok_or_else(|| OAuthError::RefreshFailed("No refresh token".to_string()))?;
+
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token.clone()),
+            ("client_id", provider_config.client_id.clone()),
+        ];
+        if !provider_config.client_secret.is_empty() {
+            form.push((
+                "client_secret",
+                provider_config.client_secret.clone(),
+            ));
+        }
+        let response = self
+            .client
+            .post(&provider_config.token_url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .form(&form)
+            .send()
+            .await
+            .map_err(|error| OAuthError::RefreshFailed(error.to_string()))?;
+        let status = response.status();
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| OAuthError::RefreshFailed(error.to_string()))?;
+        if !status.is_success() {
+            let provider_error = payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("provider rejected refresh");
+            return Err(OAuthError::RefreshFailed(format!(
+                "HTTP {status}: {provider_error}"
+            )));
+        }
+        let access_token = payload
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| OAuthError::RefreshFailed("Provider returned no access token".to_string()))?;
+        let expires_in = payload
+            .get("expires_in")
+            .and_then(|value| match value {
+                serde_json::Value::Number(value) => value.as_i64(),
+                serde_json::Value::String(value) => value.parse::<i64>().ok(),
+                _ => None,
+            })
+            .filter(|seconds| (1..=31_536_000).contains(seconds))
+            .unwrap_or(3600);
+        let new_token = OAuthToken {
+            access_token: access_token.to_string(),
+            refresh_token: payload
+                .get("refresh_token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| old_token.refresh_token.clone()),
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(expires_in),
+            provider: provider.to_string(),
+            scope: payload
+                .get("scope")
+                .and_then(serde_json::Value::as_str)
+                .map(|scope| scope.split_whitespace().map(ToOwned::to_owned).collect())
+                .unwrap_or_else(|| old_token.scope.clone()),
+        };
+
+        self.tokens.write().await.insert(key, new_token.clone());
         Ok(new_token)
     }
     

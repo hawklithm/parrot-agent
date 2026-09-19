@@ -421,7 +421,19 @@ async fn company_agent_actions(
     Ok(Json(json!({ "items": items, "accessTier": "full" })))
 }
 
-/// GET /companies/:company_id/audit/agent-actions.csv —— 简化为 JSON 同源计数。
+fn csv_cell(value: impl std::fmt::Display) -> String {
+    let value = value.to_string();
+    if value
+        .bytes()
+        .any(|byte| matches!(byte, b',' | b'"' | b'\r' | b'\n'))
+    {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value
+    }
+}
+
+/// GET /companies/:company_id/audit/agent-actions.csv —— 导出与 JSON 同源的动作记录。
 async fn company_agent_actions_csv(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
@@ -429,19 +441,44 @@ async fn company_agent_actions_csv(
 ) -> Result<axum::response::Response, StatusCode> {
     require_company_access(&actor, company_id, AccessMode::Read)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM activity_logs WHERE company_id = $1 AND actor_type = 'agent'",
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, actor_id, resource_type, resource_id, event_type, metadata, created_at \
+         FROM activity_logs WHERE company_id = $1 AND actor_type = 'agent' \
+         ORDER BY created_at DESC LIMIT 500",
     )
     .bind(company_id)
-    .fetch_one(&state.pool)
+    .fetch_all(&state.pool)
     .await
-    .unwrap_or(0);
-    let body = format!("id,actor_id,action,occurred_at\n,,,,{count} rows exported\n");
+    .map_err(|error| {
+        tracing::error!(%error, %company_id, "Failed to export agent actions");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut body = String::from(
+        "id,actor_id,resource_type,resource_id,action,details,occurred_at\n",
+    );
+    for row in rows {
+        let metadata = row.get::<Value, _>("metadata");
+        body.push_str(&[
+            csv_cell(row.get::<Uuid, _>("id")),
+            csv_cell(row.get::<Uuid, _>("actor_id")),
+            csv_cell(row.get::<String, _>("resource_type")),
+            csv_cell(row.get::<Uuid, _>("resource_id")),
+            csv_cell(row.get::<String, _>("event_type")),
+            csv_cell(metadata),
+            csv_cell(row.get::<chrono::DateTime<chrono::Utc>, _>("created_at")),
+        ]
+        .join(","));
+        body.push('\n');
+    }
     Ok(axum::response::Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/csv")
         .body(axum::body::Body::from(body))
-        .unwrap())
+        .map_err(|error| {
+            tracing::error!(%error, "Failed to build agent actions CSV response");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?)
 }
 
 /// GET /companies/:company_id/recovery-observability —— 恢复可观测性聚合。

@@ -223,8 +223,11 @@ impl ActorResolver for ToolGatewayTokenResolver {
         let row = sqlx::query(
             "SELECT s.company_id, s.agent_id, s.run_id, s.expires_at, s.revoked_at,
                     r.status::text AS run_status,
+                    r.responsible_user_id::text AS run_responsible_user_id,
                     t.id AS gateway_token_id, t.expires_at AS gateway_token_expires_at,
                     t.revoked_at AS gateway_token_revoked_at,
+                    t.subject_type AS gateway_subject_type,
+                    t.subject_id AS gateway_subject_id,
                     g.status AS gateway_status
              FROM tool_gateway_sessions s
              LEFT JOIN heartbeat_runs r ON r.id = s.run_id
@@ -321,12 +324,59 @@ impl ActorResolver for ToolGatewayTokenResolver {
         .bind(&token_hash)
         .execute(&*self.pool)
         .await;
-        Ok(Some(AuthorizationActor::agent_with_source(
+        // Match Paperclip's actor middleware: a run-scoped token inherits the
+        // responsible human from the heartbeat run. Named gateway tokens may
+        // also carry an explicit user subject. When neither exists we keep an
+        // agent-only actor so the decision engine can apply the CEO/
+        // canCreateAgents legacy creator rule.
+        let run_responsible_user_id: Option<String> = sqlx::Row::try_get(
+            &row,
+            "run_responsible_user_id",
+        )
+        .map_err(|error| AuthError::Internal {
+            message: format!("Tool gateway session is malformed: {error}"),
+        })?;
+        let gateway_subject_type: Option<String> = sqlx::Row::try_get(
+            &row,
+            "gateway_subject_type",
+        )
+        .map_err(|error| AuthError::Internal {
+            message: format!("Tool gateway session is malformed: {error}"),
+        })?;
+        let gateway_subject_id: Option<String> = sqlx::Row::try_get(
+            &row,
+            "gateway_subject_id",
+        )
+        .map_err(|error| AuthError::Internal {
+            message: format!("Tool gateway session is malformed: {error}"),
+        })?;
+        let responsible_user_id = run_responsible_user_id
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .or_else(|| {
+                (gateway_subject_type.as_deref() == Some("user"))
+                    .then(|| gateway_subject_id.as_deref())
+                    .flatten()
+                    .and_then(|value| Uuid::parse_str(value).ok())
+            });
+        let on_behalf_of_memberships = match responsible_user_id {
+            Some(user_id) => load_responsible_user_memberships(&self.pool, user_id, company_id)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        Ok(Some(AuthorizationActor::Agent {
             agent_id,
             company_id,
             run_id,
-            ActorSource::AgentJwt,
-        )))
+            source: ActorSource::AgentJwt,
+            key_id: None,
+            key_scope: None,
+            responsible_user_id,
+            on_behalf_of_user_id: responsible_user_id,
+            on_behalf_of_memberships,
+        }))
     }
 
     fn priority(&self) -> u8 {

@@ -15,6 +15,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
 use models::{CommentActorType, CreateIssueInput, UpdateIssueInput};
 use serde_json::{json, Value};
@@ -26,10 +27,13 @@ use sqlx::Row;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 use rand::{rngs::OsRng, RngCore};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
@@ -40,6 +44,7 @@ use services::mcp_client_config::{
     named_gateway_client_snippets, named_gateway_endpoint_path,
 };
 use services::mcp_http::{mcp_http_request_headers, parse_mcp_http_response_body};
+use services::secret_provider::{decrypt_secret_material, encrypt_secret_material, sha256_hex};
 
 const TOOL_POLICY_QUERY: &str = r#"SELECT id, policy_type, selectors, config, description
      FROM tool_policies
@@ -2045,6 +2050,387 @@ async fn direct_paperclip_service_call(
     Ok(value)
 }
 
+struct ManagedMcpStdioProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    stderr: Arc<Mutex<String>>,
+    stderr_task: JoinHandle<()>,
+    initialize_response: Value,
+}
+
+struct McpStdioSlot {
+    process: Option<ManagedMcpStdioProcess>,
+    last_used_at: Instant,
+    restart_window_started_at: Option<Instant>,
+    restart_count: u32,
+    restart_backoff_until: Option<Instant>,
+}
+
+impl McpStdioSlot {
+    fn new() -> Self {
+        Self {
+            process: None,
+            last_used_at: Instant::now(),
+            restart_window_started_at: None,
+            restart_count: 0,
+            restart_backoff_until: None,
+        }
+    }
+
+    fn record_failure(&mut self, now: Instant, restart_window: Duration, backoff_base: Duration, backoff_max: Duration) {
+        let in_same_window = self
+            .restart_window_started_at
+            .is_some_and(|started| now.duration_since(started) <= restart_window);
+        if !in_same_window {
+            self.restart_window_started_at = Some(now);
+            self.restart_count = 1;
+        } else {
+            self.restart_count = self.restart_count.saturating_add(1);
+        }
+        let exponent = self.restart_count.saturating_sub(1).min(6);
+        let multiplier = 1_u32 << exponent;
+        self.restart_backoff_until = Some(
+            now + backoff_base
+                .checked_mul(multiplier)
+                .unwrap_or(backoff_max)
+                .min(backoff_max),
+        );
+    }
+
+    fn reset_after_success(&mut self) {
+        self.restart_window_started_at = None;
+        self.restart_count = 0;
+        self.restart_backoff_until = None;
+    }
+}
+
+struct McpStdioSupervisor {
+    slots: Mutex<HashMap<String, Arc<Mutex<McpStdioSlot>>>>,
+    max_slots: usize,
+    idle_ttl: Duration,
+    restart_window: Duration,
+    restart_backoff: Duration,
+    restart_backoff_max: Duration,
+    restart_limit: u32,
+}
+
+impl McpStdioSupervisor {
+    fn new() -> Self {
+        let env_duration = |name: &str, default: u64, minimum: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|value| value.max(minimum))
+                .unwrap_or(default)
+        };
+        let max_slots = std::env::var("PARROT_MCP_STDIO_MAX_SLOTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(16);
+        Self {
+            slots: Mutex::new(HashMap::new()),
+            max_slots,
+            idle_ttl: Duration::from_secs(env_duration("PARROT_MCP_STDIO_IDLE_TTL_SECONDS", 60, 1)),
+            restart_window: Duration::from_secs(env_duration("PARROT_MCP_STDIO_RESTART_WINDOW_SECONDS", 60, 1)),
+            restart_backoff: Duration::from_millis(env_duration("PARROT_MCP_STDIO_RESTART_BACKOFF_MS", 1_000, 0)),
+            restart_backoff_max: Duration::from_millis(env_duration("PARROT_MCP_STDIO_RESTART_BACKOFF_MAX_MS", 60_000, 1)),
+            restart_limit: std::env::var("PARROT_MCP_STDIO_RESTART_LIMIT")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(3),
+        }
+    }
+
+    async fn evict_idle_slots(&self) {
+        let entries = self
+            .slots
+            .lock()
+            .await
+            .iter()
+            .map(|(key, slot)| (key.clone(), Arc::clone(slot)))
+            .collect::<Vec<_>>();
+        for (key, slot) in entries {
+            let mut guard = slot.lock().await;
+            if guard.last_used_at.elapsed() < self.idle_ttl {
+                continue;
+            }
+            let process = guard.process.take();
+            drop(guard);
+            if let Some(process) = process {
+                terminate_mcp_stdio_process(process).await;
+            }
+            let mut slots = self.slots.lock().await;
+            if slots.get(&key).is_some_and(|current| Arc::ptr_eq(current, &slot)) {
+                slots.remove(&key);
+            }
+        }
+    }
+
+    async fn slot_for(&self, key: String) -> Result<Arc<Mutex<McpStdioSlot>>, String> {
+        self.evict_idle_slots().await;
+        let mut slots = self.slots.lock().await;
+        if let Some(slot) = slots.get(&key) {
+            return Ok(Arc::clone(slot));
+        }
+        if slots.len() >= self.max_slots {
+            return Err(format!(
+                "MCP stdio runtime capacity exhausted (max {} active processes)",
+                self.max_slots
+            ));
+        }
+        let slot = Arc::new(Mutex::new(McpStdioSlot::new()));
+        slots.insert(key, Arc::clone(&slot));
+        Ok(slot)
+    }
+
+    async fn request(
+        &self,
+        command: &str,
+        args: &[String],
+        method: &str,
+        params: Value,
+        environment: Option<&HashMap<String, String>>,
+    ) -> Result<Value, String> {
+        let key = mcp_stdio_slot_key(command, args, environment);
+        let slot = self.slot_for(key).await?;
+        let mut slot = slot.lock().await;
+        slot.ensure_process(
+            command,
+            args,
+            environment,
+            self.restart_window,
+            self.restart_backoff,
+            self.restart_backoff_max,
+            self.restart_limit,
+        )
+        .await?;
+        let result = {
+            let process = slot
+                .process
+                .as_mut()
+                .ok_or_else(|| "MCP stdio process was not started".to_string())?;
+            if method == "initialize" {
+                Ok(process.initialize_response.clone())
+            } else {
+                let request_id = Uuid::new_v4().to_string();
+                write_mcp_stdio_message(
+                    &mut process.stdin,
+                    Some(&request_id),
+                    method,
+                    params,
+                )
+                .await?;
+                read_mcp_stdio_response(&mut process.stdout, &request_id, Duration::from_secs(30)).await
+            }
+        };
+        slot.last_used_at = Instant::now();
+        match result {
+            Ok(result) => {
+                slot.reset_after_success();
+                Ok(result)
+            }
+            Err(error) => {
+                let process = slot.process.take();
+                slot.record_failure(
+                    Instant::now(),
+                    self.restart_window,
+                    self.restart_backoff,
+                    self.restart_backoff_max,
+                );
+                drop(slot);
+                if let Some(process) = process {
+                    let stderr = process.stderr.clone();
+                    terminate_mcp_stdio_process(process).await;
+                    let stderr = stderr.lock().await.trim().to_string();
+                    if !stderr.is_empty() {
+                        return Err(format!(
+                            "{error}; MCP stderr: {}",
+                            stderr.chars().take(4_000).collect::<String>()
+                        ));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl McpStdioSlot {
+    async fn ensure_process(
+        &mut self,
+        command: &str,
+        args: &[String],
+        environment: Option<&HashMap<String, String>>,
+        restart_window: Duration,
+        restart_backoff: Duration,
+        restart_backoff_max: Duration,
+        restart_limit: u32,
+    ) -> Result<(), String> {
+        if let Some(process) = self.process.as_mut() {
+            match process.child.try_wait() {
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) => {
+                    let process = self.process.take();
+                    if let Some(process) = process {
+                        terminate_mcp_stdio_process(process).await;
+                    }
+                    self.record_failure(Instant::now(), restart_window, restart_backoff, restart_backoff_max);
+                }
+                Err(error) => {
+                    let process = self.process.take();
+                    if let Some(process) = process {
+                        terminate_mcp_stdio_process(process).await;
+                    }
+                    self.record_failure(Instant::now(), restart_window, restart_backoff, restart_backoff_max);
+                    return Err(format!("MCP stdio process status check failed: {error}"));
+                }
+            }
+        }
+        let now = Instant::now();
+        if self.restart_count >= restart_limit {
+            return Err("MCP stdio restart storm suppression is active".to_string());
+        }
+        if self.restart_backoff_until.is_some_and(|until| until > now) {
+            return Err("MCP stdio restart backoff is active".to_string());
+        }
+        match spawn_mcp_stdio_process(command, args, environment).await {
+            Ok(process) => {
+                self.process = Some(process);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_failure(now, restart_window, restart_backoff, restart_backoff_max);
+                Err(error)
+            }
+        }
+    }
+}
+
+fn mcp_stdio_slot_key(
+    command: &str,
+    args: &[String],
+    environment: Option<&HashMap<String, String>>,
+) -> String {
+    let mut material = format!("command={command}\nargs={args:?}\n");
+    if let Some(environment) = environment {
+        let mut values = environment
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        values.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        material.push_str(&format!("env={values:?}"));
+    }
+    sha256_hex(&material)
+}
+
+async fn spawn_mcp_stdio_process(
+    command: &str,
+    args: &[String],
+    environment: Option<&HashMap<String, String>>,
+) -> Result<ManagedMcpStdioProcess, String> {
+    let mut child_command = Command::new(command);
+    child_command
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(environment) = environment {
+        child_command.env_clear();
+        child_command.envs(environment);
+    }
+    let mut child = child_command
+        .spawn()
+        .map_err(|error| format!("MCP stdio process spawn failed: {error}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "MCP stdio stdin unavailable".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "MCP stdio stdout unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "MCP stdio stderr unavailable".to_string())?;
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+    let stderr_buffer_for_task = Arc::clone(&stderr_buffer);
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let mut output = stderr_buffer_for_task.lock().await;
+            output.push_str(&line);
+            output.push('\n');
+            if output.len() > 16_000 {
+                let keep_from = output.len() - 16_000;
+                output.drain(..keep_from);
+            }
+        }
+    });
+    let mut process = ManagedMcpStdioProcess {
+        child,
+        stdin,
+        stdout: BufReader::new(stdout).lines(),
+        stderr: stderr_buffer,
+        stderr_task,
+        initialize_response: Value::Null,
+    };
+    let initialize_id = Uuid::new_v4().to_string();
+    let initialize_result = async {
+        write_mcp_stdio_message(
+            &mut process.stdin,
+            Some(&initialize_id),
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "parrot-tool-gateway", "version": env!("CARGO_PKG_VERSION")}
+            }),
+        )
+        .await?;
+        let initialize_result = read_mcp_stdio_response(&mut process.stdout, &initialize_id, Duration::from_secs(30)).await?;
+        write_mcp_stdio_message(
+            &mut process.stdin,
+            None,
+            "notifications/initialized",
+            serde_json::json!({}),
+        )
+        .await?;
+        Ok::<Value, String>(initialize_result)
+    }
+    .await;
+    match initialize_result {
+        Ok(initialize_response) => {
+            process.initialize_response = initialize_response;
+            Ok(process)
+        }
+        Err(error) => {
+            let stderr = process.stderr.clone();
+            terminate_mcp_stdio_process(process).await;
+            let stderr = stderr.lock().await.trim().to_string();
+            if stderr.is_empty() {
+                Err(error)
+            } else {
+                Err(format!("{error}; MCP stderr: {}", stderr.chars().take(4_000).collect::<String>()))
+            }
+        }
+    }
+}
+
+async fn terminate_mcp_stdio_process(mut process: ManagedMcpStdioProcess) {
+    let _ = process.child.kill().await;
+    let _ = process.child.wait().await;
+    process.stderr_task.abort();
+}
+
+fn mcp_stdio_supervisor() -> &'static Arc<McpStdioSupervisor> {
+    static SUPERVISOR: OnceLock<Arc<McpStdioSupervisor>> = OnceLock::new();
+    SUPERVISOR.get_or_init(|| Arc::new(McpStdioSupervisor::new()))
+}
+
 pub(crate) async fn mcp_stdio_request(
     command: &str,
     args: &[String],
@@ -2068,69 +2454,9 @@ pub(crate) async fn mcp_stdio_request_with_env(
     if command.trim().is_empty() {
         return Err("MCP stdio command is empty".to_string());
     }
-    let mut child_command = Command::new(command);
-    child_command
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if let Some(environment) = environment {
-        child_command.env_clear();
-        child_command.envs(environment);
-    }
-    let mut child = child_command.spawn().map_err(|error| error.to_string())?;
-    let mut stdin = child.stdin.take().ok_or("MCP stdio stdin unavailable")?;
-    let stdout = child.stdout.take().ok_or("MCP stdio stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("MCP stdio stderr unavailable")?;
-    let mut stdout = BufReader::new(stdout).lines();
-    let stderr_task = tokio::spawn(async move {
-        let mut stderr = BufReader::new(stderr).take(16_000);
-        let mut output = String::new();
-        let _ = stderr.read_to_string(&mut output).await;
-        output
-    });
-    let timeout = Duration::from_secs(30);
-    let result = async {
-        let initialize_id = Uuid::new_v4().to_string();
-        write_mcp_stdio_message(
-            &mut stdin,
-            Some(&initialize_id),
-            "initialize",
-            serde_json::json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "parrot-tool-gateway", "version": env!("CARGO_PKG_VERSION")}
-            }),
-        )
-        .await?;
-        let initialize_result = read_mcp_stdio_response(&mut stdout, &initialize_id, timeout).await?;
-        if method == "initialize" {
-            return Ok(initialize_result);
-        }
-
-        write_mcp_stdio_message(
-            &mut stdin,
-            None,
-            "notifications/initialized",
-            serde_json::json!({}),
-        )
-        .await?;
-        let request_id = Uuid::new_v4().to_string();
-        write_mcp_stdio_message(&mut stdin, Some(&request_id), method, params).await?;
-        read_mcp_stdio_response(&mut stdout, &request_id, timeout).await
-    }
-    .await;
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    let stderr = stderr_task.await.unwrap_or_default();
-    result.map_err(|error: String| {
-        let stderr = stderr.trim();
-        if stderr.is_empty() {
-            error
-        } else {
-            format!("{error}; MCP stderr: {}", stderr.chars().take(4_000).collect::<String>())
-        }
-    })
+    mcp_stdio_supervisor()
+        .request(command, args, method, params, environment)
+        .await
 }
 
 async fn write_mcp_stdio_message(
@@ -2230,39 +2556,39 @@ pub(crate) fn builtin_mcp_template_tools(template_id: &str) -> Option<Value> {
     Some(json!([
         {
             "name": "list_items",
-            "description": "List deterministic todo items (read-only).",
+            "description": "List synthetic todo items.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
             "annotations": {"readOnlyHint": true}
         },
         {
             "name": "create_item",
-            "description": "Create a todo item.",
+            "description": "Create a synthetic todo item.",
             "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"], "additionalProperties": false},
-            "annotations": {}
+            "annotations": {"readOnlyHint": false}
         },
         {
             "name": "mark_done",
-            "description": "Mark a todo item done.",
+            "description": "Mark a synthetic todo item done.",
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"], "additionalProperties": false},
-            "annotations": {}
+            "annotations": {"readOnlyHint": false}
         },
         {
             "name": "delete_item",
-            "description": "Delete a todo item.",
+            "description": "Delete a synthetic todo item.",
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"], "additionalProperties": false},
             "annotations": {"destructiveHint": true}
         },
         {
             "name": "get_value",
-            "description": "Read a deterministic key/value entry (read-only).",
+            "description": "Read a synthetic KV value.",
             "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"], "additionalProperties": false},
             "annotations": {"readOnlyHint": true}
         },
         {
             "name": "set_value",
-            "description": "Set a deterministic key/value entry.",
+            "description": "Write a synthetic KV value.",
             "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, "value": {}}, "required": ["key", "value"], "additionalProperties": false},
-            "annotations": {}
+            "annotations": {"readOnlyHint": false}
         }
     ]))
 }
@@ -2293,19 +2619,77 @@ pub(crate) fn builtin_mcp_request(
                 return Err(format!("built-in MCP tool {name} was not found"));
             }
             let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let state = builtin_mcp_state()
+                .lock()
+                .map_err(|_| "built-in MCP fixture state is poisoned".to_string())?;
+            let mut state = state;
+            let state = state.entry(template_id.to_string()).or_default();
             let content = match name {
-                "list_items" => json!([{"type": "text", "text": "[]"}]),
-                "get_value" => json!([{"type": "text", "text": format!("value={}", arguments.get("key").and_then(Value::as_str).unwrap_or_default())}]),
-                "create_item" => json!([{"type": "text", "text": "created:item-1"}]),
-                "mark_done" => json!([{"type": "text", "text": "done"}]),
-                "delete_item" => json!([{"type": "text", "text": "deleted"}]),
-                "set_value" => json!([{"type": "text", "text": "set"}]),
+                "list_items" => json!([{"type": "text", "text": serde_json::to_string(&state.items.values().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".to_string())}]),
+                "get_value" => {
+                    let key = arguments.get("key").and_then(Value::as_str).unwrap_or_default();
+                    let value = state.values.get(key).cloned().unwrap_or(Value::Null);
+                    json!([{"type": "text", "text": format!("value={value}")}])
+                }
+                "create_item" => {
+                    let id = format!("item-{}", state.next_item);
+                    state.next_item = state.next_item.saturating_add(1);
+                    let item = json!({
+                        "id": id,
+                        "title": arguments.get("title").and_then(Value::as_str).unwrap_or_default(),
+                        "done": false,
+                    });
+                    state.items.insert(id.clone(), item);
+                    json!([{"type": "text", "text": format!("created:{id}")}])
+                }
+                "mark_done" => {
+                    let id = arguments.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let Some(item) = state.items.get_mut(id) else {
+                        return Err(format!("built-in MCP item {id} was not found"));
+                    };
+                    item["done"] = json!(true);
+                    json!([{"type": "text", "text": "done"}])
+                }
+                "delete_item" => {
+                    let id = arguments.get("id").and_then(Value::as_str).unwrap_or_default();
+                    if state.items.remove(id).is_none() {
+                        return Err(format!("built-in MCP item {id} was not found"));
+                    }
+                    json!([{"type": "text", "text": "deleted"}])
+                }
+                "set_value" => {
+                    let key = arguments.get("key").and_then(Value::as_str).unwrap_or_default();
+                    let value = arguments.get("value").cloned().unwrap_or(Value::Null);
+                    state.values.insert(key.to_string(), value);
+                    json!([{"type": "text", "text": "set"}])
+                }
                 _ => return Err(format!("built-in MCP tool {name} was not found")),
             };
             Ok(json!({"content": content}))
         }
         _ => Err(format!("built-in MCP method {method} was not found")),
     }
+}
+
+struct BuiltinMcpState {
+    next_item: u64,
+    items: HashMap<String, Value>,
+    values: HashMap<String, Value>,
+}
+
+impl Default for BuiltinMcpState {
+    fn default() -> Self {
+        Self {
+            next_item: 1,
+            items: HashMap::new(),
+            values: HashMap::new(),
+        }
+    }
+}
+
+fn builtin_mcp_state() -> &'static StdMutex<HashMap<String, BuiltinMcpState>> {
+    static STATE: OnceLock<StdMutex<HashMap<String, BuiltinMcpState>>> = OnceLock::new();
+    STATE.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 fn configured_mcp_stdio_template_id(
@@ -2838,6 +3222,731 @@ fn mcp_secret_header_prefix(reference: &Value) -> &'static str {
     }
 }
 
+const MCP_OAUTH_REFRESH_SKEW_SECONDS: i64 = 60;
+const MCP_OAUTH_REFRESH_LEASE_SECONDS: i64 = 30;
+const MCP_OAUTH_REFRESH_WAIT_SECONDS: u64 = 5;
+
+#[derive(Debug)]
+struct McpOAuthTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: DateTime<Utc>,
+    token_type: Option<String>,
+    scope: Option<String>,
+}
+
+#[derive(Debug)]
+struct McpOAuthRefreshFailure {
+    message: String,
+    reauthorization_required: bool,
+}
+
+fn mcp_oauth_config(config: &Value) -> Option<&serde_json::Map<String, Value>> {
+    config.get("oauth").and_then(Value::as_object)
+}
+
+fn mcp_oauth_string(config: &Value, keys: &[&str]) -> Option<String> {
+    let oauth = mcp_oauth_config(config);
+    keys.iter().find_map(|key| {
+        oauth
+            .and_then(|value| value.get(*key))
+            .or_else(|| config.get(*key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn mcp_oauth_expiry(config: &Value) -> Option<DateTime<Utc>> {
+    mcp_oauth_config(config)
+        .and_then(|oauth| oauth.get("expiresAt").or_else(|| oauth.get("expires_at")))
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn mcp_oauth_refresh_required(config: &Value) -> bool {
+    mcp_oauth_expiry(config).is_some_and(|expires_at| {
+        expires_at <= Utc::now() + ChronoDuration::seconds(MCP_OAUTH_REFRESH_SKEW_SECONDS)
+    })
+}
+
+fn mcp_oauth_lease(config: &Value) -> Option<(String, DateTime<Utc>)> {
+    let lease = mcp_oauth_config(config)?.get("refreshLease")?.as_object()?;
+    let id = lease.get("id")?.as_str()?.trim();
+    let expires_at = lease
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))?;
+    (!id.is_empty()).then(|| (id.to_string(), expires_at))
+}
+
+fn mcp_oauth_reference(refs: &Value, path: &str) -> Option<Value> {
+    refs.as_array()?.iter().find_map(|reference| {
+        let configured_path = reference
+            .get("configPath")
+            .or_else(|| reference.get("config_path"))
+            .or_else(|| reference.get("path"))
+            .and_then(Value::as_str)?;
+        configured_path.eq_ignore_ascii_case(path).then(|| reference.clone())
+    })
+}
+
+fn mcp_oauth_reference_secret_id(reference: &Value) -> Option<Uuid> {
+    reference
+        .get("secretId")
+        .or_else(|| reference.get("secret_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn mcp_oauth_reference_version(reference: &Value) -> Result<Option<i32>, String> {
+    let selector = reference
+        .get("versionSelector")
+        .or_else(|| reference.get("version_selector"))
+        .or_else(|| reference.get("version"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("latest");
+    if selector.eq_ignore_ascii_case("latest") {
+        return Ok(None);
+    }
+    selector
+        .parse::<i32>()
+        .ok()
+        .filter(|version| *version > 0)
+        .map(Some)
+        .ok_or_else(|| format!("OAuth credential version is invalid: {selector}"))
+}
+
+async fn load_mcp_oauth_secret(
+    state: &AppState,
+    company_id: Uuid,
+    reference: Option<&Value>,
+) -> Result<Option<String>, String> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let Some(secret_id) = mcp_oauth_reference_secret_id(reference) else {
+        return Err("OAuth credential reference has no valid secret id".to_string());
+    };
+    let version = mcp_oauth_reference_version(reference)?;
+    let material = if let Some(version) = version {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT v.material
+               FROM company_secret_versions v
+               JOIN company_secrets s ON s.id = v.secret_id
+              WHERE s.id = $1 AND s.company_id = $2
+                AND s.status = 'active' AND s.deleted_at IS NULL
+                AND v.version = $3 AND v.revoked_at IS NULL
+              LIMIT 1",
+        )
+        .bind(secret_id)
+        .bind(company_id)
+        .bind(version)
+        .fetch_optional(&state.pool)
+        .await
+    } else {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT v.material
+               FROM company_secret_versions v
+               JOIN company_secrets s ON s.id = v.secret_id
+              WHERE s.id = $1 AND s.company_id = $2
+                AND s.status = 'active' AND s.deleted_at IS NULL
+                AND v.status = 'current' AND v.revoked_at IS NULL
+              ORDER BY v.version DESC
+              LIMIT 1",
+        )
+        .bind(secret_id)
+        .bind(company_id)
+        .fetch_optional(&state.pool)
+        .await
+    }
+    .map_err(|error| format!("OAuth credential lookup failed: {error}"))?;
+    let Some(material) = material else {
+        return Ok(None);
+    };
+    decrypt_secret_material(&material)
+        .map(Some)
+        .map_err(|error| format!("OAuth credential could not be decrypted: {error}"))
+}
+
+fn mcp_oauth_replace_reference(refs: &Value, path: &str, replacement: Value) -> Value {
+    let mut values = refs.as_array().cloned().unwrap_or_default();
+    values.retain(|reference| {
+        let configured_path = reference
+            .get("configPath")
+            .or_else(|| reference.get("config_path"))
+            .or_else(|| reference.get("path"))
+            .and_then(Value::as_str);
+        !configured_path.is_some_and(|value| value.eq_ignore_ascii_case(path))
+    });
+    values.push(replacement);
+    Value::Array(values)
+}
+
+async fn rotate_mcp_oauth_secret_version(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    company_id: Uuid,
+    secret_id: Uuid,
+    value: &str,
+) -> Result<(), String> {
+    let (material, digest) = encrypt_secret_material(value)
+        .map_err(|error| format!("OAuth credential encryption failed: {error}"))?;
+    let latest_version = sqlx::query_scalar::<_, i32>(
+        "SELECT latest_version FROM company_secrets
+          WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL
+          FOR UPDATE",
+    )
+    .bind(secret_id)
+    .bind(company_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| format!("OAuth secret lock failed: {error}"))?
+    .ok_or_else(|| format!("OAuth secret {secret_id} was not found"))?;
+    let next_version = latest_version.max(1) + 1;
+    sqlx::query(
+        "UPDATE company_secret_versions
+            SET status = 'superseded', revoked_at = NOW()
+          WHERE secret_id = $1 AND status = 'current'",
+    )
+    .bind(secret_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| format!("OAuth secret rotation failed: {error}"))?;
+    sqlx::query(
+        "INSERT INTO company_secret_versions
+            (secret_id, version, material, value_sha256, fingerprint_sha256, status)
+         VALUES ($1, $2, $3, $4, $4, 'current')",
+    )
+    .bind(secret_id)
+    .bind(next_version)
+    .bind(material)
+    .bind(digest)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| format!("OAuth secret version insert failed: {error}"))?;
+    sqlx::query(
+        "UPDATE company_secrets
+            SET latest_version = $2, last_rotated_at = NOW(), updated_at = NOW(), status = 'active'
+          WHERE id = $1 AND company_id = $3",
+    )
+    .bind(secret_id)
+    .bind(next_version)
+    .bind(company_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| format!("OAuth secret metadata update failed: {error}"))?;
+    Ok(())
+}
+
+async fn create_mcp_oauth_secret(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    company_id: Uuid,
+    connection_id: Uuid,
+    kind: &str,
+    label: &str,
+    value: &str,
+) -> Result<Uuid, String> {
+    let (material, digest) = encrypt_secret_material(value)
+        .map_err(|error| format!("OAuth credential encryption failed: {error}"))?;
+    let secret_id = Uuid::new_v4();
+    let key = format!("tool_connection_{connection_id}_oauth_{kind}");
+    sqlx::query(
+        "INSERT INTO company_secrets
+            (id, company_id, scope, key, name, provider, status, managed_mode, description)
+         VALUES ($1, $2, 'company', $3, $4, 'local_encrypted', 'active',
+                 'paperclip_managed', $5)",
+    )
+    .bind(secret_id)
+    .bind(company_id)
+    .bind(key)
+    .bind(label)
+    .bind("OAuth credential rotated by the MCP runtime")
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| format!("OAuth secret creation failed: {error}"))?;
+    sqlx::query(
+        "INSERT INTO company_secret_versions
+            (secret_id, version, material, value_sha256, fingerprint_sha256, status)
+         VALUES ($1, 1, $2, $3, $3, 'current')",
+    )
+    .bind(secret_id)
+    .bind(material)
+    .bind(digest)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| format!("OAuth secret version creation failed: {error}"))?;
+    Ok(secret_id)
+}
+
+fn mcp_oauth_secret_reference(secret_id: Uuid, path: &str, required: bool, label: &str) -> Value {
+    serde_json::json!({
+        "secretId": secret_id,
+        "versionSelector": "latest",
+        "configPath": path,
+        "required": required,
+        "label": label,
+    })
+}
+
+fn mcp_oauth_config_without_lease(config: &Value) -> Value {
+    let mut root = config.as_object().cloned().unwrap_or_default();
+    let mut oauth = root
+        .get("oauth")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    oauth.remove("refreshLease");
+    root.insert("oauth".to_string(), Value::Object(oauth));
+    Value::Object(root)
+}
+
+fn mcp_oauth_config_with_lease(config: &Value, lease_id: Uuid, expires_at: DateTime<Utc>) -> Value {
+    let mut root = config.as_object().cloned().unwrap_or_default();
+    let mut oauth = root
+        .get("oauth")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    oauth.insert(
+        "refreshLease".to_string(),
+        serde_json::json!({
+            "id": lease_id,
+            "expiresAt": expires_at,
+        }),
+    );
+    root.insert("oauth".to_string(), Value::Object(oauth));
+    Value::Object(root)
+}
+
+async fn request_mcp_oauth_refresh(
+    token_url: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    refresh_token: &str,
+) -> Result<McpOAuthTokenResponse, McpOAuthRefreshFailure> {
+    if let Err(error) = validate_mcp_http_endpoint(token_url).await {
+        return Err(McpOAuthRefreshFailure {
+            message: error,
+            reauthorization_required: false,
+        });
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| McpOAuthRefreshFailure {
+            message: format!("OAuth refresh client initialization failed: {error}"),
+            reauthorization_required: false,
+        })?;
+    let mut form = vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+        ("client_id", client_id.to_string()),
+    ];
+    if let Some(client_secret) = client_secret {
+        form.push(("client_secret", client_secret.to_string()));
+    }
+    let response = client
+        .post(token_url)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|error| McpOAuthRefreshFailure {
+            message: format!("OAuth refresh request failed: {error}"),
+            reauthorization_required: false,
+        })?;
+    let status = response.status();
+    let payload = response.json::<Value>().await.map_err(|error| McpOAuthRefreshFailure {
+        message: format!("OAuth refresh endpoint returned invalid JSON: {error}"),
+        reauthorization_required: false,
+    })?;
+    let provider_error = payload.get("error").and_then(Value::as_str).unwrap_or_default();
+    if !status.is_success() || !provider_error.is_empty() {
+        return Err(McpOAuthRefreshFailure {
+            message: if provider_error.is_empty() {
+                format!("OAuth refresh endpoint returned HTTP {status}")
+            } else {
+                format!("OAuth refresh endpoint rejected the credential: {provider_error}")
+            },
+            reauthorization_required: provider_error == "invalid_grant",
+        });
+    }
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| McpOAuthRefreshFailure {
+            message: "OAuth refresh endpoint did not return an access token".to_string(),
+            reauthorization_required: false,
+        })?;
+    let expires_in = payload
+        .get("expires_in")
+        .and_then(|value| match value {
+            Value::Number(value) => value.as_i64(),
+            Value::String(value) => value.parse::<i64>().ok(),
+            _ => None,
+        })
+        .filter(|value| (1..=31_536_000).contains(value))
+        .unwrap_or(3600);
+    Ok(McpOAuthTokenResponse {
+        access_token: access_token.to_string(),
+        refresh_token: payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        expires_at: Utc::now() + ChronoDuration::seconds(expires_in),
+        token_type: payload
+            .get("token_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        scope: payload
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+    })
+}
+
+async fn mark_mcp_oauth_reauthorization_required(
+    state: &AppState,
+    company_id: Uuid,
+    connection_id: Uuid,
+) -> Result<(), String> {
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| format!("OAuth reauthorization transaction failed: {error}"))?;
+    let row = sqlx::query(
+        "SELECT config, credential_secret_refs FROM tool_connections
+          WHERE id = $1 AND company_id = $2 FOR UPDATE",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|error| format!("OAuth connection lock failed: {error}"))?;
+    let Some(row) = row else {
+        return Err("OAuth connection was removed while refreshing".to_string());
+    };
+    let config: Value = row.get("config");
+    let refs: Value = row.get("credential_secret_refs");
+    let next_refs = Value::Array(
+        refs.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|reference| {
+                let path = reference
+                    .get("configPath")
+                    .or_else(|| reference.get("config_path"))
+                    .or_else(|| reference.get("path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                !matches!(
+                    path.to_ascii_lowercase().as_str(),
+                    "oauth.access_token" | "oauth.access-token" | "oauth.accesstoken"
+                        | "oauth.refresh_token" | "oauth.refresh-token" | "oauth.refreshtoken"
+                )
+            })
+            .collect(),
+    );
+    let mut next_config = mcp_oauth_config_without_lease(&config);
+    if let Some(root) = next_config.as_object_mut() {
+        if let Some(oauth) = root.get_mut("oauth").and_then(Value::as_object_mut) {
+            oauth.insert("expiresAt".to_string(), Value::Null);
+            oauth.insert("reauthorizationRequiredAt".to_string(), json!(Utc::now()));
+        }
+    }
+    sqlx::query(
+        "UPDATE tool_connections
+            SET config = $3, credential_secret_refs = $4, status = 'draft', enabled = false,
+                health_status = 'error', health_message = 'OAuth authorization expired; reconnect required',
+                last_error = 'oauth_reauthorization_required', updated_at = NOW()
+          WHERE id = $1 AND company_id = $2",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .bind(next_config)
+    .bind(next_refs)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| format!("OAuth reauthorization update failed: {error}"))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| format!("OAuth reauthorization commit failed: {error}"))
+}
+
+async fn persist_mcp_oauth_refresh(
+    state: &AppState,
+    company_id: Uuid,
+    connection_id: Uuid,
+    lease_id: Uuid,
+    token: McpOAuthTokenResponse,
+) -> Result<(Value, Value), String> {
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| format!("OAuth refresh transaction failed: {error}"))?;
+    let row = sqlx::query(
+        "SELECT config, credential_secret_refs FROM tool_connections
+          WHERE id = $1 AND company_id = $2 FOR UPDATE",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|error| format!("OAuth refresh connection lock failed: {error}"))?;
+    let Some(row) = row else {
+        return Err("OAuth connection was removed while refreshing".to_string());
+    };
+    let config: Value = row.get("config");
+    let refs: Value = row.get("credential_secret_refs");
+    let active_lease = mcp_oauth_lease(&config).map(|(id, _)| id);
+    if active_lease.as_deref() != Some(lease_id.to_string().as_str()) {
+        if !mcp_oauth_refresh_required(&config) {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| format!("OAuth refresh convergence failed: {error}"))?;
+            return Ok((config, refs));
+        }
+        return Err("OAuth refresh lease was superseded while the request was in flight".to_string());
+    }
+
+    let access_reference = mcp_oauth_reference(&refs, "oauth.access_token");
+    let access_id = if let Some(reference) = access_reference.as_ref() {
+        let secret_id = mcp_oauth_reference_secret_id(reference)
+            .ok_or_else(|| "OAuth access token reference is invalid".to_string())?;
+        rotate_mcp_oauth_secret_version(
+            &mut transaction,
+            company_id,
+            secret_id,
+            &token.access_token,
+        )
+        .await?;
+        secret_id
+    } else {
+        create_mcp_oauth_secret(
+            &mut transaction,
+            company_id,
+            connection_id,
+            "access_token",
+            "OAuth access token",
+            &token.access_token,
+        )
+        .await?
+    };
+    let mut next_refs = mcp_oauth_replace_reference(
+        &refs,
+        "oauth.access_token",
+        mcp_oauth_secret_reference(access_id, "oauth.access_token", true, "OAuth access token"),
+    );
+    if let Some(refresh_token) = token.refresh_token.as_deref() {
+        let refresh_reference = mcp_oauth_reference(&refs, "oauth.refresh_token");
+        let refresh_id = if let Some(reference) = refresh_reference.as_ref() {
+            let secret_id = mcp_oauth_reference_secret_id(reference)
+                .ok_or_else(|| "OAuth refresh token reference is invalid".to_string())?;
+            rotate_mcp_oauth_secret_version(
+                &mut transaction,
+                company_id,
+                secret_id,
+                refresh_token,
+            )
+            .await?;
+            secret_id
+        } else {
+            create_mcp_oauth_secret(
+                &mut transaction,
+                company_id,
+                connection_id,
+                "refresh_token",
+                "OAuth refresh token",
+                refresh_token,
+            )
+            .await?
+        };
+        next_refs = mcp_oauth_replace_reference(
+            &next_refs,
+            "oauth.refresh_token",
+            mcp_oauth_secret_reference(refresh_id, "oauth.refresh_token", false, "OAuth refresh token"),
+        );
+    }
+    let mut next_config = mcp_oauth_config_without_lease(&config);
+    if let Some(root) = next_config.as_object_mut() {
+        let oauth = root.entry("oauth").or_insert_with(|| json!({}));
+        if let Some(oauth) = oauth.as_object_mut() {
+            oauth.insert("expiresAt".to_string(), json!(token.expires_at));
+            oauth.insert("refreshedAt".to_string(), json!(Utc::now()));
+            oauth.remove("reauthorizationRequiredAt");
+            if let Some(token_type) = token.token_type {
+                oauth.insert("tokenType".to_string(), json!(token_type));
+            }
+            if let Some(scope) = token.scope {
+                oauth.insert("scope".to_string(), json!(scope));
+            }
+        }
+    }
+    sqlx::query(
+        "UPDATE tool_connections
+            SET config = $3, credential_secret_refs = $4, status = 'active', enabled = true,
+                health_status = 'unchecked', health_message = 'OAuth credentials refreshed; health check pending',
+                last_error = NULL, updated_at = NOW()
+          WHERE id = $1 AND company_id = $2",
+    )
+    .bind(connection_id)
+    .bind(company_id)
+    .bind(&next_config)
+    .bind(&next_refs)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| format!("OAuth refreshed credential update failed: {error}"))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| format!("OAuth refresh commit failed: {error}"))?;
+    Ok((next_config, next_refs))
+}
+
+async fn refresh_mcp_oauth_if_needed(
+    state: &AppState,
+    company_id: Uuid,
+    connection_id: Uuid,
+    connection_config: &Value,
+    credential_secret_refs: &Value,
+) -> Result<(Value, Value), String> {
+    if !mcp_oauth_refresh_required(connection_config) {
+        return Ok((connection_config.clone(), credential_secret_refs.clone()));
+    }
+    let started_at = std::time::Instant::now();
+    let (lease_id, leased_config, leased_refs) = loop {
+        let mut transaction = state
+            .pool
+            .begin()
+            .await
+            .map_err(|error| format!("OAuth refresh lease transaction failed: {error}"))?;
+        let row = sqlx::query(
+            "SELECT config, credential_secret_refs FROM tool_connections
+              WHERE id = $1 AND company_id = $2 FOR UPDATE",
+        )
+        .bind(connection_id)
+        .bind(company_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| format!("OAuth refresh lease lookup failed: {error}"))?;
+        let Some(row) = row else {
+            return Err("OAuth connection was removed while refreshing".to_string());
+        };
+        let current_config: Value = row.get("config");
+        let current_refs: Value = row.get("credential_secret_refs");
+        if !mcp_oauth_refresh_required(&current_config) {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| format!("OAuth refresh lease convergence failed: {error}"))?;
+            return Ok((current_config, current_refs));
+        }
+        if let Some((current_lease, lease_expires_at)) = mcp_oauth_lease(&current_config) {
+            if lease_expires_at > Utc::now() {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| format!("OAuth refresh wait commit failed: {error}"))?;
+                if started_at.elapsed() >= Duration::from_secs(MCP_OAUTH_REFRESH_WAIT_SECONDS) {
+                    return Err("OAuth credential refresh is already in progress".to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = current_lease;
+                continue;
+            }
+            return Err(
+                "The previous OAuth refresh outcome is unknown; reconnect this connection before retrying"
+                    .to_string(),
+            );
+        }
+        let lease_id = Uuid::new_v4();
+        let lease_expires_at = Utc::now() + ChronoDuration::seconds(MCP_OAUTH_REFRESH_LEASE_SECONDS);
+        let leased_config = mcp_oauth_config_with_lease(&current_config, lease_id, lease_expires_at);
+        sqlx::query(
+            "UPDATE tool_connections SET config = $3, updated_at = NOW()
+              WHERE id = $1 AND company_id = $2",
+        )
+        .bind(connection_id)
+        .bind(company_id)
+        .bind(&leased_config)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| format!("OAuth refresh lease acquisition failed: {error}"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("OAuth refresh lease commit failed: {error}"))?;
+        break (lease_id, leased_config, current_refs);
+    };
+
+    let token_url = mcp_oauth_string(
+        &leased_config,
+        &["tokenUrl", "token_url", "tokenEndpoint", "token_endpoint"],
+    )
+    .ok_or_else(|| "OAuth connection has no token endpoint".to_string())?;
+    let client_id = mcp_oauth_string(&leased_config, &["clientId", "client_id"])
+        .or_else(|| {
+            let provider = mcp_oauth_string(&leased_config, &["provider"])?;
+            let normalized = provider
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            std::env::var(format!("PARROT_TOOL_OAUTH_{normalized}_CLIENT_ID")).ok()
+        })
+        .ok_or_else(|| "OAuth connection has no client id".to_string())?;
+    let refresh_reference = mcp_oauth_reference(&leased_refs, "oauth.refresh_token")
+        .ok_or_else(|| "OAuth credentials have expired and no refresh token is available".to_string())?;
+    let refresh_token = load_mcp_oauth_secret(state, company_id, Some(&refresh_reference))
+        .await?
+        .ok_or_else(|| "OAuth refresh token is missing or revoked".to_string())?;
+    let client_secret = load_mcp_oauth_secret(
+        state,
+        company_id,
+        mcp_oauth_reference(&leased_refs, "oauth.client_secret").as_ref(),
+    )
+    .await?;
+    let token = match request_mcp_oauth_refresh(
+        &token_url,
+        &client_id,
+        client_secret.as_deref(),
+        &refresh_token,
+    )
+    .await
+    {
+        Ok(token) => token,
+        Err(failure) => {
+            if failure.reauthorization_required {
+                mark_mcp_oauth_reauthorization_required(state, company_id, connection_id).await?;
+            }
+            return Err(failure.message);
+        }
+    };
+    persist_mcp_oauth_refresh(state, company_id, connection_id, lease_id, token).await
+}
+
 pub(crate) async fn resolve_mcp_connection_headers(
     state: &AppState,
     company_id: Uuid,
@@ -2847,8 +3956,16 @@ pub(crate) async fn resolve_mcp_connection_headers(
     credential_refs: &Value,
     credential_secret_refs: &Value,
 ) -> Result<HashMap<String, String>, String> {
-    let mut headers = configured_mcp_static_headers(connection_config, transport_config);
-    for references in [credential_refs, credential_secret_refs] {
+    let (connection_config, credential_secret_refs) = refresh_mcp_oauth_if_needed(
+        state,
+        company_id,
+        connection_id,
+        connection_config,
+        credential_secret_refs,
+    )
+    .await?;
+    let mut headers = configured_mcp_static_headers(&connection_config, transport_config);
+    for references in [credential_refs, &credential_secret_refs] {
         let Some(references) = references.as_array() else {
             continue;
         };
@@ -6122,6 +7239,57 @@ fn validate_paperclip_api_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct PaperclipBuiltinToolError {
+    upstream_status: Option<StatusCode>,
+    message: String,
+}
+
+impl PaperclipBuiltinToolError {
+    fn upstream(status: StatusCode, message: String) -> Self {
+        Self {
+            upstream_status: Some(status),
+            message,
+        }
+    }
+
+    fn response_status(&self) -> StatusCode {
+        match self.upstream_status {
+            Some(status) if status.is_client_error() || status.is_server_error() => status,
+            _ => StatusCode::BAD_GATEWAY,
+        }
+    }
+
+    fn reason_code(&self) -> &'static str {
+        if self.upstream_status.is_some() {
+            "paperclip_tool_upstream_failed"
+        } else {
+            "paperclip_tool_call_failed"
+        }
+    }
+}
+
+impl std::fmt::Display for PaperclipBuiltinToolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+impl From<String> for PaperclipBuiltinToolError {
+    fn from(message: String) -> Self {
+        Self {
+            upstream_status: None,
+            message,
+        }
+    }
+}
+
+impl From<&str> for PaperclipBuiltinToolError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
 async fn call_paperclip_builtin_tool(
     state: &AppState,
     token: &str,
@@ -6130,7 +7298,7 @@ async fn call_paperclip_builtin_tool(
     run_id: Option<Uuid>,
     tool_name: &str,
     parameters: &Value,
-) -> Result<Value, String> {
+) -> Result<Value, PaperclipBuiltinToolError> {
     if tool_name == "paperclipWaitForIssueWorkspaceService" {
         let issue_id = parameters
             .get("issueId")
@@ -6453,7 +7621,7 @@ async fn call_paperclip_builtin_tool(
                 "reject" => "reject",
                 "requestRevision" => "request-revision",
                 "resubmit" => "resubmit",
-                _ => return Err(format!("unsupported approval action: {action}")),
+                _ => return Err(format!("unsupported approval action: {action}").into()),
             };
             let body = if action == "resubmit" {
                 let payload = parameters
@@ -7222,7 +8390,7 @@ async fn call_paperclip_builtin_tool(
                 .and_then(Value::as_str)
                 .ok_or("method is required")?;
             if !matches!(method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
-                return Err(format!("unsupported HTTP method: {method}"));
+                return Err(format!("unsupported HTTP method: {method}").into());
             }
             let path = parameters
                 .get("path")
@@ -7237,16 +8405,16 @@ async fn call_paperclip_builtin_tool(
                 .map_err(|error| format!("invalid jsonBody: {error}"))?;
             (method, path.to_string(), body)
         }
-        _ => return Err(format!("Unknown Paperclip tool: {tool_name}")),
+        _ => return Err(format!("Unknown Paperclip tool: {tool_name}").into()),
     };
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|error| format!("invalid HTTP method: {error}"))?;
     let client = PaperclipInternalClient::new(token, run_id);
     let (status, value) = client.request(method.clone(), &path, body).await?;
     if !status.is_success() {
-        return Err(format!(
-            "{} {} failed with {}: {}",
-            method, path, status, value
+        return Err(PaperclipBuiltinToolError::upstream(
+            status,
+            format!("{} {} failed with {}: {}", method, path, status, value),
         ));
     }
     if tool_name == "paperclipGetIssueWorkspaceRuntime" {
@@ -8059,19 +9227,24 @@ async fn call_gateway_tool(
                 )
             }
             Err(error) => {
+                let response_status = error.response_status();
+                let reason_code = error.reason_code();
+                let error_message = error.to_string();
+                let upstream_status = error.upstream_status.map(|status| status.as_u16());
                 let _ = sqlx::query(
                     "UPDATE tool_invocations SET status='failed', error_message=$2,
                      completed_at=NOW(), updated_at=NOW() WHERE id=$1",
                 )
                 .bind(invocation_id)
-                .bind(&error)
+                .bind(&error_message)
                 .execute(&state.pool)
                 .await;
                 (
-                    StatusCode::BAD_GATEWAY,
+                    response_status,
                     Json(serde_json::json!({
-                        "error": error,
-                        "reasonCode": "paperclip_tool_call_failed",
+                        "error": error_message,
+                        "reasonCode": reason_code,
+                        "upstreamStatus": upstream_status,
                         "invocationId": invocation_id
                     })),
                 )
@@ -10593,6 +11766,80 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_fixture_preserves_state_across_tool_calls() {
+        let template_id = "paperclip.synthetic-todo-kv";
+        let key = format!("parity-{}", Uuid::new_v4());
+        let title = format!("parity-item-{}", Uuid::new_v4());
+
+        builtin_mcp_request(
+            template_id,
+            "tools/call",
+            &serde_json::json!({
+                "name": "set_value",
+                "arguments": {"key": key.clone(), "value": {"ok": true}}
+            }),
+        )
+        .expect("synthetic set_value should succeed");
+        let value = builtin_mcp_request(
+            template_id,
+            "tools/call",
+            &serde_json::json!({
+                "name": "get_value",
+                "arguments": {"key": key}
+            }),
+        )
+        .expect("synthetic get_value should succeed");
+        assert!(value["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("\"ok\":true")));
+
+        let created = builtin_mcp_request(
+            template_id,
+            "tools/call",
+            &serde_json::json!({
+                "name": "create_item",
+                "arguments": {"title": title}
+            }),
+        )
+        .expect("synthetic create_item should succeed");
+        let item_id = created["content"][0]["text"]
+            .as_str()
+            .and_then(|text| text.strip_prefix("created:"))
+            .expect("synthetic create_item should return an item id")
+            .to_string();
+        builtin_mcp_request(
+            template_id,
+            "tools/call",
+            &serde_json::json!({
+                "name": "mark_done",
+                "arguments": {"id": item_id.clone()}
+            }),
+        )
+        .expect("synthetic mark_done should succeed");
+        let listed = builtin_mcp_request(
+            template_id,
+            "tools/call",
+            &serde_json::json!({"name": "list_items", "arguments": {}}),
+        )
+        .expect("synthetic list_items should succeed");
+        let listed_text = listed["content"][0]["text"]
+            .as_str()
+            .expect("synthetic list_items should return text");
+        assert!(listed_text.contains(&title));
+        assert!(listed_text.contains("\"done\":true"));
+
+        builtin_mcp_request(
+            template_id,
+            "tools/call",
+            &serde_json::json!({
+                "name": "delete_item",
+                "arguments": {"id": item_id}
+            }),
+        )
+        .expect("synthetic delete_item should succeed");
+    }
+
+    #[test]
     fn object_without_removes_context_fields_before_rest_forwarding() {
         assert_eq!(
             object_without(
@@ -10652,5 +11899,21 @@ mod tests {
             error["reasonCode"],
             Value::String("authentication_required".to_string())
         );
+    }
+
+    #[test]
+    fn paperclip_tool_errors_preserve_upstream_business_status() {
+        let error = PaperclipBuiltinToolError::upstream(
+            StatusCode::FORBIDDEN,
+            "missing agents:create".to_string(),
+        );
+        assert_eq!(error.response_status(), StatusCode::FORBIDDEN);
+        assert_eq!(error.reason_code(), "paperclip_tool_upstream_failed");
+        assert_eq!(error.upstream_status, Some(StatusCode::FORBIDDEN));
+
+        let error = PaperclipBuiltinToolError::from("gateway unavailable");
+        assert_eq!(error.response_status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(error.reason_code(), "paperclip_tool_call_failed");
+        assert_eq!(error.upstream_status, None);
     }
 }

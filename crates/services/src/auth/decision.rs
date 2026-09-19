@@ -154,6 +154,9 @@ pub enum DecisionReason {
     AllowLocalImplicit,
     /// 公开资源（无需认证）
     AllowPublicResource,
+    /// Paperclip-compatible legacy agent creator rule (`ceo` or
+    /// `permissions.canCreateAgents`).
+    AllowLegacyAgentCreator,
 
     // 拒绝类原因
     /// 未认证
@@ -194,6 +197,7 @@ impl DecisionReason {
                 | Self::AllowIssueMentionGrant { .. }
                 | Self::AllowLocalImplicit
                 | Self::AllowPublicResource
+                | Self::AllowLegacyAgentCreator
         )
     }
 
@@ -316,6 +320,7 @@ impl std::fmt::Display for DecisionReason {
             DecisionReason::AllowIssueMentionGrant { .. } => write!(f, "allow_issue_mention_grant"),
             DecisionReason::AllowLocalImplicit => write!(f, "allow_local_implicit"),
             DecisionReason::AllowPublicResource => write!(f, "allow_public_resource"),
+            DecisionReason::AllowLegacyAgentCreator => write!(f, "allow_legacy_agent_creator"),
             DecisionReason::DenyUnauthenticated => write!(f, "deny_unauthenticated"),
             DecisionReason::DenyMissingPermission { .. } => write!(f, "deny_missing_permission"),
             DecisionReason::DenyNotCompanyMember { .. } => write!(f, "deny_not_company_member"),
