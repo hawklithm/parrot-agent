@@ -135,6 +135,7 @@ pub mod github_external_object_provider_service;
 pub mod workspace_operation_log_store_service;
 pub mod workspace_runtime_read_model_service;
 pub mod live_events_service;
+pub mod live_events;
 pub mod git_credentials_service;
 pub mod plan_review_context_service;
 pub mod stalled_review_decisions_service;

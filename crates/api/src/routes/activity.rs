@@ -42,7 +42,6 @@ pub struct CreateActivityRequest {
     action: String,
     entity_type: String,
     entity_id: Uuid,
-    #[allow(dead_code)]
     agent_id: Option<Uuid>,
     details: Option<serde_json::Value>,
 }
@@ -58,11 +57,22 @@ struct ActivityRow {
     resource_type: String,
     resource_id: Uuid,
     metadata: Option<serde_json::Value>,
+    run_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
     created_at: DateTime<Utc>,
 }
 
 fn activity_json(r: ActivityRow) -> serde_json::Value {
     let details = r.metadata.clone();
+    // Rows written before the attribution columns existed carry the ids in
+    // `metadata`, so fall back to those before reporting null.
+    let metadata_id = |key: &str| {
+        details
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
     serde_json::json!({
         "id": r.id,
         "companyId": r.company_id,
@@ -71,8 +81,8 @@ fn activity_json(r: ActivityRow) -> serde_json::Value {
         "action": r.action,
         "entityType": r.resource_type,
         "entityId": r.resource_id,
-        "agentId": details.as_ref().and_then(|v| v.get("agentId")).and_then(|v| v.as_str()),
-        "runId": details.as_ref().and_then(|v| v.get("runId")).and_then(|v| v.as_str()),
+        "agentId": r.agent_id.map(|id| id.to_string()).or_else(|| metadata_id("agentId")),
+        "runId": r.run_id.map(|id| id.to_string()).or_else(|| metadata_id("runId")),
         "details": details,
         "createdAt": r.created_at,
     })
@@ -99,10 +109,10 @@ async fn list_company_activity(
 
     let rows = sqlx::query_as::<_, ActivityRow>(
         r#"
-SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
+SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, run_id, agent_id, created_at
         FROM activity_logs
         WHERE company_id = $1
-          AND ($3::uuid IS NULL OR actor_id = $3)
+          AND ($3::uuid IS NULL OR agent_id = $3)
           AND ($4::text IS NULL OR resource_type = $4)
           AND ($5::uuid IS NULL OR resource_id = $5)
         ORDER BY created_at DESC
@@ -139,8 +149,8 @@ async fn create_activity(
 
     sqlx::query(
         r#"
-INSERT INTO activity_logs (id, company_id, actor_type, actor_id, event_type, resource_type, resource_id, metadata, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+INSERT INTO activity_logs (id, company_id, actor_type, actor_id, event_type, resource_type, resource_id, agent_id, metadata, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(id)
@@ -150,6 +160,7 @@ INSERT INTO activity_logs (id, company_id, actor_type, actor_id, event_type, res
     .bind(&body.action)
     .bind(&body.entity_type)
     .bind(body.entity_id)
+    .bind(body.agent_id)
     .bind(&body.details)
     .bind(now)
     .execute(&state.pool)
@@ -180,7 +191,7 @@ async fn get_issue_activity(
         .map_err(|_| AppError::NotFound(format!("Issue not found: {id}")))?;
     let rows = sqlx::query_as::<_, ActivityRow>(
         r#"
-SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, created_at
+SELECT id, company_id, actor_type, actor_id, event_type AS action, resource_type, resource_id, metadata, run_id, agent_id, created_at
         FROM activity_logs
         WHERE resource_type = 'issue' AND resource_id = $1
         ORDER BY created_at DESC

@@ -690,7 +690,6 @@
 | `GET /api/heartbeat-runs/:param/watchdog-decisions` | `heartbeat_runs.rs` |
 | `GET /api/instance/database-backups` | `instance_settings.rs` |
 | `GET /api/issues/:param/children` | `issues.rs` |
-| `GET /api/issues/:param/cost-tree-summary` | `costs.rs` |
 | `GET /api/issues/:param/interactions/:param` | `interactions.rs` |
 | `GET /api/issues/:param/relations` | `issues.rs` |
 | `GET /api/issues/:param/transcript` | `issues.rs` |

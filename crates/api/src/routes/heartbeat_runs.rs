@@ -87,7 +87,11 @@ pub fn heartbeat_run_routes() -> Router<AppState> {
 }
 
 /// Query params for the company heartbeat-run list (Paperclip).
+///
+/// Field names are camelCase on the wire: both the web UI and the Rust CLI
+/// send `?agentId=`.
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HeartbeatRunListQuery {
     pub agent_id: Option<Uuid>,
     pub limit: Option<i64>,
@@ -97,6 +101,7 @@ pub struct HeartbeatRunListQuery {
 
 /// Query params for live-runs (Paperclip).
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LiveRunsQuery {
     pub min_count: Option<i64>,
     pub limit: Option<i64>,
@@ -115,6 +120,7 @@ where
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunLogQuery {
     #[serde(default, deserialize_with = "deserialize_nullable_i64")]
     pub offset: Option<i64>,
@@ -124,6 +130,7 @@ pub struct RunLogQuery {
 
 /// Run events query (Paperclip).
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunEventsQuery {
     pub after_seq: Option<i64>,
     pub limit: Option<i64>,
@@ -148,6 +155,7 @@ async fn authorize_run_access(
 
 /// Watchdog decision submission body (Paperclip).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WatchdogDecisionInput {
     pub decision: String,
     pub evaluation_issue_id: Option<Uuid>,
@@ -608,7 +616,9 @@ async fn list_run_issues(
 
     let run = match run {
         Some(r) => r,
-        None => return Err(HeartbeatRunError::NotFound(run_id)),
+        // Paperclip answers `200 []` for both a missing run and a cross-tenant
+        // one, so callers cannot probe which run ids exist elsewhere.
+        None => return Ok(Json(Value::Array(vec![]))),
     };
     let company_id: Uuid = run.get("company_id");
     require_company_access(&actor, company_id, AccessMode::Read)
@@ -968,5 +978,62 @@ mod tests {
             .expect("database errors must carry ErrorContext");
         assert_eq!(context.name, "Database");
         assert_eq!(context.message, "query failed");
+    }
+
+    /// The web UI and the Rust CLI address these params by camelCase name, the
+    /// way Paperclip does. A snake_case-only struct silently drops the filter
+    /// and answers with the unfiltered set, so pin the wire names.
+    #[test]
+    fn list_query_reads_camel_case_agent_id() {
+        let agent_id = Uuid::new_v4();
+        let parsed: HeartbeatRunListQuery =
+            serde_json::from_value(json!({ "agentId": agent_id, "limit": 25, "summary": "true" }))
+                .expect("camelCase list query must deserialize");
+        assert_eq!(parsed.agent_id, Some(agent_id));
+        assert_eq!(parsed.limit, Some(25));
+        assert_eq!(parsed.summary.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn live_runs_query_reads_camel_case_min_count() {
+        let parsed: LiveRunsQuery = serde_json::from_value(json!({ "minCount": 10, "limit": 50 }))
+            .expect("camelCase live-runs query must deserialize");
+        assert_eq!(parsed.min_count, Some(10));
+        assert_eq!(parsed.limit, Some(50));
+    }
+
+    #[test]
+    fn run_events_query_reads_camel_case_after_seq() {
+        let parsed: RunEventsQuery =
+            serde_json::from_value(json!({ "afterSeq": 196, "limit": 200 }))
+                .expect("camelCase events query must deserialize");
+        assert_eq!(parsed.after_seq, Some(196));
+        assert_eq!(parsed.limit, Some(200));
+    }
+
+    #[test]
+    fn run_log_query_reads_camel_case_limit_bytes() {
+        // Query-string values arrive as text, which is what the nullable-int
+        // deserializer expects, so exercise the string form.
+        let parsed: RunLogQuery =
+            serde_json::from_value(json!({ "offset": "10", "limitBytes": "100" }))
+                .expect("camelCase log query must deserialize");
+        assert_eq!(parsed.offset, Some(10));
+        assert_eq!(parsed.limit_bytes, Some(100));
+    }
+
+    #[test]
+    fn watchdog_decision_reads_camel_case_body() {
+        let issue_id = Uuid::new_v4();
+        let parsed: WatchdogDecisionInput = serde_json::from_value(json!({
+            "decision": "continue",
+            "evaluationIssueId": issue_id,
+            "reason": "looks healthy",
+            "snoozedUntil": null,
+        }))
+        .expect("camelCase watchdog body must deserialize");
+        assert_eq!(parsed.decision, "continue");
+        assert_eq!(parsed.evaluation_issue_id, Some(issue_id));
+        assert_eq!(parsed.reason.as_deref(), Some("looks healthy"));
     }
 }

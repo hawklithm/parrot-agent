@@ -281,6 +281,9 @@ pub fn assert_board_or_agent(
 /// 写一条 activity log。对齐 Paperclip 的 `logActivity`：审计失败不阻断主流程，
 /// 只记录 warn 日志（需要强一致的场景应由调用方在同事务内写入）。
 ///
+/// 落库后同步发布 `activity.logged` live 事件（Paperclip `logActivity` 总是
+/// `publishActivity`），前端据此刷新 activity/issues 查询。
+///
 /// 注意 `activity_logs.actor_id` / `resource_id` 均为 `UUID NOT NULL`，
 /// 匿名 actor 落 nil UUID。
 pub async fn log_activity(
@@ -293,11 +296,19 @@ pub async fn log_activity(
     metadata: serde_json::Value,
 ) {
     let actor_id = actor.principal_id().unwrap_or_else(uuid::Uuid::nil);
+    // `run_id` / `agent_id` are the attribution columns the run-issue ledger and
+    // the wakeup progress throttle read; a board actor attributes to neither.
+    let (agent_id, run_id) = match actor {
+        services::auth::AuthorizationActor::Agent {
+            agent_id, run_id, ..
+        } => (Some(*agent_id), *run_id),
+        _ => (None, None),
+    };
     if let Err(err) = sqlx::query(
         r#"
         INSERT INTO activity_logs
-            (id, company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            (id, company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata, run_id, agent_id, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         "#,
     )
     .bind(uuid::Uuid::new_v4())
@@ -307,7 +318,9 @@ pub async fn log_activity(
     .bind(actor_id)
     .bind(resource_type)
     .bind(resource_id)
-    .bind(metadata)
+    .bind(&metadata)
+    .bind(run_id)
+    .bind(agent_id)
     .execute(pool)
     .await
     {
@@ -317,7 +330,24 @@ pub async fn log_activity(
             company_id = %company_id,
             "failed to write activity log"
         );
+        return;
     }
+
+    services::live_events::publish_live_event(
+        company_id,
+        "activity.logged",
+        serde_json::json!({
+            "actorType": actor.actor_type(),
+            "actorId": actor_id.to_string(),
+            "action": event_type,
+            "entityType": resource_type,
+            "entityId": resource_id.to_string(),
+            "agentId": agent_id.map(|value| value.to_string()),
+            "runId": run_id.map(|value| value.to_string()),
+            "details": metadata,
+        }),
+    )
+    .await;
 }
 
 pub use access_control::{access_control_routes, CompanyId, MemberId, Token};

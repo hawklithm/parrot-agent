@@ -97,12 +97,6 @@ pub trait CostEventRepository: Send + Sync {
         end_time: DateTime<Utc>,
     ) -> Result<i64, RepoError>;
 
-    /// Issue 成本汇总
-    async fn issue_cost_summary(
-        &self,
-        issue_id: Uuid,
-    ) -> Result<CostSummaryRow, RepoError>;
-
     /// Issue 树成本汇总（含子 issue 的递归聚合 + 运行次数和运行时间）
     async fn issue_tree_cost_summary(
         &self,
@@ -555,35 +549,6 @@ impl CostEventRepository for PgCostEventRepository {
         Ok(result.map(|r| r.0).unwrap_or(0))
     }
 
-    async fn issue_cost_summary(
-        &self,
-        issue_id: Uuid,
-    ) -> Result<CostSummaryRow, RepoError> {
-        let result = sqlx::query_as::<_, CostSummaryRow>(
-            r#"
-            SELECT
-                $1::text as dimension,
-                COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents,
-                COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens,
-                COALESCE(SUM(cached_input_tokens), 0)::bigint as total_cached_input_tokens,
-                COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens,
-                COUNT(*)::bigint as event_count,
-                0::bigint as api_run_count, 0::bigint as subscription_run_count,
-                0::bigint as subscription_cached_input_tokens, 0::bigint as subscription_input_tokens,
-                0::bigint as subscription_output_tokens, 0::bigint as provider_count, 0::bigint as model_count
-            FROM cost_events
-            WHERE issue_id = $2
-            "#
-        )
-        .bind(issue_id.to_string())
-        .bind(issue_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(RepoError::DatabaseError)?;
-
-        Ok(result)
-    }
-
     async fn issue_tree_cost_summary(
         &self,
         company_id: Uuid,
@@ -670,10 +635,10 @@ impl CostEventRepository for PgCostEventRepository {
               AND (
                 (hr.context_snapshot ->> 'issueId')::text IN (SELECT id FROM issue_tree)
                 OR EXISTS (
-                    SELECT 1 FROM activity_log al
-                    JOIN issue_tree ON al.entity_id = issue_tree.id
+                    SELECT 1 FROM activity_logs al
+                    JOIN issue_tree ON (al.resource_id)::text = issue_tree.id
                     WHERE al.company_id = '{}'::uuid
-                      AND al.entity_type = 'issue'
+                      AND al.resource_type = 'issue'
                       AND al.run_id = hr.id
                 )
               )

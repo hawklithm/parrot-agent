@@ -537,6 +537,10 @@ fn agent_context(actor: &AuthorizationActor) -> Result<(Uuid, Option<Uuid>), App
     }
 }
 
+/// Thin adapter over [`crate::routes::log_activity`] honoring this module's
+/// `(actor, event_type)` argument order. Anonymous actors are skipped: a nil
+/// `actor_id` would be indistinguishable from a real system write here, and
+/// every decisions route is board- or agent-guarded anyway.
 async fn log_activity(
     pool: &PgPool,
     company_id: Uuid,
@@ -546,22 +550,18 @@ async fn log_activity(
     resource_id: Uuid,
     metadata: Value,
 ) {
-    // `activity_logs.actor_id` is NOT NULL — only anonymous/system actors are skipped.
-    let Some(actor_id) = actor.principal_id() else {
+    if actor.principal_id().is_none() {
         return;
-    };
-    let _ = sqlx::query(
-        "INSERT INTO activity_logs (company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    }
+    crate::routes::log_activity(
+        pool,
+        company_id,
+        event_type,
+        actor,
+        resource_type,
+        resource_id,
+        metadata,
     )
-    .bind(company_id)
-    .bind(event_type)
-    .bind(actor.actor_type())
-    .bind(actor_id)
-    .bind(resource_type)
-    .bind(resource_id)
-    .bind(metadata)
-    .execute(pool)
     .await;
 }
 

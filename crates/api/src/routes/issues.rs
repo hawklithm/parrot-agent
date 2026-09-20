@@ -2347,6 +2347,122 @@ async fn list_company_issues(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// The fields a PATCH explicitly asks to change, in the camelCase shape the
+/// activity feed and the issue timeline read.
+///
+/// Only the fields `DefaultIssueService::update` actually forwards are covered:
+/// the rest of `UpdateIssueInput` is dropped before it reaches the repository,
+/// so reporting them would claim changes that never happened. A missing key
+/// means "not requested"; a JSON null is a real null value.
+fn requested_issue_fields(input: &UpdateIssueInput) -> serde_json::Map<String, Value> {
+    let mut requested = serde_json::Map::new();
+    let mut put = |key: &str, value: Option<Value>| {
+        if let Some(value) = value {
+            requested.insert(key.to_string(), value);
+        }
+    };
+    put("title", input.title.as_ref().map(|value| json!(value)));
+    put(
+        "description",
+        input.description.as_ref().map(|value| json!(value)),
+    );
+    put("status", input.status.as_ref().map(|value| json!(value)));
+    put("priority", input.priority.as_ref().map(|value| json!(value)));
+    put(
+        "assigneeAgentId",
+        input.assignee_agent_id.map(|value| json!(value)),
+    );
+    put(
+        "assigneeUserId",
+        input.assignee_user_id.map(|value| json!(value)),
+    );
+    put(
+        "workMode",
+        input.work_mode.as_ref().map(|value| json!(value)),
+    );
+    put(
+        "harnessKind",
+        input.harness_kind.as_ref().map(|value| json!(value)),
+    );
+    put(
+        "labelIds",
+        input.label_ids.as_ref().map(|ids| id_set_value(ids)),
+    );
+    put(
+        "blockedByIssueIds",
+        input
+            .blocked_by_issue_ids
+            .as_ref()
+            .map(|ids| id_set_value(ids)),
+    );
+    requested
+}
+
+/// Build the `issue.updated` details Paperclip emits from a PATCH: the
+/// requested fields, a `{field: {from, to}}` receipt, and `_previous`.
+fn issue_updated_details(
+    before: &Issue,
+    after: &Issue,
+    requested: serde_json::Map<String, Value>,
+) -> Value {
+    let current = json!({
+        "title": after.title,
+        "description": after.description,
+        "status": after.status,
+        "priority": after.priority,
+        "assigneeAgentId": after.assignee_agent_id,
+        "assigneeUserId": after.assignee_user_id,
+        "workMode": after.work_mode,
+        "harnessKind": after.harness_kind,
+        "labelIds": id_set_value(&after.label_ids),
+        "blockedByIssueIds": id_set_value(&after.blocked_by_issue_ids),
+    });
+    let previous = json!({
+        "title": before.title,
+        "description": before.description,
+        "status": before.status,
+        "priority": before.priority,
+        "assigneeAgentId": before.assignee_agent_id,
+        "assigneeUserId": before.assignee_user_id,
+        "workMode": before.work_mode,
+        "harnessKind": before.harness_kind,
+        "labelIds": id_set_value(&before.label_ids),
+        "blockedByIssueIds": id_set_value(&before.blocked_by_issue_ids),
+    });
+
+    let mut changes = serde_json::Map::new();
+    let mut previous_changes = serde_json::Map::new();
+    for key in requested.keys() {
+        let before_value = previous.get(key).cloned().unwrap_or(Value::Null);
+        let after_value = current.get(key).cloned().unwrap_or(Value::Null);
+        if before_value == after_value {
+            continue;
+        }
+        changes.insert(
+            key.clone(),
+            json!({ "from": before_value, "to": after_value }),
+        );
+        previous_changes.insert(key.clone(), before_value);
+    }
+
+    let mut details = Value::Object(requested);
+    details["identifier"] = json!(after.identifier);
+    details["changes"] = Value::Object(changes);
+    if !previous_changes.is_empty() {
+        details["_previous"] = Value::Object(previous_changes);
+    }
+    details
+}
+
+/// Issue association lists are sets; order carries no meaning, so sort for a
+/// stable comparison and a stable rendered value.
+fn id_set_value(ids: &[Uuid]) -> Value {
+    let mut rendered: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+    rendered.sort();
+    rendered.dedup();
+    Value::Array(rendered.into_iter().map(Value::String).collect())
+}
+
 /// PATCH /issues/:id - Update issue
 async fn update_issue(
     State(state): State<AppState>,
@@ -2415,20 +2531,49 @@ async fn update_issue(
         }
     }
     let service = state.issue_service.clone();
-
-    service
-        .update(id, company_id, input)
+    // Paperclip emits `issue.updated` carrying the updated fields, a
+    // `{field: {from, to}}` receipt and `_previous`; the activity feed and the
+    // issue timeline both read those keys, so snapshot the row before the write.
+    let previous = service
+        .get(id, company_id)
         .await
-        .map(|result| Json(result.issue))
         .map_err(|error| {
             tracing::error!(
                 error = ?error,
                 issue_id = %id,
                 company_id = %company_id,
-                "issue update failed"
+                "issue update failed to load previous state"
             );
             issue_service_status(&error)
-        })
+        })?
+        // The company guard above already resolved this issue, so a missing
+        // row here means it was deleted in between.
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let requested = requested_issue_fields(&input);
+
+    let result = service.update(id, company_id, input).await.map_err(|error| {
+        tracing::error!(
+            error = ?error,
+            issue_id = %id,
+            company_id = %company_id,
+            "issue update failed"
+        );
+        issue_service_status(&error)
+    })?;
+
+    let details = issue_updated_details(&previous, &result.issue, requested);
+    log_activity(
+        &state.pool,
+        company_id,
+        "issue.updated",
+        &actor,
+        "issue",
+        id,
+        details,
+    )
+    .await;
+
+    Ok(Json(result.issue))
 }
 
 /// DELETE /issues/:id - Delete issue

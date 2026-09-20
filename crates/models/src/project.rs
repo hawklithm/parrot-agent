@@ -127,8 +127,13 @@ pub struct CreateWorkspaceInput {
     pub is_primary: Option<bool>,
 }
 
+/// Membership state for project/agent/document memberships.
+///
+/// The `state` columns are `TEXT` with a `CHECK (state IN ('joined', 'left'))`
+/// constraint, not the `membership_state` enum type declared in the schema, so
+/// the sqlx type name has to be `text` to decode and bind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "membership_state", rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 #[serde(rename_all = "lowercase")]
 pub enum MembershipState {
     Joined,

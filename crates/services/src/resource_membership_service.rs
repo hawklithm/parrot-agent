@@ -321,9 +321,9 @@ impl ResourceMembershipService {
         project_id: Uuid,
         input: UpdateResourceMembershipInput,
     ) -> Result<ResourceMembershipUpdateResult, AppError> {
-        let user_uuid = user_id.parse::<Uuid>()
-            .map_err(|_| AppError::BadRequest("Invalid user_id".to_string()))?;
-        
+        // `user_id` is TEXT in the membership tables (board user ids are not a
+        // FK), so it binds as-is rather than being parsed into a UUID.
+
         // 1. Check if project exists and is not archived
         let project_exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND company_id = $2 AND archived_at IS NULL)"
@@ -343,7 +343,7 @@ impl ResourceMembershipService {
             "SELECT state, starred_at, updated_at FROM project_memberships WHERE company_id = $1 AND user_id = $2 AND project_id = $3"
         )
         .bind(company_id)
-        .bind(user_uuid)
+        .bind(user_id)
         .bind(project_id)
         .fetch_optional(&self.pool)
         .await
@@ -421,7 +421,7 @@ impl ResourceMembershipService {
             "#
         )
         .bind(company_id)
-        .bind(user_uuid)
+        .bind(user_id)
         .bind(project_id)
         .bind(next_state)
         .bind(next_starred_at)
@@ -467,9 +467,7 @@ impl ResourceMembershipService {
         agent_id: Uuid,
         input: UpdateResourceMembershipInput,
     ) -> Result<ResourceMembershipUpdateResult, AppError> {
-        let user_uuid = user_id.parse::<Uuid>()
-            .map_err(|_| AppError::BadRequest("Invalid user_id".to_string()))?;
-
+        // Same TEXT column as `project_memberships.user_id`.
         // 1. Check if agent exists and is not offboarded
         let agent_exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND company_id = $2 AND status != 'offboarded')"
@@ -489,7 +487,7 @@ impl ResourceMembershipService {
             "SELECT state, starred_at, updated_at FROM agent_memberships WHERE company_id = $1 AND user_id = $2 AND agent_id = $3"
         )
         .bind(company_id)
-        .bind(user_uuid)
+        .bind(user_id)
         .bind(agent_id)
         .fetch_optional(&self.pool)
         .await
@@ -569,7 +567,7 @@ impl ResourceMembershipService {
             "#
         )
         .bind(company_id)
-        .bind(user_uuid)
+        .bind(user_id)
         .bind(agent_id)
         .bind(next_state)  // MembershipState enum
         .bind(next_starred_at)
@@ -634,19 +632,19 @@ impl ResourceMembershipService {
 
         sqlx::query(
             r#"
-            INSERT INTO activity_log (company_id, actor_type, actor_id, agent_id, run_id, action, entity_type, entity_id, details, created_at)
+            INSERT INTO activity_logs (company_id, event_type, actor_type, actor_id, resource_type, resource_id, metadata, run_id, agent_id, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
             "#
         )
         .bind(company_id)
+        .bind(action)
         .bind(actor_type)
         .bind(actor_id)
-        .bind(agent_id)
-        .bind(run_id)
-        .bind(action)
         .bind(&result.resource_type)
         .bind(Uuid::parse_str(&result.resource_id).unwrap_or_default())
         .bind(details)
+        .bind(run_id)
+        .bind(agent_id)
         .execute(&self.pool)
         .await
         .map_err(|e| {

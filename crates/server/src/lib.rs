@@ -300,6 +300,10 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
     let teams_catalog_service: Arc<dyn services::TeamsCatalogService> =
         Arc::new(services::DefaultTeamsCatalogService::new(pool.clone()));
     let sse_service: Arc<dyn SseService> = InMemorySseService::new();
+    // Route-level audit writers publish `activity.logged` through this
+    // process-wide handle; register the same instance the app state exposes so
+    // browsers receive frames over `/companies/:id/events/ws`.
+    services::live_events::init(sse_service.clone());
     let invite_service: Arc<dyn InviteService> =
         Arc::new(InviteServiceImpl::with_pool(pool.clone()));
     let openclaw_service: Arc<dyn OpenClawService> =

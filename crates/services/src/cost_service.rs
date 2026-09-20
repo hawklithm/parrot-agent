@@ -415,9 +415,6 @@ pub trait CostService: Send + Sync {
     /// 获取配额窗口
     async fn get_quota_windows(&self, company_id: Uuid) -> ServiceResult<Vec<QuotaWindow>>;
 
-    /// 获取 Issue 成本汇总
-    async fn issue_cost_summary(&self, issue_id: Uuid) -> ServiceResult<CostSummaryDto>;
-
     /// 获取 Issue 树成本汇总（含子 Issue 递归聚合 + 运行次数/时间）
     async fn issue_tree_summary(
         &self,
@@ -695,12 +692,6 @@ impl CostService for DefaultCostService {
             }
         }
         Ok(windows)
-    }
-
-    async fn issue_cost_summary(&self, issue_id: Uuid) -> ServiceResult<CostSummaryDto> {
-        let row = self.repo.issue_cost_summary(issue_id).await
-            .map_err(|e| ServiceError::Repository(e.to_string()))?;
-        Ok(CostSummaryDto::from(row))
     }
 
     async fn issue_tree_summary(

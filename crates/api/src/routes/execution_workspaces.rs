@@ -74,6 +74,7 @@ pub fn execution_workspace_routes() -> Router<AppState> {
 
 /// Query filters mirroring Paperclip's list filters.
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecutionWorkspaceListQuery {
     pub project_id: Option<Uuid>,
     pub project_workspace_id: Option<Uuid>,

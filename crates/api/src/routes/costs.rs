@@ -19,6 +19,7 @@ use services::{CreateCostEventInput, CreateFinanceEventInput, BudgetIncidentReso
 
 /// Query parameter for issue tree summary
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExcludeRootParams {
     pub exclude_root: Option<bool>,
 }
@@ -46,8 +47,7 @@ pub fn cost_routes() -> Router<AppState> {
         .route("/companies/:company_id/costs/finance-by-biller", get(get_finance_by_biller))
         .route("/companies/:company_id/costs/finance-by-kind", get(get_finance_by_kind))
         .route("/companies/:company_id/costs/finance-events", get(list_finance_events))
-        .route("/issues/:id/cost-summary", get(get_issue_cost_summary))
-        .route("/issues/:id/cost-tree-summary", get(get_issue_tree_cost_summary))
+        .route("/issues/:id/cost-summary", get(get_issue_tree_cost_summary))
         // Budgets
         .route("/companies/:company_id/budgets/overview", get(get_budget_overview))
         .route("/companies/:company_id/budgets/policies", get(list_budget_policies))
@@ -258,22 +258,9 @@ async fn list_finance_events(
 }
 
 /// CO15: GET /issues/:id/cost-summary
-async fn get_issue_cost_summary(
-    State(state): State<AppState>,
-    IssueId(id): IssueId,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let summary = state.cost_service.issue_cost_summary(id).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({
-        "issueId": id,
-        "totalCostCents": summary.total_cost_cents,
-        "totalInputTokens": summary.total_input_tokens,
-        "totalOutputTokens": summary.total_output_tokens,
-        "eventCount": summary.event_count,
-    })))
-}
-
-/// CO15b: GET /issues/:id/cost-tree-summary
+///
+/// Mirrors Paperclip's `GET /issues/:id/cost-summary`: aggregate cost for the
+/// issue tree, with `excludeRoot` dropping the root issue from the totals.
 async fn get_issue_tree_cost_summary(
     State(state): State<AppState>,
     IssueId(id): IssueId,
@@ -366,4 +353,24 @@ async fn resolve_budget_incident(
     state.budget_service.resolve_incident(company_id, incident_id, input).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({"companyId": company_id, "incidentId": incident_id, "resolved": true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The web UI addresses this param by camelCase name, the way Paperclip
+    /// does. A snake_case-only struct silently drops the flag and answers with
+    /// the un-excluded totals, so pin the wire name.
+    ///
+    /// The value is a JSON bool because that is what a plain `Option<bool>`
+    /// deserializer accepts; the query-string form `?excludeRoot=true` is
+    /// covered by the route-level check, not here.
+    #[test]
+    fn exclude_root_reads_camel_case_query_key() {
+        let parsed: ExcludeRootParams =
+            serde_json::from_value(serde_json::json!({ "excludeRoot": true }))
+                .expect("camelCase cost-summary query must deserialize");
+        assert_eq!(parsed.exclude_root, Some(true));
+    }
 }

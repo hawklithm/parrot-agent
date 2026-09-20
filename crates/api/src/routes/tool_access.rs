@@ -23,7 +23,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::routes::{assert_board, require_company_access, AccessMode};
+use crate::routes::{
+    assert_board, has_company_access, require_company_access, AccessMode,
+};
 use services::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService, PermissionKey};
 use services::secret_provider::{decrypt_secret_material, encrypt_secret_material, sha256_hex};
 
@@ -1413,20 +1415,94 @@ async fn get_tool_connection(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     let row = get_connection_by_id(&state, company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(connection_json(&row)))
 }
 
-fn actor_company(actor: &AuthorizationActor) -> Result<Uuid, StatusCode> {
-    match actor {
-        AuthorizationActor::Board { company_id, .. }
-        | AuthorizationActor::Agent { company_id, .. } => Ok(*company_id),
-        _ => Err(StatusCode::FORBIDDEN),
+/// Resolve the owning company of a tool connection from the resource row and
+/// authorize against it — the `getAccessibleResource` contract
+/// (`server/src/routes/authz.ts:182-195` in Paperclip).
+///
+/// These routes carry no company segment, so the actor's own company cannot
+/// stand in for the resource's: the row is the only source of truth. A row
+/// that does not exist and a row belonging to another company both return
+/// `NotFound` so neither can be used to probe for ids.
+async fn accessible_connection_company(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    connection_id: Uuid,
+    mode: AccessMode,
+) -> Result<Uuid, StatusCode> {
+    accessible_resource_company(
+        state,
+        actor,
+        "SELECT company_id FROM tool_connections WHERE id = $1",
+        connection_id,
+        mode,
+    )
+    .await
+}
+
+async fn accessible_profile_company(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    profile_id: Uuid,
+    mode: AccessMode,
+) -> Result<Uuid, StatusCode> {
+    accessible_resource_company(
+        state,
+        actor,
+        "SELECT company_id FROM tool_profiles WHERE id = $1",
+        profile_id,
+        mode,
+    )
+    .await
+}
+
+async fn accessible_profile_entry_company(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    entry_id: Uuid,
+    mode: AccessMode,
+) -> Result<Uuid, StatusCode> {
+    accessible_resource_company(
+        state,
+        actor,
+        "SELECT company_id FROM tool_profile_entries WHERE id = $1",
+        entry_id,
+        mode,
+    )
+    .await
+}
+
+async fn accessible_resource_company(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    query: &str,
+    resource_id: Uuid,
+    mode: AccessMode,
+) -> Result<Uuid, StatusCode> {
+    assert_board(actor)?;
+    // A lookup failure is a genuine 500 and must stay distinct from the
+    // not-found branch, so it is mapped before the `Option` is matched on.
+    let company_id = sqlx::query_scalar::<_, Uuid>(query)
+        .bind(resource_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %resource_id, "tool resource lookup failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    match company_id {
+        Some(company_id) if has_company_access(actor, company_id) => {
+            require_company_access(actor, company_id, mode)?;
+            Ok(company_id)
+        }
+        _ => Err(StatusCode::NOT_FOUND),
     }
 }
 
@@ -1450,9 +1526,8 @@ async fn update_tool_connection(
     Path(connection_id): Path<Uuid>,
     Json(request): Json<UpdateToolConnectionRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Write).await?;
     if request
         .name
         .as_deref()
@@ -1521,9 +1596,8 @@ async fn delete_tool_connection(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Write).await?;
     let row = sqlx::query(
         "UPDATE tool_connections
             SET status = 'archived', enabled = false, updated_at = NOW()
@@ -1560,9 +1634,8 @@ async fn list_connection_grants(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -1600,7 +1673,8 @@ async fn delete_connection_grant(
     Extension(actor): Extension<AuthorizationActor>,
     Path((connection_id, grant_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     require_gateway_permission(
         &state,
         &actor,
@@ -1630,9 +1704,8 @@ async fn connection_usage(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -1690,9 +1763,8 @@ async fn connection_installs(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -1724,7 +1796,8 @@ async fn put_connection_installs(
     Path(connection_id): Path<Uuid>,
     Json(request): Json<PutConnectionInstallsRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     require_gateway_permission(
         &state,
         &actor,
@@ -1732,9 +1805,6 @@ async fn put_connection_installs(
         PermissionKey::TOOLS_MANAGE_CONNECTIONS,
     )
     .await?;
-    get_connection_by_id(&state, company_id, connection_id)
-        .await?
-        .ok_or(StatusCode::NOT_FOUND)?;
 
     if request.installs.len() > 1000 {
         return Err(StatusCode::BAD_REQUEST);
@@ -1896,9 +1966,8 @@ async fn connection_catalog(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -1943,9 +2012,8 @@ async fn connection_activity(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     get_connection_by_id(&state, company_id, connection_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -1980,13 +2048,18 @@ async fn connection_activity(
 
     // Derive lifecycle events from the connection-scoped activity log, the
     // same way Paperclip's listConnectionLifecycleEvents does (no separate
-    // table): map each log row through the canonical lifecycle mapper.
+    // table): map each log row through the canonical lifecycle mapper. The
+    // live table is `activity_logs`, whose columns are renamed relative to
+    // Paperclip's (`event_type`/`resource_type`/`resource_id`/`metadata`), so
+    // alias them back to the names the row mapping below reads.
     let log_rows = sqlx::query(
-        "SELECT id, action, entity_type, entity_id, resource_type, resource_id, details, actor_type, agent_id, user_id, created_at \
-           FROM activity_log
+        "SELECT id, event_type AS action, resource_type, resource_id, metadata AS details, \
+                actor_type, agent_id, \
+                CASE WHEN actor_type = 'user' THEN actor_id END AS user_id, created_at \
+           FROM activity_logs
           WHERE company_id = $1
-            AND ((entity_type = 'tool_connection' AND entity_id = $2)
-              OR (resource_type = 'tool_connection' AND resource_id = $2))
+            AND resource_type = 'tool_connection'
+            AND resource_id = $2
           ORDER BY created_at DESC LIMIT 50",
     )
     .bind(company_id)
@@ -2061,10 +2134,8 @@ async fn profile_new_tools(
     Extension(actor): Extension<AuthorizationActor>,
     Path(profile_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Read)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    ensure_tool_profile_scope(&state, profile_id, company_id).await?;
+    let company_id =
+        accessible_profile_company(&state, &actor, profile_id, AccessMode::Read).await?;
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT c.id, c.connection_id, c.name, c.tool_name, c.title, c.description, c.input_schema,
@@ -2110,9 +2181,8 @@ async fn delete_tool_profile(
     Extension(actor): Extension<AuthorizationActor>,
     Path(profile_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_profile_company(&state, &actor, profile_id, AccessMode::Write).await?;
     let result = sqlx::query("DELETE FROM tool_profiles WHERE id = $1 AND company_id = $2")
         .bind(profile_id)
         .bind(company_id)
@@ -2147,9 +2217,8 @@ async fn update_tool_profile(
     Path(profile_id): Path<Uuid>,
     Json(request): Json<UpdateToolProfileRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_profile_company(&state, &actor, profile_id, AccessMode::Write).await?;
     if request
         .name
         .as_deref()
@@ -2324,6 +2393,15 @@ struct GatewayAuditQuery {
     search: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
+}
+
+/// `/tool-gateway/runtime-slots*` carry no resource row to read a company from,
+/// so the caller supplies it explicitly — Paperclip
+/// `server/src/routes/tool-gateway.ts:567-580`.
+#[derive(Debug, Deserialize)]
+struct GatewayRuntimeSlotsQuery {
+    #[serde(rename = "companyId")]
+    company_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2788,8 +2866,13 @@ async fn require_gateway_runtime_permission(
 async fn gateway_runtime_slots(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
+    Query(query): Query<GatewayRuntimeSlotsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id = query
+        .company_id
+        .as_deref()
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     require_gateway_runtime_permission(&state, &actor, company_id).await?;
     use sqlx::Row;
     let rows = sqlx::query(
@@ -3233,9 +3316,8 @@ async fn update_tool_profile_entry(
     Path(entry_id): Path<Uuid>,
     Json(request): Json<UpdateProfileEntryRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_profile_entry_company(&state, &actor, entry_id, AccessMode::Write).await?;
     if request.selector_type.is_none()
         && request.effect.is_none()
         && request.application_id.is_none()
@@ -3348,9 +3430,8 @@ async fn delete_tool_profile_entry(
     Extension(actor): Extension<AuthorizationActor>,
     Path(entry_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_profile_entry_company(&state, &actor, entry_id, AccessMode::Write).await?;
     let result = sqlx::query(
         "DELETE FROM tool_profile_entries AS e
            USING tool_profiles AS p
@@ -3376,7 +3457,8 @@ async fn connection_test_agents(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     require_gateway_any_permission(
         &state,
         &actor,
@@ -3385,15 +3467,6 @@ async fn connection_test_agents(
     )
     .await?;
     use sqlx::Row;
-    let exists = sqlx::query("SELECT id FROM tool_connections WHERE id = $1 AND company_id = $2")
-        .bind(connection_id)
-        .bind(company_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if exists.is_none() {
-        return Err(StatusCode::NOT_FOUND);
-    }
     let rows = sqlx::query(
         "SELECT id, name, role, status FROM agents WHERE company_id = $1 AND status <> 'terminated' ORDER BY name ASC",
     )
@@ -3424,7 +3497,8 @@ async fn connection_test_call(
     Extension(actor): Extension<AuthorizationActor>,
     Path((connection_id, call_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     require_gateway_any_permission(
         &state,
         &actor,
@@ -3537,9 +3611,8 @@ async fn refresh_connection_catalog(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Write).await?;
     use sqlx::Row;
     let connection = sqlx::query(
         "SELECT transport, transport_config, config, credential_refs, credential_secret_refs
@@ -3836,7 +3909,8 @@ async fn install_connection_grants(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     require_gateway_permission(
         &state,
         &actor,
@@ -3844,19 +3918,6 @@ async fn install_connection_grants(
         PermissionKey::TOOLS_MANAGE_CONNECTIONS,
     )
     .await?;
-    let connection_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-             SELECT 1 FROM tool_connections WHERE id = $1 AND company_id = $2
-         )",
-    )
-    .bind(connection_id)
-    .bind(company_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if !connection_exists {
-        return Err(StatusCode::NOT_FOUND);
-    }
     sqlx::query(
         "INSERT INTO tool_connection_grants (company_id, connection_id, agent_id) \
          SELECT company_id, $1, id FROM agents WHERE company_id = $2 AND status <> 'terminated' \
@@ -6646,9 +6707,8 @@ async fn reconnect_tool_connection(
     Path(connection_id): Path<Uuid>,
     Json(request): Json<ReconnectToolAppRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Write).await?;
     let Some(credential_object) = request.credential_values.as_object() else {
         return Err(StatusCode::BAD_REQUEST);
     };
@@ -9922,9 +9982,8 @@ async fn connection_health_check(
     Extension(actor): Extension<AuthorizationActor>,
     Path(connection_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Write).await?;
     let started = std::time::Instant::now();
     let refreshed = refresh_connection_catalog(
         State(state.clone()),
@@ -9963,7 +10022,8 @@ async fn create_connection_test_call(
     Path(connection_id): Path<Uuid>,
     Json(request): Json<CreateTestCallRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Read).await?;
     require_gateway_any_permission(
         &state,
         &actor,
@@ -9971,19 +10031,6 @@ async fn create_connection_test_call(
         &[PermissionKey::TOOLS_USE, PermissionKey::TOOLS_MANAGE_CONNECTIONS],
     )
     .await?;
-    let connection_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-             SELECT 1 FROM tool_connections WHERE id = $1 AND company_id = $2
-         )",
-    )
-    .bind(connection_id)
-    .bind(company_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if !connection_exists {
-        return Err(StatusCode::NOT_FOUND);
-    }
     match crate::routes::tools::execute_mcp_connection_test_call(
         &state,
         company_id,
@@ -10028,10 +10075,8 @@ async fn duplicate_tool_profile(
     Path(profile_id): Path<Uuid>,
     Json(request): Json<DuplicateToolProfileRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    ensure_tool_profile_scope(&state, profile_id, company_id).await?;
+    let company_id =
+        accessible_profile_company(&state, &actor, profile_id, AccessMode::Write).await?;
     let name = request.name.trim();
     if name.is_empty() || name.len() > 160 {
         return Err(StatusCode::BAD_REQUEST);
@@ -10356,9 +10401,8 @@ async fn create_tool_profile_entry(
     Path(profile_id): Path<Uuid>,
     Json(request): Json<CreateProfileEntryRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_profile_company(&state, &actor, profile_id, AccessMode::Write).await?;
     let tool_name = request.tool_name.clone().or_else(|| request.tool.clone());
     let selector_type = request.selector_type.as_deref().or_else(|| {
         if tool_name.is_some() {
@@ -10453,10 +10497,8 @@ async fn review_profile_new_tools(
     Json(input): Json<ReviewNewToolsInput>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sqlx::Row;
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    ensure_tool_profile_scope(&state, profile_id, company_id).await?;
+    let company_id =
+        accessible_profile_company(&state, &actor, profile_id, AccessMode::Write).await?;
 
     let decisions = input.decisions;
     if decisions.is_empty() || decisions.len() > 250 {
@@ -10601,9 +10643,8 @@ async fn tools_oauth_start(
     Path(connection_id): Path<Uuid>,
     request: Option<Json<StartBoardConnectionAuthorizationRequest>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
-    require_board_company_access(&actor, company_id, AccessMode::Write)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let company_id =
+        accessible_connection_company(&state, &actor, connection_id, AccessMode::Write).await?;
     let request = request.map(|Json(value)| value).unwrap_or_default();
     let row = get_connection_by_id(&state, company_id, connection_id)
         .await?
@@ -10745,9 +10786,11 @@ async fn company_connection_oauth_start(
     Path((company_id, connection_id)): Path<(Uuid, Uuid)>,
     request: Option<Json<StartBoardConnectionAuthorizationRequest>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if actor_company(&actor)? != company_id {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    // Path-scoped variant of the same board flow: the company comes from the
+    // route, matching Paperclip `assertToolAppMutationAccess`
+    // (`server/src/routes/tool-access.ts:286-296`).
+    require_board_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     let user_id = match &actor {
         AuthorizationActor::Board { user_id, .. } => *user_id,
         _ => return Err(StatusCode::FORBIDDEN),
@@ -10780,8 +10823,13 @@ async fn gateway_slot_stop(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(slot_id): Path<String>,
+    Query(query): Query<GatewayRuntimeSlotsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id = query
+        .company_id
+        .as_deref()
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     require_gateway_runtime_permission(&state, &actor, company_id).await?;
     Ok(Json(
         update_runtime_slot_state(&state, company_id, &slot_id, "stopped").await?,
@@ -10793,8 +10841,13 @@ async fn gateway_slot_restart(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path(slot_id): Path<String>,
+    Query(query): Query<GatewayRuntimeSlotsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let company_id = actor_company(&actor)?;
+    let company_id = query
+        .company_id
+        .as_deref()
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     require_gateway_runtime_permission(&state, &actor, company_id).await?;
     Ok(Json(
         update_runtime_slot_state(&state, company_id, &slot_id, "running").await?,

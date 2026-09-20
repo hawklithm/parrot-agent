@@ -2363,13 +2363,6 @@ impl DefaultHeartbeatService {
         {
             tracing::warn!(%run_id, %event_error, "failed to persist heartbeat terminal event");
         }
-        publish_live_event(
-            &self.sse_service,
-            company_id,
-            "heartbeat.run.status",
-            final_event,
-        )
-        .await;
         let issue_status = if status == "succeeded" { "done" } else { "todo" };
         let _ = sqlx::query(
             "UPDATE issues SET status = $2::issue_status, checkout_run_id = NULL, execution_run_id = NULL, execution_locked_at = NULL, execution_agent_name_key = NULL, completed_at = CASE WHEN $2 = 'done' THEN NOW() ELSE NULL END, updated_at = NOW() WHERE id = $1 AND company_id = $3 AND execution_run_id = $4",
@@ -2380,6 +2373,16 @@ impl DefaultHeartbeatService {
         .bind(run_id)
             .execute(&self.pool)
             .await;
+        // Published *after* the issue write above: the frame wakes clients, and
+        // a client that refetches on it must see the settled issue, not the
+        // status this run is about to overwrite.
+        publish_live_event(
+            &self.sse_service,
+            company_id,
+            "heartbeat.run.status",
+            final_event,
+        )
+        .await;
         self.refresh_continuation_summary(issue_id, run_id, agent_id, status, error.as_deref(), &output.stdout).await;
         // A comment that arrived while this run held the agent+issue slot was
         // parked on its own wakeup request. Parked rows carry *this* run's id

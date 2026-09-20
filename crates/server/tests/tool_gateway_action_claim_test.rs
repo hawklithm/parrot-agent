@@ -175,10 +175,15 @@ async fn create_named_gateway(
 async fn list_gateway_runtime_slots(
     app: &Router,
     actor: &AuthorizationActor,
+    company_id: Option<Uuid>,
 ) -> (StatusCode, Value) {
+    let query = match company_id {
+        Some(company_id) => format!("?companyId={company_id}"),
+        None => String::new(),
+    };
     let mut request = Request::builder()
         .method("GET")
-        .uri("/tool-gateway/runtime-slots")
+        .uri(format!("/tool-gateway/runtime-slots{query}"))
         .body(Body::empty())
         .expect("build runtime slots request");
     request.extensions_mut().insert(actor.clone());
@@ -1093,9 +1098,17 @@ async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
     let operator = board_actor_with_role(company_id, MembershipRole::Operator);
     let viewer = board_actor_with_role(company_id, MembershipRole::Viewer);
 
-    let (owner_status, owner_body) = list_gateway_runtime_slots(&app, &owner).await;
+    let (owner_status, owner_body) =
+        list_gateway_runtime_slots(&app, &owner, Some(company_id)).await;
     assert_eq!(owner_status, StatusCode::OK, "owner={owner_body:?}");
     assert!(owner_body.is_array());
+
+    let (missing_status, _) = list_gateway_runtime_slots(&app, &owner, None).await;
+    assert_eq!(
+        missing_status,
+        StatusCode::BAD_REQUEST,
+        "runtime slots without a company id"
+    );
 
     let (company_owner_status, company_owner_body) =
         list_company_runtime_slots(&app, &owner, company_id).await;
@@ -1118,11 +1131,11 @@ async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
         ),
         (
             "gateway stop",
-            format!("/tool-gateway/runtime-slots/{slot_id}/stop"),
+            format!("/tool-gateway/runtime-slots/{slot_id}/stop?companyId={company_id}"),
         ),
         (
             "gateway restart",
-            format!("/tool-gateway/runtime-slots/{slot_id}/restart"),
+            format!("/tool-gateway/runtime-slots/{slot_id}/restart?companyId={company_id}"),
         ),
     ] {
         let (status, body) = post_runtime_slot_action(&app, &owner, uri).await;
@@ -1130,7 +1143,7 @@ async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
     }
 
     for (label, actor) in [("operator", operator), ("viewer", viewer)] {
-        let (status, body) = list_gateway_runtime_slots(&app, &actor).await;
+        let (status, body) = list_gateway_runtime_slots(&app, &actor, Some(company_id)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{label}={body:?}");
 
         let (status, body) = list_company_runtime_slots(&app, &actor, company_id).await;
@@ -1147,11 +1160,11 @@ async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
             ),
             (
                 "gateway stop",
-                format!("/tool-gateway/runtime-slots/{slot_id}/stop"),
+                format!("/tool-gateway/runtime-slots/{slot_id}/stop?companyId={company_id}"),
             ),
             (
                 "gateway restart",
-                format!("/tool-gateway/runtime-slots/{slot_id}/restart"),
+                format!("/tool-gateway/runtime-slots/{slot_id}/restart?companyId={company_id}"),
             ),
         ] {
             let (status, body) = post_runtime_slot_action(&app, &actor, uri).await;
