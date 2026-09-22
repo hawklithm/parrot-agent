@@ -157,11 +157,14 @@ fn company_skill_editable(alias: &str) -> String {
 }
 
 /// Newest version row, mirroring Paperclip's `current_version_id` column.
+///
+/// `revision_number` is the monotonic identity, so it orders head correctly even
+/// when two revisions share a `created_at` timestamp.
 fn company_skill_current_version_id(alias: &str) -> String {
     format!(
         "(SELECT sv.id FROM skill_versions sv \
          WHERE sv.company_id = {alias}.company_id AND sv.skill_id = {alias}.id \
-         ORDER BY sv.created_at DESC, sv.id DESC LIMIT 1)"
+         ORDER BY sv.revision_number DESC LIMIT 1)"
     )
 }
 
@@ -385,18 +388,10 @@ fn company_skill_detail_fields(alias: &str) -> Vec<(String, String)> {
         jsonb_pair(
             "currentVersion",
             format!(
-                "(SELECT jsonb_build_object( \
-                    'id', sv.id, 'companyId', sv.company_id, 'companySkillId', sv.skill_id, \
-                    'revisionNumber', (SELECT COUNT(*) FROM skill_versions prior \
-                        WHERE prior.skill_id = sv.skill_id \
-                          AND (prior.created_at, prior.id) <= (sv.created_at, sv.id)), \
-                    'label', sv.version, 'fileInventory', '[]'::jsonb, \
-                    'authorAgentId', sv.created_by_agent_id, \
-                    'authorUserId', sv.created_by_user_id, \
-                    'createdAt', sv.created_at) \
-                  FROM skill_versions sv \
+                "(SELECT {} FROM skill_versions sv \
                   WHERE sv.company_id = {alias}.company_id AND sv.skill_id = {alias}.id \
-                  ORDER BY sv.created_at DESC, sv.id DESC LIMIT 1)"
+                  ORDER BY sv.revision_number DESC LIMIT 1)",
+                skill_version_object("sv")
             ),
         ),
         jsonb_pair("starredByCurrentActor", "false"),
@@ -411,11 +406,110 @@ fn company_skill_object(alias: &str, extra: &[(String, String)]) -> String {
     jsonb_object_from_pairs(&pairs)
 }
 
+/// `CompanySkillVersion` projection.
+///
+/// `file_inventory` carries `{path, kind, content}` for the revision, so the
+/// history, diff and restore surfaces keep resolving after the live files move
+/// on. `label` is the author's note and is independent of `version`.
+fn skill_version_object(alias: &str) -> String {
+    jsonb_object_from_pairs(&[
+        jsonb_pair("id", format!("{alias}.id")),
+        jsonb_pair("companyId", format!("{alias}.company_id")),
+        jsonb_pair("companySkillId", format!("{alias}.skill_id")),
+        jsonb_pair("revisionNumber", format!("{alias}.revision_number")),
+        jsonb_pair("version", format!("{alias}.version")),
+        jsonb_pair("label", format!("{alias}.label")),
+        jsonb_pair("releaseId", format!("{alias}.release_id")),
+        jsonb_pair("releaseName", format!("{alias}.release_name")),
+        jsonb_pair("releasedAt", format!("{alias}.released_at")),
+        jsonb_pair("fileInventory", format!("{alias}.file_inventory")),
+        jsonb_pair("authorAgentId", format!("{alias}.created_by_agent_id")),
+        jsonb_pair("authorUserId", format!("{alias}.created_by_user_id")),
+        jsonb_pair("createdAt", format!("{alias}.created_at")),
+    ])
+}
+
+/// `CompanySkillTestRun` projection, including the per-run cost rollup and the
+/// retention flag the Studio uses to disable the harness deep link.
+///
+/// `status` is normalized on read: rows written before this projection existed
+/// carry the legacy `pending` default, which the Studio does not recognize.
+fn skill_test_run_object(alias: &str) -> String {
+    jsonb_object_from_pairs(&[
+        jsonb_pair("id", format!("{alias}.id")),
+        jsonb_pair("companyId", format!("{alias}.company_id")),
+        jsonb_pair("skillId", format!("{alias}.skill_id")),
+        jsonb_pair("inputId", format!("{alias}.input_id")),
+        jsonb_pair("inputSnapshot", format!("{alias}.input_snapshot")),
+        jsonb_pair("skillVersionId", format!("{alias}.skill_version_id")),
+        jsonb_pair("agentId", format!("{alias}.agent_id")),
+        jsonb_pair(
+            "agentConfigSnapshot",
+            format!("{alias}.agent_config_snapshot"),
+        ),
+        jsonb_pair("issueId", format!("{alias}.issue_id")),
+        jsonb_pair("templateId", format!("{alias}.template_id")),
+        jsonb_pair("templateName", format!("{alias}.template_name")),
+        jsonb_pair("templateBody", format!("{alias}.template_body")),
+        jsonb_pair(
+            "renderedTemplateBody",
+            format!("{alias}.rendered_template_body"),
+        ),
+        jsonb_pair(
+            "harnessIssueDescription",
+            format!(
+                "COALESCE(NULLIF({alias}.harness_issue_description, ''), {alias}.input_snapshot)"
+            ),
+        ),
+        jsonb_pair(
+            "status",
+            format!(
+                "CASE WHEN {alias}.status IN ('running','succeeded','failed','cancelled') \
+                 THEN {alias}.status ELSE 'queued' END"
+            ),
+        ),
+        jsonb_pair(
+            "outputDocumentKey",
+            format!("COALESCE(NULLIF({alias}.output_document_key, ''), 'output')"),
+        ),
+        jsonb_pair("outputSnapshot", format!("{alias}.output_snapshot")),
+        jsonb_pair("error", format!("{alias}.error")),
+        jsonb_pair("deletedAt", format!("{alias}.deleted_at")),
+        jsonb_pair("supersededAt", format!("{alias}.superseded_at")),
+        jsonb_pair(
+            "harnessIssueExpiresAt",
+            format!("{alias}.harness_issue_expires_at"),
+        ),
+        jsonb_pair(
+            "harnessIssueDeletedAt",
+            format!("{alias}.harness_issue_deleted_at"),
+        ),
+        jsonb_pair("createdAt", format!("{alias}.created_at")),
+        jsonb_pair("updatedAt", format!("{alias}.updated_at")),
+        jsonb_pair(
+            "cost",
+            format!(
+                "(SELECT jsonb_build_object( \
+                    'costCents', COALESCE(SUM(ce.cost_cents), 0), \
+                    'inputTokens', COALESCE(SUM(ce.input_tokens), 0), \
+                    'cachedInputTokens', COALESCE(SUM(ce.cached_input_tokens), 0), \
+                    'outputTokens', COALESCE(SUM(ce.output_tokens), 0)) \
+                  FROM cost_events ce \
+                  WHERE ce.company_id = {alias}.company_id AND ce.issue_id = {alias}.issue_id)"
+            ),
+        ),
+        jsonb_pair(
+            "taskExpired",
+            format!("({alias}.harness_issue_deleted_at IS NOT NULL)"),
+        ),
+    ])
+}
+
 
 #[async_trait]
 impl CompanySkillRepository for PgCompanySkillRepository {
     async fn list_by_company(&self, company_id: Uuid) -> Result<Vec<JsonValue>, RepositoryError> {
-        let rows: Vec<JsonValue> = sqlx::query_scalar(&format!(
+        let mut rows: Vec<JsonValue> = sqlx::query_scalar(&format!(
             "SELECT {} FROM company_skills cs \
              WHERE cs.company_id = $1 ORDER BY cs.name",
             company_skill_object("cs", &[])
@@ -424,6 +518,19 @@ impl CompanySkillRepository for PgCompanySkillRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(RepositoryError::DatabaseError)?;
+
+        let mut files = crate::skill_inventory::load_company_skill_files(&self.pool, company_id)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+        for row in &mut rows {
+            let skill_files = row
+                .get("id")
+                .and_then(|id| id.as_str())
+                .and_then(|id| id.parse::<Uuid>().ok())
+                .and_then(|id| files.remove(&id))
+                .unwrap_or_default();
+            crate::skill_inventory::attach_file_inventory(row, &skill_files);
+        }
 
         Ok(rows)
     }
@@ -440,7 +547,15 @@ impl CompanySkillRepository for PgCompanySkillRepository {
         .await
         .map_err(RepositoryError::DatabaseError)?;
 
-        Ok(row)
+        let Some(mut row) = row else {
+            return Ok(None);
+        };
+        let files = crate::skill_inventory::load_skill_files(&self.pool, company_id, skill_id)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+        crate::skill_inventory::attach_file_inventory(&mut row, &files);
+
+        Ok(Some(row))
     }
 
     async fn create(&self, company_id: Uuid, data: JsonValue) -> Result<JsonValue, RepositoryError> {
@@ -594,6 +709,54 @@ impl CompanySkillRepository for PgCompanySkillRepository {
         .map_err(RepositoryError::DatabaseError)?;
 
         Ok(rows)
+    }
+
+    async fn rename(
+        &self,
+        company_id: Uuid,
+        skill_id: Uuid,
+        new_name: &str,
+        new_slug: &str,
+        new_key: &str,
+        markdown: &str,
+    ) -> Result<JsonValue, RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(RepositoryError::DatabaseError)?;
+
+        // Lock the row first: the caller has already scanned for slug/key
+        // conflicts, so a concurrent rename must not slip between that scan and
+        // this write.
+        let locked: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM company_skills WHERE id = $1 AND company_id = $2 FOR UPDATE",
+        )
+        .bind(skill_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+        if locked.is_none() {
+            return Err(RepositoryError::NotFound(skill_id));
+        }
+
+        sqlx::query(
+            "UPDATE company_skills \
+             SET name = $3, slug = $4, key = $5, markdown = $6, updated_at = NOW() \
+             WHERE id = $1 AND company_id = $2",
+        )
+        .bind(skill_id)
+        .bind(company_id)
+        .bind(new_name)
+        .bind(new_slug)
+        .bind(new_key)
+        .bind(markdown)
+        .execute(&mut *tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        tx.commit().await.map_err(RepositoryError::DatabaseError)?;
+
+        self.get_by_id(company_id, skill_id)
+            .await?
+            .ok_or(RepositoryError::NotFound(skill_id))
     }
 
     async fn fork_precheck(&self, company_id: Uuid, skill_id: Uuid) -> Result<JsonValue, RepositoryError> {
@@ -778,29 +941,13 @@ impl PgSkillVersionRepository {
 #[async_trait]
 impl SkillVersionRepository for PgSkillVersionRepository {
     async fn list_versions(&self, company_id: Uuid, skill_id: Uuid) -> Result<Vec<JsonValue>, RepositoryError> {
-        let rows: Vec<JsonValue> = sqlx::query_scalar(
-            r#"
-            SELECT jsonb_build_object(
-                'id', sv.id,
-                'companyId', sv.company_id,
-                'companySkillId', sv.skill_id,
-                'revisionNumber', ROW_NUMBER() OVER (PARTITION BY sv.skill_id ORDER BY sv.created_at, sv.id),
-                'label', sv.version,
-                'releaseId', sv.release_id,
-                'releaseName', sv.release_name,
-                'releasedAt', sv.released_at,
-                'files', sv.files,
-                'fileInventory', '[]'::jsonb,
-                'authorAgentId', sv.created_by_agent_id,
-                'authorUserId', sv.created_by_user_id,
-                'createdAt', sv.created_at
-            )
-            FROM skill_versions sv
-            JOIN company_skills cs ON cs.id = sv.skill_id AND cs.company_id = $1
-            WHERE sv.skill_id = $2
-            ORDER BY sv.created_at DESC
-            "#,
-        )
+        let rows: Vec<JsonValue> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM skill_versions sv \
+             JOIN company_skills cs ON cs.id = sv.skill_id AND cs.company_id = $1 \
+             WHERE sv.skill_id = $2 \
+             ORDER BY sv.revision_number DESC",
+            skill_version_object("sv")
+        ))
         .bind(company_id)
         .bind(skill_id)
         .fetch_all(&self.pool)
@@ -811,33 +958,12 @@ impl SkillVersionRepository for PgSkillVersionRepository {
     }
 
     async fn get_version(&self, company_id: Uuid, skill_id: Uuid, version_id: Uuid) -> Result<Option<JsonValue>, RepositoryError> {
-        let row: Option<JsonValue> = sqlx::query_scalar(
-            r#"
-            SELECT jsonb_build_object(
-                'id', sv.id,
-                'companyId', sv.company_id,
-                'companySkillId', sv.skill_id,
-                'revisionNumber', (
-                    SELECT COUNT(*) + 1
-                    FROM skill_versions previous
-                    WHERE previous.skill_id = sv.skill_id
-                      AND (previous.created_at, previous.id) < (sv.created_at, sv.id)
-                ),
-                'label', sv.version,
-                'releaseId', sv.release_id,
-                'releaseName', sv.release_name,
-                'releasedAt', sv.released_at,
-                'files', sv.files,
-                'fileInventory', '[]'::jsonb,
-                'authorAgentId', sv.created_by_agent_id,
-                'authorUserId', sv.created_by_user_id,
-                'createdAt', sv.created_at
-            )
-            FROM skill_versions sv
-            JOIN company_skills cs ON cs.id = sv.skill_id AND cs.company_id = $1
-            WHERE sv.id = $2 AND sv.skill_id = $3
-            "#,
-        )
+        let row: Option<JsonValue> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM skill_versions sv \
+             JOIN company_skills cs ON cs.id = sv.skill_id AND cs.company_id = $1 \
+             WHERE sv.id = $2 AND sv.skill_id = $3",
+            skill_version_object("sv")
+        ))
         .bind(company_id)
         .bind(version_id)
         .bind(skill_id)
@@ -846,6 +972,88 @@ impl SkillVersionRepository for PgSkillVersionRepository {
         .map_err(RepositoryError::DatabaseError)?;
 
         Ok(row)
+    }
+
+    async fn create_version(
+        &self,
+        company_id: Uuid,
+        skill_id: Uuid,
+        label: Option<String>,
+        author_agent_id: Option<Uuid>,
+        author_user_id: Option<Uuid>,
+    ) -> Result<JsonValue, RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(RepositoryError::DatabaseError)?;
+
+        // Lock the skill row first: the revision number is allocated with
+        // `MAX + 1`, so two concurrent restores of the same skill must serialize.
+        let locked: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM company_skills WHERE id = $1 AND company_id = $2 FOR UPDATE",
+        )
+        .bind(skill_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+        if locked.is_none() {
+            return Err(RepositoryError::NotFound(skill_id));
+        }
+
+        let files = crate::skill_inventory::load_skill_files_in_tx(&mut tx, company_id, skill_id)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+        let file_inventory = crate::skill_inventory::skill_file_version_inventory(&files);
+
+        let next_revision: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM skill_versions \
+             WHERE company_id = $1 AND skill_id = $2",
+        )
+        .bind(company_id)
+        .bind(skill_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        let version_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO skill_versions (
+                company_id, skill_id, version, revision_number, label, file_inventory,
+                created_by_agent_id, created_by_user_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id
+            "#,
+        )
+        .bind(company_id)
+        .bind(skill_id)
+        .bind(format!("v{next_revision}"))
+        .bind(next_revision)
+        .bind(&label)
+        .bind(JsonValue::Array(file_inventory))
+        .bind(author_agent_id)
+        .bind(author_user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        sqlx::query("UPDATE company_skills SET updated_at = NOW() WHERE id = $1 AND company_id = $2")
+            .bind(skill_id)
+            .bind(company_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(RepositoryError::DatabaseError)?;
+
+        let row: Option<JsonValue> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM skill_versions sv WHERE sv.id = $1",
+            skill_version_object("sv")
+        ))
+        .bind(version_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        tx.commit().await.map_err(RepositoryError::DatabaseError)?;
+
+        row.ok_or(RepositoryError::NotFound(version_id))
     }
 }
 
@@ -996,13 +1204,21 @@ impl SkillTestRunTemplateRepository for PgSkillTestRunTemplateRepository {
                 'id', id,
                 'companyId', company_id,
                 'name', name,
+                'description', description,
+                'body', body,
+                'builtIn', false,
                 'config', config,
+                'createdByAgentId', created_by_agent_id,
+                'createdByUserId', created_by_user_id,
+                'updatedByAgentId', updated_by_agent_id,
+                'updatedByUserId', updated_by_user_id,
+                'deletedAt', deleted_at,
                 'createdAt', created_at,
                 'updatedAt', updated_at
             )
             FROM skill_test_run_templates
-            WHERE company_id = $1
-            ORDER BY name
+            WHERE company_id = $1 AND deleted_at IS NULL
+            ORDER BY name ASC, created_at ASC
             "#,
         )
         .bind(company_id)
@@ -1015,17 +1231,39 @@ impl SkillTestRunTemplateRepository for PgSkillTestRunTemplateRepository {
 
     async fn create(&self, company_id: Uuid, data: JsonValue) -> Result<JsonValue, RepositoryError> {
         let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("template");
+        let description = data.get("description").and_then(|v| v.as_str());
+        let body = data.get("body").and_then(|v| v.as_str()).unwrap_or("");
         let config = data.get("config").cloned().unwrap_or(JsonValue::Null);
+        let created_by_agent_id = data
+            .get("createdByAgentId")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<Uuid>().ok());
+        let created_by_user_id = data
+            .get("createdByUserId")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<Uuid>().ok());
 
         let row: JsonValue = sqlx::query_scalar(
             r#"
-            INSERT INTO skill_test_run_templates (company_id, name, config)
-            VALUES ($1, $2, $3)
+            INSERT INTO skill_test_run_templates (
+                company_id, name, description, body, config,
+                created_by_agent_id, created_by_user_id,
+                updated_by_agent_id, updated_by_user_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $7)
             RETURNING jsonb_build_object(
                 'id', id,
                 'companyId', company_id,
                 'name', name,
+                'description', description,
+                'body', body,
+                'builtIn', false,
                 'config', config,
+                'createdByAgentId', created_by_agent_id,
+                'createdByUserId', created_by_user_id,
+                'updatedByAgentId', updated_by_agent_id,
+                'updatedByUserId', updated_by_user_id,
+                'deletedAt', deleted_at,
                 'createdAt', created_at,
                 'updatedAt', updated_at
             )
@@ -1033,7 +1271,11 @@ impl SkillTestRunTemplateRepository for PgSkillTestRunTemplateRepository {
         )
         .bind(company_id)
         .bind(name)
+        .bind(description)
+        .bind(body)
         .bind(&config)
+        .bind(created_by_agent_id)
+        .bind(created_by_user_id)
         .fetch_one(&self.pool)
         .await
         .map_err(RepositoryError::DatabaseError)?;
@@ -1043,21 +1285,43 @@ impl SkillTestRunTemplateRepository for PgSkillTestRunTemplateRepository {
 
     async fn update(&self, company_id: Uuid, template_id: Uuid, data: JsonValue) -> Result<JsonValue, RepositoryError> {
         let name = data.get("name").and_then(|v| v.as_str());
+        let description = data.get("description").and_then(|v| v.as_str());
+        let body = data.get("body").and_then(|v| v.as_str());
         let config = data.get("config");
+        let updated_by_agent_id = data
+            .get("updatedByAgentId")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<Uuid>().ok());
+        let updated_by_user_id = data
+            .get("updatedByUserId")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<Uuid>().ok());
 
         let row: JsonValue = sqlx::query_scalar(
             r#"
             UPDATE skill_test_run_templates
             SET
                 name = COALESCE($3, name),
-                config = COALESCE($4, config),
+                description = COALESCE($4, description),
+                body = COALESCE($5, body),
+                config = COALESCE($6, config),
+                updated_by_agent_id = COALESCE($7, updated_by_agent_id),
+                updated_by_user_id = COALESCE($8, updated_by_user_id),
                 updated_at = NOW()
-            WHERE id = $1 AND company_id = $2
+            WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL
             RETURNING jsonb_build_object(
                 'id', id,
                 'companyId', company_id,
                 'name', name,
+                'description', description,
+                'body', body,
+                'builtIn', false,
                 'config', config,
+                'createdByAgentId', created_by_agent_id,
+                'createdByUserId', created_by_user_id,
+                'updatedByAgentId', updated_by_agent_id,
+                'updatedByUserId', updated_by_user_id,
+                'deletedAt', deleted_at,
                 'createdAt', created_at,
                 'updatedAt', updated_at
             )
@@ -1066,27 +1330,39 @@ impl SkillTestRunTemplateRepository for PgSkillTestRunTemplateRepository {
         .bind(template_id)
         .bind(company_id)
         .bind(name)
+        .bind(description)
+        .bind(body)
         .bind(config)
+        .bind(updated_by_agent_id)
+        .bind(updated_by_user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(RepositoryError::DatabaseError)?
-        .ok_or_else(|| RepositoryError::NotFound(template_id))?;
+        .ok_or(RepositoryError::NotFound(template_id))?;
 
         Ok(row)
     }
 
     async fn delete(&self, company_id: Uuid, template_id: Uuid) -> Result<(), RepositoryError> {
-        sqlx::query(
+        // Soft delete: runs snapshot the template they used, but the template list
+        // is still the only place a deleted template's name can be resolved.
+        let affected = sqlx::query(
             r#"
-            DELETE FROM skill_test_run_templates
-            WHERE id = $1 AND company_id = $2
+            UPDATE skill_test_run_templates
+            SET deleted_at = NOW(), updated_at = NOW()
+            WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL
             "#,
         )
         .bind(template_id)
         .bind(company_id)
         .execute(&self.pool)
         .await
-        .map_err(RepositoryError::DatabaseError)?;
+        .map_err(RepositoryError::DatabaseError)?
+        .rows_affected();
+
+        if affected == 0 {
+            return Err(RepositoryError::NotFound(template_id));
+        }
 
         Ok(())
     }
@@ -1107,24 +1383,12 @@ impl PgSkillTestRunRepository {
 #[async_trait]
 impl SkillTestRunRepository for PgSkillTestRunRepository {
     async fn list(&self, company_id: Uuid, skill_id: Uuid) -> Result<Vec<JsonValue>, RepositoryError> {
-        let rows: Vec<JsonValue> = sqlx::query_scalar(
-            r#"
-            SELECT jsonb_build_object(
-                'id', str.id,
-                'skillId', str.skill_id,
-                'templateId', str.template_id,
-                'status', str.status,
-                'result', str.result,
-                'startedAt', str.started_at,
-                'completedAt', str.completed_at,
-                'createdAt', str.created_at
-            )
-            FROM skill_test_runs str
-            JOIN company_skills cs ON cs.id = str.skill_id AND cs.company_id = $1
-            WHERE str.skill_id = $2
-            ORDER BY str.created_at DESC
-            "#,
-        )
+        let rows: Vec<JsonValue> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM skill_test_runs str \
+             WHERE str.company_id = $1 AND str.skill_id = $2 AND str.deleted_at IS NULL \
+             ORDER BY str.created_at DESC",
+            skill_test_run_object("str")
+        ))
         .bind(company_id)
         .bind(skill_id)
         .fetch_all(&self.pool)
@@ -1135,26 +1399,14 @@ impl SkillTestRunRepository for PgSkillTestRunRepository {
     }
 
     async fn get(&self, company_id: Uuid, skill_id: Uuid, run_id: Uuid) -> Result<Option<JsonValue>, RepositoryError> {
-        let row: Option<JsonValue> = sqlx::query_scalar(
-            r#"
-            SELECT jsonb_build_object(
-                'id', str.id,
-                'skillId', str.skill_id,
-                'templateId', str.template_id,
-                'status', str.status,
-                'result', str.result,
-                'startedAt', str.started_at,
-                'completedAt', str.completed_at,
-                'createdAt', str.created_at
-            )
-            FROM skill_test_runs str
-            JOIN company_skills cs ON cs.id = str.skill_id AND cs.company_id = $1
-            WHERE str.id = $2 AND str.skill_id = $3
-            "#,
-        )
-        .bind(company_id)
+        let row: Option<JsonValue> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM skill_test_runs str \
+             WHERE str.id = $1 AND str.skill_id = $2 AND str.company_id = $3",
+            skill_test_run_object("str")
+        ))
         .bind(run_id)
         .bind(skill_id)
+        .bind(company_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(RepositoryError::DatabaseError)?;
@@ -1163,39 +1415,45 @@ impl SkillTestRunRepository for PgSkillTestRunRepository {
     }
 
     async fn cancel(&self, company_id: Uuid, skill_id: Uuid, run_id: Uuid) -> Result<JsonValue, RepositoryError> {
-        let row: JsonValue = sqlx::query_scalar(
-            r#"
-            UPDATE skill_test_runs str
-            SET status = 'cancelled', updated_at = NOW()
-            FROM company_skills cs
-            WHERE str.id = $1 AND str.skill_id = $2 AND cs.id = str.skill_id AND cs.company_id = $3
-            RETURNING jsonb_build_object(
-                'id', str.id,
-                'skillId', str.skill_id,
-                'status', str.status,
-                'result', str.result,
-                'startedAt', str.started_at,
-                'completedAt', str.completed_at
-            )
-            "#,
-        )
+        // Terminal runs are returned untouched: cancelling is idempotent, and the
+        // Studio re-reads the row it already has rather than a rewritten outcome.
+        let row: Option<JsonValue> = sqlx::query_scalar(&format!(
+            "UPDATE skill_test_runs str \
+             SET status = 'cancelled', \
+                 error = COALESCE(str.error, 'Cancelled by operator'), \
+                 completed_at = COALESCE(str.completed_at, NOW()), \
+                 updated_at = NOW() \
+             WHERE str.id = $1 AND str.skill_id = $2 AND str.company_id = $3 \
+               AND str.status NOT IN ('succeeded', 'failed', 'cancelled') \
+             RETURNING {}",
+            skill_test_run_object("str")
+        ))
         .bind(run_id)
         .bind(skill_id)
         .bind(company_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(RepositoryError::DatabaseError)?
-        .ok_or_else(|| RepositoryError::NotFound(run_id))?;
+        .map_err(RepositoryError::DatabaseError)?;
 
-        Ok(row)
+        if let Some(row) = row {
+            return Ok(row);
+        }
+
+        self.get(company_id, skill_id, run_id)
+            .await?
+            .ok_or(RepositoryError::NotFound(run_id))
     }
 
     async fn delete(&self, company_id: Uuid, skill_id: Uuid, run_id: Uuid) -> Result<(), RepositoryError> {
-        sqlx::query(
+        // Soft delete: the harness issue keeps its own retention deadline, and a
+        // hard delete would orphan the run the issue still points at.
+        let affected = sqlx::query(
             r#"
-            DELETE FROM skill_test_runs str
-            USING company_skills cs
-            WHERE str.id = $1 AND str.skill_id = $2 AND cs.id = str.skill_id AND cs.company_id = $3
+            UPDATE skill_test_runs str
+            SET deleted_at = NOW(),
+                harness_issue_deleted_at = COALESCE(str.harness_issue_deleted_at, NOW()),
+                updated_at = NOW()
+            WHERE str.id = $1 AND str.skill_id = $2 AND str.company_id = $3
             "#,
         )
         .bind(run_id)
@@ -1203,9 +1461,240 @@ impl SkillTestRunRepository for PgSkillTestRunRepository {
         .bind(company_id)
         .execute(&self.pool)
         .await
-        .map_err(RepositoryError::DatabaseError)?;
+        .map_err(RepositoryError::DatabaseError)?
+        .rows_affected();
+
+        if affected == 0 {
+            return Err(RepositoryError::NotFound(run_id));
+        }
 
         Ok(())
+    }
+
+    async fn latest_active_run(&self, company_id: Uuid, skill_id: Uuid) -> Result<Option<JsonValue>, RepositoryError> {
+        let row: Option<JsonValue> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM skill_test_runs str \
+             WHERE str.company_id = $1 AND str.skill_id = $2 \
+               AND str.superseded_at IS NULL AND str.deleted_at IS NULL \
+             ORDER BY str.created_at DESC, str.id DESC LIMIT 1",
+            skill_test_run_object("str")
+        ))
+        .bind(company_id)
+        .bind(skill_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        Ok(row)
+    }
+
+    async fn create(&self, company_id: Uuid, data: JsonValue) -> Result<JsonValue, RepositoryError> {
+        let skill_id: Uuid = data
+            .get("skillId")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse().ok())
+            .ok_or(RepositoryError::NotFound(Uuid::nil()))?;
+        let input_id: Option<Uuid> = data
+            .get("inputId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok());
+        let skill_version_id: Option<Uuid> = data
+            .get("skillVersionId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok());
+        let agent_id: Option<Uuid> = data
+            .get("agentId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok());
+        let issue_id: Option<Uuid> = data
+            .get("issueId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok());
+        let started_by_agent_id: Option<Uuid> = data
+            .get("startedByAgentId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok());
+        let started_by_user_id: Option<Uuid> = data
+            .get("startedByUserId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok());
+        let text = |key: &str| -> Option<String> {
+            data.get(key).and_then(|value| value.as_str()).map(str::to_string)
+        };
+
+        let mut tx = self.pool.begin().await.map_err(RepositoryError::DatabaseError)?;
+
+        // One live run per (skill, input) slot: the newer run supersedes the older
+        // one instead of racing it, and the older run's harness task is given a
+        // retention deadline so it can be reclaimed.
+        sqlx::query(
+            r#"
+            UPDATE skill_test_runs
+            SET superseded_at = NOW(),
+                status = CASE WHEN status IN ('queued', 'running') THEN 'cancelled' ELSE status END,
+                error = CASE WHEN status IN ('queued', 'running')
+                             THEN COALESCE(error, 'Superseded by newer run') ELSE error END,
+                harness_issue_expires_at = NOW() + INTERVAL '7 days',
+                updated_at = NOW()
+            WHERE company_id = $1 AND skill_id = $2
+              AND (input_id = $3 OR ($3::uuid IS NULL AND input_id IS NULL))
+              AND superseded_at IS NULL
+            "#,
+        )
+        .bind(company_id)
+        .bind(skill_id)
+        .bind(input_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        let row: Option<JsonValue> = sqlx::query_scalar(&format!(
+            r#"
+            INSERT INTO skill_test_runs (
+                company_id, skill_id, input_id, input_snapshot, skill_version_id, agent_id,
+                agent_config_snapshot, issue_id, template_id, template_name, template_body,
+                rendered_template_body, harness_issue_description, output_document_key,
+                status, started_by_agent_id, started_by_user_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'queued', $15, $16)
+            RETURNING {}
+            "#,
+            skill_test_run_object("skill_test_runs")
+        ))
+        .bind(company_id)
+        .bind(skill_id)
+        .bind(input_id)
+        .bind(text("inputSnapshot").unwrap_or_default())
+        .bind(skill_version_id)
+        .bind(agent_id)
+        .bind(
+            data.get("agentConfigSnapshot")
+                .cloned()
+                .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
+        )
+        .bind(issue_id)
+        .bind(text("templateId"))
+        .bind(text("templateName"))
+        .bind(text("templateBody"))
+        .bind(text("renderedTemplateBody"))
+        .bind(text("harnessIssueDescription").unwrap_or_default())
+        .bind(text("outputDocumentKey").unwrap_or_else(|| "output".to_string()))
+        .bind(started_by_agent_id)
+        .bind(started_by_user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        tx.commit().await.map_err(RepositoryError::DatabaseError)?;
+
+        row.ok_or(RepositoryError::NotFound(skill_id))
+    }
+
+    async fn mark_running(&self, company_id: Uuid, issue_id: Uuid) -> Result<Option<JsonValue>, RepositoryError> {
+        let row: Option<JsonValue> = sqlx::query_scalar(&format!(
+            "UPDATE skill_test_runs str \
+             SET status = 'running', started_at = COALESCE(str.started_at, NOW()), updated_at = NOW() \
+             WHERE str.company_id = $1 AND str.issue_id = $2 AND str.status = 'queued' \
+               AND str.deleted_at IS NULL AND str.superseded_at IS NULL \
+             RETURNING {}",
+            skill_test_run_object("str")
+        ))
+        .bind(company_id)
+        .bind(issue_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        Ok(row)
+    }
+
+    async fn complete_for_issue(
+        &self,
+        company_id: Uuid,
+        issue_id: Uuid,
+        outcome: &str,
+        error: Option<String>,
+    ) -> Result<Option<JsonValue>, RepositoryError> {
+        let existing: Option<JsonValue> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM skill_test_runs str \
+             WHERE str.company_id = $1 AND str.issue_id = $2 \
+               AND str.deleted_at IS NULL AND str.superseded_at IS NULL \
+             ORDER BY str.created_at DESC, str.id DESC LIMIT 1",
+            skill_test_run_object("str")
+        ))
+        .bind(company_id)
+        .bind(issue_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        let run_id: Uuid = existing
+            .get("id")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse().ok())
+            .ok_or(RepositoryError::NotFound(Uuid::nil()))?;
+
+        // A run that already settled keeps its outcome: the issue can be closed
+        // more than once, and the first verdict is the real one.
+        let status = existing.get("status").and_then(|value| value.as_str()).unwrap_or_default();
+        if matches!(status, "succeeded" | "failed" | "cancelled") {
+            return Ok(Some(existing));
+        }
+
+        let output_document_key = existing
+            .get("outputDocumentKey")
+            .and_then(|value| value.as_str())
+            .unwrap_or("output")
+            .to_string();
+        let output_body: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT d.content
+            FROM issue_documents idoc
+            JOIN documents d ON d.id = idoc.document_id
+            WHERE idoc.company_id = $1 AND idoc.issue_id = $2 AND idoc.key = $3
+            LIMIT 1
+            "#,
+        )
+        .bind(company_id)
+        .bind(issue_id)
+        .bind(&output_document_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        let previous_snapshot = existing
+            .get("outputSnapshot")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let row: Option<JsonValue> = sqlx::query_scalar(&format!(
+            "UPDATE skill_test_runs str \
+             SET status = $3, output_snapshot = $4, error = $5, \
+                 completed_at = NOW(), updated_at = NOW() \
+             WHERE str.id = $1 AND str.company_id = $2 \
+             RETURNING {}",
+            skill_test_run_object("str")
+        ))
+        .bind(run_id)
+        .bind(company_id)
+        .bind(outcome)
+        .bind(output_body.unwrap_or(previous_snapshot))
+        .bind(error)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::DatabaseError)?;
+
+        Ok(row)
     }
 }
 

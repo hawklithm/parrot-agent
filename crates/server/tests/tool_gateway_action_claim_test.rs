@@ -374,9 +374,8 @@ async fn request_connection_route(
     (status, value)
 }
 
-
 mod common;
-use common::connect_and_migrate;
+use common::{connect_and_migrate, delete_company};
 
 
 async fn spawn_oauth_token_endpoint() -> (String, tokio::task::JoinHandle<()>) {
@@ -748,10 +747,7 @@ async fn concurrent_approval_has_one_database_claimant() {
     assert_eq!(request_status, "failed");
     assert_eq!(invocation_status, "failed");
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -840,10 +836,7 @@ async fn concurrent_tool_calls_replay_one_idempotency_key() {
     assert_eq!(stored_status, "denied");
     assert_eq!(stored_key.as_deref(), Some(idempotency_key));
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -955,10 +948,7 @@ async fn concurrent_oauth_callbacks_consume_state_once_and_persist_encrypted_use
             .await;
     assert_eq!(replay_status, StatusCode::BAD_REQUEST);
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -997,10 +987,7 @@ async fn oauth_callback_returns_paperclip_html_redirect() {
     );
     endpoint.await.expect("OAuth token endpoint task");
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -1036,10 +1023,7 @@ async fn oauth_callback_rejects_wrong_subject_without_consuming_state() {
     .expect("count unconsumed OAuth state");
     assert_eq!(state_count, 1);
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -1091,7 +1075,17 @@ async fn named_gateway_routes_require_tools_admin_permission() {
 async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
     let pool = connect_and_migrate().await;
     let company_id = Uuid::new_v4();
-    let state = build_app_state(pool).await.expect("build app state");
+    let issue_prefix = format!("TG{}", &company_id.simple().to_string()[..8]);
+    sqlx::query("INSERT INTO companies (id, name, issue_prefix) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind("Tool Gateway Runtime Slot Test")
+        .bind(issue_prefix)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+    let state = build_app_state(pool.clone())
+        .await
+        .expect("build app state");
     let app = tool_access_routes().with_state(state);
 
     let owner = board_actor_with_role(company_id, MembershipRole::Owner);
@@ -1117,9 +1111,27 @@ async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
         StatusCode::OK,
         "company owner={company_owner_body:?}"
     );
-    assert!(company_owner_body.is_array());
+    // The two list routes intentionally differ in shape: the tool-gateway route
+    // returns a bare array (Paperclip `tool-gateway.ts`), the company route an
+    // envelope (Paperclip `tool-access.ts`).
+    assert!(company_owner_body["runtimeSlots"].is_array());
 
+    // `stop`/`restart` update an existing slot row (`UPDATE ... RETURNING`), so a
+    // missing slot is a 404 (`tool_access.rs::update_runtime_slot_state`),
+    // matching Paperclip's tool-runtime supervisor. Seed one to keep asserting
+    // the owner's permission.
     let slot_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tool_runtime_slots
+            (id, company_id, slot_key, runtime_kind, status, health_status)
+         VALUES ($1, $2, $3, 'local_stdio', 'stopped', 'unchecked')",
+    )
+    .bind(slot_id)
+    .bind(company_id)
+    .bind(format!("permission-slot-{}", slot_id.simple()))
+    .execute(&pool)
+    .await
+    .expect("insert runtime slot");
     for (label, uri) in [
         (
             "company stop",
@@ -1171,6 +1183,8 @@ async fn gateway_runtime_slot_routes_require_manage_runtime_permission() {
             assert_eq!(status, StatusCode::FORBIDDEN, "{label} {action}={body:?}");
         }
     }
+
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -1201,7 +1215,7 @@ async fn stdio_template_routes_require_tools_admin_permission() {
         StatusCode::OK,
         "owner list={owner_list_body:?}"
     );
-    assert!(owner_list_body.is_array());
+    assert!(owner_list_body["templates"].is_array());
     let (owner_create_status, owner_create_body) =
         create_company_stdio_template(&app, &owner, company_id).await;
     assert_eq!(
@@ -1237,7 +1251,7 @@ async fn stdio_template_routes_require_tools_admin_permission() {
         list_company_stdio_templates(&app, &owner, company_id).await;
     assert_eq!(owner_after_disable_status, StatusCode::OK);
     assert_eq!(
-        owner_after_disable_body
+        owner_after_disable_body["templates"]
             .as_array()
             .and_then(|templates| templates.first())
             .and_then(|template| template.get("status"))
@@ -1269,10 +1283,7 @@ async fn stdio_template_routes_require_tools_admin_permission() {
         );
     }
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -1327,25 +1338,28 @@ async fn connection_management_routes_require_tool_permissions() {
     assert_eq!(status, StatusCode::OK, "test agents={body:?}");
     assert!(body.is_array());
 
+    let call_id = Uuid::new_v4();
     let (status, body) = request_connection_route(
         &app,
         &owner,
         "GET",
-        format!("/tool-connections/{connection_id}/test-calls/test-call-1"),
+        format!("/tool-connections/{connection_id}/test-calls/{call_id}"),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "test call status={body:?}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown test call={body:?}");
 
     let (status, body) = request_connection_route(
         &app,
         &owner,
         "POST",
         format!("/tool-connections/{connection_id}/test-calls"),
-        Some(json!({ "tool": "echo" })),
+        Some(json!({ "agentId": agent_id, "toolName": "echo" })),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "test call create={body:?}");
+    // No MCP catalog has been discovered for this connection, so the requested
+    // tool cannot be resolved.
+    assert_eq!(status, StatusCode::NOT_FOUND, "test call create={body:?}");
 
     let (status, body) = request_connection_route(
         &app,
@@ -1414,14 +1428,14 @@ async fn connection_management_routes_require_tool_permissions() {
                 None,
             ),
             (
-                format!("/tool-connections/{connection_id}/test-calls/test-call-1"),
+                format!("/tool-connections/{connection_id}/test-calls/{call_id}"),
                 "GET",
                 None,
             ),
             (
                 format!("/tool-connections/{connection_id}/test-calls"),
                 "POST",
-                Some(json!({ "tool": "echo" })),
+                Some(json!({ "agentId": agent_id, "toolName": "echo" })),
             ),
             (
                 format!("/tool-connections/{connection_id}/grants/installations"),
@@ -1452,10 +1466,7 @@ async fn connection_management_routes_require_tool_permissions() {
         }
     }
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -1530,7 +1541,10 @@ async fn company_tool_control_plane_routes_require_board_actor() {
         (
             "POST",
             format!("/companies/{company_id}/tools/policies/reorder"),
-            None,
+            // A body-less POST is rejected by the JSON extractor before the
+            // handler's authorization check runs; send a well-formed body so
+            // the 403 under test is actually reachable.
+            Some(json!({ "policyIds": [resource_id] })),
         ),
         (
             "POST",
@@ -1703,10 +1717,7 @@ async fn tool_application_crud_matches_board_definition_contract() {
     assert_eq!(delete_status, StatusCode::OK, "delete={delete_body:?}");
     assert_eq!(delete_body["id"], create_body["id"]);
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -1857,10 +1868,7 @@ async fn tool_connection_lifecycle_matches_definition_contract() {
     );
     assert_eq!(repeat_archive_body["status"], "archived");
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -1917,6 +1925,7 @@ async fn agent_connection_broker_routes_require_active_run_context() {
     .bind(json!({
         "oauth": {
             "authorizationUrl": "https://provider.example/oauth/authorize",
+            "tokenUrl": "https://provider.example/oauth/token",
             "clientId": "broker-client",
             "redirectUri": "https://parrot.example/api/tools/oauth/callback",
             "scopes": ["openid"]
@@ -2078,10 +2087,7 @@ async fn agent_connection_broker_routes_require_active_run_context() {
         assert_eq!(status, StatusCode::FORBIDDEN, "inactive run response={response_body:?}");
     }
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -2165,11 +2171,8 @@ async fn connection_subresources_are_company_scoped() {
         );
     }
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
-        .bind(owner_company_id)
-        .bind(other_company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, owner_company_id).await;
+    delete_company(&pool, other_company_id).await;
 }
 
 #[tokio::test]
@@ -2247,7 +2250,7 @@ async fn profile_subresources_are_company_scoped() {
         (
             "POST",
             format!("/tool-profiles/{profile_id}/duplicate"),
-            None,
+            Some(json!({"name": "cross-company duplicate"})),
         ),
         (
             "POST",
@@ -2325,7 +2328,7 @@ async fn profile_subresources_are_company_scoped() {
         &owner,
         "POST",
         format!("/tool-profiles/{profile_id}/duplicate"),
-        None,
+        Some(json!({"name": "Scoped profile copy"})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "owner profile duplicate={body:?}");
@@ -2367,11 +2370,8 @@ async fn profile_subresources_are_company_scoped() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "owner profile delete={body:?}");
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
-        .bind(owner_company_id)
-        .bind(other_company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, owner_company_id).await;
+    delete_company(&pool, other_company_id).await;
 }
 
 #[tokio::test]
@@ -2594,11 +2594,8 @@ async fn effective_profile_projection_is_scoped_and_uses_aligned_entry_schema() 
         "wrong-company agent effective profiles={body:?}"
     );
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
-        .bind(owner_company_id)
-        .bind(other_company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, owner_company_id).await;
+    delete_company(&pool, other_company_id).await;
 }
 
 #[tokio::test]
@@ -2697,11 +2694,8 @@ async fn run_decision_lookup_enforces_board_company_and_run_scope() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "missing run lookup={body:?}");
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id IN ($1, $2)")
-        .bind(company_id)
-        .bind(other_company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
+    delete_company(&pool, other_company_id).await;
 }
 
 // ================= Connection Token Exchange Tests =================
@@ -2800,10 +2794,7 @@ async fn connection_token_exchange_success_generic() {
     assert!(!refs_text.contains("minted-token"), "grant secret refs contain plaintext token");
 
     endpoint.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// Upstream 401 is mapped to credential_revoked (CONFLICT).
@@ -2856,10 +2847,7 @@ async fn connection_token_exchange_upstream_401() {
     assert_eq!(issuance_error, "credential_revoked");
 
     endpoint.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// Upstream returns invalid JSON → upstream_error (BAD_GATEWAY).
@@ -2911,10 +2899,7 @@ async fn connection_token_exchange_invalid_upstream_json() {
     assert_eq!(issuance_outcome, "upstream_error");
 
     endpoint.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// Upstream 200 with no token/access_token field → upstream_token_missing.
@@ -2967,10 +2952,7 @@ async fn connection_token_exchange_missing_token() {
     assert_eq!(issuance_error, "upstream_token_missing");
 
     endpoint.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// Upstream returns wider scope than requested → upstream_scope_exceeds_requested.
@@ -3023,10 +3005,7 @@ async fn connection_token_exchange_scope_expansion_rejected() {
     assert_eq!(issuance_error, "upstream_scope_exceeds_requested");
 
     endpoint.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// Requested TTL above 900s is truncated to 900s.
@@ -3109,10 +3088,7 @@ async fn connection_token_exchange_ttl_truncation() {
     assert!(stored_ttl >= 895 && stored_ttl <= 900, "issuance ttl_seconds={stored_ttl}");
 
     handle.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// User-grant binding: subject_user_id on request binds to user grant.
@@ -3202,10 +3178,7 @@ async fn connection_token_exchange_user_grant_binding() {
     assert_eq!(grant_subject.as_deref(), Some(user_id.as_str()));
 
     endpoint.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// No subject → workspace grant is auto-created and bound.
@@ -3258,10 +3231,7 @@ async fn connection_token_exchange_workspace_grant_binding() {
     assert!(grant_default, "workspace grant must be is_default");
 
     endpoint.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// After successful exchange, grant last_used_at is updated.
@@ -3314,10 +3284,7 @@ async fn connection_token_exchange_last_used_at_updated() {
     assert!(age >= 0 && age <= 30, "last_used_at {age}s ago, expected recent");
 
     endpoint.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// Database never stores the plaintext bearer token, only a SHA-256 hash.
@@ -3399,10 +3366,7 @@ async fn connection_token_exchange_token_hash_only_no_plaintext() {
     let config_text = serde_json::to_string(&config).expect("serialize config");
     assert!(!config_text.contains("secret-minted-token"), "plaintext token leaked into connection config");
 
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// Issuance audit record has all required fields after success.
@@ -3475,10 +3439,7 @@ async fn connection_token_exchange_issuance_audit_fields() {
     // (the failed scope-expansion test already covers this implicitly)
 
     endpoint.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 /// Concurrent exchange requests both succeed and create separate issuance records.
@@ -3552,10 +3513,7 @@ async fn connection_token_exchange_concurrent_requests() {
     assert_eq!(issuance_count, 2, "two concurrent requests produce two issuance records");
 
     handle.await.expect("token exchange endpoint task");
-    let _ = sqlx::query("DELETE FROM companies WHERE id = $1")
-        .bind(company_id)
-        .execute(&pool)
-        .await;
+    delete_company(&pool, company_id).await;
 }
 
 #[tokio::test]
@@ -3730,6 +3688,8 @@ async fn review_new_tools_persists_decisions_and_entries() {
     .await;
     assert_eq!(status, StatusCode::OK, "new tools after review={body:?}");
     assert_eq!(body.as_array().map(Vec::len), Some(0), "pending list must be empty");
+
+    delete_company(&pool, company_id).await;
 }
 
 /// Deterministic fake MCP upstream serving a fixed tools/list response; each
@@ -3817,6 +3777,8 @@ async fn catalog_refresh_version_hash_is_content_stable() {
     }
 
     server.abort();
+
+    delete_company(&pool, company_id).await;
 }
 
 /// Paperclip refreshCatalog: with config.quarantineNewEntries, new entries land
@@ -3890,6 +3852,8 @@ async fn catalog_refresh_quarantines_new_entries_per_paperclip() {
     assert_eq!(still, 2, "unchanged entries keep quarantine state");
 
     server.abort();
+
+    delete_company(&pool, company_id).await;
 }
 
 /// Policy test route runs Paperclip's decision ladder over real rows: block
@@ -3955,6 +3919,9 @@ async fn policy_test_route_runs_decision_ladder() {
     assert_eq!(status, StatusCode::OK, "policy test={body:?}");
     assert_eq!(body.get("decision").and_then(Value::as_str), Some("deny"));
     assert_eq!(body.get("reasonCode").and_then(Value::as_str), Some("deny_default"));
+
+    delete_company(&pool, company_id).await;
+    delete_company(&pool, empty_company).await;
 }
 
 /// Real rate-limit consumption: a policy with limit 2 rejects the third call
@@ -4044,6 +4011,8 @@ async fn rate_limit_policy_enforces_window_cap() {
         &pool, company_id, &policy_id, &other_bucket, &rule, chrono::Utc::now(), true,
     ).await.expect("consume other bucket").limited;
     assert!(!exceeded_other, "other tool must have its own bucket");
+
+    delete_company(&pool, company_id).await;
 }
 /// Paperclip 429 shape: a gateway decision that trips a rate_limit policy
 /// returns rate_limited with the serialized rateLimitState payload, and the
@@ -4113,4 +4082,6 @@ async fn gateway_call_returns_429_with_rate_limit_state() {
     ).await.expect("observe");
     assert!(observed.limited);
     assert_eq!(observed.count, second.count);
+
+    delete_company(&pool, company_id).await;
 }

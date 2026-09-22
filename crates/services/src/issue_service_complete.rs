@@ -47,6 +47,8 @@ pub struct ReleaseInput {
 /// Create issue input
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateIssueInput {
+    /// Optional caller-supplied id; see `models::issue::CreateIssueInput::id`.
+    pub id: Option<Uuid>,
     pub company_id: Uuid,
     pub project_id: Option<Uuid>,
     pub title: String,
@@ -116,6 +118,8 @@ pub struct UpdateIssueInput {
     pub label_ids: Option<Vec<Uuid>>,
     pub blocked_by_issue_ids: Option<Vec<Uuid>>,
     pub harness_kind: Option<String>,
+    /// Set by the skill service when a deleted test run hides its harness issue.
+    pub hidden_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Issue query filter
@@ -341,6 +345,7 @@ impl IssueService for DefaultIssueService {
 
         let status = resolve_create_issue_status(&input);
         let models_input = models::issue::CreateIssueInput {
+            id: input.id,
             company_id: input.company_id,
             project_id: input.project_id,
             project_workspace_id: input.project_workspace_id,
@@ -467,7 +472,7 @@ impl IssueService for DefaultIssueService {
             source_trust: None,
             monitor_scheduled_by: None,
             monitor_notes: None, monitor_next_check_at: None, monitor_last_triggered_at: None, monitor_attempt_count: None,
-            hidden_at: None,
+            hidden_at: input.hidden_at,
             execution_workspace_preference: None,
             execution_workspace_settings: None,
             execution_policy: None,
@@ -912,6 +917,7 @@ impl issue_service::IssueService for LegacyIssueService {
     async fn create(&self, input: models::CreateIssueInput) -> Result<crate::issue_service::IssueMutationResult, String> {
         // Map models::CreateIssueInput -> issue_service_complete::CreateIssueInput
         let compat_input = CreateIssueInput {
+            id: input.id,
             company_id: input.company_id,
             project_id: input.project_id,
             title: input.title,
@@ -960,6 +966,7 @@ impl issue_service::IssueService for LegacyIssueService {
 
     async fn create_child(&self, parent_id: Uuid, input: models::CreateIssueInput) -> Result<crate::issue_service::IssueMutationResult, String> {
         let compat_input = CreateIssueInput {
+            id: input.id,
             company_id: input.company_id,
             project_id: input.project_id,
             title: input.title,
@@ -1055,6 +1062,7 @@ impl issue_service::IssueService for LegacyIssueService {
             harness_kind: input.harness_kind,
             label_ids: input.label_ids,
             blocked_by_issue_ids: input.blocked_by_issue_ids,
+            hidden_at: input.hidden_at,
         };
         let previous = self.issue_repo.get_by_id(id).await.map_err(|e| e.to_string())?;
         let result = self.inner.update(id, company_id, compat_input).await.map_err(|e| e.to_string())?;

@@ -61,6 +61,15 @@ pub struct UpdateResourceMembershipInput {
     pub starred: Option<bool>,
 }
 
+/// Document membership has no join/leave axis, so `starred` is required and
+/// unknown keys are rejected — mirroring Paperclip's
+/// `updateDocumentResourceMembershipSchema` (`{ starred: boolean }`, `.strict()`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateDocumentMembershipInput {
+    pub starred: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceMembershipUpdateResult {
@@ -602,6 +611,154 @@ impl ResourceMembershipService {
         })
 
 
+    }
+
+    /// Update document membership (star/unstar)
+    ///
+    /// Documents have no join/leave axis: a document is readable to the whole
+    /// company, so the only per-user state is `starred`. That is why the input
+    /// is a bare boolean and why the row is deleted on unstar instead of
+    /// carrying a `state` column — a `document_memberships` row *means*
+    /// starred.
+    ///
+    /// Migrated from paperclip: server/src/services/resource-memberships.ts:439
+    pub async fn update_document(
+        &self,
+        actor: &AuthorizationActor,
+        company_id: Uuid,
+        user_id: &str,
+        document_id: Uuid,
+        starred: bool,
+    ) -> Result<ResourceMembershipUpdateResult, AppError> {
+        // 1. The document must exist and belong to this company. A cross-company
+        // id and a missing id both 404, so the endpoint cannot be used to probe
+        // for document ids in other companies.
+        let document_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM documents WHERE id = $1 AND company_id = $2)",
+        )
+        .bind(document_id)
+        .bind(company_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to check document: {e}")))?;
+
+        if !document_exists {
+            return Err(AppError::NotFound("Document not found".to_string()));
+        }
+
+        // 2. Permission check + policy hook. A star is a `joined` mutation:
+        // the resource is visible to the user, the only axis is starred.
+        let policy_decision = self
+            .assert_mutation_allowed(
+                actor,
+                company_id,
+                user_id,
+                "document",
+                document_id,
+                MembershipState::Joined,
+                Some(starred),
+            )
+            .await?;
+
+        let existing: Option<(Uuid, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>)> =
+            sqlx::query_as(
+                "SELECT id, starred_at, updated_at FROM document_memberships \
+                 WHERE company_id = $1 AND user_id = $2 AND document_id = $3",
+            )
+            .bind(company_id)
+            .bind(user_id)
+            .bind(document_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to query document membership: {e}")))?;
+
+        let policy_source = policy_decision
+            .source
+            .unwrap_or_else(|| "oss_default".to_string());
+
+        if starred {
+            // Already starred → idempotent no-op. Return the stored timestamps
+            // so a repeated request cannot reorder the caller's starred list.
+            if let Some((_, starred_at, updated_at)) = existing {
+                return Ok(ResourceMembershipUpdateResult {
+                    resource_type: "document".to_string(),
+                    resource_id: document_id.to_string(),
+                    state: "joined".to_string(),
+                    starred_at,
+                    updated_at,
+                    changed: false,
+                    change_kind: None,
+                    policy_source,
+                });
+            }
+
+            let now = chrono::Utc::now();
+            // `inserted` distinguishes a fresh star from a concurrent one that
+            // won the race; only the inserter reports `changed: true`.
+            let row: Option<(Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool)> =
+                sqlx::query_as(
+                    r#"
+                    INSERT INTO document_memberships (company_id, document_id, user_id, starred_at, created_at, updated_at)
+                    VALUES ($1, $2, $3, NOW(), NOW(), NOW())
+                    ON CONFLICT (company_id, user_id, document_id)
+                    DO UPDATE SET
+                        starred_at = document_memberships.starred_at,
+                        updated_at = document_memberships.updated_at
+                    RETURNING starred_at, updated_at, (xmax = 0) AS inserted
+                    "#,
+                )
+                .bind(company_id)
+                .bind(document_id)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to upsert document membership: {e}")))?;
+
+            let (starred_at, updated_at, inserted) = row.unwrap_or((Some(now), now, true));
+            return Ok(ResourceMembershipUpdateResult {
+                resource_type: "document".to_string(),
+                resource_id: document_id.to_string(),
+                state: "joined".to_string(),
+                starred_at: starred_at.or(Some(now)),
+                updated_at,
+                changed: inserted,
+                change_kind: inserted.then(|| "starred".to_string()),
+                policy_source,
+            });
+        }
+
+        // Unstar. No row → nothing was starred, so this is a no-op rather than
+        // an error: the caller's desired end state already holds.
+        let Some((membership_id, _, _)) = existing else {
+            return Ok(ResourceMembershipUpdateResult {
+                resource_type: "document".to_string(),
+                resource_id: document_id.to_string(),
+                state: "joined".to_string(),
+                starred_at: None,
+                updated_at: chrono::Utc::now(),
+                changed: false,
+                change_kind: None,
+                policy_source,
+            });
+        };
+
+        let deleted = sqlx::query("DELETE FROM document_memberships WHERE id = $1")
+            .bind(membership_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to delete document membership: {e}")))?;
+        let changed = deleted.rows_affected() > 0;
+
+        Ok(ResourceMembershipUpdateResult {
+            resource_type: "document".to_string(),
+            resource_id: document_id.to_string(),
+            state: "joined".to_string(),
+            starred_at: None,
+            updated_at: chrono::Utc::now(),
+            changed,
+            change_kind: changed.then(|| "unstarred".to_string()),
+            policy_source,
+        })
     }
 
     /// Log membership change activity to activity_log table

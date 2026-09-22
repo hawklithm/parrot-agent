@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use services::auth::AuthorizationActor;
+use services::skill_policy_service::{
+    normalize_skill_policy_source_type, SkillPolicyAction, SkillPolicyEvaluationResource,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use uuid::Uuid;
@@ -370,64 +373,26 @@ async fn unstar_company_skill(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// P1.3: 公司 Skill 策略网关。
-///
-/// 在 skill 变更类操作（import / install / fork）前统一评估：
-/// - 平台安全层（受保护 skill）拒绝 → 403 Forbidden
-/// - 公司策略层拒绝 → 403 Forbidden
-async fn enforce_skill_policy(
-    state: &AppState,
-    actor: &AuthorizationActor,
-    company_id: Uuid,
-    action: &str,
-    source: &str,
-    skill_key: &str,
-) -> Result<(), AppError> {
-    let role = actor_policy_role(actor, company_id);
-    let agent_id = if actor.is_agent() {
-        actor.principal_id()
-    } else {
-        None
-    };
-    let decision = state
-        .skill_policy_service
-        .evaluate(company_id, agent_id, &role, action, source, skill_key)
-        .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-
-    if !decision.allowed {
-        return Err(AppError::Forbidden(decision.reason));
-    }
-    Ok(())
-}
-
-/// 从 Actor 推导策略评估用的 role 字符串。
-fn actor_policy_role(actor: &AuthorizationActor, company_id: Uuid) -> String {
-    if actor.is_instance_admin() {
-        return "instance_admin".to_string();
-    }
-    if actor.is_agent() {
-        return "agent".to_string();
-    }
-    match actor.role_in(company_id) {
-        Some(role) => format!("{:?}", role).to_ascii_lowercase(),
-        None => "anonymous".to_string(),
-    }
-}
-
 /// SK23: Fork
 async fn fork_company_skill(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    enforce_skill_policy(
+    crate::routes::skill_policy::enforce_skill_policy(
         &state,
         &actor,
         company_id,
-        "fork",
-        "company",
-        &skill_id.to_string(),
+        SkillPolicyAction::Create,
+        crate::routes::skill_policy::skill_policy_resource(
+            &state,
+            company_id,
+            skill_id,
+            None,
+            None,
+            None,
+        )
+        .await,
     )
     .await?;
     state
@@ -596,13 +561,134 @@ async fn import_company_skill(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    enforce_skill_policy(&state, &actor, company_id, "import", "import", &skill_key).await?;
+    // `skillImportPolicyResource`：source 走 `sourceType: "workspace"`。
+    crate::routes::skill_policy::enforce_skill_policy(
+        &state,
+        &actor,
+        company_id,
+        SkillPolicyAction::Import,
+        SkillPolicyEvaluationResource {
+            skill_id: None,
+            skill_key: Some(skill_key),
+            source_type: Some(normalize_skill_policy_source_type(Some("workspace"))),
+            source_locator: None,
+        },
+    )
+    .await?;
 
     let result = state
         .skill_registry_service
         .import_skill(company_id, payload)
         .await
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// SK40: PATCH /companies/:company_id/skills/:skill_id
+async fn update_company_skill(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
+    crate::routes::skill_policy::enforce_skill_policy(
+        &state,
+        &actor,
+        company_id,
+        SkillPolicyAction::Edit,
+        crate::routes::skill_policy::skill_policy_resource(
+            &state,
+            company_id,
+            skill_id,
+            None,
+            None,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    state
+        .skill_registry_service
+        .update_company_skill(company_id, skill_id, payload)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
+}
+
+/// SK41: POST /companies/:company_id/skills/:skill_id/versions
+async fn create_skill_version(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
+    crate::routes::skill_policy::enforce_skill_policy(
+        &state,
+        &actor,
+        company_id,
+        SkillPolicyAction::Create,
+        crate::routes::skill_policy::skill_policy_resource(
+            &state,
+            company_id,
+            skill_id,
+            None,
+            None,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    let label = payload
+        .get("label")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let result = state
+        .skill_registry_service
+        .create_skill_version(company_id, skill_id, label)
+        .await
+        .map_err(AppError::from)?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// SK42: POST /companies/:company_id/skills/:skill_id/test-runs
+async fn create_skill_test_run(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path((company_id, skill_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
+    crate::routes::skill_policy::enforce_skill_policy(
+        &state,
+        &actor,
+        company_id,
+        SkillPolicyAction::Test,
+        crate::routes::skill_policy::skill_policy_resource(
+            &state,
+            company_id,
+            skill_id,
+            None,
+            None,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    let (actor_agent_id, actor_user_id) = if actor.is_agent() {
+        (actor.principal_id(), None)
+    } else {
+        (None, actor.principal_id())
+    };
+    let result = state
+        .skill_registry_service
+        .create_test_run(company_id, skill_id, payload, actor_agent_id, actor_user_id)
+        .await
+        .map_err(AppError::from)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -623,7 +709,20 @@ async fn create_company_skill(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    enforce_skill_policy(&state, &actor, company_id, "create", "company", &skill_key).await?;
+    // `skillPolicyResource` with `skillKey`（Paperclip `:1013` 传 `sourceType: "generated"`）。
+    crate::routes::skill_policy::enforce_skill_policy(
+        &state,
+        &actor,
+        company_id,
+        SkillPolicyAction::Create,
+        SkillPolicyEvaluationResource {
+            skill_id: None,
+            skill_key: Some(skill_key),
+            source_type: Some(normalize_skill_policy_source_type(Some("generated"))),
+            source_locator: None,
+        },
+    )
+    .await?;
     let result = state
         .skill_registry_service
         .create_company_skill(company_id, payload)
@@ -640,7 +739,21 @@ async fn install_skill_catalog(
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_company_access(&actor, company_id, AccessMode::Write)
         .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
-    enforce_skill_policy(&state, &actor, company_id, "install", "catalog", "*").await?;
+    // Paperclip `:1183` 传 `{ sourceType: "catalog", sourceLocator: req.body.catalogSkillId }`。
+    // 本 handler 无 body（一次装完整目录），故 `sourceLocator` 缺省。
+    crate::routes::skill_policy::enforce_skill_policy(
+        &state,
+        &actor,
+        company_id,
+        SkillPolicyAction::Install,
+        SkillPolicyEvaluationResource {
+            skill_id: None,
+            skill_key: None,
+            source_type: Some(normalize_skill_policy_source_type(Some("catalog"))),
+            source_locator: None,
+        },
+    )
+    .await?;
     state
         .skill_registry_service
         .install_catalog(company_id)
@@ -1453,7 +1566,7 @@ async fn persist_project_skill(
         .iter()
         .map(|file| SkillFileInventoryEntry {
             path: file.path.clone(),
-            kind: inventory_kind(&file.path),
+            kind: repositories::skill_inventory::classify_inventory_kind(&file.path),
         })
         .collect();
     let file_inventory_json = serde_json::to_value(&file_inventory).unwrap_or_else(|_| json!([]));
@@ -1715,27 +1828,6 @@ fn mime_type_for_path(path: &str) -> &'static str {
     }
 }
 
-fn inventory_kind(path: &str) -> &'static str {
-    let normalized = path.to_ascii_lowercase();
-    if normalized == "skill.md" {
-        "skill"
-    } else if normalized.starts_with("references/") {
-        "reference"
-    } else if normalized.starts_with("assets/") {
-        "asset"
-    } else if normalized.ends_with(".md") {
-        "markdown"
-    } else if normalized.ends_with(".sh")
-        || normalized.ends_with(".py")
-        || normalized.ends_with(".js")
-        || normalized.ends_with(".ts")
-    {
-        "script"
-    } else {
-        "other"
-    }
-}
-
 fn project_skill_source_hash(source_locator: &str) -> String {
     let digest = hex::encode(Sha256::digest(source_locator.as_bytes()));
     digest[..10].to_string()
@@ -1823,7 +1915,9 @@ pub fn skill_routes() -> Router<AppState> {
         )
         .route(
             "/companies/:company_id/skills/:skill_id",
-            get(get_company_skill).delete(delete_company_skill),
+            get(get_company_skill)
+                .patch(update_company_skill)
+                .delete(delete_company_skill),
         )
         .route(
             "/companies/:company_id/skills/:skill_id/fork-precheck",
@@ -1831,7 +1925,7 @@ pub fn skill_routes() -> Router<AppState> {
         )
         .route(
             "/companies/:company_id/skills/:skill_id/versions",
-            get(list_skill_versions),
+            get(list_skill_versions).post(create_skill_version),
         )
         .route(
             "/companies/:company_id/skills/:skill_id/versions/:version_id",
@@ -1855,7 +1949,7 @@ pub fn skill_routes() -> Router<AppState> {
         )
         .route(
             "/companies/:company_id/skills/:skill_id/test-runs",
-            get(list_skill_test_runs),
+            get(list_skill_test_runs).post(create_skill_test_run),
         )
         .route(
             "/companies/:company_id/skills/:skill_id/test-runs/:run_id",
@@ -1915,4 +2009,238 @@ pub fn skill_routes() -> Router<AppState> {
             "/companies/:company_id/skills/scan-projects",
             post(scan_skill_projects),
         )
+        .route(
+            "/companies/:company_id/skills/browse-project",
+            post(browse_project_workspace),
+        )
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectSkillBrowseRequest {
+    project_id: Uuid,
+    workspace_id: Uuid,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// A single directory entry in the browse listing.
+///
+/// `is_skill` marks an entry the import step would accept as a skill: a
+/// directory containing `SKILL.md`, or a `SKILL.md` file itself.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectSkillBrowseEntry {
+    name: String,
+    path: String,
+    kind: &'static str,
+    is_skill: bool,
+}
+
+/// SK38: Browse one directory level of a project workspace.
+///
+/// Paperclip's `browseProjectWorkspace` (`services/company-skills.ts:4814`)
+/// walks a directory one level at a time so the import picker can show what is
+/// actually on disk before anything is imported. This is the read-only half of
+/// the scan/import flow and shares its containment rules: the resolved target
+/// must stay inside the workspace root, symlinks are never followed or listed,
+/// and `.git`/`node_modules` are hidden.
+async fn browse_project_workspace(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthorizationActor>,
+    Path(company_id): Path<Uuid>,
+    payload: Json<ProjectSkillBrowseRequest>,
+) -> Result<Json<Value>, AppError> {
+    // Browsing reads the filesystem, so it needs the same write grant the
+    // import step does: Paperclip gates it on `skills.import`.
+    require_company_access(&actor, company_id, AccessMode::Write)
+        .map_err(|_| AppError::Forbidden("Skills company access denied".to_string()))?;
+
+    let request = payload.0;
+
+    let workspace: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT pw.name, pw.cwd, pw.source_type
+        FROM project_workspaces pw
+        JOIN projects p ON p.id = pw.project_id
+        WHERE pw.id = $1 AND pw.project_id = $2 AND p.company_id = $3
+        "#,
+    )
+    .bind(request.workspace_id)
+    .bind(request.project_id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    // A project in another company, a missing project, and a workspace that
+    // belongs to a different project all collapse to the same 404 so the
+    // endpoint cannot be used to enumerate ids across tenants.
+    let Some((workspace_name, workspace_cwd, source_type)) = workspace else {
+        return Err(AppError::NotFound(
+            "Project workspace not found".to_string(),
+        ));
+    };
+
+    if source_type.as_deref() == Some("remote_managed") {
+        return Err(AppError::Unprocessable(
+            "Project workspace is not available for local browsing.".to_string(),
+        ));
+    }
+
+    let Some(workspace_cwd) = workspace_cwd.filter(|value| !value.trim().is_empty()) else {
+        return Err(AppError::Unprocessable(
+            "Project workspace is not available for local browsing.".to_string(),
+        ));
+    };
+
+    let normalized_path = match request.path.as_deref().map(str::trim) {
+        Some(value) if !value.is_empty() => {
+            normalize_project_browse_path(value).ok_or_else(|| {
+                AppError::Unprocessable("Project workspace path is invalid.".to_string())
+            })?
+        }
+        _ => ".".to_string(),
+    };
+
+    let workspace_root = tokio::fs::canonicalize(&workspace_cwd)
+        .await
+        .map_err(|_| {
+            AppError::Unprocessable("Project workspace is not available locally.".to_string())
+        })?;
+
+    let relative_for_join = normalized_path.replace('/', std::path::MAIN_SEPARATOR_STR);
+    let target_path = tokio::fs::canonicalize(workspace_root.join(&relative_for_join))
+        .await
+        .map_err(|_| AppError::NotFound("Project workspace folder not found".to_string()))?;
+
+    // Canonicalizing both ends resolves symlinks, so this catches a symlinked
+    // directory that escapes the root as well as a `..` path.
+    if !target_path.starts_with(&workspace_root) {
+        return Err(AppError::Forbidden(
+            "Project workspace path is outside the workspace.".to_string(),
+        ));
+    }
+
+    let target_metadata = tokio::fs::metadata(&target_path)
+        .await
+        .map_err(|_| AppError::NotFound("Project workspace folder not found".to_string()))?;
+    if !target_metadata.is_dir() {
+        return Err(AppError::Unprocessable(
+            "Project workspace path must be a folder.".to_string(),
+        ));
+    }
+
+    let mut read_dir = tokio::fs::read_dir(&target_path)
+        .await
+        .map_err(|_| AppError::NotFound("Project workspace folder not found".to_string()))?;
+
+    let mut visible: Vec<(String, bool)> = Vec::new();
+    while let Some(entry) = read_dir
+        .next_entry()
+        .await
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" || name == "node_modules" {
+            continue;
+        }
+        // `symlink_metadata` never follows the link, so a symlink is neither
+        // listed nor allowed to stand in for a directory.
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if !file_type.is_dir() && !file_type.is_file() {
+            continue;
+        }
+        visible.push((name, file_type.is_dir()));
+    }
+
+    visible.sort_by(|left, right| match (left.1, right.1) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => left.0.cmp(&right.0),
+    });
+
+    let truncated = visible.len() > 250;
+    let mut entries = Vec::new();
+    for (name, is_directory) in visible.into_iter().take(250) {
+        let entry_path = if normalized_path == "." {
+            name.clone()
+        } else {
+            format!("{normalized_path}/{name}")
+        };
+        // A directory is a skill when it holds a `SKILL.md`; a file is a skill
+        // when it *is* `SKILL.md`. Paperclip matches the directory case
+        // case-insensitively on the real filesystem name.
+        let is_skill = if is_directory {
+            tokio::fs::metadata(target_path.join(&name).join("SKILL.md"))
+                .await
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        } else {
+            name == "SKILL.md"
+        };
+        entries.push(ProjectSkillBrowseEntry {
+            name,
+            path: entry_path,
+            kind: if is_directory { "directory" } else { "file" },
+            is_skill,
+        });
+    }
+
+    Ok(Json(json!({
+        "projectId": request.project_id,
+        "workspaceId": request.workspace_id,
+        "workspaceName": workspace_name,
+        "path": normalized_path,
+        "parentPath": if normalized_path == "." {
+            Value::Null
+        } else {
+            Value::String(
+                normalized_path
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_string())
+                    .unwrap_or_else(|| ".".to_string()),
+            )
+        },
+        "entries": entries,
+        "truncated": truncated,
+    })))
+}
+
+/// Normalize a browse path relative to the workspace root.
+///
+/// Unlike `normalize_project_skill_path`, a browse path names a *directory to
+/// list*, not a skill directory. It therefore keeps the literal segments and
+/// never rewrites a trailing `SKILL.md` to `.` — Paperclip's
+/// `normalizeProjectScanSelectionPath` (`services/company-skills.ts:1483`) has
+/// the same distinction. Absolute paths, Windows drive paths, and any `.`/`..`
+/// segment are rejected rather than resolved, so a traversal attempt fails
+/// loudly instead of being silently clamped to the root.
+fn normalize_project_browse_path(value: &str) -> Option<String> {
+    let normalized = value.trim().replace('\\', "/");
+    if normalized == "." {
+        return Some(normalized);
+    }
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.chars().nth(1) == Some(':')
+    {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for segment in normalized.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." || segment.contains('\0') {
+            return None;
+        }
+        segments.push(segment);
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments.join("/"))
 }

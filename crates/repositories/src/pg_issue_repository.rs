@@ -741,6 +741,7 @@ impl IssueRepository for PgIssueRepository {
         let mut issue = sqlx::query_as::<_, Issue>(
             r#"
             INSERT INTO issues (
+                id,
                 company_id, project_id, project_workspace_id, goal_id, parent_id,
                 title, description, status, work_mode, harness_kind, priority,
                 assignee_agent_id, assignee_user_id,
@@ -752,19 +753,20 @@ impl IssueRepository for PgIssueRepository {
                 execution_workspace_id, execution_workspace_preference
             )
             VALUES (
-                $1, $2, $3, $4, $5,
-                $6, $7, $8, $9, $10, $11,
-                $12, $13,
-                $14, $15, $16,
-                $17, $18,
-                $19, $20, $21, $22, $23,
-                $24, $25,
-                $26, $27,
-                $28, $29
+                COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11, $12,
+                $13, $14,
+                $15, $16, $17,
+                $18, $19,
+                $20, $21, $22, $23, $24,
+                $25, $26,
+                $27, $28,
+                $29, $30
             )
             RETURNING *
             "#,
         )
+        .bind(input.id)
         .bind(input.company_id)
         .bind(input.project_id)
         .bind(input.project_workspace_id)

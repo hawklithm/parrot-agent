@@ -1042,8 +1042,11 @@ async fn create_document_annotation(
     }))))
 }
 
-/// C27: POST /cases/:id/documents/:key/annotations/:thread_id/reply — Reply to annotation thread
-async fn reply_document_annotation(
+/// C27: POST /cases/:id/documents/:key/annotations/:thread_id/comments — Reply to annotation thread
+///
+/// 对齐 Paperclip `cases.ts`：线程回复走 `/comments`（Parrot 早期写成 `/reply`，
+/// 前端 `api/document-annotations.ts` 统一调用 `/comments`，导致 404）。
+async fn add_document_annotation_comment(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((id, key, thread_id)): Path<(Uuid, String, Uuid)>,
@@ -1310,7 +1313,7 @@ pub fn case_routes() -> Router<AppState> {
         // Case document annotations (C24-C28)
         .route("/cases/:id/documents/:key/annotations", get(get_document_annotations).post(create_document_annotation))
         .route("/cases/:id/documents/:key/annotations/:thread_id", get(get_document_annotation_thread).patch(update_document_annotation))
-        .route("/cases/:id/documents/:key/annotations/:thread_id/reply", post(reply_document_annotation))
+        .route("/cases/:id/documents/:key/annotations/:thread_id/comments", post(add_document_annotation_comment))
         // Case automation (C29-C32)
         .route("/cases/:id/automation/retry", post(automation_retry))
         .route("/cases/:id/automation/retry-plan", post(automation_retry_plan))

@@ -1306,8 +1306,12 @@ async fn create_issue_document_annotation(
     ))
 }
 
-/// POST /issues/:id/documents/:key/annotations/:thread_id/reply
-async fn reply_issue_document_annotation(
+/// POST /issues/:id/documents/:key/annotations/:thread_id/comments
+///
+/// 对齐 Paperclip `issues.ts` 的 `createDocumentAnnotationCommentSchema` 路由：
+/// 线程回复与线程创建一样走 `/comments`（Parrot 早期写成 `/reply`，前端
+/// `api/document-annotations.ts` 统一调用 `/comments`，导致 404）。
+async fn add_issue_document_annotation_comment(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthorizationActor>,
     Path((issue_id, raw_key, thread_id)): Path<(String, String, Uuid)>,
@@ -5964,8 +5968,8 @@ pub fn issue_routes() -> Router<AppState> {
             get(get_issue_document_annotation_thread).patch(update_issue_document_annotation),
         )
         .route(
-            "/issues/:id/documents/:key/annotations/:thread_id/reply",
-            post(reply_issue_document_annotation),
+            "/issues/:id/documents/:key/annotations/:thread_id/comments",
+            post(add_issue_document_annotation_comment),
         )
         .route("/issues/:id/documents/:key/lock", post(lock_issue_document))
         .route(

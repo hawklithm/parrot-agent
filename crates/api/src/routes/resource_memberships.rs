@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use services::auth::AuthorizationActor;
-use services::resource_membership_service::UpdateResourceMembershipInput;
+use services::resource_membership_service::{UpdateDocumentMembershipInput, UpdateResourceMembershipInput};
 use uuid::Uuid;
 
 pub fn resource_membership_routes() -> Router<AppState> {
@@ -23,6 +23,10 @@ pub fn resource_membership_routes() -> Router<AppState> {
         .route(
             "/companies/:company_id/resource-memberships/me/agents/:agent_id",
             put(update_agent_membership),
+        )
+        .route(
+            "/companies/:company_id/resource-memberships/me/documents/:document_id",
+            put(update_document_membership),
         )
 }
 
@@ -137,6 +141,60 @@ async fn update_agent_membership(
         .await?;
 
     // Log activity if changed
+    if result.changed && result.change_kind.is_some() {
+        let _ = service
+            .log_membership_activity(
+                company_id,
+                actor_type,
+                actor_id_val,
+                agent_id_actor,
+                run_id,
+                &user_id,
+                &result,
+            )
+            .await;
+    }
+
+    // Filter out internal fields (align with paperclip)
+    let response = serde_json::json!({
+        "resourceType": result.resource_type,
+        "resourceId": result.resource_id,
+        "state": result.state,
+        "starredAt": result.starred_at,
+        "updatedAt": result.updated_at,
+    });
+
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// PUT /companies/:company_id/resource-memberships/me/documents/:document_id
+/// Star or unstar a document for the current user.
+async fn update_document_membership(
+    State(state): State<AppState>,
+    Extension(auth_actor): Extension<AuthorizationActor>,
+    Path((company_id, document_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<UpdateDocumentMembershipInput>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let user_id = match &auth_actor {
+        AuthorizationActor::Board { user_id, .. } => user_id.to_string(),
+        _ => return Err(AppError::Forbidden("Board user access required".to_string())),
+    };
+
+    let (actor_type, actor_id_val, agent_id_actor, run_id) = match &auth_actor {
+        AuthorizationActor::Board { user_id, .. } => ("user", *user_id, None, None),
+        AuthorizationActor::Agent { agent_id: aid, run_id, .. } => {
+            ("agent", *aid, Some(*aid), *run_id)
+        }
+        _ => {
+            return Err(AppError::Forbidden("Authentication required".to_string()));
+        }
+    };
+
+    let service = services::ResourceMembershipService::new(state.pool.clone());
+    let result = service
+        .update_document(&auth_actor, company_id, &user_id, document_id, input.starred)
+        .await?;
+
     if result.changed && result.change_kind.is_some() {
         let _ = service
             .log_membership_activity(

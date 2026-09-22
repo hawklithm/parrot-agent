@@ -385,6 +385,16 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         // The Paperclip HTTP contract exposes all service routes below `/api`.
         .nest("/api", api_routes)
+        // Paperclip parity: express never emits `415` or `422` for a body
+        // problem — `express.json()` + zod `validate()` make a missing,
+        // malformed, or schema-invalid body a `400`
+        // (`middleware/validate.ts` + `error-handler.ts`). Axum's `Json`
+        // extractor rejects with those statuses before the handler — and before
+        // the handler's authorization check — so normalize them at the
+        // outermost layer, where the original status is still observable.
+        .layer(axum::middleware::from_fn(
+            crate::middleware::body_rejection::normalize_body_rejection_status,
+        ))
         // §8A.2 SPA fallback: serve parrot-web-ui/dist/ when PARROT_UI_DIR is set
         .merge({
             let ui_dir = std::env::var("PARROT_UI_DIR").ok();

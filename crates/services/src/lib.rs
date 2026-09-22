@@ -249,8 +249,7 @@ pub use skill_registry_service::{MockSkillRegistryService, SkillRegistryService}
 pub use skill_registry_service_impl::DefaultSkillRegistryServiceImpl;
 pub mod skill_policy_service;
 pub use skill_policy_service::{
-    DefaultSkillPolicyService, DenialType, PolicyDecision, SkillPolicyError, SkillPolicyService,
-    SkillPolicyResult,
+    DefaultSkillPolicyService, SkillPolicyError, SkillPolicyResult, SkillPolicyService,
 };
 pub mod teams_catalog_service;
 pub use teams_catalog_service::{

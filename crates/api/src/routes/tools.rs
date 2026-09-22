@@ -7919,7 +7919,7 @@ async fn call_paperclip_builtin_tool(
         "paperclipReplyIssueDocumentAnnotation" => (
             "POST",
             format!(
-                "/issues/{}/documents/{}/annotations/{}/reply",
+                "/issues/{}/documents/{}/annotations/{}/comments",
                 path_part(parameters.get("issueId"), "issueId")?,
                 path_part(parameters.get("key"), "key")?,
                 path_part(parameters.get("threadId"), "threadId")?
@@ -8189,7 +8189,7 @@ async fn call_paperclip_builtin_tool(
         "paperclipReplyCaseDocumentAnnotation" => (
             "POST",
             format!(
-                "/cases/{}/documents/{}/annotations/{}/reply",
+                "/cases/{}/documents/{}/annotations/{}/comments",
                 path_part(parameters.get("caseId"), "caseId")?,
                 path_part(parameters.get("key"), "key")?,
                 path_part(parameters.get("threadId"), "threadId")?
@@ -8263,7 +8263,7 @@ async fn call_paperclip_builtin_tool(
         "paperclipReplyRoutineDescriptionAnnotation" => (
             "POST",
             format!(
-                "/routines/{}/description/annotations/{}/reply",
+                "/routines/{}/description/annotations/{}/comments",
                 path_part(parameters.get("routineId"), "routineId")?,
                 path_part(parameters.get("threadId"), "threadId")?
             ),

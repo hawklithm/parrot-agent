@@ -276,26 +276,9 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
         pipeline_stage_repo,
         pipeline_transition_repo,
     ));
-    let skill_registry_service: Arc<dyn services::skill_registry_service::SkillRegistryService> =
-        Arc::new(DefaultSkillRegistryServiceImpl::new(
-            std::env::var("LOCAL_TRUSTED_USER_ID")
-                .ok()
-                .and_then(|id| uuid::Uuid::parse_str(&id).ok()),
-            Arc::new(PgSkillCatalogRepository::new(pool.clone())),
-            Arc::new(PgCompanySkillRepository::new(pool.clone())),
-            Arc::new(PgSkillVersionRepository::new(pool.clone())),
-            Arc::new(PgSkillTestInputRepository::new(pool.clone())),
-            Arc::new(PgSkillTestRunTemplateRepository::new(pool.clone())),
-            Arc::new(PgSkillTestRunRepository::new(pool.clone())),
-            Arc::new(PgSkillStarRepository::new(pool.clone())),
-            Arc::new(PgSkillCommentRepository::new(pool.clone())),
-            Arc::new(PgSkillFileRepository::new(pool.clone())),
-        ));
     // P1.3: 公司级 Skill 策略（平台安全层 + 公司策略层）
     let skill_policy_service: Arc<dyn services::SkillPolicyService> =
-        Arc::new(services::DefaultSkillPolicyService::new(Arc::new(
-            repositories::PgCompanySkillPolicyRepository::new(pool.clone()),
-        )));
+        Arc::new(services::DefaultSkillPolicyService::new(pool.clone()));
     // P1.4: Teams Catalog（文件系统 catalog + 事务性安装）
     let teams_catalog_service: Arc<dyn services::TeamsCatalogService> =
         Arc::new(services::DefaultTeamsCatalogService::new(pool.clone()));
@@ -431,6 +414,9 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
             .with_issue_comment_service(issue_comment_service.clone())
             .with_runtime_secret_resolver(Arc::new(
                 services::DatabaseAdapterRuntimeSecretResolver::new(pool.clone()),
+            ))
+            .with_skill_test_run_repository(Arc::new(
+                PgSkillTestRunRepository::new(pool.clone()),
             )),
     );
     let heartbeat_service: Arc<dyn services::HeartbeatService> = heartbeat_coordinator.clone();
@@ -481,6 +467,28 @@ pub async fn build_app_state(pool: PgPool) -> Result<AppState, Box<dyn std::erro
         heartbeat_service.clone(),
         recovery_action_service,
     ));
+
+    // Constructed here rather than with the other services because a skill test
+    // run opens a harness issue and wakes its assignee, so it needs the issue and
+    // heartbeat services to already exist.
+    let skill_registry_service: Arc<dyn services::skill_registry_service::SkillRegistryService> =
+        Arc::new(DefaultSkillRegistryServiceImpl::new(
+            std::env::var("LOCAL_TRUSTED_USER_ID")
+                .ok()
+                .and_then(|id| uuid::Uuid::parse_str(&id).ok()),
+            Arc::new(PgSkillCatalogRepository::new(pool.clone())),
+            Arc::new(PgCompanySkillRepository::new(pool.clone())),
+            Arc::new(PgSkillVersionRepository::new(pool.clone())),
+            Arc::new(PgSkillTestInputRepository::new(pool.clone())),
+            Arc::new(PgSkillTestRunTemplateRepository::new(pool.clone())),
+            Arc::new(PgSkillTestRunRepository::new(pool.clone())),
+            Arc::new(PgSkillStarRepository::new(pool.clone())),
+            Arc::new(PgSkillCommentRepository::new(pool.clone())),
+            Arc::new(PgSkillFileRepository::new(pool.clone())),
+            Arc::new(agent_repo.clone()),
+            issue_service.clone(),
+            heartbeat_service.clone(),
+        ));
 
     match heartbeat_coordinator.reconcile_pending_issues().await {
         Ok(count) if count > 0 => tracing::info!(count, "reconciled pending assigned issues"),

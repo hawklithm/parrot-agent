@@ -47,6 +47,17 @@ pub enum AppError {
 
     #[error("Not implemented: {0}")]
     NotImplemented(String),
+
+    /// A fully-rendered error response that preserves fields `AppError` has no
+    /// slot for — `code`, `reason`, `remediation`. Paperclip's skill-policy
+    /// denials carry them (`routes/company-skills.ts:134-141`), and dropping
+    /// them would strip the remediation hint the UI shows on a denial.
+    /// Produced from `routes::skill_policy::PolicyError`.
+    #[error("Rendered error response")]
+    Rendered {
+        status: StatusCode,
+        body: serde_json::Value,
+    },
 }
 
 /// ApiError type alias for backwards compatibility
@@ -249,6 +260,9 @@ impl IntoResponse for AppError {
             AppError::NotImplemented(msg) => {
                 (StatusCode::NOT_IMPLEMENTED, msg)
             }
+            AppError::Rendered { status, body } => {
+                return (status, Json(body)).into_response();
+            }
         };
 
         let body = Json(json!({
@@ -296,6 +310,7 @@ impl AppError {
             AppError::Internal => "Internal",
             AppError::InternalServerError(_) => "InternalServerError",
             AppError::NotImplemented(_) => "NotImplemented",
+            AppError::Rendered { .. } => "Rendered",
         }
     }
 }

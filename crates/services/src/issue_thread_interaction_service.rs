@@ -16,11 +16,11 @@ pub struct IssueThreadInteractionService {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct InteractionAgentOrgRow {
-    id: Uuid,
-    company_id: Uuid,
-    status: String,
-    reports_to: Option<Uuid>,
+pub(crate) struct InteractionAgentOrgRow {
+    pub(crate) id: Uuid,
+    pub(crate) company_id: Uuid,
+    pub(crate) status: String,
+    pub(crate) reports_to: Option<Uuid>,
 }
 
 impl IssueThreadInteractionService {
@@ -1635,7 +1635,7 @@ fn resolver_policy_rank(policy: &str) -> u8 {
     }
 }
 
-fn interaction_agent_invokability_block(
+pub(crate) fn interaction_agent_invokability_block(
     agent: &InteractionAgentOrgRow,
     company_agents: &[InteractionAgentOrgRow],
 ) -> Option<&'static str> {

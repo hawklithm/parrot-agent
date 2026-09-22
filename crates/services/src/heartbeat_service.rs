@@ -11,6 +11,7 @@ use crate::mcp_client_config::{
 };
 use chrono::{DateTime, Utc};
 use models::{Agent, AgentStatus, CommentActorType, SseEvent, SseEventType};
+use repositories::SkillTestRunRepository;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -987,6 +988,10 @@ pub struct DefaultHeartbeatService {
     budget_service: Option<Arc<dyn crate::BudgetService>>,
     runtime_secret_resolver: Option<Arc<dyn crate::AdapterRuntimeSecretResolver>>,
     issue_comment_service: Option<Arc<dyn IssueCommentService>>,
+    // Skill test runs are tracked through their harness issue, so the run row is
+    // advanced here rather than by the skill service, which never sees the run
+    // reach the agent.
+    skill_test_run_repo: Option<Arc<dyn SkillTestRunRepository>>,
 }
 
 async fn publish_live_event(
@@ -1219,6 +1224,7 @@ impl DefaultHeartbeatService {
             budget_service: None,
             runtime_secret_resolver: None,
             issue_comment_service: None,
+            skill_test_run_repo: None,
         }
     }
 
@@ -1253,6 +1259,67 @@ impl DefaultHeartbeatService {
         self
     }
 
+    pub fn with_skill_test_run_repository(
+        mut self,
+        skill_test_run_repo: Arc<dyn SkillTestRunRepository>,
+    ) -> Self {
+        self.skill_test_run_repo = Some(skill_test_run_repo);
+        self
+    }
+
+    /// Advance a skill test run to `running` once its harness issue starts.
+    ///
+    /// Best-effort: a run that cannot be advanced still executes, and the skill
+    /// service owns the authoritative status when the run settles.
+    async fn mark_skill_test_run_running(&self, issue_id: Uuid, company_id: Uuid) {
+        let Some(repo) = &self.skill_test_run_repo else {
+            return;
+        };
+        match repo.mark_running(company_id, issue_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, %issue_id, "failed to mark skill test run running");
+            }
+        }
+    }
+
+    /// Settle the skill test run owned by a finished harness issue.
+    ///
+    /// The run's output is the harness issue's `output` document, which the
+    /// repository reads back before writing the terminal status.
+    async fn complete_skill_test_run(
+        &self,
+        issue_id: Uuid,
+        company_id: Uuid,
+        run_status: &str,
+        error: Option<&str>,
+    ) {
+        let Some(repo) = &self.skill_test_run_repo else {
+            return;
+        };
+        let outcome = match run_status {
+            "succeeded" => "succeeded",
+            "cancelled" => "cancelled",
+            _ => "failed",
+        };
+        let error = match outcome {
+            "succeeded" => None,
+            "cancelled" => error.map(str::to_string),
+            _ => Some(format!("Harness run ended with status {run_status}")),
+        };
+        match repo
+            .complete_for_issue(company_id, issue_id, outcome, error)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, %issue_id, "failed to settle skill test run");
+            }
+        }
+    }
+
     /// 克隆 service 用于后台任务
     fn clone_for_background(&self) -> Self {
         Self {
@@ -1264,6 +1331,7 @@ impl DefaultHeartbeatService {
             budget_service: self.budget_service.clone(),
             runtime_secret_resolver: self.runtime_secret_resolver.clone(),
             issue_comment_service: self.issue_comment_service.clone(),
+            skill_test_run_repo: self.skill_test_run_repo.clone(),
         }
     }
 
@@ -2133,6 +2201,31 @@ impl DefaultHeartbeatService {
                 )
             }
         };
+        // A cancel terminates the adapter process, so the child exits non-zero
+        // and the branches above would read the termination this loop caused as
+        // a failure. `cancel_run` writes the run row terminal before the child
+        // is reaped; a persisted terminal status is the authoritative outcome.
+        let persisted: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status::text, error FROM heartbeat_runs WHERE id = $1",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let (status, error) = match persisted.as_ref().map(|(status, _)| status.as_str()) {
+            // The cancel that killed the process also recorded why; its reason
+            // outranks the exit code this loop just observed.
+            Some("cancelled") => (
+                "cancelled",
+                persisted
+                    .and_then(|(_, error)| error)
+                    .or_else(|| error)
+                    .or_else(|| Some("Cancelled by control plane".to_string())),
+            ),
+            Some("timed_out") => ("timed_out", error),
+            _ => (status, error),
+        };
         // Fill missing cost from official price registry when provider returned
         // token counts but no explicit cost_usd.
         if outcome.cost_usd.is_none() && (outcome.input_tokens > 0 || outcome.output_tokens > 0) {
@@ -2179,6 +2272,8 @@ impl DefaultHeartbeatService {
         {
             tracing::error!(%run_id, %error, "failed to persist heartbeat run final status");
         }
+
+        self.complete_skill_test_run(issue_id, company_id, status, error.as_deref()).await;
 
         self.post_run_summary_comment(
             run_id,
@@ -3353,6 +3448,9 @@ impl DefaultHeartbeatService {
             .map_err(|e| e.to_string())?;
         let child_ref = self.register_child(run_id, child).await;
         sqlx::query("UPDATE heartbeat_runs SET status = 'running', started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1 AND status = 'queued'").bind(run_id).execute(&self.pool).await.map_err(|e| e.to_string())?;
+        // A skill test run is tracked through its harness issue, so the run row
+        // starts moving when the issue it owns starts executing.
+        self.mark_skill_test_run_running(issue_id, company_id).await;
         let running_event = serde_json::json!({
             "runId": run_id,
             "agentId": agent_id,
@@ -3402,6 +3500,14 @@ impl DefaultHeartbeatService {
         }
         let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
         let mut stderr = child.stderr.take().ok_or("stderr unavailable")?;
+        // `Child::wait` closes stdin to signal EOF; polling `try_wait` below does
+        // not, so an adapter that reads until EOF would otherwise never finish.
+        // Already-consumed stdin is `None` and this is a no-op.
+        drop(child.stdin.take());
+        // The guard only exists to hand out stdin/stdout/stderr. Cancellation
+        // signals the process through the same mutex, so holding it across the
+        // wait would deadlock `cancel_run` for the whole run.
+        drop(child);
         let sequence = Arc::new(AtomicU64::new(0));
         let stdout_service = self.sse_service.clone();
         let stderr_service = self.sse_service.clone();
@@ -3493,13 +3599,26 @@ impl DefaultHeartbeatService {
             }
             Ok::<Vec<u8>, String>(captured)
         };
+        // Poll `try_wait` under short-lived locks instead of awaiting `wait`:
+        // the process is killed through the same mutex when a run is cancelled,
+        // and a lock held across the wait would never let that happen.
+        let wait_ref = Arc::clone(&child_ref);
+        let wait_future = async move {
+            loop {
+                match wait_ref.lock().await.try_wait() {
+                    Ok(Some(status)) => return Ok::<_, String>(status),
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        };
         let wait_result = timeout(
             timeout_sec.map(Duration::from_secs).unwrap_or(Duration::from_secs(u64::MAX)),
             async {
                 let (stdout_result, stderr_result, status) =
-                    tokio::join!(stdout_reader, stderr_reader, child.wait());
+                    tokio::join!(stdout_reader, stderr_reader, wait_future);
                 Ok::<(Vec<u8>, Vec<u8>, std::process::ExitStatus), String>(
-                    (stdout_result?, stderr_result?, status.map_err(|e| e.to_string())?),
+                    (stdout_result?, stderr_result?, status?),
                 )
             },
         )
@@ -3507,7 +3626,7 @@ impl DefaultHeartbeatService {
         let status = match wait_result {
             Ok(status) => status?,
             Err(_) => {
-                let _ = child.kill().await;
+                let _ = child_ref.lock().await.kill().await;
                 return Err(format!(
                     "adapter timed out after {} seconds",
                     timeout_sec.unwrap_or(0),
@@ -4573,7 +4692,18 @@ impl HeartbeatService for DefaultHeartbeatService {
             .bind(company_id).bind(agent_id).bind(issue_id.to_string()).fetch_optional(&self.pool).await.map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
         
         if let Some(run_id) = run {
-            // 1. 终止子进程（优雅终止）
+            // 1. Record the cancellation before killing anything. The adapter
+            // exits non-zero once terminated, so a run loop that reaps the child
+            // first would otherwise classify the termination it caused as a
+            // failure; a persisted terminal status is the authoritative outcome.
+            sqlx::query("UPDATE heartbeat_runs SET status='cancelled', error=$2, finished_at=NOW(), updated_at=NOW() WHERE id=$1 AND status IN ('queued','running','scheduled_retry')")
+                .bind(run_id)
+                .bind(reason)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
+
+            // 2. 终止子进程（优雅终止）
             if let Some(child) = self.children.lock().await.remove(&run_id) {
                 // 从 agent 配置读取 grace period（默认 2 秒）
                 let grace_sec = {
@@ -4602,14 +4732,6 @@ impl HeartbeatService for DefaultHeartbeatService {
                 }
             }
             self.http_executor.cancel(&run_id.to_string()).await;
-            
-            // 2. 更新 run 状态为 cancelled
-            sqlx::query("UPDATE heartbeat_runs SET status='cancelled', error=$2, finished_at=NOW(), updated_at=NOW() WHERE id=$1")
-                .bind(run_id)
-                .bind(reason)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| HeartbeatError::CancelRunFailed(e.to_string()))?;
             
             // 3. 释放 issue execution lock (关键修复！)
             sqlx::query(
@@ -5657,6 +5779,7 @@ impl DefaultHeartbeatService {
             budget_service: self.budget_service.clone(),
             runtime_secret_resolver: self.runtime_secret_resolver.clone(),
             issue_comment_service: self.issue_comment_service.clone(),
+            skill_test_run_repo: self.skill_test_run_repo.clone(),
         }
     }
 }

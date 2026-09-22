@@ -26,6 +26,7 @@ pub mod secret_repository;
 pub mod asset_repository;
 pub mod execution_workspace_repository;
 pub mod models;
+pub mod skill_inventory;
 pub mod board_api_key_repository;
 pub mod cli_auth_challenge_repository;
 pub mod auth_repositories;
@@ -116,11 +117,6 @@ pub use task_watchdog_repository::{
 };
 pub use skill_repository::*;
 pub use pg_skill_repository::*;
-pub mod company_skill_policy_repository;
-pub use company_skill_policy_repository::{
-    CompanySkillPolicyRepository, CompanySkillPolicyRow, PgCompanySkillPolicyRepository,
-    SkillPolicyRepositoryError,
-};
 
 /// Convert a PascalCase enum variant name (from Debug) to snake_case for DB queries.
 /// E.g., "InProgress" → "in_progress", "InReview" → "in_review", "SkillTest" → "skill_test".

@@ -109,6 +109,35 @@ pub trait SkillRegistryService: Send + Sync {
 
     /// SK39: List all skills for a company
     async fn list_company_skills(&self, company_id: Uuid) -> ServiceResult<Vec<serde_json::Value>>;
+
+    /// SK40: Update a skill's Studio-editable fields.
+    async fn update_company_skill(
+        &self,
+        company_id: Uuid,
+        skill_id: Uuid,
+        input: serde_json::Value,
+    ) -> ServiceResult<serde_json::Value>;
+
+    /// SK41: Cut a new revision of the skill's current file inventory.
+    async fn create_skill_version(
+        &self,
+        company_id: Uuid,
+        skill_id: Uuid,
+        label: Option<String>,
+    ) -> ServiceResult<serde_json::Value>;
+
+    /// SK42: Start a Skills Studio test run.
+    ///
+    /// Pins the skill revision, snapshots the agent config, opens the harness
+    /// issue the run is tracked through, and wakes the assigned agent.
+    async fn create_test_run(
+        &self,
+        company_id: Uuid,
+        skill_id: Uuid,
+        input: serde_json::Value,
+        actor_agent_id: Option<Uuid>,
+        actor_user_id: Option<Uuid>,
+    ) -> ServiceResult<serde_json::Value>;
 }
 
 /// Mock implementation for testing
@@ -402,5 +431,35 @@ impl SkillRegistryService for MockSkillRegistryService {
             serde_json::json!({"id": Uuid::new_v4(), "name": "Code Review", "category": "Development", "version": "1.0.0"}),
             serde_json::json!({"id": Uuid::new_v4(), "name": "Test Generator", "category": "Testing", "version": "1.0.0"}),
         ])
+    }
+
+    async fn update_company_skill(&self, _company_id: Uuid, skill_id: Uuid, input: serde_json::Value) -> ServiceResult<serde_json::Value> {
+        Ok(serde_json::json!({"id": skill_id, "update": input, "updated": true}))
+    }
+
+    async fn create_skill_version(&self, _company_id: Uuid, skill_id: Uuid, label: Option<String>) -> ServiceResult<serde_json::Value> {
+        Ok(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "companySkillId": skill_id,
+            "revisionNumber": 1,
+            "label": label,
+            "fileInventory": [],
+        }))
+    }
+
+    async fn create_test_run(
+        &self,
+        _company_id: Uuid,
+        skill_id: Uuid,
+        _input: serde_json::Value,
+        _actor_agent_id: Option<Uuid>,
+        _actor_user_id: Option<Uuid>,
+    ) -> ServiceResult<serde_json::Value> {
+        Ok(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "skillId": skill_id,
+            "status": "queued",
+            "issueId": Uuid::new_v4(),
+        }))
     }
 }

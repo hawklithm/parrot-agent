@@ -328,6 +328,10 @@ pub struct Issue {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateIssueInput {
+    /// Optional caller-supplied id. Paperclip's skill test harness pins the
+    /// issue id before creating it so the run row can reference it; ordinary
+    /// callers omit it and the database assigns one.
+    pub id: Option<Uuid>,
     /// Filled from the company path parameter by the API route.
     #[serde(default)]
     pub company_id: Uuid,

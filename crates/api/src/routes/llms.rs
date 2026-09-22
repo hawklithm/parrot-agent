@@ -250,7 +250,11 @@ fn build_openapi_spec() -> serde_json::Value {
         },
         "/api/companies/{companyId}/skill-policy": {
             "get": op("Get company skill policy", "skills", &bearer, &errs),
+            "put": op("Replace company skill policy", "skills", &bearer, &errs),
             "delete": op("Reset company skill policy", "skills", &bearer, &errs)
+        },
+        "/api/companies/{companyId}/skill-policy/evaluate": {
+            "post": op("Evaluate company skill policy", "skills", &bearer, &errs)
         },
         "/api/secrets": {
             "get": op("List company secrets", "secrets", &bearer, &errs),

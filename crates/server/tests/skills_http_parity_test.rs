@@ -104,8 +104,10 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .expect("insert company skill");
     sqlx::query(
         "INSERT INTO skill_versions \
-            (id, company_id, skill_id, version, release_id, release_name, released_at) \
-         VALUES ($1, $2, $3, '2.1.0', 'release-cut-v1', 'Release cut v1 - stable', '2026-08-01T00:00:00Z')",
+            (id, company_id, skill_id, version, revision_number, file_inventory, \
+             release_id, release_name, released_at) \
+         VALUES ($1, $2, $3, '2.1.0', 1, '[]'::jsonb, \
+                 'release-cut-v1', 'Release cut v1 - stable', '2026-08-01T00:00:00Z')",
     )
     .bind(release_version_a)
     .bind(company_a)

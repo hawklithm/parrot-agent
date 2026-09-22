@@ -60,8 +60,18 @@ pub async fn delete_company(pool: &PgPool, company_id: uuid::Uuid) {
         "skill_files",
         "company_skills",
         "principal_permission_grants",
+        // `activity_logs` and `heartbeat_runs` reference `companies` without
+        // `ON DELETE CASCADE`, so they must go before the company row —
+        // the tool-access handlers write activity rows on every mutation.
+        "activity_logs",
+        "heartbeat_runs",
         "agents",
         "company_memberships",
+        // `company_secrets` and `connection_grants` also reference `companies`
+        // without `ON DELETE CASCADE`. Rows hanging off a secret (`..._versions`,
+        // `..._bindings`) cascade from `company_secrets` in turn.
+        "company_secrets",
+        "connection_grants",
     ];
     // One transaction, so a company with children outside DEPENDENTS rolls
     // back whole instead of leaving the dependents deleted.

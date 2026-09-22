@@ -264,7 +264,7 @@ async fn case_document_crud_concurrency_lock_and_annotations_are_transactional(p
         &app,
         &actor,
         "POST",
-        &format!("{document_uri}/annotations/{thread_id}/reply"),
+        &format!("{document_uri}/annotations/{thread_id}/comments"),
         Some(json!({"body": "Reply from the board"})),
     )
     .await;
