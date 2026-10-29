@@ -137,9 +137,9 @@ impl CostEventRepository for PgCostEventRepository {
                 id, company_id, agent_id, issue_id, project_id, goal_id,
                 heartbeat_run_id, billing_code, provider, biller, billing_type,
                 model, input_tokens, cached_input_tokens, output_tokens,
-                cost_cents, occurred_at, created_at
+                cost_cents, amount_cents, event_type, occurred_at, created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'usage', $18, $19)
             RETURNING *
             "#
         )
@@ -158,6 +158,8 @@ impl CostEventRepository for PgCostEventRepository {
         .bind(cost_event.input_tokens)
         .bind(cost_event.cached_input_tokens)
         .bind(cost_event.output_tokens)
+        .bind(cost_event.cost_cents)
+        // Keep the legacy dashboard amount in sync with the canonical cost.
         .bind(cost_event.cost_cents)
         .bind(cost_event.occurred_at)
         .bind(cost_event.created_at)
@@ -591,10 +593,10 @@ impl CostEventRepository for PgCostEventRepository {
                 0::bigint as run_count,
                 0.0::double precision as runtime_ms
             FROM issues
-            LEFT JOIN cost_events ce ON ce.issue_id = issues.id
+            LEFT JOIN cost_events ce ON ce.company_id = '{}'::uuid AND ce.issue_id = issues.id
             WHERE issues.id IN (SELECT id FROM issue_tree)
             "#,
-            cte_seed, company_id, issue_id
+            cte_seed, company_id, company_id, issue_id
         );
 
         let cost_row = sqlx::query_as::<_, IssueTreeCostSummary>(&cost_sql)

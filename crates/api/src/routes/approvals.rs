@@ -169,6 +169,34 @@ async fn get_approval_issues(
     Ok(Json(issues))
 }
 
+/// Link a hire approval decision back to the task-team plan that requested it.
+/// A hire approval for an ordinary (non-orchestrated) hire is a no-op.
+async fn notify_orchestration_hire_decision(
+    state: &AppState,
+    company_id: Uuid,
+    approval_id: Uuid,
+    approved: bool,
+) {
+    let orchestration = services::TaskOrchestrationService::new(
+        state.pool.clone(),
+        state.heartbeat_service.clone(),
+        state.agent_service.clone(),
+        state.approval_service.clone(),
+        state.issue_service.clone(),
+    );
+    if let Err(error) = orchestration
+        .link_hire_decision(company_id, approval_id, approved)
+        .await
+    {
+        tracing::warn!(
+            %approval_id,
+            %company_id,
+            error = %error,
+            "failed to link hire approval decision to a task orchestration"
+        );
+    }
+}
+
 /// AP5: POST /approvals/:id/approve
 async fn approve_approval(
     State(state): State<AppState>,
@@ -199,6 +227,7 @@ async fn approve_approval(
         .review(input)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    notify_orchestration_hire_decision(&state, approval.company_id, approval.id, true).await;
     Ok(Json(serde_json::to_value(approval).unwrap_or_default()))
 }
 
@@ -232,6 +261,7 @@ async fn reject_approval(
         .review(input)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    notify_orchestration_hire_decision(&state, approval.company_id, approval.id, false).await;
     Ok(Json(serde_json::to_value(approval).unwrap_or_default()))
 }
 

@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{pool::PoolConnection, PgPool, Postgres, Row};
 use uuid::Uuid;
 use sha2::{Digest, Sha256};
 use std::path::{Path as FsPath, PathBuf};
@@ -1905,6 +1905,192 @@ async fn get_issue(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RunnableCeoSelection {
+    Selected(Uuid),
+    Missing,
+    Ambiguous,
+}
+
+fn should_auto_assign_runnable_ceo(
+    actor: &AuthorizationActor,
+    input: &CreateIssueInput,
+) -> bool {
+    actor.is_board()
+        && input.parent_id.is_none()
+        && matches!(input.status.as_ref(), Some(IssueStatus::Todo))
+        && input.assignee_agent_id.is_none()
+        && input.assignee_user_id.is_none()
+        && input.responsible_user_id.is_none()
+}
+
+async fn existing_issue_has_task_budget(
+    connection: &mut sqlx::PgConnection,
+    company_id: Uuid,
+    issue_id: Uuid,
+    budget_cents: i64,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT task_budget_cents IS NOT DISTINCT FROM $3
+           FROM issues WHERE id = $1 AND company_id = $2",
+    )
+    .bind(issue_id)
+    .bind(company_id)
+    .bind(Some(budget_cents))
+    .fetch_optional(connection)
+    .await?
+    .unwrap_or(false))
+}
+
+/// Resume a previously persisted auto-CEO root after a create request is
+/// replayed. The issue's server-only marker distinguishes this recovery from a
+/// Board issue that was explicitly assigned to a CEO and must not be silently
+/// converted into an orchestration.
+async fn resume_required_task_orchestration(
+    state: &AppState,
+    actor: &AuthorizationActor,
+    company_id: Uuid,
+    issue: &Issue,
+) -> Result<(), StatusCode> {
+    if !actor.is_board() {
+        return Ok(());
+    }
+    let required: Option<bool> = sqlx::query_scalar(
+        "SELECT task_orchestration_required FROM issues WHERE id = $1 AND company_id = $2",
+    )
+    .bind(issue.id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %company_id, issue_id = %issue.id, "failed to read orchestration requirement");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if required != Some(true) {
+        return Ok(());
+    }
+    // The issue assignee may have changed after the orchestration was first
+    // created. Prefer its persisted CEO when replaying; the issue assignee is
+    // only the initial-start fallback.
+    let persisted_ceo_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT ceo_agent_id FROM task_orchestrations WHERE root_issue_id = $1 AND company_id = $2",
+    )
+    .bind(issue.id)
+    .bind(company_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %company_id, issue_id = %issue.id, "failed to read persisted orchestration CEO");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let Some(requested_ceo_id) = persisted_ceo_id.or(issue.assignee_agent_id) else {
+        tracing::error!(%company_id, issue_id = %issue.id, "orchestration-required root issue has no CEO assignee");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    let orchestration = services::TaskOrchestrationService::new(
+        state.pool.clone(),
+        state.heartbeat_service.clone(),
+        state.agent_service.clone(),
+        state.approval_service.clone(),
+        state.issue_service.clone(),
+    );
+    let started = orchestration
+        .start(company_id, issue.id, requested_ceo_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %company_id, issue_id = %issue.id, "failed to resume task orchestration");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let ceo_id = started.ceo_agent_id;
+
+    if matches!(
+        issue.status,
+        IssueStatus::Todo | IssueStatus::InProgress | IssueStatus::InReview
+    ) {
+        let wakeup_service =
+            services::IssueAssignmentWakeupService::new(state.heartbeat_service.clone());
+        wakeup_service
+            .queue_wakeup(services::issue_assignment_wakeup::QueueWakeupInput {
+                company_id,
+                issue_id: issue.id,
+                assignee_agent_id: Some(ceo_id),
+                status: format!("{}", issue.status),
+                reason: "issue_assigned".to_string(),
+                mutation: "create_replay".to_string(),
+                context_source: "issue.create.replay".to_string(),
+                requested_by_actor_type: Some(actor.actor_type().to_string()),
+                requested_by_actor_id: actor.principal_id(),
+                idempotency_key: Some(format!("task-orchestration-initial:{}", issue.id)),
+                rethrow_on_error: true,
+            })
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, %company_id, issue_id = %issue.id, "failed to queue resumed orchestration");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+    Ok(())
+}
+
+async fn select_runnable_company_ceo(
+    pool: &PgPool,
+    company_id: Uuid,
+) -> Result<RunnableCeoSelection, sqlx::Error> {
+    // `idle` can start immediately and `running` can accept a queued wake.
+    // Paused, pending-approval, terminated, and non-active-company agents are
+    // deliberately excluded. Fetch at most two rows because ambiguity is a
+    // conflict, not a reason to pick an arbitrary CEO.
+    let candidates: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT agent.id
+           FROM agents agent
+           JOIN companies company ON company.id = agent.company_id
+          WHERE agent.company_id = $1
+            AND company.status = 'active'
+            AND agent.role = 'ceo'
+            AND agent.status IN ('idle', 'running')
+            AND agent.paused_at IS NULL
+          ORDER BY agent.id
+          LIMIT 2",
+    )
+    .bind(company_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(match candidates.as_slice() {
+        [] => RunnableCeoSelection::Missing,
+        [agent_id] => RunnableCeoSelection::Selected(*agent_id),
+        _ => RunnableCeoSelection::Ambiguous,
+    })
+}
+
+async fn release_issue_create_lock(
+    connection: Option<(PoolConnection<Postgres>, String)>,
+) -> Result<(), sqlx::Error> {
+    if let Some((mut connection, lock_key)) = connection {
+        if let Err(error) = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&lock_key)
+            .execute(&mut *connection)
+            .await
+        {
+            // Do not return a session-level advisory lock to the pool.
+            let _ = connection.close().await;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+async fn release_issue_create_locks(
+    title_connection: Option<(PoolConnection<Postgres>, String)>,
+    idempotency_connection: Option<(PoolConnection<Postgres>, String)>,
+) -> Result<(), sqlx::Error> {
+    // Attempt both unlocks even if the first one fails.
+    let title_result = release_issue_create_lock(title_connection).await;
+    let idempotency_result = release_issue_create_lock(idempotency_connection).await;
+    title_result.and(idempotency_result)
+}
+
 /// POST /companies/:companyId/issues - Create issue
 async fn create_issue(
     State(state): State<AppState>,
@@ -1913,6 +2099,12 @@ async fn create_issue(
     Json(mut input): Json<CreateIssueInput>,
 ) -> Result<impl IntoResponse, StatusCode> {
     crate::routes::assert_company_access(&actor, company_id, false)?;
+    if input.task_budget_cents.is_some_and(|budget| budget < 0)
+        || (input.task_budget_cents.is_some()
+            && !should_auto_assign_runnable_ceo(&actor, &input))
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
     let requested_discovery = input.watchdog_discovery.take();
     if let Some(discovery) = requested_discovery.as_ref() {
         let valid = discovery
@@ -2102,12 +2294,33 @@ async fn create_issue(
                 .bind(&title_lock_key)
                 .execute(&mut *connection)
                 .await;
+            if let Some(budget_cents) = input.task_budget_cents {
+                let matches = existing_issue_has_task_budget(
+                    &mut *connection,
+                    company_id,
+                    duplicate_issue_id,
+                    budget_cents,
+                )
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                if !matches {
+                    return Err(StatusCode::CONFLICT);
+                }
+            }
+            drop(connection);
             let duplicate_issue = state
                 .issue_service
                 .get(duplicate_issue_id, company_id)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                 .ok_or(StatusCode::NOT_FOUND)?;
+            resume_required_task_orchestration(
+                &state,
+                &actor,
+                company_id,
+                &duplicate_issue,
+            )
+            .await?;
             return Ok((
                 StatusCode::OK,
                 Json(issue_create_response(&duplicate_issue, Some("recent_open_title"))?),
@@ -2171,6 +2384,32 @@ async fn create_issue(
             }
         };
         if let Some(existing_issue_id) = existing_issue_id {
+            if let Some(budget_cents) = input.task_budget_cents {
+                let matches = existing_issue_has_task_budget(
+                    &mut *connection,
+                    company_id,
+                    existing_issue_id,
+                    budget_cents,
+                )
+                .await;
+                match matches {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                            .bind(&lock_key)
+                            .execute(&mut *connection)
+                            .await;
+                        return Err(StatusCode::CONFLICT);
+                    }
+                    Err(_) => {
+                        let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                            .bind(&lock_key)
+                            .execute(&mut *connection)
+                            .await;
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                }
+            }
             let existing_issue = match state
                 .issue_service
                 .get(existing_issue_id, company_id)
@@ -2197,6 +2436,14 @@ async fn create_issue(
                 .execute(&mut *connection)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            drop(connection);
+            resume_required_task_orchestration(
+                &state,
+                &actor,
+                company_id,
+                &existing_issue,
+            )
+            .await?;
             return Ok((
                 StatusCode::OK,
                 Json(issue_create_response(&existing_issue, Some("idempotency_key"))?),
@@ -2206,6 +2453,62 @@ async fn create_issue(
     } else {
         None
     };
+    let mut orchestration_ceo_id: Option<Uuid> = None;
+    if should_auto_assign_runnable_ceo(&actor, &input) {
+        let selection = match select_runnable_company_ceo(&state.pool, company_id).await {
+            Ok(selection) => selection,
+            Err(error) => {
+                if let Err(unlock_error) = release_issue_create_locks(
+                    title_connection.take(),
+                    idempotency_connection.take(),
+                )
+                .await
+                {
+                    tracing::error!(
+                        error = %unlock_error,
+                        company_id = %company_id,
+                        "failed to release issue creation locks after CEO lookup failure"
+                    );
+                }
+                tracing::error!(error = %error, company_id = %company_id, "failed to select runnable company CEO");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+
+        let (ceo_id, conflict_message) = match selection {
+            RunnableCeoSelection::Selected(ceo_id) => (Some(ceo_id), None),
+            RunnableCeoSelection::Missing => (
+                None,
+                Some("Cannot create this todo issue: the company has no runnable CEO."),
+            ),
+            RunnableCeoSelection::Ambiguous => (
+                None,
+                Some("Cannot create this todo issue: the company has multiple runnable CEOs."),
+            ),
+        };
+
+        if let Some(message) = conflict_message {
+            if let Err(error) = release_issue_create_locks(
+                title_connection.take(),
+                idempotency_connection.take(),
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %error,
+                    company_id = %company_id,
+                    "failed to release issue creation locks after CEO selection conflict"
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            return Ok((StatusCode::CONFLICT, Json(json!({"error": message}))));
+        }
+
+        input.assignee_agent_id = ceo_id;
+        input.task_orchestration_required = true;
+        orchestration_ceo_id = ceo_id;
+    }
+
     let service = state.issue_service.clone();
     let created = match service.create(input).await {
         Ok(created) => created,
@@ -2245,6 +2548,38 @@ async fn create_issue(
         }
     }
 
+    // A root task routed to the CEO owns a persistent orchestration. Start it
+    // before the wake below so the CEO's first run already sees the
+    // orchestration instance in its task context.
+    if let Some(ceo_id) = orchestration_ceo_id {
+        let orchestration = services::TaskOrchestrationService::new(
+            state.pool.clone(),
+            state.heartbeat_service.clone(),
+            state.agent_service.clone(),
+            state.approval_service.clone(),
+            state.issue_service.clone(),
+        );
+        match orchestration
+            .start(company_id, created.issue.id, ceo_id)
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    issue_id = %created.issue.id,
+                    %company_id,
+                    "failed to start task orchestration for a CEO-routed root issue"
+                );
+                // The persisted server-only marker keeps heartbeat recovery
+                // from dispatching this issue as an ordinary task. A Board
+                // retry with the same idempotency key (or title) re-enters the
+                // start path and then wakes it once the orchestration exists.
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
     // Queue issue assignment wakeup (matches paperclip: routes/issues.ts:7054-7062)
     // Skip if no assignee or backlog status
     if let Some(assignee_agent_id) = created.issue.assignee_agent_id {
@@ -2262,8 +2597,9 @@ async fn create_issue(
                 context_source: "issue.create".to_string(),
                 requested_by_actor_type: Some(actor.actor_type().to_string()),
                 requested_by_actor_id: actor.principal_id(),
-                idempotency_key: None,
-                rethrow_on_error: false, // Swallow error to avoid blocking response
+                idempotency_key: orchestration_ceo_id
+                    .map(|_| format!("task-orchestration-initial:{}", created.issue.id)),
+                rethrow_on_error: orchestration_ceo_id.is_some(),
             };
 
             if let Err(e) = wakeup_service.queue_wakeup(wakeup_input).await {
@@ -2273,6 +2609,9 @@ async fn create_issue(
                     assignee_agent_id = %assignee_agent_id,
                     "Failed to wake assignee on issue creation"
                 );
+                if orchestration_ceo_id.is_some() {
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
             }
         }
     }

@@ -73,6 +73,9 @@ pub struct CreateIssueInput {
     pub origin_fingerprint: Option<String>,
     pub request_depth: Option<i32>,
     pub billing_code: Option<String>,
+    pub task_budget_cents: Option<i64>,
+    #[serde(skip)]
+    pub task_orchestration_required: bool,
     pub execution_workspace_id: Option<Uuid>,
     pub execution_workspace_preference: Option<String>,
     pub execution_policy: Option<models::IssueExecutionPolicy>,
@@ -300,6 +303,16 @@ impl DefaultIssueService {
 #[async_trait]
 impl IssueService for DefaultIssueService {
     async fn create(&self, mut input: CreateIssueInput) -> Result<IssueMutationResult, ServiceError> {
+        if input.task_budget_cents.is_some()
+            && (input.task_budget_cents.is_some_and(|amount| amount < 0)
+                || input.parent_id.is_some()
+                || input.created_by_user_id.is_none()
+                || input.created_by_agent_id.is_some())
+        {
+            return Err(ServiceError::InvalidInput(
+                "task budgets may only be set by a Board user on a root issue".to_string(),
+            ));
+        }
         // Validate parent exists if specified
         if let Some(parent_id) = input.parent_id {
             let parent = self.issue_repo
@@ -369,6 +382,8 @@ impl IssueService for DefaultIssueService {
             origin_fingerprint: input.origin_fingerprint,
             request_depth: input.request_depth,
             billing_code: input.billing_code,
+            task_budget_cents: input.task_budget_cents,
+            task_orchestration_required: input.task_orchestration_required,
             execution_workspace_id: input.execution_workspace_id,
             execution_workspace_preference: input.execution_workspace_preference,
             execution_policy: input.execution_policy,
@@ -942,6 +957,8 @@ impl issue_service::IssueService for LegacyIssueService {
             origin_fingerprint: input.origin_fingerprint,
             request_depth: input.request_depth,
             billing_code: input.billing_code,
+            task_budget_cents: input.task_budget_cents,
+            task_orchestration_required: input.task_orchestration_required,
             execution_workspace_id: input.execution_workspace_id,
             execution_workspace_preference: input.execution_workspace_preference,
             execution_policy: input.execution_policy,
@@ -955,8 +972,11 @@ impl issue_service::IssueService for LegacyIssueService {
             watchdog_created_by_run_id: input.watchdog_created_by_run_id,
             watchdog_discovery_audit: input.watchdog_discovery_audit,
         };
+        let orchestration_required = compat_input.task_orchestration_required;
         let result = self.inner.create(compat_input).await.map_err(|e| e.to_string())?;
-        self.wake_assigned_issue(&result.issue, "issue_assigned");
+        if !orchestration_required {
+            self.wake_assigned_issue(&result.issue, "issue_assigned");
+        }
         Ok(crate::issue_service::IssueMutationResult {
             changed: result.changed,
             issue: result.issue,
@@ -991,6 +1011,8 @@ impl issue_service::IssueService for LegacyIssueService {
             origin_fingerprint: input.origin_fingerprint,
             request_depth: input.request_depth,
             billing_code: input.billing_code,
+            task_budget_cents: input.task_budget_cents,
+            task_orchestration_required: input.task_orchestration_required,
             execution_workspace_id: input.execution_workspace_id,
             execution_workspace_preference: input.execution_workspace_preference,
             execution_policy: input.execution_policy,

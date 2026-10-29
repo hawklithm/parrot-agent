@@ -459,6 +459,30 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
         ("paperclipUpdateRoutineTrigger", "Update a routine trigger"),
         ("paperclipDeleteRoutineTrigger", "Delete a routine trigger"),
         ("paperclipRotateRoutineTriggerSecret", "Rotate a routine trigger secret"),
+        (
+            "paperclipGetTaskOrchestration",
+            "Read the task orchestration state for a root issue in the authenticated agent's company",
+        ),
+        (
+            "paperclipSubmitTaskDecision",
+            "Submit the CEO decision contract for an orchestrated task",
+        ),
+        (
+            "paperclipAdjustTaskTeam",
+            "Change task-scoped team membership as the orchestration CEO",
+        ),
+        (
+            "paperclipSubmitTaskDeliverable",
+            "Submit a deliverable for a subtask owned by the authenticated agent",
+        ),
+        (
+            "paperclipReviewTaskSubtask",
+            "Accept or return a subtask deliverable as its assigned direct reviewer",
+        ),
+        (
+            "paperclipSubmitTaskFinalReport",
+            "Record the final report for an orchestrated task as its CEO",
+        ),
     ];
     TOOLS
         .iter()
@@ -856,6 +880,87 @@ fn paperclip_builtin_tool_definitions() -> Vec<McpToolDefinition> {
                 "paperclipUpdateRoutineTrigger" | "paperclipDeleteRoutineTrigger" | "paperclipRotateRoutineTriggerSecret" => serde_json::json!({
                     "type": "object", "properties": {"triggerId": {"type": "string", "format": "uuid"}}, "required": ["triggerId"], "additionalProperties": false
                 }),
+                "paperclipGetTaskOrchestration" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string", "format": "uuid", "description": "Root issue UUID in the authenticated agent's company"}
+                    }, "required": ["issueId"], "additionalProperties": false
+                }),
+                "paperclipSubmitTaskDecision" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string", "format": "uuid"},
+                        "contract": {"type": "object", "properties": {
+                            "contractVersion": {"type": "integer", "const": 1},
+                            "assessment": {"type": "string", "minLength": 1, "maxLength": 4000},
+                            "complexity": {"type": "string", "enum": ["simple", "complex"]},
+                            "rationale": {"type": "string", "minLength": 1, "maxLength": 4000},
+                            "members": {"type": "array", "maxItems": 32, "items": {"type": "object", "properties": {
+                                "agentId": {"type": ["string", "null"], "format": "uuid"},
+                                "action": {"type": "string", "enum": ["reuse", "hire", "exit"]},
+                                "role": {"type": "string"},
+                                "responsibilities": {"type": "string", "maxLength": 4000},
+                                "reason": {"type": "string", "maxLength": 4000},
+                                "reportsToAgentId": {"type": ["string", "null"], "format": "uuid"},
+                                "hire": {"type": ["object", "null"], "properties": {
+                                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                                    "title": {"type": ["string", "null"], "maxLength": 255},
+                                    "adapterType": {"type": "string"},
+                                    "budgetMonthlyCents": {"type": ["integer", "null"], "minimum": 0}
+                                }, "required": ["name", "adapterType"], "additionalProperties": false}
+                            }, "required": ["action", "role", "responsibilities", "reason"], "additionalProperties": false}},
+                            "subtasks": {"type": "array", "maxItems": 64, "items": {"type": "object", "properties": {
+                                "key": {"type": "string", "minLength": 1},
+                                "title": {"type": "string", "minLength": 1, "maxLength": 4000},
+                                "description": {"type": "string", "maxLength": 4000},
+                                "ownerAgentId": {"type": "string", "format": "uuid"},
+                                "reviewerAgentId": {"type": ["string", "null"], "format": "uuid"},
+                                "acceptanceCriteria": {"type": "string", "minLength": 1, "maxLength": 4000},
+                                "blockedBy": {"type": "array", "items": {"type": "string"}},
+                                "parentKey": {"type": ["string", "null"]}
+                            }, "required": ["key", "title", "description", "ownerAgentId", "acceptanceCriteria"], "additionalProperties": false}},
+                            "questions": {"type": "array", "maxItems": 10, "items": {"type": "object", "properties": {
+                                "question": {"type": "string", "minLength": 1, "maxLength": 4000},
+                                "whyItBlocks": {"type": "string", "minLength": 1, "maxLength": 4000}
+                            }, "required": ["question", "whyItBlocks"], "additionalProperties": false}},
+                            "ceoExecutes": {"type": "boolean"}
+                        }, "required": ["contractVersion", "assessment", "complexity", "rationale"], "additionalProperties": false}
+                    }, "required": ["issueId", "contract"], "additionalProperties": false
+                }),
+                "paperclipAdjustTaskTeam" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string", "format": "uuid"},
+                        "members": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "properties": {
+                            "agentId": {"type": "string", "format": "uuid"},
+                            "action": {"type": "string", "enum": ["reuse", "exit"]},
+                            "role": {"type": "string"},
+                            "responsibilities": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "reportsToAgentId": {"type": ["string", "null"], "format": "uuid"}
+                        }, "required": ["agentId", "action", "role", "responsibilities", "reason"], "additionalProperties": false}}
+                    }, "required": ["issueId", "members"], "additionalProperties": false
+                }),
+                "paperclipSubmitTaskDeliverable" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string", "format": "uuid"},
+                        "subtaskIssueId": {"type": "string", "format": "uuid"},
+                        "body": {"type": ["string", "null"]},
+                        "evidence": {}
+                    }, "required": ["issueId", "subtaskIssueId"], "additionalProperties": false
+                }),
+                "paperclipReviewTaskSubtask" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string", "format": "uuid"},
+                        "subtaskIssueId": {"type": "string", "format": "uuid"},
+                        "accepted": {"type": "boolean"},
+                        "feedback": {"type": ["string", "null"]}
+                    }, "required": ["issueId", "subtaskIssueId", "accepted"], "additionalProperties": false
+                }),
+                "paperclipSubmitTaskFinalReport" => serde_json::json!({
+                    "type": "object", "properties": {
+                        "issueId": {"type": "string", "format": "uuid"},
+                        "body": {"type": "string", "minLength": 1},
+                        "evidence": {}
+                    }, "required": ["issueId", "body"], "additionalProperties": false
+                }),
                 "paperclipApiRequest" => serde_json::json!({
                     "type": "object", "properties": {"method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]}, "path": {"type": "string"}, "jsonBody": {"type": "string"}},
                     "required": ["method", "path"], "additionalProperties": false
@@ -938,6 +1043,13 @@ fn validate_paperclip_arguments(tool_name: &str, parameters: &Value) -> Result<(
         }
         "paperclipCreateIssue" => &["title"],
         "paperclipUpdateIssue" | "paperclipCheckoutIssue" | "paperclipReleaseIssue" => &["issueId"],
+        "paperclipGetTaskOrchestration" => &["issueId"],
+        "paperclipSubmitTaskDecision" => &["issueId", "contract"],
+        "paperclipAdjustTaskTeam" => &["issueId", "members"],
+        "paperclipSubmitTaskDeliverable" | "paperclipReviewTaskSubtask" => {
+            &["issueId", "subtaskIssueId"]
+        }
+        "paperclipSubmitTaskFinalReport" => &["issueId", "body"],
         "paperclipAddComment" => &["issueId", "body"],
         "paperclipUpsertIssueDocument" => &["issueId", "key", "body"],
         "paperclipRestoreIssueDocumentRevision" => &["issueId", "key", "revisionId"],
@@ -7452,6 +7564,60 @@ async fn call_paperclip_builtin_tool(
             ),
             None,
         ),
+        "paperclipGetTaskOrchestration" => (
+            "GET",
+            format!(
+                "/companies/{company_id}/issues/{}/orchestration",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            None,
+        ),
+        "paperclipSubmitTaskDecision" => (
+            "POST",
+            format!(
+                "/companies/{company_id}/issues/{}/orchestration/decision",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            Some(serde_json::json!({
+                "contract": parameters.get("contract").cloned().unwrap_or(Value::Null)
+            })),
+        ),
+        "paperclipAdjustTaskTeam" => (
+            "POST",
+            format!(
+                "/companies/{company_id}/issues/{}/orchestration/team-members",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            Some(serde_json::json!({
+                "members": parameters.get("members").cloned().unwrap_or_else(|| serde_json::json!([]))
+            })),
+        ),
+        "paperclipSubmitTaskDeliverable" => (
+            "POST",
+            format!(
+                "/companies/{company_id}/issues/{}/orchestration/subtasks/{}/submit",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("subtaskIssueId"), "subtaskIssueId")?
+            ),
+            Some(object_without(&parameters, &["issueId", "subtaskIssueId"])),
+        ),
+        "paperclipReviewTaskSubtask" => (
+            "POST",
+            format!(
+                "/companies/{company_id}/issues/{}/orchestration/subtasks/{}/review",
+                path_part(parameters.get("issueId"), "issueId")?,
+                path_part(parameters.get("subtaskIssueId"), "subtaskIssueId")?
+            ),
+            Some(object_without(&parameters, &["issueId", "subtaskIssueId"])),
+        ),
+        "paperclipSubmitTaskFinalReport" => (
+            "POST",
+            format!(
+                "/companies/{company_id}/issues/{}/orchestration/final-report",
+                path_part(parameters.get("issueId"), "issueId")?
+            ),
+            Some(object_without(&parameters, &["issueId"])),
+        ),
         "paperclipListComments" => (
             "GET",
             format!(
@@ -11391,8 +11557,8 @@ mod tests {
     const PAPERCLIP_PARITY_TOOL_COUNT: usize = 41;
     /// Parrot 在 Paperclip 基础上额外提供的工具：`paperclipHireAgent`（走 approval 流程）。
     const PARROT_EXTRA_TOOL_COUNT: usize = 1;
-    /// Parrot 已有 API dispatcher 覆盖、此前漏注册到 MCP tools/list 的扩展工具。
-    const PARROT_EXTENDED_TOOL_COUNT: usize = 55;
+    /// Parrot API extensions plus task-orchestration tools exposed to agents.
+    const PARROT_EXTENDED_TOOL_COUNT: usize = 61;
 
     #[test]
     fn paperclip_builtin_registry_contains_core_tools() {
@@ -11422,6 +11588,24 @@ mod tests {
             "MCP registry size drifted from the Paperclip reference and Parrot extensions"
         );
         assert!(names.contains("paperclipHireAgent"));
+        for orchestration_tool in [
+            "paperclipGetTaskOrchestration",
+            "paperclipSubmitTaskDecision",
+            "paperclipAdjustTaskTeam",
+            "paperclipSubmitTaskDeliverable",
+            "paperclipReviewTaskSubtask",
+            "paperclipSubmitTaskFinalReport",
+        ] {
+            assert!(names.contains(orchestration_tool), "missing MCP tool {orchestration_tool}");
+        }
+        for board_only_tool in [
+            "paperclipDecideTaskTeamPlan",
+            "paperclipCancelTaskOrchestration",
+            "paperclipRetryTaskOrchestration",
+            "paperclipResumeTaskOrchestration",
+        ] {
+            assert!(!names.contains(board_only_tool), "Board-only tool must not be listed: {board_only_tool}");
+        }
         for extended in [
             "paperclipCreateCase", "paperclipGetCase", "paperclipUpdateCase",
             "paperclipListCases", "paperclipGetCaseChildren", "paperclipGetCaseEvents",
@@ -11456,6 +11640,69 @@ mod tests {
             .get("inputSchema")
             .and_then(|schema| schema.get("type"))
             .is_some()));
+    }
+
+    #[test]
+    fn orchestration_tool_schemas_match_the_rest_contracts() {
+        let definitions = paperclip_builtin_tool_definitions();
+        let schema_for = |name: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .map(|definition| definition.input_schema.clone())
+                .expect("orchestration tool is registered")
+        };
+
+        let decision = schema_for("paperclipSubmitTaskDecision");
+        assert_eq!(decision["required"], serde_json::json!(["issueId", "contract"]));
+        assert_eq!(
+            decision["properties"]["contract"]["properties"]["contractVersion"]["const"],
+            1
+        );
+        assert_eq!(
+            decision["properties"]["contract"]["properties"]["subtasks"]["items"]["required"],
+            serde_json::json!(["key", "title", "description", "ownerAgentId", "acceptanceCriteria"])
+        );
+        assert_eq!(
+            schema_for("paperclipAdjustTaskTeam")["properties"]["members"]["items"]["properties"]["action"]["enum"],
+            serde_json::json!(["reuse", "exit"])
+        );
+        assert_eq!(
+            schema_for("paperclipReviewTaskSubtask")["required"],
+            serde_json::json!(["issueId", "subtaskIssueId", "accepted"])
+        );
+
+        assert!(validate_paperclip_arguments(
+            "paperclipSubmitTaskDecision",
+            &serde_json::json!({
+                "issueId": Uuid::new_v4(),
+                "contract": {
+                    "contractVersion": 1,
+                    "assessment": "small",
+                    "complexity": "simple",
+                    "rationale": "CEO can do it",
+                    "ceoExecutes": true,
+                    "members": [],
+                    "subtasks": [],
+                    "questions": []
+                }
+            })
+        )
+        .is_ok());
+        assert!(validate_paperclip_arguments(
+            "paperclipSubmitTaskDecision",
+            &serde_json::json!({
+                "issueId": Uuid::new_v4(),
+                "contract": {
+                    "contractVersion": 1,
+                    "assessment": "small",
+                    "complexity": "simple",
+                    "rationale": "CEO can do it",
+                    "teamPlanApproved": true
+                }
+            })
+        )
+        .is_err());
     }
 
     #[test]

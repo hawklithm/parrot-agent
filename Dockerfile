@@ -25,6 +25,7 @@ WORKDIR /build
 COPY parrot-agent/Cargo.toml parrot-agent/Cargo.lock ./
 COPY parrot-agent/crates ./crates
 COPY parrot-agent/migrations ./migrations
+COPY parrot-agent/teams-catalog/catalog ./teams-catalog/catalog
 COPY parrot-agent/build.rs ./ 2>/dev/null || true
 
 ARG CARGO_PROFILE=release
@@ -57,6 +58,10 @@ RUN groupadd -g 1000 parrot \
 # Copy binary
 COPY --from=builder /release/bin/parrot-server /usr/local/bin/parrot-server
 RUN chmod 755 /usr/local/bin/parrot-server
+
+# Keep the CEO catalog template available for runtime overrides. The same
+# source is also compiled into the binary as a fallback for binary-only installs.
+COPY --from=builder --chown=parrot:parrot /build/teams-catalog/catalog /app/teams-catalog/catalog
 
 # Copy pre-built Web UI (built outside the image; must be present at runtime)
 # Set PARROT_UI_DIR=/app/ui when starting the container.

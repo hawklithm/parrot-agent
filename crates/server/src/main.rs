@@ -5,7 +5,10 @@
 
 mod systemd_notify;
 
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use api::create_router;
 use axum::Router;
@@ -13,11 +16,49 @@ use repositories::{
     budget_repository::{PgBudgetIncidentRepository, PgBudgetPolicyRepository},
     company_repository::CompanyRepository,
     cost_event_repository::PgCostEventRepository,
+    pg_agent_repository::PgAgentRepository,
 };
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+fn parse_bind_ip(value: Option<&str>) -> Result<IpAddr, std::net::AddrParseError> {
+    match value {
+        Some(value) => value.parse(),
+        None => Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+    }
+}
+
+pub fn build_scheduler_heartbeat(pool: &PgPool) -> Arc<services::DefaultHeartbeatService> {
+    let cost_event_repo: Arc<dyn repositories::CostEventRepository> =
+        Arc::new(PgCostEventRepository::new(pool.clone()));
+    let company_repo = Arc::new(CompanyRepository::new(pool.clone()));
+    let scheduler_cost_service: Arc<dyn services::CostService> = Arc::new(
+        services::DefaultCostService::new(
+            cost_event_repo.clone(),
+            Arc::new(PgAgentRepository::new(pool.clone())),
+            company_repo.clone(),
+        ),
+    );
+    let scheduler_budget_service: Arc<dyn services::BudgetService> = Arc::new(
+        services::DefaultBudgetService::new(
+            cost_event_repo,
+            Arc::new(PgBudgetPolicyRepository::new(pool.clone())),
+            Arc::new(PgBudgetIncidentRepository::new(pool.clone())),
+            company_repo,
+        ),
+    );
+
+    Arc::new(
+        services::DefaultHeartbeatService::new(pool.clone())
+            .with_cost_service(scheduler_cost_service)
+            .with_budget_service(scheduler_budget_service)
+            .with_runtime_secret_resolver(Arc::new(
+                services::DatabaseAdapterRuntimeSecretResolver::new(pool.clone()),
+            )),
+    )
+}
 
 async fn ensure_local_trusted_principal(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let configured_user_id = std::env::var("LOCAL_TRUSTED_USER_ID")
@@ -117,6 +158,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    let bind_ip_override = match std::env::var("PARROT_BIND_IP") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PARROT_BIND_IP must be a valid IPv4 or IPv6 address",
+            )
+            .into());
+        }
+    };
+    let bind_ip = parse_bind_ip(bind_ip_override.as_deref()).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid PARROT_BIND_IP: {error}"),
+        )
+    })?;
+
     let database_url = std::env::var("DATABASE_URL").map_err(|_| {
         "DATABASE_URL is not set. Export it before starting parrot-server, e.g.\n  \
          DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/parrot_agent_dev parrot-server"
@@ -175,17 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dispatch fingerprint) — see services::routine_execution_service.
     let routine_repo: Arc<dyn repositories::RoutineRepository> =
         Arc::new(repositories::routine_repository::PostgresRoutineRepository::new(pool.clone()));
-    let scheduler_budget_service: Arc<dyn services::BudgetService> =
-        Arc::new(services::DefaultBudgetService::new(
-            Arc::new(PgCostEventRepository::new(pool.clone())),
-            Arc::new(PgBudgetPolicyRepository::new(pool.clone())),
-            Arc::new(PgBudgetIncidentRepository::new(pool.clone())),
-            Arc::new(CompanyRepository::new(pool.clone())),
-        ));
-    let scheduler_heartbeat = Arc::new(
-        services::DefaultHeartbeatService::new(pool.clone())
-            .with_budget_service(scheduler_budget_service),
-    );
+    let scheduler_heartbeat = build_scheduler_heartbeat(&pool);
     let routine_execution_service = Arc::new(services::RoutineExecutionService::new(Arc::new(
         services::RoutineServiceImpl::new(routine_repo),
     )));
@@ -254,6 +303,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             scheduler_heartbeat.clone(),
         )))
         .await;
+    // Durable task-orchestration outbox: wakes/rejections that were committed
+    // with a state change but not delivered before a crash are replayed here.
+    job_scheduler
+        .register(Arc::new(services::TaskOrchestrationRecoveryJob::new(
+            services::TaskOrchestrationService::read_only(
+                pool.clone(),
+                scheduler_heartbeat.clone(),
+            ),
+        )))
+        .await;
     job_scheduler
         .register(Arc::new(
             services::SchedulerExecutionHistoryCleanupJob::new(job_scheduler.clone()),
@@ -313,7 +372,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(config.server.port);
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::new(bind_ip, port);
     tracing::info!("listening on http://{}", addr);
 
     // Enforcement from config: bind_mode=Lan rejects LAN mode when
@@ -358,4 +417,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bind_ip;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn bind_ip_defaults_to_all_ipv4_interfaces() {
+        assert_eq!(
+            parse_bind_ip(None).unwrap(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn bind_ip_accepts_loopback() {
+        assert_eq!(
+            parse_bind_ip(Some("127.0.0.1")).unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn bind_ip_rejects_invalid_values() {
+        assert!(parse_bind_ip(Some("localhost")).is_err());
+    }
 }

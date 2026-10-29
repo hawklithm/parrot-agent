@@ -684,6 +684,54 @@ impl HeartbeatRecoveryJob {
     }
 }
 
+/// Recovers marked roots that missed startup and replays the orchestration outbox.
+///
+/// Wakes and rejections are committed to `task_orchestration_actions` in the
+/// same transaction as the state change, so a crash between the commit and the
+/// delivery is recoverable: this job releases stale claims and re-applies
+/// pending rows.
+pub struct TaskOrchestrationRecoveryJob {
+    orchestration: crate::task_orchestration_service::TaskOrchestrationService,
+}
+
+impl TaskOrchestrationRecoveryJob {
+    pub fn new(
+        orchestration: crate::task_orchestration_service::TaskOrchestrationService,
+    ) -> Self {
+        Self { orchestration }
+    }
+}
+
+#[async_trait]
+impl ScheduledJob for TaskOrchestrationRecoveryJob {
+    fn job_name(&self) -> &str {
+        "task_orchestration_recovery"
+    }
+    fn schedule(&self) -> JobSchedule {
+        JobSchedule::IntervalSeconds(30)
+    }
+    async fn execute(&self) -> Result<String, String> {
+        let recovered = self
+            .orchestration
+            .recover_required_task_orchestrations(128)
+            .await
+            .map_err(|error| error.to_string())?;
+        let applied = self
+            .orchestration
+            .recover_pending_work(128)
+            .await
+            .map_err(|error| error.to_string())?;
+        let budget_wakes = self
+            .orchestration
+            .recover_pending_task_budget_wake_resumes(128)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(format!(
+            "recovered {recovered} required task orchestrations, replayed {applied} actions, and confirmed {budget_wakes} task-budget wake resumes"
+        ))
+    }
+}
+
 #[async_trait]
 impl ScheduledJob for HeartbeatRecoveryJob {
     fn job_name(&self) -> &str {

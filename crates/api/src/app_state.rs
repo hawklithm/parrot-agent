@@ -305,6 +305,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::routes::cases::case_routes())
         .merge(crate::routes::issue_comments::issue_comment_routes())
         .merge(crate::routes::interactions::interaction_routes())
+        .merge(crate::routes::task_orchestration::task_orchestration_routes())
         .merge(crate::routes::issue_diagnostics::issue_diagnostics_routes())
         .merge(crate::routes::low_trust::low_trust_routes())
         // Phase 3: Company/Org routes

@@ -7,6 +7,7 @@ use axum::{
 };
 use garde::Validate;
 use serde::Deserialize;
+use std::path::Path as FsPath;
 use uuid::Uuid;
 
 use crate::errors::AppError;
@@ -14,7 +15,9 @@ use crate::redaction::redact_config;
 use crate::validation::{
     AgentPermissionsInput, CreateAgentHireSchema, InstructionsBundleInput, UpdateAgentSchema,
 };
-use models::{AgentPermissions, AgentStatus, ApprovalType, TrustAuthorizationPolicy, TrustPreset};
+use models::{
+    AgentPermissions, AgentRole, AgentStatus, ApprovalType, TrustAuthorizationPolicy, TrustPreset,
+};
 use serde_json::{json, Value};
 use services::approval_service::CreateApprovalInput;
 use services::auth::{AuthorizationAction, AuthorizationActor, AuthorizationService};
@@ -27,6 +30,79 @@ use crate::routes::heartbeats::list_scheduler_heartbeats;
 /// 与 `crate::app_state::AppState` 为同一类型（统一状态），
 /// 此处仅作为别名以保持路由模块内部的引用一致。
 pub use crate::app_state::AppState;
+
+const CEO_INSTRUCTIONS_CATALOG_PATH: &str =
+    "bundled/company-defaults/core-exec-team/agents/ceo/AGENTS.md";
+// Compile-time copy makes CEO creation independent of the process working
+// directory and ensures binary-only deployments still have the default.
+const BUNDLED_CEO_INSTRUCTIONS: &str = include_str!(
+    "../../../../teams-catalog/catalog/bundled/company-defaults/core-exec-team/agents/ceo/AGENTS.md"
+);
+
+fn read_ceo_instructions_from_catalog_root(root: Option<&FsPath>) -> Result<String, AppError> {
+    let Some(root) = root else {
+        return Ok(BUNDLED_CEO_INSTRUCTIONS.to_string());
+    };
+
+    let path = root.join(CEO_INSTRUCTIONS_CATALOG_PATH);
+    match std::fs::read_to_string(&path) {
+        Ok(instructions) if !instructions.trim().is_empty() => Ok(instructions),
+        Ok(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                "CEO catalog instructions are empty; using compiled default"
+            );
+            Ok(BUNDLED_CEO_INSTRUCTIONS.to_string())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                path = %path.display(),
+                "CEO catalog instructions are not packaged at runtime; using compiled default"
+            );
+            Ok(BUNDLED_CEO_INSTRUCTIONS.to_string())
+        }
+        Err(error) => {
+            tracing::error!(path = %path.display(), error = %error, "failed to read CEO catalog instructions");
+            Err(AppError::InternalServerError(
+                "Failed to load default CEO instructions".to_string(),
+            ))
+        }
+    }
+}
+
+fn load_default_ceo_instructions() -> Result<String, AppError> {
+    let catalog_root = services::teams_catalog_service::resolve_catalog_root();
+    if std::env::var_os("TEAMS_CATALOG_DIR").is_some() && catalog_root.is_none() {
+        tracing::warn!("TEAMS_CATALOG_DIR is unavailable; using compiled CEO instructions");
+    }
+    read_ceo_instructions_from_catalog_root(catalog_root.as_deref())
+}
+
+fn instructions_bundle_for_create(
+    role: AgentRole,
+    requested: Option<&InstructionsBundleInput>,
+    load_default: impl FnOnce() -> Result<String, AppError>,
+) -> Result<Option<Value>, AppError> {
+    if let Some(bundle) = requested {
+        return Ok(Some(json!({
+            "entryFile": bundle
+                .entry_file
+                .clone()
+                .unwrap_or_else(|| "AGENTS.md".to_string()),
+            "files": bundle.files.clone(),
+        })));
+    }
+
+    if role != AgentRole::Ceo {
+        return Ok(None);
+    }
+
+    let instructions = load_default()?;
+    Ok(Some(json!({
+        "entryFile": "AGENTS.md",
+        "files": { "AGENTS.md": instructions },
+    })))
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -216,21 +292,14 @@ async fn create_agent(
         object.insert("desired_skills".to_string(), json!(desired_skills));
     }
 
-    // The API accepts an omitted entryFile and Paperclip defaults it to
-    // AGENTS.md. Store the canonical flat bundle shape that heartbeat and
-    // instructions readers consume.
-    let instructions_bundle = payload
-        .instructions_bundle
-        .as_ref()
-        .map(|bundle: &InstructionsBundleInput| {
-            json!({
-                "entryFile": bundle
-                    .entry_file
-                    .clone()
-                    .unwrap_or_else(|| "AGENTS.md".to_string()),
-                "files": bundle.files.clone(),
-            })
-        });
+    // Preserve an explicitly supplied bundle; otherwise give new CEOs the
+    // catalog-backed default. This one value is persisted on the agent and
+    // copied into the hire approval snapshot below.
+    let instructions_bundle = instructions_bundle_for_create(
+        payload.role,
+        payload.instructions_bundle.as_ref(),
+        load_default_ceo_instructions,
+    )?;
 
     // 创建Agent
     let input = CreateAgentInput {
@@ -1923,4 +1992,88 @@ async fn get_agent_run(
         "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
         "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
     })))
+}
+
+#[cfg(test)]
+mod instructions_bundle_tests {
+    use super::*;
+
+    #[test]
+    fn new_ceo_without_a_bundle_gets_the_catalog_default_shape() {
+        let bundle = instructions_bundle_for_create(AgentRole::Ceo, None, || {
+            Ok(BUNDLED_CEO_INSTRUCTIONS.to_string())
+        })
+        .unwrap()
+        .expect("CEO should receive default instructions");
+
+        assert_eq!(
+            bundle,
+            json!({
+                "entryFile": "AGENTS.md",
+                "files": { "AGENTS.md": BUNDLED_CEO_INSTRUCTIONS },
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_bundle_is_preserved_without_loading_the_default() {
+        let requested = InstructionsBundleInput {
+            entry_file: Some("custom/CEO.md".to_string()),
+            files: std::collections::HashMap::from([
+                (
+                    "custom/CEO.md".to_string(),
+                    "custom CEO instructions".to_string(),
+                ),
+                ("notes.md".to_string(), "additional custom file".to_string()),
+            ]),
+        };
+
+        let bundle = instructions_bundle_for_create(AgentRole::Ceo, Some(&requested), || {
+            Err(AppError::InternalServerError(
+                "default loader should not run".to_string(),
+            ))
+        })
+        .unwrap()
+        .expect("explicit bundle should be retained");
+
+        assert_eq!(bundle["entryFile"], "custom/CEO.md");
+        assert_eq!(bundle["files"]["custom/CEO.md"], "custom CEO instructions");
+        assert_eq!(bundle["files"]["notes.md"], "additional custom file");
+    }
+
+    #[test]
+    fn non_ceo_without_a_bundle_is_not_given_ceo_instructions() {
+        let bundle = instructions_bundle_for_create(AgentRole::Manager, None, || {
+            Err(AppError::InternalServerError(
+                "default loader should not run".to_string(),
+            ))
+        })
+        .unwrap();
+
+        assert!(bundle.is_none());
+    }
+
+    #[test]
+    fn runtime_catalog_template_takes_precedence_over_the_compiled_fallback() {
+        let root = std::env::temp_dir().join(format!("parrot-ceo-template-{}", Uuid::new_v4()));
+        let path = root.join(CEO_INSTRUCTIONS_CATALOG_PATH);
+        std::fs::create_dir_all(path.parent().expect("template parent")).unwrap();
+        std::fs::write(&path, "runtime custom CEO template").unwrap();
+
+        let loaded = read_ceo_instructions_from_catalog_root(Some(root.as_path()));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(loaded.unwrap(), "runtime custom CEO template");
+    }
+
+    #[test]
+    fn missing_catalog_template_uses_the_compiled_fallback() {
+        let root = std::env::temp_dir().join(format!("parrot-ceo-template-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let loaded = read_ceo_instructions_from_catalog_root(Some(root.as_path()));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(loaded.unwrap(), BUNDLED_CEO_INSTRUCTIONS);
+    }
 }

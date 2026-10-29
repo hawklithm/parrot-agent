@@ -395,6 +395,16 @@ pub use plan_decomposition_service::*;
 pub mod issue_diagnostics_service;
 pub use issue_diagnostics_service::*;
 pub mod heartbeat_service;
+pub mod task_orchestration_service;
+pub use task_orchestration_service::{
+    parse_decision_contract, validate_decision_contract, ContractHire, ContractMember,
+    ContractQuestion, ContractSubtask, DecisionContract, DecisionOutcome, DeliverableView,
+    OrchRow, OrchestrationError, OrchestrationEvent, OrchestrationStage, OrchestrationSubtask,
+    OrchestrationView, PendingClarification, PlanMember, TaskOrchestrationService, TeamAdjustment,
+    TeamPlan,
+    DECISION_CONTRACT_VERSION, MAX_CONTRACT_MEMBERS, MAX_CONTRACT_QUESTIONS,
+    MAX_CONTRACT_SUBTASKS, MAX_CONTRACT_TEXT_CHARS,
+};
 pub mod wake_prompt_service;
 pub use wake_prompt_service::*;
 pub mod issue_assignment_wakeup;
@@ -451,7 +461,7 @@ pub use job_scheduler::{
     EnvironmentHealthProber, StuckRunDetector, ConsistencyCheckJob,
     StatusCardSchedulerJob, SummarySlotFinalizerJob,
     HeartbeatRecoveryJob, SchedulerExecutionHistoryCleanupJob, SchedulerLeaseRepairJob,
-    TaskWatchdogJob,
+    TaskWatchdogJob, TaskOrchestrationRecoveryJob,
     SecretMaterialBackfillJob, SecretProposalExpirationJob,
     RecoveryActionRetryJob,
     DecisionTrainingCommentScrubJob,

@@ -126,8 +126,14 @@ impl ApprovalRepository for PostgresApprovalRepository {
     }
 
     async fn link_to_issue(&self, approval_id: Uuid, issue_id: Uuid) -> RepositoryResult<()> {
+        // `issue_approvals.company_id` is NOT NULL in the current schema. The
+        // company is derived from the approval inside the same statement so a
+        // caller cannot link an approval to an issue of another company.
         sqlx::query(
-            "INSERT INTO issue_approvals (id, approval_id, issue_id) VALUES ($1, $2, $3)
+            "INSERT INTO issue_approvals (id, approval_id, issue_id, company_id)
+             SELECT $1, approval.id, $3, approval.company_id
+               FROM approvals approval
+              WHERE approval.id = $2
              ON CONFLICT (approval_id, issue_id) DO NOTHING"
         )
         .bind(Uuid::new_v4())

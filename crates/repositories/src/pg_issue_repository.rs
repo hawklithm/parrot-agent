@@ -750,7 +750,9 @@ impl IssueRepository for PgIssueRepository {
                 origin_kind, origin_id, origin_run_id, origin_fingerprint, request_depth,
                 billing_code, assignee_adapter_overrides,
                 execution_policy, execution_workspace_settings,
-                execution_workspace_id, execution_workspace_preference
+                execution_workspace_id, execution_workspace_preference,
+                task_budget_cents, task_budget_revision,
+                task_orchestration_required
             )
             VALUES (
                 COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6,
@@ -761,7 +763,9 @@ impl IssueRepository for PgIssueRepository {
                 $20, $21, $22, $23, $24,
                 $25, $26,
                 $27, $28,
-                $29, $30
+                $29, $30,
+                $31, CASE WHEN $31::bigint IS NULL THEN 0 ELSE 1 END,
+                $32
             )
             RETURNING *
             "#,
@@ -799,6 +803,8 @@ impl IssueRepository for PgIssueRepository {
         .bind(&input.execution_workspace_settings)
         .bind(input.execution_workspace_id)
         .bind(input.execution_workspace_preference.as_ref())
+        .bind(input.task_budget_cents)
+        .bind(input.task_orchestration_required)
         .fetch_one(&mut *tx)
         .await
         .map_err(RepositoryError::DatabaseError)?;

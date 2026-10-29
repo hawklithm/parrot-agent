@@ -41,6 +41,7 @@ pub mod tool_access;
 pub mod secret_proposals;
 pub mod dashboard;
 pub mod skill_policy;
+pub mod task_orchestration;
 pub mod sidebar_preferences;
 pub mod skills;
 pub mod sse;
@@ -411,6 +412,7 @@ pub use costs::cost_routes;
 pub use decisions::decision_routes;
 pub use version::version_routes;
 pub use resource_memberships::resource_membership_routes;
+pub use task_orchestration::task_orchestration_routes;
 
 /// 权限测试用的 actor 构造器（board owner/admin/operator/viewer、agent、匿名）。
 /// 供 `attachments` / `work_products` 等模块的权限矩阵测试复用。

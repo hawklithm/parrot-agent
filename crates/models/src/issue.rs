@@ -359,6 +359,14 @@ pub struct CreateIssueInput {
     pub origin_fingerprint: Option<String>,
     pub request_depth: Option<i32>,
     pub billing_code: Option<String>,
+    /// Optional Board-set total lifetime budget for an auto-routed root task.
+    /// Child issues inherit the cap from their root and must leave this unset.
+    #[serde(default)]
+    pub task_budget_cents: Option<i64>,
+    /// Server-only marker for Board-created root issues that must start an
+    /// orchestration before any assignment wake can dispatch.
+    #[serde(skip)]
+    pub task_orchestration_required: bool,
     pub execution_workspace_id: Option<Uuid>,
     pub execution_workspace_preference: Option<String>,
     pub execution_policy: Option<IssueExecutionPolicy>,

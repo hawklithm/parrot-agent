@@ -21,6 +21,7 @@ use services::{CrossIssueInfluenceKind, CrossIssueInfluenceLimitService,
 fn map_interaction_service_error(error: String) -> ApiError {
     let lower = error.to_ascii_lowercase();
     if lower.contains("already resolved")
+        || lower.contains("already been resolved")
         || lower.contains("not pending")
         || lower.contains("idempotency key conflicts")
         || lower.contains("closed issue")
@@ -313,6 +314,22 @@ pub async fn create_interaction(
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.create(&issue, input, creator).await
         .map_err(map_interaction_service_error)?;
+
+    let orchestration = services::TaskOrchestrationService::new(
+        state.pool.clone(),
+        state.heartbeat_service.clone(),
+        state.agent_service.clone(),
+        state.approval_service.clone(),
+        state.issue_service.clone(),
+    );
+    crate::routes::task_orchestration::note_interaction_created(
+        &orchestration,
+        company_id,
+        issue_id,
+        &interaction.kind,
+        interaction.id,
+    )
+    .await;
 
     log_activity(
         &state.pool,
@@ -626,6 +643,25 @@ pub async fn answer_questions(
     let service = services::issue_thread_interaction_service::IssueThreadInteractionService::new(state.pool.clone());
     let interaction = service.answer_questions(issue_id, interaction_id, input, resolver).await
         .map_err(map_interaction_service_error)?;
+
+    // Persist the answer in the orchestration so the CEO's continuation run
+    // sees the clarification resolved. The continuation wake below already
+    // targets the issue assignee.
+    let orchestration = services::TaskOrchestrationService::new(
+        state.pool.clone(),
+        state.heartbeat_service.clone(),
+        state.agent_service.clone(),
+        state.approval_service.clone(),
+        state.issue_service.clone(),
+    );
+    crate::routes::task_orchestration::note_interaction_answered(
+        &orchestration,
+        company_id,
+        issue_id,
+        &interaction.kind,
+        interaction.id,
+    )
+    .await;
 
     queue_interaction_continuation_wakeup(
         &state,
